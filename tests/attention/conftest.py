@@ -11,6 +11,10 @@ of JitSpecs its collected test cases will need (mirroring the tests' own
 skip guards), compile them as one parallel ninja graph, and stage the
 resulting .so files into the AOT dir so test-time loads skip the
 per-module ninja dependency scan entirely.
+
+2.  Warm selected Prims-TS context and MLA cases in a bounded process pool,
+persisting all their CuTe-DSL plans, including later replans. Workers execute real kernels;
+normal pytest then loads those artifacts and owns each test's final result.
 """
 
 import contextlib
@@ -170,7 +174,7 @@ def _fmha_v2_specs(items):
     sink_keys = set()  # (dtype, use_swa, head_dim)
     test_names = {it.name.split("[")[0] for it in items}
     need_sm120_module = sm12x and any(
-        name == "test_fmha_v2_prefill_deepseek"
+        name.startswith("test_fmha_v2_prefill_deepseek")
         or name.startswith("test_fmha_v2_prefill_sm120")
         for name in test_names
     )
@@ -180,7 +184,7 @@ def _fmha_v2_specs(items):
             continue
         p = cs.params
         fn = it.name.split("[")[0]
-        if fn == "test_fmha_v2_prefill_deepseek":
+        if fn.startswith("test_fmha_v2_prefill_deepseek"):
             continue
         if fn == "test_trtllm_fmha_v2_prefill_sm120_large_head_dim" and not sm12x:
             continue  # test skips on non-SM12x
@@ -455,6 +459,44 @@ def pytest_collection_modifyitems(session, config, items):
                 f"[jit-prebuild] {fname}: staged {staged} kernels into AOT dir; "
                 "tests will load-only."
             )
+
+    prims_ts_items = [
+        item
+        for item in items
+        if item.path.name
+        in (
+            "test_attention_ts_mla_decode.py",
+            "test_attention_ts_sparse_mla.py",
+            "test_attention_ts_context.py",
+            "test_attention_ts_context_sage.py",
+        )
+    ]
+    if prims_ts_items:
+        from tests.test_helpers.prims_ts_attention_prebuild import (
+            prebuild_selected_attention_tests,
+        )
+
+        started = time.monotonic()
+        try:
+            if reporter:
+                reporter.write_line(
+                    "[jit-prebuild] Precompiling selected Prims-TS attention plans..."
+                )
+            built, errors, cases = prebuild_selected_attention_tests(prims_ts_items)
+            if reporter:
+                reporter.write_line(
+                    f"[jit-prebuild] Prims-TS: {built} kernels built across {cases} "
+                    f"cases in {time.monotonic() - started:.1f}s; "
+                    f"{len(errors)} warmup failures deferred to pytest."
+                )
+                for error in errors[:3]:
+                    reporter.write_line(f"[jit-prebuild] Prims-TS fallback: {error}")
+        except Exception as error:
+            if reporter:
+                reporter.write_line(
+                    f"[jit-prebuild] Prims-TS prebuild failed ({error!r}); "
+                    "falling back to per-test JIT compilation."
+                )
 
     if prebuilt_any:
         # Arm the collector-drift check in pytest_sessionfinish: anything

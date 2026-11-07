@@ -1,4 +1,4 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
+"""Multi-rank MXFP8 checks and Blackwell standard/GenPhase layer regressions.
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
@@ -32,6 +32,8 @@ import os
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 # This test verifies the mega path only through the cutedsl_megamoe shim public
 # API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
@@ -54,11 +56,20 @@ def _launcher_ranks() -> tuple[int, int]:
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "tile_n,cluster_m,capacity",
-    [(128, 4, 129), (64, 4, 129), (64, 2, 129), (64, 2, 1024)],
+    "variant,kind,tile_n,cluster_m,capacity,early",
+    [
+        ("genphase", "mxfp8_e4m3", 128, 4, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 4, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 2, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 2, 1024, True),
+        ("inference", "nvfp4", 128, 2, 129, True),
+        ("inference", "nvfp4", 128, 2, 129, False),
+        ("inference", "mxfp8_e4m3", 128, 2, 129, True),
+        ("inference", "mxfp8_e5m2", 128, 2, 129, True),
+    ],
 )
-def test_blackwell_genphase_layer_graph_and_weight_formats(
-    tile_n, cluster_m, capacity, monkeypatch
+def test_blackwell_layer_graph_and_weight_formats(
+    variant, kind, tile_n, cluster_m, capacity, early, monkeypatch
 ):
     """Public layer: both input formats, four weight formats and changing routes."""
     import torch
@@ -72,6 +83,7 @@ def test_blackwell_genphase_layer_graph_and_weight_formats(
         MoEEpTensors,
         MoEWeightPack,
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
 
@@ -95,9 +107,16 @@ def test_blackwell_genphase_layer_graph_and_weight_formats(
         torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
         / intermediate**0.5
     ).bfloat16()
-    qx, sx = pkg.quantize_genphase_mxfp8(x, torch.float8_e4m3fn)
-    q13, s13 = pkg.quantize_genphase_mxfp8(w13, torch.float8_e4m3fn)
-    q2, s2 = pkg.quantize_genphase_mxfp8(w2, torch.float8_e4m3fn)
+
+    def quantize(value):
+        if kind == "nvfp4":
+            return pkg.quantize_nvfp4_block16(value)
+        dtype = torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+        return pkg.quantize_mxfp8_block32(value, dtype)
+
+    qx, sx = quantize(x)
+    q13, s13 = quantize(w13)
+    q2, s2 = quantize(w2)
     source = MoEWeightPack(w13, w2)
     packed = MoEWeightPack(q13, q2, s13, s2)
     byte_packed = MoEWeightPack(q13, q2, s13.view(torch.uint8), s2.view(torch.uint8))
@@ -106,6 +125,27 @@ def test_blackwell_genphase_layer_graph_and_weight_formats(
     ) % experts
     scores = torch.full((capacity, topk), 1 / topk, device="cuda")
     layers = []
+
+    def kernel_config():
+        if kind == "nvfp4":
+            return Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=intermediate,
+                top_k=topk,
+                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+                apply_routing_weights_before_fc2=early,
+            )
+        kwargs = (
+            dict(
+                kernel_variant="genphase",
+                mma_tiler_mnk=(256, tile_n, 128),
+                cluster_shape_mn=(cluster_m, 1),
+            )
+            if variant == "genphase"
+            else dict(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+        )
+        return Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=intermediate, top_k=topk, kind=kind, **kwargs
+        )
 
     def check(ws, weights, output, count):
         indices, expected = pkg.sampled_reference(ws, *weights, count, sample_size=32)
@@ -134,13 +174,7 @@ def test_blackwell_genphase_layer_graph_and_weight_formats(
                     ),
                     weights,
                     backend=MegaConfig(
-                        megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-                            intermediate_size=intermediate,
-                            top_k=topk,
-                            kernel_variant="genphase",
-                            mma_tiler_mnk=(256, tile_n, 128),
-                            cluster_shape_mn=(cluster_m, 1),
-                        ),
+                        megakernel=kernel_config(),
                         quantize_input=quantize_input,
                         preprocess_weights=weight_format != "transformed",
                         transformed_weights=layers[0]._transformed
@@ -1085,7 +1119,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight_sf=_all_gather_stack(fc2_sf),
                 ab_dtype=torch.float8_e4m3fn,
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             # The topk weight is already folded before the fc1-out round-trip, so
             # the per-topk terms reduce with a plain sum; compare this rank's slice.
@@ -1180,13 +1214,26 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
+    import torch
+
     from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    kernel = create_mega_kernel(
-        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    config = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
+    kernel = create_mega_kernel(config)
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
+    assert config.finalize_mode is FinalizeMode.PERSISTENT
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.PERSISTENT,
+        )
 
 
 @pytest.mark.gpu_4

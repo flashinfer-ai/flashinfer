@@ -45,10 +45,40 @@
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
+// Compile-line definitions (the catalog's compile_flags of every route that
+// shares this text).
+//
+// PAGE_KV: KV rows per block-table page, 64 or 128.  A page holds PAGE_KV fused
+// rows (128 FP8 bytes each) followed by PAGE_KV FP32 scales, and the kernel
+// walks 64-row KV tiles, so a page spans PAGE_KV / 64 tiles: the block table is
+// indexed by bt_tile / (PAGE_KV / 64), a tile's row offset inside its page is
+// tile % (PAGE_KV / 64) * 64, and the FP32 scales of a page start at float
+// column PAGE_KV * 32 of the KV_scales view.  The #if branches at the three KV
+// walk sites (two warp groups each) spell those expressions out at PAGE_KV = 64
+// and 128, so each value compiles to the text that was delivered per page size.
+#ifndef PAGE_KV
+#error "PAGE_KV (KV rows per page, 64 or 128) must be defined on the compile line"
+#endif
+#if PAGE_KV != 64 && PAGE_KV != 128
+#error "PAGE_KV must be 64 or 128"
+#endif
+
+// Program identity: each define set of this shared text keeps the kernel symbol of the per-route
+// unit it replaced, so every JIT module built from the text exports its own kernel symbol (the
+// modules share one process; a shared symbol would resolve a launcher to another module's kernel).
+#if PAGE_KV == 128
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_a01d9cb34eb024910169
+#elif PAGE_KV == 64
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a
+#else
+#error "no exported program for this PAGE_KV"
+#endif
+
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -636,20 +666,32 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a(const __grid_co
                         int bt_tile = tile + bt_lane * 2;
                         bt_cache = 0;
                         if (bt_tile < num_kv_2) {
+                            #if PAGE_KV == 64
                             bt_cache = block_table[bt_row + bt_tile];
+                            #else
+                            bt_cache = block_table[bt_row + bt_tile / 2];
+                            #endif
                         }
                     }
                     int _shfl_0 = __shfl_sync(0xFFFFFFFF, bt_cache, bt_ptr);
                     int kv_block = _shfl_0;
                     bt_ptr += 1;
+                    #if PAGE_KV == 64
                     int page_off = 0;
+                    #else
+                    int page_off = tile % 2 * 64;
+                    #endif
                     {
                         mbarrier_wait(kv_empty_g0_addr + (kv_stage) * 8, kv_phase);
                     }
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_g0_addr + (kv_stage) * 8, 8448);
                         tma_3d_gmem2smem(smem_kv_g0_addr + kv_stage * 8192, (&KV), 0, page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #if PAGE_KV == 64
                         tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 2048 + page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #else
+                        tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 4096 + page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #endif
                     }
                     kv_stage += 1;
                     if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
@@ -691,20 +733,32 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a(const __grid_co
                         int bt_tile_1 = tile_1 + bt_lane_1 * 2;
                         bt_cache_1 = 0;
                         if (bt_tile_1 < num_kv_3) {
+                            #if PAGE_KV == 64
                             bt_cache_1 = block_table[bt_row_1 + bt_tile_1];
+                            #else
+                            bt_cache_1 = block_table[bt_row_1 + bt_tile_1 / 2];
+                            #endif
                         }
                     }
                     int _shfl_1 = __shfl_sync(0xFFFFFFFF, bt_cache_1, bt_ptr_1);
                     int kv_block_1 = _shfl_1;
                     bt_ptr_1 += 1;
+                    #if PAGE_KV == 64
                     int page_off_1 = 0;
+                    #else
+                    int page_off_1 = tile_1 % 2 * 64;
+                    #endif
                     {
                         mbarrier_wait(kv_empty_g1_addr + (kv_stage_1) * 8, kv_phase_1);
                     }
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_g1_addr + (kv_stage_1) * 8, 8448);
                         tma_3d_gmem2smem(smem_kv_g1_addr + kv_stage_1 * 8192, (&KV), 0, page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #if PAGE_KV == 64
                         tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 2048 + page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #else
+                        tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 4096 + page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #endif
                     }
                     kv_stage_1 += 1;
                     if (kv_stage_1 == 3) { kv_stage_1 = 0; kv_phase_1 ^= 1; }

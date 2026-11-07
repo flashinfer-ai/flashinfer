@@ -34,7 +34,8 @@ enum class ActivationType {
   InvalidType,
   // CUTLASS-backend only (see cutlass_fused_moe_kernels.cuh). Keep existing
   // activation values stable for the TRT-LLM backend.
-  ClampedRelu2 = 12
+  ClampedRelu2 = 12,
+  PowLU = 13
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_sparse_mqa_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 struct CakeFastDivmod {
   int32_t divisor;

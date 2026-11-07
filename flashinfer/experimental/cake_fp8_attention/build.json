@@ -1,0 +1,136 @@
+{
+  "arch_flags": {
+    "sm_90a": [
+      "-gencode=arch=compute_90a,code=sm_90a"
+    ]
+  },
+  "common": {
+    "include_dirs": [
+      "csrc"
+    ],
+    "link": {
+      "cudart": "shared",
+      "host_linker": "c++",
+      "tvm_ffi_symbols": "resolved at load; do not pass --no-undefined"
+    },
+    "link_flags": [
+      "-shared",
+      "-lcudart",
+      "-lcuda"
+    ],
+    "nvcc_flags": [
+      "-std=c++17",
+      "-O3",
+      "-DNDEBUG",
+      "--compiler-options=-fPIC",
+      "--expt-relaxed-constexpr",
+      "-Xfatbin=-compress-all",
+      "--compress-mode=size"
+    ],
+    "nvcc_flags_if": [
+      {
+        "cuda": ">=12.8",
+        "flags": [
+          "-static-global-template-stub=false"
+        ]
+      }
+    ],
+    "requires": {
+      "cuda_toolkit": {
+        "min": "12.8"
+      },
+      "tvm_ffi": {
+        "include_dirs": [
+          "tvm_ffi.libinfo.find_include_path()",
+          "tvm_ffi.libinfo.find_dlpack_include_path()"
+        ],
+        "python": "apache-tvm-ffi>=0.1.11,<0.2"
+      }
+    }
+  },
+  "generator": {
+    "cake_revision": "3580c49058b9f7caeea4b72059b91cd6cbd84c7d",
+    "cuda": "13.4.92",
+    "rendered_at": "2026-10-26T07:29:24Z"
+  },
+  "libraries": [
+    {
+      "arch": "sm_90a",
+      "closure_sha256": "f16f852e23e6ec1a724a1698c8ad5a4761735b07fa17bd5f72c121d22461cd25",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_90a,code=sm_90a",
+      "min_cuda": "12.8",
+      "name": "cake_fp8_attention_5402aaf711017814a0ce_sm_90a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_fp8_attention_5402aaf711017814a0ce_sm_90a.so",
+      "sha256": {
+        "csrc/cake_fp8_attention_5402aaf711017814a0ce_binding.cu": "3749271e4c0fc81b955cdfe2a4e944fe4d1d0039a6a4885f25538f6b3d11b021",
+        "csrc/cake_fp8_attention_5402aaf711017814a0ce_kernel.cu": "0bf7eb71abe033f3cd7803b4a67774d29847ed53e71190aafbc0947a93f262f0"
+      },
+      "sources": [
+        "csrc/cake_fp8_attention_5402aaf711017814a0ce_kernel.cu",
+        "csrc/cake_fp8_attention_5402aaf711017814a0ce_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_90a",
+      "closure_sha256": "ef711d64e58d75c66de95a58627c2e3163f28c2072e6baafbe7178e4e0caaffa",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_90a,code=sm_90a",
+      "min_cuda": "12.8",
+      "name": "cake_fp8_attention_8f4172c0adf623a761c9_sm_90a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_fp8_attention_8f4172c0adf623a761c9_sm_90a.so",
+      "sha256": {
+        "csrc/cake_fp8_attention_8f4172c0adf623a761c9_binding.cu": "31350d1bbc3990ff090b739b678b58961c53d9bf618c8a4a512346c4e657fc54",
+        "csrc/cake_fp8_attention_8f4172c0adf623a761c9_kernel.cu": "746394562cdf63d9701d4b93d462ce400ab8918e5d10e97bca73cf1d7e23a69e"
+      },
+      "sources": [
+        "csrc/cake_fp8_attention_8f4172c0adf623a761c9_kernel.cu",
+        "csrc/cake_fp8_attention_8f4172c0adf623a761c9_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_90a",
+      "closure_sha256": "631927f6bf8f1bc4774babbc63d10119da509e4d9bb7cf9f5438eb999e6030fe",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_90a,code=sm_90a",
+      "min_cuda": "12.8",
+      "name": "cake_fp8_attention_bf0833d889569b5406df_sm_90a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_fp8_attention_bf0833d889569b5406df_sm_90a.so",
+      "sha256": {
+        "csrc/cake_fp8_attention_bf0833d889569b5406df_binding.cu": "0581ca45a7d0f55a2bbb65c8a3bf8cbfd556fc6133e91e48d4cb2ab26b794469",
+        "csrc/cake_fp8_attention_bf0833d889569b5406df_kernel.cu": "2160dbd57e68859622a432ba9bcfc00f7f2cc3db03f0165e2bbfb94bd852207b"
+      },
+      "sources": [
+        "csrc/cake_fp8_attention_bf0833d889569b5406df_kernel.cu",
+        "csrc/cake_fp8_attention_bf0833d889569b5406df_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_90a",
+      "closure_sha256": "2b1d5eb81d737e0e21100912470ac3b11f8cf2210ebca0fd0bbafdb579e3b922",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_90a,code=sm_90a",
+      "min_cuda": "12.8",
+      "name": "cake_fp8_attention_c0e2681a52a8b76b0256_sm_90a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_fp8_attention_c0e2681a52a8b76b0256_sm_90a.so",
+      "sha256": {
+        "csrc/cake_fp8_attention_c0e2681a52a8b76b0256_binding.cu": "775fdcdf485609b4fee4540b69823ea92ab5694b514d4a11addeeb881ee4e5ce",
+        "csrc/cake_fp8_attention_c0e2681a52a8b76b0256_kernel.cu": "b05570ad56b4fe333a8997e3664620c29efed872c0c6dce82eb7cd5d4b06951d"
+      },
+      "sources": [
+        "csrc/cake_fp8_attention_c0e2681a52a8b76b0256_kernel.cu",
+        "csrc/cake_fp8_attention_c0e2681a52a8b76b0256_binding.cu"
+      ]
+    }
+  ],
+  "package": "flashinfer.experimental.cake_fp8_attention",
+  "schema": "cake-build/1"
+}

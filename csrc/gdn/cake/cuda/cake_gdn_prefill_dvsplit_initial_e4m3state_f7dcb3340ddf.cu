@@ -16,13 +16,7 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
 
-// Shared-memory descriptor address mask of this body: the 15-bit form on
-// SM107a, the 14-bit form on SM100a/SM103a (device compilation only).
-#if __CUDA_ARCH__ == 1070
-#define CAKE_GDN_SMEM_DESC_MASK 0x7FFF
-#else
 #define CAKE_GDN_SMEM_DESC_MASK 0x3FFF
-#endif  // __CUDA_ARCH__
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
@@ -107,11 +101,20 @@
 #error "USE_STATE_INDICES is a downstream specialization of this program; define it on the compile line"
 #endif
 #define LAUNCH_MIN_BLOCKS 1
+#ifndef CAKE_GDN_FP8_X2
+#define CAKE_GDN_FP8_X2 e4m3x2
+#endif
+#define CAKE_GDN_STRINGIZE_(x) #x
+#define CAKE_GDN_STRINGIZE(x) CAKE_GDN_STRINGIZE_(x)
+#define CAKE_GDN_FP8_X2_STR CAKE_GDN_STRINGIZE(CAKE_GDN_FP8_X2)
+#ifndef CAKE_GDN_KERNEL_SYMBOL
+#define CAKE_GDN_KERNEL_SYMBOL kernel_cake_gdn_bd8cbe7b12b9664e177a
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, uint8_t* __restrict__ initial_state, uint8_t* __restrict__ output_state, uint8_t* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
+CAKE_GDN_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, uint8_t* __restrict__ initial_state, uint8_t* __restrict__ output_state, uint8_t* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1381,7 +1384,7 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                     {
                                         uint16_t _e4m3x2_0 = *reinterpret_cast<const uint16_t*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
                                         uint32_t _f16x2_0;
-                                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
+                                        asm volatile("cvt.rn.f16x2." CAKE_GDN_FP8_X2_STR " %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
                                         uint16_t _h0_0 = (uint16_t)((_f16x2_0 >> 0) & 0xFFFFu);
                                         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(state_init_frag[state_reg_base_init + 0]) : "h"(_h0_0));
                                         uint16_t _h1_0 = (uint16_t)((_f16x2_0 >> 16) & 0xFFFFu);
@@ -1390,7 +1393,7 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                     {
                                         uint16_t _e4m3x2_1 = *reinterpret_cast<const uint16_t*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
                                         uint32_t _f16x2_1;
-                                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                                        asm volatile("cvt.rn.f16x2." CAKE_GDN_FP8_X2_STR " %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
                                         uint16_t _h0_1 = (uint16_t)((_f16x2_1 >> 0) & 0xFFFFu);
                                         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(state_init_frag[state_reg_base_init + 2 + 0]) : "h"(_h0_1));
                                         uint16_t _h1_1 = (uint16_t)((_f16x2_1 >> 16) & 0xFFFFu);
@@ -2802,22 +2805,22 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                 {
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 1]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 1]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1 + 1)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 2]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 2]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (state_base_idx_bot_cg1 + (long long)state_col_pair_cg1)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 3]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(_tmem_load_16[state_reg_base_cg1 + 3]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (state_base_idx_bot_cg1 + (long long)state_col_pair_cg1 + 1)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                 }
@@ -2848,7 +2851,7 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                     {
                                         uint16_t _e4m3x2_10 = *reinterpret_cast<const uint16_t*>(initial_state + empty_initial_top_base + (long long)empty_state_col + (long long)(empty_pair * 2));
                                         uint32_t _f16x2_10;
-                                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_10) : "h"(_e4m3x2_10));
+                                        asm volatile("cvt.rn.f16x2." CAKE_GDN_FP8_X2_STR " %0, %1;" : "=r"(_f16x2_10) : "h"(_e4m3x2_10));
                                         uint16_t _h0_10 = (uint16_t)((_f16x2_10 >> 0) & 0xFFFFu);
                                         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(empty_top_vec[empty_pair * 2 + 0]) : "h"(_h0_10));
                                         uint16_t _h1_10 = (uint16_t)((_f16x2_10 >> 16) & 0xFFFFu);
@@ -2857,7 +2860,7 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                     {
                                         uint16_t _e4m3x2_11 = *reinterpret_cast<const uint16_t*>(initial_state + empty_initial_bot_base + (long long)empty_state_col + (long long)(empty_pair * 2));
                                         uint32_t _f16x2_11;
-                                        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_11) : "h"(_e4m3x2_11));
+                                        asm volatile("cvt.rn.f16x2." CAKE_GDN_FP8_X2_STR " %0, %1;" : "=r"(_f16x2_11) : "h"(_e4m3x2_11));
                                         uint16_t _h0_11 = (uint16_t)((_f16x2_11 >> 0) & 0xFFFFu);
                                         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(empty_bot_vec[empty_pair * 2 + 0]) : "h"(_h0_11));
                                         uint16_t _h1_11 = (uint16_t)((_f16x2_11 >> 16) & 0xFFFFu);
@@ -2868,12 +2871,12 @@ kernel_cake_gdn_bd8cbe7b12b9664e177a(const __grid_constant__ CUtensorMap Q, cons
                                 for (int empty_element = 0; empty_element < 4; empty_element++) {
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(empty_top_vec[empty_element]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(empty_top_vec[empty_element]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (empty_output_top_base + (long long)empty_state_col + (long long)empty_element)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                     {
                                         unsigned short _fp8_pair;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(empty_bot_vec[empty_element]));
+                                        asm("cvt.rn.satfinite." CAKE_GDN_FP8_X2_STR ".f32 %0, 0f00000000, %1;" : "=h"(_fp8_pair) : "f"(empty_bot_vec[empty_element]));
                                         *(reinterpret_cast<unsigned char*>(output_state + (empty_output_bot_base + (long long)empty_state_col + (long long)empty_element)) + (0)) = (unsigned char)(_fp8_pair & 0xFF);
                                     }
                                 }

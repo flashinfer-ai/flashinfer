@@ -32,15 +32,27 @@ from __future__ import annotations
 import dataclasses
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Protocol, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Optional,
+    Protocol,
+    Tuple,
+    ClassVar,
+    TypeVar,
+)
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     normalize_sm90_routing_profile,
 )
 
+from ..src.moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -56,8 +68,9 @@ from .hopper_fp8 import (
     _kind_to_cutlass_dtype,
     _sym_zeros_byte_view_1b,
 )
-from ..src.moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
 
+_Fp4Buffer = TypeVar("_Fp4Buffer", bound="MegaMoEHopperMxfp4SymmBuffer")
+_Fp4Inputs = TypeVar("_Fp4Inputs", bound="MegaMoEHopperMxfp4Inputs")
 
 _MXFP4_MMA_TILER_DEFAULT = (128, 32, 128)
 _MXFP4_CLUSTER_SHAPE_DEFAULT = (1, 1, 1)
@@ -123,7 +136,14 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     fp8_accum_mode: Literal["1xacc"] = "1xacc"
     swap_ab: bool = True
     # Preserve the qualified MXFP4 layout when the FP8 base gains new features.
-    compact_pull_buffer: Literal[False] = False
+    # The compact pull buffer (one dispatch slot per active warp) and the
+    # dispatch-pull batch/rotation below are tactic fields; omitted fields
+    # select the full 4-slot buffer and the serial, static pull.
+    compact_pull_buffer: bool = False
+    # Dispatch-pull rows in flight per active dispatch warp, and the per-pass
+    # rotation of the warp -> row assignment (output-invariant).
+    dispatch_pull_batch: int = 1
+    dispatch_pull_rotate: bool = False
     generate_c: Literal[False] = False
     mma_tiler_mnk: Tuple[int, int, int] = _MXFP4_MMA_TILER_DEFAULT
     # Local layout improvements are derived defaults, not tuning axes.
@@ -135,36 +155,53 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
         kw_only=True,
     )
 
+    _weight_format: ClassVar[str] = "MXFP4"
+
+    def _validate_active_dispatch_warps(self) -> None:
+        if isinstance(
+            self.active_dispatch_warps, bool
+        ) or self.active_dispatch_warps not in (1, 2, 4):
+            raise ValueError("active_dispatch_warps must be 1, 2, or 4.")
+
+    def _validate_conversion_layout(self) -> None:
+        """Validate format-specific conversion metadata before common flags."""
+
+    def _validate_weight_schedule(self) -> None:
+        """Format-specific validation after the common geometry checks."""
+
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "routing_profile",
             normalize_sm90_routing_profile(self.routing_profile),
         )
+        self._validate_conversion_layout()
         if self.kind != "fp8_e4m3":
             raise ValueError(
-                f"Hopper MXFP4 x FP8 requires kind='fp8_e4m3'; got {self.kind!r}."
+                f"Hopper {self._weight_format} x FP8 requires kind='fp8_e4m3'; got {self.kind!r}."
             )
         if self.fp8_scale_mode != "mxfp4_hybrid":
             raise ValueError(
-                "Hopper MXFP4 x FP8 requires "
+                f"Hopper {self._weight_format} x FP8 requires "
                 "fp8_scale_mode='mxfp4_hybrid'; "
                 f"got {self.fp8_scale_mode!r}."
             )
         if self.fp8_accum_mode != "1xacc":
             raise ValueError(
-                "Hopper MXFP4 x FP8 supports only fp8_accum_mode='1xacc'; "
+                f"Hopper {self._weight_format} x FP8 supports only fp8_accum_mode='1xacc'; "
                 f"got {self.fp8_accum_mode!r}."
             )
-        if self.compact_pull_buffer is not False or self.generate_c is not False:
-            raise ValueError(
-                "MXFP4 requires compact_pull_buffer=False and generate_c=False"
-            )
+        if not isinstance(self.compact_pull_buffer, bool):
+            raise ValueError("compact_pull_buffer must be a bool.")
+        if self.generate_c is not False:
+            raise ValueError(f"{self._weight_format} requires generate_c=False")
         if self.tail_split_pairs and self.fc1_ready_mode != "tile":
-            raise ValueError("MXFP4 tail_split_pairs requires fc1_ready_mode='tile'")
+            raise ValueError(
+                f"{self._weight_format} tail_split_pairs requires fc1_ready_mode='tile'"
+            )
         if not self.swap_ab:
             raise ValueError(
-                "Hopper MXFP4 x FP8 supports only the swap-AB kernel; "
+                f"Hopper {self._weight_format} x FP8 supports only the swap-AB kernel; "
                 "ordinary FP8/native-layout fallback is forbidden."
             )
         for field_name in (
@@ -180,22 +217,19 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise ValueError(f"{field_name} must be a bool.")
-        if isinstance(
-            self.active_dispatch_warps, bool
-        ) or self.active_dispatch_warps not in (1, 2, 4):
-            raise ValueError("active_dispatch_warps must be 1, 2, or 4.")
+        self._validate_active_dispatch_warps()
         if self.fold_producer_warps and self.active_dispatch_warps != 1:
             raise ValueError(
                 "fold_producer_warps=True requires active_dispatch_warps=1."
             )
         if self.grouped_token_back:
             raise ValueError(
-                "the production MXFP4 BF16-combine profile does not support "
+                f"the production {self._weight_format} BF16-combine profile does not support "
                 "grouped_token_back."
             )
         if self.combine_format != "bf16":
             raise ValueError(
-                "the production MXFP4 profile requires combine_format='bf16'."
+                f"the production {self._weight_format} profile requires combine_format='bf16'."
             )
 
         # Reuse the target FP8 config's rank, shape, scheduler, cluster,
@@ -208,17 +242,42 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
             for item in dataclasses.fields(MegaMoEHopperFp8Config)
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
+        tile_m, tile_n, tile_k = self.mma_tiler_mnk
+        # Packed FP4 adds swap-AB token tiles N72/N80: one task holds an
+        # expert's 65-80 rows where N64 needs a second, nearly empty tile.
+        # FP8 keeps its own widths; the proxy only checks the whitelist on N.
+        if tile_n in (72, 80):
+            base_kwargs["mma_tiler_mnk"] = (tile_m, 64, tile_k)
         MegaMoEHopperFp8Config(**base_kwargs)
+        from .mxfp4_optimization import _normalize_pull_fields
 
-        tile_m, _tile_n, tile_k = self.mma_tiler_mnk
+        _normalize_pull_fields(
+            {
+                "compact_pull_buffer": self.compact_pull_buffer,
+                "dispatch_pull_batch": self.dispatch_pull_batch,
+                "dispatch_pull_rotate": self.dispatch_pull_rotate,
+            },
+            {
+                "token_back_mode": self.resolved_token_back_mode,
+                "dedup_dispatch": self.dedup_dispatch,
+                "grouped_token_back": self.grouped_token_back,
+                "active_dispatch_warps": self.active_dispatch_warps,
+            },
+        )
+
+        if tile_n in (72, 80) and tile_m != 256:
+            raise ValueError(
+                f"Hopper {self._weight_format} x FP8 token tiles N72/N80 require M=256; "
+                f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+            )
         if tile_m not in (128, 256):
             raise ValueError(
-                "Hopper MXFP4 x FP8 requires swap-AB MMA tile M=128 or 256; "
+                f"Hopper {self._weight_format} x FP8 requires swap-AB MMA tile M=128 or 256; "
                 f"got mma_tiler_mnk={self.mma_tiler_mnk}."
             )
         if tile_k not in (128, 256):
             raise ValueError(
-                "Hopper MXFP4 x FP8 requires MMA tile K=128 or 256; "
+                f"Hopper {self._weight_format} x FP8 requires MMA tile K=128 or 256; "
                 f"got mma_tiler_mnk={self.mma_tiler_mnk}."
             )
         for name, logical_k in (
@@ -227,11 +286,12 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
         ):
             if logical_k % tile_k:
                 raise ValueError(
-                    f"Hopper MXFP4 x FP8 requires {name} ({logical_k}) "
+                    f"Hopper {self._weight_format} x FP8 requires {name} ({logical_k}) "
                     f"divisible by MMA tile K={tile_k}."
                 )
         # Validate the final model/layout/protocol before any symmetric input
         # or kernel workspace is allocated.
+        self._validate_weight_schedule()
         _ = self.optimizations
 
     @property
@@ -267,25 +327,48 @@ class MegaMoEHopperMxfp4Inputs(MegaMoEHopperFp8Inputs):
     dtypes/shapes have the MXFP4 meanings documented at module scope.
     """
 
+    _weight_format: ClassVar[str] = "MXFP4"
+
 
 class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     """Lazy-compile frontend for ``Sm90MegaMoESwapABMxfp4Fp8Kernel`` only."""
+
+    _weight_format = "MXFP4"
+    _config_type: type[MegaMoEHopperMxfp4Config] = MegaMoEHopperMxfp4Config
+    _inputs_type: type[MegaMoEHopperMxfp4Inputs] = MegaMoEHopperMxfp4Inputs
+    _folded_scale_rows = 16
+    _validate_tactic = staticmethod(_validate_complete_mxfp4_tactic)
+
+    def _conversion_tactic(self, kernel) -> Dict[str, Any]:
+        return {"compact_pull_buffer": bool(kernel.token_comm.compact_pull_buffer)}
+
+    def _dispatch_tactic(self, kernel) -> Dict[str, Any]:
+        return {
+            "dispatch_pull_batch": int(kernel.token_comm.pull_batch),
+            "dispatch_pull_rotate": bool(kernel.token_comm.pull_rotate),
+        }
 
     _mega_key: Optional[tuple]
     _mega: Optional[_CompiledMega]
 
     def apply_knobs(self, knobs: Optional[dict]) -> None:
-        """Apply only declared MXFP4 tactics; reject stale/cache-only fields."""
+        """Apply declared packed-FP4 tactics; reject stale/cache-only fields."""
         if knobs is None:
             return
-        validated = _validate_complete_mxfp4_tactic(
+        from .mxfp4_optimization import MXFP4_PULL_DEFAULTS
+
+        validated = self._validate_tactic(
             knobs,
-            source="MXFP4 frontend.apply_knobs()",
+            source=f"{self._weight_format} frontend.apply_knobs()",
         )
-        new_config = dataclasses.replace(self.config, **validated)
+        # Normalized tactics omit default pull fields; reset them so a tactic
+        # never inherits the previous tactic's pull buffer or batch.
+        new_config = dataclasses.replace(
+            self.config, **{**MXFP4_PULL_DEFAULTS, **validated}
+        )
         if new_config == self.config:
             return
-        ensure_not_capturing("MXFP4 apply_knobs (config change)")
+        ensure_not_capturing(f"{self._weight_format} apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
 
@@ -304,12 +387,12 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             or self._mega_key != self._mega_compile_key()
         ):
             raise RuntimeError(
-                "MXFP4 effective tactic requires the current frontend config "
+                f"{self._weight_format} effective tactic requires the current frontend config "
                 "to have an actual compiled kernel"
             )
         kernel = mega.kernel
         c = self.config
-        return _validate_complete_mxfp4_tactic(
+        return self._validate_tactic(
             {
                 "swap_ab": c.swap_ab,
                 "pingpong": c.pingpong,
@@ -331,15 +414,22 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                 "tail_split_pairs": bool(kernel.tail_split_pairs),
                 "fc2_tail_n8": kernel.mxfp4_optimizations.fc2_tail_n8,
                 "fc1_ready_mode": kernel.mxfp4_optimizations.fc1_ready_mode,
+                **self._dispatch_tactic(kernel),
+                **self._conversion_tactic(kernel),
             },
-            source="MXFP4 frontend effective tactic",
+            source=f"{self._weight_format} frontend effective tactic",
         )
 
     @property
     def config(self) -> MegaMoEHopperMxfp4Config:
         config = super().config
-        if not isinstance(config, MegaMoEHopperMxfp4Config):
-            raise RuntimeError("MXFP4 frontend lost its format-specific config.")
+        if (
+            not isinstance(config, self._config_type)
+            or type(config)._weight_format != self._weight_format
+        ):
+            raise RuntimeError(
+                f"{self._weight_format} frontend lost its format-specific config."
+            )
         return config
 
     def _mega_compile_key(self) -> tuple:
@@ -353,6 +443,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             # but naming both protects against future generic packed formats.
             ("fc1_logical_storage_k", c.hidden, c.hidden // 2),
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
+            ("compact_pull_buffer", c.compact_pull_buffer),
+            ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),
             *super()._mega_compile_key(),
         )
 
@@ -380,86 +472,22 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                     "folded-offset shapes, and launch validation."
                 )
 
-    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
-        if not isinstance(inputs, MegaMoEHopperMxfp4Inputs):
-            raise TypeError("MXFP4 frontend requires MegaMoEHopperMxfp4Inputs.")
-        key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
-            return self._mega
-
+    def _prepare_compile(self, key: tuple) -> Optional[_CompiledMega]:
         ensure_not_capturing("MXFP4 cute.compile + symmetric-heap allocation")
         self._release_workspace()
+        return None
 
-        import cutlass.cute as cute
-        import cutlass.utils as cutlass_utils
+    @staticmethod
+    def _kernel_class():
+        from moe_hopper_fp8.megamoe_kernel_fp8 import Sm90MegaMoESwapABMxfp4Fp8Kernel
 
-        from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
-        from moe_hopper_fp8.megamoe_kernel_fp8 import (
-            Sm90MegaMoESwapABMxfp4Fp8Kernel,
-        )
+        return Sm90MegaMoESwapABMxfp4Fp8Kernel
 
-        self._assert_mirrored_constants()
+    def _kernel_extra_kwargs(self) -> Dict[str, Any]:
+        return {}
+
+    def _allocate_compiled_workspace(self, kernel) -> _CompiledMega:
         c = self.config
-        if not c.swap_ab:
-            # Redundant with config validation by design: never let a mutated
-            # object silently select the ordinary FP8/native class.
-            raise RuntimeError("MXFP4 frontend requires swap_ab=True.")
-
-        static_expert_shape = (
-            c.num_experts_per_rank,
-            c.fc1_out,
-            c.hidden,
-        )
-        cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
-        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
-            cluster_size
-        )
-        group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
-        token_padding_block = c.mma_tiler_mnk[1]
-
-        # There is intentionally no conditional class selection or fallback.
-        kernel = Sm90MegaMoESwapABMxfp4Fp8Kernel(
-            mma_tiler_mnk=c.mma_tiler_mnk,
-            cluster_shape_mnk=c.cluster_shape_mnk,
-            use_2cta_instrs=c.use_2cta_instrs,
-            group_hint=group_hint,
-            token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
-            load_balance_mode=c.load_balance_mode,
-            static_expert_shape=static_expert_shape,
-            force_static_sched=c.force_static_sched,
-            clc_bundle_size=c.clc_bundle_size,
-            num_sched_stages=c.num_sched_stages,
-            ab_dtype=_kind_to_cutlass_dtype(c.kind),
-            sf_vec_size=Fp8E8M0SfVecSize,
-            fp8_scale_mode="mxfp4_hybrid",
-            fp8_accum_mode="1xacc",
-            pingpong=c.pingpong,
-            world_size=c.world_size,
-            local_rank=c.rank,
-            num_topk=c.num_topk,
-            max_tokens_per_rank=c.num_tokens_per_rank,
-            hidden=c.hidden,
-            fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
-            token_back_mode=c.resolved_token_back_mode,
-            epi_flag_batch=c.epi_flag_batch,
-            flag_batch=c.flag_batch,
-            gate_up_clamp=self._gate_up_clamp,
-            dedup_dispatch=c.dedup_dispatch,
-            grouped_token_back=c.grouped_token_back,
-            combine_format=c.combine_format,
-            active_dispatch_warps=c.active_dispatch_warps,
-            compact_pull_buffer=False,
-            fc1_store_offload=c.fc1_store_offload,
-            fc1_early_done_publish=c.fc1_early_done_publish,
-            fold_producer_warps=c.fold_producer_warps,
-            generate_c=False,
-            mxfp4_fc2_tail_n8=c.fc2_tail_n8,
-            mxfp4_fc1_ready_mode=c.fc1_ready_mode,
-            tail_split_pairs=c.tail_split_pairs,
-        )
-
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
             (local_ws_bytes,), dtype=torch.uint8, device="cuda"
@@ -482,23 +510,123 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         )
         mega.symmetric_base = symmetric_base
         mega.peer_offsets_list = tuple(peer_offsets_list)
+        return mega
+
+    def _after_compile(self, mega: _CompiledMega, key: tuple) -> None:
+        self._mega_key = key
+
+    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
+        if (
+            not isinstance(inputs, self._inputs_type)
+            or type(inputs)._weight_format != self._weight_format
+        ):
+            raise TypeError(
+                f"{self._weight_format} frontend requires {self._inputs_type.__name__}."
+            )
+        key = self._mega_compile_key()
+        if self._mega is not None and self._mega_key == key:
+            return self._mega
+
+        cached = self._prepare_compile(key)
+        if cached is not None:
+            return cached
+
+        import cutlass.cute as cute
+        import cutlass.utils as cutlass_utils
+        from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
+
+        self._assert_mirrored_constants()
+        c = self.config
+        if not c.swap_ab:
+            # Redundant with config validation by design: never let a mutated
+            # object silently select the ordinary FP8/native class.
+            raise RuntimeError(f"{self._weight_format} frontend requires swap_ab=True.")
+
+        static_expert_shape = (
+            c.num_experts_per_rank,
+            c.fc1_out,
+            c.hidden,
+        )
+        cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
+        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
+        group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
+        token_padding_block = c.mma_tiler_mnk[1]
+
+        # There is intentionally no conditional class selection or fallback.
+        kernel = self._kernel_class()(
+            mma_tiler_mnk=c.mma_tiler_mnk,
+            cluster_shape_mnk=c.cluster_shape_mnk,
+            use_2cta_instrs=c.use_2cta_instrs,
+            group_hint=group_hint,
+            token_padding_block=token_padding_block,
+            # The activation-SF TMA addresses a token tile as (expert SF base +
+            # tile * N) // N, so every expert's SF base must be a multiple of N.
+            sf_padding_block=-(-SfPaddingBlock // token_padding_block)
+            * token_padding_block,
+            load_balance_mode=c.load_balance_mode,
+            static_expert_shape=static_expert_shape,
+            force_static_sched=c.force_static_sched,
+            clc_bundle_size=c.clc_bundle_size,
+            num_sched_stages=c.num_sched_stages,
+            ab_dtype=_kind_to_cutlass_dtype(c.kind),
+            sf_vec_size=Fp8E8M0SfVecSize,
+            fp8_scale_mode="mxfp4_hybrid",
+            fp8_accum_mode="1xacc",
+            pingpong=c.pingpong,
+            world_size=c.world_size,
+            local_rank=c.rank,
+            num_topk=c.num_topk,
+            max_tokens_per_rank=c.num_tokens_per_rank,
+            hidden=c.hidden,
+            fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
+            token_back_mode=c.resolved_token_back_mode,
+            epi_flag_batch=c.epi_flag_batch,
+            flag_batch=c.flag_batch,
+            gate_up_clamp=self._gate_up_clamp,
+            dedup_dispatch=c.dedup_dispatch,
+            grouped_token_back=c.grouped_token_back,
+            combine_format=c.combine_format,
+            active_dispatch_warps=c.active_dispatch_warps,
+            compact_pull_buffer=c.compact_pull_buffer,
+            dispatch_pull_batch=c.dispatch_pull_batch,
+            dispatch_pull_rotate=c.dispatch_pull_rotate,
+            fc1_store_offload=c.fc1_store_offload,
+            fc1_early_done_publish=c.fc1_early_done_publish,
+            fold_producer_warps=c.fold_producer_warps,
+            generate_c=False,
+            mxfp4_fc2_tail_n8=c.fc2_tail_n8,
+            mxfp4_fc1_ready_mode=c.fc1_ready_mode,
+            tail_split_pairs=c.tail_split_pairs,
+            **self._kernel_extra_kwargs(),
+        )
+
+        mega = self._allocate_compiled_workspace(kernel)
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
         if c.enable_iket:
             compile_kwargs["options"] = "iket"
         mega.compiled = cute.compile(kernel, **compile_kwargs)
-        self._mega_key = key
+        self._after_compile(mega, key)
         return mega
 
-    @staticmethod
+    @classmethod
     def _slice_inputs(
+        cls,
         inputs: MegaMoEHopperFp8Inputs,
         num_tokens: int,
     ) -> MegaMoEHopperMxfp4Inputs:
-        if not isinstance(inputs, MegaMoEHopperMxfp4Inputs):
-            raise TypeError("MXFP4 frontend requires MegaMoEHopperMxfp4Inputs.")
+        if (
+            not isinstance(inputs, cls._inputs_type)
+            or type(inputs)._weight_format != cls._weight_format
+        ):
+            raise TypeError(
+                f"{cls._weight_format} frontend requires {cls._inputs_type.__name__}."
+            )
         tok = slice(None, num_tokens)
-        return MegaMoEHopperMxfp4Inputs(
+        return cls._inputs_type(
             activation=inputs.activation[tok],
             activation_sf=inputs.activation_sf[tok],
             topk_idx=inputs.topk_idx[tok],
@@ -520,8 +648,13 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         *,
         num_tokens: int,
     ) -> None:
-        if not isinstance(inputs, MegaMoEHopperMxfp4Inputs):
-            raise TypeError("MXFP4 frontend requires MegaMoEHopperMxfp4Inputs.")
+        if (
+            not isinstance(inputs, self._inputs_type)
+            or type(inputs)._weight_format != self._weight_format
+        ):
+            raise TypeError(
+                f"{self._weight_format} frontend requires {self._inputs_type.__name__}."
+            )
         c = self.config
         buf_tokens = int(inputs.activation.shape[0])
         if num_tokens > buf_tokens:
@@ -556,7 +689,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             )
         if inputs.activation.dtype != torch.float8_e4m3fn:
             raise ValueError(
-                "MXFP4 MegaMoE activation must be torch.float8_e4m3fn, "
+                f"{self._weight_format} MegaMoE activation must be torch.float8_e4m3fn, "
                 f"got {inputs.activation.dtype}."
             )
         if inputs.activation.stride(-1) != 1:
@@ -565,12 +698,12 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         require_cuda("activation_sf", inputs.activation_sf)
         if tuple(inputs.activation_sf.shape) != (buf_tokens, 4):
             raise ValueError(
-                "MXFP4 hybrid activation_sf must have exact shape "
+                f"{self._weight_format} hybrid activation_sf must have exact shape "
                 f"({buf_tokens}, 4), got {tuple(inputs.activation_sf.shape)}."
             )
         if inputs.activation_sf.dtype != torch.float32:
             raise ValueError(
-                "MXFP4 hybrid activation_sf must be float32, "
+                f"{self._weight_format} hybrid activation_sf must be float32, "
                 f"got {inputs.activation_sf.dtype}."
             )
         if not inputs.activation_sf.is_contiguous():
@@ -640,12 +773,12 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             (
                 "fc1_weight_sf",
                 inputs.fc1_weight_sf,
-                (e, c.fc1_out // 64, c.hidden // 128, 16, 16),
+                (e, c.fc1_out // 64, c.hidden // 128, self._folded_scale_rows, 16),
             ),
             (
                 "fc2_weight_sf",
                 inputs.fc2_weight_sf,
-                (e, c.hidden // 64, c.intermediate // 128, 16, 16),
+                (e, c.hidden // 64, c.intermediate // 128, self._folded_scale_rows, 16),
             ),
         )
         for name, tensor, offset_shape in offset_contracts:
@@ -777,8 +910,8 @@ def resolve_hopper_mxfp4_knobs(
 
     from .knob_cache import lookup_knobs
     from .mxfp4_tuner import (
-        hopper_mxfp4_cache_provenance_sha256,
         _ordered_base_candidates,
+        hopper_mxfp4_cache_provenance_sha256,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -815,8 +948,23 @@ def resolve_hopper_mxfp4_knobs(
             )
         return tactic
 
-    # Prefer the bucket winner when legal; smaller shapes may require the
-    # first legal tactic in the stable manifest union instead.
+    from .mxfp4_optimization import hopper_mxfp4_fused_default_tactic
+
+    default = hopper_mxfp4_fused_default_tactic(
+        num_max_tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_total_experts,
+        world_size=world_size,
+        routing_profile=routing_profile,
+        num_topk=num_topk,
+    )
+    if default is not None:
+        return _validate_complete_mxfp4_tactic(
+            default, source="MXFP4 per-bucket default"
+        )
+    # Otherwise prefer the legacy bucket winner when legal; smaller shapes may
+    # require the first legal tactic in the stable manifest union instead.
     return _validate_complete_mxfp4_tactic(
         _ordered_base_candidates(
             num_max_tokens,
@@ -828,6 +976,7 @@ def resolve_hopper_mxfp4_knobs(
     )
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def _resolve_hopper_mxfp4_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
@@ -859,7 +1008,10 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    apply_topk_in_fc1: bool = True,
+    compact_pull_buffer: Optional[bool] = None,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -937,6 +1089,60 @@ def _resolve_hopper_mxfp4_mega_moe_config(
         # caller token-back choice wins over a cache entry.
         if token_back_mode is not None:
             resolved.pop("token_back_mode", None)
+        # Pull-buffer fields are tactic fields omitted at their defaults; an
+        # explicit caller value wins over the tactic in the same way.
+        from .mxfp4_optimization import MXFP4_PULL_DEFAULTS
+
+        resolved = {**MXFP4_PULL_DEFAULTS, **resolved}
+        for name, value in (
+            ("compact_pull_buffer", compact_pull_buffer),
+            ("dispatch_pull_batch", dispatch_pull_batch),
+            ("dispatch_pull_rotate", dispatch_pull_rotate),
+        ):
+            if value is not None:
+                resolved.pop(name)
+        # A tactic's pull batch keeps rows in the idle slots of the full
+        # 4-slot buffer of the serial epi_warps dispatch. When an explicit
+        # token-back mode or compact buffer rules that out, keep the rest of
+        # the tactic with one row in flight; the batch never changes outputs.
+        if resolved.get("dispatch_pull_batch", 1) > 1 and (
+            compact_pull_buffer or token_back_mode not in (None, "epi_warps")
+        ):
+            resolved["dispatch_pull_batch"] = 1
+        # Dispatch-side token-back keeps the unrotated serial pull loop, so an
+        # explicit dispatch-side mode also drops the tactic's rotation.
+        if (
+            token_back_mode not in (None, "epi_warps")
+            and "dispatch_pull_rotate" in resolved
+        ):
+            resolved["dispatch_pull_rotate"] = False
+        # Symmetrically, an explicit batch > 1 needs the full buffer and drops
+        # the tactic's compact one. It cannot override the tactic's token-back,
+        # dedup or dispatch-warp layout, so a conflict there is an error. Other
+        # values fall through to the config's validation.
+        if type(dispatch_pull_batch) is int and dispatch_pull_batch > 1:
+            if compact_pull_buffer is None:
+                resolved["compact_pull_buffer"] = False
+            mode = token_back_mode or resolved.get("token_back_mode", "epi_warps")
+            warps = resolved.get("active_dispatch_warps", 1)
+            if (
+                mode != "epi_warps"
+                or resolved.get("dedup_dispatch", False)
+                or resolved.get("grouped_token_back", False)
+                or dispatch_pull_batch * warps > 4
+            ):
+                source = "requested" if token_back_mode is not None else "the tactic's"
+                raise ValueError(
+                    f"dispatch_pull_batch={dispatch_pull_batch} needs "
+                    "token_back_mode='epi_warps' without dedup_dispatch or "
+                    "grouped_token_back, and dispatch_pull_batch * "
+                    f"active_dispatch_warps <= 4; got {source} "
+                    f"token_back_mode={mode!r} and the tactic's "
+                    f"dedup_dispatch={resolved.get('dedup_dispatch', False)}, "
+                    f"grouped_token_back={resolved.get('grouped_token_back', False)}, "
+                    f"active_dispatch_warps={warps}. Choose a tactic that allows "
+                    "it or leave dispatch_pull_batch unset."
+                )
 
     config = MegaMoEHopperMxfp4Config(
         rank=rank,
@@ -974,7 +1180,14 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             if fold_producer_warps is None
             else fold_producer_warps
         ),
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        compact_pull_buffer=(
+            False if compact_pull_buffer is None else compact_pull_buffer
+        ),
+        dispatch_pull_batch=1 if dispatch_pull_batch is None else dispatch_pull_batch,
+        dispatch_pull_rotate=(
+            False if dispatch_pull_rotate is None else dispatch_pull_rotate
+        ),
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
@@ -994,6 +1207,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     return config
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -1025,7 +1239,10 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    apply_topk_in_fc1: bool = True,
+    compact_pull_buffer: Optional[bool] = None,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
+    apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
@@ -1042,7 +1259,9 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     backend because it requires live weights, staged routing, and every EP
     rank in lockstep. Explicit geometry/execution axes and ``knobs=`` are
     mutually exclusive. An explicit token-back mode retains its established
-    precedence over a cached tactic.
+    precedence over a cached tactic, and so do explicit pull-buffer fields
+    (``compact_pull_buffer``, ``dispatch_pull_batch``,
+    ``dispatch_pull_rotate``); ``None`` leaves them to the tactic.
     """
     config = _resolve_hopper_mxfp4_mega_moe_config(
         num_total_experts,
@@ -1072,7 +1291,10 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
@@ -1086,8 +1308,18 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
 def _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config(
     config: MegaMoEHopperMxfp4Config,
 ) -> MegaMoEHopperMxfp4SymmBuffer:
+    return _allocate_fp4_symm_buffer(
+        config, MegaMoEHopperMxfp4Frontend, MegaMoEHopperMxfp4SymmBuffer
+    )
+
+
+def _allocate_fp4_symm_buffer(
+    config: MegaMoEHopperMxfp4Config,
+    frontend_type,
+    buffer_type: Callable[..., _Fp4Buffer],
+) -> _Fp4Buffer:
     """Allocate a fused workspace from one already-resolved immutable config."""
-    frontend = MegaMoEHopperMxfp4Frontend(config)
+    frontend = frontend_type(config)
     num_total_experts = config.num_total_experts
     num_max_tokens = config.num_tokens_per_rank
     num_topk = config.num_topk
@@ -1112,7 +1344,7 @@ def _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config(
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
 
-    return MegaMoEHopperMxfp4SymmBuffer(
+    return buffer_type(
         num_total_experts=num_total_experts,
         num_max_tokens=num_max_tokens,
         num_topk=num_topk,
@@ -1166,19 +1398,35 @@ def _build_mxfp4_inputs(
     transformed_l1: TransformedMxfp4Weights,
     transformed_l2: TransformedMxfp4Weights,
 ) -> MegaMoEHopperMxfp4Inputs:
+    return _build_fp4_inputs(
+        symm_buffer,
+        transformed_l1,
+        transformed_l2,
+        MegaMoEHopperMxfp4Inputs,
+        _resolve_transformed_mxfp4_weights,
+    )
+
+
+def _build_fp4_inputs(
+    symm_buffer: _Mxfp4InputBuffer,
+    transformed_l1: TransformedMxfp4Weights,
+    transformed_l2: TransformedMxfp4Weights,
+    inputs_type: Callable[..., _Fp4Inputs],
+    resolve_weights,
+) -> _Fp4Inputs:
     (
         fc1_weight,
         fc1_weight_sf,
         fc1_activation_dequant_scale,
         fc1_weight_dequant_scale,
-    ) = _resolve_transformed_mxfp4_weights(transformed_l1, "l1")
+    ) = resolve_weights(transformed_l1, "l1")
     (
         fc2_weight,
         fc2_weight_sf,
         fc2_activation_dequant_scale,
         fc2_weight_dequant_scale,
-    ) = _resolve_transformed_mxfp4_weights(transformed_l2, "l2")
-    return MegaMoEHopperMxfp4Inputs(
+    ) = resolve_weights(transformed_l2, "l2")
+    return inputs_type(
         activation=symm_buffer.x,
         activation_sf=symm_buffer.x_sf,
         topk_idx=symm_buffer.topk_idx,

@@ -78,14 +78,16 @@ from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
-from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import gen_cake_alltoall_module as gen_cake_alltoall_module
 from .comm import (
-    gen_moe_ep_nvlink_one_sided_module as gen_moe_ep_nvlink_one_sided_module,
+    gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
+)
+from .comm import (
+    gen_nvlink_two_sided_alltoall_module as gen_nvlink_two_sided_alltoall_module,
 )
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (

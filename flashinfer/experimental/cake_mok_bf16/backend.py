@@ -79,6 +79,10 @@ def count_routed_load(routes, ep_size, local_experts):
     bins, so the integer bin arithmetic is exact: bin 0 collects the ``-1``
     padding, the last bin the ids at the limit, values outside the range are
     dropped, and the ``ep_size`` middle bins are the counts.
+
+    Reference form. The production path reads the owner bins the count kernel
+    writes into the tail of its ``counts`` buffer (``MoKScheduler.owner_loads``);
+    the two agree exactly (``tests/experimental/test_mok_bf16.py``).
     """
     flat = routes.reshape(-1)
     owner = torch.div(flat, local_experts, rounding_mode="floor")
@@ -105,6 +109,18 @@ def select_comm_split(loads, base, hot, threshold):
     if max(values) * len(values) >= threshold * total:
         return tuple(hot)
     return tuple(base)
+
+
+def select_multimacro(tokens, macro_size):
+    """Whether a rank launches the sm_107a multimacro MXFP8 forward program.
+
+    ``tokens`` is the rank's observed schedule row count (the padded
+    ``num_tokens`` the forward kernel reads), ``None`` before any observation.
+    True exactly when that schedule holds two macro batches, the case the
+    program speeds up; the two programs give bitwise the same results for any
+    schedule, so a stale observation costs time only. Host-only.
+    """
+    return tokens is not None and -(-int(tokens) // macro_size) == 2
 
 
 class MoKFunctional:
@@ -137,6 +153,10 @@ class MoKFunctional:
         self._recompute_kernels = {}
         # id(native workspace) -> asynchronous per-rank routed-load observation.
         self._load_state = {}
+        from .jit import target_arch
+
+        self._multimacro_target = target_arch(self.device) == "sm_107a"
+        self._sm_count = {}  # device index -> multi_processor_count
         self._kernels(1.0 if clamped_swiglu else None)
         self.epilogues = MoKEpilogues(topk)
 
@@ -281,14 +301,13 @@ class MoKFunctional:
                 "Workspace/expert geometry differs from the compiled scheduler"
             )
         self._check_device(workspace)
-        properties = torch.cuda.get_device_properties(workspace.device)
+        sms = self._sm_count.get(workspace.device.index)
+        if sms is None:
+            sms = self._sm_count[workspace.device.index] = (
+                torch.cuda.get_device_properties(workspace.device).multi_processor_count
+            )
         for count in (config.fwd_num_comm_sms, config.bwd_num_comm_sms):
-            if (
-                type(count) is not int
-                or count <= 0
-                or count % 2
-                or count >= properties.multi_processor_count
-            ):
+            if type(count) is not int or count <= 0 or count % 2 or count >= sms:
                 raise ValueError(
                     "Communication-SM counts must be positive, even and leave compute SMs"
                 )
@@ -298,10 +317,7 @@ class MoKFunctional:
                 type(hot) is not tuple
                 or len(hot) != 2
                 or any(
-                    type(count) is not int
-                    or count <= 0
-                    or count % 2
-                    or count >= properties.multi_processor_count
+                    type(count) is not int or count <= 0 or count % 2 or count >= sms
                     for count in hot
                 )
             ):
@@ -374,13 +390,16 @@ class MoKFunctional:
             workspace.schedule_capacity,
             workspace.ep_rank,
         )
-        self._observe_load(workspace, config)
+        self._observe_load(workspace, config, count)
+        layout = self.scheduler.layout(counts, workspace.schedule_capacity, rank)
+        self.scheduler.release_counts()
         if owner is not None:
             return MoKSourceSchedule(
                 peer_rank=rank,
                 peer_token_idx=token,
                 num_tokens=count,
                 tokens_per_expert=counts,
+                layout=layout,
                 num_source_tokens=top_experts.shape[0],
                 workspace=owner,
             )
@@ -389,6 +408,7 @@ class MoKFunctional:
             peer_token_idx=token,
             num_tokens=count,
             tokens_per_expert=counts,
+            layout=layout,
         )
 
     def _load_entry(self, workspace, create):
@@ -396,7 +416,7 @@ class MoKFunctional:
         if entry is None and create:
             entry = {
                 "host": [
-                    torch.empty(workspace.ep_size, dtype=torch.int64, pin_memory=True)
+                    torch.empty(workspace.ep_size, dtype=torch.int32, pin_memory=True)
                     for _ in range(2)
                 ],
                 "events": [torch.cuda.Event() for _ in range(2)],
@@ -404,42 +424,111 @@ class MoKFunctional:
                 "pending": None,
                 "loads": (),
                 "split": None,
+                "tokens_host": [
+                    torch.empty(1, dtype=torch.int32, pin_memory=True) for _ in range(2)
+                ],
+                "tokens_observed": [False, False],
+                "tokens": None,
+                "multimacro": False,
             }
             self._load_state[id(workspace)] = entry
         return entry
 
-    def _observe_load(self, workspace, config):
+    def _observe_load(self, workspace, config, num_tokens=None):
         """Queue an asynchronous observation of the per-rank routed-row load.
 
-        Every rank counts the gathered expert IDs per owning rank
-        (``count_routed_load``: padding and invalid IDs excluded) on device and
-        copies the counts into pinned host memory behind a CUDA event: no host
-        synchronization. ``_comm_split`` reads the latest completed observation,
-        so a split change takes effect from the first later launch whose event
-        has completed. The gathered IDs, and so the counts, are identical on
-        every rank, but each rank decides from its own latest completed
-        observation: with back-to-back steps a launch may run with different
+        Every rank counts the gathered expert IDs per owning rank on device
+        (the scheduler's count kernel bins them in the pass that counts this
+        rank's experts; padding and invalid IDs excluded, as
+        ``count_routed_load`` specifies) and copies the counts into pinned
+        host memory behind a CUDA event: no host synchronization.
+        ``_comm_split`` reads the latest completed observation, so a split
+        change takes effect from the first later launch whose event has
+        completed; a completed observation is also adopted here, before the
+        next one replaces it. The gathered IDs, and so the counts, are
+        identical on every rank, but each rank decides from its own latest
+        completed observation: with back-to-back steps a launch may run with different
         splits on different ranks for a step. The split is a per-rank launch
         parameter (how many of that rank's SMs run its communication program);
         the protocol does not require the ranks to agree on it. Skipped during
         CUDA Graph capture: captured launches keep the split in force at
         capture time.
+
+        Behind the same event it copies this rank's schedule row count
+        ``num_tokens`` (the scheduler's ``(1,)`` int32) for the forward program
+        choice (``_multimacro``) whenever that choice is open (sm_107a,
+        schedule capacity above one macro batch), with or without
+        ``imbalance_comm_sms``.
         """
+        rows = num_tokens is not None and self._multimacro_open(config, workspace)
         if (
-            config.imbalance_comm_sms is None
-            or torch.cuda.is_current_stream_capturing()
-        ):
+            config.imbalance_comm_sms is None and not rows
+        ) or torch.cuda.is_current_stream_capturing():
             return
         entry = self._load_entry(workspace, create=True)
-        loads = count_routed_load(
-            workspace.all_gather_top_experts_buffer,
-            workspace.ep_size,
-            self.local_experts,
-        )
+        # Keep a completed observation before its slot stops being pending:
+        # when the host runs ahead of the device, no launch of the previous
+        # step may have found it complete.
+        self._collect_load(entry)
+        loads = self.scheduler.owner_loads()
         slot = entry["slot"] ^ 1
         entry["host"][slot].copy_(loads, non_blocking=True)
+        if rows:
+            entry["tokens_host"][slot].copy_(num_tokens, non_blocking=True)
+        entry["tokens_observed"][slot] = rows
         entry["events"][slot].record()
         entry["slot"] = entry["pending"] = slot
+
+    @staticmethod
+    def _collect_load(entry):
+        """Adopt the pending observation once its event has completed."""
+        pending = entry["pending"]
+        if pending is not None and entry["events"][pending].query():
+            entry["loads"] = entry["host"][pending].tolist()
+            if entry["tokens_observed"][pending]:
+                entry["tokens"] = int(entry["tokens_host"][pending][0])
+            entry["pending"] = None
+
+    def _multimacro_open(self, config, workspace):
+        """Static guard of the forward program choice: sm_107a and a schedule
+        capacity above one macro batch (otherwise every schedule has at most
+        one macro batch and the default program always runs)."""
+        return (
+            self._multimacro_target
+            and -(-workspace.schedule_capacity // config.macrobatch_size) > 1
+        )
+
+    def _multimacro(self, config, workspace):
+        """Whether this rank's next MXFP8 forward launches the multimacro program.
+
+        Decided per rank from its latest completed observation
+        (``select_multimacro``), like the communication split: ranks may run
+        different programs for a step, which the protocol permits (the
+        programs differ only in the order of this rank's own work and give
+        bitwise the same results). No observation yet keeps the default
+        program; during CUDA Graph capture the choice in force is kept.
+        ``config.comm_split_log`` also prints each change of the choice.
+        """
+        if not self._multimacro_open(config, workspace):
+            return False
+        capturing = torch.cuda.is_current_stream_capturing()
+        entry = self._load_entry(workspace, create=not capturing)
+        if entry is None:
+            return False
+        if not capturing:
+            self._collect_load(entry)
+        choice = select_multimacro(entry["tokens"], config.macrobatch_size)
+        if choice != entry["multimacro"]:
+            entry["multimacro"] = choice
+            if config.comm_split_log:
+                print(
+                    f"[cake_mok_bf16 rank {workspace.ep_rank}] forward program -> "
+                    f"{'multimacro' if choice else 'default'} (schedule rows "
+                    f"{entry['tokens']}, macro batch {config.macrobatch_size})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return choice
 
     def _comm_split(self, config, workspace):
         """(forward, backward) communication-SM counts for the next launch.
@@ -453,10 +542,8 @@ class MoKFunctional:
         entry = self._load_entry(workspace, create=not capturing)
         if entry is None:
             return base
-        pending = entry["pending"]
-        if pending is not None and not capturing and entry["events"][pending].query():
-            entry["loads"] = entry["host"][pending].tolist()
-            entry["pending"] = None
+        if not capturing:
+            self._collect_load(entry)
         split = select_comm_split(
             entry["loads"], base, config.imbalance_comm_sms, config.imbalance_threshold
         )
@@ -585,6 +672,7 @@ class MoKFunctional:
         self._barrier(workspace)
         forward_kernel, _ = self._kernels(swiglu_limit, mxfp8)
         fwd_comm_sms, _ = self._comm_split(config, workspace)
+        program = {"multimacro": self._multimacro(config, workspace)} if mxfp8 else {}
         values = forward_kernel(
             workspace.x_buffer[:shared_rows],
             workspace.x_buffer_ptrs,
@@ -602,6 +690,8 @@ class MoKFunctional:
             fwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            layout=schedule.layout,
+            **program,
         )
         self._barrier(workspace)
         output = self.epilogues.forward(
@@ -665,6 +755,7 @@ class MoKFunctional:
             fwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            layout=schedule.layout,
         )
         # Peers read this rank's x_buffer during dispatch.
         self._barrier(workspace)
@@ -773,21 +864,33 @@ class MoKFunctional:
             config.macrobatch_size,
             config.minibatch_size,
             weight_grad_accumulators=weight_grad_accumulators,
+            layout=schedule.layout,
         )
+        # Only dx_shared and the six weight gradients outlive the launch. The
+        # kernel's routed and shared scratch (values[1:9]) is dropped here,
+        # before the epilogue output and the score-gradient copy are allocated,
+        # instead of at return: the caching allocator hands its blocks only to
+        # later allocations on this stream, which are ordered after the kernel.
+        dx_shared, weight_grads = values[0], values[9:]
+        del values
         self._barrier(workspace)
         dx = self.epilogues.backward(
-            values[0], workspace.d_x_routed_buffer[: shared_rows * workspace.topk]
+            dx_shared, workspace.d_x_routed_buffer[: shared_rows * workspace.topk]
         )
+        del dx_shared
         dscores = workspace.d_router_weight_buffer[:source_count].clone()
+        dwg_shared, dwg_routed, dwu_shared, dwu_routed, dwd_shared, dwd_routed = (
+            weight_grads
+        )
         return (
             dx[:source_count],
             dscores,
-            values[10],
-            values[12],
-            values[14],
-            values[9],
-            values[11],
-            values[13],
+            dwg_routed,
+            dwu_routed,
+            dwd_routed,
+            dwg_shared,
+            dwu_shared,
+            dwd_shared,
         )
 
 

@@ -46,3 +46,41 @@ def required_num_trials(
         min_trials,
         math.ceil(safety_factor * multiplier * effective_support),
     )
+
+
+def required_num_collision_rows(
+    expected_probs, max_failure_probability=1e-12, comparisons=2
+):
+    """Select a row prefix unlikely to match completely in independent draws.
+
+    Each row's collision probability is sum(p**2), the inverse effective
+    support. Their product bounds an all-match assertion's false failure;
+    a union bound covers ``comparisons`` pairs, even with a shared baseline.
+    Pass probabilities after filtering. The independence model does not
+    guarantee detection of partial RNG defects or preserve batch coverage.
+    """
+    if not 0 < max_failure_probability < 1 or comparisons < 1:
+        raise ValueError("Require a failure probability in (0, 1) and comparisons >= 1")
+    if expected_probs.ndim != 2 or expected_probs.shape[0] == 0:
+        raise ValueError("Expected a nonempty matrix of row probabilities")
+
+    probs = expected_probs.double()
+    row_mass = probs.sum(dim=-1, keepdim=True)
+    valid = (
+        probs.isfinite().all()
+        & (probs >= 0).all()
+        & row_mass.isfinite().all()
+        & (row_mass > 0).all()
+    )
+    if not valid:
+        raise ValueError(
+            "Require finite nonnegative probabilities with positive row mass"
+        )
+    probs = probs / row_mass
+    log_all_match = probs.square().sum(dim=-1).clamp(max=1).log().cumsum(0)
+    sufficient = (
+        log_all_match <= math.log(max_failure_probability) - math.log(comparisons)
+    ).nonzero()
+    if len(sufficient) == 0:
+        raise ValueError("Candidate rows do not meet the all-match failure budget")
+    return int(sufficient[0].item()) + 1

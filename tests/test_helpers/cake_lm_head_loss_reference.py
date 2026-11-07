@@ -16,11 +16,11 @@ limitations under the License.
 Seeded inputs, the unchunked PyTorch baseline and the chunked FP64 oracle of
 the chunked LM-head + loss training problem (``X [T, H]`` BF16 hidden states,
 ``W [V, H]`` BF16 output weight, int64 labels with ``-100`` = ignored), shared
-by ``tests/experimental/test_cake_lm_head_loss.py``,
-``tests/experimental/test_cake_lm_head_loss_api.py`` and
-``benchmarks/bench_cake_lm_head_loss.py``.
+by ``tests/experimental/test_cake_lm_head_det_train.py``,
+``tests/experimental/test_cake_lm_head_det_train_api.py`` and
+``benchmarks/bench_cake_lm_head_det_train.py``.
 
-Contract reproduced here (see ``flashinfer.chunked_lm_head``):
+Contract reproduced here (see ``flashinfer.cake_lm_head_det_train``):
 
 * ``z = X @ W^T`` is a BF16 GEMM (BF16 output of an FP32 accumulation),
   promoted to FP32; ``lse_t = logsumexp_v z[t, v]``; ``logp_t = z[t, y_t] -
@@ -35,6 +35,13 @@ Contract reproduced here (see ``flashinfer.chunked_lm_head``):
 * ``dz[t, v] = d_t * (1[v = y_t] - softmax(z_t)_v)`` rounded to BF16;
   ``dX = dz @ W`` (FP32 accumulation, one BF16 cast); ``dW = dz^T @ X``
   accumulated in FP32 and cast once (BF16 by default, FP32 on request).
+* Temperature (log-probability entry only): with the per-token FP32
+  temperature ``tau_t`` the row works on ``q[t, v] = z[t, v] / tau_t`` (one
+  FP32 division after the BF16 projection): ``lse_t = logsumexp_v q[t, v]``,
+  ``logp_t = q[t, y_t] - lse_t`` and ``dz[t, v] = (d_t / tau_t) * (1[v = y_t]
+  - softmax(q_t)_v)``.  A scalar temperature is the constant ``[T]`` vector
+  of its FP32 value.  Every division here is tensor by tensor (the
+  temperature as an FP32 ``[T]`` tensor), never by a Python scalar.
 
 The FP64 oracle applies the analytic gradient to the same BF16 input values
 in float64 without any intermediate rounding; the unchunked baseline is the
@@ -48,9 +55,10 @@ dedicated test built around the implementation's own FP32 ``logp``.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -61,6 +69,12 @@ DEFAULT_LOSS_DIV = 12345.0
 RATIO_CLIP = 2.0
 LN2 = math.log(2.0)  # ratio 2 <=> logp - infer_logp = ln 2
 KNEE_MARGIN = 0.05  # every valid policy row: |logp - infer_logp - ln 2| >= KNEE_MARGIN
+# Temperature forms of :func:`make_temperature` (``None`` = no temperature argument).
+TEMPERATURE_FORMS = ("scalar", "constant", "hetero")
+DEFAULT_TEMPERATURE = 0.7  # the scalar / constant forms' value
+TEMPERATURE_RANGE = (0.25, 4.0)  # the heterogeneous form: log-uniform in this range
+TEMPERATURE_ONE_FRACTION = 0.1  # of the heterogeneous rows set to exactly 1.0
+TEMPERATURE_SEED_OFFSET = 2000003  # the temperature's own generator: seed + this
 
 _ROW_CHUNK = 4096  # rows per random draw (bounds the FP32 staging of the BF16 inputs)
 _BOUNDARY_FRACTION = 0.1  # of the valid policy rows forced below / above the clip each
@@ -85,6 +99,9 @@ class Inputs:
         torch.Tensor
     ]  # policy: int8 [T]; -1 ignored, 0 below the clip, 2 above, 3 random (with margin)
     seed: int
+    # the log-probability entry's ``temperature`` argument: ``None`` (no argument), a Python float (the scalar form)
+    # or an FP32 ``[T]`` tensor (:func:`make_temperature`)
+    temperature: Optional[Union[float, torch.Tensor]] = None
 
     @property
     def T(self) -> int:
@@ -111,16 +128,31 @@ class Inputs:
             self.infer_logp,
             self.loss_weights,
         ]
+        if isinstance(self.temperature, torch.Tensor):
+            tensors.append(self.temperature)
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+    def temperature_rows(self) -> Optional[torch.Tensor]:
+        """The temperature as the FP32 ``[T]`` vector every reference divides by (a scalar: its FP32 value in every
+        row); ``None`` without a temperature."""
+        return temperature_rows(self.temperature, self.T, self.X.device)
+
+
+def _host_generator(seed: int) -> torch.Generator:
+    """The CPU generator every input draw uses, whatever the target device: a CUDA generator's values depend on the
+    device's SM count (PyTorch sizes its random-number grid from it), so one ``(T, seed)`` would give each GPU model
+    another problem."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    return gen
 
 
 def _randn_rows(shape, gen, device, scale: float) -> torch.Tensor:
     out = torch.empty(*shape, dtype=torch.bfloat16, device=device)
     for r0 in range(0, shape[0], _ROW_CHUNK):
         r1 = min(shape[0], r0 + _ROW_CHUNK)
-        out[r0:r1].copy_(
-            torch.randn(r1 - r0, *shape[1:], device=device, generator=gen) * scale
-        )
+        draw = torch.randn(r1 - r0, *shape[1:], generator=gen) * scale
+        out[r0:r1].copy_(draw.to(torch.bfloat16))
     return out
 
 
@@ -129,9 +161,57 @@ def make_weight(
 ) -> torch.Tensor:
     """``W [V, H]`` BF16 ~ ``N(0, 1/H)`` from its own generator (shareable between problems)."""
     device = torch.device(device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    return _randn_rows((V, H), gen, device, 1.0 / math.sqrt(H))
+    return _randn_rows((V, H), _host_generator(seed), device, 1.0 / math.sqrt(H))
+
+
+def make_temperature(
+    T: int,
+    form: Optional[str],
+    *,
+    seed: int,
+    device,
+    value: float = DEFAULT_TEMPERATURE,
+) -> Optional[Union[float, torch.Tensor]]:
+    """The ``temperature`` argument of one problem in ``form``: ``None`` (no argument), ``"scalar"`` (the Python
+    float ``value``), ``"constant"`` (``torch.full((T,), value)`` FP32) or ``"hetero"`` (FP32 ``[T]``, log-uniform in
+    ``TEMPERATURE_RANGE`` with about ``TEMPERATURE_ONE_FRACTION`` of the rows exactly 1.0; every row -- ignored rows
+    too -- finite and positive).  The heterogeneous draw comes from its own generator seeded ``seed +
+    TEMPERATURE_SEED_OFFSET``, so ``(T, seed)`` fixes it and the other inputs of :func:`make_inputs` do not move."""
+    if form is None:
+        return None
+    if form not in TEMPERATURE_FORMS:
+        raise ValueError(
+            f"temperature form must be None or one of {TEMPERATURE_FORMS}, got {form!r}"
+        )
+    T = int(T)
+    device = torch.device(device)
+    if form == "scalar":
+        return float(value)
+    if form == "constant":
+        return torch.full((T,), float(value), dtype=torch.float32, device=device)
+    gen = _host_generator(int(seed) + TEMPERATURE_SEED_OFFSET)
+    low, high = TEMPERATURE_RANGE
+    u = torch.rand(T, generator=gen, dtype=torch.float64)
+    tau = torch.exp(math.log(low) + u * (math.log(high) - math.log(low))).float()
+    tau.clamp_(low, high)
+    one = torch.rand(T, generator=gen) < TEMPERATURE_ONE_FRACTION
+    return torch.where(one, torch.ones_like(tau), tau).contiguous().to(device)
+
+
+def temperature_rows(
+    temperature: Optional[Union[float, torch.Tensor]], T: int, device
+) -> Optional[torch.Tensor]:
+    """``temperature`` as an FP32 ``[T]`` tensor on ``device`` (a Python number or a 0-dim tensor: its FP32 value in
+    every row, the one rounding of the scalar form); ``None`` stays ``None``."""
+    if temperature is None:
+        return None
+    device = torch.device(device)
+    if isinstance(temperature, torch.Tensor):
+        t = temperature.detach()
+        if t.ndim == 0:
+            return torch.full((int(T),), float(t), dtype=torch.float32, device=device)
+        return t.to(device=device, dtype=torch.float32).reshape(int(T)).contiguous()
+    return torch.full((int(T),), float(temperature), dtype=torch.float32, device=device)
 
 
 def make_inputs(
@@ -146,8 +226,14 @@ def make_inputs(
     loss_div: float = DEFAULT_LOSS_DIV,
     W: Optional[torch.Tensor] = None,
     ld_pad: int = 0,
+    temperature: Optional[str] = None,
+    temperature_value: float = DEFAULT_TEMPERATURE,
 ) -> Inputs:
     """Seeded inputs of one problem with ``T`` rows.
+
+    ``temperature`` (a form of :func:`make_temperature`; ``None`` = no temperature) adds the log-probability
+    entry's temperature argument, drawn after every other input from its own generator: the other inputs are the
+    same with and without it.
 
     ``X = bf16(0.5 * N(0, 1))``; with ``ld_pad > 0`` the returned ``X`` is the
     ``[:, :H]`` view of a ``[T, H + ld_pad]`` buffer (leading stride ``H +
@@ -161,27 +247,26 @@ def make_inputs(
     ``regime`` (0 / 2; 3 = random); a random row whose ``logp - infer`` falls
     within ``KNEE_MARGIN`` of ``ln 2`` is pushed to the edge of that band on
     its own side, so no row sits at the clip knee.  ``loss_weights ~ N(0, 1)``
-    FP32, 0 on ignored rows.  Every draw comes from one generator in a fixed
-    order, so ``(T, seed)`` fixes the problem.
+    FP32, 0 on ignored rows.  Every draw comes from one CPU generator in a
+    fixed order and moves to ``device`` afterwards, so ``(T, seed)`` fixes the
+    problem on every device.
     """
     if objective not in ("ce", "policy"):
         raise ValueError(f"objective must be 'ce' or 'policy', got {objective!r}")
     T, H, V = int(T), int(H), int(V)
     device = torch.device(device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
+    gen = _host_generator(seed)
     full = _randn_rows((T, H + int(ld_pad)), gen, device, 0.5)
     X = full[:, :H] if ld_pad else full
-    labels = torch.randint(0, V, (T,), generator=gen, device=device, dtype=torch.int64)
+    labels = torch.randint(0, V, (T,), generator=gen, dtype=torch.int64)
     num_ignored = int(round(float(ignore_frac) * T))
     if num_ignored:
-        order = torch.randperm(T, generator=gen, device=device)
+        order = torch.randperm(T, generator=gen)
         labels[order[:num_ignored]] = IGNORE_INDEX
+    labels = labels.to(device)
     valid = labels >= 0
     zero = torch.zeros((T,), dtype=torch.float32, device=device)
-    dlogp = torch.where(
-        valid, torch.randn(T, generator=gen, device=device) * 0.05, zero
-    )
+    dlogp = torch.where(valid, (torch.randn(T, generator=gen) * 0.05).to(device), zero)
     if W is None:
         W = make_weight(V, H, seed=seed + 1000003, device=device)
     elif (
@@ -192,14 +277,14 @@ def make_inputs(
     if objective == "policy":
         logp32 = _logp_fp64(X, W, labels).float()
         # random rows: delta = logp - infer ~ 0.5 N(0, 1), pushed out of the band |delta - ln 2| < KNEE_MARGIN
-        delta = torch.randn(T, generator=gen, device=device) * 0.5
+        delta = (torch.randn(T, generator=gen) * 0.5).to(device)
         edge = LN2 + torch.where(
             delta >= LN2,
             torch.full_like(delta, KNEE_MARGIN),
             torch.full_like(delta, -KNEE_MARGIN),
         )
         delta = torch.where((delta - LN2).abs() < KNEE_MARGIN, edge, delta)
-        u = torch.rand(T, generator=gen, device=device)
+        u = torch.rand(T, generator=gen).to(device)
         below = valid & (u < _BOUNDARY_FRACTION)  # ratio e^-1
         above = (
             valid & (u >= _BOUNDARY_FRACTION) & (u < 2 * _BOUNDARY_FRACTION)
@@ -210,8 +295,11 @@ def make_inputs(
         regime = torch.full((T,), 3, dtype=torch.int8, device=device)
         regime[below], regime[above], regime[~valid] = 0, 2, -1
         loss_weights = torch.where(
-            valid, torch.randn(T, generator=gen, device=device), zero
+            valid, torch.randn(T, generator=gen).to(device), zero
         ).contiguous()
+    tau = make_temperature(
+        T, temperature, seed=seed, device=device, value=temperature_value
+    )
     return Inputs(
         X=X,
         W=W,
@@ -223,6 +311,7 @@ def make_inputs(
         dlogp=dlogp.contiguous(),
         regime=regime,
         seed=int(seed),
+        temperature=tau,
     )
 
 
@@ -231,9 +320,17 @@ def make_inputs(
 # ---------------------------------------------------------------------------
 
 
-def _row_stats_fp64(x64: torch.Tensor, W64: torch.Tensor, labels: torch.Tensor):
-    """``(z, lse, valid, index, logp)`` of one row chunk in float64."""
+def _row_stats_fp64(
+    x64: torch.Tensor,
+    W64: torch.Tensor,
+    labels: torch.Tensor,
+    tau64: Optional[torch.Tensor] = None,
+):
+    """``(z, lse, valid, index, logp)`` of one row chunk in float64 (with the chunk's float64 temperature rows
+    ``tau64``: ``z`` is the scaled ``q = z / tau``)."""
     z = x64 @ W64.t()
+    if tau64 is not None:
+        z = z / tau64[:, None]  # tensor by tensor
     lse = torch.logsumexp(z, dim=-1)
     valid = labels >= 0
     index = torch.where(valid, labels, torch.zeros_like(labels))
@@ -272,13 +369,19 @@ def reference_fp64(
     downstream loss ``(logp * dlogp)[valid].sum()``.  No ``[T, V]`` tensor is
     materialized: each chunk of ``chunk_rows`` rows forms ``dz`` in place and
     accumulates ``dW`` in float64.  ``T == 0`` and all-ignored batches give
-    zeros.
+    zeros.  With ``inp.temperature`` (log-probability entry only) the rows use
+    ``q = z / tau`` with the FP32 temperature values promoted to float64, and
+    ``dz = (d / tau) * (1[v = y] - softmax(q))``.
     """
     if entry not in ("loss", "logprob"):
         raise ValueError("entry must be 'loss' or 'logprob'")
+    if inp.temperature is not None and entry != "logprob":
+        raise ValueError("a temperature belongs to the log-probability entry")
     X, W, labels = inp.X, inp.W, inp.labels
     T, H, V = inp.T, inp.H, inp.V
     device = X.device
+    tau = inp.temperature_rows()
+    tau64 = None if tau is None else tau.double()
     W64 = W.double()
     total = torch.zeros((), dtype=torch.float64, device=device)
     logp = torch.empty((T,), dtype=torch.float64, device=device)
@@ -288,13 +391,14 @@ def reference_fp64(
     for r0 in range(0, T, chunk_rows):
         r1 = min(T, r0 + chunk_rows)
         x64 = X[r0:r1].double()
-        z, l, valid, index, lp = _row_stats_fp64(x64, W64, labels[r0:r1])
+        tau_c = None if tau64 is None else tau64[r0:r1]
+        z, l, valid, index, lp = _row_stats_fp64(x64, W64, labels[r0:r1], tau_c)
         logp[r0:r1], lse[r0:r1] = lp, l
         zero = torch.zeros_like(lp)
         if entry == "logprob":
             g = inp.dlogp[r0:r1].double()
             total += (lp * g)[valid].sum()
-            d = torch.where(valid, g, zero)
+            d = torch.where(valid, g if tau_c is None else g / tau_c, zero)
         elif inp.objective == "ce":
             total += -lp[valid].sum()
             d = torch.where(valid, torch.full_like(lp, -1.0 / inp.loss_div), zero)
@@ -328,6 +432,35 @@ def reference_fp64(
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _unsplit_gemms():
+    """Every CUDA GEMM inside runs as one FP32 accumulation over the whole K
+    dimension: cuBLASLt with split-K turned off.  cuBLAS otherwise picks
+    split-K by the device's SM count for a small output grid (fixed K slices
+    added in FP32 -- other roundings of the same BF16 product), so the same
+    inputs would get another baseline on each GPU model.  The previous
+    settings are restored on exit; a PyTorch without the split-K switch runs
+    its default GEMMs."""
+    matmul = torch.backends.cuda.matmul
+    if not torch.cuda.is_available() or not hasattr(
+        matmul, "allow_bf16_reduced_precision_reduction_split_k"
+    ):
+        yield
+        return
+    library = torch.backends.cuda.preferred_blas_library()
+    reduction = (
+        matmul.allow_bf16_reduced_precision_reduction,
+        matmul.allow_bf16_reduced_precision_reduction_split_k,
+    )
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    matmul.allow_bf16_reduced_precision_reduction = (False, False)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = reduction
+        torch.backends.cuda.preferred_blas_library(library)
+
+
 def reference_unchunked(
     inp: Inputs,
     *,
@@ -338,17 +471,27 @@ def reference_unchunked(
 ) -> dict:
     """The plain autograd path at the contract's rounding boundaries: BF16
     ``z = X @ W^T`` promoted to FP32, ``torch.logsumexp``, gather, the objective,
-    ``loss.backward()``.  Returns ``loss`` (FP32 0-dim), ``logp`` (FP32 ``[T]``),
+    ``loss.backward()``.  Each GEMM accumulates its whole K dimension in one
+    FP32 sum (no split-K, see :func:`_unsplit_gemms`), the same form on every
+    GPU.  Returns ``loss`` (FP32 0-dim), ``logp`` (FP32 ``[T]``),
     ``dX`` (BF16 or ``None``) and ``dW`` (BF16 by construction, upcast to
-    ``grad_weight_dtype`` when FP32 is requested, or ``None``)."""
+    ``grad_weight_dtype`` when FP32 is requested, or ``None``).  With
+    ``inp.temperature`` (log-probability entry only): ``q = z / tau[:, None]``
+    in FP32 (tensor by tensor, the temperature as an FP32 ``[T]`` tensor) in
+    place of ``z``."""
     if entry not in ("loss", "logprob"):
         raise ValueError("entry must be 'loss' or 'logprob'")
+    if inp.temperature is not None and entry != "logprob":
+        raise ValueError("a temperature belongs to the log-probability entry")
     X = inp.X.detach().requires_grad_(bool(need_dx))
     W = inp.W.detach().requires_grad_(bool(need_dw))
     labels = inp.labels
     valid = labels >= 0
-    with torch.enable_grad():
+    tau = inp.temperature_rows()
+    with torch.enable_grad(), _unsplit_gemms():
         z = (X @ W.t()).float()
+        if tau is not None:
+            z = z / tau[:, None]  # one FP32 division per element, tensor by tensor
         lse = torch.logsumexp(z, dim=-1)
         index = torch.where(valid, labels, torch.zeros_like(labels))
         zy = z.gather(1, index[:, None]).squeeze(1)

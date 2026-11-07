@@ -214,6 +214,20 @@ def compute_reference_moe(
 
 
 @contextmanager
+def env_var(name: str, value: str):
+    """Set one environment variable for the block, restoring it afterwards."""
+    saved = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+@contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
     if use_4over6:
@@ -263,6 +277,7 @@ def set_nvfp4_4over6_env(request):
 
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP4_NVFP4_NVFP4,
+    QuantMode.FP4_MXFP4_MXFP8,
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
     QuantMode.BF16,
@@ -409,14 +424,6 @@ def skip_checks(
         ):
             pytest.skip(
                 "Prims-TS FP8 per-tensor DeepSeekV3 routing requires a gated activation"
-            )
-        if (
-            is_fp4_moe
-            and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
-            and activation_type == ActivationType.Relu2
-        ):
-            pytest.skip(
-                "Prims-TS NVFP4xNVFP4 Relu2 output quantization is not supported yet"
             )
     if (
         is_fp8_block_scale_moe
@@ -581,6 +588,7 @@ def compute_reference_moe_fp4(
     wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    clamped_relu2_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -612,6 +620,9 @@ def compute_reference_moe_fp4(
         situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        clamped_relu2_limit: Limit ``L`` of ActivationType.ClampedRelu2, which
+            maps the alpha-scaled GEMM1 output ``z`` to
+            ``relu(L * tanh(z / L)) ** 2``.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -626,6 +637,10 @@ def compute_reference_moe_fp4(
         validate_cute_dsl_moe_situ_config(
             normalized_activation_type, situ_beta, situ_linear_beta
         )
+        if (normalized_activation_type == ActivationType.ClampedRelu2) != (
+            clamped_relu2_limit is not None
+        ):
+            raise ValueError("clamped_relu2_limit is required with ClampedRelu2 only")
         if situ_beta is not None:
             activation = "situ"
         elif normalized_activation_type == ActivationType.GegluTanh:
@@ -731,6 +746,10 @@ def compute_reference_moe_fp4(
                 # non-gated activation over identical weights. Used as a
                 # negative control to prove a tolerance can distinguish
                 # activation formulas rather than just output magnitude.
+                if clamped_relu2_limit is not None:
+                    gemm1_out = clamped_relu2_limit * torch.tanh(
+                        gemm1_out / clamped_relu2_limit
+                    )
                 act_out = (
                     torch.relu(gemm1_out)
                     if wrong_formula
@@ -809,6 +828,7 @@ def create_moe_tensors(
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
     vary_block_scales: bool = False,
+    swap_ab: bool = False,
 ):
     """Create properly quantized MoE tensors for testing.
 
@@ -903,11 +923,18 @@ def create_moe_tensors(
     if vary_block_scales:
         w1_bf16 = w1_bf16 * _block_scale_ramp(fc1_rows, 1, device)[None, :, None]
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_for_quant = (
-        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
-        if gated and interleave_gated_weights
-        else w1_bf16
-    )
+    if gated and interleave_gated_weights:
+        from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
+
+        w1_for_quant = interleave_linear_and_gate(
+            w1_bf16,
+            group_size=_cute_dsl_gated_weight_group_size(
+                w1_bf16.device, swap_ab=swap_ab
+            ),
+            dim=1,
+        )
+    else:
+        w1_for_quant = w1_bf16
     w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_for_quant, w1_gs, sf_vec_size)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
@@ -1357,3 +1384,20 @@ def fp8_per_tensor_requant_hook(intermediate_scale_global: torch.Tensor):
         return q.to(torch.float8_e4m3fn).float() / intermediate_scale_global
 
     return hook
+
+
+def powlu_ref(gate: torch.Tensor, m: float) -> torch.Tensor:
+    """PowLU on the gate branch, in fp32 -- mirrors PowLUAdaptor.
+
+    ``m / (sqrt(g) + 1)`` is the self-adapting exponent, and the non-positive
+    half is plain SiLU. Written with ``torch.pow`` rather than ``exp2/log2`` so
+    the reference is independent of the kernel's fast-math lowering (they agree
+    to ~6e-6 relative, far below bf16 resolution). The masked-off lanes stay at
+    1.0 because pow() of a negative base is NaN, and a NaN in an unused lane
+    still poisons torch.where on some backends.
+    """
+    gate = gate.float()
+    positive = gate > 0
+    safe = torch.where(positive, gate, torch.ones_like(gate))
+    exponent = m / (safe.sqrt() + 1.0)
+    return torch.where(positive, safe.pow(exponent) * torch.sigmoid(safe), F.silu(gate))

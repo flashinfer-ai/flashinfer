@@ -29,36 +29,33 @@
 #include <cstdint>
 #include <vector>
 
+#include "experimental/cake_host_common.cuh"
+
 extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7(int* __restrict__ context_lens, int* __restrict__ schedule_meta, int batch_size, int next_n, int num_next_n_atoms, int split_kv, int num_sms);
-extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride);
+
+// Program identity: each define set keeps the kernel symbol and the host-shim namespace of the
+// per-route unit it replaced, so every JIT module built from this text exports its own symbols
+// (the modules share one process; shared symbols would resolve to another module's copies).
+#if NEXT_N == 3
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5
+#define CAKE_PROGRAM_SHIM cake_host_shim_b448f226f95e9379
+#elif NEXT_N == 5
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_e45fed87591d52bf2023
+#define CAKE_PROGRAM_SHIM cake_host_shim_21ba806c08d71332
+#elif NEXT_N == 6
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_8ac5cd02a150f3e88152
+#define CAKE_PROGRAM_SHIM cake_host_shim_0d8cc9366cfb85bb
+#else
+#error "no exported program for this NEXT_N"
+#endif
+
+extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride);
 
 
-namespace cake_host_shim_b448f226f95e9379 {
+namespace CAKE_PROGRAM_SHIM {
 
+using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
-
-// Opt the linked kernel into its dynamic shared memory once for every device
-// that accepts it. Function-local static initialization already serializes
-// the first call; no lock or per-device cache is needed.
-inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
-  cudaKernel_t kernel = nullptr;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
-  int device_count = 0;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
-  return true;
-}
 
 namespace stage_metadata {
 
@@ -406,7 +403,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Q, TensorView arg_K
   prepared.retained.push_back(arg_schedule_meta);
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5), 81920);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 81920);
   (void)smem_ready;
   prepared.p_Q = EncodeTma_Q(arg_Q);
   prepared.p_KV = EncodeTma_KV(arg_KV);
@@ -452,9 +449,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5), kargs);
+      &config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5 failed: "
+      << "cudaLaunchKernelExC for " CAKE_STRINGIZE(CAKE_PROGRAM_KERNEL) " failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -483,14 +480,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_logits::Submit(prepared_logits, stream);
 }
 
-}  // namespace cake_host_shim_b448f226f95e9379
+}  // namespace CAKE_PROGRAM_SHIM
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_b448f226f95e9379::RunPacked(
+  CAKE_PROGRAM_SHIM::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

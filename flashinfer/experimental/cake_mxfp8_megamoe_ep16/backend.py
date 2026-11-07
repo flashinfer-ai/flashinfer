@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Cake MXFP8 MegaMoE backend for EP16 on SM100 and SM103 devices.
+# Cake MXFP8 MegaMoE backend for EP16 on SM100, SM103 and SM107 devices.
 
 from __future__ import annotations
 
@@ -30,7 +30,10 @@ import tvm_ffi
 from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
+    device_arch,
+    fused_grid_ctas,
     load_cake_mxfp8_megamoe_ep16_module,
+    require_cute_dsl_capability,
     require_supported_capability,
 )
 
@@ -45,10 +48,7 @@ _MAX_TOKENS_PER_RANK = 64
 _EXPERT_ROW_SEGMENTS = (32, 16, 16)
 _EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
 _SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
-_FUSED_GRID_CTAS = 144
-_MAX_LAUNCH_EPOCH = (2**31 - 1) // _FUSED_GRID_CTAS - 1
 _CUTE_DSL_PEER_CAPACITY = 32
-_CUTE_DSL_FLAG_WORDS = 2 + 2 * 2 * _WORLD_SIZE
 
 
 def _require_tensor(
@@ -205,8 +205,13 @@ def _validate_gathered_routing_capacity(gathered: torch.Tensor) -> None:
         )
 
 
-def _validate_launch_epoch(epoch: int) -> None:
-    if epoch < 0 or epoch > _MAX_LAUNCH_EPOCH:
+def _max_launch_epoch(grid_ctas: int) -> int:
+    # The grid counters count (epoch + 1) x CTAs of the launched fused grid in 32-bit signed arithmetic.
+    return (2**31 - 1) // grid_ctas - 1
+
+
+def _validate_launch_epoch(epoch: int, grid_ctas: int) -> None:
+    if epoch < 0 or epoch > _max_launch_epoch(grid_ctas):
         raise RuntimeError(
             "Cake MXFP8 MegaMoE session launch epoch is exhausted; "
             "create a new session before submitting another forward"
@@ -322,9 +327,13 @@ class _Workspace:
         backend: str = "cuda",
     ) -> None:
         _validate_backend(backend)
+        # The CuTe-DSL programs read their peer tables by value on the host;
+        # both backends share every other part of the layout below.
         host_peer_table = backend == "cute_dsl"
+        # One sense-reversing word per cross-rank barrier: word 0 publishes the
+        # mailboxes, word 1 completes the return of the route terms.
         self.flags = _allocate_symmetric(
-            (_CUTE_DSL_FLAG_WORDS if host_peer_table else 2,),
+            (2,),
             torch.uint32,
             device=device,
             group_name=group_name,
@@ -332,8 +341,13 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.flags.tensor.zero_()
+        # Row and route mailboxes with one slot per source rank. Every rank stores
+        # its routes into its slot on every rank and each BF16 row into its slot
+        # on the ranks that own the row's experts, so dispatch reads both from
+        # local memory.
+        route_slots = (_WORLD_SIZE,)
         self.published_hidden = _allocate_symmetric(
-            (tokens, _HIDDEN),
+            (*route_slots, tokens, _HIDDEN),
             torch.bfloat16,
             device=device,
             group_name=group_name,
@@ -341,7 +355,7 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.published_topk_ids = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.int32,
             device=device,
             group_name=group_name,
@@ -349,7 +363,7 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.published_topk_weights = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.float32,
             device=device,
             group_name=group_name,
@@ -421,7 +435,7 @@ class _Workspace:
 
 
 class CakeMxfp8MegaMoeEp16:
-    """Prepared EP16 MXFP8 MegaMoE session for SM100 and SM103 devices.
+    """Prepared EP16 MXFP8 MegaMoE session for SM100, SM103 and SM107 devices.
 
     The route supports 512 experts, hidden size 3072, intermediate size 5120,
     top-k 8, 16/32/64 tokens per rank, and up to 64 routes per expert. Routing
@@ -449,11 +463,26 @@ class CakeMxfp8MegaMoeEp16:
         if world_size != _WORLD_SIZE:
             raise ValueError(f"Cake MXFP8 MegaMoE requires EP16, got EP{world_size}")
         device = torch.device("cuda", torch.cuda.current_device())
-        require_supported_capability(torch.cuda.get_device_capability(device))
+        capability = require_supported_capability(
+            torch.cuda.get_device_capability(device)
+        )
         _validate_collective_backend(backend, process_group=self._group)
         self._backend = backend
         if backend == "cute_dsl":
-            from .cute_dsl import create_runner
+            require_cute_dsl_capability(capability)
+            from .cute_dsl import FUSED_GRID_CTAS, create_runner
+
+            grid_ctas = FUSED_GRID_CTAS[device_arch(capability)]
+        else:
+            grid_ctas = fused_grid_ctas(capability)
+        # The fused kernel's grid barriers need every CTA of its cooperative grid resident at once, one per SM.
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if grid_ctas > sm_count:
+            raise RuntimeError(
+                f"Cake MXFP8 MegaMoE needs {grid_ctas} co-resident CTAs (one per SM) on compute capability "
+                f"{capability[0]}.{capability[1]}, but the device has {sm_count} SMs"
+            )
+        self._fused_grid_ctas = grid_ctas
 
         self._validate_weights(weights, device=device)
         self.weights = weights
@@ -609,7 +638,7 @@ class CakeMxfp8MegaMoeEp16:
 
         workspace = self._workspace
         launch_epoch = self._launch_epoch
-        _validate_launch_epoch(launch_epoch)
+        _validate_launch_epoch(launch_epoch, self._fused_grid_ctas)
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
             if self._backend == "cuda":
                 self._module.run(

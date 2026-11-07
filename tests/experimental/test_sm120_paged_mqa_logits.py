@@ -16,6 +16,8 @@ or the device is not an exported architecture; the host-only helpers and the
 architecture-target gate run everywhere.
 """
 
+import re
+
 import pytest
 import torch
 from flashinfer.experimental.deepgemm_sm120_paged_mqa_logits import (
@@ -355,10 +357,16 @@ def test_sm120_paged_mqa_logits_long_context_hint(
     hinted = _runtime.atom_variant(heads, next_n, batch, max_context_hint=hint)
     unhinted = _runtime.atom_variant(heads, next_n, batch)
     assert plan.max_context_hint == hint
-    assert plan.atom_variant == hinted
-    assert plan.route_name == _runtime.route_name(
-        heads, page_kv, next_n, batch, max_context_hint=hint
+    # On a device with a route table the hint may also select a device route
+    # (its own atom and schedule); everywhere else the default route runs.
+    device = dict(cta_budget=plan.num_sms, device_sms=plan.device_sms)
+    assert plan.route_name == _runtime.resolve_route(
+        heads, page_kv, next_n, batch, max_context_hint=hint, **device
     )
+    if plan.route_name == _runtime.route_name(
+        heads, page_kv, next_n, batch, max_context_hint=hint
+    ):
+        assert plan.atom_variant == hinted
     assert plan.route["atom_variant"] == plan.atom_variant
     assert plan.launch_count == 1 and plan.kernel_launches == 2
     # The 64-head 5-/6-token native atom exceeds the TMA Q box, so that
@@ -372,14 +380,18 @@ def test_sm120_paged_mqa_logits_long_context_hint(
     plan.run()
     torch.cuda.synchronize()
     _check(plan.logical_output, _reference(data), data, plan.output)
-    # The sequence rebuilt the schedule with the hinted atom count.
-    atoms = _runtime.next_n_atoms(next_n, batch, heads, max_context_hint=hint)
+    # The sequence rebuilt the schedule with the atom count of its route.
+    atoms = _runtime.next_n_atoms(
+        next_n, batch, heads, max_context_hint=hint, page_kv=page_kv, **device
+    )
     assert atoms == plan.num_next_n_atoms
     expected = _schedule_reference(
         data["context_lens"], _runtime.split_kv(), atoms, plan.num_sms
     )
-    assert plan.schedule_meta.cpu().tolist() == expected
-    # The standalone metadata entry with the same hint produces the same schedule.
+    if plan.dyn_schedule is None:
+        assert plan.schedule_meta.cpu().tolist() == expected
+    # The standalone metadata entry with the same hint produces the static
+    # schedule of that atom count (the one the sequence rebuilt on a static route).
     meta = get_paged_mqa_logits_metadata(
         data["context_lens"],
         page_kv,
@@ -387,11 +399,19 @@ def test_sm120_paged_mqa_logits_long_context_hint(
         num_heads=heads,
         max_context_hint=hint,
     )
-    assert torch.equal(meta, plan.schedule_meta)
+    assert meta.cpu().tolist() == expected
     # With the hint at batch 2-8 the exported head counts select different
     # schedules for next_n 5/6 (a5/a6 against a2), so the head-count-free call
-    # names ``num_heads`` there; next_n 3/4 resolve without it.
-    if next_n in (5, 6):
+    # names ``num_heads`` there; next_n 3/4 resolve without it.  A device route
+    # table can change which head counts agree, so the rule is checked against
+    # the per-head atom counts of the routes.
+    per_head = {
+        _runtime.next_n_atoms(
+            next_n, batch, h, max_context_hint=hint, page_kv=page_kv, **device
+        )
+        for h in _runtime.exported_heads()
+    }
+    if len(per_head) > 1:
         with pytest.raises(ValueError, match="num_heads"):
             get_paged_mqa_logits_metadata(
                 data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
@@ -400,19 +420,17 @@ def test_sm120_paged_mqa_logits_long_context_hint(
         heads_free = get_paged_mqa_logits_metadata(
             data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
         )
-        assert torch.equal(heads_free, plan.schedule_meta)
+        assert torch.equal(heads_free, meta)
     # The same operands WITHOUT the hint schedule the reference atoms, a
-    # different buffer wherever the variant changes.  The buffer is
+    # different buffer wherever the atom count changes.  The buffer is
     # DeepGEMM-identical and carries no atom count, so a mismatch is not
     # detectable from it; the logits entries rebuild the schedule under their
     # own hint (checked above), which is why the sequence stays consistent.
     unhinted_meta = get_paged_mqa_logits_metadata(
         data["context_lens"], page_kv, plan.num_sms, num_heads=heads
     )
-    if hinted == unhinted:
-        assert torch.equal(unhinted_meta, plan.schedule_meta)
-    else:
-        assert not torch.equal(unhinted_meta, plan.schedule_meta)
+    unhinted_atoms = _runtime.next_n_atoms(next_n, batch, heads)
+    assert (unhinted_meta.cpu().tolist() == expected) == (unhinted_atoms == atoms)
     # One-shot entry with the same hint: identical bits where both wrote.
     one_shot = fp8_paged_mqa_logits(
         data["q"],
@@ -647,16 +665,16 @@ def test_sm120_paged_host_helpers_and_rejections():
                 record["next_n"],
                 _batch_of_variant(record["num_heads"], record["next_n"], name),
             )
-    # Every logits route is the ordered (metadata, logits) pair behind one
-    # prepared sequence; the metadata route is the standalone scheduler.
+    # Every logits route is one prepared sequence (the scheduler then the logits
+    # program, two kernel launches); the metadata route is the standalone
+    # scheduler stage.
     metadata_route = _runtime.metadata_route_name()
     for name, record in catalog["routes"].items():
-        stages = [stage for stage, _program in record["stages"]]
         if name == metadata_route:
+            stages = [stage for stage, _program in record["stages"]]
             assert stages == ["metadata"] and not record["sequence"]
         else:
-            assert stages == ["metadata", "logits"] and record["sequence"]
-            assert record["kernel_launches"] == 2
+            assert record["sequence"] and record["kernel_launches"] == 2
     # The Q-atom rule is catalog data over (heads, next_n, batch class).  Table
     # check: every (heads, next_n, class) resolves to the catalog's variant and
     # atom count, and the head-count-free form resolves exactly where the
@@ -902,3 +920,164 @@ def test_sm120_bindings_cover_every_program_argument():
         assert not missing, f"{name}: unbound arguments {missing}"
         checked += 1
     assert checked == len(catalog["routes"])
+
+
+def _compile_definitions(record):
+    """``{NAME: value}`` of the ``-DNAME=value`` flags of a catalogued program."""
+    return {
+        flag[2:].split("=", 1)[0]: int(flag.split("=", 1)[1])
+        for flag in record["compile_flags"]
+        if flag.startswith("-D")
+    }
+
+
+_LADDER = re.compile(
+    r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
+    re.MULTILINE,
+)
+
+
+def _program_identity(kernel_text, binding_text, definitions):
+    """``(kernel symbol, host-shim namespace)`` a JIT module built from the two units with
+    ``definitions`` exports: the literal names of a per-route text, or the branch of a shared
+    text's program-identity ladder whose ``MACRO == value`` conjunction holds for exactly these
+    definitions (one branch in the kernel and one in the binding, naming the same kernel)."""
+
+    def select(text, what):
+        branches = _LADDER.findall(text)
+        if not branches:
+            return None
+        hits = [
+            (kernel, shim)
+            for condition, kernel, shim in branches
+            if {k: int(v) for k, v in re.findall(r"(\w+) == (\d+)", condition)}
+            == definitions
+        ]
+        assert len(hits) == 1, (what, definitions, hits)
+        return hits[0]
+
+    kernel, binding = select(kernel_text, "kernel"), select(binding_text, "binding")
+    if kernel is None and binding is None:
+        symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
+        shim = re.search(
+            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+        ).group(1)
+        return symbol, shim
+    assert kernel is not None and binding is not None and kernel[0] == binding[0], (
+        kernel,
+        binding,
+    )
+    return binding
+
+
+def test_sm120_sequence_programs_share_one_text_per_atom_variant():
+    """Host-only: one logits kernel and one sequence binding per (heads, atom).
+
+    The page size and ``next_n`` of a route are compile-line definitions of the
+    shared text -- ``PAGE_KV`` on the 32-head texts (64 or 128), ``NEXT_N`` on
+    the two-token texts (2 to 6) and on the 64-head three-token text (3, 5, 6)
+    -- so every sequence record names the scheduler kernel, its text's kernel
+    and its text's binding, passes exactly the definitions those sources
+    require (``#ifndef`` guards), exports the binding's entry, and no generated
+    unit is left unreferenced.  Every record's module also exports its own kernel
+    symbol and host-shim namespace: the per-route names, which a shared text
+    selects for each definition set through its program-identity ladder.
+    """
+
+    from flashinfer.jit import env
+
+    csrc = env.FLASHINFER_CSRC_DIR
+    catalog = _runtime._catalog()
+    generated = "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated"
+    metadata_route = catalog["routes"][_runtime.metadata_route_name()]
+    scheduler = catalog["programs"][metadata_route["stages"][0][1]]
+    guard = re.compile(r"^#ifndef (\w+)$", re.M)
+
+    def required(source):
+        path = csrc / source.removeprefix("csrc/")
+        assert path.is_file(), source
+        return set(guard.findall(path.read_text()))
+
+    texts, referenced, identities = {}, set(scheduler["sources"]), {}
+    for name, route in catalog["routes"].items():
+        if not route["sequence"]:
+            continue
+        record = catalog["programs"][route["sequence"]]
+        scheduler_kernel, kernel, binding = record["sources"]
+        assert scheduler_kernel == scheduler["sources"][0], name
+        referenced.update(record["sources"])
+        heads, atom = int(route["num_heads"]), route["atom_variant"]
+        expected = {}
+        if heads == 32:
+            expected["PAGE_KV"] = int(route["page_kv"])
+        if atom == "a2" or (heads, atom) == (64, "a3"):
+            expected["NEXT_N"] = int(route["next_n"])
+        assert _compile_definitions(record) == expected, name
+        assert required(kernel) == set(expected), (name, kernel)
+        assert required(binding) == set(expected) & {"PAGE_KV"}, (name, binding)
+        entry = binding.rsplit("/", 1)[1].removesuffix("_binding.cu")
+        assert record["ffi_entry"] == entry, name
+        texts.setdefault((heads, atom), set()).add((kernel, binding))
+        identity = _program_identity(
+            (csrc / kernel.removeprefix("csrc/")).read_text(),
+            (csrc / binding.removeprefix("csrc/")).read_text(),
+            expected,
+        )
+        assert identity not in identities.values(), (name, identity, identities)
+        identities[name] = identity
+    assert texts and all(len(units) == 1 for units in texts.values()), texts
+    kernels = {next(iter(units))[0] for units in texts.values()}
+    assert len(kernels) == len(texts), sorted(kernels)
+    # Device routes (tuned per-device programs) reference their own units.
+    for route in catalog["device_routes"].values():
+        referenced.update(catalog["programs"][route["sequence"]]["sources"])
+    # A scheduler the device-route sequences share ships as a module record
+    # that is not standalone; its binding is referenced by that record.
+    for record in catalog["programs"].values():
+        if record.get("kind") == "module" and record.get("standalone") is False:
+            referenced.update(record["sources"])
+    generated_dir = csrc / generated.removeprefix("csrc/")
+    orphans = sorted(
+        p.name
+        for p in generated_dir.iterdir()
+        if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
+    )
+    assert not orphans, f"generated units not referenced by the catalog: {orphans}"
+
+
+def test_sm120_every_program_record_is_launched_by_a_route():
+    """Host-only: every program record is launched by a route.
+
+    A default route's sequence or stage program, a device route's sequence, or
+    a scheduler module (not standalone) that such a sequence starts with; so a
+    device route that leaves the catalog leaves no program record behind, and
+    ``policy.threads.metadata_dyn`` is set exactly when a ``dyn`` route ships.
+    """
+    catalog = _runtime._catalog()
+    programs = catalog["programs"]
+    launched = set()
+    for record in catalog["routes"].values():
+        if record["sequence"]:
+            launched.add(record["sequence"])
+        launched.update(name for _stage, name in record.get("stages") or ())
+    launched.update(record["sequence"] for record in catalog["device_routes"].values())
+    assert launched <= set(programs), sorted(launched - set(programs))
+    first = {
+        programs[name]["sources"][0]
+        for name in launched
+        if programs[name]["kind"] == "sequence"
+    }
+    schedulers = {
+        name
+        for name, record in programs.items()
+        if record["kind"] == "module"
+        and record.get("standalone") is False
+        and record["sources"][0] in first
+    }
+    left = sorted(set(programs) - launched - schedulers)
+    assert not left, f"program records no route launches: {left}"
+    dyn = any(
+        _runtime.route_schedule(record)["kind"] == "dyn"
+        for record in catalog["device_routes"].values()
+    )
+    assert ("metadata_dyn" in catalog["policy"]["threads"]) == dyn

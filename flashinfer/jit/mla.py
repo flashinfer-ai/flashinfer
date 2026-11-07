@@ -32,6 +32,18 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+def gen_mla_swa_sm90_module() -> JitSpec:
+    """BF16 Page64 DOTS-style sliding-window MLA, six frozen SM90 tactics."""
+    return gen_jit_spec(
+        "mla_swa_sm90",
+        [jit_env.FLASHINFER_CSRC_DIR / "mla_swa_sm90.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[9]
+        )
+        + ["-O3", "--use_fast_math", "--expt-relaxed-constexpr"],
+    )
+
+
 def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
     """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
     return gen_sparse_mla_sm120_module()

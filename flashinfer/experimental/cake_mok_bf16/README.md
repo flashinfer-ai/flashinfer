@@ -74,7 +74,11 @@ backward takes `(data, scales, data_t, scales_t)` for gate and up and the
 transposed `(data_t, scales_t)` pair for down. `quantize_mok_mxfp8_weights`
 produces both sets (E4M3 data, UE8M0 scales for 32-element blocks along the
 reduction dimension, tensor-core scale tiles `[E * rows / 128, cols / 128, 32,
-16]`). MXFP8 weight gradients are BF16 (or the FP32 accumulators).
+16]`). On CUDA tensors it launches one fused Triton kernel per operand that
+reads the BF16 weights once and writes both layouts, without host
+synchronization, so it can be captured in a CUDA Graph;
+without Triton, PyTorch operations produce the same bytes. MXFP8 weight
+gradients are BF16 (or the FP32 accumulators).
 
 `swiglu_limit` is a per-call runtime value; plain and clamped SwiGLU are
 separate kernel builds. `prepare_mok_bf16(clamped_swiglu=..., fp32_wgrad=...)`
@@ -103,6 +107,13 @@ expert output is saved: the router-score gradient is fused into SwiGLU
 backward as `dot(d_hidden, hidden) / score`, as in native MoK. Scores must be
 positive; a zero score yields a zero score gradient. A larger macrobatch ring
 uses more memory and replays less in backward.
+
+`backward` returns `dx`, `dscores` and the six weight gradients. The fused
+kernel's routed and shared scratch is released as soon as the launch is
+enqueued, before the output epilogue and the score-gradient copy allocate,
+so a training step's peak allocation is inside the fused backward launch for
+both precisions, except when the intermediate size is below a third of the
+hidden size and a rank's source rows exceed twice the macrobatch.
 
 `recompute_forward_context(config, workspace, schedule, x, shared_gate,
 shared_up, routed_gate, routed_up, swiglu_limit=None)` dispatches and
@@ -163,6 +174,18 @@ inputs and workspace remain alive. Run graphs sharing a workspace serially
 and in the same order across ranks. Growth beyond capacity requires all ranks
 to recreate the workspace.
 
+`build_schedule` derives the expert layout once per schedule
+(`MoKSchedule.layout`, int32 `[3 * local experts + schedule_capacity / 256]`:
+padded counts, row offsets, real rows and the expert of each 256-row block) and
+every fused launch of that schedule reads it; a schedule built without it
+(`layout=None`) makes each launch derive its own. The layout is a function of
+`tokens_per_expert` and `peer_rank`, whose real rows come first within each
+expert's padded rows; a schedule copied with `dataclasses.replace` that changes
+`peer_rank`, `tokens_per_expert` or the capacity must pass `layout=None`. The
+launchers memoise their launch-invariant geometry per distinct launch
+arguments (integers and, for MXFP8, the device); the memo holds no tensors
+and does not change the launch sequence.
+
 ## Contract
 
 - Scheduler layouts `(EP, local experts)`: `(1, 4)` and `(4, 4)` diagnostic
@@ -177,20 +200,24 @@ to recreate the workspace.
   hidden width that is a multiple of 512, and its forward and recompute roles
   need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
   `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
-  'cvt'"; the backward roles carry a guard and compile with 13.0). Common physical source capacity is
+  'cvt'"; the backward roles carry a guard and compile with 13.0). Every sm_107a
+  (Rubin) library needs CUDA 13.4, the first nvcc that accepts `compute_107a`.
+  Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
 - Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
   factory default `imbalance_comm_sms="auto"`, `None` keeps the fixed split): every
-  `build_schedule` counts the gathered expert IDs per owning rank on device (one
-  `torch.histc` pass, linear in the number of ids) and copies the counts into
-  pinned host memory behind a CUDA event (no host synchronization; skipped during
-  graph capture). The gathered IDs and the counts are identical on every rank;
-  each rank applies its own latest completed observation, so with back-to-back
+  `build_schedule` counts the gathered expert IDs per owning rank on device
+  inside the scheduler's count kernel (the same pass that counts this rank's
+  experts; no extra launch) and copies the counts into pinned host memory
+  behind a CUDA event (no host synchronization; skipped during graph capture).
+  The gathered IDs and the counts are identical on every rank; each rank
+  applies its own latest completed observation, so with back-to-back
   steps a launch may use different splits on different ranks for a step - the
   split is a per-rank launch parameter and the protocol does not require
   agreement. While the hottest rank's load is at least `imbalance_threshold`
-  x the mean load (facade default `"auto"`: the precision's value in
+  x the mean load (facade default `"auto"`: the device's value in
+  `IMBALANCE_DEVICE_THRESHOLDS`, else the precision's value in
   `IMBALANCE_THRESHOLDS`, BF16 4, MXFP8 2.7), the later launches use the
   (forward, backward) imbalance split; balanced steps are unchanged. Measured
   rows (`IMBALANCE_COMM_SMS`, keyed by compute capability and SM count, so B200
@@ -210,11 +237,30 @@ to recreate the workspace.
   -2.6 / -2.9 %; balanced steps +0.6 / +0.3 % (full) and +0.9 / +0.8 %
   (checkpoint) under an unconditional 44 / 36, which is why only imbalanced
   steps switch; with 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8
-  threshold sits between the measured 2.4x and 3.0x. No row elsewhere.
+  threshold sits between the measured 2.4x and 3.0x. Rubin (212 SMs) MXFP8
+  72 / 60 over its fixed 60 / 60 from a device threshold of 1.5
+  (`IMBALANCE_DEVICE_THRESHOLDS`, which replaces the precision's threshold for
+  that device), two-node EP8, 27116 tokens per rank, configurations rotated on
+  one workspace, four rounds, hottest-rank medians, MoE training-update proxy:
+  hottest rank at 1.51x the mean routed load forward -6.9 % / update -3.8 %,
+  2.05x -5.7 / -2.8 %, 3.05x -10.1 / -5.1 %, 4.66x -11.1 / -5.5 %, 6.47x
+  -10.6 / -5.5 %; balanced steps do not switch, where an unconditional 72 / 60
+  forward is 4.1 % slower. No row elsewhere.
   `MoKConfig.comm_split_log=True` (default `False`; `dataclasses.replace(config,
   comm_split_log=True)` on the returned config) prints each split change per
   rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
   to select this no longer exists.
+- Two-macro-batch forward program (sm_107a MXFP8 only): the
+  `forward_mxfp8[_clamped]_multimacro` build streams macro batch 0's
+  unaliased rows to the experts while macro batch 1 combines, instead of
+  after it. Each rank chooses it from the same lagged observation as the
+  split, when its padded schedule rows (`num_tokens`) filled exactly two
+  macro batches; otherwise, before the first observation and at a schedule
+  capacity of at most one macro batch the default build runs (and no
+  observation is queued for this alone). Both builds give bitwise the same
+  outputs, context and gradients for any schedule, so ranks may run different
+  builds in one step and a stale choice costs time only. `comm_split_log`
+  also prints each change of the choice.
 - Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
   `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
   the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
@@ -227,6 +273,11 @@ to recreate the workspace.
   step sits at the edge of the ~0.6 % spread of identical arms, so the row is
   opt-in. GB300 EP4 on one node measured no unconditional gain (balanced steps
   +0.7 ... +1.0 % slower) and has no row; B200 uses the imbalance switch above.
+  Rubin (212 SMs) MXFP8 EP8 60 / 60 against the factory 40 / 40, two-node EP8
+  (one NVLink domain), configurations rotated on one workspace, four rounds,
+  hottest-rank medians, balanced routing forward / backward: 8192 tokens per
+  rank -7.4 / -4.6 %, 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 % (round spread
+  at most 1.2 %). Rubin BF16 measured no consistent gain and has no row.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the
@@ -244,8 +295,13 @@ Single-GPU tests:
   an independent BF16-rounding reference (empty experts, multiple ring lengths,
   variable widths, CUDA Graph replay, changed and zero scores), clamped SwiGLU,
   FP32 accumulation, GLM-5.3-Flash local expert counts, recompute versus
-  saved context, every scheduler layout and the epilogues.
-- `tests/experimental/test_mok_mxfp8.py`: the weight quantizer, the fused MXFP8
+  saved context, every scheduler layout (with the owner-rank load counts
+  against the host reference and the expert layout against a torch reference,
+  explicit and launcher-derived), the counter slab, the launch-geometry memo
+  and the epilogues.
+- `tests/experimental/test_mok_mxfp8.py`: the weight quantizer (fused kernel,
+  PyTorch path and reference byte-identical, NaN / infinity / zero blocks
+  included), the fused MXFP8
   forward and forward+backward against a quantization-aware reference (plain
   and clamped; routed and shared-expert gradients; BF16 or FP32
   weight-gradient accumulation), GLM-5.3-Flash local expert counts and MXFP8

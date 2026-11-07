@@ -1,0 +1,3186 @@
+{
+  "fc1_bf16_n128": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_d2bfac69e4b5b7c5f961"
+      }
+    ],
+    "shapes": [
+      "bf16_t1024_l7"
+    ]
+  },
+  "fc1_bf16_n16": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_3cec6179da3b3834f473"
+      }
+    ],
+    "shapes": [
+      "bf16_t128_l7"
+    ]
+  },
+  "fc1_bf16_n256": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c3d9de1e9d6270fc651c"
+      }
+    ],
+    "shapes": [
+      "bf16_t2048_l7"
+    ]
+  },
+  "fc1_bf16_n32": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_364dc5e6c49377c27b79"
+      }
+    ],
+    "shapes": [
+      "bf16_t256_l7"
+    ]
+  },
+  "fc1_bf16_n64": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_cad86e812c35e9572739"
+      }
+    ],
+    "shapes": [
+      "bf16_t512_l7"
+    ]
+  },
+  "fc1_bf16_n8": {
+    "kind": "fc1",
+    "family": "bf16",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e2c03be2acbc48deccaf"
+      }
+    ],
+    "shapes": [
+      "bf16_t8_l7"
+    ]
+  },
+  "fc1_fp8_n128": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_a5b8153548cab6dd4a26"
+      }
+    ],
+    "shapes": [
+      "fp8_t1024_l7"
+    ]
+  },
+  "fc1_fp8_n16": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_5c8a855e55a71f4e5a4f"
+      }
+    ],
+    "shapes": [
+      "fp8_t128_l7"
+    ]
+  },
+  "fc1_fp8_n256": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_486e203b0db053728da1"
+      }
+    ],
+    "shapes": [
+      "fp8_t2048_l7"
+    ]
+  },
+  "fc1_fp8_n32": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e236d0a22b1241463649"
+      }
+    ],
+    "shapes": [
+      "fp8_t256_l7"
+    ]
+  },
+  "fc1_fp8_n64": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_83be80000a2c395b0180"
+      }
+    ],
+    "shapes": [
+      "fp8_t512_l7"
+    ]
+  },
+  "fc1_fp8_n8": {
+    "kind": "fc1",
+    "family": "fp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_4120432c808d60d09d02"
+      }
+    ],
+    "shapes": [
+      "fp8_t8_l7"
+    ]
+  },
+  "fc1_mxfp8_n128": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b398b040e1b8ef869e3c"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t1024_l7"
+    ]
+  },
+  "fc1_mxfp8_n16": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e2293bcb1ccd0fb0fa95"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t128_l7"
+    ]
+  },
+  "fc1_mxfp8_n256": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c16c727913eac39c7f25"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t2048_l7"
+    ]
+  },
+  "fc1_mxfp8_n64": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_98389094462077483771"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t512_l7"
+    ]
+  },
+  "fc1_mxfp8_n8": {
+    "kind": "fc1",
+    "family": "mxfp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c96f943c65b2c8eaa9ab"
+      }
+    ],
+    "shapes": [
+      "mxfp8_t8_l7"
+    ]
+  },
+  "fc1_nvfp4_bf16tok_n16": {
+    "kind": "fc1",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_ce56d77c382736e1c912"
+      }
+    ],
+    "shapes": [
+      "nvfp4_bf16tok_t128_l16",
+      "nvfp4_bf16tok_t128_l7"
+    ]
+  },
+  "fc1_nvfp4_bf16tok_n256": {
+    "kind": "fc1",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_f10c6f853ce09601ded6"
+      }
+    ],
+    "shapes": [
+      "nvfp4_bf16tok_t2048_l16",
+      "nvfp4_bf16tok_t2048_l7"
+    ]
+  },
+  "fc1_nvfp4_bf16tok_n32": {
+    "kind": "fc1",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_1f6526215da971bcc9c6"
+      }
+    ],
+    "shapes": [
+      "nvfp4_bf16tok_t256_l16",
+      "nvfp4_bf16tok_t256_l7"
+    ]
+  },
+  "fc1_nvfp4_bf16tok_n64": {
+    "kind": "fc1",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b8722b9a6936e6a4c924"
+      }
+    ],
+    "shapes": [
+      "nvfp4_bf16tok_t512_l16",
+      "nvfp4_bf16tok_t512_l7"
+    ]
+  },
+  "fc1_nvfp4_bf16tok_n8": {
+    "kind": "fc1",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e07259ed5242a5ed08f5"
+      }
+    ],
+    "shapes": [
+      "nvfp4_bf16tok_t8_l16",
+      "nvfp4_bf16tok_t8_l7"
+    ]
+  },
+  "fc1_nvfp4_n16": {
+    "kind": "fc1",
+    "family": "nvfp4",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_8e32f55e2c8cc674a74a"
+      }
+    ],
+    "shapes": [
+      "nvfp4_t128_l16",
+      "nvfp4_t128_l7"
+    ]
+  },
+  "fc1_nvfp4_n256": {
+    "kind": "fc1",
+    "family": "nvfp4",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_f8b951ca28630f6cded8"
+      }
+    ],
+    "shapes": [
+      "nvfp4_t2048_l16",
+      "nvfp4_t2048_l7"
+    ]
+  },
+  "fc1_nvfp4_n32": {
+    "kind": "fc1",
+    "family": "nvfp4",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_5b2a4076d9456a216cb0"
+      }
+    ],
+    "shapes": [
+      "nvfp4_t256_l16",
+      "nvfp4_t256_l7"
+    ]
+  },
+  "fc1_nvfp4_n64": {
+    "kind": "fc1",
+    "family": "nvfp4",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_7cb3690815e48b750087"
+      }
+    ],
+    "shapes": [
+      "nvfp4_t512_l16",
+      "nvfp4_t512_l7"
+    ]
+  },
+  "fc1_nvfp4_n8": {
+    "kind": "fc1",
+    "family": "nvfp4",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_28619698637f40d1fa2d"
+      }
+    ],
+    "shapes": [
+      "nvfp4_t8_l16",
+      "nvfp4_t8_l7"
+    ]
+  },
+  "fc2_bf16_n128": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_a4a11b14b7fc96229730"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n128"
+    ]
+  },
+  "fc2_bf16_n16": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_0d02520bcc278529cf27"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n16"
+    ]
+  },
+  "fc2_bf16_n256": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_d53109285a57b12da009"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n256"
+    ]
+  },
+  "fc2_bf16_n32": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c515b08780ee51d11666"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n32"
+    ]
+  },
+  "fc2_bf16_n64": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c1118bec4cfea74fa04e"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n64"
+    ]
+  },
+  "fc2_bf16_n8": {
+    "kind": "fc2",
+    "family": "bf16",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa"
+      }
+    ],
+    "shapes": [
+      "fc2_bf16_n8"
+    ]
+  },
+  "fc2_fp8_n128": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_4d39cc1bd1356a2b3566"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n128"
+    ]
+  },
+  "fc2_fp8_n16": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f4d6d750fa13240db475"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n16"
+    ]
+  },
+  "fc2_fp8_n256": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_667764a3fa267f85926f"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n256"
+    ]
+  },
+  "fc2_fp8_n32": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_473b3ed97ca34adb1911"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n32"
+    ]
+  },
+  "fc2_fp8_n64": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_151b3e849cd52a227427"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n64"
+    ]
+  },
+  "fc2_fp8_n8": {
+    "kind": "fc2",
+    "family": "fp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3ffef72b1c7ffd7f5ef8"
+      }
+    ],
+    "shapes": [
+      "fc2_fp8_n8"
+    ]
+  },
+  "fc2_mxfp8_n128": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae6ca81a0800a8c71538"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n128"
+    ]
+  },
+  "fc2_mxfp8_n16": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_26edf45a86b9afe56815"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n16"
+    ]
+  },
+  "fc2_mxfp8_n256": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae7dcfbf2d3e0cc4a20b"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n256"
+    ]
+  },
+  "fc2_mxfp8_n32": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_94969f032e90041ddaab"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n32"
+    ]
+  },
+  "fc2_mxfp8_n64": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f44269ae056bce32e72d"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n64"
+    ]
+  },
+  "fc2_mxfp8_n8": {
+    "kind": "fc2",
+    "family": "mxfp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ce5e4aee5124c2a50192"
+      }
+    ],
+    "shapes": [
+      "fc2_mxfp8_n8"
+    ]
+  },
+  "fc2_nvfp4_bf16tok_n16": {
+    "kind": "fc2",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3c3e3d7bf81779f17064"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_bf16tok_n16"
+    ]
+  },
+  "fc2_nvfp4_bf16tok_n256": {
+    "kind": "fc2",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_024867aa963132f48ac0"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_bf16tok_n256"
+    ]
+  },
+  "fc2_nvfp4_bf16tok_n32": {
+    "kind": "fc2",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_893d9279ac4a4a3d1904"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_bf16tok_n32"
+    ]
+  },
+  "fc2_nvfp4_bf16tok_n64": {
+    "kind": "fc2",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_af32c4e6a3c0d0e036bf"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_bf16tok_n64"
+    ]
+  },
+  "fc2_nvfp4_bf16tok_n8": {
+    "kind": "fc2",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_207264b4f5afb1793f23"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_bf16tok_n8"
+    ]
+  },
+  "fc2_nvfp4_n16": {
+    "kind": "fc2",
+    "family": "nvfp4",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_75f123649cc57072713c"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_n16"
+    ]
+  },
+  "fc2_nvfp4_n256": {
+    "kind": "fc2",
+    "family": "nvfp4",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f496b224df3869be9686"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_n256"
+    ]
+  },
+  "fc2_nvfp4_n32": {
+    "kind": "fc2",
+    "family": "nvfp4",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3a5388a6a052318613bd"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_n32"
+    ]
+  },
+  "fc2_nvfp4_n64": {
+    "kind": "fc2",
+    "family": "nvfp4",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_2b4c507bf99c30c92543"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_n64"
+    ]
+  },
+  "fc2_nvfp4_n8": {
+    "kind": "fc2",
+    "family": "nvfp4",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c3df92890bea6316d938"
+      }
+    ],
+    "shapes": [
+      "fc2_nvfp4_n8"
+    ]
+  },
+  "finalize_scalar_bf16": {
+    "kind": "finalize",
+    "family": null,
+    "tile_n": null,
+    "variant": "scalar_bf16",
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "finalize_scalar_bf16"
+    ]
+  },
+  "finalize_scalar_f32": {
+    "kind": "finalize",
+    "family": null,
+    "tile_n": null,
+    "variant": "scalar_f32",
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_7517857ff7d76e0dc9b8"
+      }
+    ],
+    "shapes": [
+      "finalize_scalar_f32"
+    ]
+  },
+  "finalize_vector_bf16": {
+    "kind": "finalize",
+    "family": null,
+    "tile_n": null,
+    "variant": "vector_bf16",
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "finalize_vector_bf16"
+    ]
+  },
+  "finalize_vector_f32": {
+    "kind": "finalize",
+    "family": null,
+    "tile_n": null,
+    "variant": "vector_f32",
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_53458328057cfece24fd"
+      }
+    ],
+    "shapes": [
+      "finalize_vector_f32"
+    ]
+  },
+  "full_bf16_n128": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_d2bfac69e4b5b7c5f961"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_a4a11b14b7fc96229730"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t1024_l7"
+    ]
+  },
+  "full_bf16_n16": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_3cec6179da3b3834f473"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_0d02520bcc278529cf27"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t128_l7"
+    ]
+  },
+  "full_bf16_n256": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c3d9de1e9d6270fc651c"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_d53109285a57b12da009"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t2048_l7"
+    ]
+  },
+  "full_bf16_n32": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7a2cba94a1fa6381e410"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_364dc5e6c49377c27b79"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c515b08780ee51d11666"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t256_l7"
+    ]
+  },
+  "full_bf16_n64": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_cad86e812c35e9572739"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c1118bec4cfea74fa04e"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t512_l7"
+    ]
+  },
+  "full_bf16_n8": {
+    "kind": "full",
+    "family": "bf16",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e2c03be2acbc48deccaf"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "full_bf16_t8_l7"
+    ]
+  },
+  "full_fp8_n128": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_a5b8153548cab6dd4a26"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_4d39cc1bd1356a2b3566"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t1024_l7"
+    ]
+  },
+  "full_fp8_n16": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_5c8a855e55a71f4e5a4f"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f4d6d750fa13240db475"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t128_l7"
+    ]
+  },
+  "full_fp8_n256": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_486e203b0db053728da1"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_667764a3fa267f85926f"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t2048_l7"
+    ]
+  },
+  "full_fp8_n32": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7a2cba94a1fa6381e410"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e236d0a22b1241463649"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_473b3ed97ca34adb1911"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t256_l7"
+    ]
+  },
+  "full_fp8_n64": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_83be80000a2c395b0180"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_151b3e849cd52a227427"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t512_l7"
+    ]
+  },
+  "full_fp8_n8": {
+    "kind": "full",
+    "family": "fp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_4120432c808d60d09d02"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3ffef72b1c7ffd7f5ef8"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "full_fp8_t8_l7"
+    ]
+  },
+  "full_mxfp8_n128": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 128,
+    "variant": null,
+    "tokens": 1024,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b398b040e1b8ef869e3c"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae6ca81a0800a8c71538"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t1024_l7"
+    ]
+  },
+  "full_mxfp8_n16": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e2293bcb1ccd0fb0fa95"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_26edf45a86b9afe56815"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t128_l7"
+    ]
+  },
+  "full_mxfp8_n256": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c16c727913eac39c7f25"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ae7dcfbf2d3e0cc4a20b"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t2048_l7"
+    ]
+  },
+  "full_mxfp8_n64": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_98389094462077483771"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f44269ae056bce32e72d"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t512_l7"
+    ]
+  },
+  "full_mxfp8_n8": {
+    "kind": "full",
+    "family": "mxfp8",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_c96f943c65b2c8eaa9ab"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_ce5e4aee5124c2a50192"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "full_mxfp8_t8_l7"
+    ]
+  },
+  "full_nvfp4_bf16tok_n16": {
+    "kind": "full",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_ce56d77c382736e1c912"
+      },
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_da3cce1da37ee8392722"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3c3e3d7bf81779f17064"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_bf16tok_t128_l16",
+      "full_nvfp4_bf16tok_t128_l7"
+    ]
+  },
+  "full_nvfp4_bf16tok_n256": {
+    "kind": "full",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_f10c6f853ce09601ded6"
+      },
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_71dc19e5913b86c81df9"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_024867aa963132f48ac0"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_bf16tok_t2048_l16",
+      "full_nvfp4_bf16tok_t2048_l7"
+    ]
+  },
+  "full_nvfp4_bf16tok_n32": {
+    "kind": "full",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7a2cba94a1fa6381e410"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_1f6526215da971bcc9c6"
+      },
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_da3cce1da37ee8392722"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_893d9279ac4a4a3d1904"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_bf16tok_t256_l16",
+      "full_nvfp4_bf16tok_t256_l7"
+    ]
+  },
+  "full_nvfp4_bf16tok_n64": {
+    "kind": "full",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_b8722b9a6936e6a4c924"
+      },
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_da3cce1da37ee8392722"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_af32c4e6a3c0d0e036bf"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_bf16tok_t512_l16",
+      "full_nvfp4_bf16tok_t512_l7"
+    ]
+  },
+  "full_nvfp4_bf16tok_n8": {
+    "kind": "full",
+    "family": "nvfp4_bf16tok",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_e07259ed5242a5ed08f5"
+      },
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_da3cce1da37ee8392722"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_207264b4f5afb1793f23"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_bf16tok_t8_l16",
+      "full_nvfp4_bf16tok_t8_l7"
+    ]
+  },
+  "full_nvfp4_n16": {
+    "kind": "full",
+    "family": "nvfp4",
+    "tile_n": 16,
+    "variant": null,
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_8e32f55e2c8cc674a74a"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_75f123649cc57072713c"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_t128_l16",
+      "full_nvfp4_t128_l7"
+    ]
+  },
+  "full_nvfp4_n256": {
+    "kind": "full",
+    "family": "nvfp4",
+    "tile_n": 256,
+    "variant": null,
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_f8b951ca28630f6cded8"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_f496b224df3869be9686"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_t2048_l16",
+      "full_nvfp4_t2048_l7"
+    ]
+  },
+  "full_nvfp4_n32": {
+    "kind": "full",
+    "family": "nvfp4",
+    "tile_n": 32,
+    "variant": null,
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7a2cba94a1fa6381e410"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_5b2a4076d9456a216cb0"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_3a5388a6a052318613bd"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_t256_l16",
+      "full_nvfp4_t256_l7"
+    ]
+  },
+  "full_nvfp4_n64": {
+    "kind": "full",
+    "family": "nvfp4",
+    "tile_n": 64,
+    "variant": null,
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_7cb3690815e48b750087"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_2b4c507bf99c30c92543"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_73af683d678f64679a42"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_t512_l16",
+      "full_nvfp4_t512_l7"
+    ]
+  },
+  "full_nvfp4_n8": {
+    "kind": "full",
+    "family": "nvfp4",
+    "tile_n": 8,
+    "variant": null,
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      },
+      {
+        "name": "fc1",
+        "program": "cake_stepfun_moe_28619698637f40d1fa2d"
+      },
+      {
+        "name": "fc2",
+        "program": "cake_stepfun_moe_c3df92890bea6316d938"
+      },
+      {
+        "name": "finalize",
+        "program": "cake_stepfun_moe_ef40785c53887398a669"
+      }
+    ],
+    "shapes": [
+      "full_nvfp4_t8_l16",
+      "full_nvfp4_t8_l7"
+    ]
+  },
+  "requant_r128c4": {
+    "kind": "requant",
+    "family": null,
+    "tile_n": null,
+    "variant": "r128c4",
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_71dc19e5913b86c81df9"
+      }
+    ],
+    "shapes": [
+      "requant_r128c4"
+    ]
+  },
+  "requant_r8c4": {
+    "kind": "requant",
+    "family": null,
+    "tile_n": null,
+    "variant": "r8c4",
+    "tokens": 512,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "requant",
+        "program": "cake_stepfun_moe_da3cce1da37ee8392722"
+      }
+    ],
+    "shapes": [
+      "requant_r8c4"
+    ]
+  },
+  "routing_cluster_t1024_bf16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t1024_bf16",
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7a2cba94a1fa6381e410"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t1024_bf16"
+    ]
+  },
+  "routing_cluster_t1024_bf16_ids": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t1024_bf16_ids",
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_7b7412cdbf97e305bb0a"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t1024_bf16_ids"
+    ]
+  },
+  "routing_cluster_t1024_f32": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t1024_f32",
+    "tokens": 256,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_cecd60278603dcc4678d"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t1024_f32"
+    ]
+  },
+  "routing_cluster_t256_bf16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t256_bf16",
+    "tokens": 64,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_36c6bd00714e0bbf252c"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t256_bf16"
+    ]
+  },
+  "routing_cluster_t256_bf16_ids": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t256_bf16_ids",
+    "tokens": 64,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_cbdd540435fadd0d63f6"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t256_bf16_ids"
+    ]
+  },
+  "routing_cluster_t256_f32": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t256_f32",
+    "tokens": 64,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_00f76a907f7053a93044"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t256_f32"
+    ]
+  },
+  "routing_cluster_t512_bf16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t512_bf16",
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_44ad161d50ffbc995694"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t512_bf16"
+    ]
+  },
+  "routing_cluster_t512_bf16_ids": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t512_bf16_ids",
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_641673f58a6362969174"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t512_bf16_ids"
+    ]
+  },
+  "routing_cluster_t512_f32": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "cluster_t512_f32",
+    "tokens": 128,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_801f356a080c3fc264f2"
+      }
+    ],
+    "shapes": [
+      "routing_cluster_t512_f32"
+    ]
+  },
+  "routing_coop_t128_bf16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "coop_t128_bf16",
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_5144f41bbd707c277a10"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_85e03fcd251dde9ebf18"
+      }
+    ],
+    "shapes": [
+      "routing_coop_t128_bf16"
+    ]
+  },
+  "routing_coop_t128_f32": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "coop_t128_f32",
+    "tokens": 2048,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing_pre",
+        "program": "cake_stepfun_moe_fdd94436356faa9ae3e0"
+      },
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_9a305f39c4182bc865be"
+      }
+    ],
+    "shapes": [
+      "routing_coop_t128_f32"
+    ]
+  },
+  "routing_dyn_block_t160_bf16_ids_n5": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t160_bf16_ids_n5",
+    "tokens": 5,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_468943c4d21a141a598c"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t160_bf16_ids_n5"
+    ]
+  },
+  "routing_dyn_block_t160_bf16_n5": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t160_bf16_n5",
+    "tokens": 5,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_650f390c7908e735b6b8"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t160_bf16_n5"
+    ]
+  },
+  "routing_dyn_block_t160_f32_n5": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t160_f32_n5",
+    "tokens": 5,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_6144d7ba1dd5eb933e02"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t160_f32_n5"
+    ]
+  },
+  "routing_dyn_block_t192_bf16_ids_n6": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t192_bf16_ids_n6",
+    "tokens": 6,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_38bad85beb6a61c84bca"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t192_bf16_ids_n6"
+    ]
+  },
+  "routing_dyn_block_t192_bf16_n6": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t192_bf16_n6",
+    "tokens": 6,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_5d32381c3df3025f8b36"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t192_bf16_n6"
+    ]
+  },
+  "routing_dyn_block_t192_f32_n6": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t192_f32_n6",
+    "tokens": 6,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_3fea9f2972306530e112"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t192_f32_n6"
+    ]
+  },
+  "routing_dyn_block_t224_bf16_ids_n7": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t224_bf16_ids_n7",
+    "tokens": 7,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_c1a1ea765b3fb9132f49"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t224_bf16_ids_n7"
+    ]
+  },
+  "routing_dyn_block_t224_bf16_n7": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t224_bf16_n7",
+    "tokens": 7,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d2ed453ef29437abcbfe"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t224_bf16_n7"
+    ]
+  },
+  "routing_dyn_block_t224_f32_n7": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t224_f32_n7",
+    "tokens": 7,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_3243c1101f8f83d67462"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t224_f32_n7"
+    ]
+  },
+  "routing_dyn_block_t256_bf16_ids_n8": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t256_bf16_ids_n8",
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_fa9bc43250643aafa1d8"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t256_bf16_ids_n8"
+    ]
+  },
+  "routing_dyn_block_t256_bf16_n8": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t256_bf16_n8",
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d8ed340b82ed5d180872"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t256_bf16_n8"
+    ]
+  },
+  "routing_dyn_block_t256_f32_n8": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t256_f32_n8",
+    "tokens": 8,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_53c9390446e5e2e0e7f2"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t256_f32_n8"
+    ]
+  },
+  "routing_dyn_block_t288_bf16_ids_n9": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t288_bf16_ids_n9",
+    "tokens": 9,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_020c9d274df0964a372c"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t288_bf16_ids_n9"
+    ]
+  },
+  "routing_dyn_block_t288_bf16_n9": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t288_bf16_n9",
+    "tokens": 9,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_f7ef47dbe2fd5582df03"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t288_bf16_n9"
+    ]
+  },
+  "routing_dyn_block_t288_f32_n9": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t288_f32_n9",
+    "tokens": 9,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_f705b4bad90742efa82b"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t288_f32_n9"
+    ]
+  },
+  "routing_dyn_block_t320_bf16_ids_n10": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t320_bf16_ids_n10",
+    "tokens": 10,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_27eba75722ade3773779"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t320_bf16_ids_n10"
+    ]
+  },
+  "routing_dyn_block_t320_bf16_n10": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t320_bf16_n10",
+    "tokens": 10,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_009bbe5472ef75ce05ae"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t320_bf16_n10"
+    ]
+  },
+  "routing_dyn_block_t320_f32_n10": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t320_f32_n10",
+    "tokens": 10,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_8d8873b942ad2696dd37"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t320_f32_n10"
+    ]
+  },
+  "routing_dyn_block_t352_bf16_ids_n11": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t352_bf16_ids_n11",
+    "tokens": 11,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_dfa112cd632ae74e7c6e"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t352_bf16_ids_n11"
+    ]
+  },
+  "routing_dyn_block_t352_bf16_n11": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t352_bf16_n11",
+    "tokens": 11,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_d5c6f1eaf5f0c70097c8"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t352_bf16_n11"
+    ]
+  },
+  "routing_dyn_block_t352_f32_n11": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t352_f32_n11",
+    "tokens": 11,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_089365bf21f908c6212f"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t352_f32_n11"
+    ]
+  },
+  "routing_dyn_block_t384_bf16_ids_n12": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t384_bf16_ids_n12",
+    "tokens": 12,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_94829f81f49d9cd83238"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t384_bf16_ids_n12"
+    ]
+  },
+  "routing_dyn_block_t384_bf16_n12": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t384_bf16_n12",
+    "tokens": 12,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_26a28a148a1411bd53b5"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t384_bf16_n12"
+    ]
+  },
+  "routing_dyn_block_t384_f32_n12": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t384_f32_n12",
+    "tokens": 12,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_da98c89d4739d782b98c"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t384_f32_n12"
+    ]
+  },
+  "routing_dyn_block_t416_bf16_ids_n13": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t416_bf16_ids_n13",
+    "tokens": 13,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_55b3a954ca28f7cd2a01"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t416_bf16_ids_n13"
+    ]
+  },
+  "routing_dyn_block_t416_bf16_n13": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t416_bf16_n13",
+    "tokens": 13,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_c476df668d159348bc57"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t416_bf16_n13"
+    ]
+  },
+  "routing_dyn_block_t416_f32_n13": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t416_f32_n13",
+    "tokens": 13,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_153ef8a2626c47b36ad2"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t416_f32_n13"
+    ]
+  },
+  "routing_dyn_block_t448_bf16_ids_n14": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t448_bf16_ids_n14",
+    "tokens": 14,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_ae9bbf9c9644097f8828"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t448_bf16_ids_n14"
+    ]
+  },
+  "routing_dyn_block_t448_bf16_n14": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t448_bf16_n14",
+    "tokens": 14,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_91d8e602f2d067496ea3"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t448_bf16_n14"
+    ]
+  },
+  "routing_dyn_block_t448_f32_n14": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t448_f32_n14",
+    "tokens": 14,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_8f16181b96ffd8a94362"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t448_f32_n14"
+    ]
+  },
+  "routing_dyn_block_t480_bf16_ids_n15": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t480_bf16_ids_n15",
+    "tokens": 15,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_490aa8adecdb6209bb9c"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t480_bf16_ids_n15"
+    ]
+  },
+  "routing_dyn_block_t480_bf16_n15": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t480_bf16_n15",
+    "tokens": 15,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_617db619833b05d03f14"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t480_bf16_n15"
+    ]
+  },
+  "routing_dyn_block_t480_f32_n15": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t480_f32_n15",
+    "tokens": 15,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_98534e8bfabc615ff7d5"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t480_f32_n15"
+    ]
+  },
+  "routing_dyn_block_t512_bf16_ids_n16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t512_bf16_ids_n16",
+    "tokens": 16,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_bf81684716f8abab06d1"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t512_bf16_ids_n16"
+    ]
+  },
+  "routing_dyn_block_t512_bf16_n16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t512_bf16_n16",
+    "tokens": 16,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_58872b8ecc4b72fcfae2"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t512_bf16_n16"
+    ]
+  },
+  "routing_dyn_block_t512_f32_n16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "dyn_block_t512_f32_n16",
+    "tokens": 16,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_52e00418e5fbb3658e6c"
+      }
+    ],
+    "shapes": [
+      "routing_dyn_block_t512_f32_n16"
+    ]
+  },
+  "routing_static_block_t128_bf16": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "static_block_t128_bf16",
+    "tokens": 4,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_149b84ba72a501e9f419"
+      }
+    ],
+    "shapes": [
+      "routing_static_block_t128_bf16"
+    ]
+  },
+  "routing_static_block_t128_bf16_ids": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "static_block_t128_bf16_ids",
+    "tokens": 4,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_59b4ebbee6bc72a686d9"
+      }
+    ],
+    "shapes": [
+      "routing_static_block_t128_bf16_ids"
+    ]
+  },
+  "routing_static_block_t128_f32": {
+    "kind": "routing",
+    "family": null,
+    "tile_n": null,
+    "variant": "static_block_t128_f32",
+    "tokens": 4,
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "stages": [
+      {
+        "name": "routing",
+        "program": "cake_stepfun_moe_ae217b5e6c838affbdf0"
+      }
+    ],
+    "shapes": [
+      "routing_static_block_t128_f32"
+    ]
+  }
+}

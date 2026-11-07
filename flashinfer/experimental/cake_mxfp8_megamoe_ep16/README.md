@@ -1,8 +1,8 @@
 # MXFP8 MegaMoE EP16
 
 This directory contains experimental JIT-only CUDA and CuTe-DSL backends for a
-fixed MXFP8 MegaMoE configuration on SM100 and SM103 devices (compute
-capability 10.0 or 10.3).
+fixed MXFP8 MegaMoE configuration on SM100, SM103 and SM107 devices (compute
+capability 10.0, 10.3 or 10.7).
 
 The public entry points are
 `flashinfer.moe_ep.CakeMxfp8MegaMoeEp16` and
@@ -41,17 +41,28 @@ forward path.
 
 - `cake_mxfp8_megamoe_ep16_fused_kernel.cu` with the fused kernel body in
   `cake_mxfp8_megamoe_ep16_fused_body.cuh`. The body is included once per
-  return protocol (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0: CTA-0 coordinator for 16
-  and 64 tokens per rank; 1: all-CTA protocol for 32), so both kernel symbols
-  come from one text. The host binding selects the symbol by token count.
+  token specialization (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0 for 16 and 64 tokens
+  per rank, 1 for 32), so both kernel symbols come from one text. Both return
+  the FC2 route terms with relaxed system-scope stores into the source rank's
+  route-term words, which the reducer waits on. The host binding selects the
+  symbol by token count.
 - the ordered route reducer and the tvm-ffi binding;
-- `cute/`: the CuTe-DSL fused kernel (`compile_program(return_all_cta, arch)`)
-  and reducer (`compile_program(arch)`).
+- `cute/`: the CuTe-DSL programs, one per architecture: the fused kernel with
+  the CTA-0 return (`..._fused_<arch>.py`, 16 and 64 tokens per rank) and with
+  the all-CTA return (`..._fused_return_all_cta_<arch>.py`, 32 tokens per
+  rank), and the reducer (`..._topk_reduce_<arch>.py`). Each defines
+  `compile_program(*options, ranks, aligned)` for its own architecture and a
+  host check of the launch arguments.
 
 The JIT loader builds one module per admitted architecture that is also a
 FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
-`sm_100a` and `sm_103a`. The manifest lists the sources and launch facts; it
-does not re-verify digests at import time.
+`sm_100a`, `sm_103a` and `sm_107a`. The `sm_107a` target needs CUDA 13.4 or
+newer. The fused kernel runs a static schedule on a cooperative grid of
+two-CTA clusters, one CTA per SM: 72 clusters (144 CTAs), except on SM107,
+where the CUDA module defines `CAKE_MEGAMOE_GRID_CLUSTERS=104` and the CuTe-DSL
+programs run the same 104-cluster schedule (208 CTAs). Both backends refuse a
+device with fewer SMs than their grid has CTAs. The manifest lists the sources
+and launch facts; it does not re-verify digests at import time.
 
 ## Supported contract
 
@@ -62,26 +73,44 @@ does not re-verify digests at import time.
 - BF16 activations and outputs with MXFP8 expert weights
 - immutable routing prepared with the session, with at most 64 routes assigned
   to any expert across all ranks
-- compute capability 10.0 or 10.3 and NVSHMEM symmetric memory
+- compute capability 10.0, 10.3 or 10.7 and NVSHMEM symmetric memory
 
-End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
-(SM103). The SM100 target is admitted from the same source: the device text
-has no architecture-dependent code and uses only instructions shared by both
-targets; it is compile-proven on B200, and the 16-rank test has not been run
-there.
+The top-k reducer waits for every route term of the forward. Routing outside
+this contract (for example routing changed in place after the session is
+created) leaves route terms unwritten and hangs the forward on all ranks.
+
+End-to-end EP16 correctness and performance were measured for both backends on
+16 GB300 GPUs (SM103) and on 16 R200 GPUs (SM107, four nodes of one NVL72
+domain). Both backends return bitwise-identical outputs there. At 16 to 64
+tokens per rank, the CuTe-DSL forward takes about 6% to 7% longer than the CUDA
+forward on SM103 and about 9% to 11% longer on SM107. The SM100 target is
+admitted from the same source: the device text has no architecture-dependent
+code and uses only instructions shared by all three targets; it is
+compile-proven on B200, and the 16-rank test has not been run there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
-one setup kernel. CuTe-DSL prepares tensor-map dimensions and strides on the
-host and passes descriptors by value through the compiled host entry.
+one setup kernel. The CuTe-DSL host entry encodes the tensor maps from the bound
+tensors and passes them by value; its host check validates the bound geometry
+once at session construction.
 
 Both implementations synchronize before session construction returns. Each
 forward then uses exactly two kernels: the first publishes and dispatches BF16
 rows, executes FC1 and FC2, and returns one contribution per route; the second
-reduces the eight route contributions in a fixed order. Neither implementation
-allocates device storage in the forward path. CUDA Graph capture is not supported.
+reduces the eight route contributions in a fixed order. Both fused kernels
+store each rank's routes into that rank's slot on every rank, and each BF16 row
+into that rank's slot on the ranks that own the row's experts, so dispatch reads
+rows and routes from local memory. Both use the same workspace layout. The
+reducer waits until no route-term word it reads is all ones. The CUDA fused
+kernel sets its rank's route terms to all ones on the first forward, and the
+CUDA reducer sets the words it read back to all ones for the next forward. The
+CuTe-DSL fused kernel instead sets its rank's route terms to all ones on every
+forward, before its publication barrier, and the CuTe-DSL reducer leaves them
+as it read them. A session runs one implementation's fused kernel and reducer.
+Neither implementation allocates device storage in the forward path. CUDA Graph
+capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
-session after 14,913,080 forwards, before its signed grid-counter epoch would
-overflow.
+session after 14,913,080 forwards (10,324,440 for both SM107 backends),
+before its signed grid-counter epoch would overflow.
 
 The backend does not participate in automatic routing, autotuning, trace
 apply, or AOT packaging. It provides no compatibility guarantee while it is

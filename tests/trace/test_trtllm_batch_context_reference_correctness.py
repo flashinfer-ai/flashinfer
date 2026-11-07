@@ -37,8 +37,18 @@ from tests.trace.reference_utils import (
         ),
     ],
 )
-def test_trtllm_batch_context_reference_correctness(shape_kwargs):
-    """trtllm_batch_context (causal prefill) kernel vs reference, SM100/103."""
+@pytest.mark.parametrize(
+    "attention_kwargs",
+    [
+        pytest.param({}, id="causal"),
+        pytest.param(
+            {"causal": False, "window_left": 7, "window_right": 5},
+            id="noncausal-two-sided-window",
+        ),
+    ],
+)
+def test_trtllm_batch_context_reference_correctness(shape_kwargs, attention_kwargs):
+    """TRTLLM-Gen paged-context kernel vs trace reference, SM100/SM103."""
     from flashinfer.prefill import trtllm_batch_context_with_kv_cache
     from flashinfer.trace.templates.attention import trtllm_batch_context_trace
 
@@ -77,6 +87,7 @@ def test_trtllm_batch_context_reference_correctness(shape_kwargs):
         cum_seq_lens_q=cum_q,
         cum_seq_lens_kv=cum_kv,
         kv_layout="HND",
+        **attention_kwargs,
     )
     ref_out = trtllm_batch_context_trace.reference(
         q,
@@ -92,6 +103,7 @@ def test_trtllm_batch_context_reference_correctness(shape_kwargs):
         cum_q,
         cum_kv,
         kv_layout="HND",
+        **attention_kwargs,
     )
     # Matches tests/attention/test_cudnn_prefill.py bf16 tolerance.
     _check(trtllm_batch_context_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)

@@ -23,11 +23,14 @@ from .cpp_ext import is_cuda_version_at_least
 
 MiniMaxH3MlpTarget = Literal["sm100a", "sm103a"]
 
-# Exact-architecture tcgen05 payloads: one generated source per target, compiled with that
-# target's flags only (no fatbin; the 2-CTA MMA / TMEM code is not portable across 10.x minors).
+# Exact-architecture tcgen05 payloads: one generated source shared by both targets,
+# compiled once per target with that target's flags only (no fatbin; the 2-CTA MMA /
+# TMEM code is not portable across 10.x minors).  MINIMAX_H3_SM_MINOR pins the host
+# capability check of each build to the compiled minor.
+_CUDA_SOURCE_NAME = "cake_minimax_h3_mlp_sm10x.cu"
 _TARGETS = {
-    "sm100a": ("cake_minimax_h3_mlp_sm100a.cu", sm100a_nvcc_flags),
-    "sm103a": ("cake_minimax_h3_mlp_sm103a.cu", sm103a_nvcc_flags),
+    "sm100a": (_CUDA_SOURCE_NAME, [*sm100a_nvcc_flags, "-DMINIMAX_H3_SM_MINOR=0"]),
+    "sm103a": (_CUDA_SOURCE_NAME, [*sm103a_nvcc_flags, "-DMINIMAX_H3_SM_MINOR=3"]),
 }
 _CAPABILITY_TO_TARGET: Dict[Tuple[int, int], MiniMaxH3MlpTarget] = {
     (10, 0): "sm100a",
@@ -71,9 +74,10 @@ def gen_minimax_h3_mlp_module(target: MiniMaxH3MlpTarget) -> JitSpec:
     SwiGLU + FC2 + indexed gate + residual; BF16, MXFP8 and NVFP4 variants) on one exact
     Blackwell target.
 
-    The module exposes ``minimax_h3_mlp``, ``minimax_h3_mlp_mxfp8`` and
-    ``minimax_h3_mlp_nvfp4``.  The device code is tcgen05 + TMEM + 2-CTA MMA and does not
-    compile for SM90 or SM120.
+    The module exposes ``minimax_h3_mlp``, ``minimax_h3_mlp_mxfp8``,
+    ``minimax_h3_mlp_mxfp8_w448`` (the MXFP8 operator on the 256x448 FC1 tile) and
+    ``minimax_h3_mlp_nvfp4``; each takes its launch grids from the caller.  The device code
+    is tcgen05 + TMEM + 2-CTA MMA and does not compile for SM90 or SM120.
     """
 
     if target not in _TARGETS:
@@ -85,7 +89,7 @@ def gen_minimax_h3_mlp_module(target: MiniMaxH3MlpTarget) -> JitSpec:
     # precise build the Cake runtime compiles; FlashInfer's default -use_fast_math (ftz, approximate
     # division / sqrt) would make this module differ from that build by one BF16 ulp on rare elements.
     return gen_jit_spec(
-        f"minimax_h3_mlp_{target}_v1",
+        f"minimax_h3_mlp_{target}_v3",
         [source],
         extra_cuda_cflags=list(_TARGETS[target][1]),
         use_fast_math=False,

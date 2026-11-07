@@ -376,6 +376,7 @@ def create_trtllm_moe_test_data(
     weight_dtype: torch.dtype,
     device: torch.device,
     moe_kernel_type: str = "fp8_per_tensor",
+    activation_type: ActivationType = ActivationType.Swiglu,
 ):
     """
     Create test data for TensorRT-LLM fused MoE benchmarking (trtllm_*_moe APIs).
@@ -429,7 +430,12 @@ def create_trtllm_moe_test_data(
 
     # Create weights - always start with bfloat16 for proper quantization
     gemm1_weights, gemm2_weights = generate_moe_weights(
-        num_experts, hidden_size, intermediate_size, device, dtype=torch.bfloat16
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device,
+        dtype=torch.bfloat16,
+        is_gated=is_gated_activation(activation_type),
     )
 
     return routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights
@@ -556,6 +562,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
     activation_type = args.activation_type
+    gemm1_rows = intermediate_size * (2 if is_gated_activation(activation_type) else 1)
     res = []
 
     backends = ["trtllm"]
@@ -583,6 +590,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp4_block_scale",
+            activation_type=activation_type,
         )
     )
 
@@ -671,10 +679,10 @@ def testTrtllmFp4BlockScaleMoe(args):
         return (n + 3) // 4 * 4
 
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        num_experts, gemm1_rows, hidden_size // 2
     )
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
+        num_experts, _sf_outer(gemm1_rows), _sf_inner(hidden_size)
     )
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
@@ -812,7 +820,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[
         fp4_mode
@@ -832,7 +840,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -2718,6 +2726,12 @@ def testTrtllmFp8BlockScaleMoe(args):
     routing_method_type = args.routing_method_type
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
+    activation_type = args.activation_type
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError(
+            "trtllm_fp8_block_scale_moe supports only Swiglu activation, "
+            f"got {activation_type.name}"
+        )
     is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
     backends = ["trtllm"]
@@ -2745,6 +2759,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp8_block_scale",
+            activation_type=activation_type,
         )
     )
 
@@ -2879,7 +2894,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -2895,6 +2910,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
+        is_gated=is_gated_activation(args.activation_type),
     )
 
     backend = "trtllm"
@@ -2987,6 +3003,11 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     routing_method_type = args.routing_method_type
     use_routing_scales_on_input = args.use_routing_scales_on_input
     is_cuda_graph_compatible = not args.no_cuda_graph
+    if not is_gated_activation(args.activation_type):
+        raise ValueError(
+            "trtllm_fp8_per_tensor_scale_moe supports only gated activations, "
+            f"got {args.activation_type.name}"
+        )
     res = []
     backends = ["trtllm"]
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -3013,6 +3034,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             weight_dtype,
             device,
             moe_kernel_type="fp8_per_tensor",
+            activation_type=args.activation_type,
         )
     )
 
@@ -3115,7 +3137,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated_activation(args.activation_type),
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -3131,6 +3153,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
+        is_gated=is_gated_activation(args.activation_type),
     )
 
     backend = "trtllm"

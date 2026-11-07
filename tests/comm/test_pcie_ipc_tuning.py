@@ -21,8 +21,10 @@ reduced with the wrong operator. The multi-GPU tests can only observe the
 consequences, and one of the consequences is a hang.
 """
 
+import ast
 import inspect
 import json
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -87,8 +89,10 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         for t in tuning.TUNE_THREADS
         if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    # Stream publication is off by default, and both of its variants with it.
     expected_rejected |= {
-        (int(IpcVariant.COPY_ENGINE_RING_MEMOP), b, t)
+        (int(v), b, t)
+        for v in (IpcVariant.COPY_ENGINE_RING_MEMOP, IpcVariant.COPY_ENGINE_RING_PIPED)
         for b in tuning.TUNE_BLOCKS
         for t in tuning.TUNE_THREADS
     }
@@ -104,6 +108,7 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
             int(IpcVariant.FLAT_STAGED),
             int(IpcVariant.COPY_ENGINE_ISLAND),
             int(IpcVariant.COPY_ENGINE_RING_MEMOP),
+            int(IpcVariant.COPY_ENGINE_RING_PIPED),
         )
         or (
             t[0] == int(IpcVariant.COPY_ENGINE_RING)
@@ -226,6 +231,34 @@ def test_survivor_count_is_a_constant_not_a_threshold() -> None:
     assert "return [TABLE_TACTIC] + kept" in src
 
 
+def _calls_in_source_order(fn) -> list[str]:
+    """The callee of every call in ``fn``, in source order."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    calls = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    return [ast.unparse(node.func) for node in calls]
+
+
+def test_the_barrier_precedes_the_first_collective_launch() -> None:
+    """A barrier sits between the allocations and the first collective launch.
+
+    The warm-up spins with no timeout, so a rank that fails before it must leave
+    its peers in NCCL, not in the kernel.
+    """
+    calls = _calls_in_source_order(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    first_launch = calls.index("ws._launch")
+    barriers = [i for i, c in enumerate(calls[:first_launch]) if c == "dist.barrier"]
+    assert barriers, f"a collective launch is issued before any barrier: {calls}"
+    allocations = [
+        i
+        for i, c in enumerate(calls[:first_launch])
+        if c in ("inp.clone", "self._output_for", "torch.zeros", "torch.cuda.Event")
+    ]
+    assert allocations and max(allocations) < barriers[-1], calls
+
+
 def test_timings_are_reduced_with_max(monkeypatch) -> None:
     """MAX, and reduced at all -- a rank-local ranking is the deadlock above."""
     seen = {}
@@ -241,6 +274,86 @@ def test_timings_are_reduced_with_max(monkeypatch) -> None:
     monkeypatch.setattr(tuning, "dist", _FakeDist)
     tuning.reduce_timings(torch.tensor([1.0, 2.0]), group=None)
     assert seen["op"] == _FakeDist.ReduceOp.MAX
+
+
+# The copy-engine plane; every other variant runs on the SM.
+_CE_VARIANTS = (
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+    IpcVariant.COPY_ENGINE_RING_PIPED,
+)
+
+
+def _on_ce_plane(config) -> bool:
+    return config.variant in _CE_VARIANTS
+
+
+def _stranded(configs, order):
+    """Candidates that every ranking round times right after a plane switch.
+
+    Models get_valid_tactics: one warm-up launch per variant, then the rounds.
+    """
+    warmed = []
+    for config in configs:
+        if all(config.variant != w.variant for w in warmed):
+            warmed.append(config)
+    previous = warmed[-1]
+    escaped = set()
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        for i in order(len(configs), r):
+            if _on_ce_plane(previous) == _on_ce_plane(configs[i]):
+                escaped.add(i)
+            previous = configs[i]
+    return [c for i, c in enumerate(configs) if i not in escaped]
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 121])
+def test_each_ranking_round_times_every_candidate_once(n: int) -> None:
+    """Every round times each candidate once, and round 0 runs in list order."""
+    for r in range(tuning.TUNE_RANK_ROUNDS):
+        assert sorted(tuning._round_order(n, r)) == list(range(n)), (n, r)
+    assert list(tuning._round_order(n, 0)) == list(range(n))
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize("profile", [PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR])
+@pytest.mark.parametrize("memop_supported", [False, True])
+@pytest.mark.parametrize("numel", [64 * 1024, 1024 * 6144, 8192 * 6144])
+def test_no_candidate_is_timed_behind_a_plane_switch_in_every_round(
+    world_size: int, profile: str, memop_supported: bool, numel: int
+) -> None:
+    """Every candidate gets at least one round free of a plane switch."""
+    tactics = tuning.candidate_tactics(
+        world_size, numel=numel, profile=profile, memop_supported=memop_supported
+    )
+    seed = get_pcie_ipc_launch_config(world_size, numel, 2)
+    configs = [seed] + [tuning.tactic_to_config(t) for t in tactics]
+
+    assert _stranded(configs, tuning._round_order) == []
+    # Not vacuous: a fixed order strands the first copy-engine candidate.
+    first_ce = next(c for c in configs if _on_ce_plane(c))
+    assert first_ce in _stranded(configs, lambda n, r: range(n))
+
+
+def test_the_ranking_rounds_take_their_order_from_round_order() -> None:
+    """The order property above is only worth anything if the loop uses it."""
+    src = inspect.getsource(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    loops = [
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(src)))
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and ast.unparse(node.iter.func) == "_round_order"
+    ]
+    assert len(loops) == 1, "the ranking rounds must iterate _round_order"
+    assert ast.unparse(loops[0].target) == "i", ast.unparse(loops[0].target)
+    calls = {
+        ast.unparse(node.func)
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Call)
+    }
+    assert {"ws._launch", "starts[r][i].record", "ends[r][i].record"} <= calls, calls
 
 
 def test_the_prefill_screen_keeps_every_measured_prefill_winner() -> None:
@@ -360,6 +473,8 @@ def test_resolve_falls_back_to_the_seed() -> None:
     assert resolve(seed, (0, 128, 128), 8, 32) is seed
     # Stale: a variant this world size does not dispatch.
     assert resolve(seed, (int(IpcVariant.FLAT_STAGED), 1, 128), 4, MAX_BLOCKS) is seed
+    # Stale: a copy-engine depth past the workspace's max_blocks.
+    assert resolve(seed, (int(IpcVariant.COPY_ENGINE_RING), 2, 256), 8, 1) is seed
     # Usable.
     assert resolve(seed, (int(IpcVariant.STAGED_RING), 2, 256), 8, MAX_BLOCKS) == (
         IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
@@ -394,6 +509,14 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
     ):
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
+    # The slow-hop mask shapes only the pipelined ring, which only
+    # stream-publication workspaces search, so it keys those alone.
+    memop = {**base, "memop_supported": True}
+    assert tuning.cache_key_extras(**memop, slow_hops=0b10001000) != (
+        tuning.cache_key_extras(**memop)
+    )
+    assert tuning.cache_key_extras(**base, slow_hops=0b10001000) == reference
+
 
 def _synthesise_cache(monkeypatch, *entries) -> None:
     """Install file-backed entries keyed the way ``save_configs`` writes them."""
@@ -413,7 +536,7 @@ def _synthesise_cache(monkeypatch, *entries) -> None:
 def test_original_and_memop_cache_namespaces_remain_loadable(
     memop_supported, monkeypatch, tmp_path
 ) -> None:
-    """Original v3 caches still hit; enabled SM120 retains its separate v4 key."""
+    """Original v3 caches still hit; enabled SM120 keeps a separate v5 key."""
     from flashinfer.autotuner import AutoTuner
 
     workspace_fields = dict(
@@ -421,7 +544,7 @@ def test_original_and_memop_cache_namespaces_remain_loadable(
     )
     # Literal persisted formats, independent of the current key builder.
     if memop_supported:
-        head = (4, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True)
+        head = (5, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True, 0)
     else:
         head = (3, 4, PROFILE_ROOTCPLX, 128, 6144 * 128)
     extras = head + ("torch.bfloat16",)
@@ -718,8 +841,47 @@ def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
     common = dict(world_size=world_size, numel=12 * 1024 * 1024 // 2)
     legacy = set(tuning.candidate_tactics(**common, memop_supported=False))
     enabled = set(tuning.candidate_tactics(**common, memop_supported=True))
+    # The pipelined ring has its own admission, tested below.
+    piped = int(IpcVariant.COPY_ENGINE_RING_PIPED)
+    added = {t for t in enabled - legacy if t[0] != piped}
     expected = {(6, 1, 256)} if world_size in (4, 8) else set()
-    assert enabled - legacy == expected
+    assert added == expected
     assert legacy <= enabled
     assert tuning.TUNE_RANK_ROUNDS == 3
     assert tuning.TUNE_SURVIVORS == 48
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pipelined_ring_is_offered_at_every_depth_from_its_chunk_floor(world_size):
+    """Stream publication and a chunk of at least the floor, or no depth at all.
+
+    Below the floor every depth is still launchable -- only measuring it is
+    withheld -- so the shape tunes exactly as it did before the schedule existed.
+    """
+    piped = int(IpcVariant.COPY_ENGINE_RING_PIPED)
+    # Two-byte elements; at `floor` each rank's chunk is exactly the floor.
+    floor = tuning.PIPED_MIN_CHUNK_BYTES * world_size // 2
+    every_depth = set(range(1, policy.CE_MAX_PIECES + 1))
+    for numel, memop_supported, offered in (
+        (floor, True, world_size in (4, 8)),
+        (8 * floor, True, world_size in (4, 8)),
+        (floor // 2, True, False),
+        (floor, False, False),
+    ):
+        depths = {
+            b
+            for v, b, _t in tuning.candidate_tactics(
+                world_size, numel=numel, memop_supported=memop_supported
+            )
+            if v == piped
+        }
+        assert depths == (every_depth if offered else set()), (numel, memop_supported)
+        if world_size in (4, 8):
+            for depth in every_depth:
+                assert _is_launchable(
+                    world_size,
+                    IpcLaunchConfig(depth, policy.CE_THREADS, IpcVariant(piped)),
+                    MAX_BLOCKS,
+                    numel,
+                    2,
+                ), (numel, depth)

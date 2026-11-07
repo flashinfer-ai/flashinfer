@@ -53,19 +53,23 @@ Enable Cake CP explicitly with
 ``chunk_gated_delta_rule(..., backend="cake_gdn", use_cp=True)``.
 ``backend="auto"`` and ``backend="flashinfer"`` keep the existing FlashInfer
 CP routing. With ``backend="cake_gdn"``, ``use_cp=False`` or ``"auto"``
-continues to select the non-CP Cake backend.
+continues to select the non-CP Cake backend.  On SM107a, ``"auto"`` with BF16
+inputs and FP32 initial and final state raises ``CakeGDNUnsupportedError``
+when the longest sequence has at least 8192 tokens and ``num_seqs * num_heads``
+is at most 32, or at least 4096 tokens and at most 8: the default backend is
+faster there.
 
-The Cake GDN CP backend covers the complete legal SM100a/SM103a public context-
-parallel input domain.  It preserves ``T precompute -> MN precompute -> state
-fixup -> CP prefill`` and supports the public dtype, head-mapping, optional
-gate/scale, int32/int64 cu-seqlens and state indices, mixed or all-empty
-varlen batches, Q/K L2 normalization, checkpoints, output, and arbitrary
-positive non-overlapping packed/indexed/in-place state strides.
-The runtime manifest records only the source inventory and loading metadata.
+The Cake GDN CP backend covers the complete legal public context-parallel input
+domain on SM100a/SM103a/SM107a.  It preserves ``T precompute -> MN
+precompute -> state fixup -> CP prefill`` and supports the public dtype,
+head-mapping, optional gate/scale, int32/int64 cu-seqlens and state indices,
+mixed or all-empty varlen batches, Q/K L2 normalization, checkpoints, output,
+and arbitrary positive non-overlapping packed/indexed/in-place state strides.
 
-On SM100a/SM103a, the ``gdn_cp`` route uses checked-in CUDA sources and is
-supported with CUDA 12.8, CUDA 12.9, and CUDA 13 for FP16/BF16 inputs plus
-FP32/FP16/BF16 state and FP32 checkpoints. Other SM100 context-parallel DSL
+On SM100a/SM103a/SM107a, the ``gdn_cp`` route uses checked-in CUDA sources for
+FP16/BF16 inputs plus FP32/FP16/BF16 state and FP32 checkpoints. SM100a/SM103a
+are supported with CUDA 12.8, CUDA 12.9, and CUDA 13; SM107a needs a toolkit
+whose ``nvcc`` can emit ``compute_107a``. Other SM100 context-parallel DSL
 routes, including FP8 state or checkpoints, require CUDA 13 and
 ``nvidia-cutlass-dsl[cu13]>=4.4.2``.
 

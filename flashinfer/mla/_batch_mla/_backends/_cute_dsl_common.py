@@ -56,10 +56,15 @@ class _CuteDslMlaExecutionState:
     Int32: Any
 
 
-def _validate_cute_dsl_plan_args_before_metadata(args: _MLAPlanArguments) -> None:
-    if args.output_dtype not in (torch.float16, torch.bfloat16):
+def _validate_cute_dsl_plan_args_before_metadata(
+    args: _MLAPlanArguments, *, supports_fp8_output: bool = False
+) -> None:
+    output_types: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
+    if supports_fp8_output:
+        output_types += (torch.float8_e4m3fn,)
+    if args.output_dtype not in output_types:
         raise _BackendPlanUnsupportedError(
-            "cute-dsl backend requires a float16 or bfloat16 output contract without o_scale."
+            "cute-dsl backend does not support the requested output dtype."
         )
     if args.use_profiler:
         raise _BackendPlanUnsupportedError(
@@ -163,17 +168,18 @@ def _prepare_cute_dsl_mla_execution_state(
     output_dtype: torch.dtype,
     causal: bool,
     supports_variable_q: bool,
+    causal_multi_q: bool,
+    always_live_kv: bool,
     compile_kernel: Callable[..., tuple[Any, Any, torch.Tensor, int, int]],
 ) -> _CuteDslMlaExecutionState:
     batch_size, total_q, actual_max_q_len, is_uniform, q_len = _q_layout(cum_seq_lens_q)
     if not is_uniform and not supports_variable_q:
         raise _BackendPlanUnsupportedError(
-            "cute-dsl-modular does not support compact variable-Q metadata."
+            "This cute-dsl backend does not support compact variable-Q metadata."
         )
-    if actual_max_q_len > 1 and causal != supports_variable_q:
+    if actual_max_q_len > 1 and causal != causal_multi_q:
         raise _BackendPlanUnsupportedError(
-            "cute-dsl-monolithic multi-Q requires causal=True; "
-            "cute-dsl-modular multi-Q requires causal=False."
+            f"This cute-dsl backend requires causal={causal_multi_q} for multi-Q."
         )
     if max_q_len < actual_max_q_len:
         raise _BackendPlanUnsupportedError(
@@ -203,7 +209,7 @@ def _prepare_cute_dsl_mla_execution_state(
             "cute-dsl backend requires positive seq_lens."
         )
     has_variable_kv_lengths = bool(torch.any(seq_lens_host != seq_lens_host[0]).item())
-    resolved_is_var_seq = use_cuda_graph or has_variable_kv_lengths
+    resolved_is_var_seq = always_live_kv or use_cuda_graph or has_variable_kv_lengths
 
     out_dtype = output_dtype
     try:
@@ -403,8 +409,12 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     _supports_lse = False
     _reject_cuda_graph = False
     _supports_variable_q = False
+    _causal_multi_q = False
+    _always_live_kv = False
+    _supports_fp8_output = False
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _plan_capabilities: ClassVar[MLAPlanCapabilities]
+    _execution_state: _CuteDslMlaExecutionState
 
     # Call-local state populated by the concrete functional factories.
     _functional_run: Callable[..., Any]
@@ -437,6 +447,11 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     def plan_from_wrapper(
         cls: type[_CuteDslBackendT], args: _MLAPlanArguments
     ) -> _CuteDslBackendT:
+        if (
+            args._float_workspace_buffer.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError("CuTe MLA plan() must finish before CUDA graph capture.")
         cls.preflight_plan_from_wrapper(args)
         args.require_cuda_graph_dense_metadata(cls._backend_name)
         dense = args.device_dense(table_width_alignment=128 // args.page_size)
@@ -462,7 +477,9 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     @classmethod
     def preflight_plan_from_wrapper(cls, args: _MLAPlanArguments) -> None:
         try:
-            _validate_cute_dsl_plan_args_before_metadata(args)
+            _validate_cute_dsl_plan_args_before_metadata(
+                args, supports_fp8_output=cls._supports_fp8_output
+            )
             if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
                 raise _BackendPlanUnsupportedError(reason)
             if cls._reject_cuda_graph and args._use_cuda_graph:
@@ -509,6 +526,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
             output_dtype=output_dtype,
             causal=causal,
             supports_variable_q=self._supports_variable_q,
+            causal_multi_q=self._causal_multi_q,
+            always_live_kv=self._always_live_kv,
             compile_kernel=self._compile_kernel,
         )
 
