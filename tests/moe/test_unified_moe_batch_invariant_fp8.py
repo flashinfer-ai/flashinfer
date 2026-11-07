@@ -1042,61 +1042,112 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
 
 
-def _torch_fp8_reference(x, ids, weights, view, act) -> torch.Tensor:
-    """FlashInfer's torch reference of the fp8 per-tensor MoE (``tests/moe/test_unified_moe_fp8.py``'s form) on the class's own
-    quantized experts and scales: dequantized e4m3 operands, fp32 products, the intermediate requantized through the same
-    multiplier, bf16 expert outputs, the routed sum."""
-    from flashinfer.fused_moe.batch_invariant.api_fp8 import MoEWeightsE4M3
-    from tests.moe.utils import compute_reference_activation
+def _flashinfer_fp8_per_tensor_reference(
+    x, w1, w2, ids, weights, m_x, m_inter, act, activation_fn=None
+) -> torch.Tensor:
+    """FlashInfer's torch reference of the fp8 per-tensor MoE: the form of ``tests/moe/test_unified_moe_fp8.py``'s
+    ``_per_tensor_fp8_reference`` (the reference its TRTLLM-Gen backend is checked against), computed here from the canonical
+    bf16 weights. The activations and every expert quantized to e4m3 by the static multipliers (``448 / amax`` per expert) and
+    dequantized to fp32; fp32 GEMM1; the typed activation in fp32 (``tests.moe.utils.compute_reference_activation``'s formulas,
+    the layer's own, so every activation is covered; FlashInfer's form spells out SwiGLU / SwiGLUStep / GeGLU / ReLU2); the
+    intermediate requantized through the static multiplier; bf16 expert outputs; the routing weights rounded to bf16; the fp32
+    routed sum. Independent of the class (its exact model is :mod:`flashinfer.fused_moe.batch_invariant.spec_fp8`; the bitwise
+    tests above are the promise). ``activation_fn`` replaces the activation (the negative control of the tolerance)."""
+    from tests.moe.utils import compute_reference_activation, powlu_ref
 
-    W = MoEWeightsE4M3.from_view(view)
-    fp8_max = 448.0
-    x_deq = x.float() / W.m_x
-    I = W.intermediate_size
-    out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
-    for e in range(W.num_experts):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    weights = weights.to(torch.bfloat16).float()
+    x_deq = (x.float() * m_x).clamp(-fp8_max, fp8_max).to(
+        torch.float8_e4m3fn
+    ).float() / m_x
+
+    def quant_dequant(w):
+        amax = w.float().abs().amax(dim=(-1, -2))
+        s = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+        q = (w.float() * s[:, None, None]).clamp(-fp8_max, fp8_max)
+        return q.to(torch.float8_e4m3fn).float() / s[:, None, None]
+
+    w1_deq, w2_deq = quant_dequant(w1), quant_dequant(w2)
+    I = w2.shape[2]
+    if activation_fn is None:
+
+        def activation_fn(gemm1):
+            if isinstance(
+                act, PowLU
+            ):  # FlashInfer's PowLU form (``tests/moe/test_unified_moe_cutlass.py``): the
+                up, gate = gemm1.split(
+                    I, dim=-1
+                )  # adaptive power on the gate, the limit clamps both branches
+                g = powlu_ref(gate, act.m)
+                if act.limit is not None:
+                    g = g.clamp_max(act.limit)
+                    up = up.clamp(-act.limit, act.limit)
+                return g * up
+            return compute_reference_activation(gemm1, act, I, out_dtype=torch.float32)
+
+    out = torch.zeros_like(x_deq)
+    for e in range(w1.shape[0]):
         tok, slot = torch.where(ids == e)
         if tok.numel() == 0:
             continue
-        w1 = W.w1q[e].float() * W.s_w1[e]
-        if W.gated:  # back to the canonical [up, gate] rows for the torch activation
-            w1 = w1.view(I // 8, 2, 8, -1)
-            w1 = torch.cat([w1[:, 0].reshape(I, -1), w1[:, 1].reshape(I, -1)], 0)
-        gemm1 = (x_deq[tok] @ w1.t()).to(torch.bfloat16)
-        inter = compute_reference_activation(gemm1, act, I).float()
-        inter_q = (inter * W.m_inter).clamp(-fp8_max, fp8_max).to(
+        inter = activation_fn(x_deq[tok] @ w1_deq[e].t())
+        inter_deq = (inter * m_inter).clamp(-fp8_max, fp8_max).to(
             torch.float8_e4m3fn
-        ).float() / W.m_inter
-        y = (inter_q @ (W.w2q[e].float() * W.s_w2[e]).t()).to(torch.bfloat16).float()
+        ).float() / m_inter
+        y = (inter_deq @ w2_deq[e].t()).to(torch.bfloat16).float()
         out[tok] += weights[tok, slot, None] * y
-    return out.to(torch.bfloat16)
+    return out
+
+
+def _wrong_activation(act, I: int):
+    """A genuinely different formula over the same weights and scales (FlashInfer's negative control: the tolerance must
+    reject it): the up branch alone for a gated activation, plain ReLU for an ungated one (the identity for ReLU itself)."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    if activation_of(act).gated:
+        return lambda gemm1: gemm1[:, :I]
+    if isinstance(act, ReLU):
+        return lambda gemm1: gemm1
+    return torch.relu
 
 
 @needs_device
-@pytest.mark.parametrize("act", [SwiGLU(), ReLU2()], ids=["swiglu", "relu2"])
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
 def test_plausible_against_flashinfers_fp8_torch_reference(act):
-    """An observation, not a promise of the class: on moderate inputs the layer lands near FlashInfer's torch reference of the
-    fp8 per-tensor MoE computed on the class's own quantized experts (the differences are the fold order and the chain's
-    rounding points: the reference rounds GEMM1 to bf16 before the activation, the class does not)."""
+    """An observation on moderate inputs under FlashInfer's own discipline for this quantization pair
+    (``tests/moe/test_unified_moe_fp8.py``: ``check_accuracy`` at atol 0.05 / rtol 0.3 on 99 % of the outputs against the torch
+    reference above, and the negative control that the tolerance rejects a wrong activation formula). Not a promise of the
+    class (the reference and the class round at different points; the exact model is the promise, tested bit for bit above),
+    and never a comparison with another backend's output."""
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
+    from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
     T, k, H, I, E = 128, 4, 512, 256, 32
+    m_inter = 8.0
     x, logits, w1, w2, m_x = _problem(
         T, k, H, I, E, seed=11, gated=activation_of(act).gated
     )
-    xq = _xq(x, m_x)
-    W = _weights(w1, w2, m_x, act, m_inter=8.0)
-    out = _layer(k, E, I, act)(_logits_pack(xq, logits), W).float()
-    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    ref = _torch_fp8_reference(
-        xq,
-        ids.cuda(),
-        weights.cuda(),
-        W.get_view(BatchInvariantMoeFp8Runner.backend_key),
-        act,
+    out = _layer(k, E, I, act)(
+        _logits_pack(_xq(x, m_x), logits), _weights(w1, w2, m_x, act, m_inter=m_inter)
     ).float()
-    cos = torch.nn.functional.cosine_similarity(
-        out.view(-1), ref.view(-1), dim=0
-    ).item()
-    rel = ((out - ref).abs().max() / ref.abs().max().clamp_min(1e-30)).item()
-    assert cos > 0.999 and rel < 5e-2, (cos, rel)
+    vals, ids = torch.topk(
+        logits, k, dim=-1
+    )  # the layer's Renormalize routing: top-k, softmax over the selected
+    weights = torch.softmax(vals, dim=-1)
+    ref = _flashinfer_fp8_per_tensor_reference(
+        x, w1, w2, ids, weights, m_x, m_inter, act
+    )
+    check_accuracy(out, ref, atol=0.05, rtol=0.3, percent=0.99)
+    wrong = _flashinfer_fp8_per_tensor_reference(
+        x,
+        w1,
+        w2,
+        ids,
+        weights,
+        m_x,
+        m_inter,
+        act,
+        activation_fn=_wrong_activation(act, I),
+    )
+    with pytest.raises(Exception, match="Mismatch percentage"):
+        check_accuracy(out, wrong, atol=0.05, rtol=0.3, percent=0.99)
