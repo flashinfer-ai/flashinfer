@@ -71,12 +71,13 @@ def test_fp4_linear_rejects_logical_scales():
         fp4_linear(a, a_scale, 1.0, w, w_scale, 1.0)
 
 
-def test_fp4_linear_bf16_matches_block_scaled_reference():
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp4_linear_bf16_matches_block_scaled_reference(enable_pdl):
     _require_gemm_gpu()
     a, a_scale, w, w_scale = _fp4_problem()
     a_sf, w_sf = _swizzled(a_scale, w_scale)
-    actual = fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0)
-    prepared = prepare_fp4_linear(w, w_sf, 1.0, 1.0)
+    actual = fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0, enable_pdl=enable_pdl)
+    prepared = prepare_fp4_linear(w, w_sf, 1.0, 1.0, enable_pdl=enable_pdl)
     prepared_actual = prepared(a, a_sf)
     expected = F.linear(
         dequantize_nvfp4(a, a_scale, 1.0), dequantize_nvfp4(w, w_scale, 1.0)
@@ -137,7 +138,8 @@ def test_fp4_swiglu_and_packed_output_contract():
         fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0, out_dtype=torch.uint8)
 
 
-def test_fp4_qkv_qknorm_rope_bf16():
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp4_qkv_qknorm_rope_bf16(enable_pdl):
     _require_gemm_gpu()
     m, n, k, head_dim = 8192, 9216, 8192, 128
     num_heads = n // (3 * head_dim)
@@ -164,6 +166,7 @@ def test_fp4_qkv_qknorm_rope_bf16():
         num_kv_heads=num_heads,
         head_dim=head_dim,
         qkv_scale=qkv_scale,
+        enable_pdl=enable_pdl,
     )
     prepared = prepare_fp4_qkv_qknorm_rope(
         w,
@@ -176,6 +179,7 @@ def test_fp4_qkv_qknorm_rope_bf16():
         num_kv_heads=num_heads,
         head_dim=head_dim,
         qkv_scale=qkv_scale,
+        enable_pdl=enable_pdl,
     )
     prepared_actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
     base = (
