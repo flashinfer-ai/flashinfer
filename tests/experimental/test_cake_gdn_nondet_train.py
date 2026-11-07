@@ -1380,8 +1380,10 @@ G3_R_FORM_ROWS = {
 
 @pytest.mark.parametrize("row", sorted(G3_R_FORM_ROWS))
 def test_group_of_three_r_form_keeps_its_bits(row, device, monkeypatch) -> None:
-    # the R form beside tail_g3_f32x gives the bits of one dhu_tc2 launch beside the package tail; without the FP32
-    # dv_local adjoint and with tail_g3 pinned, the deterministic package's bits
+    # the R form beside tail_g3_f32x gives the bits of one dhu_tc2 launch (one stream); at the same tables the package
+    # tail's bits (the planner's split table that SPLIT_R_FORM keeps serves a group of three's cluster tail only, so
+    # that comparison runs without it); without the FP32 dv_local adjoint and with tail_g3 pinned, the deterministic
+    # package's bits
     arch = cake_backend.device_arch(cake_chain._device_index(device))
     if not SERIAL_G3_R_FORM.get(arch, False):
         pytest.skip(f"{arch} runs one dhu_tc2 launch on these rows")
@@ -1397,7 +1399,15 @@ def test_group_of_three_r_form_keeps_its_bits(row, device, monkeypatch) -> None:
     assert [stage for stage, _ in launches].count(tc2) == 2, launches
     assert "tail_g3_f32x" in [stage for stage, _ in launches], launches
     _assert_same_bits(_run(inputs, seq_lens), got, OUTPUT_NAMES)
-    _assert_same_bits(_run(inputs, seq_lens, tail="tail"), got, OUTPUT_NAMES)
+    _assert_same_bits(_run(inputs, seq_lens, streams=1), got, OUTPUT_NAMES)
+    split_r_form = cake_chain.SPLIT_R_FORM
+    monkeypatch.setattr(cake_chain, "SPLIT_R_FORM", ())
+    _assert_same_bits(
+        _run(inputs, seq_lens, tail="tail", host_cache=False),
+        _run(inputs, seq_lens, host_cache=False),
+        OUTPUT_NAMES,
+    )
+    monkeypatch.setattr(cake_chain, "SPLIT_R_FORM", split_r_form)
     monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
     _assert_same_bits(
         _run(inputs, seq_lens, tail="tail_g3"),

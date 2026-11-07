@@ -2590,8 +2590,8 @@ def cake_gdn_nondet_train_backward(
         meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
     )
     # two groups (R form, :func:`adjoint_r_form`): the tcgen05 serial scan feeding a fused tail (a group of
-    # R_FORM_GROUPS; tail_g3 on TWO_STREAM_SERIAL_G3_ARCHS), and the dhu_tc2 pass 2 of a split plan feeding tail_g3 (its
-    # segments; grouped on an architecture of SPLIT_R_FORM only)
+    # R_FORM_GROUPS; a group of three's cluster tail on TWO_STREAM_SERIAL_G3_ARCHS), and the dhu_tc2 pass 2 of a split
+    # plan feeding that tail (its segments; grouped on an architecture of SPLIT_R_FORM only)
     two_groups = adjoint_r_form(
         arch, num_v_heads // num_heads, form, serial_tc=use_tc, split_tc=split_tc
     )
@@ -2967,7 +2967,7 @@ def _host_plans(
         bwd = plans[1]
         # a serial planner table that the two-stream rule groups keeps its form (the R form overlaps its scan with the
         # tail, which the pricing does not credit), with one stream too: both stream counts plan the same tables; so
-        # does a split planner table of the R form beside tail_g3 (SPLIT_R_FORM)
+        # does a split planner table of the R form beside a group of three's cluster tail (SPLIT_R_FORM)
         kept = group is not None and split_r_form(
             chunks, int(num_v_heads), group, index, bwd, options
         )
