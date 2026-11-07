@@ -249,7 +249,8 @@ _ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
 }
-# rm8: sm_100a runs the same overridden stages (CAB4 route codes + L2 push unpermute)
+# sm_100a runs the same overridden stages as sm_107a: route codes built in
+# stage_inputs, push unpermute above 32 tokens per rank.
 _ARCH_STAGE_OVERRIDES["sm_100a"] = _ARCH_STAGE_OVERRIDES["sm_107a"]
 _STAGE_LAUNCH_CONTRACTS = {
     "stage_inputs": (

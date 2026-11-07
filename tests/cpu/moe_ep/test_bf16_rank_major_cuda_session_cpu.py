@@ -666,11 +666,11 @@ def test_workspace_pool_shares_session_and_refcounts_destroy(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_sm100a_stages_are_the_manifest_stages():
+def test_sm100a_stages_are_the_sm107a_stage_overrides():
     module = _session_module()
     manifest, _ = module._load_manifest()
 
-    # rm8 candidates: sm_100a runs the sm_107a stage overrides
+    # sm_100a runs the same overridden stages as sm_107a
     assert (
         manifest["arch_stage_overrides"]["sm_100a"]
         == manifest["arch_stage_overrides"]["sm_107a"]
