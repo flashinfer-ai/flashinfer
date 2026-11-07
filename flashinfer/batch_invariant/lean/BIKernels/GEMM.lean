@@ -69,6 +69,8 @@ inductive GTerm where
   | mma128bs (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
   | mma64mx (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
   | mma128mx4 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
+  | mma32mxw48 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
+  | mma64mxw48 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
   | add (acc p : GTerm)
   | mul (x y : GTerm)
   | sym (name : String)
@@ -321,6 +323,57 @@ theorem kfoldBS_ne_kfoldMX8 (a : RowData) (b : ColData) : kfoldBS a b 1 ≠ kfol
 theorem kfoldMX4_ne_kfoldMX8K64 (a : RowData) (b : ColData) : kfoldMX4 a b 1 ≠ kfoldMX8K64 a b 1 := by
   simp [kfoldMX4, kfoldMX8K64, kfoldG, foldStepsG]
 
+/-! ### The mixed MX classes (`in_fmt = "mxfp4w8a"` / `"mxfp4w8a_k64"`: e2m1 weights against e4m3 activations)
+
+`mma32mxw48` is the mixed-operand `kind::mxf8f6f4` step of the sm_100 / sm_103 instruction: 32 e4m3 activation elements
+against 32 e2m1 weight elements, one UE8M0 scale per row and step on each operand; `mma64mxw48` the sm_107 instruction of
+the same kind at 64 elements per step (two scales per row and step). The e2m1 x e4m3 products are exact in binary32, but the
+fold over a step's products is the instruction's own and the operand formats differ from the mxfp8 step's, so each is a new
+opaque step and a new class (`gemm.mxfp4w8a.kfold`, `gemm.mxfp4w8a.kfold64`), distinct as a term from the mxfp8 / mxfp4 /
+nvfp4 classes at equal K. -/
+
+def kfoldMXW48 (a : RowData) (b : ColData) (steps : Nat) : GTerm := kfoldG GTerm.mma32mxw48 a b steps
+def kchunkMXW48 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := kchunkG GTerm.mma32mxw48 a b C kc
+def splitKernelMXW48 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) : GTerm := splitKernelG GTerm.mma32mxw48 a b C kc σ
+
+theorem splitKernelMXW48_eq_kchunkMXW48 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    splitKernelMXW48 a b C kc σ = kchunkMXW48 a b C kc := splitKernelG_eq_kchunkG _ a b C kc σ
+
+theorem splitKernelMXW48_assignment_irrelevant (a : RowData) (b : ColData) (C kc : Nat) (σ τ : Nat → Nat) :
+    splitKernelMXW48 a b C kc σ = splitKernelMXW48 a b C kc τ := by
+  rw [splitKernelMXW48_eq_kchunkMXW48, splitKernelMXW48_eq_kchunkMXW48]
+
+def kfoldMXW48K64 (a : RowData) (b : ColData) (steps : Nat) : GTerm := kfoldG GTerm.mma64mxw48 a b steps
+def kchunkMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := kchunkG GTerm.mma64mxw48 a b C kc
+def splitKernelMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) : GTerm := splitKernelG GTerm.mma64mxw48 a b C kc σ
+
+theorem splitKernelMXW48K64_eq_kchunkMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    splitKernelMXW48K64 a b C kc σ = kchunkMXW48K64 a b C kc := splitKernelG_eq_kchunkG _ a b C kc σ
+
+theorem splitKernelMXW48K64_assignment_irrelevant (a : RowData) (b : ColData) (C kc : Nat) (σ τ : Nat → Nat) :
+    splitKernelMXW48K64 a b C kc σ = splitKernelMXW48K64 a b C kc τ := by
+  rw [splitKernelMXW48K64_eq_kchunkMXW48K64, splitKernelMXW48K64_eq_kchunkMXW48K64]
+
+/-- Distinct from the one-format MX classes at equal K (the operand formats differ, so the step does) and from each other
+(one wide step against two narrow ones). -/
+theorem kfoldMXW48_ne_kfoldMX8 (a : RowData) (b : ColData) : kfoldMXW48 a b 1 ≠ kfoldMX8 a b 1 := by
+  simp [kfoldMXW48, kfoldMX8, kfoldG, foldStepsG]
+
+theorem kfoldMXW48_ne_kfoldMX4 (a : RowData) (b : ColData) : kfoldMXW48 a b 2 ≠ kfoldMX4 a b 1 := by
+  simp [kfoldMXW48, kfoldMX4, kfoldG, foldStepsG]
+
+theorem kfoldMXW48_ne_kfoldBS (a : RowData) (b : ColData) : kfoldMXW48 a b 2 ≠ kfoldBS a b 1 := by
+  simp [kfoldMXW48, kfoldBS, kfoldG, foldStepsG]
+
+theorem kfoldMXW48K64_ne_kfoldMXW48 (a : RowData) (b : ColData) : kfoldMXW48K64 a b 1 ≠ kfoldMXW48 a b 2 := by
+  simp [kfoldMXW48K64, kfoldMXW48, kfoldG, foldStepsG]
+
+theorem kfoldMXW48K64_ne_kfoldMX8K64 (a : RowData) (b : ColData) : kfoldMXW48K64 a b 1 ≠ kfoldMX8K64 a b 1 := by
+  simp [kfoldMXW48K64, kfoldMX8K64, kfoldG, foldStepsG]
+
+theorem kfoldMXW48K64_ne_kfoldMX4 (a : RowData) (b : ColData) : kfoldMXW48K64 a b 1 ≠ kfoldMX4 a b 1 := by
+  simp [kfoldMXW48K64, kfoldMX4, kfoldG, foldStepsG]
+
 /-! ## Semantics: any interpretation of the primitives -/
 
 structure Prims (α : Type) where
@@ -333,6 +386,8 @@ structure Prims (α : Type) where
   mma128bs : α → RowData → Nat → ColData → α
   mma64mx : α → RowData → Nat → ColData → α
   mma128mx4 : α → RowData → Nat → ColData → α
+  mma32mxw48 : α → RowData → Nat → ColData → α
+  mma64mxw48 : α → RowData → Nat → ColData → α
   add : α → α → α
   mul : α → α → α
   sym : String → α
@@ -351,6 +406,8 @@ def eval (P : Prims α) : GTerm → α
   | .mma128bs acc a t b => P.mma128bs (eval P acc) a t b
   | .mma64mx acc a t b => P.mma64mx (eval P acc) a t b
   | .mma128mx4 acc a t b => P.mma128mx4 (eval P acc) a t b
+  | .mma32mxw48 acc a t b => P.mma32mxw48 (eval P acc) a t b
+  | .mma64mxw48 acc a t b => P.mma64mxw48 (eval P acc) a t b
   | .add acc p => P.add (eval P acc) (eval P p)
   | .mul x y => P.mul (eval P x) (eval P y)
   | .sym s => P.sym s
@@ -429,6 +486,19 @@ theorem fold_padMX4K128 (P : Prims α) (a : RowData) (b : ColData) (steps pad : 
     (hz : ∀ (acc : α) (t : Nat), steps ≤ t → P.mma128mx4 acc a t b = acc) :
     eval P (kfoldMX4K128 a b (steps + pad)) = eval P (kfoldMX4K128 a b steps) :=
   fold_padG P GTerm.mma128mx4 P.mma128mx4 (fun _ _ _ _ => rfl) a b steps pad hz
+
+/-- **K remainder of the mixed classes**: the sm_107 class pads its last step as the other MX classes do (zero values, the
+finite UE8M0 byte 0x00, every padded product +0); the sm_100 class takes whole 128-element runs and pads no step, so the
+statement holds for it with `pad = 0`. -/
+theorem fold_padMXW48 (P : Prims α) (a : RowData) (b : ColData) (steps pad : Nat)
+    (hz : ∀ (acc : α) (t : Nat), steps ≤ t → P.mma32mxw48 acc a t b = acc) :
+    eval P (kfoldMXW48 a b (steps + pad)) = eval P (kfoldMXW48 a b steps) :=
+  fold_padG P GTerm.mma32mxw48 P.mma32mxw48 (fun _ _ _ _ => rfl) a b steps pad hz
+
+theorem fold_padMXW48K64 (P : Prims α) (a : RowData) (b : ColData) (steps pad : Nat)
+    (hz : ∀ (acc : α) (t : Nat), steps ≤ t → P.mma64mxw48 acc a t b = acc) :
+    eval P (kfoldMXW48K64 a b (steps + pad)) = eval P (kfoldMXW48K64 a b steps) :=
+  fold_padG P GTerm.mma64mxw48 P.mma64mxw48 (fun _ _ _ _ => rfl) a b steps pad hz
 
 /-! ## The epilogue chain (`spec.EpilogueChain`): `mul.rn alpha` for the scaled (fp8) classes, then exactly one `cvt.rn`
 
@@ -537,6 +607,27 @@ theorem outputMX4K128_split_eq_kchunkMX4K128 (fmt : String) (a : RowData) (b : C
     outputElemAlpha fmt (splitKernelMX4K128 a b C kc σ) = outputKchunkMX4K128 fmt a b C kc := by
   unfold outputKchunkMX4K128; rw [splitKernelMX4K128_eq_kchunkMX4K128]
 
+/-- The mixed classes through the alpha chain (the caller's scalar, as the 4-bit classes). -/
+def outputKfoldMXW48 (fmt : String) (a : RowData) (b : ColData) (steps : Nat) : GTerm :=
+  outputElemAlpha fmt (kfoldMXW48 a b steps)
+
+def outputKchunkMXW48 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTerm :=
+  outputElemAlpha fmt (kchunkMXW48 a b C kc)
+
+theorem outputMXW48_split_eq_kchunkMXW48 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    outputElemAlpha fmt (splitKernelMXW48 a b C kc σ) = outputKchunkMXW48 fmt a b C kc := by
+  unfold outputKchunkMXW48; rw [splitKernelMXW48_eq_kchunkMXW48]
+
+def outputKfoldMXW48K64 (fmt : String) (a : RowData) (b : ColData) (steps : Nat) : GTerm :=
+  outputElemAlpha fmt (kfoldMXW48K64 a b steps)
+
+def outputKchunkMXW48K64 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTerm :=
+  outputElemAlpha fmt (kchunkMXW48K64 a b C kc)
+
+theorem outputMXW48K64_split_eq_kchunkMXW48K64 (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    outputElemAlpha fmt (splitKernelMXW48K64 a b C kc σ) = outputKchunkMXW48K64 fmt a b C kc := by
+  unfold outputKchunkMXW48K64; rw [splitKernelMXW48K64_eq_kchunkMXW48K64]
+
 /-! ## The biased chain (`spec.output_elem` with a bias column, `spec.BIAS_NOTE`)
 
 The bias of the output column is added once, in fp32, to the fully reduced accumulator, then the single `cvt.rn`:
@@ -637,6 +728,14 @@ theorem splitMX4K128_launch_is_kchunkMX4K128 (C kc : Nat) (σ : Nat → Nat) (M 
     launch M rows (fun a b => splitKernelMX4K128 a b C kc σ) b r = launch M rows (fun a b => kchunkMX4K128 a b C kc) b r := by
   simp only [launch, kernelRow, splitKernelMX4K128_eq_kchunkMX4K128]
 
+theorem splitMXW48_launch_is_kchunkMXW48 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData) (b : ColData) (r : Fin M) :
+    launch M rows (fun a b => splitKernelMXW48 a b C kc σ) b r = launch M rows (fun a b => kchunkMXW48 a b C kc) b r := by
+  simp only [launch, kernelRow, splitKernelMXW48_eq_kchunkMXW48]
+
+theorem splitMXW48K64_launch_is_kchunkMXW48K64 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData) (b : ColData) (r : Fin M) :
+    launch M rows (fun a b => splitKernelMXW48K64 a b C kc σ) b r = launch M rows (fun a b => kchunkMXW48K64 a b C kc) b r := by
+  simp only [launch, kernelRow, splitKernelMXW48K64_eq_kchunkMXW48K64]
+
 /-- The biased classes are launches of per-row functions too (no batch parameter inside), so `batch_invariance`,
 `permutation_invariance` and `subbatch_invariance` apply to them unchanged; the biased split kernel is a launch of
 the biased split class. -/
@@ -688,6 +787,16 @@ theorem kchunkMX4K128_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
     kchunkMX4K128 a b 1 (2 * kc) ≠ kchunkMX4K128 a b 2 kc := by
   intro h
   simp [kchunkMX4K128, kchunkG, foldChunksG] at h
+
+theorem kchunkMXW48_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
+    kchunkMXW48 a b 1 (2 * kc) ≠ kchunkMXW48 a b 2 kc := by
+  intro h
+  simp [kchunkMXW48, kchunkG, foldChunksG] at h
+
+theorem kchunkMXW48K64_depends_on_C (a : RowData) (b : ColData) (kc : Nat) :
+    kchunkMXW48K64 a b 1 (2 * kc) ≠ kchunkMXW48K64 a b 2 kc := by
+  intro h
+  simp [kchunkMXW48K64, kchunkG, foldChunksG] at h
 
 /-! ## The dispatcher's chunk rule, mirrored (checked against the Python tables in Cases.lean) -/
 

@@ -16,6 +16,8 @@ def GTerm.sexpr : GTerm → String
   | .mma128bs acc a t b => s!"(mma128bs {acc.sexpr} (absf (a {a.id} {t}) (sfa {a.id} {t}) (b {t} {b.id}) (sfb {t} {b.id})))"
   | .mma64mx acc a t b => s!"(mma64mx {acc.sexpr} (absf (a {a.id} {t}) (sfa {a.id} {t}) (b {t} {b.id}) (sfb {t} {b.id})))"
   | .mma128mx4 acc a t b => s!"(mma128mx4 {acc.sexpr} (absf (a {a.id} {t}) (sfa {a.id} {t}) (b {t} {b.id}) (sfb {t} {b.id})))"
+  | .mma32mxw48 acc a t b => s!"(mma32mxw48 {acc.sexpr} (absf (a {a.id} {t}) (sfa {a.id} {t}) (b {t} {b.id}) (sfb {t} {b.id})))"
+  | .mma64mxw48 acc a t b => s!"(mma64mxw48 {acc.sexpr} (absf (a {a.id} {t}) (sfa {a.id} {t}) (b {t} {b.id}) (sfb {t} {b.id})))"
   | .add acc p => let (x, y) := sortPair acc.sexpr p.sexpr; s!"(add {x} {y})"
   | .mul x y => let (p, q) := sortPair x.sexpr y.sexpr; s!"(mul {p} {q})"
   | .sym s => s!"(sym {s})"

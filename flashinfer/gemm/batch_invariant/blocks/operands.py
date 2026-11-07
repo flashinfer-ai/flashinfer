@@ -24,15 +24,7 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from ..spec import BLOCK_SCALED, ELEM_BITS_OF, SF_VEC
-
-
-def k_granule(in_fmt: str) -> int:
-    """K of a block-scaled operand is a whole number of block scales and of 16-byte rows: 32 elements for every format."""
-    import math
-
-    row = 128 // ELEM_BITS_OF[in_fmt]  # elements per 16-byte row
-    return SF_VEC[in_fmt] * row // math.gcd(SF_VEC[in_fmt], row)
+from ..spec import BLOCK_SCALED, k_granule  # noqa: F401  (k_granule re-exported: the body's K granule, also the API's)
 
 
 ACC_DTYPE = cutlass.Float32
@@ -46,6 +38,8 @@ IN_DT = {
     "nvfp4_k128": cutlass.Float4E2M1FN,
     "mxfp4": cutlass.Float4E2M1FN,
     "mxfp4_k128": cutlass.Float4E2M1FN,
+    "mxfp4w8a": cutlass.Float8E4M3FN,  # the mixed classes: the A (activation) operand's dtype; B is e2m1 (blocks/blockscaled_mx_mixed.py)
+    "mxfp4w8a_k64": cutlass.Float8E4M3FN,
 }
 OUT_DT = {
     "bf16": cutlass.BFloat16,
@@ -63,6 +57,8 @@ ALIGN = {
     "nvfp4_k128": 32,
     "mxfp4": 32,
     "mxfp4_k128": 32,
+    "mxfp4w8a": 32,  # the mixed classes: the 4-bit weight row's alignment, the stricter of the two operands'
+    "mxfp4w8a_k64": 32,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
 
@@ -320,8 +316,9 @@ def can_implement(
     # the output is stored directly (no fp32 workspace) by the unsplit class and by the in-CTA chunk fold
     al_out = ALIGN["bf16"] if (chunks == 1 or knobs.cta_chunks) else ALIGN["f32"]
     if in_fmt in BLOCK_SCALED:
-        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks; a chunk is a whole
-        # number of steps AND of scale-factor atom columns (`spec.chunk_unit`: 128 elements for the MX classes)
+        # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks (whole 128-element
+        # runs for the sm_100 mixed class: `spec.k_granule`); a chunk is a whole number of steps AND of scale-factor atom
+        # columns (`spec.chunk_unit`: 128 elements for the MX classes)
         from ..spec import chunk_unit
 
         if (

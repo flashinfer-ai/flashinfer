@@ -14,7 +14,8 @@ generated Lean cases are the nominal parts' dispatch) and a few shape constants 
 the transaction efficiency of a row-major weight's narrow boxes, the multicast benefit, the shared-L2 fraction, the
 usable L2 fraction of the HBM traffic model, per-step and fixup floors, raster / swizzle / 2-CTA adjustments). Every
 constant is empirical and shared by all parts and formats; none is fitted per part. The format enters through its
-structure only: element width, MMA K step and the 8-bit kind's doubled instruction rate.
+structure only: the element width of each operand (the mixed classes stream a 4-bit weight against 8-bit activations;
+every traffic term counts an operand at its own width), MMA K step and the 8-bit kind's doubled instruction rate.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
-from .spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+from .spec import A_ELEM_BITS_OF, B_ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,7 @@ def hbm_traffic(
     sw: int,
     rast: str,
     l2: float,
+    ea: Optional[float] = None,
 ) -> float:
     """HBM bytes of the launch under the persistent scheduler's tile order: raster along m walks M within a band of ``sw``
     cluster tiles along N (along n: mirrored), ``cap`` clusters per wave, ``items`` work items (the workspace split) each
@@ -210,12 +212,14 @@ def hbm_traffic(
     across waves a band's panels stay resident when they fit in ``l2`` beside one wave's share of the other operand, else
     they are fetched again every wave of the band, and the other operand is fetched once when the whole of it fits beside
     one band, else once per band (never more than once per wave). ``l2`` is the usable L2 in bytes; the cluster tile is
-    ``cl_rows`` x ``cl_cols`` and the grid ``ncl_m`` x ``ncl_n`` cluster tiles."""
+    ``cl_rows`` x ``cl_cols`` and the grid ``ncl_m`` x ``ncl_n`` cluster tiles. ``eb`` is the B operand's element width in
+    bytes and ``ea`` the A operand's (the same when not given: the one-format classes)."""
+    ea = eb if ea is None else ea
     kk = K / items
-    a_panel = cl_rows * kk * eb
+    a_panel = cl_rows * kk * ea
     b_panel = cl_cols * kk * eb
     a_all = (
-        M * kk * eb
+        M * kk * ea
     )  # the operands themselves (out-of-bounds boxes cost no HBM traffic)
     b_all = N * kk * eb
     waves_total = max(1, -(-(ncl_m * ncl_n) // cap))
@@ -272,7 +276,10 @@ def estimate_cycles(
     cm, cn = k.cluster_shape_mn
     group = 2 if k.use_2cta_instrs else 1
     rows = tm // group
-    eb = ELEM_BITS_OF[in_fmt] / 8.0
+    # the kernel-side operands' widths in bytes: the swapped decode record computes C^T with the weight as the kernel's A
+    ea, eb = A_ELEM_BITS_OF[in_fmt] / 8.0, B_ELEM_BITS_OF[in_fmt] / 8.0
+    if k.swap_ab:
+        ea, eb = eb, ea
     kk = MMA_K_OF[in_fmt]
     rate = (
         part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
@@ -313,7 +320,7 @@ def estimate_cycles(
     )
     if k.swap_ab:
         b_eff = 1.0  # the swapped record's narrow tile is the token tile, one per CTA for the whole K: no such cost is measured for it
-    a_bytes = rows * kk * eb / (cn ** p["mcast_pow"])
+    a_bytes = rows * kk * ea / (cn ** p["mcast_pow"])
     b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
     step = (
         max(mma_cycles, (a_bytes + b_bytes) / part.load_bytes_per_clk) + p["step_floor"]
@@ -349,8 +356,9 @@ def estimate_cycles(
         k.swizzle_size,
         k.raster_along,
         p["l2_resident"] * l2_for(family, sms, nominal),
+        ea,
     )
-    unique = (pm * K + K * pn) * eb + pm * pn * out_bytes
+    unique = (pm * K * ea + K * pn * eb) + pm * pn * out_bytes
     bw = part.hbm_bytes_per_clk * sms
     # the operands' own bytes bound the launch from below (overlapped with the body). The bytes the tile order fetches
     # again are hidden while the HBM is lightly loaded: a fraction `absorb` of the body's time streams them at no cost

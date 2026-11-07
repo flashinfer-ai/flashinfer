@@ -34,6 +34,7 @@ from .spec import (
     ELEM_BITS_OF,
     MMA_K_OF,
     MMA_OP_OF,
+    MX_MIXED_FMTS,
     SF_FMT,
     SF_VEC,
     EpilogueChain,
@@ -89,6 +90,8 @@ CTA_CHUNKS_MAX_TN = {
     "nvfp4_k128": 256,
     "mxfp4": 192,
     "mxfp4_k128": 256,
+    "mxfp4w8a": 192,
+    "mxfp4w8a_k64": 256,
 }
 #: The block-scaled instruction fixes MMA M at 128 (1-CTA) / 256 (2-CTA): its scale-factor atom spans 128 rows, so no
 #: 64-row CTA tile exists; tile N below 64 would need sub-tile scale-factor addressing; a scale-factor tile multicasts to
@@ -110,13 +113,20 @@ TILES_N_NARROW = (8, 16, 32)
 SWAP_WIDE_TILE_N = 64
 #: The 64-wide swapped token tile exists for the UE8M0 classes (their scale-factor atom covers the tile's K extent of one stage);
 #: the NVFP4 classes keep the narrow token tiles only.
-SWAP_WIDE_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4", "mxfp4_k128")
+SWAP_WIDE_FMTS = (
+    "mxfp8",
+    "mxfp8_k64",
+    "mxfp4",
+    "mxfp4_k128",
+    "mxfp4w8a",
+    "mxfp4w8a_k64",
+)
 #: B-reuse (the sm_107 instructions only): a 512-row tiler on the 2-CTA 256-row instruction; each CTA pair issues two
 #: instructions per K step on the two halves of the tile, the B fragment loaded into the collector buffer by the first and
 #: consumed by the second: half the B smem traffic per MMA. One accumulator per half, the same K steps in order from +0:
 #: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
 TILE_M_BREUSE = 512
-BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128")
+BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128", "mxfp4w8a_k64")
 
 
 @dataclass(frozen=True)
@@ -266,8 +276,14 @@ class Knobs:
                 "nvfp4_k128": "kind::mxf4nvf4.block_scale",
                 "mxfp4": "kind::mxf4.block_scale",
                 "mxfp4_k128": "kind::mxf4nvf4.block_scale",
+                "mxfp4w8a": "kind::mxf8f6f4.block_scale",
+                "mxfp4w8a_k64": "kind::mxf8f6f4.block_scale",
             }[in_fmt]
             sf = f" sf={SF_FMT[in_fmt]}/{SF_VEC[in_fmt]}"
+            if in_fmt in MX_MIXED_FMTS:
+                # the mixed classes name their operand formats; the swapped decode record exchanges them (the e2m1 weight
+                # as the instruction's A, the e4m3 tokens as its B)
+                sf += " b=e2m1 a=e4m3" if self.swap_ab else " a=e4m3 b=e2m1"
             arch = " (sm_107a)" if in_fmt.endswith(("_k64", "_k128")) else ""
             breuse = (
                 " x2 b-reuse (FILL/LASTUSE)"

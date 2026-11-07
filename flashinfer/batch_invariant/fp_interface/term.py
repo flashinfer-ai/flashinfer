@@ -199,6 +199,10 @@ def sexpr(t: Term) -> str:
             out = f"(mma64mx {A[0]} {A[1]})"  # one kind::mxf4 block-scaled K-step of 64 fp4 elements (UE8M0 scales per 32)
         elif op == "op:mma_mxfp4_k128":
             out = f"(mma128mx4 {A[0]} {A[1]})"  # the sm_107 block-scaled K-step of 128 fp4 elements (UE8M0 scales per 32)
+        elif op == "op:mma_mxfp4w8a_k32":
+            out = f"(mma32mxw48 {A[0]} {A[1]})"  # the mixed kind::mxf8f6f4 K-step: 32 e4m3 activations x 32 e2m1 weights (UE8M0 scales per 32)
+        elif op == "op:mma_mxfp4w8a_k64":
+            out = f"(mma64mxw48 {A[0]} {A[1]})"  # the sm_107 mixed block-scaled K-step of 64 elements
         elif op == "op:absf_kslice":
             out = f"(absf {A[0]} {A[1]} {A[2]} {A[3]})"  # the (A, SFA, B, SFB) K-slice of one block-scaled step
         elif op == "op:sfa_rows":

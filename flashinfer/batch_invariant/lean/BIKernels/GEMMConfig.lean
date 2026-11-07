@@ -19,7 +19,7 @@ Everything is stated for the opaque primitive of the class: `mma16` (bf16) and, 
 step (`tileResultG`), `mma32` (the fp8 classes, whose knob constraints `ConfigOKFp8` lack the 8-wide tile) and
 `mma32mx` / `mma64mx8` (the MXFP8 classes, whose knob constraints `ConfigOKMx8` / `ConfigOKMx8K64` are the block-scaled
 instruction's) and `mma64bs` / `mma128bs` / `mma64mx` / `mma128mx4` (the NVFP4 and MXFP4 classes, `ConfigOKNvfp4` /
-`ConfigOKNvfp4K128` / `ConfigOKMx4` / `ConfigOKMx4K128`). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
+`ConfigOKNvfp4K128` / `ConfigOKMx4` / `ConfigOKMx4K128`), and `mma32mxw48` / `mma64mxw48` (the mixed MX classes, `ConfigOKMxW48` / `ConfigOKMxW48K64`). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
 `{128,256}` 2-CTA, `tn ∈ 32..256` and the decode tiles; for the block-scaled classes also the swapped operand order of
 the decode records and the B-reuse pair of the sm_107 class) is the same per-element function of its primitive. No Lean
 statement can discharge it; the GPU test `test_config_agreement` checks the dispatcher's candidates bit for bit against
@@ -105,6 +105,12 @@ def ConfigOKNvfp4K128 (c : Config) : Bool := ConfigOKBlockScaled true false 256 
 def ConfigOKMx4 (c : Config) : Bool := ConfigOKBlockScaled false true 192 c
 def ConfigOKMx4K128 (c : Config) : Bool := ConfigOKBlockScaled true true 256 c
 
+/-- The mixed MX classes (e2m1 weights against e4m3 activations, UE8M0 scales per 32 on both): the sm_100 class on the
+MXFP8 class's records (the 64-wide swapped token tile, the in-CTA chunk fold up to tile N 192), the sm_107 class with
+the B-reuse records and the in-CTA chunk fold at every tile N. -/
+def ConfigOKMxW48 (c : Config) : Bool := ConfigOKBlockScaled false true 192 c
+def ConfigOKMxW48K64 (c : Config) : Bool := ConfigOKBlockScaled true true 256 c
+
 /-- The in-CTA chunk fold (`ctaChunks`, `gemm/blocks/epilogue.py`) is the split kernel with the CONSTANT assignment
 of every chunk to one CTA: that CTA computes each chunk's partial from +0 in turn (the mainloop's fold per chunk) and
 folds the partials in chunk order from +0 with `add` (the TMEM running sum) -- the `fixup` of `splitKernel`, so the
@@ -181,6 +187,25 @@ theorem ctaSplitMX4K128_eq_kchunkMX4K128 (a : RowData) (b : ColData) (C kc : Nat
 
 theorem clusterSplitMX4K128_eq_kchunkMX4K128 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitMX4K128 a b C kc = kchunkMX4K128 a b C kc :=
   splitKernelMX4K128_eq_kchunkMX4K128 a b C kc _
+
+/-- The mixed classes' three implementations of one `C` are one term too (the same body). -/
+def ctaSplitMXW48 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMXW48 a b C kc (fun _ => 0)
+def clusterSplitMXW48 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMXW48 a b C kc (fun c => c)
+
+theorem ctaSplitMXW48_eq_kchunkMXW48 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitMXW48 a b C kc = kchunkMXW48 a b C kc :=
+  splitKernelMXW48_eq_kchunkMXW48 a b C kc _
+
+theorem clusterSplitMXW48_eq_kchunkMXW48 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitMXW48 a b C kc = kchunkMXW48 a b C kc :=
+  splitKernelMXW48_eq_kchunkMXW48 a b C kc _
+
+def ctaSplitMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMXW48K64 a b C kc (fun _ => 0)
+def clusterSplitMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMXW48K64 a b C kc (fun c => c)
+
+theorem ctaSplitMXW48K64_eq_kchunkMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitMXW48K64 a b C kc = kchunkMXW48K64 a b C kc :=
+  splitKernelMXW48K64_eq_kchunkMXW48K64 a b C kc _
+
+theorem clusterSplitMXW48K64_eq_kchunkMXW48K64 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitMXW48K64 a b C kc = kchunkMXW48K64 a b C kc :=
+  splitKernelMXW48K64_eq_kchunkMXW48K64 a b C kc _
 
 /-- `foldSteps` splits anywhere: `m + n` steps from `t0` are `m` steps, then `n` from `t0 + m`. -/
 theorem foldSteps_add (a : RowData) (b : ColData) (acc : GTerm) (t0 m n : Nat) :
@@ -304,6 +329,21 @@ def kblockLoopMX4K128 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nb
 theorem kblockLoopMX4K128_eq_kfoldMX4K128 (a : RowData) (b : ColData) (kb S nblk : Nat) :
     kblockLoopMX4K128 a b kb S .zero nblk = kfoldMX4K128 a b (nblk * kb) :=
   kblockLoopG_eq_kfoldG GTerm.mma128mx4 a b kb S nblk
+
+/-- The mixed classes' mainloops: inner radix 4 at the sm_100 step (one 128-byte stage of the e4m3 activation), 2 at the sm_107 one. -/
+def kblockLoopMXW48 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma32mxw48 a b kb S acc nblk
+
+theorem kblockLoopMXW48_eq_kfoldMXW48 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopMXW48 a b kb S .zero nblk = kfoldMXW48 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma32mxw48 a b kb S nblk
+
+def kblockLoopMXW48K64 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma64mxw48 a b kb S acc nblk
+
+theorem kblockLoopMXW48K64_eq_kfoldMXW48K64 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopMXW48K64 a b kb S .zero nblk = kfoldMXW48K64 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma64mxw48 a b kb S nblk
 
 /-- One output tile under `cfg`: the owning CTA (a function of the config) runs the k-block loop from a reset
 accumulator. `prev` is whatever that CTA's accumulator held from the previous tile of its persistent schedule. -/
@@ -619,6 +659,67 @@ theorem config_invarianceMX4K128_bits {α : Type} (P : Prims α) (c₁ c₂ : Co
     eval P (tileResultMX4K128 c₁ S₁ p a b kb nblk) = eval P (tileResultMX4K128 c₂ S₂ q a b kb nblk) := by
   rw [config_invarianceMX4K128 c₁ c₂ S₁ S₂ p q a b kb nblk]
 
+/-- The mixed classes' tile model: the same statements at the mixed steps. -/
+def tileResultMXW48 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma32mxw48 cfg S prev a b kb nblk
+
+theorem tileResultMXW48_eq_kfoldMXW48 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMXW48 cfg S p a b kb nblk = kfoldMXW48 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma32mxw48 cfg S p a b kb nblk
+
+theorem config_invarianceMXW48 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMXW48 c₁ S₁ p a b kb nblk = tileResultMXW48 c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma32mxw48 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantMXW48 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultMXW48 c₁ S₁ p a b kb nblk = tileResultMXW48 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceMXW48 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputMXW48_eq_outputKfoldMXW48 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMXW48 cfg S p a b kb nblk) = outputKfoldMXW48 fmt a b (nblk * kb) := by
+  unfold outputKfoldMXW48; rw [tileResultMXW48_eq_kfoldMXW48]
+
+theorem outputMXW48_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMXW48 c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultMXW48 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMXW48 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceMXW48_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultMXW48 c₁ S₁ p a b kb nblk) = eval P (tileResultMXW48 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMXW48 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+def tileResultMXW48K64 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma64mxw48 cfg S prev a b kb nblk
+
+theorem tileResultMXW48K64_eq_kfoldMXW48K64 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMXW48K64 cfg S p a b kb nblk = kfoldMXW48K64 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma64mxw48 cfg S p a b kb nblk
+
+theorem config_invarianceMXW48K64 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMXW48K64 c₁ S₁ p a b kb nblk = tileResultMXW48K64 c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma64mxw48 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantMXW48K64 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultMXW48K64 c₁ S₁ p a b kb nblk = tileResultMXW48K64 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceMXW48K64 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputMXW48K64_eq_outputKfoldMXW48K64 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMXW48K64 cfg S p a b kb nblk) = outputKfoldMXW48K64 fmt a b (nblk * kb) := by
+  unfold outputKfoldMXW48K64; rw [tileResultMXW48K64_eq_kfoldMXW48K64]
+
+theorem outputMXW48K64_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMXW48K64 c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultMXW48K64 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMXW48K64 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceMXW48K64_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultMXW48K64 c₁ S₁ p a b kb nblk) = eval P (tileResultMXW48K64 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMXW48K64 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
 /-- **Two instructions, two classes**, for either 4-bit format (one 128-wide step against two 64-wide ones over the same K). -/
 theorem tileResultBS128_ne_tileResultBS (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) :
     tileResultBS128 c₁ S₁ p a b 1 1 ≠ tileResultBS c₂ S₂ q a b 2 1 := by
@@ -629,5 +730,17 @@ theorem tileResultMX4K128_ne_tileResultMX4 (c₁ c₂ : Config) (S₁ S₂ : Nat
     tileResultMX4K128 c₁ S₁ p a b 1 1 ≠ tileResultMX4 c₂ S₂ q a b 2 1 := by
   rw [tileResultMX4K128_eq_kfoldMX4K128, tileResultMX4_eq_kfoldMX4]
   exact kfoldMX4K128_ne_kfoldMX4 a b
+
+/-- The two mixed tiles differ over the same K (one block of one wide step against one block of two narrow ones), and the
+sm_100 mixed tile differs from the mxfp8 tile at the same K and radix (the step's operand formats differ). -/
+theorem tileResultMXW48K64_ne_tileResultMXW48 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) :
+    tileResultMXW48K64 c₁ S₁ p a b 1 1 ≠ tileResultMXW48 c₂ S₂ q a b 2 1 := by
+  rw [tileResultMXW48K64_eq_kfoldMXW48K64, tileResultMXW48_eq_kfoldMXW48]
+  exact kfoldMXW48K64_ne_kfoldMXW48 a b
+
+theorem tileResultMXW48_ne_tileResultMX8 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) :
+    tileResultMXW48 c₁ S₁ p a b 1 1 ≠ tileResultMX8 c₂ S₂ q a b 1 1 := by
+  rw [tileResultMXW48_eq_kfoldMXW48, tileResultMX8_eq_kfoldMX8]
+  exact kfoldMXW48_ne_kfoldMX8 a b
 
 end BIK.GEMM

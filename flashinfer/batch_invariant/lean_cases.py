@@ -5,7 +5,7 @@
 For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain; mxfp8 at the
 ``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain; nvfp4 / nvfp4_k128
 at ``mma64bs`` / ``mma128bs`` and mxfp4 / mxfp4_k128 at ``mma64mx`` / ``mma128mx4``, the 4-bit block-scaled steps with the
-alpha chain) the file carries
+alpha chain; the mixed pair mxfp4w8a / mxfp4w8a_k64 at ``mma32mxw48`` / ``mma64mxw48`` with the alpha chain) the file carries
 
 * the spec terms of both classes of each format at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``)
   S-expression, with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` and their ``32`` / ``MX8`` /
@@ -48,7 +48,7 @@ from ..gemm.batch_invariant.generator import (
     enumerate_space,
 )
 from ..gemm.batch_invariant.schedule import chunks_for, default_config, fp4_class_for
-from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
+from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, k_granule, reduction
 
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
@@ -166,6 +166,12 @@ GEMM_FP4_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
 GEMM_FP4_K128_CASES = [(512, 1), (1024, 1), (2048, 2), (2048, 4)]
 GEMM_FP4_OUT_CASES = [(256, "bf16"), (512, "f16"), (256, "f32")]
 GEMM_FP4_K128_OUT_CASES = [(512, "bf16"), (1024, "f16"), (512, "f32")]
+#: The mixed MX classes (e2m1 weights against e4m3 activations, UE8M0 scales per 32 on both; the caller's alpha): ``mxfp4w8a``
+#: at the sm_100 / sm_103 32-wide step (K in whole 128-element runs) and ``mxfp4w8a_k64`` at the sm_107 64-wide step.
+GEMM_MXW48_CASES = GEMM_MX_CASES
+GEMM_MXW48_K64_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
+GEMM_MXW48_OUT_CASES = GEMM_MX_OUT_CASES
+GEMM_MXW48_K64_OUT_CASES = GEMM_FP4_OUT_CASES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,7 +218,7 @@ class LeanFormat:
     def elem(self) -> str:
         """The Lean chain applied to a fold: ``outputElem false`` (bf16, the MXFP8 classes), ``outputElem true`` (the fp8
         classes) or ``outputElemAlpha`` (the 4-bit classes)."""
-        if self.p in ("BS", "BS128", "MX4", "MX4K128"):
+        if self.p in ("BS", "BS128", "MX4", "MX4K128", "MXW48", "MXW48K64"):
             return "outputElemAlpha"
         return f"outputElem {'true' if self.scaled else 'false'}"
 
@@ -249,6 +255,8 @@ STEP_OF_P = {
     "BS128": "mma128bs",
     "MX4": "mma64mx",
     "MX4K128": "mma128mx4",
+    "MXW48": "mma32mxw48",
+    "MXW48K64": "mma64mxw48",
 }
 CHUNK_SUFFIX = {"": "", "32": "_fp8", "MX8": "_mx", "BS": "_fp4", "BS128": "_fp4k128"}
 
@@ -437,6 +445,48 @@ FORMATS: Tuple[LeanFormat, ...] = (
         tuple(MX_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
+    LeanFormat(
+        "mxfp4w8a",
+        "MXW48",
+        "gemmmxw48",
+        "gemm_mxw48",
+        "gemmMxW48Space",
+        "gemmMxW48Dispatch",
+        "ConfigOKMxW48",
+        "gemmMainloopInnerMxW48",
+        "chunksForMx",
+        None,
+        "chunksmx",
+        True,
+        ("k",),
+        ("sm_100", "sm_103"),
+        tuple(GEMM_MXW48_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        "mxfp4w8a_k64",
+        "MXW48K64",
+        "gemmmxw48k64",
+        "gemm_mxw48k64",
+        "gemmMxW48K64Space",
+        "gemmMxW48K64Dispatch",
+        "ConfigOKMxW48K64",
+        "gemmMainloopInnerMxW48K64",
+        "chunksForMx",
+        None,
+        "chunksmx",
+        True,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_MXW48_K64_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_MXW48_K64_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
 )
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
@@ -587,6 +637,8 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
     pairs += [(N, K) for K in DISPATCH_BIG for N in DISPATCH_NS[::3]]
     pairs += [(N, K) for N in DISPATCH_BIG for K in DISPATCH_NS[::3]]
     for N, K in pairs:
+        if K % k_granule(in_fmt):
+            continue  # a weight shape the class does not take (the sm_100 mixed class: K in whole 128-element runs)
         C = chunks_for(N, K, in_fmt)
         for M in DISPATCH_MS:
             for b_major in F.layouts:

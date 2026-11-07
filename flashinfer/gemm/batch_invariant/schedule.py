@@ -67,13 +67,17 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
 
 
 #: The sm_107 instructions' classes of the MX formats (the sm_100 / sm_103 instructions' classes elsewhere).
-MX_SM107_CLASS = {"mxfp8": "mxfp8_k64", "mxfp4": "mxfp4_k128"}
+MX_SM107_CLASS = {
+    "mxfp8": "mxfp8_k64",
+    "mxfp4": "mxfp4_k128",
+    "mxfp4w8a": "mxfp4w8a_k64",
+}
 
 
 def mx_class_for(base: str, family: Optional[str]) -> str:
     """The MX class a part runs for an MX format: the sm_107 instruction's class (64 elements per step for mxfp8,
-    ``mxfp8_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8`` /
-    ``mxfp4``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
+    ``mxfp8_k64``, and for the mixed pair, ``mxfp4w8a_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the
+    sm_100 instruction's class (``mxfp8`` / ``mxfp4`` / ``mxfp4w8a``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
     never of the shape."""
     return MX_SM107_CLASS.get(base, base) if family == "sm_107" else base
 

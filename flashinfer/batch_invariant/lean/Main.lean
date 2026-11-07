@@ -84,5 +84,20 @@ def main : IO Unit := do
     IO.println s!"gemmmx4k128loop {nblk} {(kblockLoopMX4K128 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMx4K128 3 .zero nblk).sexpr}"
   for (steps, fmt) in gemmmx4k128OutCases do
     IO.println s!"gemmmx4k128out {steps} {fmt} {(outputKfoldMX4K128 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
+  -- the mixed MX classes: the mma32mxw48 (sm_100 / sm_103) and mma64mxw48 (sm_107) steps, the alpha chain, the MX chunk rule
+  for (steps, C) in gemmmxw48Cases do
+    let t := if C == 1 then kfoldMXW48 ⟨0⟩ ⟨0⟩ steps else kchunkMXW48 ⟨0⟩ ⟨0⟩ C (steps / C)
+    IO.println s!"gemmmxw48 {steps} {C} {(outputElemAlpha "bf16" t).sexpr}"
+  for nblk in gemmmxw48LoopCases do
+    IO.println s!"gemmmxw48loop {nblk} {(kblockLoopMXW48 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMxW48 3 .zero nblk).sexpr}"
+  for (steps, fmt) in gemmmxw48OutCases do
+    IO.println s!"gemmmxw48out {steps} {fmt} {(outputKfoldMXW48 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
+  for (steps, C) in gemmmxw48k64Cases do
+    let t := if C == 1 then kfoldMXW48K64 ⟨0⟩ ⟨0⟩ steps else kchunkMXW48K64 ⟨0⟩ ⟨0⟩ C (steps / C)
+    IO.println s!"gemmmxw48k64 {steps} {C} {(outputElemAlpha "bf16" t).sexpr}"
+  for nblk in gemmmxw48k64LoopCases do
+    IO.println s!"gemmmxw48k64loop {nblk} {(kblockLoopMXW48K64 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMxW48K64 3 .zero nblk).sexpr}"
+  for (steps, fmt) in gemmmxw48k64OutCases do
+    IO.println s!"gemmmxw48k64out {steps} {fmt} {(outputKfoldMXW48K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do
     IO.println s!"attn {name} {(Attn.output P).sexpr}"
