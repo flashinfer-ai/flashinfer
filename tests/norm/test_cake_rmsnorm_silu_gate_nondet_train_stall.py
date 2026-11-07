@@ -301,20 +301,44 @@ def _checked(result):
 
 
 @functools.cache
-def _spin_cubin(major: int, minor: int) -> bytes:
-    """The side kernels compiled once per architecture (NVRTC)."""
+def _spin_image(major: int, minor: int) -> bytes:
+    """The side kernels compiled once per architecture (NVRTC): a cubin for
+    ``sm_<major><minor>`` when the loaded NVRTC supports it, else PTX for the
+    highest ``compute_XY`` it supports below the device's, which the driver
+    compiles for the device when it loads the module (an NVRTC older than the
+    device, such as the pip NVRTC 13.0 on SM107).  Skips when the NVRTC
+    supports no architecture at or below the device's."""
     from cuda.bindings import nvrtc
 
+    device_arch = 10 * major + minor
+    supported = [int(arch) for arch in _checked(nvrtc.nvrtcGetSupportedArchs())]
+    if device_arch in supported:
+        target = f"sm_{device_arch}"
+    else:
+        lower = [arch for arch in supported if arch <= device_arch]
+        if not lower:
+            _, nvrtc_major, nvrtc_minor = nvrtc.nvrtcVersion()
+            pytest.skip(
+                f"NVRTC {nvrtc_major}.{nvrtc_minor} compiles for no architecture "
+                f"at or below sm_{device_arch} (it supports {supported}), so "
+                "the side kernels cannot be built"
+            )
+        target = f"compute_{max(lower)}"
     prog = _checked(
         nvrtc.nvrtcCreateProgram(_SPIN_SOURCE.encode(), b"spin.cu", 0, [], [])
     )
-    opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+    opts = [f"--gpu-architecture={target}".encode()]
     _checked(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-    size = _checked(nvrtc.nvrtcGetCUBINSize(prog))
-    cubin = b" " * size
-    _checked(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    if target.startswith("sm_"):
+        size = _checked(nvrtc.nvrtcGetCUBINSize(prog))
+        image = b" " * size
+        _checked(nvrtc.nvrtcGetCUBIN(prog, image))
+    else:
+        size = _checked(nvrtc.nvrtcGetPTXSize(prog))
+        image = b" " * size
+        _checked(nvrtc.nvrtcGetPTX(prog, image))
     _checked(nvrtc.nvrtcDestroyProgram(prog))
-    return cubin
+    return image
 
 
 class _Spin:
@@ -335,10 +359,10 @@ class _Spin:
         self._driver = driver
         device = torch.device("cuda", torch.cuda.current_device())
         torch.empty(1, device=device)  # primary context
-        cubin = _spin_cubin(*torch.cuda.get_device_capability(device))
+        image = _spin_image(*torch.cuda.get_device_capability(device))
         ctx = _checked(driver.cuDevicePrimaryCtxRetain(device.index))
         _checked(driver.cuCtxSetCurrent(ctx))
-        self._module = _checked(driver.cuModuleLoadData(cubin))
+        self._module = _checked(driver.cuModuleLoadData(image))
         self._func = _checked(
             driver.cuModuleGetFunction(self._module, _SPIN_KERNEL.encode())
         )
