@@ -1106,15 +1106,16 @@ def _torch_compile_halo_arm(
 ) -> tuple[dict, tuple[dict, torch.Tensor]]:
     global _COMPILED_HALO_CORE
     if _COMPILED_HALO_CORE is None:
-        import torch._dynamo
+        # ``import torch._dynamo`` would bind ``torch`` as a local of this function (unbound on later calls)
+        import torch._dynamo as torch_dynamo
 
         for name in ("recompile_limit", "cache_size_limit"):
             # one compiled graph per row shape; a recompile past the limit would silently run eagerly
-            if hasattr(torch._dynamo.config, name):
+            if hasattr(torch_dynamo.config, name):
                 setattr(
-                    torch._dynamo.config,
+                    torch_dynamo.config,
                     name,
-                    max(64, getattr(torch._dynamo.config, name)),
+                    max(64, getattr(torch_dynamo.config, name)),
                 )
         _COMPILED_HALO_CORE = torch.compile(_halo_core, dynamic=False)
     core = _COMPILED_HALO_CORE
