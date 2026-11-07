@@ -1811,6 +1811,179 @@ def _align_case(route, heads, dtype, q_lens, layout="dense", width=0, page=64, f
     return pytest.param(*args, id=f"{route}-{form}" if form else route)
 
 
+# ---------------------------------------------------------- index tables off the 16-byte row loads
+# The SWA-only FP8 8-head rows of the low-head prefill route on SM107's early-PV
+# sibling (48 rows: at most 62 rows on 212 SMs, 64 on 216) and on the route's
+# own program above it (68 rows); elsewhere both run the route's program.  Then
+# the persistent FP8/H128 route, whose topk4x rows every architecture builds and
+# routes there, and two routes SM107 does not build (the tests skip there).
+_INDEX_ALIGN_CASES = [
+    _align_case("fp8_lowhead_prefill", 8, _FP8, [4] * 12, form="48-rows"),
+    _align_case("fp8_lowhead_prefill", 8, _FP8, [4] * 17, form="68-rows"),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64], width=512),
+    _align_case("fp8_lowhead_one_partition", 8, _FP8, [4] * 6, width=128),
+    _align_case(
+        "bf16_h128_topk128x", 128, _BF16, [20] * 2, width=256, page=2, form="row_first"
+    ),
+]
+_SM107_INDEX_ALIGN_ROUTES = (
+    "fp8_lowhead_prefill",
+    "fp8_h128_prefill_source_persistent",
+)
+
+
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _INDEX_ALIGN_CASES
+)
+def test_index_tables_off_the_row_loads_raise_before_launch(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page
+):
+    """The BF16 / FP8 programs load index rows 16 bytes at a time.  A table 4
+    bytes into its parent (``parent[:, 1:]`` of a ``[T, W + 1]`` parent) or one
+    with an odd row stride (``parent[:, :W]``) raises ValueError before any
+    launch and leaves ``out`` untouched; a view 16 bytes into a ``[T, W + 4]``
+    parent runs in place (same launches and programs, nothing allocated) with
+    bitwise the output of the contiguous table."""
+    _skip_unless_cake_gpu(sm107=route in _SM107_INDEX_ALIGN_ROUTES)
+    import flashinfer.mla.cake_dsv4 as cake
+
+    calls = _count_dispatches(monkeypatch)
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(len(q_lens))],
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+    )
+    table = case.sparse_indices
+    assert table.is_contiguous() and table.data_ptr() % 16 == 0
+    rows, cols = table.shape
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls and {r for r, _ in calls} == {route}
+    if route == "fp8_lowhead_prefill":
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
+        early = sm107 and rows <= 64 * min(sm_count, 216) // 216
+        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+    contiguous = (list(calls), set(launched))
+
+    off = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    off[:, 1:] = table
+    odd = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    odd[:, :cols] = table
+    calls.clear()
+    launched.clear()
+    for bad, message in (
+        (off[:, 1:], r"^sparse_indices must start at a 16-byte aligned address"),
+        (odd[:, :cols], r"^sparse_indices must have a row stride that is a multiple"),
+    ):
+        out = case.nan_out()
+        with pytest.raises(ValueError, match=message):
+            dataclasses.replace(case, sparse_indices=bad).run(
+                workspace=workspace, out=out, float_scales=True
+            )
+        torch.cuda.synchronize()
+        assert not calls and not launched, (calls, launched)
+        assert torch.isnan(out).all()
+
+    wide = torch.full((rows, cols + 4), -1, dtype=torch.int32, device="cuda:0")
+    wide[:, 4:] = table
+    view = wide[:, 4:]
+    assert view.data_ptr() == wide.data_ptr() + 16 and view.stride(0) == cols + 4
+    in_place = dataclasses.replace(case, sparse_indices=view)
+    out = case.nan_out()
+    # Only the allocation count needs the native caching allocator.
+    native = torch.cuda.get_allocator_backend() == "native"
+    requests = _allocation_requests() if native else None
+    got = in_place.run(workspace=workspace, out=out, float_scales=True)
+    torch.cuda.synchronize()
+    assert (list(calls), set(launched)) == contiguous, (calls, launched)
+    if native:
+        assert _allocation_requests() == requests, "an aligned index view was copied"
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+
+
+def test_row_tiled_launches_bind_an_aligned_index_view_in_place(monkeypatch):
+    """Row-tiled launches slice the index table by row.  A view 16 bytes into a
+    ``[T, W + 4]`` parent binds every chunk's rows in place, including chunks
+    that start at a row that is not a multiple of 4, with bitwise the tiled
+    output of the contiguous table; an odd row stride raises before the first
+    chunk."""
+    _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    bound: list = []
+    original = cake._dispatch_route
+
+    def spy(route, launcher):
+        values = launcher.values
+        bound.append(
+            (route, values["num_query_tokens"], values["swa_indices"].data_ptr())
+        )
+        return original(route, launcher)
+
+    monkeypatch.setattr(cake, "_dispatch_route", spy)
+    case = _tiling_case(layout="dense")
+    req = case.requirement()
+    assert req.route == "bf16_h32_topk128x_early_v47" and req.num_splits == 3
+    rows = case.rows
+    chunk = 37
+    small_bytes = cake_dsv4_workspace_layout(
+        chunk, 32, req.num_splits, num_query_offsets=case.batch_size + 1
+    ).total_bytes
+    assert req.rows_per_launch(small_bytes) == chunk
+    small = torch.zeros(small_bytes, dtype=torch.uint8, device="cuda:0")
+    firsts = list(range(0, rows, chunk))
+    assert len(firsts) > 1 and any(first % 4 for first in firsts)
+    expected = case.run(workspace=small, out=case.nan_out())
+    torch.cuda.synchronize()
+    tiles = [(req.route, min(chunk, rows - first)) for first in firsts]
+    assert [(r, n) for r, n, _ in bound] == tiles
+
+    table = case.sparse_indices
+    cols = int(table.shape[1])
+    wide = torch.full((rows, cols + 4), -1, dtype=torch.int32, device="cuda:0")
+    wide[:, 4:] = table
+    view = wide[:, 4:]
+    assert view.data_ptr() == wide.data_ptr() + 16 and view.stride(0) == cols + 4
+    bound.clear()
+    got = dataclasses.replace(case, sparse_indices=view).run(
+        workspace=small, out=case.nan_out()
+    )
+    torch.cuda.synchronize()
+    row_bytes = view.stride(0) * view.element_size()
+    assert bound == [
+        (r, n, view.data_ptr() + first * row_bytes)
+        for (r, n), first in zip(tiles, firsts, strict=True)
+    ]
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+
+    odd = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    odd[:, :cols] = table
+    bound.clear()
+    out = case.nan_out()
+    with pytest.raises(
+        ValueError, match=r"^sparse_indices must have a row stride that is a multiple"
+    ):
+        dataclasses.replace(case, sparse_indices=odd[:, :cols]).run(
+            workspace=small, out=out
+        )
+    torch.cuda.synchronize()
+    assert not bound and torch.isnan(out).all()
+
+
 # One call per route, and per O-writing program of the multi-program routes.
 _OUT_ALIGN_CASES = [
     _align_case(
