@@ -147,15 +147,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_det_train_00000000000000000000",
+        "kernel_symbol": "kernel_cake_gqa_det_train_dc3b7b469582069be0a5",
         "launch": {
             "block": (1024, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 65792,
             "use_pdl": False,
         },
-        "library": "cake_gqa_det_train_00000000000000000000",
+        "library": "cake_gqa_det_train_dc3b7b469582069be0a5",
         "stage": "bwd_plan",
     },
     "bwd_main_fp32": {
