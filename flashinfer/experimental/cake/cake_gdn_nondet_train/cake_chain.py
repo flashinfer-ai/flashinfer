@@ -2530,10 +2530,11 @@ def cake_gdn_nondet_train_backward(
     ``dv``, ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "nondet"``):
     any other tape, such as one of the deterministic package, is refused (``ValueError``).  ``grad_qkv``, three
     tensors of the shapes of ``dq``, ``dk`` and ``dv`` with a unit channel stride, head stride 128 and any token-row
-    stride (the head views of one packed gradient row), receives ``dq`` / ``dk`` / ``dv`` in place when the call's
-    tail is a cluster tail of ``F32X_TAILS``; the returned ``dq`` / ``dk`` / ``dv`` are then those tensors (other
-    tails return tensors of their own).  With PyTorch's deterministic algorithms enabled it runs as usual: every
-    launch is fixed-order today."""
+    stride (the head views of one packed gradient row), or a callable that returns them, receives ``dq`` / ``dk`` /
+    ``dv`` in place when the call's tail is a cluster tail of ``F32X_TAILS`` (a callable is called then, right before
+    the tail, and only then); the returned ``dq`` / ``dk`` / ``dv`` are then those tensors (other tails return tensors
+    of their own).  With PyTorch's deterministic algorithms enabled it runs as usual: every launch is fixed-order
+    today."""
     if forward.get("mode") != _TAPE_MODE:
         raise ValueError("cake_gdn_nondet_train_backward reads the tape of a non-deterministic forward "
                          "(cake_gdn_nondet_train_forward, tag 'mode': 'nondet'); this tape does not carry that tag "
@@ -2677,7 +2678,7 @@ def cake_gdn_nondet_train_backward(
         # three (GROUP_TAILS); the FP32-partial cluster tails write dq / dk / dv through their token-row strides, into
         # the caller's views (``grad_qkv``) when given
         if grad_qkv is not None and form in F32X_TAILS:
-            dq, dk, dv = grad_qkv
+            dq, dk, dv = grad_qkv() if callable(grad_qkv) else grad_qkv
         else:
             dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
             dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
@@ -3246,22 +3247,31 @@ class CakeGDNNondetPackedFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, dht):
         # the gradient row and its q / k / v head views (one strided view each, at the row offsets of the forward's
-        # views), which the tail writes through their token-row strides
-        q_shape, v_shape = ctx.view_shapes
-        seq_len, num_heads, dim = q_shape[1], q_shape[2], q_shape[3]
-        width = ctx.row_shape[-1]
-        strides = (seq_len * width, width, dim, 1)
-        d_row = torch.empty(ctx.row_shape, dtype=torch.bfloat16, device=do.device)
-        views = (
-            d_row.as_strided(q_shape, strides, 0),
-            d_row.as_strided(q_shape, strides, num_heads * dim),
-            d_row.as_strided(v_shape, strides, 2 * num_heads * dim),
-        )
-        dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht, views)
+        # views), which the tail writes through their token-row strides; made when the chain reaches the tail, so the
+        # host work runs while the adjoint scan's kernels do instead of before the first of them
+        made = []
+
+        def row_views():
+            q_shape, v_shape = ctx.view_shapes
+            seq_len, num_heads, dim = q_shape[1], q_shape[2], q_shape[3]
+            width = ctx.row_shape[-1]
+            strides = (seq_len * width, width, dim, 1)
+            d_row = torch.empty(ctx.row_shape, dtype=torch.bfloat16, device=do.device)
+            views = (
+                d_row.as_strided(q_shape, strides, 0),
+                d_row.as_strided(q_shape, strides, num_heads * dim),
+                d_row.as_strided(v_shape, strides, 2 * num_heads * dim),
+            )
+            made.append((d_row, views))
+            return views
+
+        dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht, row_views)
+        if not made:
+            # a tail that does not write the row's views (not one of F32X_TAILS)
+            row_views()
+        d_row, views = made[0]
         for view, grad in zip(views, (dq, dk, dv), strict=True):
-            if (
-                grad is not view
-            ):  # a tail that does not write the row's views (not one of F32X_TAILS)
+            if grad is not view:
                 view.copy_(grad)
         return d_row, dg, dbeta, None, dh0, None, None, None, None, None, None
 
