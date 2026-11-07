@@ -359,7 +359,7 @@ def fused_moe(
     slot order in fp32 and converted once. ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space
     gives the same bits; the dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather
+    from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
 
     if not isinstance(w, MoEWeights):
@@ -401,7 +401,9 @@ def fused_moe(
     Tk = T * k
     x_perm = torch.empty(Tk, H, dtype=torch.bfloat16, device=x.device)
     if Tk:
-        get_compiled_gather(k)(x, src, x_perm, Tk, H)
+        get_compiled_gather(
+            k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
+        )(x, src, x_perm, Tk, H)
     a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
     y = grouped_gemm(a, w.w2, counts, config2, "plain", torch.bfloat16)  # [Tk, H] bf16
     if T:

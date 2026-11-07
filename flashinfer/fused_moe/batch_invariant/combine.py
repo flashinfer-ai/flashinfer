@@ -127,14 +127,17 @@ class CombineKernel:
         cute.arch.griddepcontrol_launch_dependents()
 
 
+WARPS_PER_SM_TARGET = 32  # the combine's warp count target per SM: one warp's serial slabs of a row are latency-bound
+
+
 def warps_per_token(T: int, H: int, sms: int) -> int:
-    """The combine's placement at (T, H): enough warps per token to fill about two waves of the machine's CTAs at small
-    T (a token's k dependent loads per vector are spread over several warps), one warp per token once T alone does; a
-    power of two, at most 16 and at most one 32-vector slab per warp (H / 256 for bf16 rows)."""
+    """The combine's placement at (T, H): warps per token doubled while the launch holds fewer than ``WARPS_PER_SM_TARGET``
+    warps per SM (a long token count alone fills the machine and is bandwidth-bound with one warp per token); a power of
+    two, at most 16 and at most one 32-vector slab per warp (H / 256 for bf16 rows). ``sms``: the device's SM count."""
     n_vec = max(1, H // VEC)
     cap = max(1, min(16, -(-n_vec // LANES)))
     w = 1
-    while w * 2 <= cap and T * w * 2 <= 2 * WARPS * sms:
+    while w * 2 <= cap and T * w * 2 <= WARPS_PER_SM_TARGET * sms:
         w *= 2
     return w
 

@@ -516,11 +516,30 @@ class PlanMultiKernel:
         )
 
 
-class GatherKernel:
-    """``x_perm[p, :] = x[src[p] // k, :]``, one warp per row, 16-byte vectors (``H % 8 == 0``)."""
+ROW_WARPS_PER_SM_TARGET = 128  # the row copies' warp count target per SM (a short row count is latency-bound in one warp's serial slabs)
 
-    def __init__(self, k: int):
-        self.k = k
+
+def warps_per_row(n_rows: int, n_vec: int, sms: int) -> int:
+    """The row copies' placement at (rows, 16-byte vectors per row): a power of two of warps per row, at most 8 and at most
+    one 32-vector slab per warp, doubled while the launch holds fewer than ``ROW_WARPS_PER_SM_TARGET`` warps per SM (a long
+    row count is bandwidth-bound with one warp per row). ``sms``: the device's SM count."""
+    slabs = max(1, -(-n_vec // LANES))
+    cap = 1
+    while cap * 2 <= min(8, slabs):
+        cap *= 2
+    w = 1
+    while w * 2 <= cap and n_rows * w * 2 <= ROW_WARPS_PER_SM_TARGET * sms:
+        w *= 2
+    return w
+
+
+class GatherKernel:
+    """``x_perm[p, :] = x[src[p] // k, :]`` in 16-byte vectors (a row is a whole number of them); ``wpr`` warps per row (a
+    placement: warp ``w`` of a row owns the 32-vector slabs ``w, w + wpr, ...``)."""
+
+    def __init__(self, k: int, wpr: int = 1):
+        assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
+        self.k, self.wpr = k, wpr
 
     @cute.jit
     def __call__(
@@ -533,7 +552,7 @@ class GatherKernel:
         stream,
     ):
         self.kernel(mX, mSrc, mXp, Tk, H).launch(
-            grid=[cute.ceil_div(Tk, WARPS), 1, 1],
+            grid=[cute.ceil_div(Tk * Int32(self.wpr), WARPS), 1, 1],
             block=[WARPS * LANES, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -543,31 +562,35 @@ class GatherKernel:
     def kernel(
         self, mX: cute.Tensor, mSrc: cute.Tensor, mXp: cute.Tensor, Tk: Int32, H: Int32
     ):
+        wpr = self.wpr
+        vec = 128 // mX.element_type.width  # elements per 16-byte vector
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
-        p_raw = bidx * WARPS + tidx // LANES
+        g = bidx * WARPS + tidx // LANES
+        p_raw = g // Int32(wpr)
+        part = g % Int32(wpr)
         valid = p_raw < Tk
         p = cutlass.min(p_raw, Tk - Int32(1))
         t = mSrc[p] // Int32(self.k)
         atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            mX.element_type,
-            num_bits_per_copy=8 * mX.element_type.width,
+            cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128
         )
-        n_vec = H // Int32(8)
-        frag = cute.make_rmem_tensor((8,), mX.element_type)
+        n_vec = H // Int32(vec)
+        frag = cute.make_rmem_tensor((vec,), mX.element_type)
         row_x = mX[
             (t, None)
-        ]  # 1-D row slices: a (1, 8) 2-D tile mis-vectorises with a size-1 leading mode
+        ]  # 1-D row slices: a (1, vec) 2-D tile mis-vectorises with a size-1 leading mode
         row_p = mXp[(p, None)]
-        n_mine = (n_vec - lane + Int32(LANES - 1)) // Int32(LANES)
+        n_slabs = (n_vec + Int32(LANES - 1)) // Int32(LANES)
+        n_mine = (n_slabs - part + Int32(wpr - 1)) // Int32(wpr)
         for jj in cutlass.range(0, n_mine, 1):
-            j = jj * LANES + lane
-            cute.copy(atom, cute.local_tile(row_x, (8,), (j,)), frag)
-            if valid:
-                cute.copy(atom, frag, cute.local_tile(row_p, (8,), (j,)))
+            j = (jj * Int32(wpr) + part) * LANES + lane
+            jc = cutlass.min(j, n_vec - Int32(1))
+            cute.copy(atom, cute.local_tile(row_x, (vec,), (jc,)), frag)
+            if valid & (j < n_vec):
+                cute.copy(atom, frag, cute.local_tile(row_p, (vec,), (jc,)))
         cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -706,35 +729,41 @@ def get_compiled_plan_multi(
 
 
 @functools.cache
-def get_compiled_gather(k: int, in_fmt: str = "bf16") -> Any:
-    """``kernel(x [T, H], src [Tk] i32, x_perm [Tk, H], Tk, H)``, ``H % 8 == 0``."""
+def get_compiled_gather(k: int, in_fmt: str = "bf16", wpr: int = 1) -> Any:
+    """``kernel(x [T, H], src [Tk] i32, x_perm [Tk, H], Tk, H)``, ``H`` a multiple of 16 bytes; ``wpr`` warps per row
+    (``warps_per_row``)."""
     dt = get_cutlass_dtype(in_fmt)
+    vec = 128 // dt.width
 
     def compile_fn():
         sym_t, sym_tk, sym_h = (
             cute.sym_int(32),
             cute.sym_int(32),
-            cute.sym_int(32, divisibility=8),
+            cute.sym_int(32, divisibility=vec),
         )
         x_fake = cute.runtime.make_fake_tensor(
-            dt, (sym_t, sym_h), (cute.sym_int64(divisibility=8), 1), assumed_align=16
+            dt, (sym_t, sym_h), (cute.sym_int64(divisibility=vec), 1), assumed_align=16
         )
         s_fake = cute.runtime.make_fake_tensor(Int32, (sym_tk,), (1,), assumed_align=4)
         xp_fake = cute.runtime.make_fake_tensor(
-            dt, (sym_tk, sym_h), (cute.sym_int64(divisibility=8), 1), assumed_align=16
+            dt, (sym_tk, sym_h), (cute.sym_int64(divisibility=vec), 1), assumed_align=16
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            GatherKernel(k),
+            GatherKernel(k, wpr),
             x_fake,
             s_fake,
             xp_fake,
             Int32(1),
-            Int32(8),
+            Int32(vec),
             stream_fake,
             options="--enable-tvm-ffi",
         )
 
     return jit.build_and_load(
-        MODULE, jit.sanitize_symbol_name(f"moe_gather_k{k}_{in_fmt}"), compile_fn
+        MODULE,
+        jit.sanitize_symbol_name(
+            f"moe_gather_k{k}_{in_fmt}" + (f"_w{wpr}" if wpr > 1 else "")
+        ),
+        compile_fn,
     )

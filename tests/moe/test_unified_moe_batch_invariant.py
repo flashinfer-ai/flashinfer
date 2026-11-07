@@ -1054,3 +1054,59 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # zero tokens
     out = layer(_logits_pack(x[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+@needs_device
+def test_combine_and_gather_warp_placements_keep_the_bits():
+    """The combine's warps per token and the gather's warps per row are placements: every count gives the bits of one warp
+    per token / row (each output vector's slot fold stays on one lane; the gather moves the same bytes), the gather is its
+    definition ``x_perm[p] = x[src[p] // k]`` for bf16 and e4m3 rows, and the rules pick members of those sets at every T."""
+    from flashinfer.fused_moe.batch_invariant.combine import (
+        get_compiled_combine,
+        warps_per_token,
+    )
+    from flashinfer.fused_moe.batch_invariant.permute import (
+        get_compiled_gather,
+        warps_per_row,
+    )
+    from flashinfer.gemm.batch_invariant.api import sm_count_of
+
+    sms = sm_count_of(torch.device("cuda"))
+    g = torch.Generator(device="cuda").manual_seed(3)
+    for T, k, H in (
+        (1, 8, 2048),
+        (7, 4, 512),
+        (300, 8, 2048),
+        (1000, 8, 7168),
+        (4096, 2, 4096),
+    ):
+        Tk = T * k
+        perm = torch.randperm(Tk, device="cuda", generator=g).to(torch.int32)
+        dest = perm.view(T, k)
+        y = torch.randn(Tk, H, device="cuda", generator=g).to(torch.bfloat16)
+        w = torch.rand(T, k, device="cuda", generator=g)
+        outs = []
+        for wpt in (1, 2, 4, 8, 16):
+            out = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
+            get_compiled_combine(k, "bf16", "bf16", wpt)(y, dest, w, out, T, H)
+            outs.append(out)
+        torch.cuda.synchronize()
+        assert all(torch.equal(bits(outs[0]), bits(o)) for o in outs[1:]), (T, k, H)
+        assert warps_per_token(T, H, sms) in (1, 2, 4, 8, 16)
+        src = perm  # expanded row i = src[p] sits at position p: token i // k
+        for fmt, x in (
+            ("bf16", torch.randn(T, H, device="cuda", generator=g).to(torch.bfloat16)),
+            (
+                "e4m3",
+                torch.randn(T, H, device="cuda", generator=g).to(torch.float8_e4m3fn),
+            ),
+        ):
+            xps = []
+            for wpr in (1, 2, 4, 8):
+                xp = torch.empty(Tk, H, dtype=x.dtype, device="cuda")
+                get_compiled_gather(k, fmt, wpr)(x, src, xp, Tk, H)
+                xps.append(xp)
+            torch.cuda.synchronize()
+            assert torch.equal(bits(xps[0]), bits(x[(src // k).long()])), (fmt, T)
+            assert all(torch.equal(bits(xps[0]), bits(xp)) for xp in xps[1:]), (fmt, T)
+            assert warps_per_row(Tk, H // (16 // x.element_size()), sms) in (1, 2, 4, 8)
