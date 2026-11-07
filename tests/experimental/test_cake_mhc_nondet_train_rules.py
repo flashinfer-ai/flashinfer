@@ -363,7 +363,9 @@ LPT_FORMER_FIRES = (
 # former calibrations of these sizes fired (H 5120 (1.0, 0.99), H 7168 (1.0, 0.98)).
 LPT_HIDDEN_T = tuple(sorted({*BENCH_T, 24576}))
 LPT_FIRES_HIDDEN = tuple(
-    (arch, sm, hidden, {}) for arch, sm in det.RULES_BOARDS for hidden in NEW_HIDDEN_SIZES
+    (arch, sm, hidden, {})
+    for arch, sm in det.RULES_BOARDS
+    for hidden in NEW_HIDDEN_SIZES
 )
 LPT_SCREEN_FIRES_HIDDEN = (
     ("sm_100a", 148, 5120, {15566: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
