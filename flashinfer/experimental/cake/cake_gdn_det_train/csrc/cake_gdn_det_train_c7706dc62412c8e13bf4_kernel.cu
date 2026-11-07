@@ -151,8 +151,14 @@ __device__ __forceinline__ void tcgen05_commit_leader(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_gdn_det_train_16278f860de548514cf8(__nv_bfloat16* __restrict__ qn, __nv_bfloat16* __restrict__ kn, float* __restrict__ rstd_q, float* __restrict__ rstd_k, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ do_, __nv_bfloat16* __restrict__ dv2, __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ dh, float* __restrict__ g_cs, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, float* __restrict__ beta, __nv_bfloat16* __restrict__ dq_out, __nv_bfloat16* __restrict__ dk_out, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dv_out, __nv_bfloat16* __restrict__ dbeta_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, float scale, int normalize_qk)
+kernel_cake_gdn_det_train_c7706dc62412c8e13bf4(__nv_bfloat16* __restrict__ qn, __nv_bfloat16* __restrict__ kn, float* __restrict__ rstd_q, float* __restrict__ rstd_k, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ do_, __nv_bfloat16* __restrict__ dv2, __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ dh, float* __restrict__ g_cs, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, float* __restrict__ beta, __nv_bfloat16* __restrict__ dq_out, __nv_bfloat16* __restrict__ dk_out, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dv_out, __nv_bfloat16* __restrict__ dbeta_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, float scale, int normalize_qk, unsigned int* __restrict__ ready, const int* __restrict__ tile_order, int v_row_heads)
 {
+    // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
+    asm volatile("" : "+l"(dv2));
+    __builtin_assume(__isGlobal(dv2));
+    asm volatile("" : "+l"(dh));
+    __builtin_assume(__isGlobal(dh));
+
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -359,7 +365,7 @@ kernel_cake_gdn_det_train_16278f860de548514cf8(__nv_bfloat16* __restrict__ qn, _
     int warp_1 = warp;
     int tid_2 = tid;
     int block_x = blockIdx.x;
-    int chunk = block_x / num_v_heads;
+    int chunk = tile_order[block_x / num_v_heads];
     int hv = block_x % num_v_heads;
     int hq = hv / 2;
     int rank = cta_rank;
@@ -393,6 +399,18 @@ kernel_cake_gdn_det_train_16278f860de548514cf8(__nv_bfloat16* __restrict__ qn, _
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
         :: "r"(dst0_0 + 6144), "l"(v_new + (src_row_0 + 48ll * row_stride_0)), "r"((n_valid > r0_0 + 48) ? 16 : 0));
     asm volatile("cp.async.commit_group;");
+    if (tid_2 == 0) {
+        unsigned int _released_first;
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_released_first) : "l"(ready + (2ll + (long long)chunk * (long long)num_v_heads + (long long)hv)) : "memory");
+        unsigned int _released = _released_first;
+        while (_released < 64) {
+            asm volatile("nanosleep.u32 %0;" :: "r"(64));
+            unsigned int _released_next;
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_released_next) : "l"(ready + (2ll + (long long)chunk * (long long)num_v_heads + (long long)hv)) : "memory");
+            _released = _released_next;
+        }
+    }
+    __syncthreads();
     long long state_base = ((long long)chunk * (long long)num_v_heads + (long long)hv) * 16384ll;
     #pragma unroll
     for (int it = 0; it < 8; it++) {
@@ -871,7 +889,7 @@ kernel_cake_gdn_det_train_16278f860de548514cf8(__nv_bfloat16* __restrict__ qn, _
     asm volatile("tcgen05.fence::before_thread_sync;");
     int r0_4 = tid / 16;
     int c0_4 = tid % 16 * 8;
-    long long row_stride_4 = (long long)num_v_heads * 128ll;
+    long long row_stride_4 = (long long)v_row_heads * 128ll;
     long long src_row_4 = (long long)(tok0 + r0_4) * row_stride_4 + (long long)hv * 128ll + (long long)c0_4;
     unsigned int dst0_4 = s_v_addr + (unsigned int)(c0_4 / 64 * 8192 + (r0_4 * 128 + c0_4 % 64 * 2 ^ (r0_4 * 128 + c0_4 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
@@ -2528,6 +2546,14 @@ kernel_cake_gdn_det_train_16278f860de548514cf8(__nv_bfloat16* __restrict__ qn, _
         }
         if (n_valid > lane_0 + 32) {
             dg_out[gate_index_hi] = total - total_lo - d_hi + self_hi;
+        }
+    }
+
+    // Kernel teardown ops
+    if (tid == 0) {
+        unsigned int done_before = atomicAdd(&ready[1], 1);
+        if (done_before == (unsigned int)(gridDim.x * gridDim.y * gridDim.z - 1)) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
         }
     }
 
