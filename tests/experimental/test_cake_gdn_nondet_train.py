@@ -336,7 +336,7 @@ FUSED_TAIL_STAGES = {
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 42 and len(set(cake_jit.STAGES)) == 42
+    assert len(cake_jit.STAGES) == 45 and len(set(cake_jit.STAGES)) == 45
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -1387,6 +1387,8 @@ def test_group_of_three_r_form_keeps_its_bits(row, device, monkeypatch) -> None:
     arch = cake_backend.device_arch(cake_chain._device_index(device))
     if not SERIAL_G3_R_FORM.get(arch, False):
         pytest.skip(f"{arch} runs one dhu_tc2 launch on these rows")
+    # the planner's tables (the one-wave split replaces the R form on the architectures of ADJOINT_SPLIT_ARCHS)
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
     seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
     main = torch.cuda.current_stream(device).cuda_stream
@@ -2701,6 +2703,8 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
     # (fixed-order cluster tails) and stays within the budgets of the planner's table; a plan pin keeps the planner
     seq_lens = (16384,)
     index = cake_chain._device_index(device)
+    # the planner's tables (the one-wave split replaces the tc plan on the architectures of ADJOINT_SPLIT_ARCHS)
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
     monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
@@ -2929,6 +2933,8 @@ SPLIT_R_ROWS = {
     ids=["B200", "B300", "GB300", "R200-212", "R200-216"],
 )
 def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
+    # the planner's tables (the one-wave split replaces the R form on the architectures of ADJOINT_SPLIT_ARCHS)
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
     monkeypatch.setattr(
         cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
     )
