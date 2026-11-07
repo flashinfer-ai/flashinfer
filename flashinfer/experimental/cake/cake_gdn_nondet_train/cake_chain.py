@@ -3197,7 +3197,8 @@ def _packed_row(q, k, v) -> torch.Tensor | None:
     ``H x 128`` and ``2 H x 128`` with its row stride, head stride 128 and unit channel stride, each requiring grad
     through a view of it.  Every call with grad asks it, so it reads each tensor's shape, strides and offset once
     (tuples compared whole; the strides of size-one axes, which any value may take, only when the whole compare
-    fails)."""
+    fails), after :func:`_check_inputs`, whose shape checks (q ``[B, T, H, 128]``, k of q's shape, v ``[B, T, HV,
+    128]``) it does not repeat."""
     base = q._base
     if base is None or k._base is not base or v._base is not base:
         return None
@@ -3207,18 +3208,13 @@ def _packed_row(q, k, v) -> torch.Tensor | None:
         return None
     if base.dtype != torch.bfloat16:
         return None
-    shape, v_shape = q.shape, v.shape
-    if len(shape) != 4 or len(v_shape) != 4:
-        return None
+    shape = q.shape
     batch, seq_len, num_heads, dim = shape
-    num_v_heads = v_shape[2]
-    width = (2 * num_heads + num_v_heads) * dim
+    width = (2 * num_heads + v.shape[2]) * dim
     base_shape = base.shape
     if (
         not base_shape
         or base_shape[-1] != width
-        or k.shape != shape
-        or v_shape != (batch, seq_len, num_v_heads, dim)
         or base.numel() != batch * seq_len * width
         or not base.is_contiguous()
     ):
