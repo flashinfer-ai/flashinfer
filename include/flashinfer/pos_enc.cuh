@@ -1545,7 +1545,8 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
     config.numAttrs = 1;
 
     auto kernel =
-        RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size)
+        (RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+         !RopeVectorsAligned(cos_sin_cache, 0, 0))
             ? RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, true, vec_size, /*bdx=*/1, DType,
                                                    RoPEIdType, PagedKVIdType, QuantType,
                                                    paged_kv_t<QuantType, PagedKVIdType>>
@@ -1625,7 +1626,8 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
     config.numAttrs = 1;
 
     auto kernel =
-        RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size)
+        (RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+         !RopeVectorsAligned(cos_sin_cache, 0, 0))
             ? RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, true, vec_size, /*bdx=*/1, DType,
                                                    RoPEIdType, PagedKVIdType, QuantType,
                                                    paged_kv_mla_t<QuantType, PagedKVIdType>>

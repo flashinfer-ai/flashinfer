@@ -602,56 +602,69 @@ def test_rope_quantize_fp8_any_rope_dim(
     positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
     page_iter = positions // page_size
     entry_idx = positions % page_size
-    if attention_type == "mla":
-        kpe_cache = torch.zeros(num_pages, page_size, rope_dim, dtype=quant_dtype)
-        ckv_cache = torch.zeros(num_pages, page_size, no_rope_dim, dtype=quant_dtype)
-        cache = (ckv_cache.to(device), kpe_cache.to(device))
-        v_in = None
-    else:
-        k_cache = torch.zeros(
-            num_pages, page_size, num_kv_heads, head_dim, dtype=quant_dtype
+    # One float off the 16-byte boundary, with the same contents.
+    shifted_cache = torch.empty(
+        rope_ref.cos_sin_cache.numel() + 1, dtype=torch.float32, device=device
+    )[1:].view(rope_ref.cos_sin_cache.shape)
+    shifted_cache.copy_(rope_ref.cos_sin_cache)
+    for cos_sin_cache in (rope_ref.cos_sin_cache, shifted_cache):
+        if attention_type == "mla":
+            kpe_cache = torch.zeros(num_pages, page_size, rope_dim, dtype=quant_dtype)
+            ckv_cache = torch.zeros(
+                num_pages, page_size, no_rope_dim, dtype=quant_dtype
+            )
+            cache = (ckv_cache.to(device), kpe_cache.to(device))
+            v_in = None
+        else:
+            k_cache = torch.zeros(
+                num_pages, page_size, num_kv_heads, head_dim, dtype=quant_dtype
+            )
+            cache = (k_cache.to(device), k_cache.to(device).clone())
+            v_in = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
+        q_rope_out, q_nope_out = (
+            flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                q_in[..., :rope_dim],
+                k_in[..., :rope_dim],
+                q_in[..., rope_dim:],
+                k_in[..., rope_dim:],
+                v_in,
+                cos_sin_cache,
+                pos_ids,
+                cache,
+                page_indices,
+                page_indptr,
+                batch_indices,
+                positions,
+                page_size=page_size,
+                quantize_dtype=quant_dtype,
+                quant_scale_q=quant_scale_q,
+                quant_scale_kv=quant_scale_kv,
+                is_neox=is_neox_style,
+            )
         )
-        cache = (k_cache.to(device), k_cache.to(device).clone())
-        v_in = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
-    q_rope_out, q_nope_out = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-        q_in[..., :rope_dim],
-        k_in[..., :rope_dim],
-        q_in[..., rope_dim:],
-        k_in[..., rope_dim:],
-        v_in,
-        rope_ref.cos_sin_cache,
-        pos_ids,
-        cache,
-        page_indices,
-        page_indptr,
-        batch_indices,
-        positions,
-        page_size=page_size,
-        quantize_dtype=quant_dtype,
-        quant_scale_q=quant_scale_q,
-        quant_scale_kv=quant_scale_kv,
-        is_neox=is_neox_style,
-    )
-    torch.testing.assert_close(
-        torch.cat([q_rope_out, q_nope_out], dim=-1).float(), q_ref, atol=0.5, rtol=0.25
-    )
-    k_cached = (
-        torch.cat(
-            [
-                cache[1][page_iter, entry_idx],
-                cache[0][page_iter, entry_idx],
-            ],
-            dim=-1,
-        )
-        if attention_type == "mla"
-        else cache[0][page_iter, entry_idx]
-    )
-    torch.testing.assert_close(k_cached.float(), k_ref, atol=0.5, rtol=0.25)
-    if attention_type == "gqa":
-        v_ref = (v_in * quant_scale_kv).to(quant_dtype).float()
         torch.testing.assert_close(
-            cache[1][page_iter, entry_idx].float(), v_ref, atol=0.5, rtol=0.25
+            torch.cat([q_rope_out, q_nope_out], dim=-1).float(),
+            q_ref,
+            atol=0.5,
+            rtol=0.25,
         )
+        k_cached = (
+            torch.cat(
+                [
+                    cache[1][page_iter, entry_idx],
+                    cache[0][page_iter, entry_idx],
+                ],
+                dim=-1,
+            )
+            if attention_type == "mla"
+            else cache[0][page_iter, entry_idx]
+        )
+        torch.testing.assert_close(k_cached.float(), k_ref, atol=0.5, rtol=0.25)
+        if attention_type == "gqa":
+            v_ref = (v_in * quant_scale_kv).to(quant_dtype).float()
+            torch.testing.assert_close(
+                cache[1][page_iter, entry_idx].float(), v_ref, atol=0.5, rtol=0.25
+            )
 
 
 def _run_rope_variant(kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace):
