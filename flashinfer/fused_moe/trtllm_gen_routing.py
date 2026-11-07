@@ -243,7 +243,8 @@ def trtllm_gen_routing(
     top_k : int
         Number of experts selected per token.
     num_fused_shared_experts : int
-        Extra fused shared-expert slots appended per token (DeepSeekV3 path).
+        Extra fused shared-expert slots appended per token at weight 1.0
+        (every routing method except ``Llama4``).
     n_group, topk_group : int
         Expert-group parameters for grouped routing (DeepSeekV3). 0 disables
         grouping.
