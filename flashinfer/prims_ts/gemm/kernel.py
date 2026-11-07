@@ -3242,8 +3242,9 @@ def create_store_task(
     Before its first accumulator wait the epilogue reads per-call inputs
     (``x_scale``, ``weight_scale``, ``positions``) and stages the Q/K norm
     weights, and on a CTA's first tile nothing orders those reads after
-    LoadATask's wait through TMA -> MMA -> TMEM. The epilogue has no work
-    before its first accumulator is full, so the wait takes no overlap away.
+    LoadATask's wait through TMA -> MMA -> TMEM. The epilogue's next step is
+    the first accumulator wait, which already needs LoadATask's wait and a
+    full mainloop, so waiting first delays only those few reads.
     Without ``enable_pdl`` the barrier is ``None``. ``@schedule`` rejects
     ``None``, so it is left out of the call and of the task's resources.
     """
