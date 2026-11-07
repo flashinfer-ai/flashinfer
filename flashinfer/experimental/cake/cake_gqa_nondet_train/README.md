@@ -137,8 +137,9 @@ scratch stays allocated between calls.
 max_seqlen_k=, row_map=, budget_bytes=)` returns the scratch plus, when the
 key sizes are given, the per-call buffers.  With torch's deterministic mode
 and `torch.utils.deterministic.fill_uninitialized_memory` enabled, PyTorch
-fills each per-call buffer when it is allocated, which adds <pending> ms per
-backward call.  One workspace serves one stream at a time; without one, each
+fills each per-call buffer when it is allocated: on a B300, a row-map backward
+call with 7.1 GB, 9.8 GB or 19.4 GB of per-call buffers took 1.9 ms, 3.4 ms or
+4.5 ms longer.  One workspace serves one stream at a time; without one, each
 device stream gets its own default workspace.
 
 ## Limitations
