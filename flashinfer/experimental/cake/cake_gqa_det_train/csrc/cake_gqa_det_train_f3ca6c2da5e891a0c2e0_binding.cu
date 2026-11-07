@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_gqa_det_train_f3ca6c2da5e891a0c2e0(const __grid_constant__ CUtensorMap dsw, const __grid_constant__ CUtensorMap K, int* __restrict__ tile_base, int* __restrict__ pair_base, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, float* __restrict__ dq_accum, int num_segments, int group, int rows_pad, int n0, int n1, int h0, int hc, int tile_stride, int zero_tile, int accumulate);
+extern "C" __global__ void kernel_cake_gqa_det_train_f3ca6c2da5e891a0c2e0(const __grid_constant__ CUtensorMap dsw, const __grid_constant__ CUtensorMap K, int* __restrict__ tile_base, int* __restrict__ pair_base, int* __restrict__ pair_order, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, float* __restrict__ dq_accum, int num_segments, int group, int rows_pad, int n0, int n1, int h0, int hc, int tile_stride, int zero_tile, int accumulate);
 
 namespace cake_binding_kernel_cake_gqa_det_train_f3ca6c2da5e891a0c2e0 {
 
@@ -142,7 +142,7 @@ CUtensorMap EncodeTma_K(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_pair_base, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_dq_accum, int64_t a_num_segments, int64_t a_group, int64_t a_rows_pad, int64_t a_n0, int64_t a_n1, int64_t a_h0, int64_t a_hc, int64_t a_tile_stride, int64_t a_zero_tile, int64_t a_accumulate, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_pair_base, TensorView a_pair_order, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_dq_accum, int64_t a_num_segments, int64_t a_group, int64_t a_rows_pad, int64_t a_n0, int64_t a_n1, int64_t a_h0, int64_t a_hc, int64_t a_tile_stride, int64_t a_zero_tile, int64_t a_accumulate, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_dsw.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_dsw, "dsw");
@@ -153,6 +153,8 @@ void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_
   check_dtype(a_tile_base, DLDataType{kDLInt, 32, 1}, "tile_base");
   check_cuda_tensor(a_pair_base, "pair_base");
   check_dtype(a_pair_base, DLDataType{kDLInt, 32, 1}, "pair_base");
+  check_cuda_tensor(a_pair_order, "pair_order");
+  check_dtype(a_pair_order, DLDataType{kDLInt, 32, 1}, "pair_order");
   check_cuda_tensor(a_cu_seqlens_q, "cu_seqlens_q");
   check_dtype(a_cu_seqlens_q, DLDataType{kDLInt, 32, 1}, "cu_seqlens_q");
   check_cuda_tensor(a_cu_seqlens_k, "cu_seqlens_k");
@@ -194,6 +196,8 @@ void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_
   check_same_device(a_tile_base, a_dsw, "tile_base", "dsw");
   check_contiguous(a_pair_base, "pair_base");
   check_same_device(a_pair_base, a_dsw, "pair_base", "dsw");
+  check_contiguous(a_pair_order, "pair_order");
+  check_same_device(a_pair_order, a_dsw, "pair_order", "dsw");
   check_contiguous(a_cu_seqlens_q, "cu_seqlens_q");
   check_same_device(a_cu_seqlens_q, a_dsw, "cu_seqlens_q", "dsw");
   check_contiguous(a_cu_seqlens_k, "cu_seqlens_k");
@@ -234,6 +238,7 @@ void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_
   CUtensorMap v_K = EncodeTma_K(a_K);
   void* v_tile_base = DataPtr(a_tile_base);
   void* v_pair_base = DataPtr(a_pair_base);
+  void* v_pair_order = DataPtr(a_pair_order);
   void* v_cu_seqlens_q = DataPtr(a_cu_seqlens_q);
   void* v_cu_seqlens_k = DataPtr(a_cu_seqlens_k);
   void* v_dq_accum = DataPtr(a_dq_accum);
@@ -247,7 +252,7 @@ void Run(TensorView a_dsw, TensorView a_K, TensorView a_tile_base, TensorView a_
   int32_t v_tile_stride = static_cast<int32_t>(a_tile_stride);
   int32_t v_zero_tile = static_cast<int32_t>(a_zero_tile);
   int32_t v_accumulate = static_cast<int32_t>(a_accumulate);
-  void* kernel_args[] = {&v_dsw, &v_K, &v_tile_base, &v_pair_base, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_dq_accum, &v_num_segments, &v_group, &v_rows_pad, &v_n0, &v_n1, &v_h0, &v_hc, &v_tile_stride, &v_zero_tile, &v_accumulate};
+  void* kernel_args[] = {&v_dsw, &v_K, &v_tile_base, &v_pair_base, &v_pair_order, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_dq_accum, &v_num_segments, &v_group, &v_rows_pad, &v_n0, &v_n1, &v_h0, &v_hc, &v_tile_stride, &v_zero_tile, &v_accumulate};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(192, 1, 1);
