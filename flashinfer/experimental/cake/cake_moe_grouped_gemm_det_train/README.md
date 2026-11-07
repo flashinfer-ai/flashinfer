@@ -132,9 +132,14 @@ vendors the package calls those plain functions directly.
 the weight-gradient workspaces, resolves the route and binds the generated
 programs, and returns a `CakeMoEGroupedGemmDetLaunch`. `launch()` passes the operands'
 TMA descriptors by value (the binding encodes them on the host from the bound
-tensors' metadata at every launch), performs no allocation and no host
-synchronisation. Prepare a new launch when a shape, dtype or tensor binding
-changes; the one-shot helpers prepare on every call.
+tensors' metadata at every launch) and performs no host synchronisation. It
+allocates only the stream workspaces (scheduler and wave buffers; see the
+`cake_backend` module docstring): the first launch on a CUDA stream allocates
+that stream's buffers and later launches on it allocate nothing, while a launch
+during a CUDA-graph capture, or for a device other than the current one, takes
+a set of its own (from the graph's pool under capture). Prepare a new launch
+when a shape, dtype or tensor binding changes; the one-shot helpers prepare on
+every call.
 
 ## Stable API opt-in and autograd
 
