@@ -56,6 +56,7 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
         "fused_moe/batch_invariant/route.py",
+        "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
         "fused_moe/batch_invariant/combine.py",
     ),

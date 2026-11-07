@@ -82,7 +82,7 @@ class RouteKernel:
         T: Int32,
         E: Int32,
     ):
-        P, k, meth = self.P, self.k, self.method
+        k = self.k
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
@@ -92,90 +92,126 @@ class RouteKernel:
         t = cutlass.min(
             t_raw, T - Int32(1)
         )  # out-of-range warps recompute a valid token and store nothing
-        if cutlass.const_expr(True):
-            neg_inf = CuteF32.const(float("-inf"))
-            # the lane's experts: logits (absent -> -inf), selection scores q, weights
-            logits = []
-            for i in cutlass.range_constexpr(P):
-                e = lane * P + i
-                v = neg_inf
-                if e < E:
-                    v = mL[t, e].to(Float32)
-                logits.append(v)
-            if cutlass.const_expr(meth.score == "sigmoid"):
-                wgt = [S.sigmoid_term(CuteF32, l) for l in logits]
-                q = []
-                for i in cutlass.range_constexpr(P):
-                    e = lane * P + i
-                    qi = wgt[i]
-                    if cutlass.const_expr(meth.bias):
-                        b = CuteF32.const(0.0)
-                        if e < E:
-                            b = mBias[e]
-                        qi = CuteF32.add(wgt[i], b)
-                    if e >= E:
-                        qi = neg_inf
-                    q.append(qi)
-            else:
-                m = logits[0]
-                for i in cutlass.range_constexpr(1, P):
-                    m = CuteF32.fmax(m, logits[i])
-                for sh in cutlass.range_constexpr(5):
-                    m = CuteF32.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1 << sh))
-                z = []
-                for i in cutlass.range_constexpr(P):
-                    e = lane * P + i
-                    zi = CuteF32.const(
-                        0.0
-                    )  # absent: +0 (identity for the all-positive sum)
-                    if e < E:
-                        zi = S.exp_term(CuteF32, CuteF32.add(logits[i], CuteF32.neg(m)))
-                    z.append(zi)
-                state, start = canon.init_state(
-                    self.plan, CuteF32, lambda key: z[key[0] if key else 0]
-                )  # P = 1: no register factor
-                Ssum = canon.run(self.plan, state, start, _LanePeers(), CuteF32)
-                wgt = [CuteF32.div(zi, Ssum) for zi in z]
-                q = logits
-            # k rounds of warp argmax under (q desc, index asc)
-            taken = Int32(0)
-            sel_e = []
-            sel_w = []
-            for _r in cutlass.range_constexpr(k):
-                bv = neg_inf
-                bi = Int32(0x7FFFFFFF)
-                for i in cutlass.range_constexpr(P):
-                    e = Int32(lane * P + i)
-                    free = ((taken >> i) & Int32(1)) == Int32(0)
-                    better = (q[i] > bv) | ((q[i] == bv) & (e < bi))
-                    if free & better:
-                        bv = q[i]
-                        bi = e
-                for sh in cutlass.range_constexpr(5):
-                    ov = cute.arch.shuffle_sync_bfly(bv, offset=1 << sh)
-                    oi = cute.arch.shuffle_sync_bfly(bi, offset=1 << sh)
-                    take = (ov > bv) | ((ov == bv) & (oi < bi))
-                    if take:
-                        bv = ov
-                        bi = oi
-                owner = bi // Int32(P)
-                slot = bi % Int32(P)
-                wv = CuteF32.const(0.0)
-                for i in cutlass.range_constexpr(P):
-                    if slot == Int32(i):
-                        wv = wgt[i]
-                wv = cute.arch.shuffle_sync(wv, offset=owner)
-                if lane == owner:
-                    taken = taken | (Int32(1) << slot)
-                sel_e.append(bi)
-                sel_w.append(wv)
-            scale = mScale[0] if cutlass.const_expr(meth.scaled) else None
-            ws = S.slot_weights(CuteF32, sel_w, list(range(k)), meth, scale)
-            for r in cutlass.range_constexpr(k):
-                if (lane == Int32(r)) & valid:
-                    mExp[t, r] = sel_e[r]
-                    mW[t, r] = ws[r]
+        out_e = cute.make_rmem_tensor((k,), Int32)
+        out_w = cute.make_rmem_tensor((k,), Float32)
+        route_token(
+            self.P,
+            k,
+            self.method,
+            self.plan,
+            mL,
+            mBias,
+            mScale,
+            t,
+            lane,
+            E,
+            out_e,
+            out_w,
+        )
+        for r in cutlass.range_constexpr(k):
+            if (lane == Int32(r)) & valid:
+                mExp[t, r] = out_e[r]
+                mW[t, r] = out_w[r]
         cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def route_token(
+    P: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+    meth: cutlass.Constexpr,
+    plan: cutlass.Constexpr,
+    mL: cute.Tensor,
+    mBias: cute.Tensor,
+    mScale: cute.Tensor,
+    t: Int32,
+    lane: Int32,
+    E: Int32,
+    out_e: cute.Tensor,
+    out_w: cute.Tensor,
+):
+    """One token's routing by one warp (the class's routing term): the warp-uniform results land in ``out_e[r]`` /
+    ``out_w[r]`` for the ``k`` slots. Shared by the route kernel and the fused route + plan kernel: the same traced code,
+    the same bits."""
+    neg_inf = CuteF32.const(float("-inf"))
+    # the lane's experts: logits (absent -> -inf), selection scores q, weights
+    logits = []
+    for i in cutlass.range_constexpr(P):
+        e = lane * P + i
+        v = neg_inf
+        if e < E:
+            v = mL[t, e].to(Float32)
+        logits.append(v)
+    if cutlass.const_expr(meth.score == "sigmoid"):
+        wgt = [S.sigmoid_term(CuteF32, l) for l in logits]
+        q = []
+        for i in cutlass.range_constexpr(P):
+            e = lane * P + i
+            qi = wgt[i]
+            if cutlass.const_expr(meth.bias):
+                b = CuteF32.const(0.0)
+                if e < E:
+                    b = mBias[e]
+                qi = CuteF32.add(wgt[i], b)
+            if e >= E:
+                qi = neg_inf
+            q.append(qi)
+    else:
+        m = logits[0]
+        for i in cutlass.range_constexpr(1, P):
+            m = CuteF32.fmax(m, logits[i])
+        for sh in cutlass.range_constexpr(5):
+            m = CuteF32.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1 << sh))
+        z = []
+        for i in cutlass.range_constexpr(P):
+            e = lane * P + i
+            zi = CuteF32.const(0.0)  # absent: +0 (identity for the all-positive sum)
+            if e < E:
+                zi = S.exp_term(CuteF32, CuteF32.add(logits[i], CuteF32.neg(m)))
+            z.append(zi)
+        state, start = canon.init_state(
+            plan, CuteF32, lambda key: z[key[0] if key else 0]
+        )  # P = 1: no register factor
+        Ssum = canon.run(plan, state, start, _LanePeers(), CuteF32)
+        wgt = [CuteF32.div(zi, Ssum) for zi in z]
+        q = logits
+    # k rounds of warp argmax under (q desc, index asc)
+    taken = Int32(0)
+    sel_e = []
+    sel_w = []
+    for _r in cutlass.range_constexpr(k):
+        bv = neg_inf
+        bi = Int32(0x7FFFFFFF)
+        for i in cutlass.range_constexpr(P):
+            e = Int32(lane * P + i)
+            free = ((taken >> i) & Int32(1)) == Int32(0)
+            better = (q[i] > bv) | ((q[i] == bv) & (e < bi))
+            if free & better:
+                bv = q[i]
+                bi = e
+        for sh in cutlass.range_constexpr(5):
+            ov = cute.arch.shuffle_sync_bfly(bv, offset=1 << sh)
+            oi = cute.arch.shuffle_sync_bfly(bi, offset=1 << sh)
+            take = (ov > bv) | ((ov == bv) & (oi < bi))
+            if take:
+                bv = ov
+                bi = oi
+        owner = bi // Int32(P)
+        slot = bi % Int32(P)
+        wv = CuteF32.const(0.0)
+        for i in cutlass.range_constexpr(P):
+            if slot == Int32(i):
+                wv = wgt[i]
+        wv = cute.arch.shuffle_sync(wv, offset=owner)
+        if lane == owner:
+            taken = taken | (Int32(1) << slot)
+        sel_e.append(bi)
+        sel_w.append(wv)
+    scale = mScale[0] if cutlass.const_expr(meth.scaled) else None
+    ws = S.slot_weights(CuteF32, sel_w, list(range(k)), meth, scale)
+    for r in cutlass.range_constexpr(k):
+        out_e[r] = sel_e[r]
+        out_w[r] = ws[r]
 
 
 def route_kernel_name(Ep: int, k: int, method_name: str, in_fmt: str) -> str:
