@@ -240,8 +240,8 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes | None:
             logger.warning(
                 f"sha256 mismatch (expected {sha256} actual {actual_sha}) for {cubin_path}"
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Cannot read {cubin_path}: {e}")
     return None
 
 
@@ -346,6 +346,13 @@ dll_cubin_handlers = {}
 
 
 def setup_cubin_loader(dll_path: str) -> None:
+    """Register the Python cubin callback with a loaded native module.
+
+    Parameters
+    ----------
+    dll_path : str
+        Path of the native module that exports FlashInferSetCubinCallback.
+    """
     if dll_path in dll_cubin_handlers:
         return
 
@@ -355,8 +362,17 @@ def setup_cubin_loader(dll_path: str) -> None:
     CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
 
     def get_cubin_callback(name: bytes, sha256: bytes):
-        # Both name and sha256 are bytes (c_char_p)
-        cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
+        """Deliver the cubin bytes for ``name`` to the native side; never raises into native code."""
+        # Both name and sha256 are bytes (c_char_p). A ctypes callback cannot
+        # propagate an exception, so always hand the native side a buffer:
+        # empty bytes mean the cubin is unavailable (a failed download or
+        # checksum, logged by get_artifact), and the consumer's checked driver
+        # load decides whether that is fatal or skippable.
+        try:
+            cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
+        except Exception as e:
+            logger.error(f"Failed to load cubin {name.decode('utf-8', 'replace')}: {e}")
+            cubin = b""
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )
