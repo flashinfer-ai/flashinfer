@@ -18,6 +18,76 @@ mixing with a fixed ``HC=4`` sub-head layout.
 Training mHC (Cake)
 -------------------
 
+.. note::
+
+   The mode is part of every name: the deterministic module
+   ``flashinfer.cake_mhc_det_train`` (``det``) and the non-deterministic module
+   ``flashinfer.cake_mhc_nondet_train`` (``nondet``) export the same verbs, the
+   model's head is the deterministic module
+   ``flashinfer.cake_mhc_head_det_train``, and no entry point takes a
+   ``deterministic`` keyword. Each module imports its backend package under
+   ``flashinfer.experimental.cake`` on first use. The
+   former names below are removed, with no alias: importing them fails.
+   FlashInfer 0.7.3's ``cake_mhc_train`` names were the deterministic package
+   at the top level and the non-deterministic one under
+   ``flashinfer.experimental.cake``.
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 50 50
+
+      * - Former name
+        - Name now
+      * - ``flashinfer.cake_mhc_train.cake_mhc_train_<verb>`` and the top-level
+          ``flashinfer.cake_mhc_train_<verb>`` (0.7.3)
+        - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<verb>`` (the
+          entry points and ``*_workspace_bytes`` also at the top level)
+      * - ``flashinfer.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function`` and
+          the top-level ``flashinfer.CakeMHCTrain{Prepare,Finish}Function``
+          (0.7.3),
+          ``flashinfer.cake_mhc_det_train.CakeMHCDetTrain{Prepare,Finish}Function``
+        - ``flashinfer.cake_mhc_det_train.CakeMHCDet{Prepare,Finish}Function``
+      * - ``flashinfer.cake_mhc_train.is_cake_mhc_train_supported`` (0.7.3)
+        - ``flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_supported``
+      * - ``flashinfer.cake_mhc_train.route_key`` (0.7.3),
+          ``flashinfer.cake_mhc_det_train.route_key``
+        - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_route_key``
+      * - ``flashinfer.cake_mhc_train_backend`` (0.7.3),
+          ``flashinfer.cake_mhc_det_train_backend``
+        - ``flashinfer.experimental.cake.cake_mhc_det_train``
+      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head_<verb>``,
+          ``flashinfer.cake_mhc_train.cake_mhc_train_head_<verb>`` and the
+          top-level ``flashinfer.cake_mhc_train_head_<verb>`` (0.7.3), for
+          ``<verb>`` ``forward`` and ``backward``
+        - ``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det_train_<verb>``
+          (also at the top level)
+      * - ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``,
+          ``flashinfer.cake_mhc_train.cake_mhc_train_head`` and the top-level
+          ``flashinfer.cake_mhc_train_head`` (0.7.3)
+        - ``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det`` (also at the
+          top level)
+      * - ``flashinfer.cake_mhc_det_train.CakeMHCDetTrainHeadFunction``,
+          ``flashinfer.cake_mhc_train.CakeMHCTrainHeadFunction`` and the
+          top-level ``flashinfer.CakeMHCTrainHeadFunction`` (0.7.3)
+        - ``flashinfer.cake_mhc_head_det_train.CakeMHCHeadDetFunction``
+      * - ``flashinfer.cake_mhc_det_train.is_cake_mhc_det_train_head_supported``,
+          ``flashinfer.cake_mhc_train.is_cake_mhc_train_head_supported`` (0.7.3)
+        - ``flashinfer.cake_mhc_head_det_train.is_cake_mhc_head_det_train_supported``
+      * - ``flashinfer.cake_mhc_train_head_backend`` (0.7.3),
+          ``flashinfer.cake_mhc_det_train_head_backend``
+        - ``flashinfer.experimental.cake.cake_mhc_head_det_train``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<verb>``
+          with ``deterministic=False``
+        - ``flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_<verb>``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.is_cake_mhc_train_supported``
+        - ``flashinfer.cake_mhc_nondet_train.is_cake_mhc_nondet_train_supported``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.CakeMHCTrain{Prepare,Finish}Function``
+        - ``flashinfer.cake_mhc_nondet_train.CakeMHCNondet{Prepare,Finish}Function``
+      * - ``flashinfer.experimental.cake.cake_mhc_train.route_key``
+        - ``flashinfer.cake_mhc_nondet_train.cake_mhc_nondet_train_route_key``
+      * - ``flashinfer.experimental.cake.cake_mhc_train_backend``
+        - ``flashinfer.experimental.cake.cake_mhc_nondet_train``
+
 Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
 7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
 from ``X`` ``[T, 4, H]``: the forward mapping, coefficients and collapse
@@ -79,99 +149,131 @@ static schedule.
     cake_mhc_det_train_backward_finish
     cake_mhc_det_train_prepare
     cake_mhc_det_train_finish
-    CakeMHCDetTrainPrepareFunction
-    CakeMHCDetTrainFinishFunction
+    cake_mhc_det_train_forward_workspace_bytes
+    cake_mhc_det_train_backward_workspace_bytes
+    CakeMHCDetPrepareFunction
+    CakeMHCDetFinishFunction
 
-The model's head, the mean of the last layer's four residual streams, has its
-own kernels for hidden sizes 4096, 5120 and 7168 (4096 on SM107):
-``cake_mhc_det_train_head_forward`` returns ``Y = X.mean(dim=1)`` bit for bit as
-torch computes it for BF16 ``X`` ``[T, 4, H]``,
-``cake_mhc_det_train_head_backward`` writes the gradient
+Training mHC head (Cake)
+------------------------
+
+The model's head, the mean of the last layer's four residual streams, is the
+deterministic module ``flashinfer.cake_mhc_head_det_train`` with its own
+kernels for hidden sizes 4096, 5120 and 7168 (4096 on SM107):
+``cake_mhc_head_det_train_forward`` returns ``Y = X.mean(dim=1)`` bit for bit
+as torch computes it for BF16 ``X`` ``[T, 4, H]``,
+``cake_mhc_head_det_train_backward`` writes the gradient
 ``dX[:, i, :] = BF16(dY / 4)`` of each stream or adds it into a caller's
-``dX`` (``accumulate=True``), and ``cake_mhc_det_train_head`` is the autograd form.
+``dX`` (``accumulate=True``), and ``cake_mhc_head_det`` is the autograd form.
+The non-deterministic head module ``flashinfer.cake_mhc_head_nondet_train`` is
+a reserved name for a planned version; it does not exist yet.
+
+.. currentmodule:: flashinfer.cake_mhc_head_det_train
 
 .. autosummary::
     :toctree: ../generated
 
-    cake_mhc_det_train_head_forward
-    cake_mhc_det_train_head_backward
-    cake_mhc_det_train_head
-    CakeMHCDetTrainHeadFunction
-    is_cake_mhc_det_train_head_supported
+    cake_mhc_head_det_train_forward
+    cake_mhc_head_det_train_backward
+    cake_mhc_head_det
+    CakeMHCHeadDetFunction
+    is_cake_mhc_head_det_train_supported
 
-Training mHC with a selectable numerical mode (Cake, experimental)
-------------------------------------------------------------------
+Training mHC, non-deterministic (Cake)
+--------------------------------------
 
-``flashinfer.experimental.cake.cake_mhc_train`` is the same training function
-with a ``deterministic: bool = True`` keyword on every entry point except
-``cake_mhc_train_finish`` (it follows the package of its handle),
-``cake_mhc_train_reset_workspace`` and ``route_key``.
+``flashinfer.cake_mhc_nondet_train`` is the same training function, computed
+by the non-deterministic package
+``flashinfer.experimental.cake.cake_mhc_nondet_train`` (imported on first use)
+for the same hidden sizes: 4096, 5120 and 7168 on SM100 / SM103, 4096 on SM107;
+its entry points raise ``ValueError`` for another hidden size. Its backward has
+no final reduction kernel: the column-slab pass adds the ``dfn`` sum of every
+(column slab, token chunk) unit into ``dfn`` with FP32 reductions and folds
+``dscale`` / ``dbase`` in the same grid.
 
-* ``deterministic=True`` (default) runs ``flashinfer.cake_mhc_det_train``
-  unchanged, for hidden sizes 4096, 5120 and 7168 (4096 on SM107).
-* ``deterministic=False`` runs the non-deterministic package
-  ``flashinfer.experimental.cake.cake_mhc_train_backend``, for the same hidden
-  sizes: 4096, 5120 and 7168 on SM100 / SM103, 4096 on SM107; its entry points
-  raise ``ValueError`` for another hidden size. Its backward has no final
-  reduction kernel: the column-slab pass adds the ``dfn`` sum of every (column
-  slab, token chunk) unit into ``dfn`` with FP32 reductions and folds
-  ``dscale`` / ``dbase`` in the same grid.
+The mode is part of the names: the entry points are those of
+``flashinfer.cake_mhc_det_train`` with ``cake_mhc_nondet_train_`` in place of
+``cake_mhc_det_train_`` and the same arguments
+(``cake_mhc_nondet_train_forward_prepare`` ... ``cake_mhc_nondet_train_finish``,
+the workspace helpers, ``cake_mhc_nondet_train_reset_workspace`` and
+``is_cake_mhc_nondet_train_supported``); the autograd nodes are
+``CakeMHCNondetPrepareFunction`` and ``CakeMHCNondetFinishFunction``. No entry
+point takes a ``deterministic`` keyword, and nothing falls back to the
+deterministic package.
 
-Numerical contract of ``deterministic=False``: only the summation order of
-``dfn`` varies from run to run. Each element lies within ``P`` FP32 roundings
-of the fixed-order sum (``P <= 32`` token chunks), and the FP32 reduction
-flushes subnormal addends and results to zero. ``dX``, ``dscale``, ``dbase``,
-the forward, the statistics replay and ``backward_prepare`` are bitwise the
-deterministic values.
+Numerical contract of the non-deterministic module: only the summation order
+of ``dfn`` varies from run to run. Each element adds its per-chunk partials
+(``P <= 32`` token chunks) onto its starting value with at most ``P`` FP32
+additions, so two runs differ by at most about
+``2 P u (|start| + sum |partial|)`` per element (``u = 2^-24``). Under
+cancellation this can be many ulps of the result. The starting value is zero,
+or the caller's ``dfn`` with ``accumulate=True``. The FP32 reduction flushes subnormal
+addends and results to zero; the chunk sizes follow the host rule, so the
+low-order bits of ``dfn`` can also differ from the deterministic ``dfn``. ``dX``, the forward, the statistics
+replay and ``backward_prepare`` are bitwise the deterministic values.
+``dscale`` and ``dbase`` are bitwise the deterministic package's per-CTA
+reduction; in the token-count bands where the deterministic package sums them
+over 8-token group rows (hidden 4096 on SM100 / SM103, given in the module
+docstring of ``flashinfer.experimental.cake.cake_mhc_nondet_train.cake_jit``),
+their low-order bits can differ.
 
 Interaction with ``torch.use_deterministic_algorithms(True)``:
 
-* The entry points of ``flashinfer.experimental.cake.cake_mhc_train`` run the
-  deterministic package for ``deterministic=False`` and warn once per process
-  (``UserWarning``).
-* The non-deterministic package never falls back. Its ``backward_finish`` and
-  the backward of its prepare node raise PyTorch's alert for an operation
-  without a deterministic implementation (``RuntimeError``; with
-  ``warn_only=True`` a ``UserWarning``) right before they launch the ``dfn``
-  reduction: after their operands pass, and only for ``T > 0``. The prepare
+* ``cake_mhc_nondet_train_backward_finish`` and the backward of a
+  ``cake_mhc_nondet_train_prepare`` node raise PyTorch's alert for an
+  operation without a deterministic implementation right before they launch
+  the ``dfn`` reduction: after their operands pass, and only for ``T > 0``.
+  The alert is a ``RuntimeError``; with ``warn_only=True`` it is a
+  ``UserWarning``, and the non-deterministic kernels then run. The prepare
   node alerts also when the mode was enabled between its forward and its
-  backward. Its forward,
-  statistics, ``backward_prepare`` and workspace entry points do not alert.
-* Every compute and workspace entry point of the non-deterministic package
-  raises ``ValueError`` unless ``deterministic=False``.
+  backward.
+* ``forward_prepare``, ``forward_stats``, ``forward_finish``,
+  ``backward_prepare``, the workspace helpers and
+  ``is_cake_mhc_nondet_train_supported`` give bitwise the same results from
+  run to run and raise no such alert or warning.
+* Nothing falls back to the deterministic package. For deterministic results
+  call ``flashinfer.cake_mhc_det_train``: its entry points give the same
+  results under the mode and raise no alert.
 
 Workspaces: the workspace helpers take the deterministic package's
-``hidden=`` keyword (default 4096) in both modes; it accepts the hidden sizes
-of the device's architecture. The forward workspace has one layout in both
-modes. The ``deterministic=False`` backward workspace is the deterministic one
-at the same offsets without the per-chunk FP32 ``dfn`` partials
-(``P x 24 x 4H x 4`` bytes at hidden size ``H``), so
-``cake_mhc_train_backward_workspace(T, device, hidden=H, deterministic=True)``
-serves both modes and ``deterministic=False`` sizes the smaller one. When the
-deterministic mode turns a ``deterministic=False`` call with a caller-owned
-backward workspace that is too small for the deterministic layout into the
-deterministic backward, the call runs on a private zeroed companion buffer of
-that workspace, never on the shared default buffer. Inside a CUDA graph
-capture a missing companion raises ``ValueError``.
+``hidden=`` keyword (default 4096); it accepts the hidden sizes of the device's
+architecture. The forward workspace has one layout in both packages. The
+non-deterministic backward workspace is the deterministic one at the same
+offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 4H x 4`` bytes
+at hidden size ``H``). The non-deterministic backward accepts any valid
+workspace of at least its size, so
+``flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace(T, device, hidden=H)``
+also serves it.
 
 The default workspaces (``workspace=None``) are one buffer per device, hidden
 size and power-of-two token-count bucket in each package, shared by every
 stream and every graph replay on the device: calls that can run concurrently on
-different streams pass caller-owned workspaces. ``deterministic=False`` creates
-no default buffer while the current stream of the buffer's device is capturing
-a CUDA graph (``ValueError``); warm up with the same ``deterministic`` value,
-token count and hidden size before the capture. A companion is allocated
-zeroed outside any capture and every completed launch leaves its
-ticket words at zero, so it needs no reset; ``cake_mhc_train_reset_workspace``
-zeroes the buffer it is given.
+different streams pass caller-owned workspaces. The non-deterministic module
+creates no default buffer while the current stream of the buffer's device is
+capturing a CUDA graph (``ValueError``); warm up with the same token count and
+hidden size before the capture. Every completed launch leaves the ticket words
+of its workspace at zero, so a replay needs no reset;
+``cake_mhc_nondet_train_reset_workspace`` zeroes the buffer it is given.
 
-The head (``cake_mhc_det_train_head*``) has no cross-token reduction and no
-counterpart in this module; use the deterministic names above.
+The head has no cross-token reduction and no counterpart in this module; use
+the deterministic head module ``flashinfer.cake_mhc_head_det_train`` above.
 
-Names: ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<name>`` ->
-``flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<name>``,
-``is_cake_mhc_det_train_supported`` -> ``is_cake_mhc_train_supported`` and
-``CakeMHCDetTrain<Node>Function`` -> ``CakeMHCTrain<Node>Function`` (the
-non-deterministic package's nodes). The legacy module
-``flashinfer.cake_mhc_train`` keeps the same ``cake_mhc_train_*`` names as
-aliases of the deterministic objects, without a ``deterministic`` keyword.
+.. currentmodule:: flashinfer.cake_mhc_nondet_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_mhc_nondet_train_forward_prepare
+    cake_mhc_nondet_train_forward_stats
+    cake_mhc_nondet_train_forward_finish
+    cake_mhc_nondet_train_backward_prepare
+    cake_mhc_nondet_train_backward_finish
+    cake_mhc_nondet_train_prepare
+    cake_mhc_nondet_train_finish
+    cake_mhc_nondet_train_forward_workspace_bytes
+    cake_mhc_nondet_train_backward_workspace_bytes
+    cake_mhc_nondet_train_forward_workspace
+    cake_mhc_nondet_train_backward_workspace
+    is_cake_mhc_nondet_train_supported
+    CakeMHCNondetPrepareFunction
+    CakeMHCNondetFinishFunction

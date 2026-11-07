@@ -15,8 +15,8 @@ limitations under the License.
 
 flashinfer public-API tests of the Cake deterministic context-parallel (KCP) packed KDA training package
 (``flashinfer.experimental.cake_kda_det_train_kcp``), device-free: the keywords the entry points of
-``flashinfer.cake_kda_det_train_kcp`` forward, and the names before the det rename -- in ``flashinfer.kda_train``,
-in the modules ``cake_kcp`` / ``cake_kcp_plan`` and at the previous module paths -- bound to the same objects.
+``flashinfer.cake_kda_det_train_kcp`` forward, the det names of the facade, the package and its modules, and the
+absence of the names before the det rename.
 """
 
 import importlib
@@ -27,105 +27,118 @@ import warnings
 
 import pytest
 
-import flashinfer.cake_kda_det_train as det_api
 import flashinfer.cake_kda_det_train_kcp as kcp_api
-import flashinfer.kda_train as kda_train
 from flashinfer.api_logging import ExperimentalWarning
 
 pytestmark = pytest.mark.cpu_only
 
 PACKAGE = "flashinfer.experimental.cake_kda_det_train_kcp"
-OLD_PACKAGE = "flashinfer.experimental.cake_kda_train"
 
-# (previous name, det name) of the entry points: flashinfer.kda_train -> flashinfer.cake_kda_det_train_kcp
-FACADE_PAIRS = (
-    ("kcp_partition", "partition_det_kcp"),
-    ("build_kcp_context", "build_context_det_kcp"),
-    ("chunk_kda_kcp", "chunk_kda_det_kcp"),
-    ("chunk_kda_kcp_fwd", "chunk_kda_det_fwd_kcp"),
-    ("chunk_kda_kcp_bwd", "chunk_kda_det_bwd_kcp"),
-    ("kcp_workspace_bytes", "kda_det_workspace_bytes_kcp"),
-    ("kcp_saved_bytes", "kda_det_saved_bytes_kcp"),
-    ("kcp_comm_bytes", "kda_det_comm_bytes_kcp"),
-    ("kcp_reduce_gate_param_grads", "reduce_gate_param_grads_det_kcp"),
+# the entry points of flashinfer.cake_kda_det_train_kcp
+FACADE_NAMES = (
+    "partition_det_kcp",
+    "build_context_det_kcp",
+    "chunk_kda_det_kcp",
+    "chunk_kda_det_fwd_kcp",
+    "chunk_kda_det_bwd_kcp",
+    "kda_det_workspace_bytes_kcp",
+    "kda_det_saved_bytes_kcp",
+    "kda_det_comm_bytes_kcp",
+    "reduce_gate_param_grads_det_kcp",
 )
-# (previous name, det name) of the types the facades resolve on first access
-TYPE_PAIRS = (
-    ("KcpContext", "ContextDetKcp"),
-    ("KcpOptions", "OptionsDetKcp"),
-    ("KcpPartition", "PartitionDetKcp"),
-    ("KcpRecomputeHandle", "RecomputeHandleDetKcp"),
-    ("KcpSaved", "SavedDetKcp"),
-    ("KcpWorkspace", "WorkspaceDetKcp"),
+# the types the facade resolves on first access
+TYPE_NAMES = (
+    "ContextDetKcp",
+    "OptionsDetKcp",
+    "PartitionDetKcp",
+    "RecomputeHandleDetKcp",
+    "SavedDetKcp",
+    "WorkspaceDetKcp",
 )
-# (module, previous name, det name) of the backend modules' renamed definitions
-BACKEND_PAIRS = (
-    ("cake_kcp", "ChunkKDAKcpFunction", "ChunkKDADetFunctionKcp"),
-    ("cake_kcp", "KcpCall", "CallDetKcp"),
-    ("cake_kcp", "KcpOptions", "OptionsDetKcp"),
-    ("cake_kcp", "KcpRecomputeHandle", "RecomputeHandleDetKcp"),
-    ("cake_kcp", "KcpSaved", "SavedDetKcp"),
-    ("cake_kcp", "KcpWorkspace", "WorkspaceDetKcp"),
-    ("cake_kcp", "chunk_kda_kcp", "chunk_kda_det_kcp"),
-    ("cake_kcp", "chunk_kda_kcp_bwd", "chunk_kda_det_bwd_kcp"),
-    ("cake_kcp", "chunk_kda_kcp_fwd", "chunk_kda_det_fwd_kcp"),
-    ("cake_kcp_plan", "KcpContext", "ContextDetKcp"),
-    ("cake_kcp_plan", "KcpFragment", "FragmentDetKcp"),
-    ("cake_kcp_plan", "KcpPartition", "PartitionDetKcp"),
-    ("cake_kcp_plan", "build_kcp_context", "build_context_det_kcp"),
-    ("cake_kcp_plan", "kcp_comm_bytes", "kda_det_comm_bytes_kcp"),
-    ("cake_kcp_plan", "kcp_partition", "partition_det_kcp"),
-    ("cake_kcp_plan", "kcp_saved_bytes", "kda_det_saved_bytes_kcp"),
-    ("cake_kcp_plan", "kcp_workspace_bytes", "kda_det_workspace_bytes_kcp"),
+# (module, det name) of the backend modules' definitions
+BACKEND_NAMES = (
+    ("cake_kcp", "ChunkKDADetFunctionKcp"),
+    ("cake_kcp", "CallDetKcp"),
+    ("cake_kcp", "OptionsDetKcp"),
+    ("cake_kcp", "RecomputeHandleDetKcp"),
+    ("cake_kcp", "SavedDetKcp"),
+    ("cake_kcp", "WorkspaceDetKcp"),
+    ("cake_kcp", "chunk_kda_det_kcp"),
+    ("cake_kcp", "chunk_kda_det_bwd_kcp"),
+    ("cake_kcp", "chunk_kda_det_fwd_kcp"),
+    ("cake_kcp_plan", "ContextDetKcp"),
+    ("cake_kcp_plan", "FragmentDetKcp"),
+    ("cake_kcp_plan", "PartitionDetKcp"),
+    ("cake_kcp_plan", "build_context_det_kcp"),
+    ("cake_kcp_plan", "kda_det_comm_bytes_kcp"),
+    ("cake_kcp_plan", "partition_det_kcp"),
+    ("cake_kcp_plan", "kda_det_saved_bytes_kcp"),
+    ("cake_kcp_plan", "kda_det_workspace_bytes_kcp"),
+)
+# the names before the det rename: neither the facade nor the package nor its modules bind them
+PREVIOUS_NAMES = (
+    "ChunkKDAKcpFunction",
+    "KcpCall",
+    "KcpContext",
+    "KcpFragment",
+    "KcpOptions",
+    "KcpPartition",
+    "KcpRecomputeHandle",
+    "KcpSaved",
+    "KcpWorkspace",
+    "build_kcp_context",
+    "chunk_kda_kcp",
+    "chunk_kda_kcp_bwd",
+    "chunk_kda_kcp_fwd",
+    "kcp_comm_bytes",
+    "kcp_partition",
+    "kcp_reduce_gate_param_grads",
+    "kcp_saved_bytes",
+    "kcp_workspace_bytes",
 )
 
 
-@pytest.mark.parametrize("old,new", FACADE_PAIRS)
-def test_facade_previous_names_are_the_det_objects(old: str, new: str) -> None:
+@pytest.mark.parametrize("new", FACADE_NAMES)
+def test_facade_entries_carry_the_det_names(new: str) -> None:
     fn = getattr(kcp_api, new)
-    assert getattr(kda_train, old) is fn
     assert fn.__name__ == new and fn.__module__ == "flashinfer.cake_kda_det_train_kcp"
-    assert fn.experimental_feature == det_api._FEATURE
-    assert new in kcp_api.__all__ and old not in kcp_api.__all__
-    assert old in kda_train.__all__
+    assert fn.experimental_feature == kcp_api._FEATURE
+    assert new in kcp_api.__all__
 
 
-@pytest.mark.parametrize("old,new", TYPE_PAIRS)
-def test_facade_types_resolve_lazily_to_the_backend_classes(old: str, new: str) -> None:
+@pytest.mark.parametrize("new", TYPE_NAMES)
+def test_facade_types_resolve_lazily_to_the_backend_classes(new: str) -> None:
     module = importlib.import_module(f"{PACKAGE}.{kcp_api._LAZY_TYPES[new]}")
     cls = getattr(module, new)
     assert getattr(kcp_api, new) is cls
-    assert getattr(kda_train, old) is cls
-    assert getattr(module, old) is cls
     assert cls.__name__ == new and cls.__qualname__ == new
     assert new in kcp_api.__all__
-    if old == "KcpRecomputeHandle":
-        assert old in kda_train.__all__
     with pytest.raises(AttributeError):
         _ = kcp_api.NoSuchName  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        _ = kda_train.NoSuchName  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("module,old,new", BACKEND_PAIRS)
-def test_backend_previous_names_are_the_det_objects(
-    module: str, old: str, new: str
-) -> None:
+@pytest.mark.parametrize("module,new", BACKEND_NAMES)
+def test_backend_definitions_carry_the_det_names(module: str, new: str) -> None:
     mod = importlib.import_module(f"{PACKAGE}.{module}")
     obj = getattr(mod, new)
-    assert getattr(mod, old) is obj
     assert obj.__name__ == new
-    assert new in mod.__all__ and old not in mod.__all__
+    assert new in mod.__all__
     package = importlib.import_module(PACKAGE)
     if new in package.__all__:
         assert getattr(package, new) is obj
 
 
-@pytest.mark.parametrize("submodule", ("cake_kcp", "cake_kcp_jit", "cake_kcp_plan"))
-def test_previous_module_paths_are_the_det_kcp_modules(submodule: str) -> None:
-    new = importlib.import_module(f"{PACKAGE}.{submodule}")
-    assert importlib.import_module(f"{OLD_PACKAGE}.{submodule}") is new
-    assert new.__name__ == f"{PACKAGE}.{submodule}"
+@pytest.mark.parametrize("old", PREVIOUS_NAMES)
+def test_previous_names_are_gone(old: str) -> None:
+    package = importlib.import_module(PACKAGE)
+    modules = [kcp_api, package] + [
+        importlib.import_module(f"{PACKAGE}.{sub}")
+        for sub in ("cake_kcp", "cake_kcp_plan", "cake_kcp_jit")
+    ]
+    for mod in modules:
+        assert not hasattr(mod, old), (mod.__name__, old)
+        assert old not in getattr(mod, "__all__", ()), (mod.__name__, old)
+    assert old not in dir(kcp_api) and old not in dir(package)
 
 
 def test_errors_name_the_det_entry_points() -> None:
@@ -133,17 +146,17 @@ def test_errors_name_the_det_entry_points() -> None:
     with pytest.raises(ValueError, match=r"^partition_det_kcp: "):
         plan.partition_det_kcp([0, 64], 0)
     with pytest.raises(ValueError, match=r"^partition_det_kcp: "):
-        plan.kcp_partition([0, 64], 1, "no-such-layout")
+        plan.partition_det_kcp([0, 64], 1, "no-such-layout")
 
 
 def test_package_names_resolve_on_first_access_only() -> None:
-    # Importing the facade, the package or the previous facade imports neither the host module nor the plan.
+    # Importing the facade or the package imports neither the host module nor the plan.
     code = (
         "import sys, importlib\n"
         "for name in sys.argv[1:]: importlib.import_module(name)\n"
         f"print(sorted(m for m in sys.modules if m.startswith('{PACKAGE}.')))\n"
     )
-    for name in ("flashinfer.cake_kda_det_train_kcp", PACKAGE, "flashinfer.kda_train"):
+    for name in ("flashinfer.cake_kda_det_train_kcp", PACKAGE):
         out = subprocess.run(
             [sys.executable, "-c", code, name],
             check=True,
@@ -305,8 +318,7 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
     ``kda_det_saved_bytes_kcp`` forward ``use_gate_in_kernel`` (a keyword-only ``bool = False``; the saved query
     reads it for the in-kernel Q / K L2 norm's check) and ``reduce_gate_param_grads_det_kcp`` forwards to the KCP
     module's helper,
-    which the package lists in ``__all__``; ``flashinfer.kda_train`` binds ``kcp_reduce_gate_param_grads`` to the
-    same object.  Device-free (recorders)."""
+    which the package lists in ``__all__``.  Device-free (recorders)."""
     from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
 
     package = importlib.import_module(PACKAGE)
@@ -364,10 +376,6 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
     assert calls[4] == ("reduce", reduce_args, {})
     assert [c[2]["use_gate_in_kernel"] for c in calls[5:]] == [True, False, False]
     assert "reduce_gate_param_grads_det_kcp" in kcp_api.__all__
-    assert (
-        kda_train.kcp_reduce_gate_param_grads is kcp_api.reduce_gate_param_grads_det_kcp
-    )
-    assert "kcp_reduce_gate_param_grads" in kda_train.__all__
 
 
 def test_public_module_forwards_the_qk_l2norm(monkeypatch: pytest.MonkeyPatch) -> None:

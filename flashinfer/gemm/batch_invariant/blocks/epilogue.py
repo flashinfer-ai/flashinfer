@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Epilogue block: the spec's elementwise chain after the fold, then the store.
 
-Per epilogue subtile: TMEM -> registers (fp32), then the chain's single ``cvt.rn`` as the vector
-conversion to the output type, registers -> smem
--> TMA store (clipped at the tensor bounds). The subtile order, the C smem buffer rotation and
+Per epilogue subtile: TMEM -> registers (fp32), the chain's ops before the conversion applied per element by
+``EpilogueChain.apply_pre`` (the same function that builds the spec term: ``mul.rn alpha`` for the fp8
+classes, ``add.rn bias`` of the element's column for the biased bf16 chain, nothing otherwise), then the chain's
+single ``cvt.rn`` as the vector conversion to the output type,
+registers -> smem -> TMA store (clipped at the tensor bounds). The subtile order, the C smem buffer rotation and
 the barriers are placements. Built from the library's epilogue atoms (``get_tmem_load_op``,
 ``get_smem_store_op``); the body is ours.
 
@@ -21,6 +23,8 @@ inter-warp exchange and works for every tile shape the epilogue already handles.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -30,6 +34,14 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.fp_interface.cute import CuteF32
 from .operands import ACC_DTYPE, BAR_EPILOGUE, EPILOGUE_WARPS
+
+
+def apply_chain_pre_cvt(chain, frag, alpha):
+    """The chain's ops before the conversion, per element, in fp32 through ``CuteF32``; the conversion itself is the
+    vector ``.to(out dtype)`` that follows in the caller."""
+    if chain.pre:
+        for i in range(cute.size(frag)):
+            frag[i] = chain.apply_pre(CuteF32, frag[i], alpha)
 
 
 def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
@@ -42,6 +54,66 @@ def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
     assert name.startswith("Ld") and name.endswith("Op"), name
     st_cls = getattr(tcgen05.copy, "St" + name[2:])
     return cute.make_copy_atom(st_cls(op.repeat), elem_ty)
+
+
+@cute.jit
+def bias_per_element(
+    chain,
+    mBias: cute.Tensor,
+    coords: cute.Tensor,
+    frag: cute.Tensor,
+    alpha,
+    N: cutlass.Int32,
+):
+    """The biased chain's ops before the conversion, element by element: the bias of the element's output column, widened
+    exactly; the columns at or beyond ``N`` are left alone (the store drops them and the bias is never read past its end)."""
+    for e in cutlass.range_constexpr(cute.size(frag)):
+        n = coords[e][1]
+        if n < N:
+            frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(mBias[n]))
+
+
+@cute.jit
+def apply_chain_biased(
+    chain,
+    mBias: cute.Tensor,
+    coords: cute.Tensor,
+    frag: cute.Tensor,
+    alpha,
+    N: cutlass.Int32,
+):
+    """The chain's ops before the conversion when the chain has the bias step: per element, the bias of the element's
+    output column (``coords``: the output coordinates partitioned like the accumulator), widened exactly, through the
+    same ``apply_pre`` as the term. Whether the fragment's elements are consecutive columns of one row is decided at
+    trace time from the fragment's coordinate layout (its per-element offsets are static): for the TMEM load shapes
+    that give such a run, when the whole run lies inside the bias at a 16-byte boundary the bias slice is read with one
+    vector copy, else (a partial tile's last run, an unaligned run) element by element; the load shapes whose fragment
+    interleaves rows and columns read element by element."""
+    V = cute.size(frag)
+    offs = [
+        coords.layout(e) for e in range(V)
+    ]  # the fragment's (row, column) offsets relative to element 0
+    is_run = all(
+        o[0] == offs[0][0] and o[1] == offs[0][1] + e for e, o in enumerate(offs)
+    )
+    if cutlass.const_expr(is_run):
+        n0 = coords[0][1]
+        if n0 + V <= N and n0 % 8 == 0:
+            base = mBias.iterator.toint() + cutlass.Int64(cute.assume(n0, divby=8)) * 2
+            gB = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16
+                ),
+                cute.make_layout((V,)),
+            )
+            rB = cute.make_rmem_tensor((V,), cutlass.BFloat16)
+            cute.autovec_copy(gB, rB)
+            for e in cutlass.range_constexpr(V):
+                frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(rB[e]))
+        else:
+            bias_per_element(chain, mBias, coords, frag, alpha, N)
+    else:
+        bias_per_element(chain, mBias, coords, frag, alpha, N)
 
 
 @cute.jit
@@ -88,6 +160,7 @@ def chunk_fold_pass(
 @cute.jit
 def epilogue_loop(
     st,
+    chain,
     atom_thr_size: cutlass.Constexpr,
     tidx: cutlass.Int32,
     warp_idx: cutlass.Int32,
@@ -98,11 +171,18 @@ def epilogue_loop(
     tCgC_base: cute.Tensor,
     epi_tile: cute.Tile,
     acc_pipeline,
+    alpha,
     chunks: cutlass.Constexpr = 1,
+    mBias: Optional[cute.Tensor] = None,
+    tCcC_base: Optional[cute.Tensor] = None,
 ):
-    """``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator stage per chunk,
-    the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the last one receives
-    the fold and is stored through the ordinary subtile loop below."""
+    """``chain`` is the specification's epilogue chain (``spec.EpilogueChain``) and ``alpha`` its runtime scalar (None for
+    the unscaled chain). ``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator
+    stage per chunk, the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the
+    last one receives the fold and is stored through the ordinary subtile loop below (the chain once, after the fold).
+    ``mBias`` (the (N,) bias) with ``tCcC_base`` (the output coordinates partitioned like C): the biased chain, the
+    bias of each element's column through the same ``apply_pre`` before the conversion -- after the whole fold, chunked
+    or not, so the bias enters exactly once."""
     # ((ATOM_M, MMA_M), (ATOM_N, MMA_N), ...)
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
@@ -129,6 +209,12 @@ def epilogue_loop(
         tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, ACC_DTYPE
     )
     tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, st.c_dtype)
+    # the biased chain: the output coordinates in the accumulator's partition, so element e of a fragment knows its column
+    tTR_cC_all = None
+    if cutlass.const_expr(mBias is not None):
+        tTR_cC_all = thr_t2r.partition_D(
+            cute.flat_divide(transform_partitioned_tensor_layout(tCcC_base), epi_tile)
+        )
     # the in-CTA chunk fold: the running sum's TMEM partitions (the stage `st.sum_stage`), the store twin of the load atom, a second fragment
     tiled_copy_r2t = tTR_tSum = tTR_tSumSt = tTR_rSum = None
     if cutlass.const_expr(chunks > 1):
@@ -239,8 +325,26 @@ def epilogue_loop(
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         num_prev_subtiles = num_tiles_executed * subtile_cnt
+        tTR_cC = None
+        if cutlass.const_expr(mBias is not None):
+            tTR_cC = cute.group_modes(
+                tTR_cC_all[(None, None, None, None, None, *mnl)], 3, 5
+            )  # this tile's coordinates per subtile
         for s in range(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+            if cutlass.const_expr(mBias is not None):
+                apply_chain_biased(
+                    chain,
+                    mBias,
+                    tTR_cC[(None, None, None, s)],
+                    tTR_rAcc,
+                    alpha,
+                    mBias.shape[0],
+                )  # the chain's fp32 ops with the column's bias, once, after the fold
+            else:
+                apply_chain_pre_cvt(
+                    chain, tTR_rAcc, alpha
+                )  # the chain's fp32 ops (mul.rn alpha when scaled)
             acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
             tRS_rC.store(
                 acc_vec.to(st.c_dtype)

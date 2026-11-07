@@ -20,12 +20,11 @@ Every entry takes ``deterministic: bool = True`` and rejects a value that is not
 a ``bool`` (``TypeError``):
 
 * ``deterministic=True`` (the default) runs the deterministic package
-  ``flashinfer.experimental.cake_kda_det_train`` (the objects behind
+  ``flashinfer.experimental.cake.cake_kda_det_train`` (the objects behind
   ``flashinfer.cake_kda_det_train``): the same inputs, hardware and plan give
   bitwise the same outputs and gradients.
 * ``deterministic=False`` runs the package
-  ``flashinfer.experimental.cake.cake_kda_train``.  In the g mode (the
-  default; the raw gate mode is below) its backward moves the
+  ``flashinfer.experimental.cake.cake_kda_train``.  Its backward moves the
   ``q * dq`` term of the gate gradient ``dg`` from the fused dq / dk / dg
   program into the GLM intra program, so the fused program no longer reads
   ``q``.  The schedule has a fixed order: repeated calls give bitwise the same
@@ -38,37 +37,38 @@ a ``bool`` (``TypeError``):
   runs the deterministic package and warns once per process.
 
 Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
-``lower_bound``; FlashInfer #7816) runs on both packages: the entries forward the
-keywords to the package of the call's mode, ``chunk_kda_bwd`` then returns seven
-tensors (``dA_log`` / ``ddt_bias`` added), and the workspace and its byte query
-take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
+``lower_bound``; FlashInfer #7816) runs on both packages: the entries forward
+the keywords to the package of the call's mode, ``chunk_kda_bwd`` then returns
+seven tensors (``dA_log`` / ``ddt_bias`` added), and the workspace and its byte
+query take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
 ``deterministic=False`` it runs the deterministic package's raw-mode programs in
-the same order, so ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` and ``dg`` are
-bitwise the deterministic package's raw mode, but for the reduce of ``dA_log`` /
-``ddt_bias``.  On SM107 that reduce is the deterministic package's too (bitwise
-results).  On SM100 / SM103 the backward adds the per-chunk parameter partials in
-FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
-``ddt_bias`` can differ from run to run and from the deterministic package:
-from run to run by one FP32 ulp at most while the FP64 sum's order error stays
-below half an FP32 ulp of the result (only per-chunk terms that nearly cancel
-exceed it), and their error against an FP64 reference stays within the
-deterministic package's plus the FP64 sum's own error;
-its workspace then also holds the FP64 accumulators (2 KiB per head; 16 KiB per
-head on SM100 from 32 heads), which the byte query counts.  Under torch's
-deterministic algorithms such a call runs the deterministic package, as above.
-Both packages' saved sets carry the gate mode and ``lower_bound``, so either
-backward reads the other's raw set.
+the same order (a tape backward may run the non-deterministic package's w-only
+WY twin in place of the WY program, writing the same ``w``), so ``out`` and
+every gradient (``dg``, ``dA_log`` and ``ddt_bias`` included) are bitwise the
+deterministic package's raw mode, with the in-kernel Q/K L2 norm (below) and
+without it.  Both packages' saved sets carry the gate mode and
+``lower_bound``, so either backward reads the other's raw set.
 
 The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` / ``k``
-in, normalized inside the kernels; FlashInfer #7817) runs on the deterministic
-package only, in either gate mode: the entries forward the keyword to it, and
-the workspace and the byte queries take it.  ``deterministic=False`` raises
-``ValueError`` for it (also for a saved set of that mode); ``False`` is accepted
-in both modes.
+in, normalized inside the kernels; FlashInfer #7817) runs on both packages, in
+either gate mode: the entries forward the keyword to the package of the call's
+mode, and the workspace and the byte queries take it.  The mode has no ``S1``
+pair and no checkpoint hand-off: with ``deterministic=False`` it runs the
+deterministic package's in-kernel-norm programs in the same order (a tape
+backward may run the non-deterministic package's w-only WY twin in place of
+the WY program, writing the same ``w``), so ``out`` and every gradient
+(``dg``, and in raw gate mode ``dA_log`` and ``ddt_bias``, included) are
+bitwise the deterministic package's.  Both packages' saved sets carry the mode
+and the FP32 reciprocal norms ``qk_rstd``, so either backward reads the
+other's set of that mode.
 
 The mode of :func:`chunk_kda` is fixed at its forward call: the autograd node's
 backward is the forward's package.  Both packages write the saved set in the
-same format, so either backward reads it.  A workspace serves its own package:
+same format, so either backward reads it.  The deterministic package's entries
+take their own saved-set type only: a backward routed to that package (by
+``deterministic=True`` or by torch's deterministic algorithms) hands them a
+non-deterministic set as a ``CakeKDADetChunkSaved`` with the same fields and
+tensors.  A workspace serves its own package:
 allocate it with the ``deterministic`` value of the calls that use it (the
 non-deterministic package refuses another package's workspace, and a
 ``deterministic=True`` call refuses a ``deterministic=False`` workspace).  When
@@ -87,25 +87,24 @@ benchmarking override of ``checkpoint_handoff``).
 
 Operands (one packed batch of documents): ``q, k, v`` BF16 ``[1, S, H, 128]``
 (``q`` / ``k`` L2-normalized by the caller, or raw with
-``use_qk_l2norm_in_kernel=True``, ``deterministic=True`` only), ``g`` FP32
-``[1, S, H, 128]`` (the natural-log decay gate, preactivated), ``beta`` BF16
-``[1, S, H]`` (through the sigmoid), ``cu_seqlens`` int32 ``[num_docs + 1]`` on
-the device.  The batch axis of 1 is optional; outputs take the rank of the
-inputs.  Gradients: ``dq, dk, dv, dbeta`` BF16, ``dg`` FP32.  Per-document zero
-initial state, no final state, ``scale = 128 ** -0.5`` by default, ``H`` in
-``1..64``.
+``use_qk_l2norm_in_kernel=True``), ``g`` FP32 ``[1, S, H, 128]`` (the
+natural-log decay gate, preactivated), ``beta`` BF16 ``[1, S, H]`` (through
+the sigmoid), ``cu_seqlens`` int32 ``[num_docs + 1]`` on the device.  The batch
+axis of 1 is optional; outputs take the rank of the inputs.  Gradients:
+``dq, dk, dv, dbeta`` BF16, ``dg`` FP32.  Per-document zero initial state, no
+final state, ``scale = 128 ** -0.5`` by default, ``H`` in ``1..64``.
 
 Name map (the deterministic names are unchanged and always deterministic)::
 
     flashinfer.cake_kda_det_train      this module (deterministic=...)
-      chunk_kda_det_fwd                  chunk_kda_fwd
-      chunk_kda_det_bwd                  chunk_kda_bwd
-      chunk_kda_det                      chunk_kda
-      kda_det_train_arena                kda_train_arena
-      kda_det_train_workspace            kda_train_workspace
-      kda_det_train_workspace_bytes      kda_train_workspace_bytes
-      kda_det_train_saved_bytes          kda_train_saved_bytes
-      is_kda_det_train_supported         is_kda_train_supported
+      cake_kda_det_train_forward                  chunk_kda_fwd
+      cake_kda_det_train_backward                  chunk_kda_bwd
+      cake_kda_det                      chunk_kda
+      cake_kda_det_train_arena                kda_train_arena
+      cake_kda_det_train_workspace            kda_train_workspace
+      cake_kda_det_train_workspace_bytes      kda_train_workspace_bytes
+      cake_kda_det_train_saved_bytes          kda_train_saved_bytes
+      is_cake_kda_det_train_supported         is_kda_train_supported
 
 ``flashinfer.kda_train`` binds the same spellings (``chunk_kda``,
 ``chunk_kda_fwd``, ...) to the deterministic objects, without a
@@ -143,8 +142,8 @@ _FEATURE = "Cake packed KDA chunked training, selectable mode (SM100/SM103/SM107
 # The default scale of the GLM contract: ``head_dim ** -0.5`` with head dimension 128.
 DEFAULT_SCALE = 128**-0.5
 
-# The module of the non-deterministic package's workspace type (a workspace of it is recognized without importing
-# the package: none exists before the package is imported).
+# The module of the non-deterministic package's workspace and saved-set types (an object of either is recognized
+# without importing the package: none exists before the package is imported).
 _ND_BACKEND = f"{__package__}.experimental.cake.cake_kda_train.cake_backend"
 
 # The flashinfer package directory: frames below it are this module, its decorators and the packages.
@@ -156,7 +155,7 @@ _DET_FALLBACK_WARNED = False
 
 def _det() -> Any:
     """The deterministic package's backend, imported on first use."""
-    from .experimental.cake_kda_det_train import cake_backend
+    from .experimental.cake.cake_kda_det_train import cake_backend
 
     return cake_backend
 
@@ -232,10 +231,22 @@ def _arena_for(det: bool, arena: Any) -> Any:
     this one (the two types have the same fields); ``None`` and the routed package's own pass through."""
     if arena is None:
         return None
-    own = _det().KdaDetArena if det else _nd().KdaArena
+    own = _det().CakeKDADetArena if det else _nd().KdaArena
     if isinstance(arena, own) or not dataclasses.is_dataclass(arena):
         return arena
     return own(**{f.name: getattr(arena, f.name) for f in dataclasses.fields(arena)})
+
+
+def _det_saved(saved: Any) -> Any:
+    """``saved`` of a backward routed to the deterministic package: a saved set of the non-deterministic package
+    becomes the deterministic package's ``CakeKDADetChunkSaved`` with the same fields and tensors (the two packages write
+    the same format; the deterministic entries take their own type only), leaving out the non-deterministic set's
+    ``deterministic`` field; ``None`` and any other object pass through."""
+    nd = sys.modules.get(_ND_BACKEND)
+    if saved is None or nd is None or not isinstance(saved, nd.KdaChunkSaved):
+        return saved
+    own = _det().CakeKDADetChunkSaved
+    return own(**{f.name: getattr(saved, f.name) for f in dataclasses.fields(own)})
 
 
 def _det_call(
@@ -307,7 +318,7 @@ def chunk_kda_fwd(
         allocates its own.
     save_mode : str, optional
         ``"light"`` (saved set version 4) or ``"tape"`` (version 2); ``None`` takes the workspace's default
-        (``"light"`` without one).  See :func:`flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.
+        (``"light"`` without one).  See :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_forward`.
     arena : optional
         The lower-memory arena option (:func:`kda_train_arena`; off by default); ``None`` takes the workspace's
         option, a differing option on a given workspace is refused.
@@ -315,12 +326,12 @@ def chunk_kda_fwd(
         The documents' token counts in ``cu_seqlens`` order (host integers), required under a batched option.
     use_gate_in_kernel, A_log, dt_bias, lower_bound
         The raw gate mode (``g`` the raw BF16 gate, activated in the kernels); see
-        :func:`flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.  Both values of ``deterministic``; a workspace
+        :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_forward`.  Both values of ``deterministic``; a workspace
         serves one gate mode (``ValueError`` for the other).
     use_qk_l2norm_in_kernel : bool
         The in-kernel Q/K L2 norm (``q`` / ``k`` the raw rows, normalized inside the kernels); see
-        :func:`flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.  ``deterministic=True`` only: ``deterministic=False``
-        raises ``ValueError`` unless it is ``False``.
+        :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_forward`.  Both values of ``deterministic``; a workspace
+        serves one Q/K L2 norm mode (``ValueError`` for the other).
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring).
         The forward programs of the two are the same: bitwise the same ``out`` and saved set.
@@ -334,7 +345,7 @@ def chunk_kda_fwd(
         workspace, arena, save_mode = _det_call(
             workspace, arena, save_mode, deterministic, "chunk_kda_fwd"
         )
-        return _det().chunk_kda_det_fwd(
+        return _det().cake_kda_det_train_forward(
             q,
             k,
             v,
@@ -406,7 +417,8 @@ def chunk_kda_bwd(
     dout : torch.Tensor
         BF16 gradient of ``out``, laid out like ``v``.
     saved : optional
-        The forward's saved set (version 4 or 2, of either package: the format is the same); ``None`` recomputes it
+        The forward's saved set (version 4 or 2, of either package: the format is the same; the deterministic route
+        hands a non-deterministic set over as a ``CakeKDADetChunkSaved`` with the same fields); ``None`` recomputes it
         from the inputs (checkpoint replay).
     scale : float, optional
         The forward's scale; ``128 ** -0.5`` when ``None``.
@@ -422,8 +434,9 @@ def chunk_kda_bwd(
         The forward's raw gate mode (see :func:`chunk_kda_fwd`), in both values of ``deterministic``.  A saved set of
         the other gate mode or of another ``lower_bound`` is refused (``ValueError``).
     use_qk_l2norm_in_kernel : bool
-        The forward's in-kernel Q/K L2 norm mode (see :func:`chunk_kda_fwd`); ``deterministic=True`` only.  With
-        ``deterministic=False`` it must be ``False``, and a saved set of that mode is refused (``ValueError``).
+        The forward's in-kernel Q/K L2 norm mode (see :func:`chunk_kda_fwd`; ``dq`` / ``dk`` then the gradients of
+        the raw rows), in both values of ``deterministic``.  A saved set of the other mode is refused
+        (``ValueError``).
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring).
 
@@ -431,18 +444,17 @@ def chunk_kda_bwd(
     -------
     ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
     like the inputs.  Bitwise reproducible for the same inputs and path in both modes.  In raw gate mode
-    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train.chunk_kda_det_bwd`
-    returns them, bitwise the same for both values of ``deterministic`` and bitwise reproducible, but for
-    ``dA_log`` / ``ddt_bias`` on SM100 / SM103 with ``deterministic=False``: an unordered FP64 sum rounded once to
-    FP32, they can differ by about one FP32 ulp from run to run and from ``deterministic=True`` (see the module
-    docstring).
+    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_backward`
+    returns them, bitwise the same for both values of ``deterministic`` and bitwise reproducible.  With
+    ``use_qk_l2norm_in_kernel=True`` (either gate mode) every gradient is bitwise the same for both values of
+    ``deterministic`` too.
     """
     scale = DEFAULT_SCALE if scale is None else scale
     if _deterministic(deterministic, "chunk_kda_bwd"):
         workspace, arena, _save_mode = _det_call(
             workspace, arena, None, deterministic, "chunk_kda_bwd"
         )
-        return _det().chunk_kda_det_bwd(
+        return _det().cake_kda_det_train_backward(
             q,
             k,
             v,
@@ -450,7 +462,7 @@ def chunk_kda_bwd(
             beta,
             cu_seqlens,
             dout,
-            saved=saved,
+            saved=_det_saved(saved),
             scale=scale,
             workspace=workspace,
             arena=arena,
@@ -515,8 +527,8 @@ def chunk_kda(
     ``A_log``, ``dt_bias``, ``lower_bound``: the raw gate mode (gradients to the raw gate ``g``, BF16, and to
     ``A_log`` / ``dt_bias``, FP32), in both values of ``deterministic`` (see :func:`chunk_kda_fwd`); the
     raw mode never engages the checkpoint hand-off.
-    ``use_qk_l2norm_in_kernel``: the in-kernel Q/K L2 norm (raw ``q`` / ``k`` in, their gradients out),
-    ``deterministic=True`` only (see :func:`chunk_kda_fwd`).
+    ``use_qk_l2norm_in_kernel``: the in-kernel Q/K L2 norm (raw ``q`` / ``k`` in, their gradients out), in both
+    values of ``deterministic`` (see :func:`chunk_kda_fwd`); it never engages the checkpoint hand-off either.
     """
     scale = DEFAULT_SCALE if scale is None else scale
     if checkpoint_handoff not in ("auto", "on", "off"):
@@ -527,7 +539,7 @@ def chunk_kda(
         workspace, arena, save_mode = _det_call(
             workspace, arena, save_mode, deterministic, "chunk_kda"
         )
-        return _det().chunk_kda_det(
+        return _det().cake_kda_det(
             q,
             k,
             v,
@@ -577,10 +589,10 @@ def kda_train_arena(
 ) -> Any:
     """The lower-memory arena option of the package ``deterministic`` selects (the default, ``lean=False,
     tail_passes=1``, no batching, is the full layout); see
-    :func:`flashinfer.cake_kda_det_train.kda_det_train_arena`.  The two packages' options have the same fields and
+    :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_arena`.  The two packages' options have the same fields and
     either serves the calls of this module."""
     cls = (
-        _det().KdaDetArena
+        _det().CakeKDADetArena
         if _deterministic(deterministic, "kda_train_arena")
         else _nd().KdaArena
     )
@@ -608,14 +620,11 @@ def kda_train_workspace(
 ) -> Any:
     """A caller-owned workspace of the package ``deterministic`` selects (one arena of internal intermediates) for
     ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``, reused by every call of the same
-    ``deterministic`` that receives it; see :func:`flashinfer.cake_kda_det_train.kda_det_train_workspace` for
+    ``deterministic`` that receives it; see :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_workspace` for
     ``backward``, ``save_mode``, ``arena``, ``doc_lengths``, ``use_gate_in_kernel`` and ``use_qk_l2norm_in_kernel``
-    (the gate and Q/K L2 norm modes of the calls it serves: a call in the other gate mode is refused with
-    ``ValueError``, and ``use_qk_l2norm_in_kernel=True`` with ``deterministic=False`` raises ``ValueError``).  The
-    two packages' arenas have the same size.  A raw gate mode backward workspace of ``deterministic=False`` on
-    SM100 / SM103 also holds the FP64 parameter-gradient accumulators outside its arena (2 KiB per head; 16 KiB per
-    head on SM100 from 32 heads), so it is larger than the deterministic package's by that much
-    (:func:`kda_train_workspace_bytes` counts them)."""
+    (the gate and Q/K L2 norm modes of the calls it serves, in both values of ``deterministic``: a call in the other
+    gate mode or the other Q/K L2 norm mode is refused with ``ValueError``).  The two packages' workspaces have the
+    same size."""
     det = _deterministic(deterministic, "kda_train_workspace")
     kwargs = dict(
         backward=backward,
@@ -626,7 +635,7 @@ def kda_train_workspace(
         l2n=_l2n_mode(use_qk_l2norm_in_kernel),
     )
     if det:
-        return _det().KdaDetWorkspace.for_problem(S, num_docs, H, device, **kwargs)
+        return _det().CakeKDADetWorkspace.for_problem(S, num_docs, H, device, **kwargs)
     # the non-deterministic workspace takes the mode it requires
     return _nd().KdaWorkspace.for_problem(
         S, num_docs, H, device, deterministic=False, **kwargs
@@ -647,12 +656,10 @@ def kda_train_workspace_bytes(
     use_qk_l2norm_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
-    """Bytes :func:`kda_train_workspace` allocates for the problem: the same for both values of
-    ``deterministic``, but for a raw gate mode backward workspace (``use_gate_in_kernel=True``) on SM100 / SM103,
-    where ``deterministic=False`` adds its FP64 parameter-gradient accumulators (2 KiB per head; 16 KiB per head on
-    SM100 from 32 heads); see :func:`flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
-    (``use_gate_in_kernel`` / ``use_qk_l2norm_in_kernel``: the gate and Q/K L2 norm modes;
-    ``use_qk_l2norm_in_kernel=True`` with ``deterministic=False`` raises ``ValueError``)."""
+    """Bytes :func:`kda_train_workspace` allocates for the problem (the same for both values of
+    ``deterministic``); see :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_workspace_bytes`
+    (``use_gate_in_kernel`` / ``use_qk_l2norm_in_kernel``: the gate and Q/K L2 norm modes, in both values of
+    ``deterministic``)."""
     det = _deterministic(deterministic, "kda_train_workspace_bytes")
     return (_det() if det else _nd()).workspace_bytes(
         S,
@@ -679,8 +686,8 @@ def kda_train_saved_bytes(
     deterministic: bool = True,
 ) -> int:
     """Bytes of the saved set (the same for both values of ``deterministic``); see
-    :func:`flashinfer.cake_kda_det_train.kda_det_train_saved_bytes` (``use_qk_l2norm_in_kernel``: the Q/K L2 norm
-    mode; ``True`` with ``deterministic=False`` raises ``ValueError``)."""
+    :func:`flashinfer.cake_kda_det_train.cake_kda_det_train_saved_bytes` (``use_qk_l2norm_in_kernel``: the Q/K L2 norm
+    mode, in both values of ``deterministic``)."""
     det = _deterministic(deterministic, "kda_train_saved_bytes")
     return (_det() if det else _nd()).saved_bytes(
         S,

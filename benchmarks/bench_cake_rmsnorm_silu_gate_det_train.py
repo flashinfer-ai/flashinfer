@@ -41,6 +41,9 @@ call unless the caller passes one.  Each comparator's outputs are checked
 against the Cake outputs (largest absolute difference of ``y``, ``dx``, ``dz``,
 ``dw``).
 
+The Cake rows name the forward module the call runs (``module``: its role and
+program, from the row count and the device's SM count).
+
 ``--side-stream`` adds, for the Cake kernels, the event-timed median of seven
 forward and seven backward calls beside a one-thread kernel resident on
 another stream over the median of seven calls alone (alternating), the
@@ -68,6 +71,9 @@ from flashinfer.cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_det_train_backward_workspace,
     cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
     cake_rmsnorm_silu_gate_det_train_forward,
+)
+from flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train import (
+    cake_jit as _loader,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -114,6 +120,14 @@ def _beside_resident(call: Callable[[], object]) -> dict:
         busy.append(_event_ms(call, side))
     alone_ms, busy_ms = statistics.median(alone), statistics.median(busy)
     return {"alone_ms": alone_ms, "busy_ms": busy_ms, "ratio": busy_ms / alone_ms}
+
+
+def _forward_module(rows: int, device: torch.device) -> str:
+    """``<role> <program>`` of the forward module ``rows`` rows run on ``device``."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = _loader.device_arch(index)
+    name = _loader.module_for_rows(arch, "fwd", rows, _loader.device_sm_count(index))
+    return f"{_loader.MODULES[name]['role']} {name}"
 
 
 def _formula(x, z, w, eps):
@@ -234,6 +248,7 @@ def bench_row(
     cake["workspace_bytes"] = cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
         T * H, x.device
     )
+    cake["module"] = _forward_module(T * H, x.device)
     if side_stream:
         y = torch.empty_like(x)
         ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(T * H, x.device)
@@ -267,6 +282,8 @@ def _format(result: dict, names) -> list[str]:
         )
         if "workspace_bytes" in row:
             lines[-1] += f"  workspace {row['workspace_bytes'] / 2**10:8.1f} KiB"
+        if "module" in row:
+            lines[-1] += f"  module {row['module']}"
         for stage, side in row.get("side_stream", {}).items():
             lines.append(
                 f"T={result['T']:>6} H={result['H']:>3} {name:>13}: {stage} beside a resident kernel "

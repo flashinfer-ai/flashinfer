@@ -14,20 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Deterministic context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU training
-(SM100 / SM103 / SM107), the Cake backend.  ``flashinfer.cake_causal_conv1d_det_train`` keeps the
-names these entry points had before (``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_kcp_multi``,
-``KcpRecomputeHandle``) as compatibility aliases of the objects defined here.
+(SM100 / SM103 / SM107), the Cake backend.
 
 Every rank convolves its fragments of the packed batch; the first tokens of a fragment that continues a
 document read the history rows of the preceding fragment, exchanged through the halo collective of the
-context-parallel context of the KDA step (``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``).
+KCP context the calling family's KCP context builder made (the context its own KCP step uses).
 The per-rank launch sequences, the autograd Functions and the kernels of the ``kcp_jit`` registry live in
-``flashinfer.cake_causal_conv1d_det_train_backend.kcp``; the single-rank entry points are in
-``flashinfer.cake_causal_conv1d_det_train``::
+``flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp`` (imported on first use: importing this module
+loads none of it); the single-rank entry points are in ``flashinfer.cake_causal_conv1d_det_train``::
 
     from flashinfer.cake_causal_conv1d_det_train_kcp import (
         cake_causal_conv1d_det_kcp,
-        cake_causal_conv1d_det_multi_kcp,
+        cake_causal_conv1d_det_kcp_multi,
     )
 
     # this rank's fragments, with the history rows of the preceding fragments exchanged
@@ -36,16 +34,24 @@ The per-rank launch sequences, the autograd Functions and the kernels of the ``k
 
     # a layer's q / k / v convolutions with one halo exchange per direction
     # (bitwise three single calls)
-    q, k, v = cake_causal_conv1d_det_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx)
+    q, k, v = cake_causal_conv1d_det_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
 """
 
 from __future__ import annotations
 
+from types import ModuleType
 from typing import Any, Optional, Sequence
 
 import torch
 
 from .api_logging import flashinfer_api
+
+
+def _kcp() -> ModuleType:
+    """The KCP host module of the det backend package, imported on first use (torch.distributed, the KCP loader)."""
+    from .experimental.cake.cake_causal_conv1d_det_train import kcp
+
+    return kcp
 
 
 @flashinfer_api
@@ -71,11 +77,11 @@ def cake_causal_conv1d_det_kcp(
         partition's order; ``C`` is a multiple of 8.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps.
-    ctx : ContextDetKcp
-        From ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`` (the same context the KDA step of the rank uses).
-    recompute_handle : RecomputeHandleDetKcp, optional
+    ctx : KCP context
+        From the calling family's KCP context builder (the same context that family's KCP step of the rank uses).
+    recompute_handle : CakeCausalConv1dDetKcpRecomputeHandle, optional
         Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
-        ``flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp``) makes the checkpoint recompute of
+        ``flashinfer.cake_causal_conv1d_det_train_kcp.CakeCausalConv1dDetKcpRecomputeHandle``) makes the checkpoint recompute of
         this call run without the forward halo exchange: the original forward exchanges as always and stores its
         history rows (the saved set's own tensor, key ``"conv"``) in the handle; torch's recompute of the forward
         inside the backward reads them back, so ``y`` and the gradients are bitwise those of the same checkpoint
@@ -89,7 +95,7 @@ def cake_causal_conv1d_det_kcp(
         that needs it is pending.
     cooperative : bool, optional
         Keyword-only, default ``None`` (the package default,
-        ``flashinfer.cake_causal_conv1d_det_train_backend.kcp.COOPERATIVE_DEFAULT``, currently ``True``).  The launch
+        ``flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp.COOPERATIVE_DEFAULT``, currently ``True``).  The launch
         form of the backward's main kernel; the forward is the same either way.  ``True``: one cooperative launch,
         which starts only when all its CTAs fit on the GPU at once, so it waits for any kernel of another stream
         (for example a communication kernel) that occupies an SM.  ``False``: an ordinary launch one SM short of the
@@ -105,9 +111,7 @@ def cake_causal_conv1d_det_kcp(
         fused ``dx`` + deterministic FP32 ``dweight`` kernel of this rank's fragments.
     """
 
-    from .cake_causal_conv1d_det_train_backend import kcp as _kcp  # noqa: PLC0415
-
-    return _kcp.cake_causal_conv1d_det_kcp(
+    return _kcp().cake_causal_conv1d_det_kcp(
         x_local,
         weight,
         ctx,
@@ -117,7 +121,7 @@ def cake_causal_conv1d_det_kcp(
 
 
 @flashinfer_api
-def cake_causal_conv1d_det_multi_kcp(
+def cake_causal_conv1d_det_kcp_multi(
     xs: Sequence[torch.Tensor],
     weights: Sequence[torch.Tensor],
     ctx: Any,
@@ -140,12 +144,12 @@ def cake_causal_conv1d_det_multi_kcp(
         fragments, in the partition's order; each ``C_i`` is a multiple of 8 (they may differ).
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : ContextDetKcp
+    ctx : KCP context
         As in :func:`cake_causal_conv1d_det_kcp`.  Every rank of the group calls this function once per layer, in the
         same order, with the same tensor count and channel counts.  The ranks are not compared (that would cost a
         collective): a different count, channel count or order hangs the exchange or silently corrupts the history
         rows, as a mismatch of the single entry's per-rank contract does.
-    recompute_handle : RecomputeHandleDetKcp, optional
+    recompute_handle : CakeCausalConv1dDetKcpRecomputeHandle, optional
         Keyword-only, default ``None`` (unchanged behavior).  One handle for the whole call: the original forward
         stores the ``n`` history pools under ``"conv"`` and torch's recompute inside the backward reads them back,
         so the recompute issues no collective; the backward still exchanges once.  The rules of
@@ -162,9 +166,7 @@ def cake_causal_conv1d_det_multi_kcp(
         The ``n`` BF16 outputs, each of its input's shape.
     """
 
-    from .cake_causal_conv1d_det_train_backend import kcp as _kcp  # noqa: PLC0415
-
-    return _kcp.cake_causal_conv1d_det_multi_kcp(
+    return _kcp().cake_causal_conv1d_det_kcp_multi(
         xs,
         weights,
         ctx,
@@ -173,22 +175,32 @@ def cake_causal_conv1d_det_multi_kcp(
     )
 
 
-# ``RecomputeHandleDetKcp`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing this
-# module does not import the KCP host module (torch.distributed, the KCP loader), like the entry points above.
-def __getattr__(name: str) -> Any:
-    if name == "RecomputeHandleDetKcp":
-        from .cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp  # noqa: PLC0415
+# The KCP route's types (the checkpoint recompute handle and the autograd Functions) resolve on first access, so
+# importing this module does not import the KCP host module (torch.distributed, the KCP loader), like the entry
+# points above.
+_LAZY_TYPES = frozenset(
+    {
+        "CakeCausalConv1dDetKcpFunction",
+        "CakeCausalConv1dDetKcpMultiFunction",
+        "CakeCausalConv1dDetKcpRecomputeHandle",
+    }
+)
 
-        return RecomputeHandleDetKcp
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_TYPES:
+        return getattr(_kcp(), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | {"RecomputeHandleDetKcp"})
+    return sorted(set(globals()) | _LAZY_TYPES)
 
 
 __all__ = [
-    "RecomputeHandleDetKcp",  # noqa: F822 - resolved by __getattr__
+    "CakeCausalConv1dDetKcpFunction",  # noqa: F822 - resolved by __getattr__
+    "CakeCausalConv1dDetKcpMultiFunction",  # noqa: F822
+    "CakeCausalConv1dDetKcpRecomputeHandle",  # noqa: F822
     "cake_causal_conv1d_det_kcp",
-    "cake_causal_conv1d_det_multi_kcp",
+    "cake_causal_conv1d_det_kcp_multi",
 ]

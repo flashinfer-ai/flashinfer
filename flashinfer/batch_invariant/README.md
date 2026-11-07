@@ -19,24 +19,47 @@ With `batch_invariant=True` an output's bits depend on the input values and the 
 
 Each class has one fixed dataflow, named and hashed into a **fingerprint**; `flashinfer.batch_invariant.fingerprint(op,
 **dims)` returns it, scoped to (fingerprint, FlashInfer version, architecture). Bitwise equality is the acceptance
-criterion of every test of the mode (`tests/gemm/test_batch_invariant_mm_bf16.py`, `tests/batch_invariant/test_lean.py`).
+criterion of every test of the mode (`tests/gemm/test_batch_invariant_mm_bf16.py`, `tests/gemm/test_batch_invariant_bmm_fp8.py`, `tests/gemm/test_batch_invariant_mm_mxfp8.py`, `tests/gemm/test_batch_invariant_mm_fp4.py`,
+`tests/batch_invariant/test_lean.py`).
 
 ## Supported operators
 
 | API | Selection | Classes and fingerprint | Supported inputs |
 |---|---|---|---|
-| `mm_bf16` | `backend="auto", batch_invariant=True` | `gemm.bf16.kfold` (one fp32 fold over the K steps) or `gemm.bf16.kchunk[C]` (K cut into `C` chunks, a function of the weight shape alone, so a narrow weight runs it at every M); `fingerprint("mm_bf16", N=, K=)` | bf16 `a (M, K)` row-major and bf16 `b (K, N)` row-major or the transpose of a row-major `(N, K)` weight, `K` and `N` multiples of 8, any `M`; bf16 output; no bias; `pdl` accepted (plain stream order). SM100 / SM103 / SM107 |
+| `mm_bf16` | `backend="auto", batch_invariant=True` | `gemm.bf16.kfold` (one fp32 fold over the K steps) or `gemm.bf16.kchunk[C]` (K cut into `C` chunks, a function of the weight shape alone, so a narrow weight runs it at every M); `fingerprint("mm_bf16", N=, K=)`, and with a bias `fingerprint("mm_bf16", N=, K=, bias=True)`: the biased chain `cvt_bf16(add_f32(fold, bias[n]))` (the bf16 bias widened exactly and added once to the fully reduced accumulator before the single rounding) is a different specification | bf16 `a (M, K)` row-major and bf16 `b (K, N)` row-major or the transpose of a row-major `(N, K)` weight, `K` and `N` multiples of 8, any `M`; optional bf16 contiguous `bias (N,)`; bf16 output; `pdl` accepted (plain stream order). SM100 / SM103 / SM107 |
+| `bmm_fp8` | `backend="auto", batch_invariant=True` | `gemm.e4m3.kfold.scaled` / `gemm.e5m2.kfold.scaled` (one fp32 fold over the 32-wide fp8 K steps, then `mul.rn` by `A_scale * B_scale` formed once on the device, then one `cvt.rn`) or `gemm.<fmt>.kchunk[C].scaled` (K cut into `C` chunks of whole 32-wide steps, a function of the weight shape and the format alone); every batch element is one launch of the class, so the batch is not a dimension; `fingerprint("bmm_fp8", N=, K=, dtype=, out_dtype=)` | `A (b, M, K)` and `B (b, K, N)` both e4m3 or both e5m2, `B` column-major (the transpose of a row-major `(b, N, K)` weight, the documented layout) or row-major, `K` a multiple of 16 and `N` of 8, any `b` and `M`; the two per-tensor scales as 1-element fp32 tensors; bf16 or fp16 output. SM100 / SM103 / SM107 |
+| `mm_mxfp8` | `backend="auto", batch_invariant=True` | `gemm.mxfp8.kfold` (one fp32 fold over the 32-wide block-scaled steps of the SM100 / SM103 instruction, the UE8M0 block scales applied inside each step, then one `cvt.rn`) or `gemm.mxfp8.kchunk[C]`, and on SM107 `gemm.mxfp8.kfold64` / `gemm.mxfp8.kchunk64[C]` (the SM107 instruction folds 64 elements per step: a different class, so the architecture is a dimension of the specification); `C` is a function of the weight shape alone (chunks of whole 128-element granules); `fingerprint("mm_mxfp8", N=, K=, out_dtype=, arch=)` (`arch` defaults to the current device) | e4m3 `a (M, K)` row-major and e4m3 `b (K, N)` the transpose of a row-major `(N, K)` weight (the block-scaled instruction takes K-major operands only), `K` a multiple of 32 and `N` of 8 within the operator's own limits (`N, K >= 128`), any `M`; the scale factors as the 1-D uint8 buffers of `mxfp8_quantize(..., is_sf_swizzled_layout=True)` (the 128x4 swizzled layout; where K is not a multiple of the class's step the last step's scales are read from the buffers' padding, which must be finite, as the quantizers write it); bf16 or fp16 output. SM100 / SM103 / SM107 |
+| `mm_fp4` | `backend="auto", batch_invariant=True` | NVFP4 (`use_nvfp4=True`): `gemm.nvfp4.kfold` (one fp32 fold over the 64-wide block-scaled steps of the SM100 / SM103 instruction, the e4m3 block scales of 16-element blocks applied inside each step, then one `mul.rn` by the caller's `alpha` and one `cvt.rn`) or `gemm.nvfp4.kchunk[C]`, and on SM107 `gemm.nvfp4.kfold128` for the weight shapes the chunk rule leaves unsplit (the SM107 instruction folds 128 elements per step; a split weight shape runs `gemm.nvfp4.kchunk[C]` with the 64-wide step on SM107 too); MXFP4 (`use_nvfp4=False`): `gemm.mxfp4.kfold` / `gemm.mxfp4.kchunk[C]` (the UE8M0 block scales of 32-element blocks), and on SM107 `gemm.mxfp4.kfold128` / `gemm.mxfp4.kchunk128[C]`; `C` is a function of the weight shape and the format alone (chunks of whole granules: 128 elements for the 64-wide step, 256 for the 128-wide); `fingerprint("mm_fp4", N=, K=, out_dtype=, use_nvfp4=, arch=)` (`arch` defaults to the current device) | packed-fp4 `a (M, K / 2)` row-major and `b (K / 2, N)` the transpose of a row-major `(N, K / 2)` weight (uint8 or `float4_e2m1fn_x2`; the block-scaled instruction takes K-major operands only), `K` a multiple of 32 and `N` of 8, any `M`; the scale factors as the 1-D swizzled buffers of `nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False)` / `mxfp4_quantize(...)` (the 128x4 layout; e4m3 or uint8 bytes); `alpha` a 1-element fp32 tensor or None (1.0; a per-token alpha is not a class of the mode); where K is not a multiple of the class's step (64; 128 on SM107) the last step's scales are read from the buffers' padding, which must be finite, as the quantizers write it; bf16 or fp16 output. SM100 / SM103 / SM107 |
+| `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper` | `backend="auto", batch_invariant=True` (constructor) | `attention.bf16` per head dim: 128-key tiles and 512-key chunks on the absolute KV axis, the online softmax step and the chunk merge of `attention/batch_invariant/spec.py`; `fingerprint(<wrapper name>, head_dim=...)`. The three wrappers (prefill and decode, paged and ragged KV) compute one class: a token's bits depend on its KV position, head and window alone | bf16 q / K / V / out; head dim 64 / 128 / 256; GQA (`num_qo_heads` a multiple of `num_kv_heads`, up to 128 per group); causal (bottom-right aligned) with an optional `window_left`; page sizes 1..128 (powers of two); NHD / HND. CUDA graphs: capture `run()` after `plan()`; a replay reproduces the planned batch and a new `plan()` needs a new capture (`use_cuda_graph=True` raises). `plan()` runs a host-side planner (of the order of 10 us per request). Not: soft cap, custom masks, fused RoPE, non-causal prefill, fp8 / fp4 KV, q / k / v scales, LSE output, sinks |
+
+## The dispatcher and the launch grid
+
+Each class has an enumerated configuration space (tile, cluster shape, 2-CTA pairing, raster order, swizzle band, chunk
+fold); every record computes the class, so the choice among them moves time only (R3). `gemm/batch_invariant/heuristic.py`
+orders the records for a shape, layout, format and part by a per-tile roofline estimate: waves of tiles over the part's
+co-resident cluster capacity, each the slower of its MMA and its L2-to-SMEM traffic per k-step, the aggregate L2 bound,
+the operands' HBM bytes plus a share of the bytes the scheduler's tile order fetches again (which operand panels stay
+resident in the L2 across a swizzle band), the epilogue and the split's fixup, with a few empirical constants shared by
+every part and format (none fitted per part). The first record is the default; `autotune(True)` profiles the first ten
+(the best five, each with its raster twin) and keeps the bits by construction. The persistent grid is the device's
+co-resident cluster count for the record's cluster shape (the CuTe DSL's GPC-aware occupancy query, asked once per
+device): a launch parameter that decides which CTA computes which tile and never a bit. The heuristic takes the device's
+queried capacity and L2 size once the API has recorded them, else the family's nominal table; the generated Lean dispatch
+cases are the nominal parts' (`nominal=True`).
 
 ## How to check the proofs
 
 `lean/` holds one Lean 4 project (no Mathlib). Per class it models the dataflow as terms over opaque, correctly rounded
-primitives and proves that every implementation of the class the kernels may run (for example a split reduction with its
-index-addressed workspace, or a pipelined loop with any stage count) is the class's term, and the launch-model
-statements of R1 and R2. The model gives a configuration no way to reach an output element (R3 is immediate in it, and
+primitives (one opaque tensor-core step per operand format: `mma16` for bf16, `mma32` for the fp8 formats, so the fp8
+classes are different terms from the bf16 class even at equal K) and proves that every implementation of the class the
+kernels may run (for example a split reduction with its index-addressed workspace, or a pipelined loop with any stage
+count) is the class's term, including its epilogue chain, and the launch-model statements of R1 and R2; an elementwise
+postfix of the chain such as the bias lifts every identity by congruence, and the biased and the unbiased chain are proved
+to be different terms. The model gives a configuration no way to reach an output element (R3 is immediate in it, and
 is instantiated on the whole enumerated configuration space); that the kernel realises the model is what the engine's
 lowering trace and the GPU configuration-agreement tests establish. What Lean cannot state is the hardware hypothesis that the instruction variants a
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
-for bit.
+for bit. A second hardware hypothesis of the block-scaled classes: the block-scaled step gives the same bits with its two operands exchanged, which the swapped decode records (`swap_ab`: the weights as the kernel's A, the tokens as its B) rely on; the dispatcher takes those records up to 64 rows and the dense records above, so the rows of a 64-row and a 65-row call are compared bit for bit in `test_batch_invariance_along_rows` of the mxfp8 and fp4 suites (M = 63, 64, 65 among the row counts), and every swapped record against the dense one in `test_swapped_decode_records_compute_the_class`, on each part.
 
 `Cases.lean` is generated from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
 the Lean model reproduces the Python S-expressions node for node, re-derives the dispatchers' shape rules and checks
@@ -45,8 +68,8 @@ every record of a configuration space and every dispatcher pick against the clas
 installed.
 
 Trust statement: **Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`), plus `Lean.ofReduceBool` for the
-named exhaustive table theorems listed in `lean/Axioms.lean`** (checks over hundreds of records, decided by
-`native_decide`; every other generated case is kernel `decide`). `Lean.ofReduceBool` trusts the compiled evaluator for
+named exhaustive checks listed in `lean/Axioms.lean`** (the configuration-space and dispatcher-membership checks over
+hundreds of records per format, decided by `native_decide`; every other generated case is kernel `decide`). `Lean.ofReduceBool` trusts the compiled evaluator for
 those closed Boolean terms; `lake exe axioms` enforces exactly this list and fails on any `sorry`.
 
 ```bash

@@ -183,7 +183,7 @@ class _CakeHostInts:
             raise ValueError(f"{self.kernel}: a host check divides {a} by {b}, which is not exact")
         return quotient
 CAKE_TARGET_ARCH = 'sm_107a'
-CAKE_SMEM_BYTES = 160768
+CAKE_SMEM_BYTES = 161408
 
 def _cake_ldparam_b32(addr, ptx_type):
     return cutlass.Int32(cutlass_llvm.inline_asm(
@@ -282,6 +282,9 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
     b_smem_n16 = cute.recast_ptr(smem_raw + 136192, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.BFloat16)
     _b_smem_n16 = cute.make_tensor(b_smem_n16, _flat_layout)
     b_smem_n16_addr = smem + 136192
+    peer_ptrs = cute.recast_ptr(smem_raw + 160768, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Uint64)
+    _peer_ptrs = cute.make_tensor(peer_ptrs, _flat_layout)
+    peer_ptrs_addr = smem + 160768
     a_full_addr = cute.recast_ptr(smem_raw, dtype=cutlass.Uint64)
     a_free_addr = cute.recast_ptr(smem_raw + 64, dtype=cutlass.Uint64)
     scale_full_addr = cute.recast_ptr(smem_raw + 128, dtype=cutlass.Uint64)
@@ -357,6 +360,31 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
     _tmem_hold = cute.recast_ptr(smem_raw + 448, dtype=cutlass.Uint32)
     if warp == 0:
         cute.arch.alloc_tmem(512, _tmem_hold, is_two_cta=True, arch='sm_100')
+    if (warp == 1):
+        if prims.elect_sync():
+            for peer_0 in cutlass.range_constexpr(0, 16, 1):
+                if (peer_0 < mega_pg_world):
+                    prims.store_ext(cutlass.Uint64(cutlass.Uint64((cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(published_hidden_bf16_peers[peer_0])), mem_space=cute.AddressSpace.gmem, assumed_align=2)).toint())).ir_value(), (peer_ptrs + (peer_0)))
+    if (warp == 2):
+        if prims.elect_sync():
+            for peer_1 in cutlass.range_constexpr(0, 16, 1):
+                if (peer_1 < mega_pg_world):
+                    prims.store_ext(cutlass.Uint64(cutlass.Uint64((cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(published_topk_ids_i32_peers[peer_1])), mem_space=cute.AddressSpace.gmem, assumed_align=4)).toint())).ir_value(), (peer_ptrs + ((16 + peer_1))))
+    if (warp == 3):
+        if prims.elect_sync():
+            for peer_2 in cutlass.range_constexpr(0, 16, 1):
+                if (peer_2 < mega_pg_world):
+                    prims.store_ext(cutlass.Uint64(cutlass.Uint64((cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(published_topk_weights_f32_peers[peer_2])), mem_space=cute.AddressSpace.gmem, assumed_align=4)).toint())).ir_value(), (peer_ptrs + ((32 + peer_2))))
+    if (warp == 4):
+        if prims.elect_sync():
+            for peer_3 in cutlass.range_constexpr(0, 16, 1):
+                if (peer_3 < mega_pg_world):
+                    prims.store_ext(cutlass.Uint64(cutlass.Uint64((cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(route_terms_bf16_peers[peer_3])), mem_space=cute.AddressSpace.gmem, assumed_align=2)).toint())).ir_value(), (peer_ptrs + ((48 + peer_3))))
+    if (warp == 5):
+        if prims.elect_sync():
+            for peer_4 in cutlass.range_constexpr(0, 16, 1):
+                if (peer_4 < mega_pg_world):
+                    prims.store_ext(cutlass.Uint64(cutlass.Uint64((cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(mega_pg_flags[peer_4])), mem_space=cute.AddressSpace.gmem, assumed_align=4)).toint())).ir_value(), (peer_ptrs + ((64 + peer_4))))
     cute.arch.sync_threads()
     prims.tcgen05_fence('after_thread_sync')
     _tmem_base_ptr = cute.arch.retrieve_tmem_ptr(cutlass.Float32, 4, _tmem_hold)
@@ -379,7 +407,7 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         delta_1 = cute.make_rmem_tensor((1,), cutlass.Uint32)
         acc_stage = cute.make_rmem_tensor((1,), cutlass.Uint32)
         _phase_acc_full = cute.make_rmem_tensor((1,), cutlass.Uint32)
-        rank_flags = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.select_((mega_pg_rank) == 31, cutlass.Uint64(mega_pg_flags[31]), cutlass.select_((mega_pg_rank) == 30, cutlass.Uint64(mega_pg_flags[30]), cutlass.select_((mega_pg_rank) == 29, cutlass.Uint64(mega_pg_flags[29]), cutlass.select_((mega_pg_rank) == 28, cutlass.Uint64(mega_pg_flags[28]), cutlass.select_((mega_pg_rank) == 27, cutlass.Uint64(mega_pg_flags[27]), cutlass.select_((mega_pg_rank) == 26, cutlass.Uint64(mega_pg_flags[26]), cutlass.select_((mega_pg_rank) == 25, cutlass.Uint64(mega_pg_flags[25]), cutlass.select_((mega_pg_rank) == 24, cutlass.Uint64(mega_pg_flags[24]), cutlass.select_((mega_pg_rank) == 23, cutlass.Uint64(mega_pg_flags[23]), cutlass.select_((mega_pg_rank) == 22, cutlass.Uint64(mega_pg_flags[22]), cutlass.select_((mega_pg_rank) == 21, cutlass.Uint64(mega_pg_flags[21]), cutlass.select_((mega_pg_rank) == 20, cutlass.Uint64(mega_pg_flags[20]), cutlass.select_((mega_pg_rank) == 19, cutlass.Uint64(mega_pg_flags[19]), cutlass.select_((mega_pg_rank) == 18, cutlass.Uint64(mega_pg_flags[18]), cutlass.select_((mega_pg_rank) == 17, cutlass.Uint64(mega_pg_flags[17]), cutlass.select_((mega_pg_rank) == 16, cutlass.Uint64(mega_pg_flags[16]), cutlass.select_((mega_pg_rank) == 15, cutlass.Uint64(mega_pg_flags[15]), cutlass.select_((mega_pg_rank) == 14, cutlass.Uint64(mega_pg_flags[14]), cutlass.select_((mega_pg_rank) == 13, cutlass.Uint64(mega_pg_flags[13]), cutlass.select_((mega_pg_rank) == 12, cutlass.Uint64(mega_pg_flags[12]), cutlass.select_((mega_pg_rank) == 11, cutlass.Uint64(mega_pg_flags[11]), cutlass.select_((mega_pg_rank) == 10, cutlass.Uint64(mega_pg_flags[10]), cutlass.select_((mega_pg_rank) == 9, cutlass.Uint64(mega_pg_flags[9]), cutlass.select_((mega_pg_rank) == 8, cutlass.Uint64(mega_pg_flags[8]), cutlass.select_((mega_pg_rank) == 7, cutlass.Uint64(mega_pg_flags[7]), cutlass.select_((mega_pg_rank) == 6, cutlass.Uint64(mega_pg_flags[6]), cutlass.select_((mega_pg_rank) == 5, cutlass.Uint64(mega_pg_flags[5]), cutlass.select_((mega_pg_rank) == 4, cutlass.Uint64(mega_pg_flags[4]), cutlass.select_((mega_pg_rank) == 3, cutlass.Uint64(mega_pg_flags[3]), cutlass.select_((mega_pg_rank) == 2, cutlass.Uint64(mega_pg_flags[2]), cutlass.select_((mega_pg_rank) == 1, cutlass.Uint64(mega_pg_flags[1]), cutlass.Uint64(mega_pg_flags[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+        rank_flags = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(64 + mega_pg_rank)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
         old_sense0[0] = cutlass.Uint32(0)
         old_sense1[0] = cutlass.Uint32(0)
         if (warp == 0):
@@ -390,10 +418,11 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 old_sense1[0] = cutlass.Uint32(sense1)
         linear_thread = cutlass.Int32(((bid * 384) + tid))
         thread_stride = cutlass.Int32((num_bids * 384))
-        _forward_storage_3 = _published_topk_ids_i32
-        _forward_storage_4 = _published_topk_weights_f32
-        _forward_storage_5 = _source_topk_ids_i64
-        _forward_storage_6 = _source_topk_weights_f32
+        _forward_storage_3 = _peer_ptrs
+        _forward_storage_4 = _published_topk_ids_i32
+        _forward_storage_5 = _published_topk_weights_f32
+        _forward_storage_6 = _source_topk_ids_i64
+        _forward_storage_7 = _source_topk_weights_f32
         _forward_loop_0 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_1: _forward_condition_1 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
         _forward_loop_0.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
         with _forward_loop_0 as _forward_values_2:
@@ -407,102 +436,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot)
             else:
-                peer_ids = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids + push_slot, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight).ir_value(), peer_weights + push_slot)
             cutlass.yield_out([cutlass.Int32(push + (thread_stride))])
-        _published_topk_ids_i32 = _forward_storage_3
-        _published_topk_weights_f32 = _forward_storage_4
-        _source_topk_ids_i64 = _forward_storage_5
-        _source_topk_weights_f32 = _forward_storage_6
-        _forward_storage_10 = _route_map_i32
-        _forward_storage_11 = _route_scale_f32
-        _forward_loop_7 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_8: _forward_condition_8 < cutlass.Int32(2048))
-        _forward_loop_7.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_7 as _forward_values_9:
-            index = _forward_values_9[0]
+        _peer_ptrs = _forward_storage_3
+        _published_topk_ids_i32 = _forward_storage_4
+        _published_topk_weights_f32 = _forward_storage_5
+        _source_topk_ids_i64 = _forward_storage_6
+        _source_topk_weights_f32 = _forward_storage_7
+        _forward_storage_11 = _route_map_i32
+        _forward_storage_12 = _route_scale_f32
+        _forward_loop_8 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_9: _forward_condition_9 < cutlass.Int32(2048))
+        _forward_loop_8.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_8 as _forward_values_10:
+            index = _forward_values_10[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index)))
             cutlass.yield_out([cutlass.Int32(index + (thread_stride))])
-        _route_map_i32 = _forward_storage_10
-        _route_scale_f32 = _forward_storage_11
-        _forward_storage_15 = _route_counts_u32
-        _forward_loop_12 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_13: _forward_condition_13 < cutlass.Int32(32))
-        _forward_loop_12.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_12 as _forward_values_14:
-            expert = _forward_values_14[0]
+        _route_map_i32 = _forward_storage_11
+        _route_scale_f32 = _forward_storage_12
+        _forward_storage_16 = _route_counts_u32
+        _forward_loop_13 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_14: _forward_condition_14 < cutlass.Int32(32))
+        _forward_loop_13.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_13 as _forward_values_15:
+            expert = _forward_values_15[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert)))
             cutlass.yield_out([cutlass.Int32(expert + (thread_stride))])
-        _route_counts_u32 = _forward_storage_15
-        _forward_storage_19 = _fc1_done
-        _forward_loop_16 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_17: _forward_condition_17 < cutlass.Int32(96))
-        _forward_loop_16.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_16 as _forward_values_18:
-            expert_row_tile = _forward_values_18[0]
+        _route_counts_u32 = _forward_storage_16
+        _forward_storage_20 = _fc1_done
+        _forward_loop_17 = cutlass.while_generate([cutlass.Int32(linear_thread)], lambda _forward_condition_18: _forward_condition_18 < cutlass.Int32(96))
+        _forward_loop_17.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_17 as _forward_values_19:
+            expert_row_tile = _forward_values_19[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
             cutlass.yield_out([cutlass.Int32(expert_row_tile + (thread_stride))])
-        _fc1_done = _forward_storage_19
-        _forward_storage_23 = _published_hidden_bf16
-        _forward_storage_24 = _source_hidden_bf16
-        _forward_storage_25 = _source_topk_ids_i64
-        _forward_storage_26 = push_owners
-        _forward_loop_20 = cutlass.while_generate([cutlass.Int32((linear_thread * 8))], lambda _forward_condition_21: _forward_condition_21 < cutlass.Int32((tokens_per_rank * 3072)))
-        _forward_loop_20.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_20 as _forward_values_22:
-            index_1 = _forward_values_22[0]
+        _fc1_done = _forward_storage_20
+        _forward_storage_24 = _peer_ptrs
+        _forward_storage_25 = _published_hidden_bf16
+        _forward_storage_26 = _source_hidden_bf16
+        _forward_storage_27 = _source_topk_ids_i64
+        _forward_storage_28 = push_owners
+        _forward_loop_21 = cutlass.while_generate([cutlass.Int32((linear_thread * 8))], lambda _forward_condition_22: _forward_condition_22 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_21.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_21 as _forward_values_23:
+            index_1 = _forward_values_23[0]
             hidden_f32 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_27 = prims.load_ext(source_hidden_bf16 + index_1, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_28 = _gmem_load_into_27.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32[0] = _gmem_load_into_f32_28[0]
-            hidden_f32[1] = _gmem_load_into_f32_28[1]
-            hidden_f32[2] = _gmem_load_into_f32_28[2]
-            hidden_f32[3] = _gmem_load_into_f32_28[3]
-            hidden_f32[4] = _gmem_load_into_f32_28[4]
-            hidden_f32[5] = _gmem_load_into_f32_28[5]
-            hidden_f32[6] = _gmem_load_into_f32_28[6]
-            hidden_f32[7] = _gmem_load_into_f32_28[7]
+            _gmem_load_into_29 = prims.load_ext(source_hidden_bf16 + index_1, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_30 = _gmem_load_into_29.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32[0] = _gmem_load_into_f32_30[0]
+            hidden_f32[1] = _gmem_load_into_f32_30[1]
+            hidden_f32[2] = _gmem_load_into_f32_30[2]
+            hidden_f32[3] = _gmem_load_into_f32_30[3]
+            hidden_f32[4] = _gmem_load_into_f32_30[4]
+            hidden_f32[5] = _gmem_load_into_f32_30[5]
+            hidden_f32[6] = _gmem_load_into_f32_30[6]
+            hidden_f32[7] = _gmem_load_into_f32_30[7]
             chunk = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_29 = prims.cvt_packfloat_f32(hidden_f32[1], hidden_f32[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk[0] = cutlass.Uint32(_bf16_pack_29)
-            _bf16_pack_30 = prims.cvt_packfloat_f32(hidden_f32[3], hidden_f32[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk[1] = cutlass.Uint32(_bf16_pack_30)
-            _bf16_pack_31 = prims.cvt_packfloat_f32(hidden_f32[5], hidden_f32[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk[2] = cutlass.Uint32(_bf16_pack_31)
-            _bf16_pack_32 = prims.cvt_packfloat_f32(hidden_f32[7], hidden_f32[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk[3] = cutlass.Uint32(_bf16_pack_32)
+            _bf16_pack_31 = prims.cvt_packfloat_f32(hidden_f32[1], hidden_f32[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk[0] = cutlass.Uint32(_bf16_pack_31)
+            _bf16_pack_32 = prims.cvt_packfloat_f32(hidden_f32[3], hidden_f32[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk[1] = cutlass.Uint32(_bf16_pack_32)
+            _bf16_pack_33 = prims.cvt_packfloat_f32(hidden_f32[5], hidden_f32[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk[2] = cutlass.Uint32(_bf16_pack_33)
+            _bf16_pack_34 = prims.cvt_packfloat_f32(hidden_f32[7], hidden_f32[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk[3] = cutlass.Uint32(_bf16_pack_34)
             push_token = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_1).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners[0] = cutlass.Uint32(0)
             for push_slot_1 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token * 8) + push_slot_1)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners[0] = cutlass.Uint32((push_owners[0] | (1 << cutlass.Uint32(owner_rank))))
             row_offset = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_1))
-            _while_storage_36 = _published_hidden_bf16
-            _while_storage_37 = chunk
-            _while_storage_38 = push_owners
-            _while_loop_33 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_34: (push_owners[0] != 0))
-            with _while_loop_33 as _while_values_35:
-                _ffs_reversed_bits_39 = cute.arch.brev(cutlass.Uint32(push_owners[0]))
-                _ffs_leading_one_40 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_39))
-                _find_first_set = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_40))
+            _while_storage_38 = _peer_ptrs
+            _while_storage_39 = _published_hidden_bf16
+            _while_storage_40 = chunk
+            _while_storage_41 = push_owners
+            _while_loop_35 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_36: (push_owners[0] != 0))
+            with _while_loop_35 as _while_values_37:
+                _ffs_reversed_bits_42 = cute.arch.brev(cutlass.Uint32(push_owners[0]))
+                _ffs_leading_one_43 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_42))
+                _find_first_set = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_43))
                 push_dest_1 = cutlass.Int32((_find_first_set - 1))
                 push_owners[0] = cutlass.Uint32((push_owners[0] & (push_owners[0] - 1)))
                 if (push_dest_1 == mega_pg_rank):
-                    _gmem_store_bits_41 = cutlass.Vector.from_elements([cutlass.Uint32(chunk[0]), cutlass.Uint32(chunk[1]), cutlass.Uint32(chunk[2]), cutlass.Uint32(chunk[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_41.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset, dtype=cutlass.Uint32))
+                    _gmem_store_bits_44 = cutlass.Vector.from_elements([cutlass.Uint32(chunk[0]), cutlass.Uint32(chunk[1]), cutlass.Uint32(chunk[2]), cutlass.Uint32(chunk[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_44.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset, dtype=cutlass.Uint32))
                 else:
-                    peer_rows = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_1) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_1) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_1) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_1) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_1) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_1) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_1) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_1) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_1) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_1) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_1) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_1) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_1) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_1) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_1) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_1) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_1) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_1) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_1) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_1) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_1) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_1) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_1) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_1) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_1) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_1) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_1) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_1) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_1) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_1) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_1) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_42 = cutlass.Vector.from_elements([cutlass.Uint32(chunk[0]), cutlass.Uint32(chunk[1]), cutlass.Uint32(chunk[2]), cutlass.Uint32(chunk[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_42.ir_value(), cute.recast_ptr(peer_rows + row_offset, dtype=cutlass.Uint32))
+                    peer_rows = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_1])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_45 = cutlass.Vector.from_elements([cutlass.Uint32(chunk[0]), cutlass.Uint32(chunk[1]), cutlass.Uint32(chunk[2]), cutlass.Uint32(chunk[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_45.ir_value(), cute.recast_ptr(peer_rows + row_offset, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_36
-            chunk = _while_storage_37
-            push_owners = _while_storage_38
+            _peer_ptrs = _while_storage_38
+            _published_hidden_bf16 = _while_storage_39
+            chunk = _while_storage_40
+            push_owners = _while_storage_41
             cutlass.yield_out([cutlass.Int32(index_1 + ((thread_stride * 8)))])
-        _published_hidden_bf16 = _forward_storage_23
-        _source_hidden_bf16 = _forward_storage_24
-        _source_topk_ids_i64 = _forward_storage_25
-        push_owners = _forward_storage_26
+        _peer_ptrs = _forward_storage_24
+        _published_hidden_bf16 = _forward_storage_25
+        _source_hidden_bf16 = _forward_storage_26
+        _source_topk_ids_i64 = _forward_storage_27
+        push_owners = _forward_storage_28
         arrival = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival[0] = cutlass.Uint32(4294967295)
         arrival[1] = cutlass.Uint32(4294967295)
@@ -513,17 +547,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival[6] = cutlass.Uint32(4294967295)
         arrival[7] = cutlass.Uint32(4294967295)
         arm_thread = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_46 = _route_terms_bf16
-        _forward_storage_47 = arrival
-        _forward_loop_43 = cutlass.while_generate([cutlass.Int32((arm_thread * 16))], lambda _forward_condition_44: _forward_condition_44 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_43.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_43 as _forward_values_45:
-            arrival_word = _forward_values_45[0]
-            _gmem_store_bits_48 = cutlass.Vector.from_elements([cutlass.Uint32(arrival[0]), cutlass.Uint32(arrival[1]), cutlass.Uint32(arrival[2]), cutlass.Uint32(arrival[3]), cutlass.Uint32(arrival[4]), cutlass.Uint32(arrival[5]), cutlass.Uint32(arrival[6]), cutlass.Uint32(arrival[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_48.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word, dtype=cutlass.Uint32))
+        _forward_storage_49 = _route_terms_bf16
+        _forward_storage_50 = arrival
+        _forward_loop_46 = cutlass.while_generate([cutlass.Int32((arm_thread * 16))], lambda _forward_condition_47: _forward_condition_47 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_46.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_46 as _forward_values_48:
+            arrival_word = _forward_values_48[0]
+            _gmem_store_bits_51 = cutlass.Vector.from_elements([cutlass.Uint32(arrival[0]), cutlass.Uint32(arrival[1]), cutlass.Uint32(arrival[2]), cutlass.Uint32(arrival[3]), cutlass.Uint32(arrival[4]), cutlass.Uint32(arrival[5]), cutlass.Uint32(arrival[6]), cutlass.Uint32(arrival[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_51.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word + ((thread_stride * 16)))])
-        _route_terms_bf16 = _forward_storage_46
-        arrival = _forward_storage_47
+        _route_terms_bf16 = _forward_storage_49
+        arrival = _forward_storage_50
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -536,8 +570,8 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         if ((bid == 0) & (warp == 0)):
             if prims.elect_sync():
                 delta[0] = cutlass.Uint32(1)
-                _if_condition_49 = cutlass.Boolean((mega_pg_rank == 0))
-                delta[0] = cutlass.Uint32(cutlass.select_(_if_condition_49, cutlass.Uint32((2147483648 - cutlass.Uint32((mega_pg_world - 1)))), delta[0]))
+                _if_condition_52 = cutlass.Boolean((mega_pg_rank == 0))
+                delta[0] = cutlass.Uint32(cutlass.select_(_if_condition_52, cutlass.Uint32((2147483648 - cutlass.Uint32((mega_pg_world - 1)))), delta[0]))
                 cute.arch.fence_proxy("async.global")
                 cutlass_llvm.inline_asm(
                     res=None,
@@ -553,16 +587,16 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     if (peer < mega_pg_world):
                         peer_flags = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(mega_pg_flags[peer])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                         cute.arch.atomic_add(peer_flags + 0, cutlass.Uint32(delta[0]), sem='relaxed', scope='sys')
-                _poll_50 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
-                while ((_poll_50 ^ cutlass.Uint32((old_sense0[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
-                    _poll_50 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                _poll_53 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                while ((_poll_53 ^ cutlass.Uint32((old_sense0[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
+                    _poll_53 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
                 cute.arch.fence_proxy("async.global")
                 cute.arch.atomic_add(publication_visible + 0, cutlass.Uint32(1), sem='release', scope='gpu')
         if ((bid != 0) & (warp == 0)):
             if prims.elect_sync():
-                _poll_51 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
-                while ((_poll_51 ^ cutlass.Uint32((old_sense0[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
-                    _poll_51 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                _poll_54 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                while ((_poll_54 ^ cutlass.Uint32((old_sense0[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
+                    _poll_54 = cutlass.Uint32(prims.load_ext(rank_flags + 0, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
                 cute.arch.fence_proxy("async.global")
         prims.barrier_cta_sync(12, thread_count=384)
         source_rank = cutlass.Int32((bid % 16))
@@ -585,83 +619,83 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert[0] = cutlass.Int32(cute.make_tensor(remote_ids, _flat_layout)[source_route_lane])
                 route_weight_lane[0] = cutlass.Float32(cute.make_tensor(remote_weights, _flat_layout)[source_route_lane])
-                _if_condition_52 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane[0] = cutlass.Int32(cutlass.select_(_if_condition_52, cutlass.Int32(1), owned_lane[0]))
+                _if_condition_55 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane[0] = cutlass.Int32(cutlass.select_(_if_condition_55, cutlass.Int32(1), owned_lane[0]))
             any_owned = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned != 0):
                 source_words = remote_hidden_words + (source_token * 1536)
-                _gmem_load_into_packed_addr_53 = cute.recast_ptr(source_words + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_54 = prims.load_ext(_gmem_load_into_packed_addr_53 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[0] = cutlass.Uint32(_gmem_load_into_packed_54[0])
-                row_words[1] = cutlass.Uint32(_gmem_load_into_packed_54[1])
-                row_words[2] = cutlass.Uint32(_gmem_load_into_packed_54[2])
-                row_words[3] = cutlass.Uint32(_gmem_load_into_packed_54[3])
-                _gmem_load_into_packed_addr_55 = cute.recast_ptr(source_words + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_56 = prims.load_ext(_gmem_load_into_packed_addr_55 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_56[0])
-                row_words[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_56[1])
-                row_words[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_56[2])
-                row_words[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_56[3])
-                _gmem_load_into_packed_addr_57 = cute.recast_ptr(source_words + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_58 = prims.load_ext(_gmem_load_into_packed_addr_57 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_58[0])
-                row_words[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_58[1])
-                row_words[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_58[2])
-                row_words[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_58[3])
-                _gmem_load_into_packed_addr_59 = cute.recast_ptr(source_words + ((lane + 96) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_60 = prims.load_ext(_gmem_load_into_packed_addr_59 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_60[0])
-                row_words[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_60[1])
-                row_words[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_60[2])
-                row_words[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_60[3])
-                _gmem_load_into_packed_addr_61 = cute.recast_ptr(source_words + ((lane + 128) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_62 = prims.load_ext(_gmem_load_into_packed_addr_61 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_62[0])
-                row_words[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_62[1])
-                row_words[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_62[2])
-                row_words[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_62[3])
-                _gmem_load_into_packed_addr_63 = cute.recast_ptr(source_words + ((lane + 160) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_64 = prims.load_ext(_gmem_load_into_packed_addr_63 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_64[0])
-                row_words[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_64[1])
-                row_words[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_64[2])
-                row_words[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_64[3])
-                _gmem_load_into_packed_addr_65 = cute.recast_ptr(source_words + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_66 = prims.load_ext(_gmem_load_into_packed_addr_65 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(24) + 0] = cutlass.Uint32(_gmem_load_into_packed_66[0])
-                row_words[(24) + 1] = cutlass.Uint32(_gmem_load_into_packed_66[1])
-                row_words[(24) + 2] = cutlass.Uint32(_gmem_load_into_packed_66[2])
-                row_words[(24) + 3] = cutlass.Uint32(_gmem_load_into_packed_66[3])
-                _gmem_load_into_packed_addr_67 = cute.recast_ptr(source_words + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_68 = prims.load_ext(_gmem_load_into_packed_addr_67 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(28) + 0] = cutlass.Uint32(_gmem_load_into_packed_68[0])
-                row_words[(28) + 1] = cutlass.Uint32(_gmem_load_into_packed_68[1])
-                row_words[(28) + 2] = cutlass.Uint32(_gmem_load_into_packed_68[2])
-                row_words[(28) + 3] = cutlass.Uint32(_gmem_load_into_packed_68[3])
-                _gmem_load_into_packed_addr_69 = cute.recast_ptr(source_words + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_70 = prims.load_ext(_gmem_load_into_packed_addr_69 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(32) + 0] = cutlass.Uint32(_gmem_load_into_packed_70[0])
-                row_words[(32) + 1] = cutlass.Uint32(_gmem_load_into_packed_70[1])
-                row_words[(32) + 2] = cutlass.Uint32(_gmem_load_into_packed_70[2])
-                row_words[(32) + 3] = cutlass.Uint32(_gmem_load_into_packed_70[3])
-                _gmem_load_into_packed_addr_71 = cute.recast_ptr(source_words + ((lane + 288) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_72 = prims.load_ext(_gmem_load_into_packed_addr_71 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(36) + 0] = cutlass.Uint32(_gmem_load_into_packed_72[0])
-                row_words[(36) + 1] = cutlass.Uint32(_gmem_load_into_packed_72[1])
-                row_words[(36) + 2] = cutlass.Uint32(_gmem_load_into_packed_72[2])
-                row_words[(36) + 3] = cutlass.Uint32(_gmem_load_into_packed_72[3])
-                _gmem_load_into_packed_addr_73 = cute.recast_ptr(source_words + ((lane + 320) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_74 = prims.load_ext(_gmem_load_into_packed_addr_73 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(40) + 0] = cutlass.Uint32(_gmem_load_into_packed_74[0])
-                row_words[(40) + 1] = cutlass.Uint32(_gmem_load_into_packed_74[1])
-                row_words[(40) + 2] = cutlass.Uint32(_gmem_load_into_packed_74[2])
-                row_words[(40) + 3] = cutlass.Uint32(_gmem_load_into_packed_74[3])
-                _gmem_load_into_packed_addr_75 = cute.recast_ptr(source_words + ((lane + 352) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_76 = prims.load_ext(_gmem_load_into_packed_addr_75 + 0, dtype=cutlass.Uint32, count=4)
-                row_words[(44) + 0] = cutlass.Uint32(_gmem_load_into_packed_76[0])
-                row_words[(44) + 1] = cutlass.Uint32(_gmem_load_into_packed_76[1])
-                row_words[(44) + 2] = cutlass.Uint32(_gmem_load_into_packed_76[2])
-                row_words[(44) + 3] = cutlass.Uint32(_gmem_load_into_packed_76[3])
+                _gmem_load_into_packed_addr_56 = cute.recast_ptr(source_words + (lane * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_57 = prims.load_ext(_gmem_load_into_packed_addr_56 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[0] = cutlass.Uint32(_gmem_load_into_packed_57[0])
+                row_words[1] = cutlass.Uint32(_gmem_load_into_packed_57[1])
+                row_words[2] = cutlass.Uint32(_gmem_load_into_packed_57[2])
+                row_words[3] = cutlass.Uint32(_gmem_load_into_packed_57[3])
+                _gmem_load_into_packed_addr_58 = cute.recast_ptr(source_words + ((lane + 32) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_59 = prims.load_ext(_gmem_load_into_packed_addr_58 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_59[0])
+                row_words[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_59[1])
+                row_words[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_59[2])
+                row_words[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_59[3])
+                _gmem_load_into_packed_addr_60 = cute.recast_ptr(source_words + ((lane + 64) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_61 = prims.load_ext(_gmem_load_into_packed_addr_60 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_61[0])
+                row_words[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_61[1])
+                row_words[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_61[2])
+                row_words[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_61[3])
+                _gmem_load_into_packed_addr_62 = cute.recast_ptr(source_words + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_63 = prims.load_ext(_gmem_load_into_packed_addr_62 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_63[0])
+                row_words[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_63[1])
+                row_words[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_63[2])
+                row_words[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_63[3])
+                _gmem_load_into_packed_addr_64 = cute.recast_ptr(source_words + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_65 = prims.load_ext(_gmem_load_into_packed_addr_64 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_65[0])
+                row_words[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_65[1])
+                row_words[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_65[2])
+                row_words[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_65[3])
+                _gmem_load_into_packed_addr_66 = cute.recast_ptr(source_words + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_67 = prims.load_ext(_gmem_load_into_packed_addr_66 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_67[0])
+                row_words[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_67[1])
+                row_words[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_67[2])
+                row_words[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_67[3])
+                _gmem_load_into_packed_addr_68 = cute.recast_ptr(source_words + ((lane + 192) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_69 = prims.load_ext(_gmem_load_into_packed_addr_68 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(24) + 0] = cutlass.Uint32(_gmem_load_into_packed_69[0])
+                row_words[(24) + 1] = cutlass.Uint32(_gmem_load_into_packed_69[1])
+                row_words[(24) + 2] = cutlass.Uint32(_gmem_load_into_packed_69[2])
+                row_words[(24) + 3] = cutlass.Uint32(_gmem_load_into_packed_69[3])
+                _gmem_load_into_packed_addr_70 = cute.recast_ptr(source_words + ((lane + 224) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_71 = prims.load_ext(_gmem_load_into_packed_addr_70 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(28) + 0] = cutlass.Uint32(_gmem_load_into_packed_71[0])
+                row_words[(28) + 1] = cutlass.Uint32(_gmem_load_into_packed_71[1])
+                row_words[(28) + 2] = cutlass.Uint32(_gmem_load_into_packed_71[2])
+                row_words[(28) + 3] = cutlass.Uint32(_gmem_load_into_packed_71[3])
+                _gmem_load_into_packed_addr_72 = cute.recast_ptr(source_words + ((lane + 256) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_73 = prims.load_ext(_gmem_load_into_packed_addr_72 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(32) + 0] = cutlass.Uint32(_gmem_load_into_packed_73[0])
+                row_words[(32) + 1] = cutlass.Uint32(_gmem_load_into_packed_73[1])
+                row_words[(32) + 2] = cutlass.Uint32(_gmem_load_into_packed_73[2])
+                row_words[(32) + 3] = cutlass.Uint32(_gmem_load_into_packed_73[3])
+                _gmem_load_into_packed_addr_74 = cute.recast_ptr(source_words + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_75 = prims.load_ext(_gmem_load_into_packed_addr_74 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(36) + 0] = cutlass.Uint32(_gmem_load_into_packed_75[0])
+                row_words[(36) + 1] = cutlass.Uint32(_gmem_load_into_packed_75[1])
+                row_words[(36) + 2] = cutlass.Uint32(_gmem_load_into_packed_75[2])
+                row_words[(36) + 3] = cutlass.Uint32(_gmem_load_into_packed_75[3])
+                _gmem_load_into_packed_addr_76 = cute.recast_ptr(source_words + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_77 = prims.load_ext(_gmem_load_into_packed_addr_76 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(40) + 0] = cutlass.Uint32(_gmem_load_into_packed_77[0])
+                row_words[(40) + 1] = cutlass.Uint32(_gmem_load_into_packed_77[1])
+                row_words[(40) + 2] = cutlass.Uint32(_gmem_load_into_packed_77[2])
+                row_words[(40) + 3] = cutlass.Uint32(_gmem_load_into_packed_77[3])
+                _gmem_load_into_packed_addr_78 = cute.recast_ptr(source_words + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_79 = prims.load_ext(_gmem_load_into_packed_addr_78 + 0, dtype=cutlass.Uint32, count=4)
+                row_words[(44) + 0] = cutlass.Uint32(_gmem_load_into_packed_79[0])
+                row_words[(44) + 1] = cutlass.Uint32(_gmem_load_into_packed_79[1])
+                row_words[(44) + 2] = cutlass.Uint32(_gmem_load_into_packed_79[2])
+                row_words[(44) + 3] = cutlass.Uint32(_gmem_load_into_packed_79[3])
                 if (owned_lane[0] != 0):
                     local_expert_lane = cutlass.Int32((global_expert[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add = cute.arch.atomic_add(route_counts_u32 + local_expert_lane, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -675,30 +709,30 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index = cute.arch.shuffle_sync(row_index_lane[0], route_slot, mask=4294967295, mask_and_clamp=31)
                     if (row_index >= 0):
                         row_dst = activation_words + (row_index * 1536)
-                        _gmem_store_bits_77 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[0]), cutlass.Uint32(row_words[1]), cutlass.Uint32(row_words[2]), cutlass.Uint32(row_words[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_77.ir_value(), row_dst + (lane * 4))
-                        _gmem_store_bits_78 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(4) + 0]), cutlass.Uint32(row_words[(4) + 1]), cutlass.Uint32(row_words[(4) + 2]), cutlass.Uint32(row_words[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_78.ir_value(), row_dst + ((lane + 32) * 4))
-                        _gmem_store_bits_79 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(8) + 0]), cutlass.Uint32(row_words[(8) + 1]), cutlass.Uint32(row_words[(8) + 2]), cutlass.Uint32(row_words[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_79.ir_value(), row_dst + ((lane + 64) * 4))
-                        _gmem_store_bits_80 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(12) + 0]), cutlass.Uint32(row_words[(12) + 1]), cutlass.Uint32(row_words[(12) + 2]), cutlass.Uint32(row_words[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_80.ir_value(), row_dst + ((lane + 96) * 4))
-                        _gmem_store_bits_81 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(16) + 0]), cutlass.Uint32(row_words[(16) + 1]), cutlass.Uint32(row_words[(16) + 2]), cutlass.Uint32(row_words[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_81.ir_value(), row_dst + ((lane + 128) * 4))
-                        _gmem_store_bits_82 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(20) + 0]), cutlass.Uint32(row_words[(20) + 1]), cutlass.Uint32(row_words[(20) + 2]), cutlass.Uint32(row_words[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_82.ir_value(), row_dst + ((lane + 160) * 4))
-                        _gmem_store_bits_83 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(24) + 0]), cutlass.Uint32(row_words[(24) + 1]), cutlass.Uint32(row_words[(24) + 2]), cutlass.Uint32(row_words[(24) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_83.ir_value(), row_dst + ((lane + 192) * 4))
-                        _gmem_store_bits_84 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(28) + 0]), cutlass.Uint32(row_words[(28) + 1]), cutlass.Uint32(row_words[(28) + 2]), cutlass.Uint32(row_words[(28) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_84.ir_value(), row_dst + ((lane + 224) * 4))
-                        _gmem_store_bits_85 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(32) + 0]), cutlass.Uint32(row_words[(32) + 1]), cutlass.Uint32(row_words[(32) + 2]), cutlass.Uint32(row_words[(32) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_85.ir_value(), row_dst + ((lane + 256) * 4))
-                        _gmem_store_bits_86 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(36) + 0]), cutlass.Uint32(row_words[(36) + 1]), cutlass.Uint32(row_words[(36) + 2]), cutlass.Uint32(row_words[(36) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_86.ir_value(), row_dst + ((lane + 288) * 4))
-                        _gmem_store_bits_87 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(40) + 0]), cutlass.Uint32(row_words[(40) + 1]), cutlass.Uint32(row_words[(40) + 2]), cutlass.Uint32(row_words[(40) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_87.ir_value(), row_dst + ((lane + 320) * 4))
-                        _gmem_store_bits_88 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(44) + 0]), cutlass.Uint32(row_words[(44) + 1]), cutlass.Uint32(row_words[(44) + 2]), cutlass.Uint32(row_words[(44) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_88.ir_value(), row_dst + ((lane + 352) * 4))
+                        _gmem_store_bits_80 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[0]), cutlass.Uint32(row_words[1]), cutlass.Uint32(row_words[2]), cutlass.Uint32(row_words[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_80.ir_value(), row_dst + (lane * 4))
+                        _gmem_store_bits_81 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(4) + 0]), cutlass.Uint32(row_words[(4) + 1]), cutlass.Uint32(row_words[(4) + 2]), cutlass.Uint32(row_words[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_81.ir_value(), row_dst + ((lane + 32) * 4))
+                        _gmem_store_bits_82 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(8) + 0]), cutlass.Uint32(row_words[(8) + 1]), cutlass.Uint32(row_words[(8) + 2]), cutlass.Uint32(row_words[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_82.ir_value(), row_dst + ((lane + 64) * 4))
+                        _gmem_store_bits_83 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(12) + 0]), cutlass.Uint32(row_words[(12) + 1]), cutlass.Uint32(row_words[(12) + 2]), cutlass.Uint32(row_words[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_83.ir_value(), row_dst + ((lane + 96) * 4))
+                        _gmem_store_bits_84 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(16) + 0]), cutlass.Uint32(row_words[(16) + 1]), cutlass.Uint32(row_words[(16) + 2]), cutlass.Uint32(row_words[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_84.ir_value(), row_dst + ((lane + 128) * 4))
+                        _gmem_store_bits_85 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(20) + 0]), cutlass.Uint32(row_words[(20) + 1]), cutlass.Uint32(row_words[(20) + 2]), cutlass.Uint32(row_words[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_85.ir_value(), row_dst + ((lane + 160) * 4))
+                        _gmem_store_bits_86 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(24) + 0]), cutlass.Uint32(row_words[(24) + 1]), cutlass.Uint32(row_words[(24) + 2]), cutlass.Uint32(row_words[(24) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_86.ir_value(), row_dst + ((lane + 192) * 4))
+                        _gmem_store_bits_87 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(28) + 0]), cutlass.Uint32(row_words[(28) + 1]), cutlass.Uint32(row_words[(28) + 2]), cutlass.Uint32(row_words[(28) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_87.ir_value(), row_dst + ((lane + 224) * 4))
+                        _gmem_store_bits_88 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(32) + 0]), cutlass.Uint32(row_words[(32) + 1]), cutlass.Uint32(row_words[(32) + 2]), cutlass.Uint32(row_words[(32) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_88.ir_value(), row_dst + ((lane + 256) * 4))
+                        _gmem_store_bits_89 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(36) + 0]), cutlass.Uint32(row_words[(36) + 1]), cutlass.Uint32(row_words[(36) + 2]), cutlass.Uint32(row_words[(36) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_89.ir_value(), row_dst + ((lane + 288) * 4))
+                        _gmem_store_bits_90 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(40) + 0]), cutlass.Uint32(row_words[(40) + 1]), cutlass.Uint32(row_words[(40) + 2]), cutlass.Uint32(row_words[(40) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_90.ir_value(), row_dst + ((lane + 320) * 4))
+                        _gmem_store_bits_91 = cutlass.Vector.from_elements([cutlass.Uint32(row_words[(44) + 0]), cutlass.Uint32(row_words[(44) + 1]), cutlass.Uint32(row_words[(44) + 2]), cutlass.Uint32(row_words[(44) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_91.ir_value(), row_dst + ((lane + 352) * 4))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -712,12 +746,12 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         if ((bid == 0) & (warp == 0)):
             if prims.elect_sync():
                 delta_1[0] = cutlass.Uint32(1)
-                _if_condition_89 = cutlass.Boolean((mega_pg_rank == 0))
-                delta_1[0] = cutlass.Uint32(cutlass.select_(_if_condition_89, cutlass.Uint32((2147483648 - cutlass.Uint32((mega_pg_world - 1)))), delta_1[0]))
+                _if_condition_92 = cutlass.Boolean((mega_pg_rank == 0))
+                delta_1[0] = cutlass.Uint32(cutlass.select_(_if_condition_92, cutlass.Uint32((2147483648 - cutlass.Uint32((mega_pg_world - 1)))), delta_1[0]))
                 cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.acq_rel, syncscope=None)
-                for peer_1 in cutlass.range_constexpr(0, 16, 1):
-                    if (peer_1 < mega_pg_world):
-                        peer_flags_1 = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(mega_pg_flags[peer_1])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                for peer_5 in cutlass.range_constexpr(0, 16, 1):
+                    if (peer_5 < mega_pg_world):
+                        peer_flags_1 = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(mega_pg_flags[peer_5])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                         cute.arch.atomic_add(peer_flags_1 + 1, cutlass.Uint32(delta_1[0]), sem='relaxed', scope='sys')
         acc_stage[0] = cutlass.Uint32(0)
         _phase_acc_full[0] = cutlass.Uint32(0)
@@ -743,15 +777,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         feature_base = cutlass.Int32((((weight_m_tile * 128) + (cta_rank * 64)) + (warp * 16)))
                         half_ptr = cutlass.Int32(warp_row_ptr)
                         _tmem_load_0 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_90_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_90_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_90_dst = cute.make_tensor(_tmem_load_0.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_90_atom, _tmem_load_90_src, _tmem_load_90_dst)
+                        _tmem_load_93_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_93_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_93_dst = cute.make_tensor(_tmem_load_0.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_93_atom, _tmem_load_93_src, _tmem_load_93_dst)
                         _tmem_load_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_91_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_91_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_91_dst = cute.make_tensor(_tmem_load_1.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_91_atom, _tmem_load_91_src, _tmem_load_91_dst)
+                        _tmem_load_94_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_94_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_94_dst = cute.make_tensor(_tmem_load_1.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_94_atom, _tmem_load_94_src, _tmem_load_94_dst)
                         cute.arch.fence_view_async_tmem_load()
                         folded = cute.make_rmem_tensor((16,), cutlass.Float32)
                         for pair_idx in cutlass.range_constexpr(0, 8, 1):
@@ -790,29 +824,29 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         r1[13] = cutlass.Float32(folded[13])
                         r1[14] = cutlass.Float32(folded[7])
                         r1[15] = cutlass.Float32(folded[15])
-                        _tmem_store_raw_92 = cutlass.Vector.from_elements([cutlass.Float32(r1[0]), cutlass.Float32(r1[(0 + 1)]), cutlass.Float32(r1[(0 + 2)]), cutlass.Float32(r1[(0 + 3)]), cutlass.Float32(r1[(0 + 4)]), cutlass.Float32(r1[(0 + 5)]), cutlass.Float32(r1[(0 + 6)]), cutlass.Float32(r1[(0 + 7)]), cutlass.Float32(r1[(0 + 8)]), cutlass.Float32(r1[(0 + 9)]), cutlass.Float32(r1[(0 + 10)]), cutlass.Float32(r1[(0 + 11)]), cutlass.Float32(r1[(0 + 12)]), cutlass.Float32(r1[(0 + 13)]), cutlass.Float32(r1[(0 + 14)]), cutlass.Float32(r1[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_92)
+                        _tmem_store_raw_95 = cutlass.Vector.from_elements([cutlass.Float32(r1[0]), cutlass.Float32(r1[(0 + 1)]), cutlass.Float32(r1[(0 + 2)]), cutlass.Float32(r1[(0 + 3)]), cutlass.Float32(r1[(0 + 4)]), cutlass.Float32(r1[(0 + 5)]), cutlass.Float32(r1[(0 + 6)]), cutlass.Float32(r1[(0 + 7)]), cutlass.Float32(r1[(0 + 8)]), cutlass.Float32(r1[(0 + 9)]), cutlass.Float32(r1[(0 + 10)]), cutlass.Float32(r1[(0 + 11)]), cutlass.Float32(r1[(0 + 12)]), cutlass.Float32(r1[(0 + 13)]), cutlass.Float32(r1[(0 + 14)]), cutlass.Float32(r1[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_95)
                         cute.arch.fence_view_async_tmem_store()
                         tmem_load = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_93_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_93_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_93_dst = cute.make_tensor(tmem_load.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_93_atom, _tmem_load_93_src, _tmem_load_93_dst)
+                        _tmem_load_96_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_96_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_96_dst = cute.make_tensor(tmem_load.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_96_atom, _tmem_load_96_src, _tmem_load_96_dst)
                         cute.arch.fence_view_async_tmem_load()
-                        _tmem_store_raw_94 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load[0]), cutlass.Float32(tmem_load[(0 + 1)]), cutlass.Float32(tmem_load[(0 + 2)]), cutlass.Float32(tmem_load[(0 + 3)]), cutlass.Float32(tmem_load[(0 + 4)]), cutlass.Float32(tmem_load[(0 + 5)]), cutlass.Float32(tmem_load[(0 + 6)]), cutlass.Float32(tmem_load[(0 + 7)]), cutlass.Float32(tmem_load[(0 + 8)]), cutlass.Float32(tmem_load[(0 + 9)]), cutlass.Float32(tmem_load[(0 + 10)]), cutlass.Float32(tmem_load[(0 + 11)]), cutlass.Float32(tmem_load[(0 + 12)]), cutlass.Float32(tmem_load[(0 + 13)]), cutlass.Float32(tmem_load[(0 + 14)]), cutlass.Float32(tmem_load[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_94)
+                        _tmem_store_raw_97 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load[0]), cutlass.Float32(tmem_load[(0 + 1)]), cutlass.Float32(tmem_load[(0 + 2)]), cutlass.Float32(tmem_load[(0 + 3)]), cutlass.Float32(tmem_load[(0 + 4)]), cutlass.Float32(tmem_load[(0 + 5)]), cutlass.Float32(tmem_load[(0 + 6)]), cutlass.Float32(tmem_load[(0 + 7)]), cutlass.Float32(tmem_load[(0 + 8)]), cutlass.Float32(tmem_load[(0 + 9)]), cutlass.Float32(tmem_load[(0 + 10)]), cutlass.Float32(tmem_load[(0 + 11)]), cutlass.Float32(tmem_load[(0 + 12)]), cutlass.Float32(tmem_load[(0 + 13)]), cutlass.Float32(tmem_load[(0 + 14)]), cutlass.Float32(tmem_load[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_97)
                         cute.arch.fence_view_async_tmem_store()
                         r3_raw = cute.make_rmem_tensor((16,), cutlass.Float32)
                         tmem_load_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_95_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                        _tmem_load_95_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_95_dst = cute.make_tensor(tmem_load_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_95_atom, _tmem_load_95_src, _tmem_load_95_dst)
+                        _tmem_load_98_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                        _tmem_load_98_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_98_dst = cute.make_tensor(tmem_load_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_98_atom, _tmem_load_98_src, _tmem_load_98_dst)
                         tmem_load_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_96_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                        _tmem_load_96_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_96_dst = cute.make_tensor(tmem_load_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_96_atom, _tmem_load_96_src, _tmem_load_96_dst)
+                        _tmem_load_99_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                        _tmem_load_99_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_99_dst = cute.make_tensor(tmem_load_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_99_atom, _tmem_load_99_src, _tmem_load_99_dst)
                         cute.arch.fence_view_async_tmem_load()
                         for elem_1 in cutlass.range_constexpr(0, 8, 1):
                             r3_raw[elem_1] = cutlass.Float32(tmem_load_1[elem_1])
@@ -834,20 +868,20 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         r3[13] = cutlass.Float32(r3_raw[11])
                         r3[14] = cutlass.Float32(r3_raw[14])
                         r3[15] = cutlass.Float32(r3_raw[15])
-                        _tmem_store_raw_97 = cutlass.Vector.from_elements([cutlass.Float32(r3[0]), cutlass.Float32(r3[(0 + 1)]), cutlass.Float32(r3[(0 + 2)]), cutlass.Float32(r3[(0 + 3)]), cutlass.Float32(r3[(0 + 4)]), cutlass.Float32(r3[(0 + 5)]), cutlass.Float32(r3[(0 + 6)]), cutlass.Float32(r3[(0 + 7)]), cutlass.Float32(r3[(0 + 8)]), cutlass.Float32(r3[(0 + 9)]), cutlass.Float32(r3[(0 + 10)]), cutlass.Float32(r3[(0 + 11)]), cutlass.Float32(r3[(0 + 12)]), cutlass.Float32(r3[(0 + 13)]), cutlass.Float32(r3[(0 + 14)]), cutlass.Float32(r3[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_97)
+                        _tmem_store_raw_100 = cutlass.Vector.from_elements([cutlass.Float32(r3[0]), cutlass.Float32(r3[(0 + 1)]), cutlass.Float32(r3[(0 + 2)]), cutlass.Float32(r3[(0 + 3)]), cutlass.Float32(r3[(0 + 4)]), cutlass.Float32(r3[(0 + 5)]), cutlass.Float32(r3[(0 + 6)]), cutlass.Float32(r3[(0 + 7)]), cutlass.Float32(r3[(0 + 8)]), cutlass.Float32(r3[(0 + 9)]), cutlass.Float32(r3[(0 + 10)]), cutlass.Float32(r3[(0 + 11)]), cutlass.Float32(r3[(0 + 12)]), cutlass.Float32(r3[(0 + 13)]), cutlass.Float32(r3[(0 + 14)]), cutlass.Float32(r3[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(half_ptr), cutlass.Int32), _tmem_store_raw_100)
                         cute.arch.fence_view_async_tmem_store()
                         r4_raw = cute.make_rmem_tensor((16,), cutlass.Float32)
                         tmem_load_3 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_98_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                        _tmem_load_98_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_98_dst = cute.make_tensor(tmem_load_3.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_98_atom, _tmem_load_98_src, _tmem_load_98_dst)
+                        _tmem_load_101_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                        _tmem_load_101_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(half_ptr), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_101_dst = cute.make_tensor(tmem_load_3.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_101_atom, _tmem_load_101_src, _tmem_load_101_dst)
                         tmem_load_4 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_99_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                        _tmem_load_99_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_99_dst = cute.make_tensor(tmem_load_4.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_99_atom, _tmem_load_99_src, _tmem_load_99_dst)
+                        _tmem_load_102_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                        _tmem_load_102_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((half_ptr + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_102_dst = cute.make_tensor(tmem_load_4.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_102_atom, _tmem_load_102_src, _tmem_load_102_dst)
                         cute.arch.fence_view_async_tmem_load()
                         for elem_2 in cutlass.range_constexpr(0, 8, 1):
                             r4_raw[elem_2] = cutlass.Float32(tmem_load_3[elem_2])
@@ -883,77 +917,77 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             for element in cutlass.range_constexpr(0, 16, 1):
                                 scaled[element] = cutlass.Float32(0.0)
                         _packed_6 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-                        _bf16_pack_100 = prims.cvt_packfloat_f32(scaled[1], scaled[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[0] = cutlass.Uint32(_bf16_pack_100)
-                        _bf16_pack_101 = prims.cvt_packfloat_f32(scaled[3], scaled[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[1] = cutlass.Uint32(_bf16_pack_101)
-                        _bf16_pack_102 = prims.cvt_packfloat_f32(scaled[5], scaled[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[2] = cutlass.Uint32(_bf16_pack_102)
-                        _bf16_pack_103 = prims.cvt_packfloat_f32(scaled[7], scaled[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[3] = cutlass.Uint32(_bf16_pack_103)
-                        _bf16_pack_104 = prims.cvt_packfloat_f32(scaled[9], scaled[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[4] = cutlass.Uint32(_bf16_pack_104)
-                        _bf16_pack_105 = prims.cvt_packfloat_f32(scaled[11], scaled[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[5] = cutlass.Uint32(_bf16_pack_105)
-                        _bf16_pack_106 = prims.cvt_packfloat_f32(scaled[13], scaled[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[6] = cutlass.Uint32(_bf16_pack_106)
-                        _bf16_pack_107 = prims.cvt_packfloat_f32(scaled[15], scaled[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        _packed_6[7] = cutlass.Uint32(_bf16_pack_107)
-                        _gmem_store_bits_108 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_6[0]), cutlass.Uint32(_packed_6[1]), cutlass.Uint32(_packed_6[2]), cutlass.Uint32(_packed_6[3]), cutlass.Uint32(_packed_6[4]), cutlass.Uint32(_packed_6[5]), cutlass.Uint32(_packed_6[6]), cutlass.Uint32(_packed_6[7])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_108.ir_value(), cute.recast_ptr(fc1_workspace_bf16 + ((((expert_1 * 64) + packed_token) * 5120) + feature_base), dtype=cutlass.Uint32))
+                        _bf16_pack_103 = prims.cvt_packfloat_f32(scaled[1], scaled[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[0] = cutlass.Uint32(_bf16_pack_103)
+                        _bf16_pack_104 = prims.cvt_packfloat_f32(scaled[3], scaled[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[1] = cutlass.Uint32(_bf16_pack_104)
+                        _bf16_pack_105 = prims.cvt_packfloat_f32(scaled[5], scaled[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[2] = cutlass.Uint32(_bf16_pack_105)
+                        _bf16_pack_106 = prims.cvt_packfloat_f32(scaled[7], scaled[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[3] = cutlass.Uint32(_bf16_pack_106)
+                        _bf16_pack_107 = prims.cvt_packfloat_f32(scaled[9], scaled[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[4] = cutlass.Uint32(_bf16_pack_107)
+                        _bf16_pack_108 = prims.cvt_packfloat_f32(scaled[11], scaled[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[5] = cutlass.Uint32(_bf16_pack_108)
+                        _bf16_pack_109 = prims.cvt_packfloat_f32(scaled[13], scaled[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[6] = cutlass.Uint32(_bf16_pack_109)
+                        _bf16_pack_110 = prims.cvt_packfloat_f32(scaled[15], scaled[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        _packed_6[7] = cutlass.Uint32(_bf16_pack_110)
+                        _gmem_store_bits_111 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_6[0]), cutlass.Uint32(_packed_6[1]), cutlass.Uint32(_packed_6[2]), cutlass.Uint32(_packed_6[3]), cutlass.Uint32(_packed_6[4]), cutlass.Uint32(_packed_6[5]), cutlass.Uint32(_packed_6[6]), cutlass.Uint32(_packed_6[7])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_111.ir_value(), cute.recast_ptr(fc1_workspace_bf16 + ((((expert_1 * 64) + packed_token) * 5120) + feature_base), dtype=cutlass.Uint32))
                     else:
                         warp_row_ptr_1 = cutlass.Int32(((taddr + cutlass.Uint32(acc_offset)) + cutlass.Uint32(((warp * 32) << 16))))
                         hidden_base = cutlass.Int32((((weight_m_tile * 256) + (cta_rank * 128)) + (warp * 32)))
                         hidden_lo = cute.make_rmem_tensor((8,), cutlass.Uint32)
                         hidden_hi = cute.make_rmem_tensor((8,), cutlass.Uint32)
                         _tmem_load_7 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_109_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_109_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_109_dst = cute.make_tensor(_tmem_load_7.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_109_atom, _tmem_load_109_src, _tmem_load_109_dst)
+                        _tmem_load_112_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_112_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_112_dst = cute.make_tensor(_tmem_load_7.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_112_atom, _tmem_load_112_src, _tmem_load_112_dst)
                         _tmem_load_8 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_110_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_110_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_110_dst = cute.make_tensor(_tmem_load_8.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_110_atom, _tmem_load_110_src, _tmem_load_110_dst)
+                        _tmem_load_113_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_113_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_113_dst = cute.make_tensor(_tmem_load_8.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_113_atom, _tmem_load_113_src, _tmem_load_113_dst)
                         cute.arch.fence_view_async_tmem_load()
                         casted_input = cute.make_rmem_tensor((32,), cutlass.Float32)
                         for elem_4 in cutlass.range_constexpr(0, 16, 1):
                             casted_input[elem_4] = cutlass.Float32(_tmem_load_7[elem_4])
                             casted_input[(16 + elem_4)] = cutlass.Float32(_tmem_load_8[elem_4])
                         casted_bf16 = cute.make_rmem_tensor((16,), cutlass.Uint32)
-                        _bf16_pack_111 = prims.cvt_packfloat_f32(casted_input[1], casted_input[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[0] = cutlass.Uint32(_bf16_pack_111)
-                        _bf16_pack_112 = prims.cvt_packfloat_f32(casted_input[3], casted_input[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[1] = cutlass.Uint32(_bf16_pack_112)
-                        _bf16_pack_113 = prims.cvt_packfloat_f32(casted_input[5], casted_input[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[2] = cutlass.Uint32(_bf16_pack_113)
-                        _bf16_pack_114 = prims.cvt_packfloat_f32(casted_input[7], casted_input[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[3] = cutlass.Uint32(_bf16_pack_114)
-                        _bf16_pack_115 = prims.cvt_packfloat_f32(casted_input[9], casted_input[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[4] = cutlass.Uint32(_bf16_pack_115)
-                        _bf16_pack_116 = prims.cvt_packfloat_f32(casted_input[11], casted_input[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[5] = cutlass.Uint32(_bf16_pack_116)
-                        _bf16_pack_117 = prims.cvt_packfloat_f32(casted_input[13], casted_input[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[6] = cutlass.Uint32(_bf16_pack_117)
-                        _bf16_pack_118 = prims.cvt_packfloat_f32(casted_input[15], casted_input[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[7] = cutlass.Uint32(_bf16_pack_118)
-                        _bf16_pack_119 = prims.cvt_packfloat_f32(casted_input[17], casted_input[16], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[8] = cutlass.Uint32(_bf16_pack_119)
-                        _bf16_pack_120 = prims.cvt_packfloat_f32(casted_input[19], casted_input[18], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[9] = cutlass.Uint32(_bf16_pack_120)
-                        _bf16_pack_121 = prims.cvt_packfloat_f32(casted_input[21], casted_input[20], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[10] = cutlass.Uint32(_bf16_pack_121)
-                        _bf16_pack_122 = prims.cvt_packfloat_f32(casted_input[23], casted_input[22], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[11] = cutlass.Uint32(_bf16_pack_122)
-                        _bf16_pack_123 = prims.cvt_packfloat_f32(casted_input[25], casted_input[24], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[12] = cutlass.Uint32(_bf16_pack_123)
-                        _bf16_pack_124 = prims.cvt_packfloat_f32(casted_input[27], casted_input[26], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[13] = cutlass.Uint32(_bf16_pack_124)
-                        _bf16_pack_125 = prims.cvt_packfloat_f32(casted_input[29], casted_input[28], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[14] = cutlass.Uint32(_bf16_pack_125)
-                        _bf16_pack_126 = prims.cvt_packfloat_f32(casted_input[31], casted_input[30], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                        casted_bf16[15] = cutlass.Uint32(_bf16_pack_126)
+                        _bf16_pack_114 = prims.cvt_packfloat_f32(casted_input[1], casted_input[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[0] = cutlass.Uint32(_bf16_pack_114)
+                        _bf16_pack_115 = prims.cvt_packfloat_f32(casted_input[3], casted_input[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[1] = cutlass.Uint32(_bf16_pack_115)
+                        _bf16_pack_116 = prims.cvt_packfloat_f32(casted_input[5], casted_input[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[2] = cutlass.Uint32(_bf16_pack_116)
+                        _bf16_pack_117 = prims.cvt_packfloat_f32(casted_input[7], casted_input[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[3] = cutlass.Uint32(_bf16_pack_117)
+                        _bf16_pack_118 = prims.cvt_packfloat_f32(casted_input[9], casted_input[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[4] = cutlass.Uint32(_bf16_pack_118)
+                        _bf16_pack_119 = prims.cvt_packfloat_f32(casted_input[11], casted_input[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[5] = cutlass.Uint32(_bf16_pack_119)
+                        _bf16_pack_120 = prims.cvt_packfloat_f32(casted_input[13], casted_input[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[6] = cutlass.Uint32(_bf16_pack_120)
+                        _bf16_pack_121 = prims.cvt_packfloat_f32(casted_input[15], casted_input[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[7] = cutlass.Uint32(_bf16_pack_121)
+                        _bf16_pack_122 = prims.cvt_packfloat_f32(casted_input[17], casted_input[16], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[8] = cutlass.Uint32(_bf16_pack_122)
+                        _bf16_pack_123 = prims.cvt_packfloat_f32(casted_input[19], casted_input[18], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[9] = cutlass.Uint32(_bf16_pack_123)
+                        _bf16_pack_124 = prims.cvt_packfloat_f32(casted_input[21], casted_input[20], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[10] = cutlass.Uint32(_bf16_pack_124)
+                        _bf16_pack_125 = prims.cvt_packfloat_f32(casted_input[23], casted_input[22], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[11] = cutlass.Uint32(_bf16_pack_125)
+                        _bf16_pack_126 = prims.cvt_packfloat_f32(casted_input[25], casted_input[24], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[12] = cutlass.Uint32(_bf16_pack_126)
+                        _bf16_pack_127 = prims.cvt_packfloat_f32(casted_input[27], casted_input[26], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[13] = cutlass.Uint32(_bf16_pack_127)
+                        _bf16_pack_128 = prims.cvt_packfloat_f32(casted_input[29], casted_input[28], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[14] = cutlass.Uint32(_bf16_pack_128)
+                        _bf16_pack_129 = prims.cvt_packfloat_f32(casted_input[31], casted_input[30], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                        casted_bf16[15] = cutlass.Uint32(_bf16_pack_129)
                         packed = cute.make_rmem_tensor((16,), cutlass.Float32)
                         for pair in cutlass.range_constexpr(0, 8, 1):
                             _prmt = prims_nvvm.prmt(cutlass.Uint32(casted_bf16[pair]), cutlass.Uint32(21520), prims_nvvm.PermuteMode.DEFAULT, hi=cutlass.Uint32(casted_bf16[(8 + pair)])).bitcast(cutlass.Uint32)
@@ -978,29 +1012,29 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         r1_1[13] = cutlass.Float32(packed[13])
                         r1_1[14] = cutlass.Float32(packed[7])
                         r1_1[15] = cutlass.Float32(packed[15])
-                        _tmem_store_raw_127 = cutlass.Vector.from_elements([cutlass.Float32(r1_1[0]), cutlass.Float32(r1_1[(0 + 1)]), cutlass.Float32(r1_1[(0 + 2)]), cutlass.Float32(r1_1[(0 + 3)]), cutlass.Float32(r1_1[(0 + 4)]), cutlass.Float32(r1_1[(0 + 5)]), cutlass.Float32(r1_1[(0 + 6)]), cutlass.Float32(r1_1[(0 + 7)]), cutlass.Float32(r1_1[(0 + 8)]), cutlass.Float32(r1_1[(0 + 9)]), cutlass.Float32(r1_1[(0 + 10)]), cutlass.Float32(r1_1[(0 + 11)]), cutlass.Float32(r1_1[(0 + 12)]), cutlass.Float32(r1_1[(0 + 13)]), cutlass.Float32(r1_1[(0 + 14)]), cutlass.Float32(r1_1[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_127)
+                        _tmem_store_raw_130 = cutlass.Vector.from_elements([cutlass.Float32(r1_1[0]), cutlass.Float32(r1_1[(0 + 1)]), cutlass.Float32(r1_1[(0 + 2)]), cutlass.Float32(r1_1[(0 + 3)]), cutlass.Float32(r1_1[(0 + 4)]), cutlass.Float32(r1_1[(0 + 5)]), cutlass.Float32(r1_1[(0 + 6)]), cutlass.Float32(r1_1[(0 + 7)]), cutlass.Float32(r1_1[(0 + 8)]), cutlass.Float32(r1_1[(0 + 9)]), cutlass.Float32(r1_1[(0 + 10)]), cutlass.Float32(r1_1[(0 + 11)]), cutlass.Float32(r1_1[(0 + 12)]), cutlass.Float32(r1_1[(0 + 13)]), cutlass.Float32(r1_1[(0 + 14)]), cutlass.Float32(r1_1[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_130)
                         cute.arch.fence_view_async_tmem_store()
                         tmem_load_5 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                        _tmem_load_128_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                        _tmem_load_128_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                        _tmem_load_128_dst = cute.make_tensor(tmem_load_5.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                        cute.copy(_tmem_load_128_atom, _tmem_load_128_src, _tmem_load_128_dst)
+                        _tmem_load_131_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                        _tmem_load_131_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                        _tmem_load_131_dst = cute.make_tensor(tmem_load_5.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                        cute.copy(_tmem_load_131_atom, _tmem_load_131_src, _tmem_load_131_dst)
                         cute.arch.fence_view_async_tmem_load()
-                        _tmem_store_raw_129 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load_5[0]), cutlass.Float32(tmem_load_5[(0 + 1)]), cutlass.Float32(tmem_load_5[(0 + 2)]), cutlass.Float32(tmem_load_5[(0 + 3)]), cutlass.Float32(tmem_load_5[(0 + 4)]), cutlass.Float32(tmem_load_5[(0 + 5)]), cutlass.Float32(tmem_load_5[(0 + 6)]), cutlass.Float32(tmem_load_5[(0 + 7)]), cutlass.Float32(tmem_load_5[(0 + 8)]), cutlass.Float32(tmem_load_5[(0 + 9)]), cutlass.Float32(tmem_load_5[(0 + 10)]), cutlass.Float32(tmem_load_5[(0 + 11)]), cutlass.Float32(tmem_load_5[(0 + 12)]), cutlass.Float32(tmem_load_5[(0 + 13)]), cutlass.Float32(tmem_load_5[(0 + 14)]), cutlass.Float32(tmem_load_5[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_129)
+                        _tmem_store_raw_132 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load_5[0]), cutlass.Float32(tmem_load_5[(0 + 1)]), cutlass.Float32(tmem_load_5[(0 + 2)]), cutlass.Float32(tmem_load_5[(0 + 3)]), cutlass.Float32(tmem_load_5[(0 + 4)]), cutlass.Float32(tmem_load_5[(0 + 5)]), cutlass.Float32(tmem_load_5[(0 + 6)]), cutlass.Float32(tmem_load_5[(0 + 7)]), cutlass.Float32(tmem_load_5[(0 + 8)]), cutlass.Float32(tmem_load_5[(0 + 9)]), cutlass.Float32(tmem_load_5[(0 + 10)]), cutlass.Float32(tmem_load_5[(0 + 11)]), cutlass.Float32(tmem_load_5[(0 + 12)]), cutlass.Float32(tmem_load_5[(0 + 13)]), cutlass.Float32(tmem_load_5[(0 + 14)]), cutlass.Float32(tmem_load_5[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_132)
                         cute.arch.fence_view_async_tmem_store()
                         r3_raw_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
                         tmem_load_1_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_130_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                        _tmem_load_130_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_130_dst = cute.make_tensor(tmem_load_1_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_130_atom, _tmem_load_130_src, _tmem_load_130_dst)
+                        _tmem_load_133_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                        _tmem_load_133_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_133_dst = cute.make_tensor(tmem_load_1_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_133_atom, _tmem_load_133_src, _tmem_load_133_dst)
                         tmem_load_2_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_131_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                        _tmem_load_131_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_131_dst = cute.make_tensor(tmem_load_2_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_131_atom, _tmem_load_131_src, _tmem_load_131_dst)
+                        _tmem_load_134_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                        _tmem_load_134_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_134_dst = cute.make_tensor(tmem_load_2_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_134_atom, _tmem_load_134_src, _tmem_load_134_dst)
                         cute.arch.fence_view_async_tmem_load()
                         for elem_5 in cutlass.range_constexpr(0, 8, 1):
                             r3_raw_1[elem_5] = cutlass.Float32(tmem_load_1_1[elem_5])
@@ -1022,20 +1056,20 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         r3_1[13] = cutlass.Float32(r3_raw_1[11])
                         r3_1[14] = cutlass.Float32(r3_raw_1[14])
                         r3_1[15] = cutlass.Float32(r3_raw_1[15])
-                        _tmem_store_raw_132 = cutlass.Vector.from_elements([cutlass.Float32(r3_1[0]), cutlass.Float32(r3_1[(0 + 1)]), cutlass.Float32(r3_1[(0 + 2)]), cutlass.Float32(r3_1[(0 + 3)]), cutlass.Float32(r3_1[(0 + 4)]), cutlass.Float32(r3_1[(0 + 5)]), cutlass.Float32(r3_1[(0 + 6)]), cutlass.Float32(r3_1[(0 + 7)]), cutlass.Float32(r3_1[(0 + 8)]), cutlass.Float32(r3_1[(0 + 9)]), cutlass.Float32(r3_1[(0 + 10)]), cutlass.Float32(r3_1[(0 + 11)]), cutlass.Float32(r3_1[(0 + 12)]), cutlass.Float32(r3_1[(0 + 13)]), cutlass.Float32(r3_1[(0 + 14)]), cutlass.Float32(r3_1[(0 + 15)])], cutlass.Float32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_132)
+                        _tmem_store_raw_135 = cutlass.Vector.from_elements([cutlass.Float32(r3_1[0]), cutlass.Float32(r3_1[(0 + 1)]), cutlass.Float32(r3_1[(0 + 2)]), cutlass.Float32(r3_1[(0 + 3)]), cutlass.Float32(r3_1[(0 + 4)]), cutlass.Float32(r3_1[(0 + 5)]), cutlass.Float32(r3_1[(0 + 6)]), cutlass.Float32(r3_1[(0 + 7)]), cutlass.Float32(r3_1[(0 + 8)]), cutlass.Float32(r3_1[(0 + 9)]), cutlass.Float32(r3_1[(0 + 10)]), cutlass.Float32(r3_1[(0 + 11)]), cutlass.Float32(r3_1[(0 + 12)]), cutlass.Float32(r3_1[(0 + 13)]), cutlass.Float32(r3_1[(0 + 14)]), cutlass.Float32(r3_1[(0 + 15)])], cutlass.Float32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_1), cutlass.Int32), _tmem_store_raw_135)
                         cute.arch.fence_view_async_tmem_store()
                         r4_raw_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
                         tmem_load_3_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_133_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                        _tmem_load_133_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_133_dst = cute.make_tensor(tmem_load_3_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_133_atom, _tmem_load_133_src, _tmem_load_133_dst)
+                        _tmem_load_136_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                        _tmem_load_136_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_1), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_136_dst = cute.make_tensor(tmem_load_3_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_136_atom, _tmem_load_136_src, _tmem_load_136_dst)
                         tmem_load_4_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                        _tmem_load_134_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                        _tmem_load_134_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                        _tmem_load_134_dst = cute.make_tensor(tmem_load_4_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                        cute.copy(_tmem_load_134_atom, _tmem_load_134_src, _tmem_load_134_dst)
+                        _tmem_load_137_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                        _tmem_load_137_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_1 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                        _tmem_load_137_dst = cute.make_tensor(tmem_load_4_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(_tmem_load_137_atom, _tmem_load_137_src, _tmem_load_137_dst)
                         cute.arch.fence_view_async_tmem_load()
                         for elem_6 in cutlass.range_constexpr(0, 8, 1):
                             r4_raw_1[elem_6] = cutlass.Float32(tmem_load_3_1[elem_6])
@@ -1070,12 +1104,12 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             routes_per_source_1 = cutlass.Int32((tokens_per_rank * 8))
                             source_rank_0 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_route).ir_value(), cutlass.Int32(routes_per_source_1).ir_value())))
                             source_route = cutlass.Int32((global_route - (source_rank_0 * routes_per_source_1)))
-                            remote_terms = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.select_((source_rank_0) == 31, cutlass.Uint64(route_terms_bf16_peers[31]), cutlass.select_((source_rank_0) == 30, cutlass.Uint64(route_terms_bf16_peers[30]), cutlass.select_((source_rank_0) == 29, cutlass.Uint64(route_terms_bf16_peers[29]), cutlass.select_((source_rank_0) == 28, cutlass.Uint64(route_terms_bf16_peers[28]), cutlass.select_((source_rank_0) == 27, cutlass.Uint64(route_terms_bf16_peers[27]), cutlass.select_((source_rank_0) == 26, cutlass.Uint64(route_terms_bf16_peers[26]), cutlass.select_((source_rank_0) == 25, cutlass.Uint64(route_terms_bf16_peers[25]), cutlass.select_((source_rank_0) == 24, cutlass.Uint64(route_terms_bf16_peers[24]), cutlass.select_((source_rank_0) == 23, cutlass.Uint64(route_terms_bf16_peers[23]), cutlass.select_((source_rank_0) == 22, cutlass.Uint64(route_terms_bf16_peers[22]), cutlass.select_((source_rank_0) == 21, cutlass.Uint64(route_terms_bf16_peers[21]), cutlass.select_((source_rank_0) == 20, cutlass.Uint64(route_terms_bf16_peers[20]), cutlass.select_((source_rank_0) == 19, cutlass.Uint64(route_terms_bf16_peers[19]), cutlass.select_((source_rank_0) == 18, cutlass.Uint64(route_terms_bf16_peers[18]), cutlass.select_((source_rank_0) == 17, cutlass.Uint64(route_terms_bf16_peers[17]), cutlass.select_((source_rank_0) == 16, cutlass.Uint64(route_terms_bf16_peers[16]), cutlass.select_((source_rank_0) == 15, cutlass.Uint64(route_terms_bf16_peers[15]), cutlass.select_((source_rank_0) == 14, cutlass.Uint64(route_terms_bf16_peers[14]), cutlass.select_((source_rank_0) == 13, cutlass.Uint64(route_terms_bf16_peers[13]), cutlass.select_((source_rank_0) == 12, cutlass.Uint64(route_terms_bf16_peers[12]), cutlass.select_((source_rank_0) == 11, cutlass.Uint64(route_terms_bf16_peers[11]), cutlass.select_((source_rank_0) == 10, cutlass.Uint64(route_terms_bf16_peers[10]), cutlass.select_((source_rank_0) == 9, cutlass.Uint64(route_terms_bf16_peers[9]), cutlass.select_((source_rank_0) == 8, cutlass.Uint64(route_terms_bf16_peers[8]), cutlass.select_((source_rank_0) == 7, cutlass.Uint64(route_terms_bf16_peers[7]), cutlass.select_((source_rank_0) == 6, cutlass.Uint64(route_terms_bf16_peers[6]), cutlass.select_((source_rank_0) == 5, cutlass.Uint64(route_terms_bf16_peers[5]), cutlass.select_((source_rank_0) == 4, cutlass.Uint64(route_terms_bf16_peers[4]), cutlass.select_((source_rank_0) == 3, cutlass.Uint64(route_terms_bf16_peers[3]), cutlass.select_((source_rank_0) == 2, cutlass.Uint64(route_terms_bf16_peers[2]), cutlass.select_((source_rank_0) == 1, cutlass.Uint64(route_terms_bf16_peers[1]), cutlass.Uint64(route_terms_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                            remote_terms = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(48 + source_rank_0)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                             term_word = cutlass.Uint64(((cutlass.Uint64(source_route) * 1536) + cutlass.Uint64(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(hidden_base).ir_value(), cutlass.Int32(2).ir_value())))))
-                            _sys_volatile_store_128_135 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_lo[0]), cutlass.Uint32(hidden_lo[1]), cutlass.Uint32(hidden_lo[2]), cutlass.Uint32(hidden_lo[3]), cutlass.Uint32(hidden_lo[4]), cutlass.Uint32(hidden_lo[5]), cutlass.Uint32(hidden_lo[6]), cutlass.Uint32(hidden_lo[7])], cutlass.Uint32)
-                            prims.store_ext(_sys_volatile_store_128_135.ir_value(), remote_terms + term_word, order=prims.MemOrder.VOLATILE)
-                            _sys_volatile_store_128_136 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_hi[0]), cutlass.Uint32(hidden_hi[1]), cutlass.Uint32(hidden_hi[2]), cutlass.Uint32(hidden_hi[3]), cutlass.Uint32(hidden_hi[4]), cutlass.Uint32(hidden_hi[5]), cutlass.Uint32(hidden_hi[6]), cutlass.Uint32(hidden_hi[7])], cutlass.Uint32)
-                            prims.store_ext(_sys_volatile_store_128_136.ir_value(), remote_terms + (term_word + 8), order=prims.MemOrder.VOLATILE)
+                            _sys_volatile_store_128_138 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_lo[0]), cutlass.Uint32(hidden_lo[1]), cutlass.Uint32(hidden_lo[2]), cutlass.Uint32(hidden_lo[3]), cutlass.Uint32(hidden_lo[4]), cutlass.Uint32(hidden_lo[5]), cutlass.Uint32(hidden_lo[6]), cutlass.Uint32(hidden_lo[7])], cutlass.Uint32)
+                            prims.store_ext(_sys_volatile_store_128_138.ir_value(), remote_terms + term_word, order=prims.MemOrder.VOLATILE)
+                            _sys_volatile_store_128_139 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_hi[0]), cutlass.Uint32(hidden_hi[1]), cutlass.Uint32(hidden_hi[2]), cutlass.Uint32(hidden_hi[3]), cutlass.Uint32(hidden_hi[4]), cutlass.Uint32(hidden_hi[5]), cutlass.Uint32(hidden_hi[6]), cutlass.Uint32(hidden_hi[7])], cutlass.Uint32)
+                            prims.store_ext(_sys_volatile_store_128_139.ir_value(), remote_terms + (term_word + 8), order=prims.MemOrder.VOLATILE)
                     prims.tcgen05_fence('before_thread_sync')
                     prims.barrier_cta_sync(4, thread_count=128)
                     prims.tcgen05_fence('after_thread_sync')
@@ -1092,15 +1126,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         if (phase == 0):
                             feature_base_1 = cutlass.Int32((((weight_m_tile * 128) + (cta_rank * 64)) + (warp * 16)))
                             _tmem_load_14 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_137_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
-                            _tmem_load_137_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_137_dst = cute.make_tensor(_tmem_load_14.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_137_atom, _tmem_load_137_src, _tmem_load_137_dst)
+                            _tmem_load_140_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
+                            _tmem_load_140_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_140_dst = cute.make_tensor(_tmem_load_14.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_140_atom, _tmem_load_140_src, _tmem_load_140_dst)
                             _tmem_load_15 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_138_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
-                            _tmem_load_138_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_138_dst = cute.make_tensor(_tmem_load_15.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_138_atom, _tmem_load_138_src, _tmem_load_138_dst)
+                            _tmem_load_141_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
+                            _tmem_load_141_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_141_dst = cute.make_tensor(_tmem_load_15.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_141_atom, _tmem_load_141_src, _tmem_load_141_dst)
                             folded_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             for pair_idx_2 in cutlass.range_constexpr(0, 4, 1):
                                 elem_7 = (pair_idx_2 * 2)
@@ -1140,29 +1174,29 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             r1_2[13] = cutlass.Float32(folded_1[13])
                             r1_2[14] = cutlass.Float32(folded_1[7])
                             r1_2[15] = cutlass.Float32(folded_1[15])
-                            _tmem_store_raw_139 = cutlass.Vector.from_elements([cutlass.Float32(r1_2[0]), cutlass.Float32(r1_2[(0 + 1)]), cutlass.Float32(r1_2[(0 + 2)]), cutlass.Float32(r1_2[(0 + 3)]), cutlass.Float32(r1_2[(0 + 4)]), cutlass.Float32(r1_2[(0 + 5)]), cutlass.Float32(r1_2[(0 + 6)]), cutlass.Float32(r1_2[(0 + 7)]), cutlass.Float32(r1_2[(0 + 8)]), cutlass.Float32(r1_2[(0 + 9)]), cutlass.Float32(r1_2[(0 + 10)]), cutlass.Float32(r1_2[(0 + 11)]), cutlass.Float32(r1_2[(0 + 12)]), cutlass.Float32(r1_2[(0 + 13)]), cutlass.Float32(r1_2[(0 + 14)]), cutlass.Float32(r1_2[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_139)
+                            _tmem_store_raw_142 = cutlass.Vector.from_elements([cutlass.Float32(r1_2[0]), cutlass.Float32(r1_2[(0 + 1)]), cutlass.Float32(r1_2[(0 + 2)]), cutlass.Float32(r1_2[(0 + 3)]), cutlass.Float32(r1_2[(0 + 4)]), cutlass.Float32(r1_2[(0 + 5)]), cutlass.Float32(r1_2[(0 + 6)]), cutlass.Float32(r1_2[(0 + 7)]), cutlass.Float32(r1_2[(0 + 8)]), cutlass.Float32(r1_2[(0 + 9)]), cutlass.Float32(r1_2[(0 + 10)]), cutlass.Float32(r1_2[(0 + 11)]), cutlass.Float32(r1_2[(0 + 12)]), cutlass.Float32(r1_2[(0 + 13)]), cutlass.Float32(r1_2[(0 + 14)]), cutlass.Float32(r1_2[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_142)
                             cute.arch.fence_view_async_tmem_store()
                             _tmem_load_16 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                            _tmem_load_140_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                            _tmem_load_140_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                            _tmem_load_140_dst = cute.make_tensor(_tmem_load_16.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                            cute.copy(_tmem_load_140_atom, _tmem_load_140_src, _tmem_load_140_dst)
+                            _tmem_load_143_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                            _tmem_load_143_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                            _tmem_load_143_dst = cute.make_tensor(_tmem_load_16.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                            cute.copy(_tmem_load_143_atom, _tmem_load_143_src, _tmem_load_143_dst)
                             cute.arch.fence_view_async_tmem_load()
-                            _tmem_store_raw_141 = cutlass.Vector.from_elements([cutlass.Float32(_tmem_load_16[0]), cutlass.Float32(_tmem_load_16[(0 + 1)]), cutlass.Float32(_tmem_load_16[(0 + 2)]), cutlass.Float32(_tmem_load_16[(0 + 3)]), cutlass.Float32(_tmem_load_16[(0 + 4)]), cutlass.Float32(_tmem_load_16[(0 + 5)]), cutlass.Float32(_tmem_load_16[(0 + 6)]), cutlass.Float32(_tmem_load_16[(0 + 7)]), cutlass.Float32(_tmem_load_16[(0 + 8)]), cutlass.Float32(_tmem_load_16[(0 + 9)]), cutlass.Float32(_tmem_load_16[(0 + 10)]), cutlass.Float32(_tmem_load_16[(0 + 11)]), cutlass.Float32(_tmem_load_16[(0 + 12)]), cutlass.Float32(_tmem_load_16[(0 + 13)]), cutlass.Float32(_tmem_load_16[(0 + 14)]), cutlass.Float32(_tmem_load_16[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_141)
+                            _tmem_store_raw_144 = cutlass.Vector.from_elements([cutlass.Float32(_tmem_load_16[0]), cutlass.Float32(_tmem_load_16[(0 + 1)]), cutlass.Float32(_tmem_load_16[(0 + 2)]), cutlass.Float32(_tmem_load_16[(0 + 3)]), cutlass.Float32(_tmem_load_16[(0 + 4)]), cutlass.Float32(_tmem_load_16[(0 + 5)]), cutlass.Float32(_tmem_load_16[(0 + 6)]), cutlass.Float32(_tmem_load_16[(0 + 7)]), cutlass.Float32(_tmem_load_16[(0 + 8)]), cutlass.Float32(_tmem_load_16[(0 + 9)]), cutlass.Float32(_tmem_load_16[(0 + 10)]), cutlass.Float32(_tmem_load_16[(0 + 11)]), cutlass.Float32(_tmem_load_16[(0 + 12)]), cutlass.Float32(_tmem_load_16[(0 + 13)]), cutlass.Float32(_tmem_load_16[(0 + 14)]), cutlass.Float32(_tmem_load_16[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_144)
                             cute.arch.fence_view_async_tmem_store()
                             r3_raw_2 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             _tmem_load_17 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_142_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                            _tmem_load_142_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_142_dst = cute.make_tensor(_tmem_load_17.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_142_atom, _tmem_load_142_src, _tmem_load_142_dst)
+                            _tmem_load_145_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                            _tmem_load_145_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_145_dst = cute.make_tensor(_tmem_load_17.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_145_atom, _tmem_load_145_src, _tmem_load_145_dst)
                             _tmem_load_18 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_143_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                            _tmem_load_143_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_143_dst = cute.make_tensor(_tmem_load_18.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_143_atom, _tmem_load_143_src, _tmem_load_143_dst)
+                            _tmem_load_146_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                            _tmem_load_146_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_146_dst = cute.make_tensor(_tmem_load_18.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_146_atom, _tmem_load_146_src, _tmem_load_146_dst)
                             cute.arch.fence_view_async_tmem_load()
                             for elem_9 in cutlass.range_constexpr(0, 8, 1):
                                 r3_raw_2[elem_9] = cutlass.Float32(_tmem_load_17[elem_9])
@@ -1184,20 +1218,20 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             r3_2[13] = cutlass.Float32(r3_raw_2[11])
                             r3_2[14] = cutlass.Float32(r3_raw_2[14])
                             r3_2[15] = cutlass.Float32(r3_raw_2[15])
-                            _tmem_store_raw_144 = cutlass.Vector.from_elements([cutlass.Float32(r3_2[0]), cutlass.Float32(r3_2[(0 + 1)]), cutlass.Float32(r3_2[(0 + 2)]), cutlass.Float32(r3_2[(0 + 3)]), cutlass.Float32(r3_2[(0 + 4)]), cutlass.Float32(r3_2[(0 + 5)]), cutlass.Float32(r3_2[(0 + 6)]), cutlass.Float32(r3_2[(0 + 7)]), cutlass.Float32(r3_2[(0 + 8)]), cutlass.Float32(r3_2[(0 + 9)]), cutlass.Float32(r3_2[(0 + 10)]), cutlass.Float32(r3_2[(0 + 11)]), cutlass.Float32(r3_2[(0 + 12)]), cutlass.Float32(r3_2[(0 + 13)]), cutlass.Float32(r3_2[(0 + 14)]), cutlass.Float32(r3_2[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_144)
+                            _tmem_store_raw_147 = cutlass.Vector.from_elements([cutlass.Float32(r3_2[0]), cutlass.Float32(r3_2[(0 + 1)]), cutlass.Float32(r3_2[(0 + 2)]), cutlass.Float32(r3_2[(0 + 3)]), cutlass.Float32(r3_2[(0 + 4)]), cutlass.Float32(r3_2[(0 + 5)]), cutlass.Float32(r3_2[(0 + 6)]), cutlass.Float32(r3_2[(0 + 7)]), cutlass.Float32(r3_2[(0 + 8)]), cutlass.Float32(r3_2[(0 + 9)]), cutlass.Float32(r3_2[(0 + 10)]), cutlass.Float32(r3_2[(0 + 11)]), cutlass.Float32(r3_2[(0 + 12)]), cutlass.Float32(r3_2[(0 + 13)]), cutlass.Float32(r3_2[(0 + 14)]), cutlass.Float32(r3_2[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_147)
                             cute.arch.fence_view_async_tmem_store()
                             r4_raw_2 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             _tmem_load_19 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_145_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                            _tmem_load_145_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_145_dst = cute.make_tensor(_tmem_load_19.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_145_atom, _tmem_load_145_src, _tmem_load_145_dst)
+                            _tmem_load_148_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                            _tmem_load_148_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_148_dst = cute.make_tensor(_tmem_load_19.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_148_atom, _tmem_load_148_src, _tmem_load_148_dst)
                             _tmem_load_20 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_146_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                            _tmem_load_146_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_146_dst = cute.make_tensor(_tmem_load_20.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_146_atom, _tmem_load_146_src, _tmem_load_146_dst)
+                            _tmem_load_149_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                            _tmem_load_149_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_149_dst = cute.make_tensor(_tmem_load_20.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_149_atom, _tmem_load_149_src, _tmem_load_149_dst)
                             cute.arch.fence_view_async_tmem_load()
                             for elem_10 in cutlass.range_constexpr(0, 8, 1):
                                 r4_raw_2[elem_10] = cutlass.Float32(_tmem_load_19[elem_10])
@@ -1234,60 +1268,60 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                                     for element_1 in cutlass.range_constexpr(0, 16, 1):
                                         scaled_1[element_1] = cutlass.Float32(0.0)
                                 _packed_7 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-                                _bf16_pack_147 = prims.cvt_packfloat_f32(scaled_1[1], scaled_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[0] = cutlass.Uint32(_bf16_pack_147)
-                                _bf16_pack_148 = prims.cvt_packfloat_f32(scaled_1[3], scaled_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[1] = cutlass.Uint32(_bf16_pack_148)
-                                _bf16_pack_149 = prims.cvt_packfloat_f32(scaled_1[5], scaled_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[2] = cutlass.Uint32(_bf16_pack_149)
-                                _bf16_pack_150 = prims.cvt_packfloat_f32(scaled_1[7], scaled_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[3] = cutlass.Uint32(_bf16_pack_150)
-                                _bf16_pack_151 = prims.cvt_packfloat_f32(scaled_1[9], scaled_1[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[4] = cutlass.Uint32(_bf16_pack_151)
-                                _bf16_pack_152 = prims.cvt_packfloat_f32(scaled_1[11], scaled_1[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[5] = cutlass.Uint32(_bf16_pack_152)
-                                _bf16_pack_153 = prims.cvt_packfloat_f32(scaled_1[13], scaled_1[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[6] = cutlass.Uint32(_bf16_pack_153)
-                                _bf16_pack_154 = prims.cvt_packfloat_f32(scaled_1[15], scaled_1[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                                _packed_7[7] = cutlass.Uint32(_bf16_pack_154)
-                                _gmem_store_bits_155 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_7[0]), cutlass.Uint32(_packed_7[1]), cutlass.Uint32(_packed_7[2]), cutlass.Uint32(_packed_7[3]), cutlass.Uint32(_packed_7[4]), cutlass.Uint32(_packed_7[5]), cutlass.Uint32(_packed_7[6]), cutlass.Uint32(_packed_7[7])], cutlass.Uint32)
-                                prims.store_ext(_gmem_store_bits_155.ir_value(), cute.recast_ptr(fc1_workspace_bf16 + ((((expert_1 * 64) + packed_token_1) * 5120) + feature_base_1), dtype=cutlass.Uint32))
+                                _bf16_pack_150 = prims.cvt_packfloat_f32(scaled_1[1], scaled_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[0] = cutlass.Uint32(_bf16_pack_150)
+                                _bf16_pack_151 = prims.cvt_packfloat_f32(scaled_1[3], scaled_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[1] = cutlass.Uint32(_bf16_pack_151)
+                                _bf16_pack_152 = prims.cvt_packfloat_f32(scaled_1[5], scaled_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[2] = cutlass.Uint32(_bf16_pack_152)
+                                _bf16_pack_153 = prims.cvt_packfloat_f32(scaled_1[7], scaled_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[3] = cutlass.Uint32(_bf16_pack_153)
+                                _bf16_pack_154 = prims.cvt_packfloat_f32(scaled_1[9], scaled_1[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[4] = cutlass.Uint32(_bf16_pack_154)
+                                _bf16_pack_155 = prims.cvt_packfloat_f32(scaled_1[11], scaled_1[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[5] = cutlass.Uint32(_bf16_pack_155)
+                                _bf16_pack_156 = prims.cvt_packfloat_f32(scaled_1[13], scaled_1[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[6] = cutlass.Uint32(_bf16_pack_156)
+                                _bf16_pack_157 = prims.cvt_packfloat_f32(scaled_1[15], scaled_1[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                                _packed_7[7] = cutlass.Uint32(_bf16_pack_157)
+                                _gmem_store_bits_158 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_7[0]), cutlass.Uint32(_packed_7[1]), cutlass.Uint32(_packed_7[2]), cutlass.Uint32(_packed_7[3]), cutlass.Uint32(_packed_7[4]), cutlass.Uint32(_packed_7[5]), cutlass.Uint32(_packed_7[6]), cutlass.Uint32(_packed_7[7])], cutlass.Uint32)
+                                prims.store_ext(_gmem_store_bits_158.ir_value(), cute.recast_ptr(fc1_workspace_bf16 + ((((expert_1 * 64) + packed_token_1) * 5120) + feature_base_1), dtype=cutlass.Uint32))
                         else:
                             hidden_base_1 = cutlass.Int32((((weight_m_tile * 256) + (cta_rank * 128)) + (warp * 32)))
                             hidden_lo_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
                             hidden_hi_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
                             _tmem_load_7_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_156_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
-                            _tmem_load_156_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_156_dst = cute.make_tensor(_tmem_load_7_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_156_atom, _tmem_load_156_src, _tmem_load_156_dst)
+                            _tmem_load_159_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
+                            _tmem_load_159_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_159_dst = cute.make_tensor(_tmem_load_7_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_159_atom, _tmem_load_159_src, _tmem_load_159_dst)
                             _tmem_load_8_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_157_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
-                            _tmem_load_157_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_157_dst = cute.make_tensor(_tmem_load_8_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_157_atom, _tmem_load_157_src, _tmem_load_157_dst)
+                            _tmem_load_160_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x8), cutlass.Float32)
+                            _tmem_load_160_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_160_dst = cute.make_tensor(_tmem_load_8_1.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_160_atom, _tmem_load_160_src, _tmem_load_160_dst)
                             cute.arch.fence_view_async_tmem_load()
                             casted_input_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             for elem_12 in cutlass.range_constexpr(0, 8, 1):
                                 casted_input_1[elem_12] = cutlass.Float32(_tmem_load_7_1[elem_12])
                                 casted_input_1[(8 + elem_12)] = cutlass.Float32(_tmem_load_8_1[elem_12])
                             casted_bf16_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-                            _bf16_pack_158 = prims.cvt_packfloat_f32(casted_input_1[1], casted_input_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[0] = cutlass.Uint32(_bf16_pack_158)
-                            _bf16_pack_159 = prims.cvt_packfloat_f32(casted_input_1[3], casted_input_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[1] = cutlass.Uint32(_bf16_pack_159)
-                            _bf16_pack_160 = prims.cvt_packfloat_f32(casted_input_1[5], casted_input_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[2] = cutlass.Uint32(_bf16_pack_160)
-                            _bf16_pack_161 = prims.cvt_packfloat_f32(casted_input_1[7], casted_input_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[3] = cutlass.Uint32(_bf16_pack_161)
-                            _bf16_pack_162 = prims.cvt_packfloat_f32(casted_input_1[9], casted_input_1[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[4] = cutlass.Uint32(_bf16_pack_162)
-                            _bf16_pack_163 = prims.cvt_packfloat_f32(casted_input_1[11], casted_input_1[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[5] = cutlass.Uint32(_bf16_pack_163)
-                            _bf16_pack_164 = prims.cvt_packfloat_f32(casted_input_1[13], casted_input_1[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[6] = cutlass.Uint32(_bf16_pack_164)
-                            _bf16_pack_165 = prims.cvt_packfloat_f32(casted_input_1[15], casted_input_1[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-                            casted_bf16_1[7] = cutlass.Uint32(_bf16_pack_165)
+                            _bf16_pack_161 = prims.cvt_packfloat_f32(casted_input_1[1], casted_input_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[0] = cutlass.Uint32(_bf16_pack_161)
+                            _bf16_pack_162 = prims.cvt_packfloat_f32(casted_input_1[3], casted_input_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[1] = cutlass.Uint32(_bf16_pack_162)
+                            _bf16_pack_163 = prims.cvt_packfloat_f32(casted_input_1[5], casted_input_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[2] = cutlass.Uint32(_bf16_pack_163)
+                            _bf16_pack_164 = prims.cvt_packfloat_f32(casted_input_1[7], casted_input_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[3] = cutlass.Uint32(_bf16_pack_164)
+                            _bf16_pack_165 = prims.cvt_packfloat_f32(casted_input_1[9], casted_input_1[8], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[4] = cutlass.Uint32(_bf16_pack_165)
+                            _bf16_pack_166 = prims.cvt_packfloat_f32(casted_input_1[11], casted_input_1[10], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[5] = cutlass.Uint32(_bf16_pack_166)
+                            _bf16_pack_167 = prims.cvt_packfloat_f32(casted_input_1[13], casted_input_1[12], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[6] = cutlass.Uint32(_bf16_pack_167)
+                            _bf16_pack_168 = prims.cvt_packfloat_f32(casted_input_1[15], casted_input_1[14], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+                            casted_bf16_1[7] = cutlass.Uint32(_bf16_pack_168)
                             packed_1 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             for pair_2 in cutlass.range_constexpr(0, 4, 1):
                                 _prmt_4 = prims_nvvm.prmt(cutlass.Uint32(casted_bf16_1[pair_2]), cutlass.Uint32(21520), prims_nvvm.PermuteMode.DEFAULT, hi=cutlass.Uint32(casted_bf16_1[(4 + pair_2)])).bitcast(cutlass.Uint32)
@@ -1314,29 +1348,29 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             r1_3[13] = cutlass.Float32(packed_1[13])
                             r1_3[14] = cutlass.Float32(packed_1[7])
                             r1_3[15] = cutlass.Float32(packed_1[15])
-                            _tmem_store_raw_166 = cutlass.Vector.from_elements([cutlass.Float32(r1_3[0]), cutlass.Float32(r1_3[(0 + 1)]), cutlass.Float32(r1_3[(0 + 2)]), cutlass.Float32(r1_3[(0 + 3)]), cutlass.Float32(r1_3[(0 + 4)]), cutlass.Float32(r1_3[(0 + 5)]), cutlass.Float32(r1_3[(0 + 6)]), cutlass.Float32(r1_3[(0 + 7)]), cutlass.Float32(r1_3[(0 + 8)]), cutlass.Float32(r1_3[(0 + 9)]), cutlass.Float32(r1_3[(0 + 10)]), cutlass.Float32(r1_3[(0 + 11)]), cutlass.Float32(r1_3[(0 + 12)]), cutlass.Float32(r1_3[(0 + 13)]), cutlass.Float32(r1_3[(0 + 14)]), cutlass.Float32(r1_3[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_166)
+                            _tmem_store_raw_169 = cutlass.Vector.from_elements([cutlass.Float32(r1_3[0]), cutlass.Float32(r1_3[(0 + 1)]), cutlass.Float32(r1_3[(0 + 2)]), cutlass.Float32(r1_3[(0 + 3)]), cutlass.Float32(r1_3[(0 + 4)]), cutlass.Float32(r1_3[(0 + 5)]), cutlass.Float32(r1_3[(0 + 6)]), cutlass.Float32(r1_3[(0 + 7)]), cutlass.Float32(r1_3[(0 + 8)]), cutlass.Float32(r1_3[(0 + 9)]), cutlass.Float32(r1_3[(0 + 10)]), cutlass.Float32(r1_3[(0 + 11)]), cutlass.Float32(r1_3[(0 + 12)]), cutlass.Float32(r1_3[(0 + 13)]), cutlass.Float32(r1_3[(0 + 14)]), cutlass.Float32(r1_3[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_16X128B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_169)
                             cute.arch.fence_view_async_tmem_store()
                             tmem_load_6 = cute.make_rmem_tensor((16,), cutlass.Float32)
-                            _tmem_load_167_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
-                            _tmem_load_167_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
-                            _tmem_load_167_dst = cute.make_tensor(tmem_load_6.iterator + 0, cute.make_layout((16,), stride=(1,)))
-                            cute.copy(_tmem_load_167_atom, _tmem_load_167_src, _tmem_load_167_dst)
+                            _tmem_load_170_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x64bOp(cute.nvgpu.tcgen05.Repetition.x16), cutlass.Float32)
+                            _tmem_load_170_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((16,), stride=(1,)))
+                            _tmem_load_170_dst = cute.make_tensor(tmem_load_6.iterator + 0, cute.make_layout((16,), stride=(1,)))
+                            cute.copy(_tmem_load_170_atom, _tmem_load_170_src, _tmem_load_170_dst)
                             cute.arch.fence_view_async_tmem_load()
-                            _tmem_store_raw_168 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load_6[0]), cutlass.Float32(tmem_load_6[(0 + 1)]), cutlass.Float32(tmem_load_6[(0 + 2)]), cutlass.Float32(tmem_load_6[(0 + 3)]), cutlass.Float32(tmem_load_6[(0 + 4)]), cutlass.Float32(tmem_load_6[(0 + 5)]), cutlass.Float32(tmem_load_6[(0 + 6)]), cutlass.Float32(tmem_load_6[(0 + 7)]), cutlass.Float32(tmem_load_6[(0 + 8)]), cutlass.Float32(tmem_load_6[(0 + 9)]), cutlass.Float32(tmem_load_6[(0 + 10)]), cutlass.Float32(tmem_load_6[(0 + 11)]), cutlass.Float32(tmem_load_6[(0 + 12)]), cutlass.Float32(tmem_load_6[(0 + 13)]), cutlass.Float32(tmem_load_6[(0 + 14)]), cutlass.Float32(tmem_load_6[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_168)
+                            _tmem_store_raw_171 = cutlass.Vector.from_elements([cutlass.Float32(tmem_load_6[0]), cutlass.Float32(tmem_load_6[(0 + 1)]), cutlass.Float32(tmem_load_6[(0 + 2)]), cutlass.Float32(tmem_load_6[(0 + 3)]), cutlass.Float32(tmem_load_6[(0 + 4)]), cutlass.Float32(tmem_load_6[(0 + 5)]), cutlass.Float32(tmem_load_6[(0 + 6)]), cutlass.Float32(tmem_load_6[(0 + 7)]), cutlass.Float32(tmem_load_6[(0 + 8)]), cutlass.Float32(tmem_load_6[(0 + 9)]), cutlass.Float32(tmem_load_6[(0 + 10)]), cutlass.Float32(tmem_load_6[(0 + 11)]), cutlass.Float32(tmem_load_6[(0 + 12)]), cutlass.Float32(tmem_load_6[(0 + 13)]), cutlass.Float32(tmem_load_6[(0 + 14)]), cutlass.Float32(tmem_load_6[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_171)
                             cute.arch.fence_view_async_tmem_store()
                             r3_raw_3 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             tmem_load_1_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_169_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                            _tmem_load_169_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_169_dst = cute.make_tensor(tmem_load_1_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_169_atom, _tmem_load_169_src, _tmem_load_169_dst)
+                            _tmem_load_172_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                            _tmem_load_172_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_172_dst = cute.make_tensor(tmem_load_1_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_172_atom, _tmem_load_172_src, _tmem_load_172_dst)
                             tmem_load_2_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_170_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
-                            _tmem_load_170_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_170_dst = cute.make_tensor(tmem_load_2_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_170_atom, _tmem_load_170_src, _tmem_load_170_dst)
+                            _tmem_load_173_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x256bOp(cute.nvgpu.tcgen05.Repetition.x2), cutlass.Float32)
+                            _tmem_load_173_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=16), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_173_dst = cute.make_tensor(tmem_load_2_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_173_atom, _tmem_load_173_src, _tmem_load_173_dst)
                             cute.arch.fence_view_async_tmem_load()
                             for elem_14 in cutlass.range_constexpr(0, 8, 1):
                                 r3_raw_3[elem_14] = cutlass.Float32(tmem_load_1_2[elem_14])
@@ -1358,20 +1392,20 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             r3_3[13] = cutlass.Float32(r3_raw_3[11])
                             r3_3[14] = cutlass.Float32(r3_raw_3[14])
                             r3_3[15] = cutlass.Float32(r3_raw_3[15])
-                            _tmem_store_raw_171 = cutlass.Vector.from_elements([cutlass.Float32(r3_3[0]), cutlass.Float32(r3_3[(0 + 1)]), cutlass.Float32(r3_3[(0 + 2)]), cutlass.Float32(r3_3[(0 + 3)]), cutlass.Float32(r3_3[(0 + 4)]), cutlass.Float32(r3_3[(0 + 5)]), cutlass.Float32(r3_3[(0 + 6)]), cutlass.Float32(r3_3[(0 + 7)]), cutlass.Float32(r3_3[(0 + 8)]), cutlass.Float32(r3_3[(0 + 9)]), cutlass.Float32(r3_3[(0 + 10)]), cutlass.Float32(r3_3[(0 + 11)]), cutlass.Float32(r3_3[(0 + 12)]), cutlass.Float32(r3_3[(0 + 13)]), cutlass.Float32(r3_3[(0 + 14)]), cutlass.Float32(r3_3[(0 + 15)])], cutlass.Float32)
-                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_171)
+                            _tmem_store_raw_174 = cutlass.Vector.from_elements([cutlass.Float32(r3_3[0]), cutlass.Float32(r3_3[(0 + 1)]), cutlass.Float32(r3_3[(0 + 2)]), cutlass.Float32(r3_3[(0 + 3)]), cutlass.Float32(r3_3[(0 + 4)]), cutlass.Float32(r3_3[(0 + 5)]), cutlass.Float32(r3_3[(0 + 6)]), cutlass.Float32(r3_3[(0 + 7)]), cutlass.Float32(r3_3[(0 + 8)]), cutlass.Float32(r3_3[(0 + 9)]), cutlass.Float32(r3_3[(0 + 10)]), cutlass.Float32(r3_3[(0 + 11)]), cutlass.Float32(r3_3[(0 + 12)]), cutlass.Float32(r3_3[(0 + 13)]), cutlass.Float32(r3_3[(0 + 14)]), cutlass.Float32(r3_3[(0 + 15)])], cutlass.Float32)
+                            prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32(warp_row_ptr_2), cutlass.Int32), _tmem_store_raw_174)
                             cute.arch.fence_view_async_tmem_store()
                             r4_raw_3 = cute.make_rmem_tensor((16,), cutlass.Float32)
                             tmem_load_3_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_172_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                            _tmem_load_172_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_172_dst = cute.make_tensor(tmem_load_3_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_172_atom, _tmem_load_172_src, _tmem_load_172_dst)
+                            _tmem_load_175_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                            _tmem_load_175_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32(warp_row_ptr_2), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_175_dst = cute.make_tensor(tmem_load_3_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_175_atom, _tmem_load_175_src, _tmem_load_175_dst)
                             tmem_load_4_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-                            _tmem_load_173_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
-                            _tmem_load_173_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
-                            _tmem_load_173_dst = cute.make_tensor(tmem_load_4_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
-                            cute.copy(_tmem_load_173_atom, _tmem_load_173_src, _tmem_load_173_dst)
+                            _tmem_load_176_atom = cute.make_copy_atom(cute.nvgpu.tcgen05.Ld16x128bOp(cute.nvgpu.tcgen05.Repetition.x4), cutlass.Float32)
+                            _tmem_load_176_src = cute.make_tensor(cute.make_ptr(cutlass.Float32, cutlass.Uint32((warp_row_ptr_2 + 1048576)), mem_space=cutlass.AddressSpace.tmem, assumed_align=8), cute.make_layout((8,), stride=(1,)))
+                            _tmem_load_176_dst = cute.make_tensor(tmem_load_4_2.iterator + 0, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(_tmem_load_176_atom, _tmem_load_176_src, _tmem_load_176_dst)
                             cute.arch.fence_view_async_tmem_load()
                             for elem_15 in cutlass.range_constexpr(0, 8, 1):
                                 r4_raw_3[elem_15] = cutlass.Float32(tmem_load_3_2[elem_15])
@@ -1407,12 +1441,12 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                                     routes_per_source_2 = cutlass.Int32((tokens_per_rank * 8))
                                     source_rank_0_1 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_route_1).ir_value(), cutlass.Int32(routes_per_source_2).ir_value())))
                                     source_route_1 = cutlass.Int32((global_route_1 - (source_rank_0_1 * routes_per_source_2)))
-                                    remote_terms_1 = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.select_((source_rank_0_1) == 31, cutlass.Uint64(route_terms_bf16_peers[31]), cutlass.select_((source_rank_0_1) == 30, cutlass.Uint64(route_terms_bf16_peers[30]), cutlass.select_((source_rank_0_1) == 29, cutlass.Uint64(route_terms_bf16_peers[29]), cutlass.select_((source_rank_0_1) == 28, cutlass.Uint64(route_terms_bf16_peers[28]), cutlass.select_((source_rank_0_1) == 27, cutlass.Uint64(route_terms_bf16_peers[27]), cutlass.select_((source_rank_0_1) == 26, cutlass.Uint64(route_terms_bf16_peers[26]), cutlass.select_((source_rank_0_1) == 25, cutlass.Uint64(route_terms_bf16_peers[25]), cutlass.select_((source_rank_0_1) == 24, cutlass.Uint64(route_terms_bf16_peers[24]), cutlass.select_((source_rank_0_1) == 23, cutlass.Uint64(route_terms_bf16_peers[23]), cutlass.select_((source_rank_0_1) == 22, cutlass.Uint64(route_terms_bf16_peers[22]), cutlass.select_((source_rank_0_1) == 21, cutlass.Uint64(route_terms_bf16_peers[21]), cutlass.select_((source_rank_0_1) == 20, cutlass.Uint64(route_terms_bf16_peers[20]), cutlass.select_((source_rank_0_1) == 19, cutlass.Uint64(route_terms_bf16_peers[19]), cutlass.select_((source_rank_0_1) == 18, cutlass.Uint64(route_terms_bf16_peers[18]), cutlass.select_((source_rank_0_1) == 17, cutlass.Uint64(route_terms_bf16_peers[17]), cutlass.select_((source_rank_0_1) == 16, cutlass.Uint64(route_terms_bf16_peers[16]), cutlass.select_((source_rank_0_1) == 15, cutlass.Uint64(route_terms_bf16_peers[15]), cutlass.select_((source_rank_0_1) == 14, cutlass.Uint64(route_terms_bf16_peers[14]), cutlass.select_((source_rank_0_1) == 13, cutlass.Uint64(route_terms_bf16_peers[13]), cutlass.select_((source_rank_0_1) == 12, cutlass.Uint64(route_terms_bf16_peers[12]), cutlass.select_((source_rank_0_1) == 11, cutlass.Uint64(route_terms_bf16_peers[11]), cutlass.select_((source_rank_0_1) == 10, cutlass.Uint64(route_terms_bf16_peers[10]), cutlass.select_((source_rank_0_1) == 9, cutlass.Uint64(route_terms_bf16_peers[9]), cutlass.select_((source_rank_0_1) == 8, cutlass.Uint64(route_terms_bf16_peers[8]), cutlass.select_((source_rank_0_1) == 7, cutlass.Uint64(route_terms_bf16_peers[7]), cutlass.select_((source_rank_0_1) == 6, cutlass.Uint64(route_terms_bf16_peers[6]), cutlass.select_((source_rank_0_1) == 5, cutlass.Uint64(route_terms_bf16_peers[5]), cutlass.select_((source_rank_0_1) == 4, cutlass.Uint64(route_terms_bf16_peers[4]), cutlass.select_((source_rank_0_1) == 3, cutlass.Uint64(route_terms_bf16_peers[3]), cutlass.select_((source_rank_0_1) == 2, cutlass.Uint64(route_terms_bf16_peers[2]), cutlass.select_((source_rank_0_1) == 1, cutlass.Uint64(route_terms_bf16_peers[1]), cutlass.Uint64(route_terms_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                                    remote_terms_1 = cute.make_ptr(cutlass.Uint32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(48 + source_rank_0_1)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                                     term_word_1 = cutlass.Uint64(((cutlass.Uint64(source_route_1) * 1536) + cutlass.Uint64(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(hidden_base_1).ir_value(), cutlass.Int32(2).ir_value())))))
-                                    _sys_volatile_store_128_174 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_lo_1[0]), cutlass.Uint32(hidden_lo_1[1]), cutlass.Uint32(hidden_lo_1[2]), cutlass.Uint32(hidden_lo_1[3]), cutlass.Uint32(hidden_lo_1[4]), cutlass.Uint32(hidden_lo_1[5]), cutlass.Uint32(hidden_lo_1[6]), cutlass.Uint32(hidden_lo_1[7])], cutlass.Uint32)
-                                    prims.store_ext(_sys_volatile_store_128_174.ir_value(), remote_terms_1 + term_word_1, order=prims.MemOrder.VOLATILE)
-                                    _sys_volatile_store_128_175 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_hi_1[0]), cutlass.Uint32(hidden_hi_1[1]), cutlass.Uint32(hidden_hi_1[2]), cutlass.Uint32(hidden_hi_1[3]), cutlass.Uint32(hidden_hi_1[4]), cutlass.Uint32(hidden_hi_1[5]), cutlass.Uint32(hidden_hi_1[6]), cutlass.Uint32(hidden_hi_1[7])], cutlass.Uint32)
-                                    prims.store_ext(_sys_volatile_store_128_175.ir_value(), remote_terms_1 + (term_word_1 + 8), order=prims.MemOrder.VOLATILE)
+                                    _sys_volatile_store_128_177 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_lo_1[0]), cutlass.Uint32(hidden_lo_1[1]), cutlass.Uint32(hidden_lo_1[2]), cutlass.Uint32(hidden_lo_1[3]), cutlass.Uint32(hidden_lo_1[4]), cutlass.Uint32(hidden_lo_1[5]), cutlass.Uint32(hidden_lo_1[6]), cutlass.Uint32(hidden_lo_1[7])], cutlass.Uint32)
+                                    prims.store_ext(_sys_volatile_store_128_177.ir_value(), remote_terms_1 + term_word_1, order=prims.MemOrder.VOLATILE)
+                                    _sys_volatile_store_128_178 = cutlass.Vector.from_elements([cutlass.Uint32(hidden_hi_1[0]), cutlass.Uint32(hidden_hi_1[1]), cutlass.Uint32(hidden_hi_1[2]), cutlass.Uint32(hidden_hi_1[3]), cutlass.Uint32(hidden_hi_1[4]), cutlass.Uint32(hidden_hi_1[5]), cutlass.Uint32(hidden_hi_1[6]), cutlass.Uint32(hidden_hi_1[7])], cutlass.Uint32)
+                                    prims.store_ext(_sys_volatile_store_128_178.ir_value(), remote_terms_1 + (term_word_1 + 8), order=prims.MemOrder.VOLATILE)
                         prims.tcgen05_fence('before_thread_sync')
                         prims.barrier_cta_sync(4, thread_count=128)
                         prims.tcgen05_fence('after_thread_sync')
@@ -1421,12 +1455,12 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                                 if prims.elect_sync():
                                     cute.arch.atomic_add(fc1_done + expert_row_tile_2, cutlass.Uint32(1), sem='release', scope='gpu')
                 if prims.elect_sync():
-                    _mbarrier_cluster_arrive_176 = prims.mapa(acc_free_addr + acc_stage[0], cutlass.Int32(0))
-                    prims.mbarrier_arrive(_mbarrier_cluster_arrive_176, count=cutlass.Int32(1), scope=prims.MemScope.CLUSTER)
-                _advanced_stage_177 = cutlass.Uint32(acc_stage[0] + 1)
-                _stage_wrapped_178 = cutlass.Boolean(_advanced_stage_177 == 2)
-                acc_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_178, 0, _advanced_stage_177))
-                _phase_acc_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_178, _phase_acc_full[0] ^ cutlass.Uint32(1), _phase_acc_full[0]))
+                    _mbarrier_cluster_arrive_179 = prims.mapa(acc_free_addr + acc_stage[0], cutlass.Int32(0))
+                    prims.mbarrier_arrive(_mbarrier_cluster_arrive_179, count=cutlass.Int32(1), scope=prims.MemScope.CLUSTER)
+                _advanced_stage_180 = cutlass.Uint32(acc_stage[0] + 1)
+                _stage_wrapped_181 = cutlass.Boolean(_advanced_stage_180 == 2)
+                acc_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_181, 0, _advanced_stage_180))
+                _phase_acc_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_181, _phase_acc_full[0] ^ cutlass.Uint32(1), _phase_acc_full[0]))
         cute.arch.cluster_arrive(aligned=True)
         cute.arch.cluster_wait()
         if (warp == 0):
@@ -1434,9 +1468,9 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=True)
         if ((bid == 0) & (warp == 0)):
             if prims.elect_sync():
-                _poll_179 = cutlass.Uint32(prims.load_ext(rank_flags + 1, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
-                while ((_poll_179 ^ cutlass.Uint32((old_sense1[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
-                    _poll_179 = cutlass.Uint32(prims.load_ext(rank_flags + 1, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                _poll_182 = cutlass.Uint32(prims.load_ext(rank_flags + 1, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
+                while ((_poll_182 ^ cutlass.Uint32((old_sense1[0] ^ 2147483648))) & cutlass.Uint32(2147483648)) != cutlass.Uint32(0):
+                    _poll_182 = cutlass.Uint32(prims.load_ext(rank_flags + 1, dtype=cutlass.Uint32, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.SYS))
     elif warp == 4:
         push_owners_1 = cute.make_rmem_tensor((1,), cutlass.Uint32)
         row_index_lane_1 = cute.make_rmem_tensor((1,), cutlass.Int32)
@@ -1452,14 +1486,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _phase_b_full = cute.make_rmem_tensor((1,), cutlass.Uint32)
         linear_thread_1 = cutlass.Int32(((bid * 384) + tid))
         thread_stride_1 = cutlass.Int32((num_bids * 384))
-        _forward_storage_183 = _published_topk_ids_i32
-        _forward_storage_184 = _published_topk_weights_f32
-        _forward_storage_185 = _source_topk_ids_i64
-        _forward_storage_186 = _source_topk_weights_f32
-        _forward_loop_180 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_181: _forward_condition_181 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
-        _forward_loop_180.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_180 as _forward_values_182:
-            push_1 = _forward_values_182[0]
+        _forward_storage_186 = _peer_ptrs
+        _forward_storage_187 = _published_topk_ids_i32
+        _forward_storage_188 = _published_topk_weights_f32
+        _forward_storage_189 = _source_topk_ids_i64
+        _forward_storage_190 = _source_topk_weights_f32
+        _forward_loop_183 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_184: _forward_condition_184 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
+        _forward_loop_183.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_183 as _forward_values_185:
+            push_1 = _forward_values_185[0]
             push_dest_2 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(push_1).ir_value(), cutlass.Int32((tokens_per_rank * 8)).ir_value())))
             push_route_1 = cutlass.Int32((push_1 - (push_dest_2 * (tokens_per_rank * 8))))
             push_slot_2 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 8) + push_route_1))
@@ -1469,102 +1504,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id_1).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot_2, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_1).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot_2)
             else:
-                peer_ids_1 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest_2) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest_2) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest_2) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest_2) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest_2) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest_2) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest_2) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest_2) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest_2) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest_2) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest_2) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest_2) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest_2) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest_2) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest_2) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest_2) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest_2) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest_2) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest_2) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest_2) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest_2) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest_2) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest_2) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest_2) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest_2) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest_2) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest_2) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest_2) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest_2) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest_2) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest_2) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights_1 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest_2) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest_2) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest_2) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest_2) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest_2) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest_2) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest_2) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest_2) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest_2) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest_2) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest_2) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest_2) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest_2) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest_2) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest_2) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest_2) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest_2) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest_2) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest_2) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest_2) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest_2) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest_2) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest_2) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest_2) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest_2) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest_2) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest_2) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest_2) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest_2) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest_2) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest_2) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids_1 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest_2)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights_1 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest_2)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id_1).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids_1 + push_slot_2, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_1).ir_value(), peer_weights_1 + push_slot_2)
             cutlass.yield_out([cutlass.Int32(push_1 + (thread_stride_1))])
-        _published_topk_ids_i32 = _forward_storage_183
-        _published_topk_weights_f32 = _forward_storage_184
-        _source_topk_ids_i64 = _forward_storage_185
-        _source_topk_weights_f32 = _forward_storage_186
-        _forward_storage_190 = _route_map_i32
-        _forward_storage_191 = _route_scale_f32
-        _forward_loop_187 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_188: _forward_condition_188 < cutlass.Int32(2048))
-        _forward_loop_187.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_187 as _forward_values_189:
-            index_2 = _forward_values_189[0]
+        _peer_ptrs = _forward_storage_186
+        _published_topk_ids_i32 = _forward_storage_187
+        _published_topk_weights_f32 = _forward_storage_188
+        _source_topk_ids_i64 = _forward_storage_189
+        _source_topk_weights_f32 = _forward_storage_190
+        _forward_storage_194 = _route_map_i32
+        _forward_storage_195 = _route_scale_f32
+        _forward_loop_191 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_192: _forward_condition_192 < cutlass.Int32(2048))
+        _forward_loop_191.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_191 as _forward_values_193:
+            index_2 = _forward_values_193[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index_2)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index_2)))
             cutlass.yield_out([cutlass.Int32(index_2 + (thread_stride_1))])
-        _route_map_i32 = _forward_storage_190
-        _route_scale_f32 = _forward_storage_191
-        _forward_storage_195 = _route_counts_u32
-        _forward_loop_192 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_193: _forward_condition_193 < cutlass.Int32(32))
-        _forward_loop_192.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_192 as _forward_values_194:
-            expert_2 = _forward_values_194[0]
-            prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_2)))
-            cutlass.yield_out([cutlass.Int32(expert_2 + (thread_stride_1))])
-        _route_counts_u32 = _forward_storage_195
-        _forward_storage_199 = _fc1_done
-        _forward_loop_196 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_197: _forward_condition_197 < cutlass.Int32(96))
+        _route_map_i32 = _forward_storage_194
+        _route_scale_f32 = _forward_storage_195
+        _forward_storage_199 = _route_counts_u32
+        _forward_loop_196 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_197: _forward_condition_197 < cutlass.Int32(32))
         _forward_loop_196.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
         with _forward_loop_196 as _forward_values_198:
-            expert_row_tile_3 = _forward_values_198[0]
-            prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_3, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
-            cutlass.yield_out([cutlass.Int32(expert_row_tile_3 + (thread_stride_1))])
-        _fc1_done = _forward_storage_199
-        _forward_storage_203 = _published_hidden_bf16
-        _forward_storage_204 = _source_hidden_bf16
-        _forward_storage_205 = _source_topk_ids_i64
-        _forward_storage_206 = push_owners_1
-        _forward_loop_200 = cutlass.while_generate([cutlass.Int32((linear_thread_1 * 8))], lambda _forward_condition_201: _forward_condition_201 < cutlass.Int32((tokens_per_rank * 3072)))
+            expert_2 = _forward_values_198[0]
+            prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_2)))
+            cutlass.yield_out([cutlass.Int32(expert_2 + (thread_stride_1))])
+        _route_counts_u32 = _forward_storage_199
+        _forward_storage_203 = _fc1_done
+        _forward_loop_200 = cutlass.while_generate([cutlass.Int32(linear_thread_1)], lambda _forward_condition_201: _forward_condition_201 < cutlass.Int32(96))
         _forward_loop_200.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
         with _forward_loop_200 as _forward_values_202:
-            index_3 = _forward_values_202[0]
+            expert_row_tile_3 = _forward_values_202[0]
+            prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_3, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
+            cutlass.yield_out([cutlass.Int32(expert_row_tile_3 + (thread_stride_1))])
+        _fc1_done = _forward_storage_203
+        _forward_storage_207 = _peer_ptrs
+        _forward_storage_208 = _published_hidden_bf16
+        _forward_storage_209 = _source_hidden_bf16
+        _forward_storage_210 = _source_topk_ids_i64
+        _forward_storage_211 = push_owners_1
+        _forward_loop_204 = cutlass.while_generate([cutlass.Int32((linear_thread_1 * 8))], lambda _forward_condition_205: _forward_condition_205 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_204.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_204 as _forward_values_206:
+            index_3 = _forward_values_206[0]
             hidden_f32_1 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_207 = prims.load_ext(source_hidden_bf16 + index_3, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_208 = _gmem_load_into_207.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32_1[0] = _gmem_load_into_f32_208[0]
-            hidden_f32_1[1] = _gmem_load_into_f32_208[1]
-            hidden_f32_1[2] = _gmem_load_into_f32_208[2]
-            hidden_f32_1[3] = _gmem_load_into_f32_208[3]
-            hidden_f32_1[4] = _gmem_load_into_f32_208[4]
-            hidden_f32_1[5] = _gmem_load_into_f32_208[5]
-            hidden_f32_1[6] = _gmem_load_into_f32_208[6]
-            hidden_f32_1[7] = _gmem_load_into_f32_208[7]
+            _gmem_load_into_212 = prims.load_ext(source_hidden_bf16 + index_3, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_213 = _gmem_load_into_212.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32_1[0] = _gmem_load_into_f32_213[0]
+            hidden_f32_1[1] = _gmem_load_into_f32_213[1]
+            hidden_f32_1[2] = _gmem_load_into_f32_213[2]
+            hidden_f32_1[3] = _gmem_load_into_f32_213[3]
+            hidden_f32_1[4] = _gmem_load_into_f32_213[4]
+            hidden_f32_1[5] = _gmem_load_into_f32_213[5]
+            hidden_f32_1[6] = _gmem_load_into_f32_213[6]
+            hidden_f32_1[7] = _gmem_load_into_f32_213[7]
             chunk_1 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_209 = prims.cvt_packfloat_f32(hidden_f32_1[1], hidden_f32_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_1[0] = cutlass.Uint32(_bf16_pack_209)
-            _bf16_pack_210 = prims.cvt_packfloat_f32(hidden_f32_1[3], hidden_f32_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_1[1] = cutlass.Uint32(_bf16_pack_210)
-            _bf16_pack_211 = prims.cvt_packfloat_f32(hidden_f32_1[5], hidden_f32_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_1[2] = cutlass.Uint32(_bf16_pack_211)
-            _bf16_pack_212 = prims.cvt_packfloat_f32(hidden_f32_1[7], hidden_f32_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_1[3] = cutlass.Uint32(_bf16_pack_212)
+            _bf16_pack_214 = prims.cvt_packfloat_f32(hidden_f32_1[1], hidden_f32_1[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_1[0] = cutlass.Uint32(_bf16_pack_214)
+            _bf16_pack_215 = prims.cvt_packfloat_f32(hidden_f32_1[3], hidden_f32_1[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_1[1] = cutlass.Uint32(_bf16_pack_215)
+            _bf16_pack_216 = prims.cvt_packfloat_f32(hidden_f32_1[5], hidden_f32_1[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_1[2] = cutlass.Uint32(_bf16_pack_216)
+            _bf16_pack_217 = prims.cvt_packfloat_f32(hidden_f32_1[7], hidden_f32_1[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_1[3] = cutlass.Uint32(_bf16_pack_217)
             push_token_1 = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_3).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners_1[0] = cutlass.Uint32(0)
             for push_slot_3 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank_1 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token_1 * 8) + push_slot_3)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners_1[0] = cutlass.Uint32((push_owners_1[0] | (1 << cutlass.Uint32(owner_rank_1))))
             row_offset_1 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_3))
-            _while_storage_216 = _published_hidden_bf16
-            _while_storage_217 = chunk_1
-            _while_storage_218 = push_owners_1
-            _while_loop_213 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_214: (push_owners_1[0] != 0))
-            with _while_loop_213 as _while_values_215:
-                _ffs_reversed_bits_219 = cute.arch.brev(cutlass.Uint32(push_owners_1[0]))
-                _ffs_leading_one_220 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_219))
-                _find_first_set_1 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_1[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_220))
+            _while_storage_221 = _peer_ptrs
+            _while_storage_222 = _published_hidden_bf16
+            _while_storage_223 = chunk_1
+            _while_storage_224 = push_owners_1
+            _while_loop_218 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_219: (push_owners_1[0] != 0))
+            with _while_loop_218 as _while_values_220:
+                _ffs_reversed_bits_225 = cute.arch.brev(cutlass.Uint32(push_owners_1[0]))
+                _ffs_leading_one_226 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_225))
+                _find_first_set_1 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_1[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_226))
                 push_dest_3 = cutlass.Int32((_find_first_set_1 - 1))
                 push_owners_1[0] = cutlass.Uint32((push_owners_1[0] & (push_owners_1[0] - 1)))
                 if (push_dest_3 == mega_pg_rank):
-                    _gmem_store_bits_221 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_1[0]), cutlass.Uint32(chunk_1[1]), cutlass.Uint32(chunk_1[2]), cutlass.Uint32(chunk_1[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_221.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_1, dtype=cutlass.Uint32))
+                    _gmem_store_bits_227 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_1[0]), cutlass.Uint32(chunk_1[1]), cutlass.Uint32(chunk_1[2]), cutlass.Uint32(chunk_1[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_227.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_1, dtype=cutlass.Uint32))
                 else:
-                    peer_rows_1 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_3) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_3) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_3) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_3) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_3) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_3) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_3) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_3) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_3) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_3) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_3) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_3) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_3) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_3) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_3) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_3) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_3) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_3) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_3) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_3) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_3) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_3) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_3) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_3) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_3) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_3) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_3) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_3) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_3) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_3) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_3) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_222 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_1[0]), cutlass.Uint32(chunk_1[1]), cutlass.Uint32(chunk_1[2]), cutlass.Uint32(chunk_1[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_222.ir_value(), cute.recast_ptr(peer_rows_1 + row_offset_1, dtype=cutlass.Uint32))
+                    peer_rows_1 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_3])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_228 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_1[0]), cutlass.Uint32(chunk_1[1]), cutlass.Uint32(chunk_1[2]), cutlass.Uint32(chunk_1[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_228.ir_value(), cute.recast_ptr(peer_rows_1 + row_offset_1, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_216
-            chunk_1 = _while_storage_217
-            push_owners_1 = _while_storage_218
+            _peer_ptrs = _while_storage_221
+            _published_hidden_bf16 = _while_storage_222
+            chunk_1 = _while_storage_223
+            push_owners_1 = _while_storage_224
             cutlass.yield_out([cutlass.Int32(index_3 + ((thread_stride_1 * 8)))])
-        _published_hidden_bf16 = _forward_storage_203
-        _source_hidden_bf16 = _forward_storage_204
-        _source_topk_ids_i64 = _forward_storage_205
-        push_owners_1 = _forward_storage_206
+        _peer_ptrs = _forward_storage_207
+        _published_hidden_bf16 = _forward_storage_208
+        _source_hidden_bf16 = _forward_storage_209
+        _source_topk_ids_i64 = _forward_storage_210
+        push_owners_1 = _forward_storage_211
         arrival_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival_1[0] = cutlass.Uint32(4294967295)
         arrival_1[1] = cutlass.Uint32(4294967295)
@@ -1575,17 +1615,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival_1[6] = cutlass.Uint32(4294967295)
         arrival_1[7] = cutlass.Uint32(4294967295)
         arm_thread_1 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_226 = _route_terms_bf16
-        _forward_storage_227 = arrival_1
-        _forward_loop_223 = cutlass.while_generate([cutlass.Int32((arm_thread_1 * 16))], lambda _forward_condition_224: _forward_condition_224 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_223.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_223 as _forward_values_225:
-            arrival_word_1 = _forward_values_225[0]
-            _gmem_store_bits_228 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_1[0]), cutlass.Uint32(arrival_1[1]), cutlass.Uint32(arrival_1[2]), cutlass.Uint32(arrival_1[3]), cutlass.Uint32(arrival_1[4]), cutlass.Uint32(arrival_1[5]), cutlass.Uint32(arrival_1[6]), cutlass.Uint32(arrival_1[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_228.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_1, dtype=cutlass.Uint32))
+        _forward_storage_232 = _route_terms_bf16
+        _forward_storage_233 = arrival_1
+        _forward_loop_229 = cutlass.while_generate([cutlass.Int32((arm_thread_1 * 16))], lambda _forward_condition_230: _forward_condition_230 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_229.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_229 as _forward_values_231:
+            arrival_word_1 = _forward_values_231[0]
+            _gmem_store_bits_234 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_1[0]), cutlass.Uint32(arrival_1[1]), cutlass.Uint32(arrival_1[2]), cutlass.Uint32(arrival_1[3]), cutlass.Uint32(arrival_1[4]), cutlass.Uint32(arrival_1[5]), cutlass.Uint32(arrival_1[6]), cutlass.Uint32(arrival_1[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_234.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_1, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word_1 + ((thread_stride_1 * 16)))])
-        _route_terms_bf16 = _forward_storage_226
-        arrival_1 = _forward_storage_227
+        _route_terms_bf16 = _forward_storage_232
+        arrival_1 = _forward_storage_233
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -1616,47 +1656,47 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert_1[0] = cutlass.Int32(cute.make_tensor(remote_ids_1, _flat_layout)[source_route_lane_1])
                 route_weight_lane_1[0] = cutlass.Float32(cute.make_tensor(remote_weights_1, _flat_layout)[source_route_lane_1])
-                _if_condition_229 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_1[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane_1[0] = cutlass.Int32(cutlass.select_(_if_condition_229, cutlass.Int32(1), owned_lane_1[0]))
+                _if_condition_235 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_1[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane_1[0] = cutlass.Int32(cutlass.select_(_if_condition_235, cutlass.Int32(1), owned_lane_1[0]))
             any_owned_1 = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane_1[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned_1 != 0):
                 source_words_1 = remote_hidden_words_1 + (source_token_1 * 1536)
-                _gmem_load_into_packed_addr_230 = cute.recast_ptr(source_words_1 + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_231 = prims.load_ext(_gmem_load_into_packed_addr_230 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[0] = cutlass.Uint32(_gmem_load_into_packed_231[0])
-                row_words_1[1] = cutlass.Uint32(_gmem_load_into_packed_231[1])
-                row_words_1[2] = cutlass.Uint32(_gmem_load_into_packed_231[2])
-                row_words_1[3] = cutlass.Uint32(_gmem_load_into_packed_231[3])
-                _gmem_load_into_packed_addr_232 = cute.recast_ptr(source_words_1 + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_233 = prims.load_ext(_gmem_load_into_packed_addr_232 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_233[0])
-                row_words_1[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_233[1])
-                row_words_1[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_233[2])
-                row_words_1[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_233[3])
-                _gmem_load_into_packed_addr_234 = cute.recast_ptr(source_words_1 + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_235 = prims.load_ext(_gmem_load_into_packed_addr_234 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_235[0])
-                row_words_1[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_235[1])
-                row_words_1[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_235[2])
-                row_words_1[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_235[3])
-                _gmem_load_into_packed_addr_236 = cute.recast_ptr(source_words_1 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_addr_236 = cute.recast_ptr(source_words_1 + (lane * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_237 = prims.load_ext(_gmem_load_into_packed_addr_236 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_237[0])
-                row_words_1[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_237[1])
-                row_words_1[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_237[2])
-                row_words_1[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_237[3])
-                _gmem_load_into_packed_addr_238 = cute.recast_ptr(source_words_1 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                row_words_1[0] = cutlass.Uint32(_gmem_load_into_packed_237[0])
+                row_words_1[1] = cutlass.Uint32(_gmem_load_into_packed_237[1])
+                row_words_1[2] = cutlass.Uint32(_gmem_load_into_packed_237[2])
+                row_words_1[3] = cutlass.Uint32(_gmem_load_into_packed_237[3])
+                _gmem_load_into_packed_addr_238 = cute.recast_ptr(source_words_1 + ((lane + 32) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_239 = prims.load_ext(_gmem_load_into_packed_addr_238 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_239[0])
-                row_words_1[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_239[1])
-                row_words_1[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_239[2])
-                row_words_1[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_239[3])
-                _gmem_load_into_packed_addr_240 = cute.recast_ptr(source_words_1 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                row_words_1[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_239[0])
+                row_words_1[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_239[1])
+                row_words_1[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_239[2])
+                row_words_1[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_239[3])
+                _gmem_load_into_packed_addr_240 = cute.recast_ptr(source_words_1 + ((lane + 64) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_241 = prims.load_ext(_gmem_load_into_packed_addr_240 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_241[0])
-                row_words_1[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_241[1])
-                row_words_1[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_241[2])
-                row_words_1[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_241[3])
+                row_words_1[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_241[0])
+                row_words_1[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_241[1])
+                row_words_1[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_241[2])
+                row_words_1[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_241[3])
+                _gmem_load_into_packed_addr_242 = cute.recast_ptr(source_words_1 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_243 = prims.load_ext(_gmem_load_into_packed_addr_242 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_243[0])
+                row_words_1[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_243[1])
+                row_words_1[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_243[2])
+                row_words_1[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_243[3])
+                _gmem_load_into_packed_addr_244 = cute.recast_ptr(source_words_1 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_245 = prims.load_ext(_gmem_load_into_packed_addr_244 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_245[0])
+                row_words_1[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_245[1])
+                row_words_1[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_245[2])
+                row_words_1[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_245[3])
+                _gmem_load_into_packed_addr_246 = cute.recast_ptr(source_words_1 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_247 = prims.load_ext(_gmem_load_into_packed_addr_246 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_247[0])
+                row_words_1[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_247[1])
+                row_words_1[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_247[2])
+                row_words_1[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_247[3])
                 if (owned_lane_1[0] != 0):
                     local_expert_lane_1 = cutlass.Int32((global_expert_1[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add_1 = cute.arch.atomic_add(route_counts_u32 + local_expert_lane_1, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -1670,69 +1710,69 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index_1 = cute.arch.shuffle_sync(row_index_lane_1[0], route_slot_1, mask=4294967295, mask_and_clamp=31)
                     if (row_index_1 >= 0):
                         row_dst_1 = activation_words_1 + (row_index_1 * 1536)
-                        _gmem_store_bits_242 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[0]), cutlass.Uint32(row_words_1[1]), cutlass.Uint32(row_words_1[2]), cutlass.Uint32(row_words_1[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_242.ir_value(), row_dst_1 + (lane * 4))
-                        _gmem_store_bits_243 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(4) + 0]), cutlass.Uint32(row_words_1[(4) + 1]), cutlass.Uint32(row_words_1[(4) + 2]), cutlass.Uint32(row_words_1[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_243.ir_value(), row_dst_1 + ((lane + 32) * 4))
-                        _gmem_store_bits_244 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(8) + 0]), cutlass.Uint32(row_words_1[(8) + 1]), cutlass.Uint32(row_words_1[(8) + 2]), cutlass.Uint32(row_words_1[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_244.ir_value(), row_dst_1 + ((lane + 64) * 4))
-                        _gmem_store_bits_245 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(12) + 0]), cutlass.Uint32(row_words_1[(12) + 1]), cutlass.Uint32(row_words_1[(12) + 2]), cutlass.Uint32(row_words_1[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_245.ir_value(), row_dst_1 + ((lane + 96) * 4))
-                        _gmem_store_bits_246 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(16) + 0]), cutlass.Uint32(row_words_1[(16) + 1]), cutlass.Uint32(row_words_1[(16) + 2]), cutlass.Uint32(row_words_1[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_246.ir_value(), row_dst_1 + ((lane + 128) * 4))
-                        _gmem_store_bits_247 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(20) + 0]), cutlass.Uint32(row_words_1[(20) + 1]), cutlass.Uint32(row_words_1[(20) + 2]), cutlass.Uint32(row_words_1[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_247.ir_value(), row_dst_1 + ((lane + 160) * 4))
-                _gmem_load_into_packed_addr_248 = cute.recast_ptr(source_words_1 + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_249 = prims.load_ext(_gmem_load_into_packed_addr_248 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[0] = cutlass.Uint32(_gmem_load_into_packed_249[0])
-                row_words_1[1] = cutlass.Uint32(_gmem_load_into_packed_249[1])
-                row_words_1[2] = cutlass.Uint32(_gmem_load_into_packed_249[2])
-                row_words_1[3] = cutlass.Uint32(_gmem_load_into_packed_249[3])
-                _gmem_load_into_packed_addr_250 = cute.recast_ptr(source_words_1 + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_251 = prims.load_ext(_gmem_load_into_packed_addr_250 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_251[0])
-                row_words_1[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_251[1])
-                row_words_1[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_251[2])
-                row_words_1[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_251[3])
-                _gmem_load_into_packed_addr_252 = cute.recast_ptr(source_words_1 + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_253 = prims.load_ext(_gmem_load_into_packed_addr_252 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_253[0])
-                row_words_1[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_253[1])
-                row_words_1[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_253[2])
-                row_words_1[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_253[3])
-                _gmem_load_into_packed_addr_254 = cute.recast_ptr(source_words_1 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                        _gmem_store_bits_248 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[0]), cutlass.Uint32(row_words_1[1]), cutlass.Uint32(row_words_1[2]), cutlass.Uint32(row_words_1[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_248.ir_value(), row_dst_1 + (lane * 4))
+                        _gmem_store_bits_249 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(4) + 0]), cutlass.Uint32(row_words_1[(4) + 1]), cutlass.Uint32(row_words_1[(4) + 2]), cutlass.Uint32(row_words_1[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_249.ir_value(), row_dst_1 + ((lane + 32) * 4))
+                        _gmem_store_bits_250 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(8) + 0]), cutlass.Uint32(row_words_1[(8) + 1]), cutlass.Uint32(row_words_1[(8) + 2]), cutlass.Uint32(row_words_1[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_250.ir_value(), row_dst_1 + ((lane + 64) * 4))
+                        _gmem_store_bits_251 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(12) + 0]), cutlass.Uint32(row_words_1[(12) + 1]), cutlass.Uint32(row_words_1[(12) + 2]), cutlass.Uint32(row_words_1[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_251.ir_value(), row_dst_1 + ((lane + 96) * 4))
+                        _gmem_store_bits_252 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(16) + 0]), cutlass.Uint32(row_words_1[(16) + 1]), cutlass.Uint32(row_words_1[(16) + 2]), cutlass.Uint32(row_words_1[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_252.ir_value(), row_dst_1 + ((lane + 128) * 4))
+                        _gmem_store_bits_253 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(20) + 0]), cutlass.Uint32(row_words_1[(20) + 1]), cutlass.Uint32(row_words_1[(20) + 2]), cutlass.Uint32(row_words_1[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_253.ir_value(), row_dst_1 + ((lane + 160) * 4))
+                _gmem_load_into_packed_addr_254 = cute.recast_ptr(source_words_1 + ((lane + 192) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_255 = prims.load_ext(_gmem_load_into_packed_addr_254 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_255[0])
-                row_words_1[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_255[1])
-                row_words_1[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_255[2])
-                row_words_1[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_255[3])
-                _gmem_load_into_packed_addr_256 = cute.recast_ptr(source_words_1 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                row_words_1[0] = cutlass.Uint32(_gmem_load_into_packed_255[0])
+                row_words_1[1] = cutlass.Uint32(_gmem_load_into_packed_255[1])
+                row_words_1[2] = cutlass.Uint32(_gmem_load_into_packed_255[2])
+                row_words_1[3] = cutlass.Uint32(_gmem_load_into_packed_255[3])
+                _gmem_load_into_packed_addr_256 = cute.recast_ptr(source_words_1 + ((lane + 224) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_257 = prims.load_ext(_gmem_load_into_packed_addr_256 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_257[0])
-                row_words_1[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_257[1])
-                row_words_1[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_257[2])
-                row_words_1[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_257[3])
-                _gmem_load_into_packed_addr_258 = cute.recast_ptr(source_words_1 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                row_words_1[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_257[0])
+                row_words_1[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_257[1])
+                row_words_1[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_257[2])
+                row_words_1[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_257[3])
+                _gmem_load_into_packed_addr_258 = cute.recast_ptr(source_words_1 + ((lane + 256) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_259 = prims.load_ext(_gmem_load_into_packed_addr_258 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_1[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_259[0])
-                row_words_1[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_259[1])
-                row_words_1[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_259[2])
-                row_words_1[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_259[3])
+                row_words_1[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_259[0])
+                row_words_1[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_259[1])
+                row_words_1[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_259[2])
+                row_words_1[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_259[3])
+                _gmem_load_into_packed_addr_260 = cute.recast_ptr(source_words_1 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_261 = prims.load_ext(_gmem_load_into_packed_addr_260 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_261[0])
+                row_words_1[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_261[1])
+                row_words_1[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_261[2])
+                row_words_1[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_261[3])
+                _gmem_load_into_packed_addr_262 = cute.recast_ptr(source_words_1 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_263 = prims.load_ext(_gmem_load_into_packed_addr_262 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_263[0])
+                row_words_1[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_263[1])
+                row_words_1[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_263[2])
+                row_words_1[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_263[3])
+                _gmem_load_into_packed_addr_264 = cute.recast_ptr(source_words_1 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_265 = prims.load_ext(_gmem_load_into_packed_addr_264 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_1[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_265[0])
+                row_words_1[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_265[1])
+                row_words_1[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_265[2])
+                row_words_1[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_265[3])
                 for route_slot_2 in cutlass.range_constexpr(0, 8, 1):
                     row_index_2 = cute.arch.shuffle_sync(row_index_lane_1[0], route_slot_2, mask=4294967295, mask_and_clamp=31)
                     if (row_index_2 >= 0):
-                        _gmem_store_bits_260 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[0]), cutlass.Uint32(row_words_1[1]), cutlass.Uint32(row_words_1[2]), cutlass.Uint32(row_words_1[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_260.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 192) * 4)))
-                        _gmem_store_bits_261 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(4) + 0]), cutlass.Uint32(row_words_1[(4) + 1]), cutlass.Uint32(row_words_1[(4) + 2]), cutlass.Uint32(row_words_1[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_261.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 224) * 4)))
-                        _gmem_store_bits_262 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(8) + 0]), cutlass.Uint32(row_words_1[(8) + 1]), cutlass.Uint32(row_words_1[(8) + 2]), cutlass.Uint32(row_words_1[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_262.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 256) * 4)))
-                        _gmem_store_bits_263 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(12) + 0]), cutlass.Uint32(row_words_1[(12) + 1]), cutlass.Uint32(row_words_1[(12) + 2]), cutlass.Uint32(row_words_1[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_263.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 288) * 4)))
-                        _gmem_store_bits_264 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(16) + 0]), cutlass.Uint32(row_words_1[(16) + 1]), cutlass.Uint32(row_words_1[(16) + 2]), cutlass.Uint32(row_words_1[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_264.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 320) * 4)))
-                        _gmem_store_bits_265 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(20) + 0]), cutlass.Uint32(row_words_1[(20) + 1]), cutlass.Uint32(row_words_1[(20) + 2]), cutlass.Uint32(row_words_1[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_265.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 352) * 4)))
+                        _gmem_store_bits_266 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[0]), cutlass.Uint32(row_words_1[1]), cutlass.Uint32(row_words_1[2]), cutlass.Uint32(row_words_1[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_266.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 192) * 4)))
+                        _gmem_store_bits_267 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(4) + 0]), cutlass.Uint32(row_words_1[(4) + 1]), cutlass.Uint32(row_words_1[(4) + 2]), cutlass.Uint32(row_words_1[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_267.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 224) * 4)))
+                        _gmem_store_bits_268 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(8) + 0]), cutlass.Uint32(row_words_1[(8) + 1]), cutlass.Uint32(row_words_1[(8) + 2]), cutlass.Uint32(row_words_1[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_268.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 256) * 4)))
+                        _gmem_store_bits_269 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(12) + 0]), cutlass.Uint32(row_words_1[(12) + 1]), cutlass.Uint32(row_words_1[(12) + 2]), cutlass.Uint32(row_words_1[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_269.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 288) * 4)))
+                        _gmem_store_bits_270 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(16) + 0]), cutlass.Uint32(row_words_1[(16) + 1]), cutlass.Uint32(row_words_1[(16) + 2]), cutlass.Uint32(row_words_1[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_270.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 320) * 4)))
+                        _gmem_store_bits_271 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_1[(20) + 0]), cutlass.Uint32(row_words_1[(20) + 1]), cutlass.Uint32(row_words_1[(20) + 2]), cutlass.Uint32(row_words_1[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_271.ir_value(), activation_words_1 + ((row_index_2 * 1536) + ((lane + 352) * 4)))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -1770,164 +1810,164 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             pass
                         prims.tcgen05_fence('after_thread_sync')
                         _mma_b_lo_0 = cutlass.Int32((((b_smem_addr >> 4) & 0x7FFF) + b_stage[0] * 256))
-                        _mma_ts_f16_266_d = prims.make_tmem_ptr(cutlass.Int32((tmem_accum + ((acc_stage_1[0] * 3) * 32))), cutlass.Int32)
-                        _mma_ts_f16_266_b_lo = cutlass.Uint32(_mma_b_lo_0)
-                        _mma_ts_f16_266_b_low_0, _mma_ts_f16_266_b_low_1, _mma_ts_f16_266_b_low_2, _mma_ts_f16_266_b_low_3, _mma_ts_f16_266_b_low_4, _mma_ts_f16_266_b_low_5, _mma_ts_f16_266_b_low_6, _mma_ts_f16_266_b_low_7, _mma_ts_f16_266_fullmask = _cake_inline_ptx(
+                        _mma_ts_f16_272_d = prims.make_tmem_ptr(cutlass.Int32((tmem_accum + ((acc_stage_1[0] * 3) * 32))), cutlass.Int32)
+                        _mma_ts_f16_272_b_lo = cutlass.Uint32(_mma_b_lo_0)
+                        _mma_ts_f16_272_b_low_0, _mma_ts_f16_272_b_low_1, _mma_ts_f16_272_b_low_2, _mma_ts_f16_272_b_low_3, _mma_ts_f16_272_b_low_4, _mma_ts_f16_272_b_low_5, _mma_ts_f16_272_b_low_6, _mma_ts_f16_272_b_low_7, _mma_ts_f16_272_fullmask = _cake_inline_ptx(
                             '{\n.reg .b32 b_base;\nmov.b32 b_base, {$r0};\nadd.u32 {$w0}, b_base, 0x00000000;\nadd.u32 {$w1}, b_base, 0x00000002;\nadd.u32 {$w2}, b_base, 0x00000004;\nadd.u32 {$w3}, b_base, 0x00000006;\nadd.u32 {$w4}, b_base, 0x00000080;\nadd.u32 {$w5}, b_base, 0x00000082;\nadd.u32 {$w6}, b_base, 0x00000084;\nadd.u32 {$w7}, b_base, 0x00000086;\nmov.b32 {$w8}, 0xFFFFFFFF;\n}',
                             write_only_types=[cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32],
-                            read_only_args=[_mma_ts_f16_266_b_lo],
+                            read_only_args=[_mma_ts_f16_272_b_lo],
                         )
-                        if prims.elect_sync(membermask=_mma_ts_f16_266_fullmask):
-                            _mma_ts_f16_266_b_0 = cutlass.Uint64(_mma_ts_f16_266_b_low_0) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_0 = prims.make_tmem_ptr(cutlass.Int32(tmem_transformed_a + (transformed_stage[0] * 64)), cutlass.Int32)
+                        if prims.elect_sync(membermask=_mma_ts_f16_272_fullmask):
+                            _mma_ts_f16_272_b_0 = cutlass.Uint64(_mma_ts_f16_272_b_low_0) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_0 = prims.make_tmem_ptr(cutlass.Int32(tmem_transformed_a + (transformed_stage[0] * 64)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_0, _mma_ts_f16_266_b_0,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_0, _mma_ts_f16_272_b_0,
                                 cutlass.Uint32(0x10080490), cutlass.Boolean(((cutlass.Int32(1) if (iter_k == 0) else cutlass.Int32(0))) == 0),
                             )
-                            _mma_ts_f16_266_b_1 = cutlass.Uint64(_mma_ts_f16_266_b_low_1) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_1 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 8)), cutlass.Int32)
+                            _mma_ts_f16_272_b_1 = cutlass.Uint64(_mma_ts_f16_272_b_low_1) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_1 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 8)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_1, _mma_ts_f16_266_b_1,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_1, _mma_ts_f16_272_b_1,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_2 = cutlass.Uint64(_mma_ts_f16_266_b_low_2) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_2 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 16)), cutlass.Int32)
+                            _mma_ts_f16_272_b_2 = cutlass.Uint64(_mma_ts_f16_272_b_low_2) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_2 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 16)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_2, _mma_ts_f16_266_b_2,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_2, _mma_ts_f16_272_b_2,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_3 = cutlass.Uint64(_mma_ts_f16_266_b_low_3) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_3 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 24)), cutlass.Int32)
+                            _mma_ts_f16_272_b_3 = cutlass.Uint64(_mma_ts_f16_272_b_low_3) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_3 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 24)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_3, _mma_ts_f16_266_b_3,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_3, _mma_ts_f16_272_b_3,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_4 = cutlass.Uint64(_mma_ts_f16_266_b_low_4) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_4 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 32)), cutlass.Int32)
+                            _mma_ts_f16_272_b_4 = cutlass.Uint64(_mma_ts_f16_272_b_low_4) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_4 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 32)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_4, _mma_ts_f16_266_b_4,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_4, _mma_ts_f16_272_b_4,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_5 = cutlass.Uint64(_mma_ts_f16_266_b_low_5) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_5 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 40)), cutlass.Int32)
+                            _mma_ts_f16_272_b_5 = cutlass.Uint64(_mma_ts_f16_272_b_low_5) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_5 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 40)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_5, _mma_ts_f16_266_b_5,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_5, _mma_ts_f16_272_b_5,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_6 = cutlass.Uint64(_mma_ts_f16_266_b_low_6) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_6 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 48)), cutlass.Int32)
+                            _mma_ts_f16_272_b_6 = cutlass.Uint64(_mma_ts_f16_272_b_low_6) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_6 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 48)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_6, _mma_ts_f16_266_b_6,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_6, _mma_ts_f16_272_b_6,
                                 cutlass.Uint32(0x10080490), True,
                             )
-                            _mma_ts_f16_266_b_7 = cutlass.Uint64(_mma_ts_f16_266_b_low_7) | (cutlass.Uint64(0x40004040) << 32)
-                            _mma_ts_f16_266_a_7 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 56)), cutlass.Int32)
+                            _mma_ts_f16_272_b_7 = cutlass.Uint64(_mma_ts_f16_272_b_low_7) | (cutlass.Uint64(0x40004040) << 32)
+                            _mma_ts_f16_272_a_7 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 56)), cutlass.Int32)
                             prims.tcgen05_mma(
                                 prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                _mma_ts_f16_266_d, _mma_ts_f16_266_a_7, _mma_ts_f16_266_b_7,
+                                _mma_ts_f16_272_d, _mma_ts_f16_272_a_7, _mma_ts_f16_272_b_7,
                                 cutlass.Uint32(0x10080490), True,
                             )
                         with cute.arch.elect_one():
                             cute.nvgpu.tcgen05.commit(b_free_addr + b_stage[0], 3, cute.nvgpu.tcgen05.CtaGroup.TWO)
-                        _advanced_stage_267 = cutlass.Uint32(b_stage[0] + 1)
-                        _stage_wrapped_268 = cutlass.Boolean(_advanced_stage_267 == 6)
-                        b_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_268, 0, _advanced_stage_267))
-                        _phase_b_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_268, _phase_b_full[0] ^ cutlass.Uint32(1), _phase_b_full[0]))
+                        _advanced_stage_273 = cutlass.Uint32(b_stage[0] + 1)
+                        _stage_wrapped_274 = cutlass.Boolean(_advanced_stage_273 == 6)
+                        b_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_274, 0, _advanced_stage_273))
+                        _phase_b_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_274, _phase_b_full[0] ^ cutlass.Uint32(1), _phase_b_full[0]))
                         for tail_1 in cutlass.range_constexpr(0, 2, 1):
                             if (route_count_1 > (32 + (tail_1 * 16))):
                                 while not prims.mbarrier_try_wait_parity(b_full_addr + b_stage[0], _phase_b_full[0], time_limit=10000000, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.ACQUIRE):
                                     pass
                                 prims.tcgen05_fence('after_thread_sync')
                                 _mma_b_lo_1 = cutlass.Int32((((b_smem_n16_addr >> 4) & 0x7FFF) + b_stage[0] * 256))
-                                _mma_ts_f16_269_d = prims.make_tmem_ptr(cutlass.Int32((tmem_accum + ((((acc_stage_1[0] * 3) + cutlass.Uint32(tail_1)) + 1) * 32))), cutlass.Int32)
-                                _mma_ts_f16_269_b_lo = cutlass.Uint32(_mma_b_lo_1)
-                                _mma_ts_f16_269_b_low_0, _mma_ts_f16_269_b_low_1, _mma_ts_f16_269_b_low_2, _mma_ts_f16_269_b_low_3, _mma_ts_f16_269_b_low_4, _mma_ts_f16_269_b_low_5, _mma_ts_f16_269_b_low_6, _mma_ts_f16_269_b_low_7, _mma_ts_f16_269_fullmask = _cake_inline_ptx(
+                                _mma_ts_f16_275_d = prims.make_tmem_ptr(cutlass.Int32((tmem_accum + ((((acc_stage_1[0] * 3) + cutlass.Uint32(tail_1)) + 1) * 32))), cutlass.Int32)
+                                _mma_ts_f16_275_b_lo = cutlass.Uint32(_mma_b_lo_1)
+                                _mma_ts_f16_275_b_low_0, _mma_ts_f16_275_b_low_1, _mma_ts_f16_275_b_low_2, _mma_ts_f16_275_b_low_3, _mma_ts_f16_275_b_low_4, _mma_ts_f16_275_b_low_5, _mma_ts_f16_275_b_low_6, _mma_ts_f16_275_b_low_7, _mma_ts_f16_275_fullmask = _cake_inline_ptx(
                                     '{\n.reg .b32 b_base;\nmov.b32 b_base, {$r0};\nadd.u32 {$w0}, b_base, 0x00000000;\nadd.u32 {$w1}, b_base, 0x00000002;\nadd.u32 {$w2}, b_base, 0x00000004;\nadd.u32 {$w3}, b_base, 0x00000006;\nadd.u32 {$w4}, b_base, 0x00000040;\nadd.u32 {$w5}, b_base, 0x00000042;\nadd.u32 {$w6}, b_base, 0x00000044;\nadd.u32 {$w7}, b_base, 0x00000046;\nmov.b32 {$w8}, 0xFFFFFFFF;\n}',
                                     write_only_types=[cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32],
-                                    read_only_args=[_mma_ts_f16_269_b_lo],
+                                    read_only_args=[_mma_ts_f16_275_b_lo],
                                 )
-                                if prims.elect_sync(membermask=_mma_ts_f16_269_fullmask):
-                                    _mma_ts_f16_269_b_0 = cutlass.Uint64(_mma_ts_f16_269_b_low_0) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_0 = prims.make_tmem_ptr(cutlass.Int32(tmem_transformed_a + (transformed_stage[0] * 64)), cutlass.Int32)
+                                if prims.elect_sync(membermask=_mma_ts_f16_275_fullmask):
+                                    _mma_ts_f16_275_b_0 = cutlass.Uint64(_mma_ts_f16_275_b_low_0) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_0 = prims.make_tmem_ptr(cutlass.Int32(tmem_transformed_a + (transformed_stage[0] * 64)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_0, _mma_ts_f16_269_b_0,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_0, _mma_ts_f16_275_b_0,
                                         cutlass.Uint32(0x10040490), cutlass.Boolean(((cutlass.Int32(1) if (iter_k == 0) else cutlass.Int32(0))) == 0),
                                     )
-                                    _mma_ts_f16_269_b_1 = cutlass.Uint64(_mma_ts_f16_269_b_low_1) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_1 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 8)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_1 = cutlass.Uint64(_mma_ts_f16_275_b_low_1) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_1 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 8)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_1, _mma_ts_f16_269_b_1,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_1, _mma_ts_f16_275_b_1,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_2 = cutlass.Uint64(_mma_ts_f16_269_b_low_2) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_2 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 16)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_2 = cutlass.Uint64(_mma_ts_f16_275_b_low_2) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_2 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 16)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_2, _mma_ts_f16_269_b_2,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_2, _mma_ts_f16_275_b_2,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_3 = cutlass.Uint64(_mma_ts_f16_269_b_low_3) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_3 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 24)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_3 = cutlass.Uint64(_mma_ts_f16_275_b_low_3) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_3 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 24)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_3, _mma_ts_f16_269_b_3,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_3, _mma_ts_f16_275_b_3,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_4 = cutlass.Uint64(_mma_ts_f16_269_b_low_4) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_4 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 32)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_4 = cutlass.Uint64(_mma_ts_f16_275_b_low_4) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_4 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 32)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_4, _mma_ts_f16_269_b_4,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_4, _mma_ts_f16_275_b_4,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_5 = cutlass.Uint64(_mma_ts_f16_269_b_low_5) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_5 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 40)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_5 = cutlass.Uint64(_mma_ts_f16_275_b_low_5) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_5 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 40)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_5, _mma_ts_f16_269_b_5,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_5, _mma_ts_f16_275_b_5,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_6 = cutlass.Uint64(_mma_ts_f16_269_b_low_6) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_6 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 48)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_6 = cutlass.Uint64(_mma_ts_f16_275_b_low_6) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_6 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 48)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_6, _mma_ts_f16_269_b_6,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_6, _mma_ts_f16_275_b_6,
                                         cutlass.Uint32(0x10040490), True,
                                     )
-                                    _mma_ts_f16_269_b_7 = cutlass.Uint64(_mma_ts_f16_269_b_low_7) | (cutlass.Uint64(0x40004040) << 32)
-                                    _mma_ts_f16_269_a_7 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 56)), cutlass.Int32)
+                                    _mma_ts_f16_275_b_7 = cutlass.Uint64(_mma_ts_f16_275_b_low_7) | (cutlass.Uint64(0x40004040) << 32)
+                                    _mma_ts_f16_275_a_7 = prims.make_tmem_ptr(cutlass.Int32((tmem_transformed_a + (transformed_stage[0] * 64) + 56)), cutlass.Int32)
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16, prims.CTAGroup.CTA_2,
-                                        _mma_ts_f16_269_d, _mma_ts_f16_269_a_7, _mma_ts_f16_269_b_7,
+                                        _mma_ts_f16_275_d, _mma_ts_f16_275_a_7, _mma_ts_f16_275_b_7,
                                         cutlass.Uint32(0x10040490), True,
                                     )
                                 with cute.arch.elect_one():
                                     cute.nvgpu.tcgen05.commit(b_free_addr + b_stage[0], 3, cute.nvgpu.tcgen05.CtaGroup.TWO)
-                                _advanced_stage_270 = cutlass.Uint32(b_stage[0] + 1)
-                                _stage_wrapped_271 = cutlass.Boolean(_advanced_stage_270 == 6)
-                                b_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_271, 0, _advanced_stage_270))
-                                _phase_b_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_271, _phase_b_full[0] ^ cutlass.Uint32(1), _phase_b_full[0]))
+                                _advanced_stage_276 = cutlass.Uint32(b_stage[0] + 1)
+                                _stage_wrapped_277 = cutlass.Boolean(_advanced_stage_276 == 6)
+                                b_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_277, 0, _advanced_stage_276))
+                                _phase_b_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_277, _phase_b_full[0] ^ cutlass.Uint32(1), _phase_b_full[0]))
                         with cute.arch.elect_one():
                             cute.nvgpu.tcgen05.commit(transformed_free_addr + transformed_stage[0], 3, cute.nvgpu.tcgen05.CtaGroup.TWO)
-                        _advanced_stage_272 = cutlass.Uint32(transformed_stage[0] + 1)
-                        _stage_wrapped_273 = cutlass.Boolean(_advanced_stage_272 == 4)
-                        transformed_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_273, 0, _advanced_stage_272))
-                        _phase_transformed_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_273, _phase_transformed_full[0] ^ cutlass.Uint32(1), _phase_transformed_full[0]))
+                        _advanced_stage_278 = cutlass.Uint32(transformed_stage[0] + 1)
+                        _stage_wrapped_279 = cutlass.Boolean(_advanced_stage_278 == 4)
+                        transformed_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_279, 0, _advanced_stage_278))
+                        _phase_transformed_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_279, _phase_transformed_full[0] ^ cutlass.Uint32(1), _phase_transformed_full[0]))
                     with cute.arch.elect_one():
                         cute.nvgpu.tcgen05.commit(acc_full_addr + acc_stage_1[0], 3, cute.nvgpu.tcgen05.CtaGroup.TWO)
-                    _advanced_stage_274 = cutlass.Uint32(acc_stage_1[0] + 1)
-                    _stage_wrapped_275 = cutlass.Boolean(_advanced_stage_274 == 2)
-                    acc_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_275, 0, _advanced_stage_274))
-                    _phase_acc_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_275, _phase_acc_free[0] ^ cutlass.Uint32(1), _phase_acc_free[0]))
+                    _advanced_stage_280 = cutlass.Uint32(acc_stage_1[0] + 1)
+                    _stage_wrapped_281 = cutlass.Boolean(_advanced_stage_280 == 2)
+                    acc_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_281, 0, _advanced_stage_280))
+                    _phase_acc_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_281, _phase_acc_free[0] ^ cutlass.Uint32(1), _phase_acc_free[0]))
         prims.tcgen05_fence('before_thread_sync')
         cute.arch.cluster_arrive(aligned=True)
         cute.arch.cluster_wait()
@@ -1945,14 +1985,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         scale_atom = cute.make_rmem_tensor((1,), cutlass.Int32)
         linear_thread_2 = cutlass.Int32(((bid * 384) + tid))
         thread_stride_2 = cutlass.Int32((num_bids * 384))
-        _forward_storage_279 = _published_topk_ids_i32
-        _forward_storage_280 = _published_topk_weights_f32
-        _forward_storage_281 = _source_topk_ids_i64
-        _forward_storage_282 = _source_topk_weights_f32
-        _forward_loop_276 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_277: _forward_condition_277 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
-        _forward_loop_276.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_276 as _forward_values_278:
-            push_2 = _forward_values_278[0]
+        _forward_storage_285 = _peer_ptrs
+        _forward_storage_286 = _published_topk_ids_i32
+        _forward_storage_287 = _published_topk_weights_f32
+        _forward_storage_288 = _source_topk_ids_i64
+        _forward_storage_289 = _source_topk_weights_f32
+        _forward_loop_282 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_283: _forward_condition_283 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
+        _forward_loop_282.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_282 as _forward_values_284:
+            push_2 = _forward_values_284[0]
             push_dest_4 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(push_2).ir_value(), cutlass.Int32((tokens_per_rank * 8)).ir_value())))
             push_route_2 = cutlass.Int32((push_2 - (push_dest_4 * (tokens_per_rank * 8))))
             push_slot_4 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 8) + push_route_2))
@@ -1962,102 +2003,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id_2).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot_4, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_2).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot_4)
             else:
-                peer_ids_2 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest_4) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest_4) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest_4) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest_4) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest_4) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest_4) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest_4) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest_4) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest_4) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest_4) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest_4) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest_4) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest_4) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest_4) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest_4) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest_4) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest_4) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest_4) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest_4) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest_4) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest_4) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest_4) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest_4) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest_4) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest_4) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest_4) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest_4) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest_4) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest_4) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest_4) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest_4) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights_2 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest_4) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest_4) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest_4) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest_4) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest_4) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest_4) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest_4) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest_4) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest_4) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest_4) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest_4) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest_4) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest_4) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest_4) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest_4) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest_4) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest_4) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest_4) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest_4) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest_4) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest_4) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest_4) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest_4) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest_4) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest_4) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest_4) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest_4) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest_4) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest_4) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest_4) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest_4) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids_2 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest_4)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights_2 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest_4)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id_2).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids_2 + push_slot_4, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_2).ir_value(), peer_weights_2 + push_slot_4)
             cutlass.yield_out([cutlass.Int32(push_2 + (thread_stride_2))])
-        _published_topk_ids_i32 = _forward_storage_279
-        _published_topk_weights_f32 = _forward_storage_280
-        _source_topk_ids_i64 = _forward_storage_281
-        _source_topk_weights_f32 = _forward_storage_282
-        _forward_storage_286 = _route_map_i32
-        _forward_storage_287 = _route_scale_f32
-        _forward_loop_283 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_284: _forward_condition_284 < cutlass.Int32(2048))
-        _forward_loop_283.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_283 as _forward_values_285:
-            index_4 = _forward_values_285[0]
+        _peer_ptrs = _forward_storage_285
+        _published_topk_ids_i32 = _forward_storage_286
+        _published_topk_weights_f32 = _forward_storage_287
+        _source_topk_ids_i64 = _forward_storage_288
+        _source_topk_weights_f32 = _forward_storage_289
+        _forward_storage_293 = _route_map_i32
+        _forward_storage_294 = _route_scale_f32
+        _forward_loop_290 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_291: _forward_condition_291 < cutlass.Int32(2048))
+        _forward_loop_290.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_290 as _forward_values_292:
+            index_4 = _forward_values_292[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index_4)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index_4)))
             cutlass.yield_out([cutlass.Int32(index_4 + (thread_stride_2))])
-        _route_map_i32 = _forward_storage_286
-        _route_scale_f32 = _forward_storage_287
-        _forward_storage_291 = _route_counts_u32
-        _forward_loop_288 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_289: _forward_condition_289 < cutlass.Int32(32))
-        _forward_loop_288.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_288 as _forward_values_290:
-            expert_4 = _forward_values_290[0]
+        _route_map_i32 = _forward_storage_293
+        _route_scale_f32 = _forward_storage_294
+        _forward_storage_298 = _route_counts_u32
+        _forward_loop_295 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_296: _forward_condition_296 < cutlass.Int32(32))
+        _forward_loop_295.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_295 as _forward_values_297:
+            expert_4 = _forward_values_297[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_4)))
             cutlass.yield_out([cutlass.Int32(expert_4 + (thread_stride_2))])
-        _route_counts_u32 = _forward_storage_291
-        _forward_storage_295 = _fc1_done
-        _forward_loop_292 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_293: _forward_condition_293 < cutlass.Int32(96))
-        _forward_loop_292.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_292 as _forward_values_294:
-            expert_row_tile_4 = _forward_values_294[0]
+        _route_counts_u32 = _forward_storage_298
+        _forward_storage_302 = _fc1_done
+        _forward_loop_299 = cutlass.while_generate([cutlass.Int32(linear_thread_2)], lambda _forward_condition_300: _forward_condition_300 < cutlass.Int32(96))
+        _forward_loop_299.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_299 as _forward_values_301:
+            expert_row_tile_4 = _forward_values_301[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_4, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
             cutlass.yield_out([cutlass.Int32(expert_row_tile_4 + (thread_stride_2))])
-        _fc1_done = _forward_storage_295
-        _forward_storage_299 = _published_hidden_bf16
-        _forward_storage_300 = _source_hidden_bf16
-        _forward_storage_301 = _source_topk_ids_i64
-        _forward_storage_302 = push_owners_2
-        _forward_loop_296 = cutlass.while_generate([cutlass.Int32((linear_thread_2 * 8))], lambda _forward_condition_297: _forward_condition_297 < cutlass.Int32((tokens_per_rank * 3072)))
-        _forward_loop_296.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_296 as _forward_values_298:
-            index_5 = _forward_values_298[0]
+        _fc1_done = _forward_storage_302
+        _forward_storage_306 = _peer_ptrs
+        _forward_storage_307 = _published_hidden_bf16
+        _forward_storage_308 = _source_hidden_bf16
+        _forward_storage_309 = _source_topk_ids_i64
+        _forward_storage_310 = push_owners_2
+        _forward_loop_303 = cutlass.while_generate([cutlass.Int32((linear_thread_2 * 8))], lambda _forward_condition_304: _forward_condition_304 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_303.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_303 as _forward_values_305:
+            index_5 = _forward_values_305[0]
             hidden_f32_2 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_303 = prims.load_ext(source_hidden_bf16 + index_5, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_304 = _gmem_load_into_303.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32_2[0] = _gmem_load_into_f32_304[0]
-            hidden_f32_2[1] = _gmem_load_into_f32_304[1]
-            hidden_f32_2[2] = _gmem_load_into_f32_304[2]
-            hidden_f32_2[3] = _gmem_load_into_f32_304[3]
-            hidden_f32_2[4] = _gmem_load_into_f32_304[4]
-            hidden_f32_2[5] = _gmem_load_into_f32_304[5]
-            hidden_f32_2[6] = _gmem_load_into_f32_304[6]
-            hidden_f32_2[7] = _gmem_load_into_f32_304[7]
+            _gmem_load_into_311 = prims.load_ext(source_hidden_bf16 + index_5, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_312 = _gmem_load_into_311.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32_2[0] = _gmem_load_into_f32_312[0]
+            hidden_f32_2[1] = _gmem_load_into_f32_312[1]
+            hidden_f32_2[2] = _gmem_load_into_f32_312[2]
+            hidden_f32_2[3] = _gmem_load_into_f32_312[3]
+            hidden_f32_2[4] = _gmem_load_into_f32_312[4]
+            hidden_f32_2[5] = _gmem_load_into_f32_312[5]
+            hidden_f32_2[6] = _gmem_load_into_f32_312[6]
+            hidden_f32_2[7] = _gmem_load_into_f32_312[7]
             chunk_2 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_305 = prims.cvt_packfloat_f32(hidden_f32_2[1], hidden_f32_2[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_2[0] = cutlass.Uint32(_bf16_pack_305)
-            _bf16_pack_306 = prims.cvt_packfloat_f32(hidden_f32_2[3], hidden_f32_2[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_2[1] = cutlass.Uint32(_bf16_pack_306)
-            _bf16_pack_307 = prims.cvt_packfloat_f32(hidden_f32_2[5], hidden_f32_2[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_2[2] = cutlass.Uint32(_bf16_pack_307)
-            _bf16_pack_308 = prims.cvt_packfloat_f32(hidden_f32_2[7], hidden_f32_2[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_2[3] = cutlass.Uint32(_bf16_pack_308)
+            _bf16_pack_313 = prims.cvt_packfloat_f32(hidden_f32_2[1], hidden_f32_2[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_2[0] = cutlass.Uint32(_bf16_pack_313)
+            _bf16_pack_314 = prims.cvt_packfloat_f32(hidden_f32_2[3], hidden_f32_2[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_2[1] = cutlass.Uint32(_bf16_pack_314)
+            _bf16_pack_315 = prims.cvt_packfloat_f32(hidden_f32_2[5], hidden_f32_2[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_2[2] = cutlass.Uint32(_bf16_pack_315)
+            _bf16_pack_316 = prims.cvt_packfloat_f32(hidden_f32_2[7], hidden_f32_2[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_2[3] = cutlass.Uint32(_bf16_pack_316)
             push_token_2 = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_5).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners_2[0] = cutlass.Uint32(0)
             for push_slot_5 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank_2 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token_2 * 8) + push_slot_5)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners_2[0] = cutlass.Uint32((push_owners_2[0] | (1 << cutlass.Uint32(owner_rank_2))))
             row_offset_2 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_5))
-            _while_storage_312 = _published_hidden_bf16
-            _while_storage_313 = chunk_2
-            _while_storage_314 = push_owners_2
-            _while_loop_309 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_310: (push_owners_2[0] != 0))
-            with _while_loop_309 as _while_values_311:
-                _ffs_reversed_bits_315 = cute.arch.brev(cutlass.Uint32(push_owners_2[0]))
-                _ffs_leading_one_316 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_315))
-                _find_first_set_2 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_2[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_316))
+            _while_storage_320 = _peer_ptrs
+            _while_storage_321 = _published_hidden_bf16
+            _while_storage_322 = chunk_2
+            _while_storage_323 = push_owners_2
+            _while_loop_317 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_318: (push_owners_2[0] != 0))
+            with _while_loop_317 as _while_values_319:
+                _ffs_reversed_bits_324 = cute.arch.brev(cutlass.Uint32(push_owners_2[0]))
+                _ffs_leading_one_325 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_324))
+                _find_first_set_2 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_2[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_325))
                 push_dest_5 = cutlass.Int32((_find_first_set_2 - 1))
                 push_owners_2[0] = cutlass.Uint32((push_owners_2[0] & (push_owners_2[0] - 1)))
                 if (push_dest_5 == mega_pg_rank):
-                    _gmem_store_bits_317 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_2[0]), cutlass.Uint32(chunk_2[1]), cutlass.Uint32(chunk_2[2]), cutlass.Uint32(chunk_2[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_317.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_2, dtype=cutlass.Uint32))
+                    _gmem_store_bits_326 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_2[0]), cutlass.Uint32(chunk_2[1]), cutlass.Uint32(chunk_2[2]), cutlass.Uint32(chunk_2[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_326.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_2, dtype=cutlass.Uint32))
                 else:
-                    peer_rows_2 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_5) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_5) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_5) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_5) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_5) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_5) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_5) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_5) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_5) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_5) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_5) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_5) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_5) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_5) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_5) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_5) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_5) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_5) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_5) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_5) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_5) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_5) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_5) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_5) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_5) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_5) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_5) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_5) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_5) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_5) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_5) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_318 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_2[0]), cutlass.Uint32(chunk_2[1]), cutlass.Uint32(chunk_2[2]), cutlass.Uint32(chunk_2[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_318.ir_value(), cute.recast_ptr(peer_rows_2 + row_offset_2, dtype=cutlass.Uint32))
+                    peer_rows_2 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_5])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_327 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_2[0]), cutlass.Uint32(chunk_2[1]), cutlass.Uint32(chunk_2[2]), cutlass.Uint32(chunk_2[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_327.ir_value(), cute.recast_ptr(peer_rows_2 + row_offset_2, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_312
-            chunk_2 = _while_storage_313
-            push_owners_2 = _while_storage_314
+            _peer_ptrs = _while_storage_320
+            _published_hidden_bf16 = _while_storage_321
+            chunk_2 = _while_storage_322
+            push_owners_2 = _while_storage_323
             cutlass.yield_out([cutlass.Int32(index_5 + ((thread_stride_2 * 8)))])
-        _published_hidden_bf16 = _forward_storage_299
-        _source_hidden_bf16 = _forward_storage_300
-        _source_topk_ids_i64 = _forward_storage_301
-        push_owners_2 = _forward_storage_302
+        _peer_ptrs = _forward_storage_306
+        _published_hidden_bf16 = _forward_storage_307
+        _source_hidden_bf16 = _forward_storage_308
+        _source_topk_ids_i64 = _forward_storage_309
+        push_owners_2 = _forward_storage_310
         arrival_2 = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival_2[0] = cutlass.Uint32(4294967295)
         arrival_2[1] = cutlass.Uint32(4294967295)
@@ -2068,17 +2114,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival_2[6] = cutlass.Uint32(4294967295)
         arrival_2[7] = cutlass.Uint32(4294967295)
         arm_thread_2 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_322 = _route_terms_bf16
-        _forward_storage_323 = arrival_2
-        _forward_loop_319 = cutlass.while_generate([cutlass.Int32((arm_thread_2 * 16))], lambda _forward_condition_320: _forward_condition_320 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_319.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_319 as _forward_values_321:
-            arrival_word_2 = _forward_values_321[0]
-            _gmem_store_bits_324 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_2[0]), cutlass.Uint32(arrival_2[1]), cutlass.Uint32(arrival_2[2]), cutlass.Uint32(arrival_2[3]), cutlass.Uint32(arrival_2[4]), cutlass.Uint32(arrival_2[5]), cutlass.Uint32(arrival_2[6]), cutlass.Uint32(arrival_2[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_324.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_2, dtype=cutlass.Uint32))
+        _forward_storage_331 = _route_terms_bf16
+        _forward_storage_332 = arrival_2
+        _forward_loop_328 = cutlass.while_generate([cutlass.Int32((arm_thread_2 * 16))], lambda _forward_condition_329: _forward_condition_329 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_328.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_328 as _forward_values_330:
+            arrival_word_2 = _forward_values_330[0]
+            _gmem_store_bits_333 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_2[0]), cutlass.Uint32(arrival_2[1]), cutlass.Uint32(arrival_2[2]), cutlass.Uint32(arrival_2[3]), cutlass.Uint32(arrival_2[4]), cutlass.Uint32(arrival_2[5]), cutlass.Uint32(arrival_2[6]), cutlass.Uint32(arrival_2[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_333.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_2, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word_2 + ((thread_stride_2 * 16)))])
-        _route_terms_bf16 = _forward_storage_322
-        arrival_2 = _forward_storage_323
+        _route_terms_bf16 = _forward_storage_331
+        arrival_2 = _forward_storage_332
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2134,47 +2180,47 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert_2[0] = cutlass.Int32(cute.make_tensor(remote_ids_2, _flat_layout)[source_route_lane_2])
                 route_weight_lane_2[0] = cutlass.Float32(cute.make_tensor(remote_weights_2, _flat_layout)[source_route_lane_2])
-                _if_condition_325 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_2[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane_2[0] = cutlass.Int32(cutlass.select_(_if_condition_325, cutlass.Int32(1), owned_lane_2[0]))
+                _if_condition_334 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_2[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane_2[0] = cutlass.Int32(cutlass.select_(_if_condition_334, cutlass.Int32(1), owned_lane_2[0]))
             any_owned_2 = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane_2[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned_2 != 0):
                 source_words_2 = remote_hidden_words_2 + (source_token_2 * 1536)
-                _gmem_load_into_packed_addr_326 = cute.recast_ptr(source_words_2 + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_327 = prims.load_ext(_gmem_load_into_packed_addr_326 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[0] = cutlass.Uint32(_gmem_load_into_packed_327[0])
-                row_words_2[1] = cutlass.Uint32(_gmem_load_into_packed_327[1])
-                row_words_2[2] = cutlass.Uint32(_gmem_load_into_packed_327[2])
-                row_words_2[3] = cutlass.Uint32(_gmem_load_into_packed_327[3])
-                _gmem_load_into_packed_addr_328 = cute.recast_ptr(source_words_2 + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_329 = prims.load_ext(_gmem_load_into_packed_addr_328 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_329[0])
-                row_words_2[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_329[1])
-                row_words_2[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_329[2])
-                row_words_2[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_329[3])
-                _gmem_load_into_packed_addr_330 = cute.recast_ptr(source_words_2 + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_331 = prims.load_ext(_gmem_load_into_packed_addr_330 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_331[0])
-                row_words_2[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_331[1])
-                row_words_2[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_331[2])
-                row_words_2[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_331[3])
-                _gmem_load_into_packed_addr_332 = cute.recast_ptr(source_words_2 + ((lane + 96) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_333 = prims.load_ext(_gmem_load_into_packed_addr_332 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_333[0])
-                row_words_2[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_333[1])
-                row_words_2[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_333[2])
-                row_words_2[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_333[3])
-                _gmem_load_into_packed_addr_334 = cute.recast_ptr(source_words_2 + ((lane + 128) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_335 = prims.load_ext(_gmem_load_into_packed_addr_334 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_335[0])
-                row_words_2[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_335[1])
-                row_words_2[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_335[2])
-                row_words_2[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_335[3])
-                _gmem_load_into_packed_addr_336 = cute.recast_ptr(source_words_2 + ((lane + 160) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_337 = prims.load_ext(_gmem_load_into_packed_addr_336 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_337[0])
-                row_words_2[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_337[1])
-                row_words_2[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_337[2])
-                row_words_2[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_337[3])
+                _gmem_load_into_packed_addr_335 = cute.recast_ptr(source_words_2 + (lane * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_336 = prims.load_ext(_gmem_load_into_packed_addr_335 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[0] = cutlass.Uint32(_gmem_load_into_packed_336[0])
+                row_words_2[1] = cutlass.Uint32(_gmem_load_into_packed_336[1])
+                row_words_2[2] = cutlass.Uint32(_gmem_load_into_packed_336[2])
+                row_words_2[3] = cutlass.Uint32(_gmem_load_into_packed_336[3])
+                _gmem_load_into_packed_addr_337 = cute.recast_ptr(source_words_2 + ((lane + 32) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_338 = prims.load_ext(_gmem_load_into_packed_addr_337 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_338[0])
+                row_words_2[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_338[1])
+                row_words_2[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_338[2])
+                row_words_2[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_338[3])
+                _gmem_load_into_packed_addr_339 = cute.recast_ptr(source_words_2 + ((lane + 64) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_340 = prims.load_ext(_gmem_load_into_packed_addr_339 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_340[0])
+                row_words_2[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_340[1])
+                row_words_2[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_340[2])
+                row_words_2[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_340[3])
+                _gmem_load_into_packed_addr_341 = cute.recast_ptr(source_words_2 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_342 = prims.load_ext(_gmem_load_into_packed_addr_341 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_342[0])
+                row_words_2[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_342[1])
+                row_words_2[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_342[2])
+                row_words_2[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_342[3])
+                _gmem_load_into_packed_addr_343 = cute.recast_ptr(source_words_2 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_344 = prims.load_ext(_gmem_load_into_packed_addr_343 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_344[0])
+                row_words_2[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_344[1])
+                row_words_2[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_344[2])
+                row_words_2[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_344[3])
+                _gmem_load_into_packed_addr_345 = cute.recast_ptr(source_words_2 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_346 = prims.load_ext(_gmem_load_into_packed_addr_345 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_346[0])
+                row_words_2[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_346[1])
+                row_words_2[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_346[2])
+                row_words_2[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_346[3])
                 if (owned_lane_2[0] != 0):
                     local_expert_lane_2 = cutlass.Int32((global_expert_2[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add_2 = cute.arch.atomic_add(route_counts_u32 + local_expert_lane_2, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -2188,69 +2234,69 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index_3 = cute.arch.shuffle_sync(row_index_lane_2[0], route_slot_3, mask=4294967295, mask_and_clamp=31)
                     if (row_index_3 >= 0):
                         row_dst_2 = activation_words_2 + (row_index_3 * 1536)
-                        _gmem_store_bits_338 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[0]), cutlass.Uint32(row_words_2[1]), cutlass.Uint32(row_words_2[2]), cutlass.Uint32(row_words_2[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_338.ir_value(), row_dst_2 + (lane * 4))
-                        _gmem_store_bits_339 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(4) + 0]), cutlass.Uint32(row_words_2[(4) + 1]), cutlass.Uint32(row_words_2[(4) + 2]), cutlass.Uint32(row_words_2[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_339.ir_value(), row_dst_2 + ((lane + 32) * 4))
-                        _gmem_store_bits_340 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(8) + 0]), cutlass.Uint32(row_words_2[(8) + 1]), cutlass.Uint32(row_words_2[(8) + 2]), cutlass.Uint32(row_words_2[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_340.ir_value(), row_dst_2 + ((lane + 64) * 4))
-                        _gmem_store_bits_341 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(12) + 0]), cutlass.Uint32(row_words_2[(12) + 1]), cutlass.Uint32(row_words_2[(12) + 2]), cutlass.Uint32(row_words_2[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_341.ir_value(), row_dst_2 + ((lane + 96) * 4))
-                        _gmem_store_bits_342 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(16) + 0]), cutlass.Uint32(row_words_2[(16) + 1]), cutlass.Uint32(row_words_2[(16) + 2]), cutlass.Uint32(row_words_2[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_342.ir_value(), row_dst_2 + ((lane + 128) * 4))
-                        _gmem_store_bits_343 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(20) + 0]), cutlass.Uint32(row_words_2[(20) + 1]), cutlass.Uint32(row_words_2[(20) + 2]), cutlass.Uint32(row_words_2[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_343.ir_value(), row_dst_2 + ((lane + 160) * 4))
-                _gmem_load_into_packed_addr_344 = cute.recast_ptr(source_words_2 + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_345 = prims.load_ext(_gmem_load_into_packed_addr_344 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[0] = cutlass.Uint32(_gmem_load_into_packed_345[0])
-                row_words_2[1] = cutlass.Uint32(_gmem_load_into_packed_345[1])
-                row_words_2[2] = cutlass.Uint32(_gmem_load_into_packed_345[2])
-                row_words_2[3] = cutlass.Uint32(_gmem_load_into_packed_345[3])
-                _gmem_load_into_packed_addr_346 = cute.recast_ptr(source_words_2 + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_347 = prims.load_ext(_gmem_load_into_packed_addr_346 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_347[0])
-                row_words_2[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_347[1])
-                row_words_2[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_347[2])
-                row_words_2[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_347[3])
-                _gmem_load_into_packed_addr_348 = cute.recast_ptr(source_words_2 + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_349 = prims.load_ext(_gmem_load_into_packed_addr_348 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_349[0])
-                row_words_2[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_349[1])
-                row_words_2[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_349[2])
-                row_words_2[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_349[3])
-                _gmem_load_into_packed_addr_350 = cute.recast_ptr(source_words_2 + ((lane + 288) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_351 = prims.load_ext(_gmem_load_into_packed_addr_350 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_351[0])
-                row_words_2[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_351[1])
-                row_words_2[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_351[2])
-                row_words_2[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_351[3])
-                _gmem_load_into_packed_addr_352 = cute.recast_ptr(source_words_2 + ((lane + 320) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_353 = prims.load_ext(_gmem_load_into_packed_addr_352 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_353[0])
-                row_words_2[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_353[1])
-                row_words_2[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_353[2])
-                row_words_2[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_353[3])
-                _gmem_load_into_packed_addr_354 = cute.recast_ptr(source_words_2 + ((lane + 352) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_355 = prims.load_ext(_gmem_load_into_packed_addr_354 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_2[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_355[0])
-                row_words_2[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_355[1])
-                row_words_2[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_355[2])
-                row_words_2[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_355[3])
+                        _gmem_store_bits_347 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[0]), cutlass.Uint32(row_words_2[1]), cutlass.Uint32(row_words_2[2]), cutlass.Uint32(row_words_2[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_347.ir_value(), row_dst_2 + (lane * 4))
+                        _gmem_store_bits_348 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(4) + 0]), cutlass.Uint32(row_words_2[(4) + 1]), cutlass.Uint32(row_words_2[(4) + 2]), cutlass.Uint32(row_words_2[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_348.ir_value(), row_dst_2 + ((lane + 32) * 4))
+                        _gmem_store_bits_349 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(8) + 0]), cutlass.Uint32(row_words_2[(8) + 1]), cutlass.Uint32(row_words_2[(8) + 2]), cutlass.Uint32(row_words_2[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_349.ir_value(), row_dst_2 + ((lane + 64) * 4))
+                        _gmem_store_bits_350 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(12) + 0]), cutlass.Uint32(row_words_2[(12) + 1]), cutlass.Uint32(row_words_2[(12) + 2]), cutlass.Uint32(row_words_2[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_350.ir_value(), row_dst_2 + ((lane + 96) * 4))
+                        _gmem_store_bits_351 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(16) + 0]), cutlass.Uint32(row_words_2[(16) + 1]), cutlass.Uint32(row_words_2[(16) + 2]), cutlass.Uint32(row_words_2[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_351.ir_value(), row_dst_2 + ((lane + 128) * 4))
+                        _gmem_store_bits_352 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(20) + 0]), cutlass.Uint32(row_words_2[(20) + 1]), cutlass.Uint32(row_words_2[(20) + 2]), cutlass.Uint32(row_words_2[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_352.ir_value(), row_dst_2 + ((lane + 160) * 4))
+                _gmem_load_into_packed_addr_353 = cute.recast_ptr(source_words_2 + ((lane + 192) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_354 = prims.load_ext(_gmem_load_into_packed_addr_353 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[0] = cutlass.Uint32(_gmem_load_into_packed_354[0])
+                row_words_2[1] = cutlass.Uint32(_gmem_load_into_packed_354[1])
+                row_words_2[2] = cutlass.Uint32(_gmem_load_into_packed_354[2])
+                row_words_2[3] = cutlass.Uint32(_gmem_load_into_packed_354[3])
+                _gmem_load_into_packed_addr_355 = cute.recast_ptr(source_words_2 + ((lane + 224) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_356 = prims.load_ext(_gmem_load_into_packed_addr_355 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_356[0])
+                row_words_2[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_356[1])
+                row_words_2[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_356[2])
+                row_words_2[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_356[3])
+                _gmem_load_into_packed_addr_357 = cute.recast_ptr(source_words_2 + ((lane + 256) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_358 = prims.load_ext(_gmem_load_into_packed_addr_357 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_358[0])
+                row_words_2[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_358[1])
+                row_words_2[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_358[2])
+                row_words_2[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_358[3])
+                _gmem_load_into_packed_addr_359 = cute.recast_ptr(source_words_2 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_360 = prims.load_ext(_gmem_load_into_packed_addr_359 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_360[0])
+                row_words_2[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_360[1])
+                row_words_2[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_360[2])
+                row_words_2[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_360[3])
+                _gmem_load_into_packed_addr_361 = cute.recast_ptr(source_words_2 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_362 = prims.load_ext(_gmem_load_into_packed_addr_361 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_362[0])
+                row_words_2[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_362[1])
+                row_words_2[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_362[2])
+                row_words_2[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_362[3])
+                _gmem_load_into_packed_addr_363 = cute.recast_ptr(source_words_2 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_364 = prims.load_ext(_gmem_load_into_packed_addr_363 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_2[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_364[0])
+                row_words_2[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_364[1])
+                row_words_2[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_364[2])
+                row_words_2[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_364[3])
                 for route_slot_4 in cutlass.range_constexpr(0, 8, 1):
                     row_index_4 = cute.arch.shuffle_sync(row_index_lane_2[0], route_slot_4, mask=4294967295, mask_and_clamp=31)
                     if (row_index_4 >= 0):
-                        _gmem_store_bits_356 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[0]), cutlass.Uint32(row_words_2[1]), cutlass.Uint32(row_words_2[2]), cutlass.Uint32(row_words_2[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_356.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 192) * 4)))
-                        _gmem_store_bits_357 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(4) + 0]), cutlass.Uint32(row_words_2[(4) + 1]), cutlass.Uint32(row_words_2[(4) + 2]), cutlass.Uint32(row_words_2[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_357.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 224) * 4)))
-                        _gmem_store_bits_358 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(8) + 0]), cutlass.Uint32(row_words_2[(8) + 1]), cutlass.Uint32(row_words_2[(8) + 2]), cutlass.Uint32(row_words_2[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_358.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 256) * 4)))
-                        _gmem_store_bits_359 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(12) + 0]), cutlass.Uint32(row_words_2[(12) + 1]), cutlass.Uint32(row_words_2[(12) + 2]), cutlass.Uint32(row_words_2[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_359.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 288) * 4)))
-                        _gmem_store_bits_360 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(16) + 0]), cutlass.Uint32(row_words_2[(16) + 1]), cutlass.Uint32(row_words_2[(16) + 2]), cutlass.Uint32(row_words_2[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_360.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 320) * 4)))
-                        _gmem_store_bits_361 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(20) + 0]), cutlass.Uint32(row_words_2[(20) + 1]), cutlass.Uint32(row_words_2[(20) + 2]), cutlass.Uint32(row_words_2[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_361.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 352) * 4)))
+                        _gmem_store_bits_365 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[0]), cutlass.Uint32(row_words_2[1]), cutlass.Uint32(row_words_2[2]), cutlass.Uint32(row_words_2[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_365.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 192) * 4)))
+                        _gmem_store_bits_366 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(4) + 0]), cutlass.Uint32(row_words_2[(4) + 1]), cutlass.Uint32(row_words_2[(4) + 2]), cutlass.Uint32(row_words_2[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_366.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 224) * 4)))
+                        _gmem_store_bits_367 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(8) + 0]), cutlass.Uint32(row_words_2[(8) + 1]), cutlass.Uint32(row_words_2[(8) + 2]), cutlass.Uint32(row_words_2[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_367.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 256) * 4)))
+                        _gmem_store_bits_368 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(12) + 0]), cutlass.Uint32(row_words_2[(12) + 1]), cutlass.Uint32(row_words_2[(12) + 2]), cutlass.Uint32(row_words_2[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_368.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 288) * 4)))
+                        _gmem_store_bits_369 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(16) + 0]), cutlass.Uint32(row_words_2[(16) + 1]), cutlass.Uint32(row_words_2[(16) + 2]), cutlass.Uint32(row_words_2[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_369.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 320) * 4)))
+                        _gmem_store_bits_370 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_2[(20) + 0]), cutlass.Uint32(row_words_2[(20) + 1]), cutlass.Uint32(row_words_2[(20) + 2]), cutlass.Uint32(row_words_2[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_370.ir_value(), activation_words_2 + ((row_index_4 * 1536) + ((lane + 352) * 4)))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -2322,14 +2368,14 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                                 mode=prims.TMALoadMode.TILE,
                             )
                         cute.arch.mbarrier_arrive_and_expect_tx(scale_full_addr + scale_stage[0], 512)
-                    _advanced_stage_362 = cutlass.Uint32(a_stage[0] + 1)
-                    _stage_wrapped_363 = cutlass.Boolean(_advanced_stage_362 == 8)
-                    a_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_363, 0, _advanced_stage_362))
-                    _phase_a_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_363, _phase_a_free[0] ^ cutlass.Uint32(1), _phase_a_free[0]))
-                    _advanced_stage_364 = cutlass.Uint32(scale_stage[0] + 1)
-                    _stage_wrapped_365 = cutlass.Boolean(_advanced_stage_364 == 8)
-                    scale_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_365, 0, _advanced_stage_364))
-                    _phase_scale_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_365, _phase_scale_free[0] ^ cutlass.Uint32(1), _phase_scale_free[0]))
+                    _advanced_stage_371 = cutlass.Uint32(a_stage[0] + 1)
+                    _stage_wrapped_372 = cutlass.Boolean(_advanced_stage_371 == 8)
+                    a_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_372, 0, _advanced_stage_371))
+                    _phase_a_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_372, _phase_a_free[0] ^ cutlass.Uint32(1), _phase_a_free[0]))
+                    _advanced_stage_373 = cutlass.Uint32(scale_stage[0] + 1)
+                    _stage_wrapped_374 = cutlass.Boolean(_advanced_stage_373 == 8)
+                    scale_stage[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_374, 0, _advanced_stage_373))
+                    _phase_scale_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_374, _phase_scale_free[0] ^ cutlass.Uint32(1), _phase_scale_free[0]))
         cute.arch.cluster_arrive(aligned=True)
         cute.arch.cluster_wait()
     elif warp == 6:
@@ -2343,14 +2389,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _phase_b_free = cute.make_rmem_tensor((1,), cutlass.Uint32)
         linear_thread_3 = cutlass.Int32(((bid * 384) + tid))
         thread_stride_3 = cutlass.Int32((num_bids * 384))
-        _forward_storage_369 = _published_topk_ids_i32
-        _forward_storage_370 = _published_topk_weights_f32
-        _forward_storage_371 = _source_topk_ids_i64
-        _forward_storage_372 = _source_topk_weights_f32
-        _forward_loop_366 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_367: _forward_condition_367 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
-        _forward_loop_366.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_366 as _forward_values_368:
-            push_3 = _forward_values_368[0]
+        _forward_storage_378 = _peer_ptrs
+        _forward_storage_379 = _published_topk_ids_i32
+        _forward_storage_380 = _published_topk_weights_f32
+        _forward_storage_381 = _source_topk_ids_i64
+        _forward_storage_382 = _source_topk_weights_f32
+        _forward_loop_375 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_376: _forward_condition_376 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
+        _forward_loop_375.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_375 as _forward_values_377:
+            push_3 = _forward_values_377[0]
             push_dest_6 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(push_3).ir_value(), cutlass.Int32((tokens_per_rank * 8)).ir_value())))
             push_route_3 = cutlass.Int32((push_3 - (push_dest_6 * (tokens_per_rank * 8))))
             push_slot_6 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 8) + push_route_3))
@@ -2360,102 +2407,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id_3).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot_6, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_3).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot_6)
             else:
-                peer_ids_3 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest_6) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest_6) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest_6) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest_6) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest_6) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest_6) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest_6) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest_6) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest_6) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest_6) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest_6) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest_6) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest_6) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest_6) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest_6) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest_6) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest_6) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest_6) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest_6) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest_6) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest_6) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest_6) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest_6) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest_6) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest_6) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest_6) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest_6) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest_6) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest_6) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest_6) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest_6) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights_3 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest_6) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest_6) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest_6) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest_6) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest_6) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest_6) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest_6) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest_6) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest_6) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest_6) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest_6) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest_6) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest_6) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest_6) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest_6) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest_6) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest_6) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest_6) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest_6) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest_6) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest_6) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest_6) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest_6) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest_6) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest_6) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest_6) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest_6) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest_6) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest_6) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest_6) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest_6) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids_3 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest_6)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights_3 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest_6)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id_3).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids_3 + push_slot_6, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_3).ir_value(), peer_weights_3 + push_slot_6)
             cutlass.yield_out([cutlass.Int32(push_3 + (thread_stride_3))])
-        _published_topk_ids_i32 = _forward_storage_369
-        _published_topk_weights_f32 = _forward_storage_370
-        _source_topk_ids_i64 = _forward_storage_371
-        _source_topk_weights_f32 = _forward_storage_372
-        _forward_storage_376 = _route_map_i32
-        _forward_storage_377 = _route_scale_f32
-        _forward_loop_373 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_374: _forward_condition_374 < cutlass.Int32(2048))
-        _forward_loop_373.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_373 as _forward_values_375:
-            index_6 = _forward_values_375[0]
+        _peer_ptrs = _forward_storage_378
+        _published_topk_ids_i32 = _forward_storage_379
+        _published_topk_weights_f32 = _forward_storage_380
+        _source_topk_ids_i64 = _forward_storage_381
+        _source_topk_weights_f32 = _forward_storage_382
+        _forward_storage_386 = _route_map_i32
+        _forward_storage_387 = _route_scale_f32
+        _forward_loop_383 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_384: _forward_condition_384 < cutlass.Int32(2048))
+        _forward_loop_383.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_383 as _forward_values_385:
+            index_6 = _forward_values_385[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index_6)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index_6)))
             cutlass.yield_out([cutlass.Int32(index_6 + (thread_stride_3))])
-        _route_map_i32 = _forward_storage_376
-        _route_scale_f32 = _forward_storage_377
-        _forward_storage_381 = _route_counts_u32
-        _forward_loop_378 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_379: _forward_condition_379 < cutlass.Int32(32))
-        _forward_loop_378.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_378 as _forward_values_380:
-            expert_6 = _forward_values_380[0]
+        _route_map_i32 = _forward_storage_386
+        _route_scale_f32 = _forward_storage_387
+        _forward_storage_391 = _route_counts_u32
+        _forward_loop_388 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_389: _forward_condition_389 < cutlass.Int32(32))
+        _forward_loop_388.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_388 as _forward_values_390:
+            expert_6 = _forward_values_390[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_6)))
             cutlass.yield_out([cutlass.Int32(expert_6 + (thread_stride_3))])
-        _route_counts_u32 = _forward_storage_381
-        _forward_storage_385 = _fc1_done
-        _forward_loop_382 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_383: _forward_condition_383 < cutlass.Int32(96))
-        _forward_loop_382.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_382 as _forward_values_384:
-            expert_row_tile_5 = _forward_values_384[0]
+        _route_counts_u32 = _forward_storage_391
+        _forward_storage_395 = _fc1_done
+        _forward_loop_392 = cutlass.while_generate([cutlass.Int32(linear_thread_3)], lambda _forward_condition_393: _forward_condition_393 < cutlass.Int32(96))
+        _forward_loop_392.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_392 as _forward_values_394:
+            expert_row_tile_5 = _forward_values_394[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_5, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
             cutlass.yield_out([cutlass.Int32(expert_row_tile_5 + (thread_stride_3))])
-        _fc1_done = _forward_storage_385
-        _forward_storage_389 = _published_hidden_bf16
-        _forward_storage_390 = _source_hidden_bf16
-        _forward_storage_391 = _source_topk_ids_i64
-        _forward_storage_392 = push_owners_3
-        _forward_loop_386 = cutlass.while_generate([cutlass.Int32((linear_thread_3 * 8))], lambda _forward_condition_387: _forward_condition_387 < cutlass.Int32((tokens_per_rank * 3072)))
-        _forward_loop_386.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_386 as _forward_values_388:
-            index_7 = _forward_values_388[0]
+        _fc1_done = _forward_storage_395
+        _forward_storage_399 = _peer_ptrs
+        _forward_storage_400 = _published_hidden_bf16
+        _forward_storage_401 = _source_hidden_bf16
+        _forward_storage_402 = _source_topk_ids_i64
+        _forward_storage_403 = push_owners_3
+        _forward_loop_396 = cutlass.while_generate([cutlass.Int32((linear_thread_3 * 8))], lambda _forward_condition_397: _forward_condition_397 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_396.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_396 as _forward_values_398:
+            index_7 = _forward_values_398[0]
             hidden_f32_3 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_393 = prims.load_ext(source_hidden_bf16 + index_7, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_394 = _gmem_load_into_393.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32_3[0] = _gmem_load_into_f32_394[0]
-            hidden_f32_3[1] = _gmem_load_into_f32_394[1]
-            hidden_f32_3[2] = _gmem_load_into_f32_394[2]
-            hidden_f32_3[3] = _gmem_load_into_f32_394[3]
-            hidden_f32_3[4] = _gmem_load_into_f32_394[4]
-            hidden_f32_3[5] = _gmem_load_into_f32_394[5]
-            hidden_f32_3[6] = _gmem_load_into_f32_394[6]
-            hidden_f32_3[7] = _gmem_load_into_f32_394[7]
+            _gmem_load_into_404 = prims.load_ext(source_hidden_bf16 + index_7, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_405 = _gmem_load_into_404.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32_3[0] = _gmem_load_into_f32_405[0]
+            hidden_f32_3[1] = _gmem_load_into_f32_405[1]
+            hidden_f32_3[2] = _gmem_load_into_f32_405[2]
+            hidden_f32_3[3] = _gmem_load_into_f32_405[3]
+            hidden_f32_3[4] = _gmem_load_into_f32_405[4]
+            hidden_f32_3[5] = _gmem_load_into_f32_405[5]
+            hidden_f32_3[6] = _gmem_load_into_f32_405[6]
+            hidden_f32_3[7] = _gmem_load_into_f32_405[7]
             chunk_3 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_395 = prims.cvt_packfloat_f32(hidden_f32_3[1], hidden_f32_3[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_3[0] = cutlass.Uint32(_bf16_pack_395)
-            _bf16_pack_396 = prims.cvt_packfloat_f32(hidden_f32_3[3], hidden_f32_3[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_3[1] = cutlass.Uint32(_bf16_pack_396)
-            _bf16_pack_397 = prims.cvt_packfloat_f32(hidden_f32_3[5], hidden_f32_3[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_3[2] = cutlass.Uint32(_bf16_pack_397)
-            _bf16_pack_398 = prims.cvt_packfloat_f32(hidden_f32_3[7], hidden_f32_3[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_3[3] = cutlass.Uint32(_bf16_pack_398)
+            _bf16_pack_406 = prims.cvt_packfloat_f32(hidden_f32_3[1], hidden_f32_3[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_3[0] = cutlass.Uint32(_bf16_pack_406)
+            _bf16_pack_407 = prims.cvt_packfloat_f32(hidden_f32_3[3], hidden_f32_3[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_3[1] = cutlass.Uint32(_bf16_pack_407)
+            _bf16_pack_408 = prims.cvt_packfloat_f32(hidden_f32_3[5], hidden_f32_3[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_3[2] = cutlass.Uint32(_bf16_pack_408)
+            _bf16_pack_409 = prims.cvt_packfloat_f32(hidden_f32_3[7], hidden_f32_3[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_3[3] = cutlass.Uint32(_bf16_pack_409)
             push_token_3 = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_7).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners_3[0] = cutlass.Uint32(0)
             for push_slot_7 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank_3 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token_3 * 8) + push_slot_7)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners_3[0] = cutlass.Uint32((push_owners_3[0] | (1 << cutlass.Uint32(owner_rank_3))))
             row_offset_3 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_7))
-            _while_storage_402 = _published_hidden_bf16
-            _while_storage_403 = chunk_3
-            _while_storage_404 = push_owners_3
-            _while_loop_399 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_400: (push_owners_3[0] != 0))
-            with _while_loop_399 as _while_values_401:
-                _ffs_reversed_bits_405 = cute.arch.brev(cutlass.Uint32(push_owners_3[0]))
-                _ffs_leading_one_406 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_405))
-                _find_first_set_3 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_3[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_406))
+            _while_storage_413 = _peer_ptrs
+            _while_storage_414 = _published_hidden_bf16
+            _while_storage_415 = chunk_3
+            _while_storage_416 = push_owners_3
+            _while_loop_410 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_411: (push_owners_3[0] != 0))
+            with _while_loop_410 as _while_values_412:
+                _ffs_reversed_bits_417 = cute.arch.brev(cutlass.Uint32(push_owners_3[0]))
+                _ffs_leading_one_418 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_417))
+                _find_first_set_3 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_3[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_418))
                 push_dest_7 = cutlass.Int32((_find_first_set_3 - 1))
                 push_owners_3[0] = cutlass.Uint32((push_owners_3[0] & (push_owners_3[0] - 1)))
                 if (push_dest_7 == mega_pg_rank):
-                    _gmem_store_bits_407 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_3[0]), cutlass.Uint32(chunk_3[1]), cutlass.Uint32(chunk_3[2]), cutlass.Uint32(chunk_3[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_407.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_3, dtype=cutlass.Uint32))
+                    _gmem_store_bits_419 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_3[0]), cutlass.Uint32(chunk_3[1]), cutlass.Uint32(chunk_3[2]), cutlass.Uint32(chunk_3[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_419.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_3, dtype=cutlass.Uint32))
                 else:
-                    peer_rows_3 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_7) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_7) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_7) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_7) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_7) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_7) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_7) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_7) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_7) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_7) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_7) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_7) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_7) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_7) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_7) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_7) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_7) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_7) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_7) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_7) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_7) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_7) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_7) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_7) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_7) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_7) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_7) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_7) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_7) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_7) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_7) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_408 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_3[0]), cutlass.Uint32(chunk_3[1]), cutlass.Uint32(chunk_3[2]), cutlass.Uint32(chunk_3[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_408.ir_value(), cute.recast_ptr(peer_rows_3 + row_offset_3, dtype=cutlass.Uint32))
+                    peer_rows_3 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_7])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_420 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_3[0]), cutlass.Uint32(chunk_3[1]), cutlass.Uint32(chunk_3[2]), cutlass.Uint32(chunk_3[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_420.ir_value(), cute.recast_ptr(peer_rows_3 + row_offset_3, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_402
-            chunk_3 = _while_storage_403
-            push_owners_3 = _while_storage_404
+            _peer_ptrs = _while_storage_413
+            _published_hidden_bf16 = _while_storage_414
+            chunk_3 = _while_storage_415
+            push_owners_3 = _while_storage_416
             cutlass.yield_out([cutlass.Int32(index_7 + ((thread_stride_3 * 8)))])
-        _published_hidden_bf16 = _forward_storage_389
-        _source_hidden_bf16 = _forward_storage_390
-        _source_topk_ids_i64 = _forward_storage_391
-        push_owners_3 = _forward_storage_392
+        _peer_ptrs = _forward_storage_399
+        _published_hidden_bf16 = _forward_storage_400
+        _source_hidden_bf16 = _forward_storage_401
+        _source_topk_ids_i64 = _forward_storage_402
+        push_owners_3 = _forward_storage_403
         arrival_3 = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival_3[0] = cutlass.Uint32(4294967295)
         arrival_3[1] = cutlass.Uint32(4294967295)
@@ -2466,17 +2518,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival_3[6] = cutlass.Uint32(4294967295)
         arrival_3[7] = cutlass.Uint32(4294967295)
         arm_thread_3 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_412 = _route_terms_bf16
-        _forward_storage_413 = arrival_3
-        _forward_loop_409 = cutlass.while_generate([cutlass.Int32((arm_thread_3 * 16))], lambda _forward_condition_410: _forward_condition_410 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_409.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_409 as _forward_values_411:
-            arrival_word_3 = _forward_values_411[0]
-            _gmem_store_bits_414 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_3[0]), cutlass.Uint32(arrival_3[1]), cutlass.Uint32(arrival_3[2]), cutlass.Uint32(arrival_3[3]), cutlass.Uint32(arrival_3[4]), cutlass.Uint32(arrival_3[5]), cutlass.Uint32(arrival_3[6]), cutlass.Uint32(arrival_3[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_414.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_3, dtype=cutlass.Uint32))
+        _forward_storage_424 = _route_terms_bf16
+        _forward_storage_425 = arrival_3
+        _forward_loop_421 = cutlass.while_generate([cutlass.Int32((arm_thread_3 * 16))], lambda _forward_condition_422: _forward_condition_422 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_421.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_421 as _forward_values_423:
+            arrival_word_3 = _forward_values_423[0]
+            _gmem_store_bits_426 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_3[0]), cutlass.Uint32(arrival_3[1]), cutlass.Uint32(arrival_3[2]), cutlass.Uint32(arrival_3[3]), cutlass.Uint32(arrival_3[4]), cutlass.Uint32(arrival_3[5]), cutlass.Uint32(arrival_3[6]), cutlass.Uint32(arrival_3[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_426.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_3, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word_3 + ((thread_stride_3 * 16)))])
-        _route_terms_bf16 = _forward_storage_412
-        arrival_3 = _forward_storage_413
+        _route_terms_bf16 = _forward_storage_424
+        arrival_3 = _forward_storage_425
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2507,47 +2559,47 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert_3[0] = cutlass.Int32(cute.make_tensor(remote_ids_3, _flat_layout)[source_route_lane_3])
                 route_weight_lane_3[0] = cutlass.Float32(cute.make_tensor(remote_weights_3, _flat_layout)[source_route_lane_3])
-                _if_condition_415 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_3[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane_3[0] = cutlass.Int32(cutlass.select_(_if_condition_415, cutlass.Int32(1), owned_lane_3[0]))
+                _if_condition_427 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_3[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane_3[0] = cutlass.Int32(cutlass.select_(_if_condition_427, cutlass.Int32(1), owned_lane_3[0]))
             any_owned_3 = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane_3[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned_3 != 0):
                 source_words_3 = remote_hidden_words_3 + (source_token_3 * 1536)
-                _gmem_load_into_packed_addr_416 = cute.recast_ptr(source_words_3 + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_417 = prims.load_ext(_gmem_load_into_packed_addr_416 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[0] = cutlass.Uint32(_gmem_load_into_packed_417[0])
-                row_words_3[1] = cutlass.Uint32(_gmem_load_into_packed_417[1])
-                row_words_3[2] = cutlass.Uint32(_gmem_load_into_packed_417[2])
-                row_words_3[3] = cutlass.Uint32(_gmem_load_into_packed_417[3])
-                _gmem_load_into_packed_addr_418 = cute.recast_ptr(source_words_3 + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_419 = prims.load_ext(_gmem_load_into_packed_addr_418 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_419[0])
-                row_words_3[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_419[1])
-                row_words_3[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_419[2])
-                row_words_3[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_419[3])
-                _gmem_load_into_packed_addr_420 = cute.recast_ptr(source_words_3 + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_421 = prims.load_ext(_gmem_load_into_packed_addr_420 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_421[0])
-                row_words_3[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_421[1])
-                row_words_3[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_421[2])
-                row_words_3[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_421[3])
-                _gmem_load_into_packed_addr_422 = cute.recast_ptr(source_words_3 + ((lane + 96) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_423 = prims.load_ext(_gmem_load_into_packed_addr_422 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_423[0])
-                row_words_3[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_423[1])
-                row_words_3[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_423[2])
-                row_words_3[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_423[3])
-                _gmem_load_into_packed_addr_424 = cute.recast_ptr(source_words_3 + ((lane + 128) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_425 = prims.load_ext(_gmem_load_into_packed_addr_424 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_425[0])
-                row_words_3[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_425[1])
-                row_words_3[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_425[2])
-                row_words_3[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_425[3])
-                _gmem_load_into_packed_addr_426 = cute.recast_ptr(source_words_3 + ((lane + 160) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_427 = prims.load_ext(_gmem_load_into_packed_addr_426 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_427[0])
-                row_words_3[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_427[1])
-                row_words_3[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_427[2])
-                row_words_3[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_427[3])
+                _gmem_load_into_packed_addr_428 = cute.recast_ptr(source_words_3 + (lane * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_429 = prims.load_ext(_gmem_load_into_packed_addr_428 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[0] = cutlass.Uint32(_gmem_load_into_packed_429[0])
+                row_words_3[1] = cutlass.Uint32(_gmem_load_into_packed_429[1])
+                row_words_3[2] = cutlass.Uint32(_gmem_load_into_packed_429[2])
+                row_words_3[3] = cutlass.Uint32(_gmem_load_into_packed_429[3])
+                _gmem_load_into_packed_addr_430 = cute.recast_ptr(source_words_3 + ((lane + 32) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_431 = prims.load_ext(_gmem_load_into_packed_addr_430 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_431[0])
+                row_words_3[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_431[1])
+                row_words_3[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_431[2])
+                row_words_3[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_431[3])
+                _gmem_load_into_packed_addr_432 = cute.recast_ptr(source_words_3 + ((lane + 64) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_433 = prims.load_ext(_gmem_load_into_packed_addr_432 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_433[0])
+                row_words_3[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_433[1])
+                row_words_3[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_433[2])
+                row_words_3[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_433[3])
+                _gmem_load_into_packed_addr_434 = cute.recast_ptr(source_words_3 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_435 = prims.load_ext(_gmem_load_into_packed_addr_434 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_435[0])
+                row_words_3[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_435[1])
+                row_words_3[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_435[2])
+                row_words_3[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_435[3])
+                _gmem_load_into_packed_addr_436 = cute.recast_ptr(source_words_3 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_437 = prims.load_ext(_gmem_load_into_packed_addr_436 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_437[0])
+                row_words_3[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_437[1])
+                row_words_3[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_437[2])
+                row_words_3[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_437[3])
+                _gmem_load_into_packed_addr_438 = cute.recast_ptr(source_words_3 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_439 = prims.load_ext(_gmem_load_into_packed_addr_438 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_439[0])
+                row_words_3[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_439[1])
+                row_words_3[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_439[2])
+                row_words_3[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_439[3])
                 if (owned_lane_3[0] != 0):
                     local_expert_lane_3 = cutlass.Int32((global_expert_3[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add_3 = cute.arch.atomic_add(route_counts_u32 + local_expert_lane_3, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -2561,69 +2613,69 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index_5 = cute.arch.shuffle_sync(row_index_lane_3[0], route_slot_5, mask=4294967295, mask_and_clamp=31)
                     if (row_index_5 >= 0):
                         row_dst_3 = activation_words_3 + (row_index_5 * 1536)
-                        _gmem_store_bits_428 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[0]), cutlass.Uint32(row_words_3[1]), cutlass.Uint32(row_words_3[2]), cutlass.Uint32(row_words_3[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_428.ir_value(), row_dst_3 + (lane * 4))
-                        _gmem_store_bits_429 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(4) + 0]), cutlass.Uint32(row_words_3[(4) + 1]), cutlass.Uint32(row_words_3[(4) + 2]), cutlass.Uint32(row_words_3[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_429.ir_value(), row_dst_3 + ((lane + 32) * 4))
-                        _gmem_store_bits_430 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(8) + 0]), cutlass.Uint32(row_words_3[(8) + 1]), cutlass.Uint32(row_words_3[(8) + 2]), cutlass.Uint32(row_words_3[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_430.ir_value(), row_dst_3 + ((lane + 64) * 4))
-                        _gmem_store_bits_431 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(12) + 0]), cutlass.Uint32(row_words_3[(12) + 1]), cutlass.Uint32(row_words_3[(12) + 2]), cutlass.Uint32(row_words_3[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_431.ir_value(), row_dst_3 + ((lane + 96) * 4))
-                        _gmem_store_bits_432 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(16) + 0]), cutlass.Uint32(row_words_3[(16) + 1]), cutlass.Uint32(row_words_3[(16) + 2]), cutlass.Uint32(row_words_3[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_432.ir_value(), row_dst_3 + ((lane + 128) * 4))
-                        _gmem_store_bits_433 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(20) + 0]), cutlass.Uint32(row_words_3[(20) + 1]), cutlass.Uint32(row_words_3[(20) + 2]), cutlass.Uint32(row_words_3[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_433.ir_value(), row_dst_3 + ((lane + 160) * 4))
-                _gmem_load_into_packed_addr_434 = cute.recast_ptr(source_words_3 + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_435 = prims.load_ext(_gmem_load_into_packed_addr_434 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[0] = cutlass.Uint32(_gmem_load_into_packed_435[0])
-                row_words_3[1] = cutlass.Uint32(_gmem_load_into_packed_435[1])
-                row_words_3[2] = cutlass.Uint32(_gmem_load_into_packed_435[2])
-                row_words_3[3] = cutlass.Uint32(_gmem_load_into_packed_435[3])
-                _gmem_load_into_packed_addr_436 = cute.recast_ptr(source_words_3 + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_437 = prims.load_ext(_gmem_load_into_packed_addr_436 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_437[0])
-                row_words_3[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_437[1])
-                row_words_3[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_437[2])
-                row_words_3[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_437[3])
-                _gmem_load_into_packed_addr_438 = cute.recast_ptr(source_words_3 + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_439 = prims.load_ext(_gmem_load_into_packed_addr_438 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_439[0])
-                row_words_3[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_439[1])
-                row_words_3[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_439[2])
-                row_words_3[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_439[3])
-                _gmem_load_into_packed_addr_440 = cute.recast_ptr(source_words_3 + ((lane + 288) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_441 = prims.load_ext(_gmem_load_into_packed_addr_440 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_441[0])
-                row_words_3[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_441[1])
-                row_words_3[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_441[2])
-                row_words_3[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_441[3])
-                _gmem_load_into_packed_addr_442 = cute.recast_ptr(source_words_3 + ((lane + 320) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_443 = prims.load_ext(_gmem_load_into_packed_addr_442 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_443[0])
-                row_words_3[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_443[1])
-                row_words_3[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_443[2])
-                row_words_3[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_443[3])
-                _gmem_load_into_packed_addr_444 = cute.recast_ptr(source_words_3 + ((lane + 352) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_445 = prims.load_ext(_gmem_load_into_packed_addr_444 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_3[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_445[0])
-                row_words_3[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_445[1])
-                row_words_3[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_445[2])
-                row_words_3[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_445[3])
+                        _gmem_store_bits_440 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[0]), cutlass.Uint32(row_words_3[1]), cutlass.Uint32(row_words_3[2]), cutlass.Uint32(row_words_3[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_440.ir_value(), row_dst_3 + (lane * 4))
+                        _gmem_store_bits_441 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(4) + 0]), cutlass.Uint32(row_words_3[(4) + 1]), cutlass.Uint32(row_words_3[(4) + 2]), cutlass.Uint32(row_words_3[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_441.ir_value(), row_dst_3 + ((lane + 32) * 4))
+                        _gmem_store_bits_442 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(8) + 0]), cutlass.Uint32(row_words_3[(8) + 1]), cutlass.Uint32(row_words_3[(8) + 2]), cutlass.Uint32(row_words_3[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_442.ir_value(), row_dst_3 + ((lane + 64) * 4))
+                        _gmem_store_bits_443 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(12) + 0]), cutlass.Uint32(row_words_3[(12) + 1]), cutlass.Uint32(row_words_3[(12) + 2]), cutlass.Uint32(row_words_3[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_443.ir_value(), row_dst_3 + ((lane + 96) * 4))
+                        _gmem_store_bits_444 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(16) + 0]), cutlass.Uint32(row_words_3[(16) + 1]), cutlass.Uint32(row_words_3[(16) + 2]), cutlass.Uint32(row_words_3[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_444.ir_value(), row_dst_3 + ((lane + 128) * 4))
+                        _gmem_store_bits_445 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(20) + 0]), cutlass.Uint32(row_words_3[(20) + 1]), cutlass.Uint32(row_words_3[(20) + 2]), cutlass.Uint32(row_words_3[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_445.ir_value(), row_dst_3 + ((lane + 160) * 4))
+                _gmem_load_into_packed_addr_446 = cute.recast_ptr(source_words_3 + ((lane + 192) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_447 = prims.load_ext(_gmem_load_into_packed_addr_446 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[0] = cutlass.Uint32(_gmem_load_into_packed_447[0])
+                row_words_3[1] = cutlass.Uint32(_gmem_load_into_packed_447[1])
+                row_words_3[2] = cutlass.Uint32(_gmem_load_into_packed_447[2])
+                row_words_3[3] = cutlass.Uint32(_gmem_load_into_packed_447[3])
+                _gmem_load_into_packed_addr_448 = cute.recast_ptr(source_words_3 + ((lane + 224) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_449 = prims.load_ext(_gmem_load_into_packed_addr_448 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_449[0])
+                row_words_3[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_449[1])
+                row_words_3[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_449[2])
+                row_words_3[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_449[3])
+                _gmem_load_into_packed_addr_450 = cute.recast_ptr(source_words_3 + ((lane + 256) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_451 = prims.load_ext(_gmem_load_into_packed_addr_450 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_451[0])
+                row_words_3[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_451[1])
+                row_words_3[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_451[2])
+                row_words_3[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_451[3])
+                _gmem_load_into_packed_addr_452 = cute.recast_ptr(source_words_3 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_453 = prims.load_ext(_gmem_load_into_packed_addr_452 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_453[0])
+                row_words_3[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_453[1])
+                row_words_3[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_453[2])
+                row_words_3[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_453[3])
+                _gmem_load_into_packed_addr_454 = cute.recast_ptr(source_words_3 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_455 = prims.load_ext(_gmem_load_into_packed_addr_454 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_455[0])
+                row_words_3[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_455[1])
+                row_words_3[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_455[2])
+                row_words_3[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_455[3])
+                _gmem_load_into_packed_addr_456 = cute.recast_ptr(source_words_3 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_457 = prims.load_ext(_gmem_load_into_packed_addr_456 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_3[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_457[0])
+                row_words_3[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_457[1])
+                row_words_3[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_457[2])
+                row_words_3[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_457[3])
                 for route_slot_6 in cutlass.range_constexpr(0, 8, 1):
                     row_index_6 = cute.arch.shuffle_sync(row_index_lane_3[0], route_slot_6, mask=4294967295, mask_and_clamp=31)
                     if (row_index_6 >= 0):
-                        _gmem_store_bits_446 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[0]), cutlass.Uint32(row_words_3[1]), cutlass.Uint32(row_words_3[2]), cutlass.Uint32(row_words_3[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_446.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 192) * 4)))
-                        _gmem_store_bits_447 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(4) + 0]), cutlass.Uint32(row_words_3[(4) + 1]), cutlass.Uint32(row_words_3[(4) + 2]), cutlass.Uint32(row_words_3[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_447.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 224) * 4)))
-                        _gmem_store_bits_448 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(8) + 0]), cutlass.Uint32(row_words_3[(8) + 1]), cutlass.Uint32(row_words_3[(8) + 2]), cutlass.Uint32(row_words_3[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_448.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 256) * 4)))
-                        _gmem_store_bits_449 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(12) + 0]), cutlass.Uint32(row_words_3[(12) + 1]), cutlass.Uint32(row_words_3[(12) + 2]), cutlass.Uint32(row_words_3[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_449.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 288) * 4)))
-                        _gmem_store_bits_450 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(16) + 0]), cutlass.Uint32(row_words_3[(16) + 1]), cutlass.Uint32(row_words_3[(16) + 2]), cutlass.Uint32(row_words_3[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_450.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 320) * 4)))
-                        _gmem_store_bits_451 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(20) + 0]), cutlass.Uint32(row_words_3[(20) + 1]), cutlass.Uint32(row_words_3[(20) + 2]), cutlass.Uint32(row_words_3[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_451.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 352) * 4)))
+                        _gmem_store_bits_458 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[0]), cutlass.Uint32(row_words_3[1]), cutlass.Uint32(row_words_3[2]), cutlass.Uint32(row_words_3[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_458.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 192) * 4)))
+                        _gmem_store_bits_459 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(4) + 0]), cutlass.Uint32(row_words_3[(4) + 1]), cutlass.Uint32(row_words_3[(4) + 2]), cutlass.Uint32(row_words_3[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_459.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 224) * 4)))
+                        _gmem_store_bits_460 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(8) + 0]), cutlass.Uint32(row_words_3[(8) + 1]), cutlass.Uint32(row_words_3[(8) + 2]), cutlass.Uint32(row_words_3[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_460.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 256) * 4)))
+                        _gmem_store_bits_461 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(12) + 0]), cutlass.Uint32(row_words_3[(12) + 1]), cutlass.Uint32(row_words_3[(12) + 2]), cutlass.Uint32(row_words_3[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_461.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 288) * 4)))
+                        _gmem_store_bits_462 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(16) + 0]), cutlass.Uint32(row_words_3[(16) + 1]), cutlass.Uint32(row_words_3[(16) + 2]), cutlass.Uint32(row_words_3[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_462.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 320) * 4)))
+                        _gmem_store_bits_463 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_3[(20) + 0]), cutlass.Uint32(row_words_3[(20) + 1]), cutlass.Uint32(row_words_3[(20) + 2]), cutlass.Uint32(row_words_3[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_463.ir_value(), activation_words_3 + ((row_index_6 * 1536) + ((lane + 352) * 4)))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -2661,33 +2713,33 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         pass
                     if prims.elect_sync():
                         if (phase_3 == 0):
-                            _tma_mbar_452 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
+                            _tma_mbar_464 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
                             prims.cp_async_bulk_tensor_shared_cluster_global(
                                 cute.make_ptr(cutlass.Uint8, cutlass.Uint32((b_smem_addr + (b_stage_1[0] * 4096))), mem_space=cute.AddressSpace.smem, assumed_align=16),
                                 activation_bf16.get_ptr(),
                                 [cutlass.Int32(0), cutlass.Int32((cta_rank * 16)), cutlass.Int32((iter_k_2 * 2)), cutlass.Int32(expert_7)],
-                                _tma_mbar_452,
+                                _tma_mbar_464,
                                 [],
                                 mode=prims.TMALoadMode.TILE,
                                 group=prims.CTAGroup.CTA_2,
                             )
                         else:
-                            _tma_mbar_453 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
+                            _tma_mbar_465 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
                             prims.cp_async_bulk_tensor_shared_cluster_global(
                                 cute.make_ptr(cutlass.Uint8, cutlass.Uint32((b_smem_addr + (b_stage_1[0] * 4096))), mem_space=cute.AddressSpace.smem, assumed_align=16),
                                 fc1_workspace_bf16_tma.get_ptr(),
                                 [cutlass.Int32(0), cutlass.Int32((cta_rank * 16)), cutlass.Int32((iter_k_2 * 2)), cutlass.Int32(expert_7)],
-                                _tma_mbar_453,
+                                _tma_mbar_465,
                                 [],
                                 mode=prims.TMALoadMode.TILE,
                                 group=prims.CTAGroup.CTA_2,
                             )
-                        _mbarrier_cluster_expect_tx_454 = prims.mapa(b_full_addr + b_stage_1[0], cutlass.Int32(cta_rank & 0xFFFFFFFE))
-                        prims.mbarrier_arrive_expect_tx(_mbarrier_cluster_expect_tx_454, 4096, scope=prims.MemScope.CTA)
-                    _advanced_stage_455 = cutlass.Uint32(b_stage_1[0] + 1)
-                    _stage_wrapped_456 = cutlass.Boolean(_advanced_stage_455 == 6)
-                    b_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_456, 0, _advanced_stage_455))
-                    _phase_b_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_456, _phase_b_free[0] ^ cutlass.Uint32(1), _phase_b_free[0]))
+                        _mbarrier_cluster_expect_tx_466 = prims.mapa(b_full_addr + b_stage_1[0], cutlass.Int32(cta_rank & 0xFFFFFFFE))
+                        prims.mbarrier_arrive_expect_tx(_mbarrier_cluster_expect_tx_466, 4096, scope=prims.MemScope.CTA)
+                    _advanced_stage_467 = cutlass.Uint32(b_stage_1[0] + 1)
+                    _stage_wrapped_468 = cutlass.Boolean(_advanced_stage_467 == 6)
+                    b_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_468, 0, _advanced_stage_467))
+                    _phase_b_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_468, _phase_b_free[0] ^ cutlass.Uint32(1), _phase_b_free[0]))
                     for tail_3 in cutlass.range_constexpr(0, 2, 1):
                         if (route_count_2 > (32 + (tail_3 * 16))):
                             while not prims.mbarrier_wait_parity(b_free_addr + b_stage_1[0], _phase_b_free[0], prims.MBarrierWait.TRY, scope=prims.MBarrierScope.CTA, order=prims.MemOrder.ACQUIRE):
@@ -2695,33 +2747,33 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                             if prims.elect_sync():
                                 tail_row = (32 + (tail_3 * 16))
                                 if (phase_3 == 0):
-                                    _tma_mbar_457 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
+                                    _tma_mbar_469 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
                                     prims.cp_async_bulk_tensor_shared_cluster_global(
                                         cute.make_ptr(cutlass.Uint8, cutlass.Uint32((b_smem_n16_addr + (b_stage_1[0] * 4096))), mem_space=cute.AddressSpace.smem, assumed_align=16),
                                         activation_bf16_n16.get_ptr(),
                                         [cutlass.Int32(0), cutlass.Int32((tail_row + (cta_rank * 8))), cutlass.Int32((iter_k_2 * 2)), cutlass.Int32(expert_7)],
-                                        _tma_mbar_457,
+                                        _tma_mbar_469,
                                         [],
                                         mode=prims.TMALoadMode.TILE,
                                         group=prims.CTAGroup.CTA_2,
                                     )
                                 else:
-                                    _tma_mbar_458 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
+                                    _tma_mbar_470 = cutlass.Array((b_full_addr + b_stage_1[0]).to_llvm_ptr(), shape=1, dtype=cutlass.Uint64)
                                     prims.cp_async_bulk_tensor_shared_cluster_global(
                                         cute.make_ptr(cutlass.Uint8, cutlass.Uint32((b_smem_n16_addr + (b_stage_1[0] * 4096))), mem_space=cute.AddressSpace.smem, assumed_align=16),
                                         fc1_workspace_bf16_tma_n16.get_ptr(),
                                         [cutlass.Int32(0), cutlass.Int32((tail_row + (cta_rank * 8))), cutlass.Int32((iter_k_2 * 2)), cutlass.Int32(expert_7)],
-                                        _tma_mbar_458,
+                                        _tma_mbar_470,
                                         [],
                                         mode=prims.TMALoadMode.TILE,
                                         group=prims.CTAGroup.CTA_2,
                                     )
-                                _mbarrier_cluster_expect_tx_459 = prims.mapa(b_full_addr + b_stage_1[0], cutlass.Int32(cta_rank & 0xFFFFFFFE))
-                                prims.mbarrier_arrive_expect_tx(_mbarrier_cluster_expect_tx_459, 2048, scope=prims.MemScope.CTA)
-                            _advanced_stage_460 = cutlass.Uint32(b_stage_1[0] + 1)
-                            _stage_wrapped_461 = cutlass.Boolean(_advanced_stage_460 == 6)
-                            b_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_461, 0, _advanced_stage_460))
-                            _phase_b_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_461, _phase_b_free[0] ^ cutlass.Uint32(1), _phase_b_free[0]))
+                                _mbarrier_cluster_expect_tx_471 = prims.mapa(b_full_addr + b_stage_1[0], cutlass.Int32(cta_rank & 0xFFFFFFFE))
+                                prims.mbarrier_arrive_expect_tx(_mbarrier_cluster_expect_tx_471, 2048, scope=prims.MemScope.CTA)
+                            _advanced_stage_472 = cutlass.Uint32(b_stage_1[0] + 1)
+                            _stage_wrapped_473 = cutlass.Boolean(_advanced_stage_472 == 6)
+                            b_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_473, 0, _advanced_stage_472))
+                            _phase_b_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_473, _phase_b_free[0] ^ cutlass.Uint32(1), _phase_b_free[0]))
                 if (phase_3 == 1):
                     pass
         cute.arch.cluster_arrive(aligned=True)
@@ -2735,14 +2787,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         owned_lane_4 = cute.make_rmem_tensor((1,), cutlass.Int32)
         linear_thread_4 = cutlass.Int32(((bid * 384) + tid))
         thread_stride_4 = cutlass.Int32((num_bids * 384))
-        _forward_storage_465 = _published_topk_ids_i32
-        _forward_storage_466 = _published_topk_weights_f32
-        _forward_storage_467 = _source_topk_ids_i64
-        _forward_storage_468 = _source_topk_weights_f32
-        _forward_loop_462 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_463: _forward_condition_463 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
-        _forward_loop_462.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_462 as _forward_values_464:
-            push_4 = _forward_values_464[0]
+        _forward_storage_477 = _peer_ptrs
+        _forward_storage_478 = _published_topk_ids_i32
+        _forward_storage_479 = _published_topk_weights_f32
+        _forward_storage_480 = _source_topk_ids_i64
+        _forward_storage_481 = _source_topk_weights_f32
+        _forward_loop_474 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_475: _forward_condition_475 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
+        _forward_loop_474.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_474 as _forward_values_476:
+            push_4 = _forward_values_476[0]
             push_dest_8 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(push_4).ir_value(), cutlass.Int32((tokens_per_rank * 8)).ir_value())))
             push_route_4 = cutlass.Int32((push_4 - (push_dest_8 * (tokens_per_rank * 8))))
             push_slot_8 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 8) + push_route_4))
@@ -2752,102 +2805,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id_4).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot_8, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_4).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot_8)
             else:
-                peer_ids_4 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest_8) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest_8) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest_8) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest_8) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest_8) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest_8) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest_8) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest_8) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest_8) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest_8) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest_8) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest_8) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest_8) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest_8) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest_8) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest_8) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest_8) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest_8) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest_8) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest_8) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest_8) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest_8) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest_8) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest_8) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest_8) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest_8) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest_8) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest_8) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest_8) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest_8) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest_8) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights_4 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest_8) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest_8) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest_8) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest_8) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest_8) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest_8) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest_8) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest_8) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest_8) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest_8) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest_8) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest_8) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest_8) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest_8) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest_8) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest_8) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest_8) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest_8) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest_8) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest_8) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest_8) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest_8) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest_8) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest_8) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest_8) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest_8) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest_8) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest_8) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest_8) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest_8) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest_8) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids_4 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest_8)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights_4 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest_8)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id_4).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids_4 + push_slot_8, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_4).ir_value(), peer_weights_4 + push_slot_8)
             cutlass.yield_out([cutlass.Int32(push_4 + (thread_stride_4))])
-        _published_topk_ids_i32 = _forward_storage_465
-        _published_topk_weights_f32 = _forward_storage_466
-        _source_topk_ids_i64 = _forward_storage_467
-        _source_topk_weights_f32 = _forward_storage_468
-        _forward_storage_472 = _route_map_i32
-        _forward_storage_473 = _route_scale_f32
-        _forward_loop_469 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_470: _forward_condition_470 < cutlass.Int32(2048))
-        _forward_loop_469.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_469 as _forward_values_471:
-            index_8 = _forward_values_471[0]
+        _peer_ptrs = _forward_storage_477
+        _published_topk_ids_i32 = _forward_storage_478
+        _published_topk_weights_f32 = _forward_storage_479
+        _source_topk_ids_i64 = _forward_storage_480
+        _source_topk_weights_f32 = _forward_storage_481
+        _forward_storage_485 = _route_map_i32
+        _forward_storage_486 = _route_scale_f32
+        _forward_loop_482 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_483: _forward_condition_483 < cutlass.Int32(2048))
+        _forward_loop_482.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_482 as _forward_values_484:
+            index_8 = _forward_values_484[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index_8)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index_8)))
             cutlass.yield_out([cutlass.Int32(index_8 + (thread_stride_4))])
-        _route_map_i32 = _forward_storage_472
-        _route_scale_f32 = _forward_storage_473
-        _forward_storage_477 = _route_counts_u32
-        _forward_loop_474 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_475: _forward_condition_475 < cutlass.Int32(32))
-        _forward_loop_474.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_474 as _forward_values_476:
-            expert_8 = _forward_values_476[0]
+        _route_map_i32 = _forward_storage_485
+        _route_scale_f32 = _forward_storage_486
+        _forward_storage_490 = _route_counts_u32
+        _forward_loop_487 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_488: _forward_condition_488 < cutlass.Int32(32))
+        _forward_loop_487.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_487 as _forward_values_489:
+            expert_8 = _forward_values_489[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_8)))
             cutlass.yield_out([cutlass.Int32(expert_8 + (thread_stride_4))])
-        _route_counts_u32 = _forward_storage_477
-        _forward_storage_481 = _fc1_done
-        _forward_loop_478 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_479: _forward_condition_479 < cutlass.Int32(96))
-        _forward_loop_478.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_478 as _forward_values_480:
-            expert_row_tile_6 = _forward_values_480[0]
+        _route_counts_u32 = _forward_storage_490
+        _forward_storage_494 = _fc1_done
+        _forward_loop_491 = cutlass.while_generate([cutlass.Int32(linear_thread_4)], lambda _forward_condition_492: _forward_condition_492 < cutlass.Int32(96))
+        _forward_loop_491.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_491 as _forward_values_493:
+            expert_row_tile_6 = _forward_values_493[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_6, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
             cutlass.yield_out([cutlass.Int32(expert_row_tile_6 + (thread_stride_4))])
-        _fc1_done = _forward_storage_481
-        _forward_storage_485 = _published_hidden_bf16
-        _forward_storage_486 = _source_hidden_bf16
-        _forward_storage_487 = _source_topk_ids_i64
-        _forward_storage_488 = push_owners_4
-        _forward_loop_482 = cutlass.while_generate([cutlass.Int32((linear_thread_4 * 8))], lambda _forward_condition_483: _forward_condition_483 < cutlass.Int32((tokens_per_rank * 3072)))
-        _forward_loop_482.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_482 as _forward_values_484:
-            index_9 = _forward_values_484[0]
+        _fc1_done = _forward_storage_494
+        _forward_storage_498 = _peer_ptrs
+        _forward_storage_499 = _published_hidden_bf16
+        _forward_storage_500 = _source_hidden_bf16
+        _forward_storage_501 = _source_topk_ids_i64
+        _forward_storage_502 = push_owners_4
+        _forward_loop_495 = cutlass.while_generate([cutlass.Int32((linear_thread_4 * 8))], lambda _forward_condition_496: _forward_condition_496 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_495.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_495 as _forward_values_497:
+            index_9 = _forward_values_497[0]
             hidden_f32_4 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_489 = prims.load_ext(source_hidden_bf16 + index_9, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_490 = _gmem_load_into_489.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32_4[0] = _gmem_load_into_f32_490[0]
-            hidden_f32_4[1] = _gmem_load_into_f32_490[1]
-            hidden_f32_4[2] = _gmem_load_into_f32_490[2]
-            hidden_f32_4[3] = _gmem_load_into_f32_490[3]
-            hidden_f32_4[4] = _gmem_load_into_f32_490[4]
-            hidden_f32_4[5] = _gmem_load_into_f32_490[5]
-            hidden_f32_4[6] = _gmem_load_into_f32_490[6]
-            hidden_f32_4[7] = _gmem_load_into_f32_490[7]
+            _gmem_load_into_503 = prims.load_ext(source_hidden_bf16 + index_9, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_504 = _gmem_load_into_503.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32_4[0] = _gmem_load_into_f32_504[0]
+            hidden_f32_4[1] = _gmem_load_into_f32_504[1]
+            hidden_f32_4[2] = _gmem_load_into_f32_504[2]
+            hidden_f32_4[3] = _gmem_load_into_f32_504[3]
+            hidden_f32_4[4] = _gmem_load_into_f32_504[4]
+            hidden_f32_4[5] = _gmem_load_into_f32_504[5]
+            hidden_f32_4[6] = _gmem_load_into_f32_504[6]
+            hidden_f32_4[7] = _gmem_load_into_f32_504[7]
             chunk_4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_491 = prims.cvt_packfloat_f32(hidden_f32_4[1], hidden_f32_4[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_4[0] = cutlass.Uint32(_bf16_pack_491)
-            _bf16_pack_492 = prims.cvt_packfloat_f32(hidden_f32_4[3], hidden_f32_4[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_4[1] = cutlass.Uint32(_bf16_pack_492)
-            _bf16_pack_493 = prims.cvt_packfloat_f32(hidden_f32_4[5], hidden_f32_4[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_4[2] = cutlass.Uint32(_bf16_pack_493)
-            _bf16_pack_494 = prims.cvt_packfloat_f32(hidden_f32_4[7], hidden_f32_4[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_4[3] = cutlass.Uint32(_bf16_pack_494)
+            _bf16_pack_505 = prims.cvt_packfloat_f32(hidden_f32_4[1], hidden_f32_4[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_4[0] = cutlass.Uint32(_bf16_pack_505)
+            _bf16_pack_506 = prims.cvt_packfloat_f32(hidden_f32_4[3], hidden_f32_4[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_4[1] = cutlass.Uint32(_bf16_pack_506)
+            _bf16_pack_507 = prims.cvt_packfloat_f32(hidden_f32_4[5], hidden_f32_4[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_4[2] = cutlass.Uint32(_bf16_pack_507)
+            _bf16_pack_508 = prims.cvt_packfloat_f32(hidden_f32_4[7], hidden_f32_4[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_4[3] = cutlass.Uint32(_bf16_pack_508)
             push_token_4 = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_9).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners_4[0] = cutlass.Uint32(0)
             for push_slot_9 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank_4 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token_4 * 8) + push_slot_9)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners_4[0] = cutlass.Uint32((push_owners_4[0] | (1 << cutlass.Uint32(owner_rank_4))))
             row_offset_4 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_9))
-            _while_storage_498 = _published_hidden_bf16
-            _while_storage_499 = chunk_4
-            _while_storage_500 = push_owners_4
-            _while_loop_495 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_496: (push_owners_4[0] != 0))
-            with _while_loop_495 as _while_values_497:
-                _ffs_reversed_bits_501 = cute.arch.brev(cutlass.Uint32(push_owners_4[0]))
-                _ffs_leading_one_502 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_501))
-                _find_first_set_4 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_4[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_502))
+            _while_storage_512 = _peer_ptrs
+            _while_storage_513 = _published_hidden_bf16
+            _while_storage_514 = chunk_4
+            _while_storage_515 = push_owners_4
+            _while_loop_509 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_510: (push_owners_4[0] != 0))
+            with _while_loop_509 as _while_values_511:
+                _ffs_reversed_bits_516 = cute.arch.brev(cutlass.Uint32(push_owners_4[0]))
+                _ffs_leading_one_517 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_516))
+                _find_first_set_4 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_4[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_517))
                 push_dest_9 = cutlass.Int32((_find_first_set_4 - 1))
                 push_owners_4[0] = cutlass.Uint32((push_owners_4[0] & (push_owners_4[0] - 1)))
                 if (push_dest_9 == mega_pg_rank):
-                    _gmem_store_bits_503 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_4[0]), cutlass.Uint32(chunk_4[1]), cutlass.Uint32(chunk_4[2]), cutlass.Uint32(chunk_4[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_503.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_4, dtype=cutlass.Uint32))
+                    _gmem_store_bits_518 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_4[0]), cutlass.Uint32(chunk_4[1]), cutlass.Uint32(chunk_4[2]), cutlass.Uint32(chunk_4[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_518.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_4, dtype=cutlass.Uint32))
                 else:
-                    peer_rows_4 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_9) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_9) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_9) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_9) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_9) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_9) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_9) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_9) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_9) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_9) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_9) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_9) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_9) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_9) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_9) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_9) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_9) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_9) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_9) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_9) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_9) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_9) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_9) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_9) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_9) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_9) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_9) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_9) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_9) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_9) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_9) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_504 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_4[0]), cutlass.Uint32(chunk_4[1]), cutlass.Uint32(chunk_4[2]), cutlass.Uint32(chunk_4[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_504.ir_value(), cute.recast_ptr(peer_rows_4 + row_offset_4, dtype=cutlass.Uint32))
+                    peer_rows_4 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_9])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_519 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_4[0]), cutlass.Uint32(chunk_4[1]), cutlass.Uint32(chunk_4[2]), cutlass.Uint32(chunk_4[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_519.ir_value(), cute.recast_ptr(peer_rows_4 + row_offset_4, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_498
-            chunk_4 = _while_storage_499
-            push_owners_4 = _while_storage_500
+            _peer_ptrs = _while_storage_512
+            _published_hidden_bf16 = _while_storage_513
+            chunk_4 = _while_storage_514
+            push_owners_4 = _while_storage_515
             cutlass.yield_out([cutlass.Int32(index_9 + ((thread_stride_4 * 8)))])
-        _published_hidden_bf16 = _forward_storage_485
-        _source_hidden_bf16 = _forward_storage_486
-        _source_topk_ids_i64 = _forward_storage_487
-        push_owners_4 = _forward_storage_488
+        _peer_ptrs = _forward_storage_498
+        _published_hidden_bf16 = _forward_storage_499
+        _source_hidden_bf16 = _forward_storage_500
+        _source_topk_ids_i64 = _forward_storage_501
+        push_owners_4 = _forward_storage_502
         arrival_4 = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival_4[0] = cutlass.Uint32(4294967295)
         arrival_4[1] = cutlass.Uint32(4294967295)
@@ -2858,17 +2916,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival_4[6] = cutlass.Uint32(4294967295)
         arrival_4[7] = cutlass.Uint32(4294967295)
         arm_thread_4 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_508 = _route_terms_bf16
-        _forward_storage_509 = arrival_4
-        _forward_loop_505 = cutlass.while_generate([cutlass.Int32((arm_thread_4 * 16))], lambda _forward_condition_506: _forward_condition_506 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_505.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_505 as _forward_values_507:
-            arrival_word_4 = _forward_values_507[0]
-            _gmem_store_bits_510 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_4[0]), cutlass.Uint32(arrival_4[1]), cutlass.Uint32(arrival_4[2]), cutlass.Uint32(arrival_4[3]), cutlass.Uint32(arrival_4[4]), cutlass.Uint32(arrival_4[5]), cutlass.Uint32(arrival_4[6]), cutlass.Uint32(arrival_4[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_510.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_4, dtype=cutlass.Uint32))
+        _forward_storage_523 = _route_terms_bf16
+        _forward_storage_524 = arrival_4
+        _forward_loop_520 = cutlass.while_generate([cutlass.Int32((arm_thread_4 * 16))], lambda _forward_condition_521: _forward_condition_521 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_520.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_520 as _forward_values_522:
+            arrival_word_4 = _forward_values_522[0]
+            _gmem_store_bits_525 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_4[0]), cutlass.Uint32(arrival_4[1]), cutlass.Uint32(arrival_4[2]), cutlass.Uint32(arrival_4[3]), cutlass.Uint32(arrival_4[4]), cutlass.Uint32(arrival_4[5]), cutlass.Uint32(arrival_4[6]), cutlass.Uint32(arrival_4[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_525.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_4, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word_4 + ((thread_stride_4 * 16)))])
-        _route_terms_bf16 = _forward_storage_508
-        arrival_4 = _forward_storage_509
+        _route_terms_bf16 = _forward_storage_523
+        arrival_4 = _forward_storage_524
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2899,47 +2957,47 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert_4[0] = cutlass.Int32(cute.make_tensor(remote_ids_4, _flat_layout)[source_route_lane_4])
                 route_weight_lane_4[0] = cutlass.Float32(cute.make_tensor(remote_weights_4, _flat_layout)[source_route_lane_4])
-                _if_condition_511 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_4[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane_4[0] = cutlass.Int32(cutlass.select_(_if_condition_511, cutlass.Int32(1), owned_lane_4[0]))
+                _if_condition_526 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_4[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane_4[0] = cutlass.Int32(cutlass.select_(_if_condition_526, cutlass.Int32(1), owned_lane_4[0]))
             any_owned_4 = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane_4[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned_4 != 0):
                 source_words_4 = remote_hidden_words_4 + (source_token_4 * 1536)
-                _gmem_load_into_packed_addr_512 = cute.recast_ptr(source_words_4 + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_513 = prims.load_ext(_gmem_load_into_packed_addr_512 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[0] = cutlass.Uint32(_gmem_load_into_packed_513[0])
-                row_words_4[1] = cutlass.Uint32(_gmem_load_into_packed_513[1])
-                row_words_4[2] = cutlass.Uint32(_gmem_load_into_packed_513[2])
-                row_words_4[3] = cutlass.Uint32(_gmem_load_into_packed_513[3])
-                _gmem_load_into_packed_addr_514 = cute.recast_ptr(source_words_4 + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_515 = prims.load_ext(_gmem_load_into_packed_addr_514 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_515[0])
-                row_words_4[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_515[1])
-                row_words_4[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_515[2])
-                row_words_4[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_515[3])
-                _gmem_load_into_packed_addr_516 = cute.recast_ptr(source_words_4 + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_517 = prims.load_ext(_gmem_load_into_packed_addr_516 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_517[0])
-                row_words_4[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_517[1])
-                row_words_4[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_517[2])
-                row_words_4[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_517[3])
-                _gmem_load_into_packed_addr_518 = cute.recast_ptr(source_words_4 + ((lane + 96) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_519 = prims.load_ext(_gmem_load_into_packed_addr_518 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_519[0])
-                row_words_4[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_519[1])
-                row_words_4[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_519[2])
-                row_words_4[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_519[3])
-                _gmem_load_into_packed_addr_520 = cute.recast_ptr(source_words_4 + ((lane + 128) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_521 = prims.load_ext(_gmem_load_into_packed_addr_520 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_521[0])
-                row_words_4[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_521[1])
-                row_words_4[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_521[2])
-                row_words_4[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_521[3])
-                _gmem_load_into_packed_addr_522 = cute.recast_ptr(source_words_4 + ((lane + 160) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_523 = prims.load_ext(_gmem_load_into_packed_addr_522 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_523[0])
-                row_words_4[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_523[1])
-                row_words_4[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_523[2])
-                row_words_4[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_523[3])
+                _gmem_load_into_packed_addr_527 = cute.recast_ptr(source_words_4 + (lane * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_528 = prims.load_ext(_gmem_load_into_packed_addr_527 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[0] = cutlass.Uint32(_gmem_load_into_packed_528[0])
+                row_words_4[1] = cutlass.Uint32(_gmem_load_into_packed_528[1])
+                row_words_4[2] = cutlass.Uint32(_gmem_load_into_packed_528[2])
+                row_words_4[3] = cutlass.Uint32(_gmem_load_into_packed_528[3])
+                _gmem_load_into_packed_addr_529 = cute.recast_ptr(source_words_4 + ((lane + 32) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_530 = prims.load_ext(_gmem_load_into_packed_addr_529 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_530[0])
+                row_words_4[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_530[1])
+                row_words_4[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_530[2])
+                row_words_4[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_530[3])
+                _gmem_load_into_packed_addr_531 = cute.recast_ptr(source_words_4 + ((lane + 64) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_532 = prims.load_ext(_gmem_load_into_packed_addr_531 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_532[0])
+                row_words_4[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_532[1])
+                row_words_4[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_532[2])
+                row_words_4[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_532[3])
+                _gmem_load_into_packed_addr_533 = cute.recast_ptr(source_words_4 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_534 = prims.load_ext(_gmem_load_into_packed_addr_533 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_534[0])
+                row_words_4[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_534[1])
+                row_words_4[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_534[2])
+                row_words_4[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_534[3])
+                _gmem_load_into_packed_addr_535 = cute.recast_ptr(source_words_4 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_536 = prims.load_ext(_gmem_load_into_packed_addr_535 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_536[0])
+                row_words_4[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_536[1])
+                row_words_4[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_536[2])
+                row_words_4[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_536[3])
+                _gmem_load_into_packed_addr_537 = cute.recast_ptr(source_words_4 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_538 = prims.load_ext(_gmem_load_into_packed_addr_537 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_538[0])
+                row_words_4[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_538[1])
+                row_words_4[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_538[2])
+                row_words_4[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_538[3])
                 if (owned_lane_4[0] != 0):
                     local_expert_lane_4 = cutlass.Int32((global_expert_4[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add_4 = cute.arch.atomic_add(route_counts_u32 + local_expert_lane_4, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -2953,69 +3011,69 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index_7 = cute.arch.shuffle_sync(row_index_lane_4[0], route_slot_7, mask=4294967295, mask_and_clamp=31)
                     if (row_index_7 >= 0):
                         row_dst_4 = activation_words_4 + (row_index_7 * 1536)
-                        _gmem_store_bits_524 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[0]), cutlass.Uint32(row_words_4[1]), cutlass.Uint32(row_words_4[2]), cutlass.Uint32(row_words_4[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_524.ir_value(), row_dst_4 + (lane * 4))
-                        _gmem_store_bits_525 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(4) + 0]), cutlass.Uint32(row_words_4[(4) + 1]), cutlass.Uint32(row_words_4[(4) + 2]), cutlass.Uint32(row_words_4[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_525.ir_value(), row_dst_4 + ((lane + 32) * 4))
-                        _gmem_store_bits_526 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(8) + 0]), cutlass.Uint32(row_words_4[(8) + 1]), cutlass.Uint32(row_words_4[(8) + 2]), cutlass.Uint32(row_words_4[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_526.ir_value(), row_dst_4 + ((lane + 64) * 4))
-                        _gmem_store_bits_527 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(12) + 0]), cutlass.Uint32(row_words_4[(12) + 1]), cutlass.Uint32(row_words_4[(12) + 2]), cutlass.Uint32(row_words_4[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_527.ir_value(), row_dst_4 + ((lane + 96) * 4))
-                        _gmem_store_bits_528 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(16) + 0]), cutlass.Uint32(row_words_4[(16) + 1]), cutlass.Uint32(row_words_4[(16) + 2]), cutlass.Uint32(row_words_4[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_528.ir_value(), row_dst_4 + ((lane + 128) * 4))
-                        _gmem_store_bits_529 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(20) + 0]), cutlass.Uint32(row_words_4[(20) + 1]), cutlass.Uint32(row_words_4[(20) + 2]), cutlass.Uint32(row_words_4[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_529.ir_value(), row_dst_4 + ((lane + 160) * 4))
-                _gmem_load_into_packed_addr_530 = cute.recast_ptr(source_words_4 + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_531 = prims.load_ext(_gmem_load_into_packed_addr_530 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[0] = cutlass.Uint32(_gmem_load_into_packed_531[0])
-                row_words_4[1] = cutlass.Uint32(_gmem_load_into_packed_531[1])
-                row_words_4[2] = cutlass.Uint32(_gmem_load_into_packed_531[2])
-                row_words_4[3] = cutlass.Uint32(_gmem_load_into_packed_531[3])
-                _gmem_load_into_packed_addr_532 = cute.recast_ptr(source_words_4 + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_533 = prims.load_ext(_gmem_load_into_packed_addr_532 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_533[0])
-                row_words_4[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_533[1])
-                row_words_4[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_533[2])
-                row_words_4[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_533[3])
-                _gmem_load_into_packed_addr_534 = cute.recast_ptr(source_words_4 + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_535 = prims.load_ext(_gmem_load_into_packed_addr_534 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_535[0])
-                row_words_4[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_535[1])
-                row_words_4[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_535[2])
-                row_words_4[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_535[3])
-                _gmem_load_into_packed_addr_536 = cute.recast_ptr(source_words_4 + ((lane + 288) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_537 = prims.load_ext(_gmem_load_into_packed_addr_536 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_537[0])
-                row_words_4[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_537[1])
-                row_words_4[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_537[2])
-                row_words_4[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_537[3])
-                _gmem_load_into_packed_addr_538 = cute.recast_ptr(source_words_4 + ((lane + 320) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_539 = prims.load_ext(_gmem_load_into_packed_addr_538 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_539[0])
-                row_words_4[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_539[1])
-                row_words_4[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_539[2])
-                row_words_4[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_539[3])
-                _gmem_load_into_packed_addr_540 = cute.recast_ptr(source_words_4 + ((lane + 352) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_541 = prims.load_ext(_gmem_load_into_packed_addr_540 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_4[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_541[0])
-                row_words_4[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_541[1])
-                row_words_4[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_541[2])
-                row_words_4[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_541[3])
+                        _gmem_store_bits_539 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[0]), cutlass.Uint32(row_words_4[1]), cutlass.Uint32(row_words_4[2]), cutlass.Uint32(row_words_4[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_539.ir_value(), row_dst_4 + (lane * 4))
+                        _gmem_store_bits_540 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(4) + 0]), cutlass.Uint32(row_words_4[(4) + 1]), cutlass.Uint32(row_words_4[(4) + 2]), cutlass.Uint32(row_words_4[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_540.ir_value(), row_dst_4 + ((lane + 32) * 4))
+                        _gmem_store_bits_541 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(8) + 0]), cutlass.Uint32(row_words_4[(8) + 1]), cutlass.Uint32(row_words_4[(8) + 2]), cutlass.Uint32(row_words_4[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_541.ir_value(), row_dst_4 + ((lane + 64) * 4))
+                        _gmem_store_bits_542 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(12) + 0]), cutlass.Uint32(row_words_4[(12) + 1]), cutlass.Uint32(row_words_4[(12) + 2]), cutlass.Uint32(row_words_4[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_542.ir_value(), row_dst_4 + ((lane + 96) * 4))
+                        _gmem_store_bits_543 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(16) + 0]), cutlass.Uint32(row_words_4[(16) + 1]), cutlass.Uint32(row_words_4[(16) + 2]), cutlass.Uint32(row_words_4[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_543.ir_value(), row_dst_4 + ((lane + 128) * 4))
+                        _gmem_store_bits_544 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(20) + 0]), cutlass.Uint32(row_words_4[(20) + 1]), cutlass.Uint32(row_words_4[(20) + 2]), cutlass.Uint32(row_words_4[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_544.ir_value(), row_dst_4 + ((lane + 160) * 4))
+                _gmem_load_into_packed_addr_545 = cute.recast_ptr(source_words_4 + ((lane + 192) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_546 = prims.load_ext(_gmem_load_into_packed_addr_545 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[0] = cutlass.Uint32(_gmem_load_into_packed_546[0])
+                row_words_4[1] = cutlass.Uint32(_gmem_load_into_packed_546[1])
+                row_words_4[2] = cutlass.Uint32(_gmem_load_into_packed_546[2])
+                row_words_4[3] = cutlass.Uint32(_gmem_load_into_packed_546[3])
+                _gmem_load_into_packed_addr_547 = cute.recast_ptr(source_words_4 + ((lane + 224) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_548 = prims.load_ext(_gmem_load_into_packed_addr_547 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_548[0])
+                row_words_4[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_548[1])
+                row_words_4[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_548[2])
+                row_words_4[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_548[3])
+                _gmem_load_into_packed_addr_549 = cute.recast_ptr(source_words_4 + ((lane + 256) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_550 = prims.load_ext(_gmem_load_into_packed_addr_549 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_550[0])
+                row_words_4[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_550[1])
+                row_words_4[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_550[2])
+                row_words_4[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_550[3])
+                _gmem_load_into_packed_addr_551 = cute.recast_ptr(source_words_4 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_552 = prims.load_ext(_gmem_load_into_packed_addr_551 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_552[0])
+                row_words_4[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_552[1])
+                row_words_4[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_552[2])
+                row_words_4[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_552[3])
+                _gmem_load_into_packed_addr_553 = cute.recast_ptr(source_words_4 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_554 = prims.load_ext(_gmem_load_into_packed_addr_553 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_554[0])
+                row_words_4[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_554[1])
+                row_words_4[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_554[2])
+                row_words_4[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_554[3])
+                _gmem_load_into_packed_addr_555 = cute.recast_ptr(source_words_4 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_556 = prims.load_ext(_gmem_load_into_packed_addr_555 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_4[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_556[0])
+                row_words_4[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_556[1])
+                row_words_4[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_556[2])
+                row_words_4[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_556[3])
                 for route_slot_8 in cutlass.range_constexpr(0, 8, 1):
                     row_index_8 = cute.arch.shuffle_sync(row_index_lane_4[0], route_slot_8, mask=4294967295, mask_and_clamp=31)
                     if (row_index_8 >= 0):
-                        _gmem_store_bits_542 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[0]), cutlass.Uint32(row_words_4[1]), cutlass.Uint32(row_words_4[2]), cutlass.Uint32(row_words_4[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_542.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 192) * 4)))
-                        _gmem_store_bits_543 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(4) + 0]), cutlass.Uint32(row_words_4[(4) + 1]), cutlass.Uint32(row_words_4[(4) + 2]), cutlass.Uint32(row_words_4[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_543.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 224) * 4)))
-                        _gmem_store_bits_544 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(8) + 0]), cutlass.Uint32(row_words_4[(8) + 1]), cutlass.Uint32(row_words_4[(8) + 2]), cutlass.Uint32(row_words_4[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_544.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 256) * 4)))
-                        _gmem_store_bits_545 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(12) + 0]), cutlass.Uint32(row_words_4[(12) + 1]), cutlass.Uint32(row_words_4[(12) + 2]), cutlass.Uint32(row_words_4[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_545.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 288) * 4)))
-                        _gmem_store_bits_546 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(16) + 0]), cutlass.Uint32(row_words_4[(16) + 1]), cutlass.Uint32(row_words_4[(16) + 2]), cutlass.Uint32(row_words_4[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_546.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 320) * 4)))
-                        _gmem_store_bits_547 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(20) + 0]), cutlass.Uint32(row_words_4[(20) + 1]), cutlass.Uint32(row_words_4[(20) + 2]), cutlass.Uint32(row_words_4[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_547.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 352) * 4)))
+                        _gmem_store_bits_557 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[0]), cutlass.Uint32(row_words_4[1]), cutlass.Uint32(row_words_4[2]), cutlass.Uint32(row_words_4[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_557.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 192) * 4)))
+                        _gmem_store_bits_558 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(4) + 0]), cutlass.Uint32(row_words_4[(4) + 1]), cutlass.Uint32(row_words_4[(4) + 2]), cutlass.Uint32(row_words_4[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_558.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 224) * 4)))
+                        _gmem_store_bits_559 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(8) + 0]), cutlass.Uint32(row_words_4[(8) + 1]), cutlass.Uint32(row_words_4[(8) + 2]), cutlass.Uint32(row_words_4[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_559.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 256) * 4)))
+                        _gmem_store_bits_560 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(12) + 0]), cutlass.Uint32(row_words_4[(12) + 1]), cutlass.Uint32(row_words_4[(12) + 2]), cutlass.Uint32(row_words_4[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_560.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 288) * 4)))
+                        _gmem_store_bits_561 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(16) + 0]), cutlass.Uint32(row_words_4[(16) + 1]), cutlass.Uint32(row_words_4[(16) + 2]), cutlass.Uint32(row_words_4[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_561.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 320) * 4)))
+                        _gmem_store_bits_562 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_4[(20) + 0]), cutlass.Uint32(row_words_4[(20) + 1]), cutlass.Uint32(row_words_4[(20) + 2]), cutlass.Uint32(row_words_4[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_562.ir_value(), activation_words_4 + ((row_index_8 * 1536) + ((lane + 352) * 4)))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -3045,14 +3103,15 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _phase_transformed_free = cute.make_rmem_tensor((1,), cutlass.Uint32)
         linear_thread_5 = cutlass.Int32(((bid * 384) + tid))
         thread_stride_5 = cutlass.Int32((num_bids * 384))
-        _forward_storage_551 = _published_topk_ids_i32
-        _forward_storage_552 = _published_topk_weights_f32
-        _forward_storage_553 = _source_topk_ids_i64
-        _forward_storage_554 = _source_topk_weights_f32
-        _forward_loop_548 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_549: _forward_condition_549 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
-        _forward_loop_548.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_548 as _forward_values_550:
-            push_5 = _forward_values_550[0]
+        _forward_storage_566 = _peer_ptrs
+        _forward_storage_567 = _published_topk_ids_i32
+        _forward_storage_568 = _published_topk_weights_f32
+        _forward_storage_569 = _source_topk_ids_i64
+        _forward_storage_570 = _source_topk_weights_f32
+        _forward_loop_563 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_564: _forward_condition_564 < cutlass.Int32(((16 * tokens_per_rank) * 8)))
+        _forward_loop_563.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_563 as _forward_values_565:
+            push_5 = _forward_values_565[0]
             push_dest_10 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(push_5).ir_value(), cutlass.Int32((tokens_per_rank * 8)).ir_value())))
             push_route_5 = cutlass.Int32((push_5 - (push_dest_10 * (tokens_per_rank * 8))))
             push_slot_10 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 8) + push_route_5))
@@ -3062,102 +3121,107 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 prims.store_ext(cutlass.Int32(route_id_5).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(cute.recast_ptr(published_topk_ids_i32, dtype=cutlass.Int32) + push_slot_10, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_5).ir_value(), cute.recast_ptr(published_topk_weights_f32, dtype=cutlass.Float32) + push_slot_10)
             else:
-                peer_ids_5 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.select_((push_dest_10) == 31, cutlass.Uint64(published_topk_ids_i32_peers[31]), cutlass.select_((push_dest_10) == 30, cutlass.Uint64(published_topk_ids_i32_peers[30]), cutlass.select_((push_dest_10) == 29, cutlass.Uint64(published_topk_ids_i32_peers[29]), cutlass.select_((push_dest_10) == 28, cutlass.Uint64(published_topk_ids_i32_peers[28]), cutlass.select_((push_dest_10) == 27, cutlass.Uint64(published_topk_ids_i32_peers[27]), cutlass.select_((push_dest_10) == 26, cutlass.Uint64(published_topk_ids_i32_peers[26]), cutlass.select_((push_dest_10) == 25, cutlass.Uint64(published_topk_ids_i32_peers[25]), cutlass.select_((push_dest_10) == 24, cutlass.Uint64(published_topk_ids_i32_peers[24]), cutlass.select_((push_dest_10) == 23, cutlass.Uint64(published_topk_ids_i32_peers[23]), cutlass.select_((push_dest_10) == 22, cutlass.Uint64(published_topk_ids_i32_peers[22]), cutlass.select_((push_dest_10) == 21, cutlass.Uint64(published_topk_ids_i32_peers[21]), cutlass.select_((push_dest_10) == 20, cutlass.Uint64(published_topk_ids_i32_peers[20]), cutlass.select_((push_dest_10) == 19, cutlass.Uint64(published_topk_ids_i32_peers[19]), cutlass.select_((push_dest_10) == 18, cutlass.Uint64(published_topk_ids_i32_peers[18]), cutlass.select_((push_dest_10) == 17, cutlass.Uint64(published_topk_ids_i32_peers[17]), cutlass.select_((push_dest_10) == 16, cutlass.Uint64(published_topk_ids_i32_peers[16]), cutlass.select_((push_dest_10) == 15, cutlass.Uint64(published_topk_ids_i32_peers[15]), cutlass.select_((push_dest_10) == 14, cutlass.Uint64(published_topk_ids_i32_peers[14]), cutlass.select_((push_dest_10) == 13, cutlass.Uint64(published_topk_ids_i32_peers[13]), cutlass.select_((push_dest_10) == 12, cutlass.Uint64(published_topk_ids_i32_peers[12]), cutlass.select_((push_dest_10) == 11, cutlass.Uint64(published_topk_ids_i32_peers[11]), cutlass.select_((push_dest_10) == 10, cutlass.Uint64(published_topk_ids_i32_peers[10]), cutlass.select_((push_dest_10) == 9, cutlass.Uint64(published_topk_ids_i32_peers[9]), cutlass.select_((push_dest_10) == 8, cutlass.Uint64(published_topk_ids_i32_peers[8]), cutlass.select_((push_dest_10) == 7, cutlass.Uint64(published_topk_ids_i32_peers[7]), cutlass.select_((push_dest_10) == 6, cutlass.Uint64(published_topk_ids_i32_peers[6]), cutlass.select_((push_dest_10) == 5, cutlass.Uint64(published_topk_ids_i32_peers[5]), cutlass.select_((push_dest_10) == 4, cutlass.Uint64(published_topk_ids_i32_peers[4]), cutlass.select_((push_dest_10) == 3, cutlass.Uint64(published_topk_ids_i32_peers[3]), cutlass.select_((push_dest_10) == 2, cutlass.Uint64(published_topk_ids_i32_peers[2]), cutlass.select_((push_dest_10) == 1, cutlass.Uint64(published_topk_ids_i32_peers[1]), cutlass.Uint64(published_topk_ids_i32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
-                peer_weights_5 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.select_((push_dest_10) == 31, cutlass.Uint64(published_topk_weights_f32_peers[31]), cutlass.select_((push_dest_10) == 30, cutlass.Uint64(published_topk_weights_f32_peers[30]), cutlass.select_((push_dest_10) == 29, cutlass.Uint64(published_topk_weights_f32_peers[29]), cutlass.select_((push_dest_10) == 28, cutlass.Uint64(published_topk_weights_f32_peers[28]), cutlass.select_((push_dest_10) == 27, cutlass.Uint64(published_topk_weights_f32_peers[27]), cutlass.select_((push_dest_10) == 26, cutlass.Uint64(published_topk_weights_f32_peers[26]), cutlass.select_((push_dest_10) == 25, cutlass.Uint64(published_topk_weights_f32_peers[25]), cutlass.select_((push_dest_10) == 24, cutlass.Uint64(published_topk_weights_f32_peers[24]), cutlass.select_((push_dest_10) == 23, cutlass.Uint64(published_topk_weights_f32_peers[23]), cutlass.select_((push_dest_10) == 22, cutlass.Uint64(published_topk_weights_f32_peers[22]), cutlass.select_((push_dest_10) == 21, cutlass.Uint64(published_topk_weights_f32_peers[21]), cutlass.select_((push_dest_10) == 20, cutlass.Uint64(published_topk_weights_f32_peers[20]), cutlass.select_((push_dest_10) == 19, cutlass.Uint64(published_topk_weights_f32_peers[19]), cutlass.select_((push_dest_10) == 18, cutlass.Uint64(published_topk_weights_f32_peers[18]), cutlass.select_((push_dest_10) == 17, cutlass.Uint64(published_topk_weights_f32_peers[17]), cutlass.select_((push_dest_10) == 16, cutlass.Uint64(published_topk_weights_f32_peers[16]), cutlass.select_((push_dest_10) == 15, cutlass.Uint64(published_topk_weights_f32_peers[15]), cutlass.select_((push_dest_10) == 14, cutlass.Uint64(published_topk_weights_f32_peers[14]), cutlass.select_((push_dest_10) == 13, cutlass.Uint64(published_topk_weights_f32_peers[13]), cutlass.select_((push_dest_10) == 12, cutlass.Uint64(published_topk_weights_f32_peers[12]), cutlass.select_((push_dest_10) == 11, cutlass.Uint64(published_topk_weights_f32_peers[11]), cutlass.select_((push_dest_10) == 10, cutlass.Uint64(published_topk_weights_f32_peers[10]), cutlass.select_((push_dest_10) == 9, cutlass.Uint64(published_topk_weights_f32_peers[9]), cutlass.select_((push_dest_10) == 8, cutlass.Uint64(published_topk_weights_f32_peers[8]), cutlass.select_((push_dest_10) == 7, cutlass.Uint64(published_topk_weights_f32_peers[7]), cutlass.select_((push_dest_10) == 6, cutlass.Uint64(published_topk_weights_f32_peers[6]), cutlass.select_((push_dest_10) == 5, cutlass.Uint64(published_topk_weights_f32_peers[5]), cutlass.select_((push_dest_10) == 4, cutlass.Uint64(published_topk_weights_f32_peers[4]), cutlass.select_((push_dest_10) == 3, cutlass.Uint64(published_topk_weights_f32_peers[3]), cutlass.select_((push_dest_10) == 2, cutlass.Uint64(published_topk_weights_f32_peers[2]), cutlass.select_((push_dest_10) == 1, cutlass.Uint64(published_topk_weights_f32_peers[1]), cutlass.Uint64(published_topk_weights_f32_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_ids_5 = cute.make_ptr(cutlass.Int32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(16 + push_dest_10)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
+                peer_weights_5 = cute.make_ptr(cutlass.Float32, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[(32 + push_dest_10)])), mem_space=cute.AddressSpace.gmem, assumed_align=4)
                 prims.store_ext(cutlass.Int32(route_id_5).bitcast(cutlass.Uint32).ir_value(), cute.recast_ptr(peer_ids_5 + push_slot_10, dtype=cutlass.Uint32))
                 prims.store_ext(cutlass.Float32(route_weight_5).ir_value(), peer_weights_5 + push_slot_10)
             cutlass.yield_out([cutlass.Int32(push_5 + (thread_stride_5))])
-        _published_topk_ids_i32 = _forward_storage_551
-        _published_topk_weights_f32 = _forward_storage_552
-        _source_topk_ids_i64 = _forward_storage_553
-        _source_topk_weights_f32 = _forward_storage_554
-        _forward_storage_558 = _route_map_i32
-        _forward_storage_559 = _route_scale_f32
-        _forward_loop_555 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_556: _forward_condition_556 < cutlass.Int32(2048))
-        _forward_loop_555.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_555 as _forward_values_557:
-            index_10 = _forward_values_557[0]
+        _peer_ptrs = _forward_storage_566
+        _published_topk_ids_i32 = _forward_storage_567
+        _published_topk_weights_f32 = _forward_storage_568
+        _source_topk_ids_i64 = _forward_storage_569
+        _source_topk_weights_f32 = _forward_storage_570
+        _forward_storage_574 = _route_map_i32
+        _forward_storage_575 = _route_scale_f32
+        _forward_loop_571 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_572: _forward_condition_572 < cutlass.Int32(2048))
+        _forward_loop_571.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_571 as _forward_values_573:
+            index_10 = _forward_values_573[0]
             prims.store_ext(cutlass.Int32(-1).ir_value(), (route_map_i32 + (index_10)))
             prims.store_ext(cutlass.Float32(0.0).ir_value(), (route_scale_f32 + (index_10)))
             cutlass.yield_out([cutlass.Int32(index_10 + (thread_stride_5))])
-        _route_map_i32 = _forward_storage_558
-        _route_scale_f32 = _forward_storage_559
-        _forward_storage_563 = _route_counts_u32
-        _forward_loop_560 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_561: _forward_condition_561 < cutlass.Int32(32))
-        _forward_loop_560.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_560 as _forward_values_562:
-            expert_9 = _forward_values_562[0]
+        _route_map_i32 = _forward_storage_574
+        _route_scale_f32 = _forward_storage_575
+        _forward_storage_579 = _route_counts_u32
+        _forward_loop_576 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_577: _forward_condition_577 < cutlass.Int32(32))
+        _forward_loop_576.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_576 as _forward_values_578:
+            expert_9 = _forward_values_578[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), (route_counts_u32 + (expert_9)))
             cutlass.yield_out([cutlass.Int32(expert_9 + (thread_stride_5))])
-        _route_counts_u32 = _forward_storage_563
-        _forward_storage_567 = _fc1_done
-        _forward_loop_564 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_565: _forward_condition_565 < cutlass.Int32(96))
-        _forward_loop_564.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_564 as _forward_values_566:
-            expert_row_tile_7 = _forward_values_566[0]
+        _route_counts_u32 = _forward_storage_579
+        _forward_storage_583 = _fc1_done
+        _forward_loop_580 = cutlass.while_generate([cutlass.Int32(linear_thread_5)], lambda _forward_condition_581: _forward_condition_581 < cutlass.Int32(96))
+        _forward_loop_580.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_580 as _forward_values_582:
+            expert_row_tile_7 = _forward_values_582[0]
             prims.store_ext(cutlass.Uint32(0).ir_value(), fc1_done + expert_row_tile_7, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
             cutlass.yield_out([cutlass.Int32(expert_row_tile_7 + (thread_stride_5))])
-        _fc1_done = _forward_storage_567
-        _forward_storage_571 = _published_hidden_bf16
-        _forward_storage_572 = _source_hidden_bf16
-        _forward_storage_573 = _source_topk_ids_i64
-        _forward_storage_574 = push_owners_5
-        _forward_loop_568 = cutlass.while_generate([cutlass.Int32((linear_thread_5 * 8))], lambda _forward_condition_569: _forward_condition_569 < cutlass.Int32((tokens_per_rank * 3072)))
-        _forward_loop_568.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_568 as _forward_values_570:
-            index_11 = _forward_values_570[0]
+        _fc1_done = _forward_storage_583
+        _forward_storage_587 = _peer_ptrs
+        _forward_storage_588 = _published_hidden_bf16
+        _forward_storage_589 = _source_hidden_bf16
+        _forward_storage_590 = _source_topk_ids_i64
+        _forward_storage_591 = push_owners_5
+        _forward_loop_584 = cutlass.while_generate([cutlass.Int32((linear_thread_5 * 8))], lambda _forward_condition_585: _forward_condition_585 < cutlass.Int32((tokens_per_rank * 3072)))
+        _forward_loop_584.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_584 as _forward_values_586:
+            index_11 = _forward_values_586[0]
             hidden_f32_5 = cute.make_rmem_tensor((8,), cutlass.Float32)
-            _gmem_load_into_575 = prims.load_ext(source_hidden_bf16 + index_11, dtype=cutlass.Int16, count=8)
-            _gmem_load_into_f32_576 = _gmem_load_into_575.bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            hidden_f32_5[0] = _gmem_load_into_f32_576[0]
-            hidden_f32_5[1] = _gmem_load_into_f32_576[1]
-            hidden_f32_5[2] = _gmem_load_into_f32_576[2]
-            hidden_f32_5[3] = _gmem_load_into_f32_576[3]
-            hidden_f32_5[4] = _gmem_load_into_f32_576[4]
-            hidden_f32_5[5] = _gmem_load_into_f32_576[5]
-            hidden_f32_5[6] = _gmem_load_into_f32_576[6]
-            hidden_f32_5[7] = _gmem_load_into_f32_576[7]
+            _gmem_load_into_592 = prims.load_ext(source_hidden_bf16 + index_11, dtype=cutlass.Int16, count=8)
+            _gmem_load_into_f32_593 = _gmem_load_into_592.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            hidden_f32_5[0] = _gmem_load_into_f32_593[0]
+            hidden_f32_5[1] = _gmem_load_into_f32_593[1]
+            hidden_f32_5[2] = _gmem_load_into_f32_593[2]
+            hidden_f32_5[3] = _gmem_load_into_f32_593[3]
+            hidden_f32_5[4] = _gmem_load_into_f32_593[4]
+            hidden_f32_5[5] = _gmem_load_into_f32_593[5]
+            hidden_f32_5[6] = _gmem_load_into_f32_593[6]
+            hidden_f32_5[7] = _gmem_load_into_f32_593[7]
             chunk_5 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-            _bf16_pack_577 = prims.cvt_packfloat_f32(hidden_f32_5[1], hidden_f32_5[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_5[0] = cutlass.Uint32(_bf16_pack_577)
-            _bf16_pack_578 = prims.cvt_packfloat_f32(hidden_f32_5[3], hidden_f32_5[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_5[1] = cutlass.Uint32(_bf16_pack_578)
-            _bf16_pack_579 = prims.cvt_packfloat_f32(hidden_f32_5[5], hidden_f32_5[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_5[2] = cutlass.Uint32(_bf16_pack_579)
-            _bf16_pack_580 = prims.cvt_packfloat_f32(hidden_f32_5[7], hidden_f32_5[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-            chunk_5[3] = cutlass.Uint32(_bf16_pack_580)
+            _bf16_pack_594 = prims.cvt_packfloat_f32(hidden_f32_5[1], hidden_f32_5[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_5[0] = cutlass.Uint32(_bf16_pack_594)
+            _bf16_pack_595 = prims.cvt_packfloat_f32(hidden_f32_5[3], hidden_f32_5[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_5[1] = cutlass.Uint32(_bf16_pack_595)
+            _bf16_pack_596 = prims.cvt_packfloat_f32(hidden_f32_5[5], hidden_f32_5[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_5[2] = cutlass.Uint32(_bf16_pack_596)
+            _bf16_pack_597 = prims.cvt_packfloat_f32(hidden_f32_5[7], hidden_f32_5[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+            chunk_5[3] = cutlass.Uint32(_bf16_pack_597)
             push_token_5 = cutlass.Int32(cutlass.Int32(cutlass_arith.divui(cutlass.Uint32(index_11).ir_value(), cutlass.Uint32(3072).ir_value())))
             push_owners_5[0] = cutlass.Uint32(0)
             for push_slot_11 in cutlass.range_constexpr(0, 8, 1):
                 owner_rank_5 = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(cutlass.Int32(_source_topk_ids_i64[((push_token_5 * 8) + push_slot_11)])).ir_value(), cutlass.Int32(32).ir_value())))
                 push_owners_5[0] = cutlass.Uint32((push_owners_5[0] | (1 << cutlass.Uint32(owner_rank_5))))
             row_offset_5 = cutlass.Int32((((mega_pg_rank * tokens_per_rank) * 3072) + index_11))
-            _while_storage_584 = _published_hidden_bf16
-            _while_storage_585 = chunk_5
-            _while_storage_586 = push_owners_5
-            _while_loop_581 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_582: (push_owners_5[0] != 0))
-            with _while_loop_581 as _while_values_583:
-                _ffs_reversed_bits_587 = cute.arch.brev(cutlass.Uint32(push_owners_5[0]))
-                _ffs_leading_one_588 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_587))
-                _find_first_set_5 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_5[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_588))
+            _while_storage_601 = _peer_ptrs
+            _while_storage_602 = _published_hidden_bf16
+            _while_storage_603 = chunk_5
+            _while_storage_604 = push_owners_5
+            _while_loop_598 = cutlass.while_generate([cutlass.Int32(0)], lambda _while_condition_599: (push_owners_5[0] != 0))
+            with _while_loop_598 as _while_values_600:
+                _ffs_reversed_bits_605 = cute.arch.brev(cutlass.Uint32(push_owners_5[0]))
+                _ffs_leading_one_606 = cutlass.Int32(cute.arch.bfind(_ffs_reversed_bits_605))
+                _find_first_set_5 = cutlass.Int32(cutlass.select_(cutlass.Uint32(push_owners_5[0]) == cutlass.Uint32(0), cutlass.Int32(0), cutlass.Int32(32) - _ffs_leading_one_606))
                 push_dest_11 = cutlass.Int32((_find_first_set_5 - 1))
                 push_owners_5[0] = cutlass.Uint32((push_owners_5[0] & (push_owners_5[0] - 1)))
                 if (push_dest_11 == mega_pg_rank):
-                    _gmem_store_bits_589 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_5[0]), cutlass.Uint32(chunk_5[1]), cutlass.Uint32(chunk_5[2]), cutlass.Uint32(chunk_5[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_589.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_5, dtype=cutlass.Uint32))
+                    _gmem_store_bits_607 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_5[0]), cutlass.Uint32(chunk_5[1]), cutlass.Uint32(chunk_5[2]), cutlass.Uint32(chunk_5[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_607.ir_value(), cute.recast_ptr(cute.recast_ptr(published_hidden_bf16, dtype=cutlass.BFloat16) + row_offset_5, dtype=cutlass.Uint32))
                 else:
-                    peer_rows_5 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.select_((push_dest_11) == 31, cutlass.Uint64(published_hidden_bf16_peers[31]), cutlass.select_((push_dest_11) == 30, cutlass.Uint64(published_hidden_bf16_peers[30]), cutlass.select_((push_dest_11) == 29, cutlass.Uint64(published_hidden_bf16_peers[29]), cutlass.select_((push_dest_11) == 28, cutlass.Uint64(published_hidden_bf16_peers[28]), cutlass.select_((push_dest_11) == 27, cutlass.Uint64(published_hidden_bf16_peers[27]), cutlass.select_((push_dest_11) == 26, cutlass.Uint64(published_hidden_bf16_peers[26]), cutlass.select_((push_dest_11) == 25, cutlass.Uint64(published_hidden_bf16_peers[25]), cutlass.select_((push_dest_11) == 24, cutlass.Uint64(published_hidden_bf16_peers[24]), cutlass.select_((push_dest_11) == 23, cutlass.Uint64(published_hidden_bf16_peers[23]), cutlass.select_((push_dest_11) == 22, cutlass.Uint64(published_hidden_bf16_peers[22]), cutlass.select_((push_dest_11) == 21, cutlass.Uint64(published_hidden_bf16_peers[21]), cutlass.select_((push_dest_11) == 20, cutlass.Uint64(published_hidden_bf16_peers[20]), cutlass.select_((push_dest_11) == 19, cutlass.Uint64(published_hidden_bf16_peers[19]), cutlass.select_((push_dest_11) == 18, cutlass.Uint64(published_hidden_bf16_peers[18]), cutlass.select_((push_dest_11) == 17, cutlass.Uint64(published_hidden_bf16_peers[17]), cutlass.select_((push_dest_11) == 16, cutlass.Uint64(published_hidden_bf16_peers[16]), cutlass.select_((push_dest_11) == 15, cutlass.Uint64(published_hidden_bf16_peers[15]), cutlass.select_((push_dest_11) == 14, cutlass.Uint64(published_hidden_bf16_peers[14]), cutlass.select_((push_dest_11) == 13, cutlass.Uint64(published_hidden_bf16_peers[13]), cutlass.select_((push_dest_11) == 12, cutlass.Uint64(published_hidden_bf16_peers[12]), cutlass.select_((push_dest_11) == 11, cutlass.Uint64(published_hidden_bf16_peers[11]), cutlass.select_((push_dest_11) == 10, cutlass.Uint64(published_hidden_bf16_peers[10]), cutlass.select_((push_dest_11) == 9, cutlass.Uint64(published_hidden_bf16_peers[9]), cutlass.select_((push_dest_11) == 8, cutlass.Uint64(published_hidden_bf16_peers[8]), cutlass.select_((push_dest_11) == 7, cutlass.Uint64(published_hidden_bf16_peers[7]), cutlass.select_((push_dest_11) == 6, cutlass.Uint64(published_hidden_bf16_peers[6]), cutlass.select_((push_dest_11) == 5, cutlass.Uint64(published_hidden_bf16_peers[5]), cutlass.select_((push_dest_11) == 4, cutlass.Uint64(published_hidden_bf16_peers[4]), cutlass.select_((push_dest_11) == 3, cutlass.Uint64(published_hidden_bf16_peers[3]), cutlass.select_((push_dest_11) == 2, cutlass.Uint64(published_hidden_bf16_peers[2]), cutlass.select_((push_dest_11) == 1, cutlass.Uint64(published_hidden_bf16_peers[1]), cutlass.Uint64(published_hidden_bf16_peers[0]))))))))))))))))))))))))))))))))), mem_space=cute.AddressSpace.gmem, assumed_align=2)
-                    _gmem_store_bits_590 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_5[0]), cutlass.Uint32(chunk_5[1]), cutlass.Uint32(chunk_5[2]), cutlass.Uint32(chunk_5[3])], cutlass.Uint32)
-                    prims.store_ext(_gmem_store_bits_590.ir_value(), cute.recast_ptr(peer_rows_5 + row_offset_5, dtype=cutlass.Uint32))
+                    peer_rows_5 = cute.make_ptr(cutlass.BFloat16, cutlass.Uint64(cutlass.Uint64(_peer_ptrs[push_dest_11])), mem_space=cute.AddressSpace.gmem, assumed_align=2)
+                    _gmem_store_bits_608 = cutlass.Vector.from_elements([cutlass.Uint32(chunk_5[0]), cutlass.Uint32(chunk_5[1]), cutlass.Uint32(chunk_5[2]), cutlass.Uint32(chunk_5[3])], cutlass.Uint32)
+                    prims.store_ext(_gmem_store_bits_608.ir_value(), cute.recast_ptr(peer_rows_5 + row_offset_5, dtype=cutlass.Uint32))
                 cutlass.yield_out([cutlass.Int32(0)])
-            _published_hidden_bf16 = _while_storage_584
-            chunk_5 = _while_storage_585
-            push_owners_5 = _while_storage_586
+            _peer_ptrs = _while_storage_601
+            _published_hidden_bf16 = _while_storage_602
+            chunk_5 = _while_storage_603
+            push_owners_5 = _while_storage_604
             cutlass.yield_out([cutlass.Int32(index_11 + ((thread_stride_5 * 8)))])
-        _published_hidden_bf16 = _forward_storage_571
-        _source_hidden_bf16 = _forward_storage_572
-        _source_topk_ids_i64 = _forward_storage_573
-        push_owners_5 = _forward_storage_574
+        _peer_ptrs = _forward_storage_587
+        _published_hidden_bf16 = _forward_storage_588
+        _source_hidden_bf16 = _forward_storage_589
+        _source_topk_ids_i64 = _forward_storage_590
+        push_owners_5 = _forward_storage_591
         arrival_5 = cute.make_rmem_tensor((8,), cutlass.Uint32)
         arrival_5[0] = cutlass.Uint32(4294967295)
         arrival_5[1] = cutlass.Uint32(4294967295)
@@ -3168,17 +3232,17 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         arrival_5[6] = cutlass.Uint32(4294967295)
         arrival_5[7] = cutlass.Uint32(4294967295)
         arm_thread_5 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
-        _forward_storage_594 = _route_terms_bf16
-        _forward_storage_595 = arrival_5
-        _forward_loop_591 = cutlass.while_generate([cutlass.Int32((arm_thread_5 * 16))], lambda _forward_condition_592: _forward_condition_592 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-        _forward_loop_591.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-        with _forward_loop_591 as _forward_values_593:
-            arrival_word_5 = _forward_values_593[0]
-            _gmem_store_bits_596 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_5[0]), cutlass.Uint32(arrival_5[1]), cutlass.Uint32(arrival_5[2]), cutlass.Uint32(arrival_5[3]), cutlass.Uint32(arrival_5[4]), cutlass.Uint32(arrival_5[5]), cutlass.Uint32(arrival_5[6]), cutlass.Uint32(arrival_5[7])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_596.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_5, dtype=cutlass.Uint32))
+        _forward_storage_612 = _route_terms_bf16
+        _forward_storage_613 = arrival_5
+        _forward_loop_609 = cutlass.while_generate([cutlass.Int32((arm_thread_5 * 16))], lambda _forward_condition_610: _forward_condition_610 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_609.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_609 as _forward_values_611:
+            arrival_word_5 = _forward_values_611[0]
+            _gmem_store_bits_614 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_5[0]), cutlass.Uint32(arrival_5[1]), cutlass.Uint32(arrival_5[2]), cutlass.Uint32(arrival_5[3]), cutlass.Uint32(arrival_5[4]), cutlass.Uint32(arrival_5[5]), cutlass.Uint32(arrival_5[6]), cutlass.Uint32(arrival_5[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_614.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_5, dtype=cutlass.Uint32))
             cutlass.yield_out([cutlass.Int32(arrival_word_5 + ((thread_stride_5 * 16)))])
-        _route_terms_bf16 = _forward_storage_594
-        arrival_5 = _forward_storage_595
+        _route_terms_bf16 = _forward_storage_612
+        arrival_5 = _forward_storage_613
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -3209,83 +3273,83 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
             if (lane < 8):
                 global_expert_5[0] = cutlass.Int32(cute.make_tensor(remote_ids_5, _flat_layout)[source_route_lane_5])
                 route_weight_lane_5[0] = cutlass.Float32(cute.make_tensor(remote_weights_5, _flat_layout)[source_route_lane_5])
-                _if_condition_597 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_5[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
-                owned_lane_5[0] = cutlass.Int32(cutlass.select_(_if_condition_597, cutlass.Int32(1), owned_lane_5[0]))
+                _if_condition_615 = cutlass.Boolean((cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(global_expert_5[0]).ir_value(), cutlass.Int32(32).ir_value())) == mega_pg_rank))
+                owned_lane_5[0] = cutlass.Int32(cutlass.select_(_if_condition_615, cutlass.Int32(1), owned_lane_5[0]))
             any_owned_5 = cutlass.Int32(cute.arch.vote_any_sync(cutlass.Boolean((owned_lane_5[0] != 0)), cutlass.Uint32(4294967295)))
             if (any_owned_5 != 0):
                 source_words_5 = remote_hidden_words_5 + (source_token_5 * 1536)
-                _gmem_load_into_packed_addr_598 = cute.recast_ptr(source_words_5 + (lane * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_599 = prims.load_ext(_gmem_load_into_packed_addr_598 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[0] = cutlass.Uint32(_gmem_load_into_packed_599[0])
-                row_words_5[1] = cutlass.Uint32(_gmem_load_into_packed_599[1])
-                row_words_5[2] = cutlass.Uint32(_gmem_load_into_packed_599[2])
-                row_words_5[3] = cutlass.Uint32(_gmem_load_into_packed_599[3])
-                _gmem_load_into_packed_addr_600 = cute.recast_ptr(source_words_5 + ((lane + 32) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_601 = prims.load_ext(_gmem_load_into_packed_addr_600 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_601[0])
-                row_words_5[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_601[1])
-                row_words_5[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_601[2])
-                row_words_5[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_601[3])
-                _gmem_load_into_packed_addr_602 = cute.recast_ptr(source_words_5 + ((lane + 64) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_603 = prims.load_ext(_gmem_load_into_packed_addr_602 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_603[0])
-                row_words_5[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_603[1])
-                row_words_5[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_603[2])
-                row_words_5[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_603[3])
-                _gmem_load_into_packed_addr_604 = cute.recast_ptr(source_words_5 + ((lane + 96) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_605 = prims.load_ext(_gmem_load_into_packed_addr_604 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_605[0])
-                row_words_5[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_605[1])
-                row_words_5[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_605[2])
-                row_words_5[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_605[3])
-                _gmem_load_into_packed_addr_606 = cute.recast_ptr(source_words_5 + ((lane + 128) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_607 = prims.load_ext(_gmem_load_into_packed_addr_606 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_607[0])
-                row_words_5[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_607[1])
-                row_words_5[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_607[2])
-                row_words_5[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_607[3])
-                _gmem_load_into_packed_addr_608 = cute.recast_ptr(source_words_5 + ((lane + 160) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_609 = prims.load_ext(_gmem_load_into_packed_addr_608 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_609[0])
-                row_words_5[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_609[1])
-                row_words_5[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_609[2])
-                row_words_5[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_609[3])
-                _gmem_load_into_packed_addr_610 = cute.recast_ptr(source_words_5 + ((lane + 192) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_611 = prims.load_ext(_gmem_load_into_packed_addr_610 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(24) + 0] = cutlass.Uint32(_gmem_load_into_packed_611[0])
-                row_words_5[(24) + 1] = cutlass.Uint32(_gmem_load_into_packed_611[1])
-                row_words_5[(24) + 2] = cutlass.Uint32(_gmem_load_into_packed_611[2])
-                row_words_5[(24) + 3] = cutlass.Uint32(_gmem_load_into_packed_611[3])
-                _gmem_load_into_packed_addr_612 = cute.recast_ptr(source_words_5 + ((lane + 224) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_613 = prims.load_ext(_gmem_load_into_packed_addr_612 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(28) + 0] = cutlass.Uint32(_gmem_load_into_packed_613[0])
-                row_words_5[(28) + 1] = cutlass.Uint32(_gmem_load_into_packed_613[1])
-                row_words_5[(28) + 2] = cutlass.Uint32(_gmem_load_into_packed_613[2])
-                row_words_5[(28) + 3] = cutlass.Uint32(_gmem_load_into_packed_613[3])
-                _gmem_load_into_packed_addr_614 = cute.recast_ptr(source_words_5 + ((lane + 256) * 4), dtype=cutlass.Uint32)
-                _gmem_load_into_packed_615 = prims.load_ext(_gmem_load_into_packed_addr_614 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(32) + 0] = cutlass.Uint32(_gmem_load_into_packed_615[0])
-                row_words_5[(32) + 1] = cutlass.Uint32(_gmem_load_into_packed_615[1])
-                row_words_5[(32) + 2] = cutlass.Uint32(_gmem_load_into_packed_615[2])
-                row_words_5[(32) + 3] = cutlass.Uint32(_gmem_load_into_packed_615[3])
-                _gmem_load_into_packed_addr_616 = cute.recast_ptr(source_words_5 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_addr_616 = cute.recast_ptr(source_words_5 + (lane * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_617 = prims.load_ext(_gmem_load_into_packed_addr_616 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(36) + 0] = cutlass.Uint32(_gmem_load_into_packed_617[0])
-                row_words_5[(36) + 1] = cutlass.Uint32(_gmem_load_into_packed_617[1])
-                row_words_5[(36) + 2] = cutlass.Uint32(_gmem_load_into_packed_617[2])
-                row_words_5[(36) + 3] = cutlass.Uint32(_gmem_load_into_packed_617[3])
-                _gmem_load_into_packed_addr_618 = cute.recast_ptr(source_words_5 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                row_words_5[0] = cutlass.Uint32(_gmem_load_into_packed_617[0])
+                row_words_5[1] = cutlass.Uint32(_gmem_load_into_packed_617[1])
+                row_words_5[2] = cutlass.Uint32(_gmem_load_into_packed_617[2])
+                row_words_5[3] = cutlass.Uint32(_gmem_load_into_packed_617[3])
+                _gmem_load_into_packed_addr_618 = cute.recast_ptr(source_words_5 + ((lane + 32) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_619 = prims.load_ext(_gmem_load_into_packed_addr_618 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(40) + 0] = cutlass.Uint32(_gmem_load_into_packed_619[0])
-                row_words_5[(40) + 1] = cutlass.Uint32(_gmem_load_into_packed_619[1])
-                row_words_5[(40) + 2] = cutlass.Uint32(_gmem_load_into_packed_619[2])
-                row_words_5[(40) + 3] = cutlass.Uint32(_gmem_load_into_packed_619[3])
-                _gmem_load_into_packed_addr_620 = cute.recast_ptr(source_words_5 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                row_words_5[(4) + 0] = cutlass.Uint32(_gmem_load_into_packed_619[0])
+                row_words_5[(4) + 1] = cutlass.Uint32(_gmem_load_into_packed_619[1])
+                row_words_5[(4) + 2] = cutlass.Uint32(_gmem_load_into_packed_619[2])
+                row_words_5[(4) + 3] = cutlass.Uint32(_gmem_load_into_packed_619[3])
+                _gmem_load_into_packed_addr_620 = cute.recast_ptr(source_words_5 + ((lane + 64) * 4), dtype=cutlass.Uint32)
                 _gmem_load_into_packed_621 = prims.load_ext(_gmem_load_into_packed_addr_620 + 0, dtype=cutlass.Uint32, count=4)
-                row_words_5[(44) + 0] = cutlass.Uint32(_gmem_load_into_packed_621[0])
-                row_words_5[(44) + 1] = cutlass.Uint32(_gmem_load_into_packed_621[1])
-                row_words_5[(44) + 2] = cutlass.Uint32(_gmem_load_into_packed_621[2])
-                row_words_5[(44) + 3] = cutlass.Uint32(_gmem_load_into_packed_621[3])
+                row_words_5[(8) + 0] = cutlass.Uint32(_gmem_load_into_packed_621[0])
+                row_words_5[(8) + 1] = cutlass.Uint32(_gmem_load_into_packed_621[1])
+                row_words_5[(8) + 2] = cutlass.Uint32(_gmem_load_into_packed_621[2])
+                row_words_5[(8) + 3] = cutlass.Uint32(_gmem_load_into_packed_621[3])
+                _gmem_load_into_packed_addr_622 = cute.recast_ptr(source_words_5 + ((lane + 96) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_623 = prims.load_ext(_gmem_load_into_packed_addr_622 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(12) + 0] = cutlass.Uint32(_gmem_load_into_packed_623[0])
+                row_words_5[(12) + 1] = cutlass.Uint32(_gmem_load_into_packed_623[1])
+                row_words_5[(12) + 2] = cutlass.Uint32(_gmem_load_into_packed_623[2])
+                row_words_5[(12) + 3] = cutlass.Uint32(_gmem_load_into_packed_623[3])
+                _gmem_load_into_packed_addr_624 = cute.recast_ptr(source_words_5 + ((lane + 128) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_625 = prims.load_ext(_gmem_load_into_packed_addr_624 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(16) + 0] = cutlass.Uint32(_gmem_load_into_packed_625[0])
+                row_words_5[(16) + 1] = cutlass.Uint32(_gmem_load_into_packed_625[1])
+                row_words_5[(16) + 2] = cutlass.Uint32(_gmem_load_into_packed_625[2])
+                row_words_5[(16) + 3] = cutlass.Uint32(_gmem_load_into_packed_625[3])
+                _gmem_load_into_packed_addr_626 = cute.recast_ptr(source_words_5 + ((lane + 160) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_627 = prims.load_ext(_gmem_load_into_packed_addr_626 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(20) + 0] = cutlass.Uint32(_gmem_load_into_packed_627[0])
+                row_words_5[(20) + 1] = cutlass.Uint32(_gmem_load_into_packed_627[1])
+                row_words_5[(20) + 2] = cutlass.Uint32(_gmem_load_into_packed_627[2])
+                row_words_5[(20) + 3] = cutlass.Uint32(_gmem_load_into_packed_627[3])
+                _gmem_load_into_packed_addr_628 = cute.recast_ptr(source_words_5 + ((lane + 192) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_629 = prims.load_ext(_gmem_load_into_packed_addr_628 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(24) + 0] = cutlass.Uint32(_gmem_load_into_packed_629[0])
+                row_words_5[(24) + 1] = cutlass.Uint32(_gmem_load_into_packed_629[1])
+                row_words_5[(24) + 2] = cutlass.Uint32(_gmem_load_into_packed_629[2])
+                row_words_5[(24) + 3] = cutlass.Uint32(_gmem_load_into_packed_629[3])
+                _gmem_load_into_packed_addr_630 = cute.recast_ptr(source_words_5 + ((lane + 224) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_631 = prims.load_ext(_gmem_load_into_packed_addr_630 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(28) + 0] = cutlass.Uint32(_gmem_load_into_packed_631[0])
+                row_words_5[(28) + 1] = cutlass.Uint32(_gmem_load_into_packed_631[1])
+                row_words_5[(28) + 2] = cutlass.Uint32(_gmem_load_into_packed_631[2])
+                row_words_5[(28) + 3] = cutlass.Uint32(_gmem_load_into_packed_631[3])
+                _gmem_load_into_packed_addr_632 = cute.recast_ptr(source_words_5 + ((lane + 256) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_633 = prims.load_ext(_gmem_load_into_packed_addr_632 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(32) + 0] = cutlass.Uint32(_gmem_load_into_packed_633[0])
+                row_words_5[(32) + 1] = cutlass.Uint32(_gmem_load_into_packed_633[1])
+                row_words_5[(32) + 2] = cutlass.Uint32(_gmem_load_into_packed_633[2])
+                row_words_5[(32) + 3] = cutlass.Uint32(_gmem_load_into_packed_633[3])
+                _gmem_load_into_packed_addr_634 = cute.recast_ptr(source_words_5 + ((lane + 288) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_635 = prims.load_ext(_gmem_load_into_packed_addr_634 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(36) + 0] = cutlass.Uint32(_gmem_load_into_packed_635[0])
+                row_words_5[(36) + 1] = cutlass.Uint32(_gmem_load_into_packed_635[1])
+                row_words_5[(36) + 2] = cutlass.Uint32(_gmem_load_into_packed_635[2])
+                row_words_5[(36) + 3] = cutlass.Uint32(_gmem_load_into_packed_635[3])
+                _gmem_load_into_packed_addr_636 = cute.recast_ptr(source_words_5 + ((lane + 320) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_637 = prims.load_ext(_gmem_load_into_packed_addr_636 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(40) + 0] = cutlass.Uint32(_gmem_load_into_packed_637[0])
+                row_words_5[(40) + 1] = cutlass.Uint32(_gmem_load_into_packed_637[1])
+                row_words_5[(40) + 2] = cutlass.Uint32(_gmem_load_into_packed_637[2])
+                row_words_5[(40) + 3] = cutlass.Uint32(_gmem_load_into_packed_637[3])
+                _gmem_load_into_packed_addr_638 = cute.recast_ptr(source_words_5 + ((lane + 352) * 4), dtype=cutlass.Uint32)
+                _gmem_load_into_packed_639 = prims.load_ext(_gmem_load_into_packed_addr_638 + 0, dtype=cutlass.Uint32, count=4)
+                row_words_5[(44) + 0] = cutlass.Uint32(_gmem_load_into_packed_639[0])
+                row_words_5[(44) + 1] = cutlass.Uint32(_gmem_load_into_packed_639[1])
+                row_words_5[(44) + 2] = cutlass.Uint32(_gmem_load_into_packed_639[2])
+                row_words_5[(44) + 3] = cutlass.Uint32(_gmem_load_into_packed_639[3])
                 if (owned_lane_5[0] != 0):
                     local_expert_lane_5 = cutlass.Int32((global_expert_5[0] - (mega_pg_rank * 32)))
                     _atomic_fetch_add_5 = cute.arch.atomic_add(route_counts_u32 + local_expert_lane_5, cutlass.Uint32(1), sem='relaxed', scope='gpu')
@@ -3299,30 +3363,30 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     row_index_9 = cute.arch.shuffle_sync(row_index_lane_5[0], route_slot_9, mask=4294967295, mask_and_clamp=31)
                     if (row_index_9 >= 0):
                         row_dst_5 = activation_words_5 + (row_index_9 * 1536)
-                        _gmem_store_bits_622 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[0]), cutlass.Uint32(row_words_5[1]), cutlass.Uint32(row_words_5[2]), cutlass.Uint32(row_words_5[3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_622.ir_value(), row_dst_5 + (lane * 4))
-                        _gmem_store_bits_623 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(4) + 0]), cutlass.Uint32(row_words_5[(4) + 1]), cutlass.Uint32(row_words_5[(4) + 2]), cutlass.Uint32(row_words_5[(4) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_623.ir_value(), row_dst_5 + ((lane + 32) * 4))
-                        _gmem_store_bits_624 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(8) + 0]), cutlass.Uint32(row_words_5[(8) + 1]), cutlass.Uint32(row_words_5[(8) + 2]), cutlass.Uint32(row_words_5[(8) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_624.ir_value(), row_dst_5 + ((lane + 64) * 4))
-                        _gmem_store_bits_625 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(12) + 0]), cutlass.Uint32(row_words_5[(12) + 1]), cutlass.Uint32(row_words_5[(12) + 2]), cutlass.Uint32(row_words_5[(12) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_625.ir_value(), row_dst_5 + ((lane + 96) * 4))
-                        _gmem_store_bits_626 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(16) + 0]), cutlass.Uint32(row_words_5[(16) + 1]), cutlass.Uint32(row_words_5[(16) + 2]), cutlass.Uint32(row_words_5[(16) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_626.ir_value(), row_dst_5 + ((lane + 128) * 4))
-                        _gmem_store_bits_627 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(20) + 0]), cutlass.Uint32(row_words_5[(20) + 1]), cutlass.Uint32(row_words_5[(20) + 2]), cutlass.Uint32(row_words_5[(20) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_627.ir_value(), row_dst_5 + ((lane + 160) * 4))
-                        _gmem_store_bits_628 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(24) + 0]), cutlass.Uint32(row_words_5[(24) + 1]), cutlass.Uint32(row_words_5[(24) + 2]), cutlass.Uint32(row_words_5[(24) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_628.ir_value(), row_dst_5 + ((lane + 192) * 4))
-                        _gmem_store_bits_629 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(28) + 0]), cutlass.Uint32(row_words_5[(28) + 1]), cutlass.Uint32(row_words_5[(28) + 2]), cutlass.Uint32(row_words_5[(28) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_629.ir_value(), row_dst_5 + ((lane + 224) * 4))
-                        _gmem_store_bits_630 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(32) + 0]), cutlass.Uint32(row_words_5[(32) + 1]), cutlass.Uint32(row_words_5[(32) + 2]), cutlass.Uint32(row_words_5[(32) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_630.ir_value(), row_dst_5 + ((lane + 256) * 4))
-                        _gmem_store_bits_631 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(36) + 0]), cutlass.Uint32(row_words_5[(36) + 1]), cutlass.Uint32(row_words_5[(36) + 2]), cutlass.Uint32(row_words_5[(36) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_631.ir_value(), row_dst_5 + ((lane + 288) * 4))
-                        _gmem_store_bits_632 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(40) + 0]), cutlass.Uint32(row_words_5[(40) + 1]), cutlass.Uint32(row_words_5[(40) + 2]), cutlass.Uint32(row_words_5[(40) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_632.ir_value(), row_dst_5 + ((lane + 320) * 4))
-                        _gmem_store_bits_633 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(44) + 0]), cutlass.Uint32(row_words_5[(44) + 1]), cutlass.Uint32(row_words_5[(44) + 2]), cutlass.Uint32(row_words_5[(44) + 3])], cutlass.Uint32)
-                        prims.store_ext(_gmem_store_bits_633.ir_value(), row_dst_5 + ((lane + 352) * 4))
+                        _gmem_store_bits_640 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[0]), cutlass.Uint32(row_words_5[1]), cutlass.Uint32(row_words_5[2]), cutlass.Uint32(row_words_5[3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_640.ir_value(), row_dst_5 + (lane * 4))
+                        _gmem_store_bits_641 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(4) + 0]), cutlass.Uint32(row_words_5[(4) + 1]), cutlass.Uint32(row_words_5[(4) + 2]), cutlass.Uint32(row_words_5[(4) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_641.ir_value(), row_dst_5 + ((lane + 32) * 4))
+                        _gmem_store_bits_642 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(8) + 0]), cutlass.Uint32(row_words_5[(8) + 1]), cutlass.Uint32(row_words_5[(8) + 2]), cutlass.Uint32(row_words_5[(8) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_642.ir_value(), row_dst_5 + ((lane + 64) * 4))
+                        _gmem_store_bits_643 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(12) + 0]), cutlass.Uint32(row_words_5[(12) + 1]), cutlass.Uint32(row_words_5[(12) + 2]), cutlass.Uint32(row_words_5[(12) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_643.ir_value(), row_dst_5 + ((lane + 96) * 4))
+                        _gmem_store_bits_644 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(16) + 0]), cutlass.Uint32(row_words_5[(16) + 1]), cutlass.Uint32(row_words_5[(16) + 2]), cutlass.Uint32(row_words_5[(16) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_644.ir_value(), row_dst_5 + ((lane + 128) * 4))
+                        _gmem_store_bits_645 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(20) + 0]), cutlass.Uint32(row_words_5[(20) + 1]), cutlass.Uint32(row_words_5[(20) + 2]), cutlass.Uint32(row_words_5[(20) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_645.ir_value(), row_dst_5 + ((lane + 160) * 4))
+                        _gmem_store_bits_646 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(24) + 0]), cutlass.Uint32(row_words_5[(24) + 1]), cutlass.Uint32(row_words_5[(24) + 2]), cutlass.Uint32(row_words_5[(24) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_646.ir_value(), row_dst_5 + ((lane + 192) * 4))
+                        _gmem_store_bits_647 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(28) + 0]), cutlass.Uint32(row_words_5[(28) + 1]), cutlass.Uint32(row_words_5[(28) + 2]), cutlass.Uint32(row_words_5[(28) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_647.ir_value(), row_dst_5 + ((lane + 224) * 4))
+                        _gmem_store_bits_648 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(32) + 0]), cutlass.Uint32(row_words_5[(32) + 1]), cutlass.Uint32(row_words_5[(32) + 2]), cutlass.Uint32(row_words_5[(32) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_648.ir_value(), row_dst_5 + ((lane + 256) * 4))
+                        _gmem_store_bits_649 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(36) + 0]), cutlass.Uint32(row_words_5[(36) + 1]), cutlass.Uint32(row_words_5[(36) + 2]), cutlass.Uint32(row_words_5[(36) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_649.ir_value(), row_dst_5 + ((lane + 288) * 4))
+                        _gmem_store_bits_650 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(40) + 0]), cutlass.Uint32(row_words_5[(40) + 1]), cutlass.Uint32(row_words_5[(40) + 2]), cutlass.Uint32(row_words_5[(40) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_650.ir_value(), row_dst_5 + ((lane + 320) * 4))
+                        _gmem_store_bits_651 = cutlass.Vector.from_elements([cutlass.Uint32(row_words_5[(44) + 0]), cutlass.Uint32(row_words_5[(44) + 1]), cutlass.Uint32(row_words_5[(44) + 2]), cutlass.Uint32(row_words_5[(44) + 3])], cutlass.Uint32)
+                        prims.store_ext(_gmem_store_bits_651.ir_value(), row_dst_5 + ((lane + 352) * 4))
         prims.barrier_cta_sync(12, thread_count=384)
         cutlass_llvm.fence(cutlass_llvm.AtomicOrdering.release, syncscope='device')
         if (warp == 0):
@@ -3359,38 +3423,38 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                 for _iter_k in cutlass.range(cutlass.Int32(0), cutlass.Int32(num_k_tiles_3), cutlass.Int32(1), unroll=1, unroll_full=False):
                     while not prims.mbarrier_wait_parity(scale_full_addr + scale_stage_1[0], _phase_scale_full[0], prims.MBarrierWait.TRY, scope=prims.MBarrierScope.CTA, order=prims.MemOrder.ACQUIRE):
                         pass
-                    _smem_load_634 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32(((scale_smem_addr + (scale_stage_1[0] * 512)) + cutlass.Uint32((local_scale_word * 4)))), mem_space=cute.AddressSpace.smem, assumed_align=4), dtype=cutlass.Int32)
-                    _smem_load_634 = _smem_load_634.bitcast(cutlass.Uint32)
-                    scale_reg[0] = _smem_load_634
+                    _smem_load_652 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32(((scale_smem_addr + (scale_stage_1[0] * 512)) + cutlass.Uint32((local_scale_word * 4)))), mem_space=cute.AddressSpace.smem, assumed_align=4), dtype=cutlass.Int32)
+                    _smem_load_652 = _smem_load_652.bitcast(cutlass.Uint32)
+                    scale_reg[0] = _smem_load_652
                     while not prims.mbarrier_wait_parity(a_full_addr + a_stage_1[0], _phase_a_full[0], prims.MBarrierWait.TRY, scope=prims.MBarrierScope.CTA, order=prims.MemOrder.ACQUIRE):
                         pass
                     while not prims.mbarrier_wait_parity(transformed_free_addr + transformed_stage_1[0], _phase_transformed_free[0], prims.MBarrierWait.TRY, scope=prims.MBarrierScope.CTA, order=prims.MemOrder.ACQUIRE):
                         pass
                     prims.tcgen05_fence('after_thread_sync')
-                    _smem_load_635 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((0 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_635 = _smem_load_635.bitcast(cutlass.Uint32)
-                    raw_fragment[0] = _smem_load_635[0]
-                    raw_fragment[(0) + 1] = _smem_load_635[1]
-                    raw_fragment[(0) + 2] = _smem_load_635[2]
-                    raw_fragment[(0) + 3] = _smem_load_635[3]
-                    _smem_load_636 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((16 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_636 = _smem_load_636.bitcast(cutlass.Uint32)
-                    raw_fragment[4] = _smem_load_636[0]
-                    raw_fragment[(4) + 1] = _smem_load_636[1]
-                    raw_fragment[(4) + 2] = _smem_load_636[2]
-                    raw_fragment[(4) + 3] = _smem_load_636[3]
-                    _smem_load_637 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((32 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_637 = _smem_load_637.bitcast(cutlass.Uint32)
-                    raw_fragment[8] = _smem_load_637[0]
-                    raw_fragment[(8) + 1] = _smem_load_637[1]
-                    raw_fragment[(8) + 2] = _smem_load_637[2]
-                    raw_fragment[(8) + 3] = _smem_load_637[3]
-                    _smem_load_638 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((48 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_638 = _smem_load_638.bitcast(cutlass.Uint32)
-                    raw_fragment[12] = _smem_load_638[0]
-                    raw_fragment[(12) + 1] = _smem_load_638[1]
-                    raw_fragment[(12) + 2] = _smem_load_638[2]
-                    raw_fragment[(12) + 3] = _smem_load_638[3]
+                    _smem_load_653 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((0 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_653 = _smem_load_653.bitcast(cutlass.Uint32)
+                    raw_fragment[0] = _smem_load_653[0]
+                    raw_fragment[(0) + 1] = _smem_load_653[1]
+                    raw_fragment[(0) + 2] = _smem_load_653[2]
+                    raw_fragment[(0) + 3] = _smem_load_653[3]
+                    _smem_load_654 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((16 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_654 = _smem_load_654.bitcast(cutlass.Uint32)
+                    raw_fragment[4] = _smem_load_654[0]
+                    raw_fragment[(4) + 1] = _smem_load_654[1]
+                    raw_fragment[(4) + 2] = _smem_load_654[2]
+                    raw_fragment[(4) + 3] = _smem_load_654[3]
+                    _smem_load_655 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((32 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_655 = _smem_load_655.bitcast(cutlass.Uint32)
+                    raw_fragment[8] = _smem_load_655[0]
+                    raw_fragment[(8) + 1] = _smem_load_655[1]
+                    raw_fragment[(8) + 2] = _smem_load_655[2]
+                    raw_fragment[(8) + 3] = _smem_load_655[3]
+                    _smem_load_656 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((48 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_656 = _smem_load_656.bitcast(cutlass.Uint32)
+                    raw_fragment[12] = _smem_load_656[0]
+                    raw_fragment[(12) + 1] = _smem_load_656[1]
+                    raw_fragment[(12) + 2] = _smem_load_656[2]
+                    raw_fragment[(12) + 3] = _smem_load_656[3]
                     _prmt_0 = prims_nvvm.prmt(cutlass.Uint32(scale_reg[0]), cutlass.Uint32(0), prims_nvvm.PermuteMode.DEFAULT, hi=cutlass.Uint32(scale_reg[0])).bitcast(cutlass.Uint32)
                     _cvt_bf16x2_ue8m0x2 = _cake_inline_ptx(
                         'cvt.rn.bf16x2.ue8m0x2 {$w0}, {$r0};',
@@ -3793,30 +3857,30 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                         read_only_args=[cutlass.Uint32(_bf16x2_from_e4m3x2_32_15), cutlass.Uint32(scale_fragment[7])],
                     )
                     products[31] = cutlass.Uint32(_bf16x2_mul_32_15)
-                    _smem_load_639 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((64 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_639 = _smem_load_639.bitcast(cutlass.Uint32)
-                    raw_fragment[0] = _smem_load_639[0]
-                    raw_fragment[(0) + 1] = _smem_load_639[1]
-                    raw_fragment[(0) + 2] = _smem_load_639[2]
-                    raw_fragment[(0) + 3] = _smem_load_639[3]
-                    _smem_load_640 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((80 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_640 = _smem_load_640.bitcast(cutlass.Uint32)
-                    raw_fragment[4] = _smem_load_640[0]
-                    raw_fragment[(4) + 1] = _smem_load_640[1]
-                    raw_fragment[(4) + 2] = _smem_load_640[2]
-                    raw_fragment[(4) + 3] = _smem_load_640[3]
-                    _smem_load_641 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((96 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_641 = _smem_load_641.bitcast(cutlass.Uint32)
-                    raw_fragment[8] = _smem_load_641[0]
-                    raw_fragment[(8) + 1] = _smem_load_641[1]
-                    raw_fragment[(8) + 2] = _smem_load_641[2]
-                    raw_fragment[(8) + 3] = _smem_load_641[3]
-                    _smem_load_642 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((112 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
-                    _smem_load_642 = _smem_load_642.bitcast(cutlass.Uint32)
-                    raw_fragment[12] = _smem_load_642[0]
-                    raw_fragment[(12) + 1] = _smem_load_642[1]
-                    raw_fragment[(12) + 2] = _smem_load_642[2]
-                    raw_fragment[(12) + 3] = _smem_load_642[3]
+                    _smem_load_657 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((64 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_657 = _smem_load_657.bitcast(cutlass.Uint32)
+                    raw_fragment[0] = _smem_load_657[0]
+                    raw_fragment[(0) + 1] = _smem_load_657[1]
+                    raw_fragment[(0) + 2] = _smem_load_657[2]
+                    raw_fragment[(0) + 3] = _smem_load_657[3]
+                    _smem_load_658 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((80 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_658 = _smem_load_658.bitcast(cutlass.Uint32)
+                    raw_fragment[4] = _smem_load_658[0]
+                    raw_fragment[(4) + 1] = _smem_load_658[1]
+                    raw_fragment[(4) + 2] = _smem_load_658[2]
+                    raw_fragment[(4) + 3] = _smem_load_658[3]
+                    _smem_load_659 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((96 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_659 = _smem_load_659.bitcast(cutlass.Uint32)
+                    raw_fragment[8] = _smem_load_659[0]
+                    raw_fragment[(8) + 1] = _smem_load_659[1]
+                    raw_fragment[(8) + 2] = _smem_load_659[2]
+                    raw_fragment[(8) + 3] = _smem_load_659[3]
+                    _smem_load_660 = prims.load_ext(cute.make_ptr(cutlass.Int32, cutlass.Uint32((((raw_smem_addr + (a_stage_1[0] * 16384)) + cutlass.Uint32((row * 128))) + cutlass.Uint32((112 ^ ((row & 7) << 4))))), mem_space=cute.AddressSpace.smem, assumed_align=16), dtype=cutlass.Int32, count=4)
+                    _smem_load_660 = _smem_load_660.bitcast(cutlass.Uint32)
+                    raw_fragment[12] = _smem_load_660[0]
+                    raw_fragment[(12) + 1] = _smem_load_660[1]
+                    raw_fragment[(12) + 2] = _smem_load_660[2]
+                    raw_fragment[(12) + 3] = _smem_load_660[3]
                     _prmt_2_1 = prims_nvvm.prmt(cutlass.Uint32(scale_reg[0]), cutlass.Uint32(8738), prims_nvvm.PermuteMode.DEFAULT, hi=cutlass.Uint32(scale_reg[0])).bitcast(cutlass.Uint32)
                     _cvt_bf16x2_ue8m0x2_8 = _cake_inline_ptx(
                         'cvt.rn.bf16x2.ue8m0x2 {$w0}, {$r0};',
@@ -4221,29 +4285,29 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
                     products[63] = cutlass.Uint32(_bf16x2_mul_1_15)
                     tmem_base = cutlass.Int32((((taddr + 256) + cutlass.Uint32(tmem_row_base)) + (transformed_stage_1[0] * 64)))
                     for chunk_6 in cutlass.range_constexpr(0, 8, 1):
-                        _tmem_store_raw_643 = cutlass.Vector.from_elements([cutlass.Uint32(products[(chunk_6 * 8)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 1)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 2)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 3)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 4)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 5)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 6)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 7)]).bitcast(cutlass.Int32)], cutlass.Int32)
-                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32((tmem_base + (chunk_6 * 8))), cutlass.Int32), _tmem_store_raw_643)
+                        _tmem_store_raw_661 = cutlass.Vector.from_elements([cutlass.Uint32(products[(chunk_6 * 8)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 1)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 2)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 3)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 4)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 5)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 6)]).bitcast(cutlass.Int32), cutlass.Uint32(products[((chunk_6 * 8) + 7)]).bitcast(cutlass.Int32)], cutlass.Int32)
+                        prims.tcgen05_st(prims.Tcgen05LdStShape.SHAPE_32X32B, prims.make_tmem_ptr(cutlass.Int32((tmem_base + (chunk_6 * 8))), cutlass.Int32), _tmem_store_raw_661)
                     cute.arch.fence_view_async_tmem_store()
                     prims.tcgen05_fence('before_thread_sync')
                     prims.barrier_cta_sync(3, thread_count=128)
                     if (warp == 8):
                         if prims.elect_sync():
-                            _mbarrier_cluster_arrive_644 = prims.mapa(transformed_full_addr + transformed_stage_1[0], cutlass.Int32(0))
-                            prims.mbarrier_arrive(_mbarrier_cluster_arrive_644, count=cutlass.Int32(1), scope=prims.MemScope.CTA)
+                            _mbarrier_cluster_arrive_662 = prims.mapa(transformed_full_addr + transformed_stage_1[0], cutlass.Int32(0))
+                            prims.mbarrier_arrive(_mbarrier_cluster_arrive_662, count=cutlass.Int32(1), scope=prims.MemScope.CTA)
                             cute.arch.mbarrier_arrive(a_free_addr + a_stage_1[0])
                             cute.arch.mbarrier_arrive(scale_free_addr + scale_stage_1[0])
-                    _advanced_stage_645 = cutlass.Uint32(a_stage_1[0] + 1)
-                    _stage_wrapped_646 = cutlass.Boolean(_advanced_stage_645 == 8)
-                    a_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_646, 0, _advanced_stage_645))
-                    _phase_a_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_646, _phase_a_full[0] ^ cutlass.Uint32(1), _phase_a_full[0]))
-                    _advanced_stage_647 = cutlass.Uint32(scale_stage_1[0] + 1)
-                    _stage_wrapped_648 = cutlass.Boolean(_advanced_stage_647 == 8)
-                    scale_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_648, 0, _advanced_stage_647))
-                    _phase_scale_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_648, _phase_scale_full[0] ^ cutlass.Uint32(1), _phase_scale_full[0]))
-                    _advanced_stage_649 = cutlass.Uint32(transformed_stage_1[0] + 1)
-                    _stage_wrapped_650 = cutlass.Boolean(_advanced_stage_649 == 4)
-                    transformed_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_650, 0, _advanced_stage_649))
-                    _phase_transformed_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_650, _phase_transformed_free[0] ^ cutlass.Uint32(1), _phase_transformed_free[0]))
+                    _advanced_stage_663 = cutlass.Uint32(a_stage_1[0] + 1)
+                    _stage_wrapped_664 = cutlass.Boolean(_advanced_stage_663 == 8)
+                    a_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_664, 0, _advanced_stage_663))
+                    _phase_a_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_664, _phase_a_full[0] ^ cutlass.Uint32(1), _phase_a_full[0]))
+                    _advanced_stage_665 = cutlass.Uint32(scale_stage_1[0] + 1)
+                    _stage_wrapped_666 = cutlass.Boolean(_advanced_stage_665 == 8)
+                    scale_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_666, 0, _advanced_stage_665))
+                    _phase_scale_full[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_666, _phase_scale_full[0] ^ cutlass.Uint32(1), _phase_scale_full[0]))
+                    _advanced_stage_667 = cutlass.Uint32(transformed_stage_1[0] + 1)
+                    _stage_wrapped_668 = cutlass.Boolean(_advanced_stage_667 == 4)
+                    transformed_stage_1[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_668, 0, _advanced_stage_667))
+                    _phase_transformed_free[0] = cutlass.Uint32(cutlass.select_(_stage_wrapped_668, _phase_transformed_free[0] ^ cutlass.Uint32(1), _phase_transformed_free[0]))
         cute.arch.cluster_arrive(aligned=True)
         cute.arch.cluster_wait()
 
@@ -4357,7 +4421,7 @@ def launch_cake_mxfp8_megamoe_ep16_fused_sm_107a(source_hidden_bf16: cute.Tensor
         grid=(grid_x, grid_y, grid_z),
         block=(384, 1, 1),
         cluster=(2, 1, 1),
-        smem=160768,
+        smem=161408,
         min_blocks_per_mp=1,
         cooperative=True,
         stream=stream,

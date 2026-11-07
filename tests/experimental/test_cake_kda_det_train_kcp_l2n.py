@@ -86,9 +86,9 @@ from tests.test_helpers.cake_package import cake_package
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_build = cake_package("cake_kda_det_train", "cake_build")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_build = cake_package("cake.cake_kda_det_train", "cake_build")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 D = cake_kcp.D
 SCALE = cake_kcp.SCALE
@@ -1463,7 +1463,7 @@ def _fake_registry(
         def __contains__(self, lib):
             return lib not in unexported
 
-    m.setattr(cake_backend, "chunk_kda_det_fwd", fwd)
+    m.setattr(cake_backend, "cake_kda_det_train_forward", fwd)
     m.setattr(cake_backend, "plan", plan)
     m.setattr(cake_backend, "lifetime_table", lifetime_table)
     m.setattr(cake_jit, "L2N_MODES", ("off", "fused", "fallback"), raising=False)
@@ -1649,7 +1649,7 @@ def test_l2n_capability_check() -> None:
                 m.setattr(cake_jit, "L2N_MODES", ("off", "fused"), raising=False)
                 if form == "fallback":
                     assert "plan" in cake_kcp_plan.qk_l2norm_missing(form, gate)
-                m.setattr(cake_backend, "chunk_kda_det_fwd", plain)
+                m.setattr(cake_backend, "cake_kda_det_train_forward", plain)
                 assert "use_qk_l2norm_in_kernel" in cake_kcp_plan.qk_l2norm_missing(
                     form, gate
                 )
@@ -1854,7 +1854,7 @@ def test_l2n_kernel_path_raises_until_bound() -> None:
         with pytest.MonkeyPatch.context() as m:
             for name in ("tables", "_size_pools", "_bind_local", "_local_plan"):
                 m.setattr(cake_kcp.WorkspaceDetKcp, name, _never(name))
-            for name in ("plan", "workspace_bytes", "KdaDetWorkspace"):
+            for name in ("plan", "workspace_bytes", "CakeKDADetWorkspace"):
                 real_fn = getattr(cake_backend, name)
                 m.setattr(cake_backend, name, _never(f"cake_backend.{name}", real_fn))
             # a CUDA device reads as dev_arch (no device is touched: the refusal comes first)
@@ -2081,14 +2081,19 @@ LOCAL_RECORD_CASES = [
     LOCAL_RECORD_CASES,
     ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
 )
-def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> None:
+@pytest.mark.parametrize("fuse", (1, 0), ids=("fwd_o_fuse1", "fwd_o_fuse0"))
+def test_l2n_local_stage_values_cover_the_records(
+    H, arch, sm, gate, form, fuse
+) -> None:
     """The real drivers (:func:`cake_kcp._qk_l2norm_begin`, then :func:`cake_kcp._forward` /
     :func:`cake_kcp._backward`, their KCP programs and collectives recorded, not run) on the mode's plan
     (``cake_backend.plan(..., l2n=form)``): a saving and a non-saving forward, a saved-mode and a replay backward bind
     every logical name of every record they launch; no record outside the mode's own (``_l2n`` twins, the ``qk_*``
     programs) binds ``q_raw`` / ``k_raw``; the first reader gets the saved rstd with (1, 0), a fresh one with (0, 1)
     or none with (0, 0); no gate epilogue launches; stage for stage the records are the flag-off plan's or the mode's
-    twins, the KCP-owned records and the KCP walk / merge / collective sequence unchanged."""
+    twins, the KCP-owned records and the KCP walk / merge / collective sequence unchanged.  ``fuse``: the
+    ``fwd_o_fuse`` knob (1 shipped): a forward that keeps no tape walks ``kcp_fwdh_o``, whose local operands the
+    values carry, and launches no ``kcp_fwd_o``; under 0 (and in the replay forward) the tape walk and ``kcp_fwd_o``."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
         pytest.skip(
@@ -2188,7 +2193,7 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
             local_values=None, out=None if backward else torch.zeros(1), grads=grads if backward else None,
             device=torch.device("cpu"), opts=opts, gate=gate, l2n=mode != "off", l2n_mode=mode, l2n_values=None,
             backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
-            saved_carry=int(opts.saved_carry), bufs={}, kcp=[],
+            saved_carry=int(opts.saved_carry), fwd_o_fuse=fuse, bufs={}, kcp=[],
         )  # fmt: skip
         backend.begin_call(call)
         kept = None
@@ -2201,6 +2206,15 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
             assert call.l2n_values is None, kind
         else:
             cake_kcp._forward(call, save=kind == "fwd_save", replay=False)
+        if (
+            kind != "bwd_saved"
+        ):  # the forward's walk program and the local operands it reads
+            fused = fuse == 1 and not backward
+            assert call.fwd_walk == ("kcp_fwdh_o" if fused else "kcp_fwdh_tape"), kind
+            absent = set(cake_kcp_jit._WALK_OPERANDS[call.fwd_walk]) - set(
+                call.local_values
+            )
+            assert not absent, (kind, call.fwd_walk, sorted(absent))
         done = list(launches)
         launches.clear()
         return done, kept, call.kcp
@@ -2221,6 +2235,8 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         res, kept, kcp_on = run(form, kind)
         res_off, _, kcp_off = run("off", kind)
         assert kcp_on == kcp_off and kcp_on, kind  # the KCP programs and collectives
+        fwd_o = [r for s, r, _g, _v in res if s == "kcp" and r == "kcp_fwd_o"]
+        assert len(fwd_o) == int(kind.startswith("fwd") and fuse == 0), (kind, fwd_o)
         for src, record, _grid, values in res:
             m = mod(src, record)
             absent = set(m["logical"].values()) - set(values)
@@ -3035,10 +3051,10 @@ def _run_rank(
     if rank == 0:
         cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
         kw_s = {**GK, **L2N}
-        out_s, saved_s = cake_backend.chunk_kda_det_fwd(
+        out_s, saved_s = cake_backend.cake_kda_det_train_forward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, **kw_s
         )
-        grads_s = cake_backend.chunk_kda_det_bwd(
+        grads_s = cake_backend.cake_kda_det_train_backward(
             glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, glob["dout"], saved=saved_s, **kw_s
         )  # fmt: skip
         single = {"out": out_s, **dict(zip(grad_names, grads_s, strict=True))}

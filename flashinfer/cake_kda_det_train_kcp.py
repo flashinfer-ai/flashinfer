@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Deterministic context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
-(SM100 / SM103 / SM107), the Cake backend.  ``flashinfer.kda_train`` keeps the names these
-entry points had before (``chunk_kda_kcp``, ``kcp_partition``, ``KcpRecomputeHandle``, ...)
-as compatibility aliases of the objects defined here.
+(SM100 / SM103 / SM107), the Cake backend.
 
 The packed batch is split over the ranks of a process group (``partition_det_kcp``), every rank
 holds its fragments of the documents, and the per-document state recurrences cross the rank
@@ -46,7 +44,9 @@ from typing import Any, Optional
 import torch
 
 from .api_logging import flashinfer_experimental_api
-from .cake_kda_det_train import _FEATURE, DEFAULT_SCALE
+from .cake_kda_det_train import DEFAULT_SCALE
+
+_FEATURE = "Cake packed KDA chunked training (SM100/SM103/SM107)"
 
 # The KCP entry points forward to ``flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp`` (the per-rank
 # launch sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the
@@ -164,17 +164,17 @@ def chunk_kda_det_fwd_kcp(
     Parameters
     ----------
     q, k, v, g, beta : torch.Tensor
-        This rank's shard of the operands of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (the tokens of its fragments, in the
+        This rank's shard of the operands of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` (the tokens of its fragments, in the
         partition's order): BF16 ``[1, S_local, H, 128]`` ``q, k, v``, FP32 ``g``, BF16 ``[1, S_local, H]`` ``beta``.
     ctx : ContextDetKcp
         From :func:`build_context_det_kcp`.
     scale : float, optional
         Output scale; ``128 ** -0.5`` when ``None``.
     save_for_backward : bool
-        Write the saved set (the local saved set of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` plus the boundary states the backward
+        Write the saved set (the local saved set of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` plus the boundary states the backward
         starts from).
     save_mode : str
-        ``"light"`` or ``"tape"`` as for :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.
+        ``"light"`` or ``"tape"`` as for :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward`.
     boundary_mode : str
         ``"saved"`` keeps the received boundary states in the saved set; ``"replay"`` saves nothing and lets the
         backward replay the forward's exchanges.
@@ -196,7 +196,7 @@ def chunk_kda_det_fwd_kcp(
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded.
-        The raw gate mode of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (keywords
+        The raw gate mode of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_forward` (keywords
         ``use_gate_in_kernel``, ``A_log``, ``dt_bias``, ``lower_bound``, forwarded like the options) applies to this
         rank's shard: with ``use_gate_in_kernel=True`` ``g`` is the rank's raw gate (BF16, any view under the
         single-rank stride rule, never copied), ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32 ``[H * 128]`` or
@@ -381,7 +381,7 @@ def kda_det_workspace_bytes_kcp(
     use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
-    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
+    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_workspace_bytes`
     for a backward workspace; a forward-only one takes the KCP forward layout, 2432 B per internal token-head) plus
     the boundary pools of the context's collectives, as ``WorkspaceDetKcp`` allocates them (the backward's send pools
     share the forward's storage; the ring exchange's hop pools, allocated by the first ``exchange="ring"`` call, are
@@ -447,7 +447,7 @@ def kda_det_saved_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
 ) -> int:
-    """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`~flashinfer.cake_kda_det_train.kda_det_train_saved_bytes`), the
+    """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`~flashinfer.cake_kda_det_train.cake_kda_det_train_saved_bytes`), the
     boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
     (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
     (:func:`chunk_kda_det_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``

@@ -661,7 +661,7 @@ def _run_upload_rank(
     pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
     prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
     no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
     from tests.test_helpers.cake_host_sync import (
         census,
         counts_agree,
@@ -723,8 +723,8 @@ def _run_upload_rank(
         return [out.detach()] + [lf.grad for lf in leaves]
 
     def halo(c) -> list:
-        y, hist = conv.cake_causal_conv1d_kcp_forward(x, w, c)
-        return [y, *conv.cake_causal_conv1d_kcp_backward(x, w, c, dy, hist)]
+        y, hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, c)
+        return [y, *conv.cake_causal_conv1d_det_train_kcp_backward(x, w, c, dy, hist)]
 
     def eq(a, b) -> bool:
         return len(a) == len(b) and all(
@@ -1018,7 +1018,8 @@ def test_module_imports_only_torch_and_its_package() -> None:
     no new module either; ``weakref`` for the trimmed
     path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
     module; ``torch.utils`` for the checkpoint hand-off, which reads the pack-hook classes of
-    ``torch.utils.checkpoint`` once (``cake_kcp._handoff_frames_readable``) -- torch, no new package)."""
+    ``torch.utils.checkpoint`` once (``cake_kcp._handoff_frames_readable``) -- torch, no new package;
+    ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module)."""
     import ast
 
     src = Path(cake_kcp.__file__).read_text()
@@ -1040,7 +1041,8 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "warnings",
         "functools",
         "weakref",
-    }  # weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; torch.utils: the checkpoint hand-off reads the pack-hook classes of torch.utils.checkpoint once; no other use
+        "operator",
+    }  # operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; torch.utils: the checkpoint hand-off reads the pack-hook classes of torch.utils.checkpoint once; no other use
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -1242,7 +1244,7 @@ def _run_rank_ckpt(
 
     from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
-    conv_kcp = cake_package("cake_causal_conv1d_train", "kcp")
+    conv_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
     lengths, H, _w, layout = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
@@ -1722,9 +1724,9 @@ def _run_rank_ckpt(
 
     def layer(xq, xk, xv, wq, wk, wv, g_, b_, w_, hq, hk, hv):
         T = xq.shape[0]
-        qq = conv_kcp.cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)
-        kk = conv_kcp.cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
-        vv = conv_kcp.cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+        qq = conv_kcp.cake_causal_conv1d_det_kcp(xq, wq, ctx, recompute_handle=hq)
+        kk = conv_kcp.cake_causal_conv1d_det_kcp(xk, wk, ctx, recompute_handle=hk)
+        vv = conv_kcp.cake_causal_conv1d_det_kcp(xv, wv, ctx, recompute_handle=hv)
         y = cake_kcp.chunk_kda_kcp(
             l2(qq.view(T, H, 128)),
             l2(kk.view(T, H, 128)),
@@ -1748,8 +1750,8 @@ def _run_rank_ckpt(
         hs = (
             (
                 cake_kcp.RecomputeHandleKcp(),  # shared by the q convolution and KDA
-                conv_kcp.KcpRecomputeHandle(),
-                conv_kcp.KcpRecomputeHandle(),
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle(),
             )
             if mode == "handle"
             else (None, None, None)
@@ -1800,12 +1802,12 @@ def _run_rank_ckpt(
         + 2 * int(ctx.halo.n_hist_rows) * C * 2
     )
 
-    # the same layer with cake_causal_conv1d_kcp_multi (the q / k / v convolutions in one call, one halo exchange
+    # the same layer with cake_causal_conv1d_det_kcp_multi (the q / k / v convolutions in one call, one halo exchange
     # per direction) and ONE handle for the convolutions and KDA: bitwise the three single calls, two halo
     # collectives (and waits) fewer in every phase that exchanges halos, the same retained bytes
     def layer_multi(xq, xk, xv, wq, wk, wv, g_, b_, w_, h):
         T = xq.shape[0]
-        qq, kk, vv = conv_kcp.cake_causal_conv1d_kcp_multi(
+        qq, kk, vv = conv_kcp.cake_causal_conv1d_det_kcp_multi(
             (xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h
         )
         y = cake_kcp.chunk_kda_kcp(
