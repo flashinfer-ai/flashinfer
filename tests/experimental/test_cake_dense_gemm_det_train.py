@@ -6774,6 +6774,8 @@ def test_registry_fallback_serves_every_registered_class(arch):
                         continue  # a shape the class refuses
                     if mirror.template in registered:
                         continue
+                    if mirror.transposed_out != out_t:
+                        continue  # the unbatched weight-gradient swap: the transposed class plans the row
                     if cake_backend._measured_row_rule(
                         arch, mirror.a_mn, mirror.b_mn, out_f32, out_t, False, N, K, M
                     ):
@@ -7630,6 +7632,280 @@ def test_wgrad_swap_follows_the_measured_rule():
         if a_mn and b_mn and not batched and K is None:
             mirror = (arch, True, True, out_f32, not out_t, False, M, None, N)
             assert mirror not in ROW_RULES, (key, mirror)
+
+
+# The unbatched weight-gradient view pairs of the generic entry (A = G.T, B = X, out [d_out, d_in]) on rows the rule table keys
+# in the swapped orientation alone: (arch, SM count, d_out, d_in) -> the program the weight-gradient entry plans for the row at
+# T 16384 (bf16 output), which the generic call now plans too.
+UNBATCHED_WGRAD_SWAP_ROWS = {
+    ("sm_100a", 152, 32, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_100a", 152, 48, 5120): "dense_proj_det_gemm_nn_n128_hen_t_pro15",
+    ("sm_100a", 152, 128, 8192): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_100a", 152, 576, 6144): "dense_proj_det_gemm_nn_n192_hee_t_tma1_pro7",
+    ("sm_103a", 152, 32, 5120): "dense_proj_det_gemm_nn_n128_hen_t_sks_pro7",
+    ("sm_103a", 152, 64, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_103a", 152, 128, 6144): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro7",
+    ("sm_103a", 152, 512, 4096): "dense_proj_det_gemm_nn_n256_m64_hen_t_pro15",
+    ("sm_107a", 212, 128, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_skx_pro15",
+}
+
+
+@pytest.mark.parametrize("out_f32", [False, True])
+@pytest.mark.parametrize("T", [1024, 16384, 65537])
+def test_unbatched_wgrad_view_pair_plans_the_wgrad_entry(T, out_f32):
+    """An unbatched generic call with both operands MN-major and no transposed store (the weight gradient
+    ``G.T @ X``) on a row keyed in the swapped orientation alone plans exactly the weight-gradient entry's plan for
+    the same math: the swapped ``X.T @ G`` with the transposed store, the same operand views and output view."""
+    odt = torch.float32 if out_f32 else torch.bfloat16
+    for (arch, sm, d_out, d_in), template in UNBATCHED_WGRAD_SWAP_ROWS.items():
+        assert cake_backend._orientation_rules(arch, d_out, d_in, out_f32) == (
+            True,
+            False,
+        )
+        G = torch.empty(T, d_out, dtype=torch.bfloat16)
+        X = torch.empty(T, d_in, dtype=torch.bfloat16)
+        out = torch.empty(d_out, d_in, dtype=odt)
+        got = cake_dense_gemm_det_train_projection_plan(
+            G.t(), X, out, sm_count=sm, l2_bytes=L2_BYTES, arch=arch
+        )
+        A, B, transposed = wgrad_views(G, X, arch=arch, out_f32=out_f32)
+        assert transposed
+        want = cake_dense_gemm_det_train_projection_plan(
+            A, B, out, sm_count=sm, l2_bytes=L2_BYTES, transposed_out=True, arch=arch
+        )
+        where = (arch, sm, d_out, d_in, T, out_f32)
+        assert got[0] == want[0], where
+        assert got[0].transposed_out and not got[0].swap_fallback, where
+        for g, w in zip(got[1:], want[1:], strict=True):
+            # the same views; a batch of one never dereferences its batch stride (2-D views unsqueezed)
+            assert (g.data_ptr(), tuple(g.shape), g.stride()[1:]) == (
+                w.data_ptr(),
+                tuple(w.shape),
+                w.stride()[1:],
+            ), where
+        if T == 16384 and not out_f32:
+            assert got[0].template == template, (where, got[0].template)
+
+
+@pytest.mark.parametrize("out_f32", [False, True])
+@pytest.mark.parametrize("T", [1024, 16384])
+def test_unbatched_narrow_output_wgrad_plans_the_swapped_call(T, out_f32):
+    """On sm_100a / sm_103a an unbatched generic call with both operands MN-major, no transposed store, no rule in
+    either orientation, at most 64 output columns against 4096 to 8192 output rows and at least 256 tokens (the
+    ``[d_in, d_out]`` weight gradient ``X.T @ G`` of a narrow projection) plans exactly the swapped generic call
+    ``G.T @ X`` with the transposed store into the same output: the 64-row transposed program instead of one padded
+    224- / 256-column tile."""
+    odt = torch.float32 if out_f32 else torch.bfloat16
+    template = (
+        "dense_proj_det_gemm_nn_n128_m64_f32_t_pro7"
+        if out_f32
+        else "dense_proj_det_gemm_nn_n128_m64_t_pro7"
+    )
+    for arch in ("sm_100a", "sm_103a"):
+        for d_in, d_out in ((4096, 8), (4096, 32), (5120, 48), (8192, 64)):
+            assert cake_backend._orientation_rules(arch, d_in, d_out, out_f32) == (
+                False,
+                False,
+            )
+            G = torch.empty(T, d_out, dtype=torch.bfloat16)
+            X = torch.empty(T, d_in, dtype=torch.bfloat16)
+            out = torch.empty(d_in, d_out, dtype=odt)
+            got = cake_dense_gemm_det_train_projection_plan(
+                X.t(), G, out, sm_count=152, l2_bytes=L2_BYTES, arch=arch
+            )
+            want = cake_dense_gemm_det_train_projection_plan(
+                G.t(),
+                X,
+                out,
+                sm_count=152,
+                l2_bytes=L2_BYTES,
+                transposed_out=True,
+                arch=arch,
+            )
+            where = (arch, d_in, d_out, T, out_f32)
+            assert got[0] == want[0], where
+            assert got[0].transposed_out and not got[0].swap_fallback, where
+            for g, w in zip(got[1:], want[1:], strict=True):
+                assert (g.data_ptr(), tuple(g.shape), g.stride()[1:]) == (
+                    w.data_ptr(),
+                    tuple(w.shape),
+                    w.stride()[1:],
+                ), where
+            if T == 16384 and d_out == 32:
+                assert got[0].template == template, (where, got[0].template)
+
+
+def test_unbatched_wgrad_swap_keeps_every_other_call():
+    """The unbatched weight-gradient swap takes only the rows it names: a row keyed direct, a row
+    without a rule and more than 64 output columns (2048 -> 32 in the out_in orientation, which the weight-gradient
+    entry swaps by the padded-work heuristic; 4096 x 72), a narrow output against fewer than 4096 rows (2048 x 32) or
+    more than 8192 rows (12288 x 40), a narrow output with fewer than 256 tokens, the narrow output on sm_107a, the
+    sm_107a bf16 6144 -> 576 weight gradient below 6144 tokens, a call with the transposed store and the K-major
+    layouts keep the caller's orientation, as before."""
+    T = 16384
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        sm = 212 if arch == "sm_107a" else 152
+
+        def plan(A, B, out, arch=arch, sm=sm, **kw):
+            return cake_dense_gemm_det_train_projection_plan(
+                A, B, out, sm_count=sm, l2_bytes=L2_BYTES, arch=arch, **kw
+            )[0]
+
+        # (M, N, K); a row keyed direct: 5120 -> 512 on sm_100a / sm_103a, 4096 -> 1024 on sm_107a
+        rows = [(1024, 4096, T) if arch == "sm_107a" else (512, 5120, T)]
+        rows += [(32, 2048, T), (4096, 72, T), (2048, 32, T)]
+        if arch == "sm_107a":
+            rows += [(4096, 32, T), (576, 6144, 4096)]
+        else:
+            rows += [(12288, 40, T), (4096, 32, 255)]
+        for M, N, K in rows:
+            A = torch.empty(K, M, dtype=torch.bfloat16).t()
+            B = torch.empty(K, N, dtype=torch.bfloat16)
+            p = plan(A, B, torch.empty(M, N, dtype=torch.bfloat16))
+            assert not p.transposed_out and not p.swap_fallback, (arch, M, N, K)
+            assert p.M == M and p.N == N, (arch, M, N, K)
+        G = torch.empty(T, 32, dtype=torch.bfloat16)
+        X = torch.empty(T, 4096, dtype=torch.bfloat16)
+        p = plan(
+            G.t(), X, torch.empty(4096, 32, dtype=torch.bfloat16), transposed_out=True
+        )
+        assert p.M == 32 and p.N == 4096 and p.transposed_out
+        assert not plan(
+            torch.empty(32, T, dtype=torch.bfloat16),
+            torch.empty(4096, T, dtype=torch.bfloat16).t(),
+            torch.empty(32, 4096, dtype=torch.bfloat16),
+        ).transposed_out
+        assert not plan(
+            torch.empty(32, T, dtype=torch.bfloat16),
+            X,
+            torch.empty(32, 4096, dtype=torch.bfloat16),
+        ).transposed_out
+        swap = cake_backend._single_wgrad_swap
+        assert not swap(arch, 32, 4096, T, False, True, False)
+        assert not swap(arch, 32, 4096, T, True, False, False)
+        assert swap(arch, 32, 4096, T, True, True, False)
+        narrow = arch != "sm_107a"
+        assert swap(arch, 4096, 32, T, True, True, False) == narrow
+        assert swap(arch, 8192, 32, 256, True, True, False) == narrow
+        assert not swap(arch, 4096, 32, 255, True, True, False)
+        assert not swap(arch, 12288, 32, T, True, True, False)
+        # sm_107a: the bf16 6144 -> 576 key swaps from 6144 tokens on, the fp32 one at every T
+        if arch == "sm_107a":
+            assert not swap(arch, 576, 6144, 6143, True, True, False)
+            assert swap(arch, 576, 6144, 6144, True, True, False)
+            assert swap(arch, 576, 6144, 1024, True, True, True)
+
+
+def test_unbatched_wgrad_view_pair_binds_the_wgrad_entry_launch(monkeypatch):
+    """Through the convenience path (planned and bound) the generic entry's unbatched weight-gradient view pair
+    launches the weight-gradient entry's program with the same arguments (CPU stand-ins: nothing is launched)."""
+    calls, _ = _cpu_k1_entry_points(monkeypatch, arch="sm_100a")
+    T = 2048
+    G = torch.randn(T, 48).to(torch.bfloat16)
+    X = torch.randn(T, 5120).to(torch.bfloat16)
+    out = torch.empty(48, 5120, dtype=torch.bfloat16)
+    for index in (-1, 0):  # the convenience path, then the bound launch of the key
+        monkeypatch.setattr(cake_backend, "_entry_index", lambda sources, i=index: i)
+        for _ in range(2):
+            calls.clear()
+            assert (
+                cake_backend.cake_dense_gemm_det_train_projection(G.t(), X, out) is out
+            )
+            assert (
+                cake_backend.cake_dense_gemm_det_train_projection_wgrad(G, X, out)
+                is out
+            )
+            (name, args), (want_name, want_args) = calls
+            assert name == want_name, (name, want_name)
+            assert len(args) == len(want_args)
+            for i, (g, w) in enumerate(zip(args, want_args, strict=True)):
+                if not isinstance(w, torch.Tensor):
+                    assert type(g) is type(w) and g == w, (i, g, w)
+                    continue
+                # the same views; a batch of one never dereferences its batch stride (2-D views unsqueezed)
+                assert (tuple(g.shape), g.data_ptr(), g.dtype) == (
+                    tuple(w.shape),
+                    w.data_ptr(),
+                    w.dtype,
+                ), i
+                assert g.stride()[-2:] == w.stride()[-2:], i
+    # the module of the swapped plan (the weight-gradient entry's views X.T, G with the transposed store)
+    swapped, *_ = cake_dense_gemm_det_train_projection_plan(
+        X.t(),
+        G,
+        out,
+        sm_count=152,
+        l2_bytes=126 << 20,
+        transposed_out=True,
+        arch="sm_100a",
+    )
+    assert name == cake_backend.select_module("sm_100a", swapped.template), (
+        name,
+        swapped.template,
+    )
+
+
+@pytest.mark.parametrize("orient", ["out_in", "in_out"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_unbatched_wgrad_view_pair_matches_fp64_and_the_wgrad_entry_bits(
+    out_dtype, orient
+):
+    """On the device, a re-planned unbatched weight-gradient view pair of 5120 -> 48 at T 2048: ``out_in``
+    (``G.T @ X`` into ``[48, 5120]``, keyed in the swapped orientation alone) runs the weight-gradient entry's launch,
+    ``in_out`` (``X.T @ G`` into ``[5120, 48]``, a narrow output without a rule) the swapped generic call's launch
+    (``G.T @ X`` with the transposed store): bitwise equal outputs on the prepared and the convenience paths, bit-exact
+    reruns and the FP64 reference of the exact BF16 operands within the package tolerance."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    device = torch.device("cuda")
+    arch = arch_for(device)
+    out_f32 = out_dtype == torch.float32
+    T, d_out, d_in = 2048, 48, 5120
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, d_out, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, d_in, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    if orient == "out_in":
+        A, B, shape = G.t(), X, (d_out, d_in)
+    else:
+        A, B, shape = X.t(), G, (d_in, d_out)
+    M, N = shape
+    if not cake_backend._single_wgrad_swap(arch, M, N, T, True, True, out_f32):
+        pytest.skip(
+            f"the {orient} view pair of {d_in} -> {d_out} is not swapped on {arch}"
+        )
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    out = torch.full(shape, float("nan"), dtype=out_dtype, device=device)
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
+    ref_out = torch.full_like(out, float("nan"))
+    if orient == "out_in":
+        reference = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, ref_out)
+    else:
+        reference = cake_dense_gemm_det_train_projection_prepare(
+            B.t(), A.t(), ref_out, transposed_out=True
+        )
+    assert prepared.plan == reference.plan and prepared.plan.transposed_out
+    _require_program(prepared.template)
+    reference.launch()
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(A.double(), B.double()))
+    bits = torch.int32 if out_f32 else torch.int16
+    first = out.clone()
+    assert torch.equal(out.view(bits), ref_out.view(bits))
+    for _ in range(20):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(bits), first.view(bits))
+    conv = torch.full_like(out, float("nan"))
+    for _ in range(2):  # planned, then the bound launch of the key
+        cake_backend.cake_dense_gemm_det_train_projection(A, B, conv)
+        torch.cuda.synchronize()
+        assert torch.equal(conv.view(bits), first.view(bits))
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
 def test_round2_knobs_name_their_programs():

@@ -3187,6 +3187,21 @@ def qk_l2norm_arch(device: torch.device | str | None = None) -> str | None:
     return _cuda_arch(index)
 
 
+def _device_arch(device: torch.device | str | None) -> str | None:
+    """The exported architecture of CUDA device ``device`` (an index-less ``"cuda"``: the current CUDA device), the
+    ``arch`` a context's local plan and byte queries take, as the forward plans with that of its operands' device
+    (``cake_jit.device_arch``); ``None`` on a CPU device, on a host without CUDA (no CUDA call is made) and on a
+    device no record targets, where the existing backend keeps its own default (the current CUDA device's
+    architecture, else the first exported one)."""
+    if device is None or not torch.cuda.is_available():
+        return None
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return None
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    return _cuda_arch(index)
+
+
 def _qk_l2norm_readers(mode: str, picked: dict[tuple[str, str], str]) -> str | None:
     """Why the records ``picked`` for one problem (``(path, stage) -> record``) do not give the route's order of
     mode ``mode``, ``None`` when they do: fused, the forward's intra program is the ``_l2n`` twin (its first q / k
@@ -3466,7 +3481,9 @@ def cake_kda_det_train_kcp_workspace_bytes(
     each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
     largest local arena (the first of the largest in list order, with its tail-count table where it is a lean one, as
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
-    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
+    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.  Each
+    context's local arena is planned for the architecture of its own device (``ctx.device``), as its forward plans
+    it, not for that of the current CUDA device.
     ``lean_passes``: the tail passes a lean arena is sized for (``CakeKDADetKcpWorkspace(lean_passes=...)``; ``None``:
     :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
     (``CakeKDADetKcpWorkspace(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
@@ -3519,7 +3536,12 @@ def cake_kda_det_train_kcp_workspace_bytes(
 
         # the existing backend's arena rule; imported here so the metadata module stays torch-only
         cake_backend = _single_rank.module("cake_backend")
-        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate, **l2n_kw)
+        # the architecture of the context's device, the one its forward plans with (never the current CUDA device's,
+        # which may be another model); None keeps the existing backend's default
+        arch = _device_arch(c.device)
+        p = cake_backend.plan(
+            c.T_r, c.n_frag, int(H), c.sm_count, arch=arch, gate=gate, **l2n_kw
+        )
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
             t = 4 * local_tail_count_words(a, H)
@@ -3532,6 +3554,7 @@ def cake_kda_det_train_kcp_workspace_bytes(
                     backward=backward,
                     save_mode=save_mode,
                     sm_count=c.sm_count,
+                    arch=arch,
                     fwd_layout=local_fwd_layout(backward, save_mode),
                     gate=gate,
                     **l2n_kw,
@@ -3544,7 +3567,9 @@ def cake_kda_det_train_kcp_workspace_bytes(
         # buffer size follows the same segment-count convention as the arena bytes above)
         if intra_writes_tables(p):
             scratch[(int(c.T_r), int(c.n_frag))] = int(
-                cake_backend.tables_bytes(c.T_r, c.n_frag, int(H), sm_count=c.sm_count)
+                cake_backend.tables_bytes(
+                    c.T_r, c.n_frag, int(H), sm_count=c.sm_count, arch=arch
+                )
             )
     layouts = [
         kcp_arena_layout(

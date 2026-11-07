@@ -1265,6 +1265,44 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
     return L > 1 and not transposed_out and M <= 256 and N >= 2 * M
 
 
+#: FlashInfer-only: the architectures on which an unbatched weight gradient with a narrow output (``N <= 64`` columns
+#: against ``4096 <= M <= 8192`` rows, ``K >= 256``) and no measured rule was measured faster swapped (see
+#: :func:`_single_wgrad_swap`).
+_NARROW_N_SWAP_ARCHES = ("sm_100a", "sm_103a")
+
+#: FlashInfer-only: the smallest token count ``K`` at which a keyed unbatched weight gradient runs swapped, by
+#: ``(arch, M, N, out_f32)`` of the generic call (see :func:`_single_wgrad_swap`).  On sm_107a (212 SMs) the 6144 -> 576
+#: bf16 weight gradient ran the swapped plan 0.91x at T 2048 and 4096 and 1.18x to 1.46x from T 6144 to 40961.
+_SINGLE_WGRAD_SWAP_MIN_K = {("sm_107a", 576, 6144, False): 6144}
+
+
+def _single_wgrad_swap(
+    arch: str, M: int, N: int, K: int, a_mn: bool, b_mn: bool, out_f32: bool
+) -> bool:
+    """FlashInfer-only: an unbatched (``L == 1``) call with both operands MN-major and no transposed store is the
+    weight gradient ``G.T @ X`` of :func:`cake_dense_gemm_det_train_projection_wgrad` with ``G = A.T`` (``M`` output
+    rows) and ``X = B`` (``N`` columns).  It runs the swapped ``X.T @ G`` with the transposed store
+
+    * where that entry swaps by a measured rule: ``ROW_RULES`` keys the row in the swapped orientation alone
+      (:func:`_orientation_rules`; the narrow 32- to 128-row, 512-row and 576-row weight gradients) and ``K`` is at
+      least the row's ``_SINGLE_WGRAD_SWAP_MIN_K`` entry, if any.  The plan, its program and its bits are then the
+      weight-gradient entry's;
+    * where no rule keys the row in either orientation, the output is narrow (``N <= 64``: the ``[d_in, d_out]``
+      weight gradient ``X.T @ G`` of a narrow projection), ``4096 <= M <= 8192`` and ``K >= 256``, on
+      ``_NARROW_N_SWAP_ARCHES``: the direct plan pads the ``N`` columns into one 224- / 256-column tile, the swapped
+      plan puts them in a 64-row tile.  Above 8192 rows the swapped plan measured slower at most token counts, and
+      below 256 tokens the call is launch-bound (flat to 2 % slower swapped).
+
+    Every other unbatched call keeps the caller's orientation."""
+    if not (a_mn and b_mn):
+        return False
+    swapped_rule, direct_rule = _orientation_rules(arch, M, N, out_f32)
+    if swapped_rule or direct_rule:
+        min_k = _SINGLE_WGRAD_SWAP_MIN_K.get((arch, M, N, out_f32), 0)
+        return swapped_rule and not direct_rule and min_k <= K
+    return arch in _NARROW_N_SWAP_ARCHES and N <= 64 and 4096 <= M <= 8192 and K >= 256
+
+
 # fmt: off
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); a ragged rule leaves the
@@ -2756,7 +2794,15 @@ def cake_dense_gemm_det_train_projection_plan(
     epilogue default to the TMA store plans the same symbol unmeasured, so the registry does not serve it there and
     the row runs the registry fallback above (as before those programs were generated); a caller-forced ``epi``
     is served, and the fp32-output programs (``_f32_tma<slots>_sks``: the TMA store by default at every K) are
-    served as before."""
+    served as before.
+
+    A fourth FlashInfer-only deviation, the unbatched weight-gradient swap (:func:`_single_wgrad_swap`): an ``L == 1``
+    call with both operands MN-major and no transposed store is the weight gradient ``G.T @ X``; where the rule table
+    keys that row in the swapped orientation alone, the call is planned swapped like the batched small-M swap (and
+    under the same registry fallback), so it runs the plan of :func:`cake_dense_gemm_det_train_projection_wgrad` for
+    the same math instead of padding its few output rows into a tall tile; a row without a rule whose output has at
+    most 64 columns against 4096 to 8192 rows and ``K >= 256`` is planned swapped too on ``_NARROW_N_SWAP_ARCHES`` (its
+    columns go to the 64-row tile of the transposed store instead of one padded 224- / 256-column tile)."""
     _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -2851,7 +2897,19 @@ def cake_dense_gemm_det_train_projection_plan(
                 "tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor]",
                 chained,
             )
-    swap_eligible = swap_small_m(L, M, N, transposed_out)
+    swap_eligible = swap_small_m(L, M, N, transposed_out) or (
+        L == 1
+        and not transposed_out
+        and _single_wgrad_swap(
+            arch,
+            M,
+            N,
+            K,
+            operand_view(A3, "A", k_axis=2)[0],
+            operand_view(B3, "B", k_axis=1)[0],
+            out.dtype == torch.float32,
+        )
+    )
     swapped = _allow_swap and swap_eligible
     if swapped:
         A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
@@ -4646,14 +4704,13 @@ def _k1_swapped(
     *,
     transposed_out: bool,
 ) -> bool:
-    """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
-    launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
-    (``plan.swap_fallback``)."""
+    """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  A chain plan
+    records it (``plan.swapped``).  Otherwise a swap (the launcher's batched small-M rule, :func:`swap_small_m`, or the
+    unbatched weight-gradient rule, :func:`_single_wgrad_swap`) turns a call without the transposed store into a plan
+    with it; the registry fallback that undid a swap (``plan.swap_fallback``) planned the caller's orientation."""
     if isinstance(plan, ChainGemmPlan):
         return plan.swapped
-    A3, B3 = as_batched(A, "A"), as_batched(B, "B")
-    L, M, N = int(A3.shape[0]), int(A3.shape[1]), int(B3.shape[2])
-    return swap_small_m(L, M, N, transposed_out) and not plan.swap_fallback
+    return bool(plan.transposed_out) and not transposed_out
 
 
 def _k1_views(

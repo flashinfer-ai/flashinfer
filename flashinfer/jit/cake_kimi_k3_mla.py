@@ -8,8 +8,9 @@ definitions shares that program's file: its record's ``source_flags`` (kernel) a
 ``binding_flags`` (binding) carry the definitions, passed to that source only.  ``MODULES``
 holds one record per program (sources, compile flags, FFI entry, argument plan, supported
 architectures) and ``KERNELS`` maps a logical kernel key (``main_rt16`` .. ``main_rt96``,
-``main_rt16_late`` .. ``main_rt48_late``, ``main_wide``, ``reduce_w1`` / ``reduce_w2`` /
-``reduce_w4``, ``reduce_cta``, ``reduce_cta_rt``) to its program, or to one program per
+``main_rt16_late`` .. ``main_rt48_late``, ``main_wide``, ``main_wide_persistent``,
+``reduce_w1`` / ``reduce_w2`` / ``reduce_w4``, ``reduce_w1_tile_flags`` .. ``reduce_w4_tile_flags``,
+``reduce_cta``, ``reduce_cta_rt``) to its program, or to one program per
 architecture when the two lowerings do not fold.  Both literals are written by the Cake exporter.
 """
 
@@ -261,6 +262,33 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kimi_k3_mla_fp8_paged_attention_f494b12c9709d813606b": {
+        "sources": [
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_f494b12c9709d813606b_kernel.cu",
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_f494b12c9709d813606b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["buffer", "O"],
+            ["buffer", "cum_seq_lens_q"],
+            ["parameter", "batch"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_split"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_full_items"],
+            ["parameter", "tile_rows"],
+            ["buffer", "tile_flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_kimi_k3_mla_fp8_paged_attention_9ee76b721fc2501c240d": {
         "sources": [
             "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_9ee76b721fc2501c240d_kernel.cu",
@@ -339,6 +367,33 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kimi_k3_mla_fp8_paged_attention_c65bf2189498f99e556e": {
+        "sources": [
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_c65bf2189498f99e556e_kernel.cu",
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_c65bf2189498f99e556e_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["buffer", "O"],
+            ["buffer", "cum_seq_lens_q"],
+            ["parameter", "batch"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_split"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_full_items"],
+            ["parameter", "tile_rows"],
+            ["buffer", "tile_flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_kimi_k3_mla_fp8_paged_attention_26ef66c318f8588ba983": {
         "sources": [
             "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_26ef66c318f8588ba983_kernel.cu",
@@ -359,6 +414,33 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "m_tiles"],
             ["parameter", "n_full_items"],
             ["parameter", "tile_rows"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_kimi_k3_mla_fp8_paged_attention_c1b0fc7c71f54e822a30": {
+        "sources": [
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_c1b0fc7c71f54e822a30_kernel.cu",
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_c1b0fc7c71f54e822a30_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["buffer", "O"],
+            ["buffer", "cum_seq_lens_q"],
+            ["parameter", "batch"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_split"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_full_items"],
+            ["parameter", "tile_rows"],
+            ["buffer", "tile_flags"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -456,6 +538,41 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_kimi_k3_mla_fp8_paged_attention_002aa1cf108580113f2e": {
+        "sources": [
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_002aa1cf108580113f2e_kernel.cu",
+            "cake_kimi_k3_mla/cake_kimi_k3_mla_fp8_paged_attention_002aa1cf108580113f2e_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "tmap_q"],
+            ["tma_buffer", "tmap_k"],
+            ["tma_buffer", "tmap_qr"],
+            ["tma_buffer", "tmap_kr"],
+            ["tma_buffer", "tmap_v"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["buffer", "O"],
+            ["buffer", "seq_lens"],
+            ["buffer", "cum_seq_lens_q"],
+            ["buffer", "page_table"],
+            ["parameter", "softmax_scale_log2"],
+            ["parameter", "bmm2_scale"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_split"],
+            ["parameter", "max_pages_per_seq"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_full_items"],
+            ["parameter", "n_work_clusters"],
+            ["buffer", "tile_flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 KERNELS: dict[str, str | dict[str, str]] = {
     "main_rt16": "cake_kimi_k3_mla_fp8_paged_attention_b0d0c47e81edc26da19e",
@@ -467,11 +584,15 @@ KERNELS: dict[str, str | dict[str, str]] = {
     "main_rt64": "cake_kimi_k3_mla_fp8_paged_attention_29b047f732fcfdfeb85b",
     "main_rt96": "cake_kimi_k3_mla_fp8_paged_attention_07d8fd7941e0ab779c08",
     "main_wide": "cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653",
+    "main_wide_persistent": "cake_kimi_k3_mla_fp8_paged_attention_002aa1cf108580113f2e",
     "reduce_cta": "cake_kimi_k3_mla_fp8_paged_attention_9ee76b721fc2501c240d",
     "reduce_cta_rt": "cake_kimi_k3_mla_fp8_paged_attention_b4fc7a8391cbdef2d260",
     "reduce_w1": "cake_kimi_k3_mla_fp8_paged_attention_26ef66c318f8588ba983",
     "reduce_w2": "cake_kimi_k3_mla_fp8_paged_attention_65966e1a7be656a5db1e",
     "reduce_w4": "cake_kimi_k3_mla_fp8_paged_attention_b21abb8be454a75ab942",
+    "reduce_w1_tile_flags": "cake_kimi_k3_mla_fp8_paged_attention_c1b0fc7c71f54e822a30",
+    "reduce_w2_tile_flags": "cake_kimi_k3_mla_fp8_paged_attention_c65bf2189498f99e556e",
+    "reduce_w4_tile_flags": "cake_kimi_k3_mla_fp8_paged_attention_f494b12c9709d813606b",
 }
 
 

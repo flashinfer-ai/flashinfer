@@ -17,17 +17,22 @@ partition and the context of every rank in each package, and compares:
   fragment table, ``conv_kernel_size``, the ``sm_count`` default), tensors by
   dtype, shape and values, and ``seg_chunk_start`` over the context's chunk
   table;
-- the error type and message (package names masked) of invalid partition and
-  context inputs, and the process-group check (``torch.distributed`` stubbed).
+- the error type and message (each package's own name masked) of invalid
+  partition and context inputs, and the process-group check
+  (``torch.distributed`` stubbed).
 
 Not compared: the segment plan, the ``P`` rule, the wave rule, the head plan,
 the byte queries and the arena layouts.  These differ between the packages by
 design.
 
-The packages and their entries are found by rule (:func:`_kcp_package` and
-:func:`_entry`), so the #8928 renames, which land family by family, need no
-change here.  A package that the rule does not find, or that does not import,
-fails the test; nothing is skipped.
+The packages and their entries carry their final #8928 names: the package of
+``(op, mode)`` is the one row of PACKAGES whose import path ends in
+``cake_<op>_<mode>_train_kcp``, and its entries are
+``cake_<op>_<mode>_train_kcp_partition`` and
+``cake_<op>_<mode>_train_kcp_build_context`` (:func:`_kcp_package` and
+:func:`_entry`).  A missing package or entry, a KDA or GDN KCP row or entry
+under another name, or a package that does not import fails the test; nothing
+is skipped.
 
 CI runs this file in the unit-test run over ``tests/``.  CPU only: no GPU, no
 process group and no kernel.
@@ -57,10 +62,11 @@ FAMILIES = (("kda", "det"), ("kda", "nondet"), ("gdn", "det"), ("gdn", "nondet")
 
 # A row of PACKAGES is the KCP package of (op, mode) when the last part of its
 # import path is ``cake_<op>_<mode>_train_kcp`` (#8928 names, for example
-# ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``) or, before the
-# rename, ``cake_<op>_train_kcp`` for the non-deterministic package.  The key of
-# the row does not matter.
-_KCP_PACKAGE = re.compile(r"cake_(kda|gdn)(?:_(det|nondet))?_train_kcp")
+# ``flashinfer.experimental.cake.cake_gdn_nondet_train_kcp``).  The key of the
+# row does not matter.  A KDA or GDN KCP row under any other name (the
+# pre-#8928 ``cake_<op>_train_kcp``, for example) fails the test.
+_KCP_PACKAGE = re.compile(r"cake_(kda|gdn)_(det|nondet)_train_kcp")
+_KCP_PACKAGE_LIKE = re.compile(r"cake_(?:kda|gdn)\w*_kcp\w*")
 
 # The base context: what a context derives from its partition, the same in the
 # four packages.  The p_rule, the head plans and each package's upload state
@@ -113,9 +119,16 @@ LAYOUT_CASES = (
 )
 CASES_PER_LAYOUT = 16
 
-# A package's own names in an error message: ``partition_det_kcp``,
-# ``CakeKDADetKcpPartition``, ``cake_gdn_nondet_train_kcp_build_context``.
-_PACKAGE_NAME = re.compile(r"\b\w*[Kk]cp\w*\b")
+
+def _package_name(op: str, mode: str) -> re.Pattern[str]:
+    """The package's own name in an error message, and nothing else: its snake-case
+    prefix ``cake_<op>_<mode>_train_kcp`` (``cake_gdn_nondet_train_kcp_build_context``)
+    and its class prefix ``Cake<OP><Mode>Kcp`` (``CakeKDADetKcpPartition``)."""
+    snake = f"cake_{op}_{mode}_train_kcp"
+    camel = f"Cake{op.upper()}{mode.capitalize()}Kcp"
+    return re.compile(
+        rf"(?<![A-Za-z0-9_])(?:{snake}(?![A-Za-z0-9])|{camel}(?![a-z0-9]))"
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,15 +139,27 @@ class Kcp:
     plan: ModuleType
     partition: Callable[..., Any]
     build_context: Callable[..., Any]
+    name: re.Pattern[str]  # the package's own name in an error message
+
+
+def _kcp_rows() -> tuple[dict[tuple[str, str], list[str]], list[str]]:
+    """The keys of the KCP rows of PACKAGES by ``(op, mode)``, and the import paths
+    of the KDA and GDN KCP rows under any other name."""
+    found: dict[tuple[str, str], list[str]] = {}
+    other = []
+    for key, path in PACKAGES.items():
+        last = path.rsplit(".", 1)[-1]
+        match = _KCP_PACKAGE.fullmatch(last)
+        if match:
+            found.setdefault((match[1], match[2]), []).append(key)
+        elif _KCP_PACKAGE_LIKE.fullmatch(last):
+            other.append(path)
+    return found, other
 
 
 def _kcp_package(op: str, mode: str) -> str:
     """The key of the one row of PACKAGES that holds the KCP package of ``(op, mode)``."""
-    keys = []
-    for key, path in PACKAGES.items():
-        match = _KCP_PACKAGE.fullmatch(path.rsplit(".", 1)[-1])
-        if match and (match[1], match[2] or "nondet") == (op, mode):
-            keys.append(key)
+    keys = _kcp_rows()[0].get((op, mode), [])
     if len(keys) != 1:
         pytest.fail(
             f"PACKAGES must hold one row for the {op} {mode} KCP package (import "
@@ -144,35 +169,38 @@ def _kcp_package(op: str, mode: str) -> str:
     return keys[0]
 
 
-def _entry(plan: ModuleType, words: tuple[str, ...]) -> Callable[..., Any]:
-    """The one public function of ``plan`` whose name has ``words`` in a row and the word ``kcp``.
-
-    The rule holds for the names before #8928 (``partition_det_kcp``,
-    ``build_context_kcp``) and after it (``cake_kda_det_train_kcp_partition``,
-    ``cake_gdn_nondet_train_kcp_build_context``).  An alias of the same function
-    counts once.
-    """
-    found: dict[Callable[..., Any], list[str]] = {}
-    for name, value in vars(plan).items():
-        if (
-            name.startswith("_")
-            or not inspect.isfunction(value)
-            or value.__module__ != plan.__name__
-        ):
-            continue
-        parts = name.split("_")
-        n = len(words)
-        if "kcp" in parts and any(
-            tuple(parts[i : i + n]) == words for i in range(len(parts))
-        ):
-            found.setdefault(value, []).append(name)
-    if len(found) != 1:
+def _entry(plan: ModuleType, op: str, mode: str, what: str) -> Callable[..., Any]:
+    """``cake_<op>_<mode>_train_kcp_<what>`` of ``plan``: a public function of the
+    module itself, and the module's only public function that names ``what`` with
+    ``kcp`` (no pre-#8928 name such as ``partition_det_kcp``, no alias)."""
+    name = f"cake_{op}_{mode}_train_kcp_{what}"
+    words = tuple(what.split("_"))
+    value = vars(plan).get(name)
+    if not inspect.isfunction(value) or value.__module__ != plan.__name__:
         pytest.fail(
-            f"{plan.__name__}: expected one public function named with "
-            f"{'_'.join(words)!r} and 'kcp', found {sorted(found.values())}",
+            f"{plan.__name__}: expected the public function {name}, found {value!r}",
             pytrace=False,
         )
-    return next(iter(found))
+    others = []
+    for other, obj in vars(plan).items():
+        parts = other.split("_")
+        if (
+            other != name
+            and not other.startswith("_")
+            and inspect.isfunction(obj)
+            and "kcp" in parts
+            and any(
+                tuple(parts[i : i + len(words)]) == words for i in range(len(parts))
+            )
+        ):
+            others.append(other)
+    if others:
+        pytest.fail(
+            f"{plan.__name__}: {name} must be the only public KCP {what} function; "
+            f"also found {sorted(others)}",
+            pytrace=False,
+        )
+    return value
 
 
 @functools.cache
@@ -182,8 +210,9 @@ def _kcp(op: str, mode: str) -> Kcp:
     return Kcp(
         path=PACKAGES[key],
         plan=plan,
-        partition=_entry(plan, ("partition",)),
-        build_context=_entry(plan, ("build", "context")),
+        partition=_entry(plan, op, mode, "partition"),
+        build_context=_entry(plan, op, mode, "build_context"),
+        name=_package_name(op, mode),
     )
 
 
@@ -232,14 +261,14 @@ def _context_record(kcp: Kcp, ctx: Any) -> dict[str, Any]:
     return record
 
 
-def _outcome(call: Callable[[], Any]) -> dict[str, Any]:
-    """The result of ``call``, or its error type and message with the package names masked."""
+def _outcome(kcp: Kcp, call: Callable[[], Any]) -> dict[str, Any]:
+    """The result of ``call``, or its error type and message with the package's own name masked."""
     try:
         return {"result": call()}
     except Exception as e:
         return {
             "error": type(e).__name__,
-            "message": _PACKAGE_NAME.sub("<name>", str(e)),
+            "message": kcp.name.sub("<package>", str(e)),
         }
 
 
@@ -326,6 +355,16 @@ def _case(kind: str, seed: int) -> Case:
 
 def _partition(kcp: Kcp, cu, W, layout="contiguous", fragments=None, cut_points=None):
     return kcp.partition(cu, W, layout, fragments, cut_points=cut_points)
+
+
+def test_the_four_kcp_packages_and_no_other_are_found() -> None:
+    """PACKAGES holds exactly one row for each of the four KCP packages, under its
+    #8928 name, and no KDA or GDN KCP row under another name."""
+    found, other = _kcp_rows()
+    assert not other, (
+        f"KDA / GDN KCP rows not named cake_<op>_<mode>_train_kcp: {other}"
+    )
+    assert {k: len(v) for k, v in found.items()} == dict.fromkeys(FAMILIES, 1), found
 
 
 @pytest.mark.parametrize("op, mode", FAMILIES, ids=[f"{o}-{m}" for o, m in FAMILIES])
@@ -418,7 +457,7 @@ def test_invalid_partition_inputs_fail_alike(kcps: dict[str, Kcp], case: str) ->
     cu, W, kwargs = INVALID_PARTITIONS[case]
     outcomes = {
         name: _outcome(
-            lambda kcp=kcp: _partition_record(_partition(kcp, cu, W, **kwargs))
+            kcp, lambda kcp=kcp: _partition_record(_partition(kcp, cu, W, **kwargs))
         )
         for name, kcp in kcps.items()
     }
@@ -452,7 +491,7 @@ def test_invalid_context_inputs_fail_alike(kcps: dict[str, Kcp], case: str) -> N
         return _context_record(kcp, ctx)
 
     outcomes = {
-        name: _outcome(lambda kcp=kcp: build(kcp)) for name, kcp in kcps.items()
+        name: _outcome(kcp, lambda kcp=kcp: build(kcp)) for name, kcp in kcps.items()
     }
     assert all("error" in o for o in outcomes.values()), outcomes
     _assert_same("error", outcomes)
@@ -481,7 +520,7 @@ def test_process_group_check_matches(
         return _context_record(kcp, kcp.build_context(part, group, 1, "cpu"))
 
     outcomes = {
-        name: _outcome(lambda kcp=kcp: build(kcp)) for name, kcp in kcps.items()
+        name: _outcome(kcp, lambda kcp=kcp: build(kcp)) for name, kcp in kcps.items()
     }
     assert all(("error" not in o) == ok for o in outcomes.values()), outcomes
     _assert_same("process-group check", outcomes)

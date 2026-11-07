@@ -547,6 +547,251 @@ the `dW` pair range (pair and row indices, keys, sort) and at most 128 MiB
 of FP32 partial rows; it does not depend on `V`.  The dense workspace is `dz`
 plus blocks of `chunk_size` rows and at most 16384 vocabulary columns.
 
+## Zero-weight policy rows of the loss entry
+
+A policy row with a valid label whose `loss_weights` entry is exactly zero
+(`+0` or `-0`) contributes exactly zero loss and zero gradient.  Its weight is
+known before the forward, like a `-100` label, so the loss entry leaves such a
+row out of the gradient path:
+
+* The chunk loop runs over the gradient rows `G = (labels >= 0) &
+  (loss_weights != 0)` only: the row compaction uses this mask (the host
+  count path and the hidden valid-row count), and both row counts come back
+  in the call's one count readback (one 8-byte copy; no further host
+  synchronization).  A NaN weight keeps its row in `G`.
+* The zero-weight rows `Z = (labels >= 0) & (loss_weights == 0)` run no
+  `row_grad`, dX GEMM or weight-gradient GEMM.  Their `dX` rows are exact
+  `+0`.  With `return_logp=True` their `logp` comes from a logp-only pass of
+  the log-probability forward kernels (`gemm_logits_lbl` + `row_finalize`,
+  chunk-bounded buffers) into the same `[T]` output; without `return_logp`
+  that pass does not run.
+* A call whose valid rows all have zero weight launches no gradient GEMM: both
+  gradients are zeros and the loss is the plain path's (`+0`).
+* The logp-only pass runs ahead of the chunk loop, except when the hidden
+  valid-row count already holds chunk 0's buffers and either the chunk loop
+  keeps no buffer until the backward (`W` without a gradient, or
+  `fuse_dw_cast=False`) or no chunk loop follows: it then runs after the loop
+  (or in its place) once those buffers are released.  With the hidden count,
+  a weight gradient and `fuse_dw_cast`, it runs where the byte model below
+  predicts the lower peak: ahead of the loop beside chunk 0's buffers, or
+  after it beside the accumulators and the deferred chunk's `dz` rows (ahead
+  on a tie).  The memory report adds
+  `zero_weight_rows`, `zero_weight_loss_mode`,
+  `zero_weight_logp_temporary_bytes`, `zero_weight_logp_phase_bytes` and, in
+  the exact mode, `zero_weight_exact_loss_temporary_bytes`.
+* A call of fewer than `cake_backend.zero_weight_min_rows()` rows `T` (default
+  4096, `set_zero_weight_min_rows`) keeps its zero-weight rows in the chunk
+  loop.  The default is the floor timed for the non-deterministic package's
+  split of the same entry; this package re-times it before relying on it.
+
+### The loss: `"exact"` (default) and `"regroup"`
+
+`cake_backend.set_zero_weight_loss_mode(mode)` (process setting, returns the
+previous mode; `zero_weight_loss_mode()` reads it):
+
+* `"exact"`: the loss is bitwise the loss of the same call without the split.
+  The plain path forms one term per valid row in `row_finalize`
+  (`term = w * clipped`, `clipped = ratio < 2 ? ratio : 2`, so a NaN or
+  infinite ratio clips to 2) and reduces the terms chunk by chunk over the
+  valid rows in `loss_reduce`: one 256-thread CTA, thread `i` adds
+  `term[i], term[i + 256], ...` into an FP64 register that starts at `+0`,
+  then a warp butterfly and a cross-warp butterfly; the first chunk stores
+  the chunk sum in the FP64 accumulator, every later chunk adds its sum, and
+  the last chunk stores `float(0 - acc)`.  The split keeps every chunk's
+  terms without another buffer: chunk 0's stay in the chunk-local `term`
+  buffer, chunk `c >= 1` writes its terms into the compact `loss_weights`
+  rows of chunk `c - 1` (gathered before the loop and read by no launch
+  after that chunk's `row_finalize`).  After the loop the terms go to their
+  rows' positions among the valid rows (`k + |{z < g_k}|`), each zero-weight
+  row's slot takes its weight (`+0` / `-0`: the term the plain path forms for
+  that row for any ratio), and the shipped `loss_reduce` runs over the plain
+  path's chunks of that array (`ceil(T_v / C)` launches, the same `rows_c`
+  and first / last flags) on the call's stream.  Every thread adds the same
+  values in the same order, so the FP64 sums and the FP32 rounding are the
+  plain path's.
+* `"regroup"`: the chunk loop's own `loss_reduce` over `G` (the same FP64 sum
+  of the same nonzero terms over the split's chunk boundaries); the loss may
+  differ from the plain path's in its last FP32 bits.  No term placement and
+  no extra launch.
+
+### Bits against the call without the split
+
+| output | bits |
+| --- | --- |
+| `logp`, `lse` of every row (`Z` rows from the logp-only pass) | identical (the same per-row logits and row-statistics arithmetic) |
+| `loss`, mode `"exact"` | identical, non-finite values in `Z` rows included (their term is `+-0` either way) |
+| `loss`, mode `"regroup"` | the same FP64 sum over other chunk boundaries: may differ in the last FP32 bits |
+| `dX` row of a `Z` row | exact `+0` (the plain path: `+-0`, or NaN through `0 * inf` when the row's `X`, logits or `infer_logp` is not finite) |
+| `dX` row of a `G` row | identical when its chunk runs the same dX form and K-slice count in both calls; otherwise within the accuracy budget |
+| `dW` | the same products, summed over the split's chunk rows (the K reduction groups differ): within the accuracy budget; a `Z` row with a non-finite `X` row or logit no longer makes it NaN |
+
+Run to run every output is bitwise the same, as everywhere in this package.
+
+### Memory
+
+The split never holds more of the plain path's per-row buffers: on the host
+count path the index of `G` and the index of `Z` are formed at their exact
+sizes (`8 |G| + 8 |Z| = 8 T_v` bytes, the plain index's); on the hidden
+valid-row count path the `[T]` gradient-row index takes the place of the
+`[T]` valid-row index and the `Z` index adds `8 |Z|`; the gradient-row mask
+kept for the fused dX finalize is `T` bytes (the valid-row mask's); the chunk
+loop's compact row vectors and `dX_acc` cover `G` only.  Per phase, against the same call
+without the split (`Cb = min(C, |G|) <= Cm = min(C, T_v)`):
+
+| phase | bytes added | bytes saved |
+| --- | --- | --- |
+| count (before the loop) | the `Z` mask and the second int32 scan, `T + 4 T` (released before the loop) | -- |
+| chunk loop | `Z` index `8 |Z|` (hidden valid-row count path only); the `Z` rows' `logp` `4 |Z|` when the pass ran first | compact rows `24 |Z|` (labels, `lse`, `logp`, `infer_logp`, `loss_weights`); `dX_acc` `4 H |Z|`; chunk buffers of `Cm - Cb` rows |
+| exact loss (after the loop, mode `"exact"`) | term array `4 T_v`, positions `8 |G|` (then `12 |Z|` for the `Z` slots); the two kept term buffers `4 |G| + 4 Cb` | the loop's statistics (`8 Cm ceil(V / 256)`), `lse` (`4 T_v`), `d` / `term` (`8 Cm`), gather buffer (`2 Cm H`) and, when compacted, `infer_logp` / labels (`12 T_v`), released before this phase; `dX_acc` `4 H |Z|` |
+| logp-only pass | its chunk buffers of `min(C, |Z|)` rows and `O(|Z|)` vectors | runs before the loop allocates (or after it released its buffers) |
+
+The chunk loop and the exact-loss phase stay below the plain path's chunk
+loop for every `|Z| >= 1` within the documented geometry (the exact-loss
+phase's additions are covered by the released statistics and `lse` alone
+while `12 |G| <= Cm * V / 32`, at the default chunk and `V = 154880` up to
+1.6 million gradient rows).  Two further terms depend on the shapes, and the
+split bounds both:
+
+* **dX K slices.** The K-slice workspace (`4 H Cb` bytes per slab) follows the
+  largest slice count over the chunks, and the slice rule gives a small tail
+  chunk more slices.  The split's chunk loop therefore runs no chunk at more
+  slices than the largest count of the same call without the split
+  (`dx_slices_cap`; a count above it becomes the cap fitted to the K steps).
+  A chunk the cap lowers runs another dX slice count than the rule picks, so
+  its `dX` rows can differ in their last bits (within the accuracy budget,
+  as any `G` row of another dX form); an explicit `k_slices` knob is the
+  same in both calls and is not capped.
+* **The guard.** After the count readback the host predicts both peaks from
+  the two counts (`cake_backend.zero_weight_memory`, no further
+  synchronization; `zero_weight_plan` adds the slice counts of this device):
+  `plain = R(T_v) + A(T_v)` and `split = max(loop, pass, exact)` with
+  `loop = R(|G|) + A(|G|) + 8 |Z| (+ 4 |Z| when the pass ran first)`,
+  `pass = P + I (+ chunk 0's logits / statistics / gather buffer when it runs
+  ahead of a hidden count) or P + I + A(|G|) + dz + 4 (after the loop)`,
+  `exact = I + A(|G|) + dz + 4 T_v + max(8 |G|, 12 |Z|) + 4 |G| + 4 Cb`, where
+  `R` / `A` are `memory_report`'s temporaries / accumulators of a chunk loop
+  over that many rows (with its K-slice slabs), `P` the logp-only pass's
+  workspace plus `8 |Z|`, `I = 8 |G| + 8 |Z| (+ T for the fused dX
+  finalize's mask)` the held indices and `dz` the deferred chunk's rows.  A
+  call with `split > plain` runs without the split (its valid-row index
+  formed on the device from the two counts; on the hidden count path chunk
+  0's queued gather and logits GEMM are dropped).  `memory_mode="budget"`
+  compares `memory_plan`'s predicted peaks of the two calls (the same
+  budget) instead.
+
+The model leaves out what both calls hold alike (the outputs, the inputs) and
+some small terms: the record's TMA-descriptor and scratch bytes of the
+logp-only pass, the allocator's block rounding, the count phase's transient
+masks and scans before the loop (`~5 T` bytes), and reserved (cached) bytes.
+
+Not applied (the plain path runs, every valid row in the chunk loop): a call
+below the row floor above, `compact_rows=False`, `objective="ce"`, the
+log-probability entry (see the next section), the prepared runner
+(`prepare_lm_head_det_loss`, a fixed row set) and a caller-given
+`num_valid_rows` (its plan needs no readback, so the split count is not
+available).  `memory_mode="budget"` splits the rows too: its chunk loop and
+step-peak model run over the gradient rows, its bound still counts every valid
+row, and the model adds the logp-only pass and the exact loss's term phase
+(`memory_plan(..., zero_rows=..., zero_total=..., exact_loss=...)`).  The
+loss entry has no temperature, so the split has no temperature form.
+
+## Zero-gradient rows of the log-probability backward
+
+A valid row whose upstream gradient `dlogp` is exactly zero (`+0` or `-0`;
+for example a token the caller's loss masks) contributes exact zeros to `dX`
+and `dW`.  The log-probability backward knows `dlogp` only when it runs, so
+it handles these rows on the device, without a host synchronization:
+
+* The backward orders the forward's valid rows so that the live rows (a
+  nonzero `dlogp`, NaN included) come first, each group in ascending row
+  order, and forms the per-chunk count of live rows in device memory, in one
+  kernel launch per call (`zero_dlogp_partition`; the same outputs as its
+  PyTorch reference `zero_dlogp_partition_reference`, bit for bit).  The
+  order is a stable partition formed from an inclusive scan: a function of
+  the labels and of which `dlogp` entries are zero.
+* The chunk's dz arm of the logits GEMM (`gemm_logits_dz_dcnt`; with a
+  temperature `gemm_logits_dz_dcnt_tau`), its weight-gradient accumulate
+  (`gemm_dw_acc_dcnt`, `gemm_dw_acc_gn_dcnt`) and its bf16 fused cast
+  (`gemm_dw_cast_bf16_dcnt`, `gemm_dw_cast_bf16_tma_dcnt`) read the chunk's
+  count and skip the work items (dz) or the K steps (dW) past it.  The launch
+  shape stays the chunk's full row count, so the call is the same set of
+  launches for every `dlogp` and a CUDA graph capture of the backward replays
+  for other `dlogp` values.  These forms are this package's GEMM arithmetic
+  with a device row bound: each output element has one owner per launch and
+  the chunks run in order.
+* The dX GEMM has no counted form in this package: it computes every row of
+  each chunk with the forms and K-slice counts the plan takes without the
+  skip (the chunks keep their sizes).  The rows past a chunk's count may read
+  `dz` rows the counted dz arm did not write, so their `dX_acc` rows hold
+  values that nothing reads: the fused dX finalize (`scale_cast_scatter_bf16`)
+  addresses the accumulator through the partition's live-row scan only and
+  writes exact `+0` on every other row.  The skip therefore requires the
+  fused dX finalize whenever the call forms `dX`.
+* Memory: the call holds the partition's int64 row order (8 bytes per valid
+  row), int32 live-row scan (4 bytes per row of `T`) and per-chunk counts
+  until the dX output boundary, and its FP32 reordered `lse` (4 bytes per
+  valid row) through the chunk loop.  In exchange it forms neither the bool
+  valid-row mask nor the finalize's int32 scan, and its chunk loop binds no
+  row-statistics buffer (`min(T_v, chunk_size) * ceil(V / 256) * 8` bytes,
+  which no launch of this backward writes or reads).
+
+Bits.  Every output is the same on every run.  `logp` and `lse` come from
+the forward, which the skip does not change.  A skipped row's `dX` row is
+exact `+0`.  A live row's `dX` row is the same per-row arithmetic; its chunk
+can change (the live rows move to the front), and with it that chunk's dX
+K-slice count, so its bits can differ from a call without the skip within
+the accuracy budgets.  `dW` sums the same nonzero products over the live
+rows in the new row order (FP32), so its bits can differ from a call without
+the skip within the accuracy budgets.  A call with no zero-gradient row keeps
+the row order, the chunks and the K steps of the call without the skip:
+`dX` and `dW` are then bit-identical to it.
+
+Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
+in `dW`, as without the skip).  A non-finite `X` row or logit of a
+zero-gradient row makes `dW` NaN without the skip (`0 * inf`); with the
+skip it still does when the row falls within the 63 rows after a chunk's
+live rows (the weight-gradient GEMM's last 64-row K step), and not
+elsewhere.  Its `dX` row is an exact zero either way.
+
+The skip applies to a compacted backward that reuses the forward's row index
+(the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
+`dX`, the fused dX finalize (`dx_finalize`), on a record that registers the
+`_dcnt` forms and the partition kernel, of at least
+`cake_backend.zero_dlogp_min_rows(device)` valid rows: the override of
+`cake_backend.set_zero_dlogp_min_rows` when one is set (an integer, or
+`None` = never, on every architecture), else the architecture's default
+floor below.  With no override set the setter returns
+`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`; passing it back (or a copy or an
+unpickled copy of it) restores the per-architecture default, and
+`zero_dlogp_min_rows()` without a device returns 4097.
+
+| architecture | floor (valid rows of one call) | source |
+| --- | --- | --- |
+| sm_100a (B200) | 1946 (`T` = 2048 with 5 % ignored rows) | `ZERO_DLOGP_MIN_ROWS_BY_ARCH` |
+| sm_103a (GB300) | 3891 (`T` = 4096 with 5 % ignored rows) | `ZERO_DLOGP_MIN_ROWS_BY_ARCH` |
+| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`, one row above a default chunk) | not timed below one default chunk |
+
+The call's plan decides: under the skip the last chunk's bf16 fused cast runs
+its counted form -- the counted TMA-epilogue form where the plan without the
+skip takes the TMA-epilogue cast (`dw_cast_tma_rule`), else the counted
+per-thread form; the same `dW` bits either way -- and a plan with a form
+that has no counted one (an explicitly pinned weight-gradient TMA epilogue,
+an fp32 fused cast) runs the backward without the skip: no partition
+launch, rows in the forward's order.  A call with a temperature runs the
+counted temperature form of the dz arm
+(`cake_backend.set_zero_dlogp_temperature_dz_counted(False)`, or a record
+without it: the uncounted `gemm_logits_dz_tau` over every row, the same
+outputs) beside the counted dW forms; a per-token temperature is gathered in
+the partition's order.
+
+Not applied (the backward runs as without the skip): `compact_rows=False`
+or a call whose labels are all valid (no row index), a backward that
+recounts its valid rows (no forward row index), `logprob_dz=False`,
+`dx_finalize=False` with `dX`, the kept logits (`memory_mode="keep_logits"`),
+the opt-in forms (`memory_mode="budget"`, `num_valid_rows`), the prepared
+runner, the reference backend and a temperature backward given
+`temperature_rows` without the temperature itself.
+
 ## Switches and environment variables
 
 Every switch above is a keyword argument of each entry point it affects
@@ -572,7 +817,14 @@ variable either) and the non-switch keywords `num_valid_rows` /
 `check_num_valid_rows` through unchanged.  The gradient placement of the loss
 entry is a process setting of the backend
 (`cake_backend.set_gradient_placement`, see "Public entry points"), neither a
-keyword nor a variable.
+keyword nor a variable; so are the two settings of the zero-gradient row skip
+(`cake_backend.set_zero_dlogp_min_rows`,
+`cake_backend.set_zero_dlogp_temperature_dz_counted`, see "Zero-gradient rows
+of the log-probability backward"), each read once per call and part of the
+backward binding key, and the two settings of the loss entry's zero-weight
+split (`cake_backend.set_zero_weight_min_rows`,
+`cake_backend.set_zero_weight_loss_mode`, see "Zero-weight policy rows of the
+loss entry"), each read once per call (no binding depends on them).
 
 | Keyword (backend default) | Variable read by `flashinfer.cake_lm_head_det_train` | Parsing |
 | --- | --- | --- |
@@ -584,6 +836,10 @@ keyword nor a variable.
 | `gemm_tuning` (`{}`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING` | JSON object -> dict; unset / blank -> no knob; invalid -> `ValueError` |
 | `BINDING_CACHE.configure(enabled=...)` (`True`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `0` -> disabled (read at import, applied on first use) |
 | `BINDING_CACHE.configure(capacity=...)` (`64`) | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | positive integer (read at import, applied on first use) |
+| `cake_backend.set_zero_dlogp_min_rows(rows)` (per architecture: `1946` on sm_100a, `3891` on sm_103a, `4097` elsewhere) | none (process setting) | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT` restores the per-architecture default |
+| `cake_backend.set_zero_dlogp_temperature_dz_counted(counted)` (`True`) | none (process setting) | `True`: the skip's dz arm with a temperature runs `gemm_logits_dz_dcnt_tau`; `False`: `gemm_logits_dz_tau` over every row (the same outputs) |
+| `cake_backend.set_zero_weight_min_rows(rows)` (`4096`) | none (process setting) | a non-negative integer; a policy loss call of fewer rows `T` keeps its zero-weight rows in the chunk loop (`0`: every compacted policy call splits) |
+| `cake_backend.set_zero_weight_loss_mode(mode)` (`"exact"`) | none (process setting) | `"exact"`: the loss bits of the call without the split; `"regroup"`: the split's own chunk sums |
 
 ## Kernel structure of one token chunk
 
@@ -736,6 +992,14 @@ depths differ.
   one-chunk call (no old sum) and a longer last chunk keep the shipped cast;
   an explicit `"epi_store"` knob of `gemm_tuning`'s `"dw"` wins over the rule.
   Bitwise: the same per-element `(old + acc) * g` and round-to-nearest.
+* `_dcnt`: the forms of the zero-gradient row skip (see "Zero-gradient rows
+  of the log-probability backward"): the dz arm (`gemm_logits_dz_dcnt`, its
+  temperature form `gemm_logits_dz_dcnt_tau`), the weight-gradient accumulate
+  (`gemm_dw_acc_dcnt`, `gemm_dw_acc_gn_dcnt`) and the bf16 fused cast
+  (`gemm_dw_cast_bf16_dcnt`, `gemm_dw_cast_bf16_tma_dcnt`) bounded by the
+  chunk's device count of live rows (`CNT`); the accumulate's TMA epilogue
+  and the fp32 cast have none (`cake_backend.DCNT_BASES`).  Bitwise: the same
+  arithmetic on the rows before the count.
 
 The raster height is a scalar of the base forms: `group_m` 16 for the logits
 GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
