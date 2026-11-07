@@ -962,6 +962,99 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Warp-per-token finalize: each warp reduces one token row, or the blockIdx.y-th of gridDim.y
+// slices of it when there are too few tokens to fill the GPU. Lane k < topK reads the token's k-th
+// expanded index and weight, and the warp then walks its slice FINALIZE_WARP_VECS 128-bit vectors
+// per lane at a time, issuing the loads of all of them before accumulating, for every local expert.
+constexpr int FINALIZE_WARP_THREADS = 256;
+constexpr int FINALIZE_WARP_VECS = 4;
+// Row slices are added until the launch has at least this many warps.
+constexpr int FINALIZE_WARP_MIN_WARPS = 2048;
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelWarpPerToken(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
+  using VecElem = cutlass::Array<Type, ElemPerVec>;
+  using ComputeElem = cutlass::Array<float, ElemPerVec>;
+  constexpr int WarpsPerBlock = FINALIZE_WARP_THREADS / 32;
+  constexpr unsigned FullMask = 0xffffffffu;
+
+  int const lane = threadIdx.x % 32;
+  int64_t const tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
+  if (tokenIdx >= params.numTokens) {
+    return;
+  }
+  int64_t const numVecs = params.hiddenDim / ElemPerVec;
+  int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
+  int64_t const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+  int64_t const stepsPerSlice =
+      ((numVecs + vecsPerStep - 1) / vecsPerStep + gridDim.y - 1) / gridDim.y;
+  int64_t const vecBegin = blockIdx.y * stepsPerSlice * vecsPerStep;
+  int64_t const vecEnd = min(numVecs, vecBegin + stepsPerSlice * vecsPerStep);
+
+  // The permutation and the expert weights come from routing, which completed before the GEMMs
+  // this kernel depends on could start, so they are read before waiting on the primary kernel.
+  int permutedIdx = -1;
+  float scale = 0.f;
+  if (lane < params.topK) {
+    int64_t const expandedIdx = tokenIdx * params.topK + lane;
+    permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+    scale = params.expertWeightsPtr != nullptr
+                ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
+                : 1.f;
+  }
+  unsigned const localMask = __ballot_sync(FullMask, permutedIdx != -1);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
+  // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
+  // the slice skip their loads and stores.
+  for (int64_t stepBegin = vecBegin; stepBegin < vecEnd; stepBegin += vecsPerStep) {
+    int64_t const vecBase = stepBegin + lane;
+    ComputeElem acc[FINALIZE_WARP_VECS];
+#pragma unroll
+    for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+      acc[u].fill(0.f);
+    }
+    for (unsigned mask = localMask; mask != 0; mask &= mask - 1) {
+      int const k = __ffs(mask) - 1;
+      int64_t const row = __shfl_sync(FullMask, permutedIdx, k);
+      float const w = __shfl_sync(FullMask, scale, k);
+      auto const* inVecPtr = reinterpret_cast<float4 const*>(params.inPtr) + row * numVecsPadded;
+      VecElem in[FINALIZE_WARP_VECS];
+#pragma unroll
+      for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+        if (vecBase + u * 32 < vecEnd) {
+          float4 const v = vectorizedLoadPtx(inVecPtr + vecBase + u * 32);
+          in[u] = *reinterpret_cast<VecElem const*>(&v);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+        if (vecBase + u * 32 < vecEnd) {
+          acc[u] = acc[u] + w * arrayConvert<VecElem, ComputeElem>(in[u]);
+        }
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+      if (vecBase + u * 32 < vecEnd) {
+        outVecPtr[vecBase + u * 32] = arrayConvert<ComputeElem, VecElem>(acc[u]);
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Small-batch finalize: each CTA reduces one hidden-dim slice of one token. The topK reduction is
 // split across blockDim.y thread groups so every thread issues at most
 // SMALL_BATCH_FINALIZE_MAX_LOADS independent 128-bit loads, and the partial sums are combined
@@ -1184,6 +1277,16 @@ void run(Data const& data, void* stream) {
       // vectorized loading.
       dim3 numBlocks(numBlocksX, numBlocksY);
       LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
+    } else if (vectorWidthAligned && data.topK <= 32 && data.inPtr2 == nullptr) {
+      int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
+      int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+      int const numSteps =
+          (data.hiddenDim / finalizeElemsPerVector + vecsPerStep - 1) / vecsPerStep;
+      int const numSlices =
+          std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
+      dim3 numBlocks((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
+      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1, numBlocks,
+                  /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
     } else {
       FLASHINFER_CHECK(
           data.topK <= MaxTopK,

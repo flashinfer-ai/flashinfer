@@ -737,6 +737,8 @@ static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
 
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
+// CTAs of the smaller cluster that permutes mid-sized batches of precomputed top-k ids.
+static constexpr int NumBlocksPerSmallCluster = 4;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
