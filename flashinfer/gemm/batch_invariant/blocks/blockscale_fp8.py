@@ -394,12 +394,11 @@ def blockscale_epilogue_loop(
                     )
                     tTR_rSum[s * V + e] = r0
                     tTR_rSum[s * V + e + 1] = r1
-            cute.arch.fence_view_async_tmem_load()  # the partial has been read
-            sync.arrive_and_wait()
+            cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(
                     acc_state
-                )  # TMEM stage free for the next block
+                )  # one arrive per warp: the stage is free once all four arrived
             acc_state.advance()
         # the chain (one cvt.rn) and the store of the tile's fold, subtile by subtile
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
