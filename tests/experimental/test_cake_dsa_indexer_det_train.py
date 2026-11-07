@@ -168,6 +168,7 @@ _COMMON = dict(
     rank_t16_slots=[4096],
     rank_persist_max_k=0,
     rank_persist_ctas_per_sm=4,
+    merge_rank=False,
 )
 NARROW_PAIR_POLICY = DispatchPolicy.from_record(
     dict(
@@ -351,10 +352,19 @@ def test_registry_records_are_well_formed():
         scan_keys = sorted(k for k in keys if k.startswith("scan:"))
         finalize_keys = sorted(k for k in keys if k.startswith("finalize:"))
         rank_keys = sorted(k for k in keys if k.startswith("finalize_rank:"))
+        merge_rank_keys = sorted(k for k in keys if k.startswith("merge:rank:"))
         assert scan_keys and finalize_keys and MERGE_KEY in keys, arch
-        assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | {
-            MERGE_KEY
-        }, arch
+        assert set(keys) == set(scan_keys) | set(finalize_keys) | set(rank_keys) | set(
+            merge_rank_keys
+        ) | {MERGE_KEY}, arch
+        # the fused merge + rank finalize programs: one merge program per slab rank window, registered exactly where
+        # the record turns merge_rank on
+        assert bool(merge_rank_keys) == bool(policy.merge_rank), arch
+        for key in merge_rank_keys:
+            window = int(key[len("merge:rank:w") :])
+            assert window in policy.rank_window_variants, (arch, key)
+            assert window <= policy.rank_slab_window_max, (arch, key)
+            assert cake_jit.PROGRAMS[keys[key]]["role"] == "merge", (arch, key)
         # every scan key follows the key grammar; an FP8 key (``:fp8`` before ``:lsf``) runs the sampled-fit form, in
         # the plain unit order or as the snake copy of a registered plain FP8 program, and the BF16 record's rules
         # below are the BF16 programs' (the FP8 form has a record of its own, ``policy_for(arch, "fp8")``)
@@ -3485,11 +3495,12 @@ def test_dispatch_rows_are_exact_and_plan_matches_runner(seg_q, seg_k, top_k):
     )
     assert runner.choice == plan and plan.max_seqlen_k == bound
     assert _plan(inputs).max_seqlen_k is None
-    assert runner.stages == (
-        ("scan", "merge", plan.finalize_role)
-        if plan.split
-        else ("scan", plan.finalize_role)
-    )
+    if plan.split and plan.merge_rank:
+        assert runner.stages == ("scan", "merge")
+    elif plan.split:
+        assert runner.stages == ("scan", "merge", plan.finalize_role)
+    else:
+        assert runner.stages == ("scan", plan.finalize_role)
     assert set(runner.programs) == set(runner.stages)
     assert runner.workspace_bytes == plan.workspace_bytes
     out = runner()
@@ -4738,6 +4749,118 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             2048, True, False, False, False
         )  # a form of the bulk program
         assert not on.finalize_rank_persistent_for(2048, False, False, False, False)
+
+
+_MERGE_RANK_CALLS = (
+    # (num_queries, num_keys, num_segments): split calls whose finalize is the slab rank form (windows 16384 and 65536)
+    (4, 22018, 1),
+    (1, 16384, 1),
+    (64, 16384, 1),
+    (128, 32768, 2),
+)
+
+
+def test_merge_rank_fuses_the_slab_rank_finalize_into_split_merges():
+    """A split call whose finalize is the slab rank form runs the merge of key ``merge:rank:w<window>`` and no finalize
+    program where the architecture's record turns ``merge_rank`` on; the finalize key it replaces is unchanged, a record
+    with ``merge_rank`` off keeps the merge + finalize programs, and the FP8 form never fuses."""
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        off = DispatchPolicy.from_record(dict(policy.record(), merge_rank=False))
+        keys = cake_jit.PROGRAM_KEYS[arch]
+        grid = 212 if arch == "sm_107a" else 148
+        for T, Tkv, S in _MERGE_RANK_CALLS:
+            call = dict(
+                num_queries=T,
+                num_keys=Tkv,
+                num_segments=S,
+                ratio=1,
+                top_k=2048,
+                grid=grid,
+                scan_keys=keys,
+            )
+            fused, plain = select_program(policy, **call), select_program(off, **call)
+            assert plain.split and not plain.merge_rank, (arch, T, Tkv, S)
+            assert plain.keys == (plain.scan_key, MERGE_KEY, plain.finalize_key)
+            assert fused.merge_rank is bool(policy.merge_rank), (arch, T, Tkv, S)
+            if not fused.merge_rank:
+                assert fused == plain
+                continue
+            window = fused.rank_window
+            assert window is not None and window <= policy.rank_slab_window_max
+            assert (
+                fused.merge_key == f"merge:rank:w{window}" and fused.merge_key in keys
+            )
+            assert fused.keys == (fused.scan_key, fused.merge_key)
+            assert fused.finalize_key == plain.finalize_key
+            assert (
+                dataclasses.replace(fused, merge_key=MERGE_KEY, merge_rank=False)
+                == plain
+            )
+            fp8 = plan_dsa_indexer_det_topk(
+                T,
+                Tkv,
+                S,
+                top_k=2048,
+                arch=arch,
+                num_sms=grid,
+                dtype=torch.float8_e4m3fn,
+            )
+            assert not fp8.merge_rank and fp8.merge_key in (None, MERGE_KEY), arch
+        # a call above the fused programs' top_k bound, an unsplit call and a two-level window keep the finalize program
+        for call in (
+            dict(num_queries=4, num_keys=22018, num_segments=1, top_k=4096),
+            dict(num_queries=8192, num_keys=8192, num_segments=1, top_k=2048),
+            dict(num_queries=4, num_keys=300000, num_segments=1, top_k=2048),
+        ):
+            c = select_program(policy, ratio=1, grid=grid, scan_keys=keys, **call)
+            assert not c.merge_rank and c.keys[-1] == c.finalize_key, (arch, call)
+
+
+def test_merge_rank_runs_are_bitwise_the_merge_plus_finalize_runs(monkeypatch):
+    """The fused merge writes the bits of the merge + slab rank finalize pair: every output of a split call is bitwise the
+    same with the architecture's record and with ``merge_rank`` off, and the fused call launches no finalize program."""
+    _require_program()
+    arch = arch_for(torch.device("cuda"))
+    if not policy_for(arch).merge_rank:
+        pytest.skip(f"merge_rank is off on {arch}")
+    rows = (
+        ([4], [22018]),
+        ([64], [16384]),
+        ([64, 64], [16384, 16384]),
+        ([3, 5], [7000, 30000]),
+    )
+    for seed, (seg_q, seg_k) in enumerate(rows):
+        inputs = ref.make_random_inputs(
+            seg_q, seg_k, top_k=2048, seed=700 + seed, device="cuda"
+        )
+        runner = _prepare(inputs)
+        if not runner.choice.split or not runner.choice.merge_rank:
+            continue
+        assert runner.stages == ("scan", "merge"), (seg_q, seg_k, runner.stages)
+        fused = _cloned(runner())
+        with monkeypatch.context() as m:
+            original = cake_backend.policy_for
+
+            def merge_rank_off(arch, form=cake_policy.BF16):
+                return DispatchPolicy.from_record(
+                    dict(original(arch, form).record(), merge_rank=False)
+                )
+
+            m.setattr(cake_backend, "policy_for", merge_rank_off)
+            plain_runner = _prepare(inputs)
+            assert plain_runner.stages == (
+                "scan",
+                "merge",
+                plain_runner.choice.finalize_role,
+            )
+            plain = _cloned(plain_runner())
+        assert torch.equal(fused[0], plain[0]), (seg_q, seg_k)
+        assert torch.equal(fused[1].view(torch.int32), plain[1].view(torch.int32)), (
+            seg_q,
+            seg_k,
+        )
+        _judge_ok(fused, ref.select_reference(inputs))
 
 
 def test_device_facts_are_queried_once_per_device(monkeypatch):

@@ -1164,11 +1164,11 @@ def _prepare_runner(
         dtype=q.dtype,
     )
     # every program of the call must be registered before anything is allocated (fail closed by name)
+    # a merge that finalizes its rows itself (``choice.merge_rank``, key merge:rank:w*) leaves no finalize program to bind
     fin_role = choice.finalize_role
-    programs = {
-        "scan": program_for(arch, choice.scan_key),
-        fin_role: program_for(arch, choice.finalize_key),
-    }
+    programs = {"scan": program_for(arch, choice.scan_key)}
+    if not choice.merge_rank:
+        programs[fin_role] = program_for(arch, choice.finalize_key)
     if choice.merge_key is not None:
         programs["merge"] = program_for(arch, choice.merge_key)
     workspace_bytes = int(choice.workspace_bytes)
@@ -1308,10 +1308,11 @@ def _prepare_runner(
             stages.append("merge")
         # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x SMs) CTAs, each walking rows bid, bid + grid, ...
         fin_grid = (finalize_grid(choice, _num_sms(device)), 1, 1)
-        launches.append(
-            bind_program(programs[fin_role], arch, fin_role, values, fin_grid)
-        )
-        stages.append(fin_role)
+        if fin_role in programs:
+            launches.append(
+                bind_program(programs[fin_role], arch, fin_role, values, fin_grid)
+            )
+            stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
     # on the ticket architectures the scan program draws every work unit from the workspace's

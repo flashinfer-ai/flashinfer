@@ -158,6 +158,7 @@ POLICY_FIELDS = (
     "rank_t16_slots",  # sort-slot counts (threads x finalize_items) whose staged form runs as 16-item threads (half the threads), ascending
     "rank_persist_max_k",  # the persistent two-row pipelined rank finalize serves the staged bulk calls with top_k <= this on the architecture (lever FRP-K; 0 = the one-row program everywhere; program key tag :persist)
     "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x SM count) CTAs, each walking rows bid, bid + grid, ...
+    "merge_rank",  # a split call whose finalize is the slab rank form (window <= rank_slab_window_max, top_k <= MERGE_RANK_MAX_TOP_K) runs the merge with the rank finalize fused in (key merge:rank:w<window>) and launches no finalize program
 )
 
 KINDS = ("narrow", "wide", "l6", "split", "pair_narrow", "pair_wide", "pair_l6")
@@ -167,6 +168,9 @@ PHYSICAL_KINDS = tuple(
     sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
 )
 MERGE_KEY = "merge"
+# The merge with the rank finalize fused in leaves each split row in its final ascending-ID layout (the slab rank finalize's
+# bits); its programs hold up to this many kept entries per row in shared memory.
+MERGE_RANK_MAX_TOP_K = 2048
 # Input forms of a call, selected by its q / k dtype: ``bf16`` (the default) and ``fp8`` (float8_e4m3fn q / k with
 # per-key FP32 scales, opt-in).  An FP8 scan program's key carries the form tag before the LSF suffix,
 # ``scan:<kind>:u<unroll>:s<snake>:f<fit>:fp8[:lsf]``; the merge and finalize programs serve both forms.
@@ -302,6 +306,7 @@ _BOOL = (
     "rank_two_level",
     "rank_bulk_io",
     "rank_t16",
+    "merge_rank",
 )
 _NUMBER = (
     "sample_fit_max_mean_tiles",
@@ -442,6 +447,7 @@ class DispatchPolicy:
     rank_t16_slots: list
     rank_persist_max_k: int
     rank_persist_ctas_per_sm: int
+    merge_rank: bool
 
     @classmethod
     def from_record(cls, raw: Any) -> "DispatchPolicy":
@@ -1500,6 +1506,28 @@ class DispatchPolicy:
             return False
         return int(top_k) <= cap
 
+    def merge_rank_for(
+        self, split: bool, top_k: int, rank_window: Optional[int], two_level: bool
+    ) -> bool:
+        """True when a split call runs the merge with the rank finalize fused in (program key ``merge:rank:w<rank_window>``) and
+        launches no finalize program: ``merge_rank`` on the architecture, a slab (not two-level) rank finalize window up to
+        ``rank_slab_window_max`` and ``top_k <= MERGE_RANK_MAX_TOP_K``.  The fused program writes the slab rank finalize's rows
+        (same kept set, same ascending-ID order, same padding), so results are bitwise independent of the choice."""
+        return (
+            bool(self.merge_rank)
+            and bool(split)
+            and rank_window is not None
+            and not bool(two_level)
+            and int(rank_window) <= int(self.rank_slab_window_max)
+            and int(top_k) <= MERGE_RANK_MAX_TOP_K
+        )
+
+
+def merge_key(rank_window: Optional[int] = None) -> str:
+    """Program key of a split call's merge: ``merge``, or ``merge:rank:w<rank_window>`` for the merge with the rank finalize
+    fused in."""
+    return MERGE_KEY if rank_window is None else f"{MERGE_KEY}:rank:w{int(rank_window)}"
+
 
 def finalize_grid(choice: "ProgramChoice", num_sms: int) -> int:
     """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x SM count)`` for the persistent rank program (lever
@@ -1714,7 +1742,8 @@ class ProgramChoice:
     rank_persist_ctas: int  # persistent CTAs per SM of that form (0 when the call runs a one-row program)
     scan_key: str
     merge_key: Optional[str]
-    finalize_key: str
+    merge_rank: bool  # the merge program finalizes the split rows itself (key merge:rank:w*): no finalize launch
+    finalize_key: str  # the finalize program of the call (recorded even when merge_rank fuses it into the merge)
     scan_entries: int  # int64 candidate entries of the persistent buffers
     staging_entries: int  # int64 split-staging entries behind them (0 without a split)
     workspace_bytes: int
@@ -1725,7 +1754,7 @@ class ProgramChoice:
         return (
             (self.scan_key,)
             + ((self.merge_key,) if self.merge_key is not None else ())
-            + (self.finalize_key,)
+            + (() if self.merge_rank else (self.finalize_key,))
         )
 
     @property
@@ -1950,6 +1979,7 @@ def select_program(
     rank_persistent = policy.finalize_rank_persistent_for(
         K, rank_staged, rank_two_level, rank_bulk_io, rank_t16
     )
+    merge_rank = policy.merge_rank_for(split, K, rank_window, rank_two_level)
     scan_entries = grid_ctas * block_q * cap
     staging = T * n_split * K if split else 0
     key = scan_key(physical, unroll, snake, fit, lsf)
@@ -1999,7 +2029,10 @@ def select_program(
         if rank_persistent
         else 0,
         scan_key=key,
-        merge_key=MERGE_KEY if split else None,
+        merge_key=(merge_key(rank_window) if merge_rank else MERGE_KEY)
+        if split
+        else None,
+        merge_rank=merge_rank,
         finalize_key=finalize_key(
             rank_threads,
             rank_window,
@@ -2066,6 +2099,7 @@ def fp8_program_choice(
         lsf=fields.lsf,
         scan_key=key,
         merge_key=MERGE_KEY if split else None,
+        merge_rank=False,  # the FP8 form keeps the merge + finalize programs of its records
         scan_entries=scan_entries,
         staging_entries=staging,
         workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
@@ -2174,6 +2208,7 @@ __all__ = [
     "FP8_KIND_FALLBACK",
     "KINDS",
     "MERGE_KEY",
+    "MERGE_RANK_MAX_TOP_K",
     "POLICY_FIELDS",
     "RANK_ITEMS_DEFAULT",
     "SAMPLE_SHIFT_PERMILLE_BOUNDS",
@@ -2187,6 +2222,7 @@ __all__ = [
     "fp8_policy_record",
     "fp8_program_choice",
     "fp8_scan_programs",
+    "merge_key",
     "physical_kind",
     "sample_class_for",
     "scan_key",

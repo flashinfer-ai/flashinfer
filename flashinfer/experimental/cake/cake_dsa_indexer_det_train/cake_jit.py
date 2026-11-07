@@ -292,6 +292,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_107a"],
         "ticket_arg_arches": ["sm_107a"],
     },
+    "cake_dsa_indexer_det_topk_515346273bb05c921713": {
+        "role": "merge",
+        "library": "cake_dsa_indexer_det_topk_515346273bb05c921713",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
     "cake_dsa_indexer_det_topk_521027e8563a9664acef": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_521027e8563a9664acef",
@@ -301,6 +306,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_526027b3b42a3dc9a141",
         "arches": ["sm_103a"],
+    },
+    "cake_dsa_indexer_det_topk_54d6e6c62c7e427bab11": {
+        "role": "merge",
+        "library": "cake_dsa_indexer_det_topk_54d6e6c62c7e427bab11",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_dsa_indexer_det_topk_55767b3e4f028548bd92": {
         "role": "finalize_rank",
@@ -367,6 +377,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_629db978ba455dd1e92b",
         "arches": ["sm_103a"],
+    },
+    "cake_dsa_indexer_det_topk_64eb5bd999f161023bed": {
+        "role": "merge",
+        "library": "cake_dsa_indexer_det_topk_64eb5bd999f161023bed",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_dsa_indexer_det_topk_69d2d7c68ccceb095540": {
         "role": "finalize_rank",
@@ -766,6 +781,9 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_det_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_det_topk_2581ee71bf5e5ecd2556",
         "merge": "cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7",
+        "merge:rank:w16384": "cake_dsa_indexer_det_topk_54d6e6c62c7e427bab11",
+        "merge:rank:w65536": "cake_dsa_indexer_det_topk_64eb5bd999f161023bed",
+        "merge:rank:w8192": "cake_dsa_indexer_det_topk_515346273bb05c921713",
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_det_topk_401fb46fc3a69d791fdd",
         "scan:l6:u1:s0:f0:lsf": "cake_dsa_indexer_det_topk_f59c7d519b4a998a5cf9",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_det_topk_d121d20b4ff827b4b6d2",
@@ -830,6 +848,9 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_det_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_det_topk_2581ee71bf5e5ecd2556",
         "merge": "cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7",
+        "merge:rank:w16384": "cake_dsa_indexer_det_topk_54d6e6c62c7e427bab11",
+        "merge:rank:w65536": "cake_dsa_indexer_det_topk_64eb5bd999f161023bed",
+        "merge:rank:w8192": "cake_dsa_indexer_det_topk_515346273bb05c921713",
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_det_topk_401fb46fc3a69d791fdd",
         "scan:l6:u1:s0:f0:lsf": "cake_dsa_indexer_det_topk_f59c7d519b4a998a5cf9",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_det_topk_d121d20b4ff827b4b6d2",
@@ -902,6 +923,9 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_det_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk:persist": "cake_dsa_indexer_det_topk_aa0bedf1a5601a3c55be",
         "merge": "cake_dsa_indexer_det_topk_b8440d1d1d54917a47d7",
+        "merge:rank:w16384": "cake_dsa_indexer_det_topk_54d6e6c62c7e427bab11",
+        "merge:rank:w65536": "cake_dsa_indexer_det_topk_64eb5bd999f161023bed",
+        "merge:rank:w8192": "cake_dsa_indexer_det_topk_515346273bb05c921713",
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_det_topk_3c9bece1433e9cf03979",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_det_topk_110194b650e766125f9f",
         "scan:l6:u1:s0:f1:fp8": "cake_dsa_indexer_det_topk_bacae64bc8920dd8578b",
@@ -1019,6 +1043,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 0,
         "rank_persist_ctas_per_sm": 4,
+        "merge_rank": True,
     },
     "sm_103a": {
         "tile_keys": 128,
@@ -1104,6 +1129,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 0,
         "rank_persist_ctas_per_sm": 4,
+        "merge_rank": True,
     },
     "sm_107a": {
         "tile_keys": 128,
@@ -1205,6 +1231,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 2048,
         "rank_persist_ctas_per_sm": 4,
+        "merge_rank": True,
     },
 }
 # The FP8 input form's dispatch record of an architecture is its ``POLICY``
