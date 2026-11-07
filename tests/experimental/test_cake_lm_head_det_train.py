@@ -12627,15 +12627,16 @@ def _logprob_step(inp, kind, form, *, C=64, between=None, **kw):
 
 # Forwards a checkpointed log-probability step runs.  The recomputation takes the checkpointed call's row results
 # when the checkpoint's hooks are innermost and it gets the same input tensors; the reentrant first pass has no graph
-# (nothing kept), ``copies_outside`` hands the recomputation copies and ``offload_inside`` puts other hooks innermost
-# (each runs the forward again).  ``nested`` and ``offload_outside`` (the same tensors on the CPU only) run one or two.
+# (nothing kept) and ``copies_outside`` hands the recomputation copies (both run the forward again);
+# ``offload_inside`` puts other hooks innermost, which save the call's tensors themselves (no recomputation of the
+# call).  ``nested`` and ``offload_outside`` (the same tensors on the CPU only) run one or two.
 _LOGPROB_FORWARDS = dict(
     reentrant=2,
     nonreentrant=1,
     nonreentrant_no_early_stop=1,
     nonreentrant_no_determinism_check=1,
     copies_outside=2,
-    offload_inside=2,
+    offload_inside=1,
 )
 
 
@@ -12673,8 +12674,8 @@ def test_checkpointed_logprob_recomputation_runs_the_forward_after_a_change(
 ):
     """The recomputation runs the forward again when an input of the checkpointed call (here the labels, which the
     checkpointed function reads from outside the region) or its kept ``logp`` changed in place after the forward, or
-    when it calls the entry with other options: ``dX`` / ``dW`` are then those of the changed call (an uncheckpointed
-    step on it), never from a stale row result."""
+    when it calls the entry with other options: ``dX`` / ``dW`` are then those of an uncheckpointed step on the changed
+    labels (the options of the checkpointed call, which its backward runs), never from a stale row result."""
     inp = _host_inputs(200, "ce")
     if change == "options":
         # a checkpointed function whose recomputation passes another chunk size than its first pass
@@ -12697,7 +12698,8 @@ def test_checkpointed_logprob_recomputation_runs_the_forward_after_a_change(
                 head, X, W, use_reentrant=False, determinism_check="none"
             ).backward()
         assert len(seen) == 2, seen
-        plain = _logprob_step(inp, "plain", form, C=32, backend="reference")
+        # the backward is the checkpointed call's (chunk size 64); the recomputed row results are the same bits
+        plain = _logprob_step(inp, "plain", form, C=64, backend="reference")
         assert _placement_bits(X.grad, plain["dX"]) and _placement_bits(W.grad, plain["dW"])
         return
 
@@ -12758,15 +12760,18 @@ def _logits_gemm_keys(launched) -> int:
 
 @pytest.mark.parametrize("form", [None, "scalar", "tensor"])
 def test_device_checkpointed_logprob_step_runs_the_logits_gemms_once(glm_weight, form):
-    """A non-reentrant (plain, selective, under a dispatch mode) checkpointed log-probability step launches the
-    uncheckpointed step's logits and gradient GEMMs, no more, and gives its bits."""
+    """A non-reentrant (plain, selective, under a dispatch mode) checkpointed log-probability step runs the logits
+    forward once, as the uncheckpointed step (without a temperature: the same logits and gradient GEMM launches, no
+    more), and gives its bits."""
     _require_program(entry="logprob")
     inp = _device_inputs(12289, "ce", W=glm_weight)
     _logprob_step(inp, "plain", form, C=4096)
-    with _launch_record() as launched:
+    with _launch_record() as launched, _logprob_forwards() as seen:
         plain = _logprob_step(inp, "plain", form, C=4096)
     logits, grads = _logits_gemm_keys(launched), _gradient_gemm_keys(launched)
-    assert logits >= 8 and grads >= 5, sorted({k[0] for k in launched})
+    assert len(seen) == 1, seen
+    if form is None:
+        assert logits > 0 and grads > 0, sorted({k[0] for k in launched})
     for kind in (
         "nonreentrant",
         "selective_recompute",
@@ -12774,8 +12779,9 @@ def test_device_checkpointed_logprob_step_runs_the_logits_gemms_once(glm_weight,
         "selective_save_all",
         "dispatch_mode",
     ):
-        with _launch_record() as launched:
+        with _launch_record() as launched, _logprob_forwards() as seen:
             run = _logprob_step(inp, kind, form, C=4096)
+        assert len(seen) == 1, (kind, seen)
         assert _logits_gemm_keys(launched) == logits, kind
         assert _gradient_gemm_keys(launched) == grads, kind
         _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
@@ -12951,7 +12957,8 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
     """The temperature entry under selective activation checkpointing runs its forward with every torch dispatch
     mode popped in both passes (the checkpointed forward and the recomputation), as the other det entries, and gives
     the uncheckpointed step's ``logp`` / ``dX`` / ``dW`` bits (a per-token temperature).  ``opt_in``: the opt-in
-    module's autograd function (the entry with a count)."""
+    module's autograd function (the entry with a count).  Under the gradient placement ``"auto"`` the main module's
+    recomputation takes the checkpointed call's row results (no forward); ``"forward"`` runs it in both passes."""
     inp = _host_inputs(65, ignore_frac=0.1, temperature="hetero")
     mod = cake_backend if module == "backend" else opt_in
     kw = (
@@ -12988,14 +12995,18 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
 
     plain = step("plain")
     assert stacks == [0], stacks
-    stacks.clear()
-    logps.clear()
-    run = step(kind)
-    assert stacks == [0, 0], stacks
-    for name, a, b in zip(("logp", "dX", "dW"), run, plain, strict=True):
-        assert torch.equal(a, b), name
+    for placement in ("auto", "forward"):
+        stacks.clear()
+        logps.clear()
+        with _placement(placement):
+            run = step(kind)
+        taken = module == "backend" and placement == "auto"
+        assert stacks == ([0] if taken else [0, 0]), (placement, stacks)
+        for name, a, b in zip(("logp", "dX", "dW"), run, plain, strict=True):
+            assert torch.equal(a, b), (placement, name)
     gc.collect()
     assert len(cake_backend._CHECKPOINT_CALLS) == 0
+    assert len(cake_backend._LOGPROB_CHECKPOINT_CALLS) == 0
 
 
 def _tau_region_entry(entry, inp, X, W):
