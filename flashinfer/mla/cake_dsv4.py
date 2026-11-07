@@ -2477,13 +2477,14 @@ class _K64SplitRule:
 # measured 1.23x of the K=32 program at 12 rows and 1.11-1.12x at 15, but
 # 0.91-0.92x of two pieces at 16 rows (48 pieces).  In a test harness on a
 # 216-SM R200, three pieces with a merge of the three-piece merge's geometry
-# ran 0.80-0.93 us per call faster than two pieces with the merge of any
-# count at 16 and 17 rows, in each of 8 rounds.  A launch whose every row
-# fits in one piece (at most ceil(9 / s) tiles: short requests, piece 0
-# writes O itself) still runs the merge kernel and measured 0.81-0.86x (0.97x
-# of two pieces at 15 rows of at most three tiles); the host does not read
-# row lengths, so those launches split as well.  Without PDL the 17-row
-# launch measured 0.98x with two pieces: no launch without PDL splits.
+# ran a median 0.80-0.93 us per call faster than two pieces with the merge
+# of any count at 16 and 17 rows, and at least 0.3 us faster in each of 8
+# rounds.  A launch whose every row fits in one piece (at most ceil(9 / s)
+# tiles: short requests, piece 0 writes O itself) still runs the merge
+# kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at most
+# three tiles); the host does not read row lengths, so those launches split
+# as well.  Without PDL the 17-row launch measured 0.98x with two pieces: no
+# launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
