@@ -158,14 +158,6 @@ class BatchInvariantMoeRunner(MoERunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
         if routing.method not in METHOD_OF_FLASHINFER:
             # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
             self._method = None
@@ -232,6 +224,22 @@ class BatchInvariantMoeRunner(MoERunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # group-limited selection is a routing term the class does not have; with pre-routed ids the group
+            # structure never enters the computation, so only the logits mode refuses it
+            if cfg.routing.n_group not in (
+                None,
+                0,
+                1,
+            ) or cfg.routing.topk_group not in (
+                None,
+                0,
+                1,
+            ):
+                raise unsupported(
+                    CLASS,
+                    "group-limited routing (n_group > 1) from logits",
+                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,
