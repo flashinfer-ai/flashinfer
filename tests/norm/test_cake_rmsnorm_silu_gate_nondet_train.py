@@ -29,10 +29,10 @@ static and the claimed backward at 1, 3 and 7 CTAs), a workspace reused across
 shapes.  The matrix covers dynamic token and head counts (``H = 48`` and small
 or irregular row counts), ``[T, H, 128]`` strided and flattened layouts,
 near-zero variance, saturated gates, FP32 and BF16 weight gradients,
-accumulation, ``compute_grad_weight=False``, the short backward (one cluster up
-to 256 rows, BF16 weight gradient: no workspace made or touched, a caller
-workspace checked and left as it is, the first row count past it on the
-backward), empty work, a workspace reused across shapes (zero after every
+accumulation, ``compute_grad_weight=False``, the small-row backwards (one
+cluster each, in the rows of their ``BACKWARD_BANDS`` bands: no workspace made
+or touched, a caller workspace checked and left as it is, the first row count
+past them on the backward), empty work, a workspace reused across shapes (zero after every
 call), a workspace with nonzero scratch returned to zero by
 ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``, two streams with their own
 workspaces, CUDA Graph capture and replay (captured calls without a
@@ -185,9 +185,9 @@ def _forward_module(rows: int) -> str:
 
 def _backward_module(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> str:
     """The backward module ``module_for_rows`` runs for ``rows`` rows and a
-    ``dw_dtype`` weight gradient on this device: the short backward up to 256
-    rows (BF16), the static backward while the rows' chunks fit one wave of
-    CTAs, the claimed backward past it."""
+    ``dw_dtype`` weight gradient on this device: a small-row backward in the
+    rows of its ``BACKWARD_BANDS`` band, the static backward while the rows'
+    chunks fit one wave of CTAs, the claimed backward past it."""
     return _module("bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16", rows)
 
 
@@ -542,7 +542,7 @@ def test_workspace_reused_across_shapes_without_reset():
     for role, name in loader.ROUTES[arch].items():
         if not role.startswith("bwd"):
             continue
-        if role.endswith("_short"):
+        if role in loader.BAND_ROLES:
             assert loader.workspace_layout(name) == (), role
             assert loader.workspace_bytes(name) == 0, role
         else:
@@ -640,10 +640,10 @@ def test_reset_workspace_clears_nonzero_scratch():
     reset_workspace(ws)
     torch.cuda.synchronize()
     assert not bool(ws.any())
-    # 37 x 7 = 259 rows: past the short backward's 256, so both calls use the
-    # workspace
+    # 149 x 7 = 1043 rows: past every small-row backward's band, so both calls
+    # use the workspace
     for i, (T, H, dtype) in enumerate(
-        ((1031, 48, torch.bfloat16), (37, 7, torch.float32))
+        ((1031, 48, torch.bfloat16), (149, 7, torch.float32))
     ):
         x, z, w, dy = make(T, H, seed=61 + i)
         gw = (
@@ -1109,7 +1109,7 @@ def test_registry_records_reference_the_build_manifest():
     sources and the precise-arithmetic flags; the static and the claimed
     backward records cut their rows into chunks and carry their workspace
     buffers, the claimed one running past the static one's CTAs per SM; the
-    short backward records launch one cluster and take no workspace."""
+    small-row backward records launch one cluster and take no workspace."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert (
@@ -1126,7 +1126,9 @@ def test_registry_records_reference_the_build_manifest():
             + loader.MID_ROLES
             + loader.SHORT_ROLES
         )
-        assert set(loader.ROLES) <= routed <= set(loader.ROLES + tiers)
+        assert (
+            set(loader.ROLES) <= routed <= set(loader.ROLES + tiers + loader.BAND_ROLES)
+        )
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             assert record["role"] == role and arch in record["arches"], (arch, role)
@@ -1149,8 +1151,7 @@ def test_registry_records_reference_the_build_manifest():
         elif record["role"] in ("fwd_xlong", "fwd_long", "fwd_mid"):
             assert record["grid_rule"]["kind"] == "persistent_row_blocks"
             assert record.get("workspace") is None
-        elif record["role"] in loader.SHORT_ROLES:
-            assert record["role"] == "bwd_bf16_short"
+        elif record["role"] in loader.BAND_ROLES:
             assert clustered
             assert record["launch"]["cluster"] == (record["grid_rule"]["cluster"], 1, 1)
             assert {"dw", "weight_grad"} <= set(plan), name
@@ -1238,8 +1239,10 @@ def test_backward_cta_rule(rows, sm_count, per_chunk, chunks, ctas):
                 )
                 assert grid == (ctas, 1, 1)
             want = role + ("_mid" if chunks > 8 * sm_count else "")
-            if rows <= 256 and role + "_short" in loader.ROUTES[arch]:
-                want = role + "_short"
+            for last, band in BACKWARD_BANDS[arch][role]:
+                if rows <= last:
+                    want = band
+                    break
             got = loader.module_for_rows(arch, role, rows, sm_count)
             assert got == loader.ROUTES[arch][want], (arch, role, rows)
 
@@ -1258,21 +1261,39 @@ CLAIMED_ROUTES = {"bwd_bf16_mid": 8, "bwd_f32_mid": 8}
 
 # The short roles each architecture routes, with the bound of their rows: rows
 # per SM (``max_rows_per_sm``, one count per architecture: the short forward,
-# whose grid of one CTA per row block grows with the rows) or rows
-# (``max_rows``: the short backward, whose grid is one cluster of 16 CTAs
-# whatever the rows; BF16 weight gradients only).
+# whose grid of one CTA per row block grows with the rows).
 SHORT_ROUTES = {
+    "sm_100a": {"fwd_short": ("max_rows_per_sm", 12)},
+    "sm_103a": {"fwd_short": ("max_rows_per_sm", 12)},
+    "sm_107a": {"fwd_short": ("max_rows_per_sm", 59)},
+}
+# The small-row backward bands of each architecture and backward role: (last
+# row, role) in increasing rows, each band's module one cluster of 16 CTAs
+# whatever the rows (the measured fastest program at each row count; the
+# tiny backward of 256-thread CTAs, ``bwd_bf16_short``, for a BF16 weight
+# gradient only).
+BACKWARD_BANDS = {
     "sm_100a": {
-        "fwd_short": ("max_rows_per_sm", 12),
-        "bwd_bf16_short": ("max_rows", 256),
+        "bwd_bf16": (
+            (192, "bwd_bf16_t512"),
+            (256, "bwd_bf16_short"),
+            (512, "bwd_bf16_t512"),
+            (1024, "bwd_bf16_t1024"),
+        ),
+        "bwd_f32": ((512, "bwd_f32_t512"), (1024, "bwd_f32_t1024")),
     },
     "sm_103a": {
-        "fwd_short": ("max_rows_per_sm", 12),
-        "bwd_bf16_short": ("max_rows", 256),
+        "bwd_bf16": ((512, "bwd_bf16_short"), (620, "bwd_bf16_t1024")),
+        "bwd_f32": ((512, "bwd_f32_t512"), (720, "bwd_f32_t1024")),
     },
     "sm_107a": {
-        "fwd_short": ("max_rows_per_sm", 59),
-        "bwd_bf16_short": ("max_rows", 256),
+        "bwd_bf16": (
+            (120, "bwd_bf16_t512"),
+            (256, "bwd_bf16_short"),
+            (512, "bwd_bf16_t512"),
+            (1024, "bwd_bf16_t1024"),
+        ),
+        "bwd_f32": ((512, "bwd_f32_t512"), (900, "bwd_f32_t1024")),
     },
 }
 
@@ -1288,11 +1309,15 @@ def _short_end(arch, role, sm_count):
 
 
 def _tier_module(arch, role, rows, sm_count):
-    """The module of ``role`` for ``rows`` rows by ``SHORT_ROUTES``,
-    ``TIER_ROUTES`` and ``CLAIMED_ROUTES``: the short module up to its rows
-    (per SM or in all), else the extra-long forward from its rows per SM, else
-    the long forward from its own, else the mid forward from its own or the
+    """The module of ``role`` for ``rows`` rows by ``BACKWARD_BANDS``,
+    ``SHORT_ROUTES``, ``TIER_ROUTES`` and ``CLAIMED_ROUTES``: the module of the
+    first backward band holding ``rows``, else the short forward up to its
+    rows per SM, else the extra-long forward from its rows per SM, else the
+    long forward from its own, else the mid forward from its own or the
     claimed backward past its chunks per SM, else the role's module."""
+    for last, band in BACKWARD_BANDS[arch].get(role, ()):
+        if rows <= last:
+            return loader.ROUTES[arch][band]
     end = _short_end(arch, role, sm_count)
     if end is not None and rows <= end:
         return loader.ROUTES[arch][role + "_short"]
@@ -1311,10 +1336,12 @@ def _tier_module(arch, role, rows, sm_count):
 
 @pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
 def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
-    """``module_for_rows``: a role's short module up to ``max_rows`` rows of
-    its grid rule (the short backward) or ``max_rows_per_sm * sm_count`` (the
-    short forward), above that the forward's extra-long and long modules from
-    ``min_rows_per_sm * sm_count`` rows of their own rule on the architecture,
+    """``module_for_rows``: a backward role's small-row module in the rows of
+    its ``BACKWARD_BANDS`` band (each band at most its module's ``max_rows``,
+    the FP32 weight gradient never on the BF16-only tiny backward), the short
+    forward up to ``max_rows_per_sm * sm_count``, above that the forward's
+    extra-long and long modules from ``min_rows_per_sm * sm_count`` rows of
+    their own rule on the architecture,
     below that its mid module from its own rule's rows, the claimed backward
     where the rows have more chunks than ``more_chunks_than_per_sm * sm_count``
     (on the architectures that route them), the role's module between and on
@@ -1323,8 +1350,26 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
     assert loader.XLONG_ROLES == ("fwd_xlong",)
     assert loader.LONG_ROLES == ("fwd_long",)
     assert loader.MID_ROLES == ("fwd_mid", "bwd_bf16_mid", "bwd_f32_mid")
-    assert loader.SHORT_ROLES == ("fwd_short", "bwd_bf16_short")
+    assert loader.SHORT_ROLES == ("fwd_short",)
+    assert loader.BAND_ROLES == (
+        "bwd_bf16_short",
+        "bwd_bf16_t512",
+        "bwd_bf16_t1024",
+        "bwd_f32_t512",
+        "bwd_f32_t1024",
+    )
+    assert loader.BACKWARD_BANDS == BACKWARD_BANDS
     for arch in loader.ARCHES:
+        for role, bands in BACKWARD_BANDS[arch].items():
+            lasts = [last for last, _ in bands]
+            assert lasts == sorted(set(lasts)), (arch, role)
+            for last, band in bands:
+                assert band.startswith(role + "_"), (arch, role, band)
+                name = loader.ROUTES[arch][band]
+                record = loader.MODULES[name]
+                assert record["role"] == band
+                assert record["grid_rule"]["kind"] == "cluster"
+                assert last <= int(record["grid_rule"]["max_rows"]), (arch, band)
         shorts = {}
         for role, name in loader.ROUTES[arch].items():
             if role in loader.SHORT_ROLES:
@@ -1349,6 +1394,8 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
         edges = {1, 48, 255, 256, 257, 8 * 8192, 8 * 8192 + 1, 2**31 - 1}
+        for bands in BACKWARD_BANDS[arch].values():
+            edges |= {last + d for last, _ in bands for d in (0, 1)}
         for start in (10, 12, 59, 64, 800, 976, 1740, 2400, 3000):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
@@ -1381,17 +1428,30 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
     ):
         got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count)
         assert got == routes103[role], (rows, role)
-    # the backward on every architecture: the short backward up to 256 rows
-    # whatever the SMs (BF16 weight gradient), the static backward up to 64
-    # rows per SM (8 chunks of one 8-row block per SM), the claimed backward
-    # past it, at every larger row count
+    # the backward on every architecture: the small-row backwards in their
+    # bands whatever the SMs (on sm_100a the 4-team exact tiny backward up to
+    # 192 rows of a BF16 weight gradient and 512 of an FP32 one, the 8-team
+    # one up to 1024), the static backward from the next row up to 64 rows per
+    # SM (8 chunks of one 8-row block per SM), the claimed backward past it,
+    # at every larger row count
+    for rows, role, band in (
+        (1, "bwd_bf16", "bwd_bf16_t512"),
+        (192, "bwd_bf16", "bwd_bf16_t512"),
+        (193, "bwd_bf16", "bwd_bf16_short"),
+        (256, "bwd_bf16", "bwd_bf16_short"),
+        (257, "bwd_bf16", "bwd_bf16_t512"),
+        (513, "bwd_bf16", "bwd_bf16_t1024"),
+        (1024, "bwd_f32", "bwd_f32_t1024"),
+        (1, "bwd_f32", "bwd_f32_t512"),
+        (512, "bwd_f32", "bwd_f32_t512"),
+    ):
+        got = loader.module_for_rows("sm_100a", role, rows, sm_count)
+        assert got == loader.ROUTES["sm_100a"][band], (role, rows)
     for arch in loader.ARCHES:
         for role in ("bwd_bf16", "bwd_f32"):
-            short = "_short" if role == "bwd_bf16" else ""
+            first = BACKWARD_BANDS[arch][role][-1][0] + 1
             for rows, tier in (
-                (1, short),
-                (256, short),
-                (257, ""),
+                (first, ""),
                 (64 * sm_count, ""),
                 (64 * sm_count + 1, "_mid"),
                 (8 * 8192 + 1, "_mid"),
@@ -1666,55 +1726,63 @@ def test_short_forward_grid_at_its_threshold_keeps_the_bound_on_this_device():
     assert grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count), (arch, sm_count, grid)
 
 
-# (rows, SMs) of the short backward: one cluster of 16 CTAs whatever the rows
-# and the SMs, up to 256 rows, so no CTA takes more than one 16-row block.
+# (rows, SMs) of the small-row backwards: one cluster of 16 CTAs whatever the
+# rows and the SMs, up to each program's ``max_rows``.
 SHORT_BACKWARD_GRIDS = [
     (1, 148),
     (48, 148),  # T 1, H 48
     (13 * 7, 152),
     (5 * 48, 148),
     (256, 148),
-    (256, 152),
-    (256, 160),
-    (256, 212),
+    (512, 152),
+    (1024, 160),
+    (1024, 212),
 ]
+# role -> (threads a CTA, max_rows, dynamic shared memory bytes or None to take
+# the record's) of the small-row backwards.
+SMALL_ROW_BACKWARDS = {
+    "bwd_bf16_short": (256, 3072, 6144),
+    "bwd_bf16_t512": (512, 512, None),
+    "bwd_bf16_t1024": (1024, 1024, None),
+    "bwd_f32_t512": (512, 512, None),
+    "bwd_f32_t1024": (1024, 1024, None),
+}
 
 
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
-def test_short_backward_is_one_cluster_up_to_256_rows(rows, sm_count):
-    """The BF16 weight gradient's short backward: one cluster of 16 CTAs up to
-    256 rows, no workspace; the FP32 weight gradient runs the static backward
-    at every row count up to 64 rows per SM."""
-    name = loader.ROUTES["sm_100a"]["bwd_bf16_short"]
-    for arch in ("sm_100a", "sm_103a", "sm_107a"):
-        assert loader.ROUTES[arch]["bwd_bf16_short"] == name
-        assert "bwd_f32_short" not in loader.ROUTES[arch]
-        assert loader.module_for_rows(arch, "bwd_bf16", rows, sm_count) == name
-        base = loader.route_module(arch, "bwd_bf16")
-        assert loader.module_for_rows(arch, "bwd_bf16", 257, sm_count) == base
-        f32 = loader.route_module(arch, "bwd_f32")
-        assert loader.module_for_rows(arch, "bwd_f32", rows, sm_count) == f32
-    record = loader.MODULES[name]
-    assert record["grid_rule"] == {
-        "cluster": 16,
-        "kind": "cluster",
-        "max_rows": 256,
-    }
-    assert record["launch"]["block"] == (256, 1, 1)
-    assert record["launch"]["cluster"] == (16, 1, 1)
-    assert record["launch"]["dynamic_smem_bytes"] == 6144
-    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
-    assert loader.backward_ctas(name, rows, sm_count) == 16
-    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=16)
-    assert grid == (16, 1, 1)
-    assert -(-rows // 16) <= grid[0]
-    assert loader.workspace_bytes(name) == 0
-    with pytest.raises(ValueError, match="chunks"):
-        loader.backward_chunks(name, rows)
+def test_small_row_backwards_are_one_cluster(rows, sm_count):
+    """Every small-row backward: one cluster of 16 CTAs whatever the rows and
+    the SMs, up to its ``max_rows``, no workspace and no chunks; the tiny
+    backward of 256-thread CTAs only for a BF16 weight gradient."""
+    for role, (threads, most, smem) in SMALL_ROW_BACKWARDS.items():
+        name = loader.ROUTES["sm_100a"][role]
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            assert loader.ROUTES[arch][role] == name
+            assert "bwd_f32_short" not in loader.ROUTES[arch]
+        record = loader.MODULES[name]
+        assert record["role"] == role
+        assert record["grid_rule"] == {
+            "cluster": 16,
+            "kind": "cluster",
+            "max_rows": most,
+        }
+        assert record["launch"]["block"] == (threads, 1, 1)
+        assert record["launch"]["cluster"] == (16, 1, 1)
+        if smem is not None:
+            assert record["launch"]["dynamic_smem_bytes"] == smem
+        assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
+        if rows > most:
+            continue
+        assert loader.backward_ctas(name, rows, sm_count) == 16
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=16)
+        assert grid == (16, 1, 1)
+        assert loader.workspace_bytes(name) == 0
+        with pytest.raises(ValueError, match="chunks"):
+            loader.backward_chunks(name, rows)
 
 
-# Short-backward shapes (T, H, layout): T * H rows up to 256 in every layout,
-# and the first row counts past it.
+# Small-row backward shapes (T, H, layout): T * H rows in the bands in every
+# layout, and row counts past them.
 SHORT_BACKWARD_SHAPES = [
     (1, 1, "contiguous"),
     (1, 48, "contiguous"),
@@ -1729,19 +1797,24 @@ SHORT_BACKWARD_SHAPES = [
     (2, 48, "misaligned"),
     (257, 1, "flat"),
     (37, 7, "contiguous"),
+    (513, 1, "flat"),
+    (621, 1, "flat"),
+    (1025, 1, "flat"),
 ]
 
 
 def _short_backward(rows: int, dw_dtype: torch.dtype) -> tuple[str, str | None]:
-    """``(the module module_for_rows runs, the short backward module or None)``
-    for ``rows`` rows and a ``dw_dtype`` weight gradient on this device."""
+    """``(the module module_for_rows runs, that module where it is a small-row
+    backward or None)`` for ``rows`` rows and a ``dw_dtype`` weight gradient on
+    this device."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
     name = loader.module_for_rows(
         arch, role, rows, loader.device_sm_count(device_index)
     )
-    return name, (name if name == loader.ROUTES[arch].get(role + "_short") else None)
+    small = loader.MODULES[name]["role"] in loader.BAND_ROLES
+    return name, (name if small else None)
 
 
 @pytest.mark.parametrize("T,H,layout", SHORT_BACKWARD_SHAPES)
@@ -1752,9 +1825,9 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
     T, H, layout, dw_dtype, launches, monkeypatch
 ):
     """Within the FP64 budgets and the same bits on every launch
-    (``check_all``), the module ``module_for_rows`` names launched; on the
-    short backward (up to 256 rows, BF16 weight gradient) no stream workspace
-    is made, a caller workspace holding anything is left as it is (the results
+    (``check_all``), the module ``module_for_rows`` names launched; on a
+    small-row backward (the rows of its ``BACKWARD_BANDS`` band) no stream
+    workspace is made, a caller workspace holding anything is left as it is (the results
     the same bits) and one that is not a workspace is refused."""
     monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
     x, z, w, dy = make(T, H, layout=layout, seed=80)
@@ -1775,7 +1848,7 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
     torch.cuda.synchronize()
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a, b)
-    assert bool((ws == 7).all()), "the short backward wrote the workspace"
+    assert bool((ws == 7).all()), "the small-row backward wrote the workspace"
     with pytest.raises(ValueError, match="deterministic mode"):
         backward(dy, x, z, w, EPS, workspace=ws.float())
     with pytest.raises(ValueError, match="uint8"):
@@ -1784,7 +1857,8 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
 
 
 def test_short_backward_accumulates_and_skips_the_weight_gradient():
-    """On the short backward (BF16 weight gradient): ``accumulate_grad_weight``
+    """On the small-row backward of 240 rows (BF16 weight gradient):
+    ``accumulate_grad_weight``
     adds to the accumulator before the one rounding (within the budget, the
     same bits on every launch), ``compute_grad_weight=False`` leaves
     ``grad_weight`` as it is, and ``dx`` and ``dz`` are the same bits either
@@ -1793,7 +1867,7 @@ def test_short_backward_accumulates_and_skips_the_weight_gradient():
     x, z, w, dy = make(5, 48, seed=81)
     _name, short = _short_backward(5 * 48, dw_dtype)
     if short is None:
-        pytest.skip("this architecture routes no short backward")
+        pytest.skip("this architecture routes no small-row backward at 240 rows")
     dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
     first = None

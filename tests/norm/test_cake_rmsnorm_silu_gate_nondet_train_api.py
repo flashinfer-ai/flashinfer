@@ -72,9 +72,9 @@ package's public forward and backward only.  This module checks:
   the weight-gradient budget of the deterministic ``dw``; so do they around
   the forward's short, mid, long and extra-long thresholds and
   at the first and last rows of each backward program, each call launching
-  ``module_for_rows``' module: the short backward (a BF16 weight gradient of
-  at most 256 rows), the static backward (at most 8 chunks of rows per SM) and
-  the claimed backward (more chunks); gate inputs at and past the packed
+  ``module_for_rows``' module: the small-row backwards (one cluster each, in
+  the rows of their ``BACKWARD_BANDS`` bands), the static backward (at most 8
+  chunks of rows per SM) and the claimed backward (more chunks); gate inputs at and past the packed
   gate's range and infinite upstream gradients give the FP64 reference's
   ``NaN``, ``+inf`` and ``-inf`` positions and finite elements within the
   error budget (with infinite upstream gradients, ``dx`` and ``dz`` have the
@@ -663,14 +663,14 @@ def test_no_call_alerts_under_deterministic_algorithms(
     """Under ``torch.use_deterministic_algorithms(True)``, strict or with
     ``warn_only=True``, every call runs with no warning and no error: the
     forward and the backward into a BF16 and an FP32 weight gradient at the
-    first rows of the static and of the claimed backward of more than 256 rows
-    (``_backward_tiers``), and the autograd backward, with the weight
+    first rows of the static and of the claimed backward past the small-row
+    bands (``_backward_tiers``), and the autograd backward, with the weight
     gradient, of :func:`cake_rmsnorm_silu_gate_nondet`, of
     :class:`CakeRMSNormSiLUGateNondetFunction` and of a non-reentrant
     checkpoint.  The functional calls launch ``module_for_rows``' modules."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
-    least = _backward_tiers(arch, "bwd_bf16", sms)["short"][2] + 1
+    least = _backward_tiers(arch, "bwd_bf16", sms)["static"][1]
     calls = []
     for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
         tiers = _backward_tiers(arch, role, sms)
@@ -1315,19 +1315,17 @@ def _backward_tiers(
 ) -> dict[str, tuple[str, int, int | None]]:
     """``tier -> (module, first rows, last rows or None)`` of the backward
     ``role`` (``bwd_bf16`` or ``bwd_f32``) on ``arch`` with ``sms`` SMs, from
-    the loader's routes and grid rules: the short backward up to its
-    ``max_rows`` where ``arch`` routes one (a BF16 weight gradient), the
-    static backward from the next row while the rows have at most
+    the loader's routes, bands and grid rules: ``band<i>`` the module of the
+    role's ``i``-th ``BACKWARD_BANDS`` band (a small-row backward) over its
+    rows, the static backward from the next row while the rows have at most
     ``more_chunks_than_per_sm`` chunks per SM, and the claimed backward past
     that, with no last row."""
     routes = loader.ROUTES[arch]
     tiers: dict[str, tuple[str, int, int | None]] = {}
     first = 1
-    short = routes.get(f"{role}_short")
-    if short is not None:
-        last = int(loader.MODULES[short]["grid_rule"]["max_rows"])
-        tiers["short"] = (short, first, last)
-        first = last + 1
+    for i, (last, band) in enumerate(loader.BACKWARD_BANDS.get(arch, {}).get(role, ())):
+        tiers[f"band{i}"] = (routes[band], first, int(last))
+        first = int(last) + 1
     claimed = routes[f"{role}_mid"]
     start = _start_rows(arch, claimed, sms)
     tiers["static"] = (routes[role], first, start - 1)
@@ -1577,13 +1575,20 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     assert launched == [name] * (suite.REPEATS + 2), launched
 
 
+# The backward's small-row bands of the most bands an architecture routes
+# (``_backward_tiers``: ``band0`` ... ``band3``), then its static and claimed
+# backward.
+BACKWARD_TIERS = ["band0", "band1", "band2", "band3", "static", "claimed"]
 # The edges of the backward's programs on this device (``_backward_tiers``):
 # (tier, edge).  ``chunks`` is the claimed backward's last rows of one-block
 # chunks (``rows_per_block * chunk_limit``), ``chunks+1`` its first rows of
 # two-block chunks.
 BACKWARD_TIER_EDGES = [
-    pytest.param("short", "first", id="short-first"),
-    pytest.param("short", "last", id="short-last"),
+    *(
+        pytest.param(f"band{i}", edge, id=f"band{i}-{edge}")
+        for i in range(4)
+        for edge in ("first", "last")
+    ),
     pytest.param("static", "first", id="static-first"),
     pytest.param("static", "last", id="static-last"),
     pytest.param("claimed", "first", id="claimed-first"),
@@ -1601,8 +1606,8 @@ def test_backward_tier_edges_within_the_deterministic_error(
     tier, edge, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """At the first and the last rows of each backward program on this
-    device's SM count (``_backward_tiers``: the short backward of a BF16
-    weight gradient up to its ``max_rows``, the static backward while the rows
+    device's SM count (``_backward_tiers``: the small-row backwards in their
+    bands, the static backward while the rows
     have at most ``more_chunks_than_per_sm`` chunks per SM, the claimed
     backward past that) and where the claimed backward's chunks grow from one
     block to two (``backward_chunks``): ``module_for_rows`` runs the program
@@ -1683,7 +1688,7 @@ def test_backward_shapes_within_the_deterministic_error(
 
 
 @requires_device
-@pytest.mark.parametrize("tier", ["short", "static", "claimed"])
+@pytest.mark.parametrize("tier", BACKWARD_TIERS)
 @pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
 )
@@ -1691,7 +1696,7 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
     tier, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Infinite ``grad_out`` in rows that are not the last, on each backward
-    program (``_backward_tiers``: the short backward's last rows, the static
+    program (``_backward_tiers``: each small-row band's last rows, the static
     backward's last rows, 4097 rows past the claimed backward's first): the
     weight gradient of the columns holding them is not finite and has the
     FP64 reference's class (an infinity its sign, a ``NaN`` a ``NaN``), every
@@ -1757,18 +1762,20 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
     assert launched == [name] * suite.REPEATS, launched
 
 
-# The rows of one row block of each backward program: the short backward's
-# blocks of 16 rows, the static and the claimed backward's blocks of 8.
-BACKWARD_BLOCK_ROWS = {"short": 16, "static": 8, "claimed": 8}
+def _block_rows(name: str) -> int:
+    """The rows of one row block of the backward module ``name``: 16 for the
+    tiny backward of 256-thread CTAs (``bwd_bf16_short``), 8 for the exact
+    tiny backward's teams and the static and the claimed backward."""
+    return 16 if loader.MODULES[name]["role"] == "bwd_bf16_short" else 8
 
 
-def _last_block_rows(tier: str, first: int, last: int | None) -> dict[str, int]:
-    """Two row counts of the program ``tier`` that are not a multiple of its
-    block: ``rem1`` one row in the last block (the smallest such count from
-    ``2 * block + 1`` rows and ``first``) and ``remmax`` one row short of a
-    whole block (the largest up to ``last``, or 4096 rows past ``rem1`` for
-    the claimed backward, which has no last row)."""
-    block = BACKWARD_BLOCK_ROWS[tier]
+def _last_block_rows(block: int, first: int, last: int | None) -> dict[str, int]:
+    """Two row counts of a program of ``block``-row blocks over ``first`` to
+    ``last`` rows that are not a multiple of its block: ``rem1`` one row in
+    the last block (the smallest such count from ``2 * block + 1`` rows and
+    ``first``) and ``remmax`` one row short of a whole block (the largest up
+    to ``last``, or 4096 rows past ``rem1`` for the claimed backward, which
+    has no last row)."""
     lo = max(first, 2 * block + 1)
     low = lo + (1 - lo) % block
     high = low + 4096 + block - 2 if last is None else last - (last + 1) % block
@@ -1783,7 +1790,7 @@ def _last_block_rows(tier: str, first: int, last: int | None) -> dict[str, int]:
     strict=False,
 )
 @pytest.mark.parametrize("count", ["rem1", "remmax"])
-@pytest.mark.parametrize("tier", ["short", "static", "claimed"])
+@pytest.mark.parametrize("tier", BACKWARD_TIERS)
 @pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
 )
@@ -1808,8 +1815,11 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     if tier not in tiers:
         pytest.skip(f"{arch} routes no {tier} {role} backward")
     name, first, last = tiers[tier]
-    rows = _last_block_rows(tier, first, last)[count]
-    assert rows % BACKWARD_BLOCK_ROWS[tier] != 0, rows
+    block = _block_rows(name)
+    rows = _last_block_rows(block, first, last)[count]
+    if not first <= rows <= (last if last is not None else rows):
+        pytest.skip(f"{tier} ({first}-{last} rows) has no such row count")
+    assert rows % block != 0, rows
     assert loader.module_for_rows(arch, role, rows, sms) == name, (rows, sms)
     x, z, w, dy = suite.make(rows, 1, layout="flat", seed=28)
     # (row, column, sign of the weight-gradient term): a term dy * silu(z) * x

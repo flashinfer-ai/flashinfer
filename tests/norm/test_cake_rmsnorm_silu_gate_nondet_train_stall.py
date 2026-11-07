@@ -41,10 +41,10 @@ that becomes resident after every run was claimed takes none).  Each CTA adds
 the FP32 weight-gradient partials of its chunks exactly into 64-bit integer
 windows of the workspace and takes a ticket on the arrival word; whichever CTA
 arrives last rounds the exact sum once into ``dw``, and no CTA waits for
-another.  Up to 256 rows a BF16 weight gradient comes from the short backward:
-one cluster of 16 CTAs, scheduled together on the SMs of one GPC, whose CTAs
-each wait for the other CTAs' FP32 partials of their columns and finish them,
-with no workspace (an FP32 weight gradient has no short backward).  Beside a
+another.  In the rows of its ``BACKWARD_BANDS`` bands the weight gradient
+comes from a small-row backward: one cluster of 16 CTAs, scheduled together
+on the SMs of one GPC, whose CTAs each wait for the other CTAs' FP32 partials
+of their columns and finish them, with no workspace.  Beside a
 long-resident one-thread kernel on another stream each call must keep its
 speed: per token count, the median of seven event-timed calls with the side
 kernel resident is at most ``MAX_RATIO`` times the median of seven calls alone,
@@ -63,13 +63,14 @@ here asserts that delay; documented in
 is checked here: with the side kernel's preferred carveout set to the maximum
 shared memory, the backward (BF16 and FP32 weight gradients) and the forward
 start beside it and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far
-below the side kernel's ``ALL_SM_SPIN_MS`` lifetime; so does the short
-backward (6144 bytes a CTA) at 1 and 5 tokens (48 and 240 rows), which on
-SM100 and SM103 also starts beside it with the default and the maximum-L1
-carveout.  On SM107 the short backward does not start beside the side kernel
-with such a small carveout until that kernel exits (observed on R200): there it
-must end at most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the
-static backward at the same rows).
+below the side kernel's ``ALL_SM_SPIN_MS`` lifetime; so does the small-row
+backward of a BF16 weight gradient at 1 and 5 tokens (48 and 240 rows, the
+program of each one's band), which on SM100 and SM103 also starts beside it
+with the default and the maximum-L1 carveout.  On SM107 it does not start
+beside the side kernel with such a small carveout until that kernel exits
+(observed on R200 for the 256-thread tiny backward): there it must end at
+most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the static
+backward at the same rows).
 
 The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 #7548, item 1): busy / alone is at most the proportional ``N / (N - k)``, plus
@@ -104,8 +105,8 @@ or the GPU fall on both alike: a measurement counts only when each forward's
 alone median is at most ``SHORT_MAX_ALONE_SPREAD`` times its fastest alone
 sample of that measurement, else it is taken again, at most
 ``SHORT_EXTRA_ATTEMPTS`` more times, and the bound applies to the first
-measurement that counts (to the last one when none does).  The short backward
-at 1 and 5 tokens (48 and 240 rows) keeps its speed beside the one-thread
+measurement that counts (to the last one when none does).  The small-row
+backward at 1 and 5 tokens (48 and 240 rows) keeps its speed beside the one-thread
 kernel and, beside the short forward's side kernels, ends no later than the
 backward it replaces (the role's module, the static backward, at the same
 rows) by the short forward's bound and measurement rule: there a measurement
@@ -119,7 +120,7 @@ the call started.  In every test ``y``, ``dx``, ``dz`` and ``dw`` are bitwise
 those of the first call alone of the same entry point and module (a chunk's
 partial does not depend on the grid or on the CTA that claimed it, and the sum
 of the partials is exact), every ``dw`` also lies within the backend suite's
-budget of an FP64 reference, the short backward's ``dx`` and ``dz`` are
+budget of an FP64 reference, the small-row backward's ``dx`` and ``dz`` are
 bitwise those of the backward it replaces, and the workspace is zero after
 every call.
 """
@@ -976,14 +977,14 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
     )
 
 
-# The short backward (BF16 weight gradient only): one token and the most whole
-# tokens of H heads within its 256 rows, beside the short forward's side
-# kernels.  Its held test takes the short forward's bound, slack and
-# SHORT_MAX_ALONE_SPREAD.
+# The small-row backward (BF16 weight gradient): one token and five tokens of H
+# heads (48 and 240 rows, each the program of its BACKWARD_BANDS band on the
+# architecture), beside the short forward's side kernels.  Its held test takes
+# the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD.
 SHORT_BACKWARD_TOKENS = (1, 5)
 SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
-# cudaSharedmemCarveoutMaxL1.  The test below checks that the short backward
-# (6144 bytes a CTA) starts beside a side kernel holding every SM without
+# cudaSharedmemCarveoutMaxL1.  The test below checks that the small-row backward
+# starts beside a side kernel holding every SM without
 # shared memory with this or the default carveout (at most
 # MAX_ALL_SM_EXTRA_MS more than alone), or on the architectures of
 # SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT that it ends at most
@@ -993,17 +994,16 @@ CARVEOUT_MAX_L1 = 0
 
 
 def _short_backward(tokens: int) -> tuple[str, str]:
-    """``(the short backward, the backward it replaces)``: the BF16
-    weight-gradient modules of ``tokens * H`` rows (the second the role's
-    module, the static backward), where the architecture routes the short
-    backward (skips elsewhere)."""
+    """``(the small-row backward, the backward it replaces)``: the BF16
+    weight-gradient modules of ``tokens * H`` rows (the first the module of
+    the architecture's ``BACKWARD_BANDS`` band holding them, the second the
+    role's module, the static backward); skips where no band holds them."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    name = loader.ROUTES[arch].get("bwd_bf16_short")
-    if name is None:
-        pytest.skip(f"{arch} routes no bwd_bf16_short module")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    assert loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms) == name
+    name = loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms)
+    if loader.MODULES[name]["role"] not in loader.BAND_ROLES:
+        pytest.skip(f"{arch} runs no small-row backward for {tokens * H} rows")
     return name, loader.route_module(arch, "bwd_bf16")
 
 
