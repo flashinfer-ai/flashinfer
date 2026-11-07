@@ -238,6 +238,123 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate", [288, 352, 416])
+@pytest.mark.parametrize("capacity", [1, 8])
+def test_w4a16_e8m0_modelopt_small_m_generic_path_uses_planned_scratch(
+    intermediate, capacity
+):
+    """E8M0 shards the small-M direct kernel rejects fall back to the generic path.
+
+    The direct kernel needs intermediate_cache2 rounded up to 256 columns; the
+    generic path does not, and the scratch planner only reserves the rounded
+    width when the direct kernel applies.
+    """
+    from b12x.moe import fused_moe
+
+    experts, hidden, topk = 8, 256, 6
+    assert intermediate % 128 and intermediate % 256 and intermediate > 256
+    assert not _small_m_direct_supported(
+        m=capacity,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        topk=topk,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout="w13",
+        scale_format="e8m0_k32",
+    )
+    x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)
+    ids = torch.stack(
+        [torch.randperm(experts, device="cuda")[:topk] for _ in range(capacity)]
+    ).to(torch.int32)
+    weights = torch.softmax(torch.randn(capacity, topk, device="cuda"), dim=-1)
+    raw = (
+        torch.randint(
+            256,
+            (experts, intermediate * 2, hidden // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        _pattern_e8m0((experts, intermediate * 2, hidden // 32)),
+        torch.ones(experts, device="cuda"),
+        torch.randint(
+            256,
+            (experts, hidden, intermediate // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        _pattern_e8m0((experts, hidden, intermediate // 32), offset=1),
+        torch.ones(experts, device="cuda"),
+    )
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat("fp4_e8m0_k32")
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16,
+            nonlinearity="silu",
+            io_dtype=x.dtype,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=raw[0].clone(),
+            w13_block_scales=raw[1].clone(),
+            w13_global_scales=raw[2].clone(),
+            w2=raw[3].clone(),
+            w2_block_scales=raw[4].clone(),
+            w2_global_scales=raw[5].clone(),
+        ),
+    )
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        routing=fused_moe.RoutingSpec(),
+    )
+    scratch = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=s.device)
+        for s in plan.scratch_specs()
+    )
+    output = torch.empty_like(x)
+    for rows in sorted({1, capacity}):
+        actual = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x[:rows],
+            experts=prepared,
+            topk_weights=weights[:rows],
+            topk_ids=ids[:rows],
+            output=output[:rows],
+        ).run()
+        oracle = moe_reference_w4a16_fp4_e8m0_k32(
+            x[:rows],
+            *raw,
+            ids[:rows],
+            weights[:rows],
+            experts,
+            hidden,
+            intermediate,
+            activation="silu",
+            swiglu_limit=None,
+            w13_layout="w13",
+        )
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+        _assert_matches_oracle(actual, oracle, activation="silu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [70, 300])
 def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
     """Large-M route blocks skip the MMAs of 16-row blocks without live routes.
