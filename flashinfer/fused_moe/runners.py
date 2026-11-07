@@ -7585,6 +7585,12 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
+    def _cache_key_extras(self) -> tuple:
+        # PDL changes the compiled GEMMs (use_pdl, skip_early_exit_pdl) and the
+        # launch overlap the tactics are timed under, so PDL-on and PDL-off
+        # layers are tuned separately.
+        return super()._cache_key_extras() + (bool(self._enable_pdl),)
+
     def _weight_layout(self) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
