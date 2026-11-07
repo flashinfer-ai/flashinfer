@@ -1,0 +1,404 @@
+"""Prepared Mega and split candidates for the complete EP selector."""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+from contextlib import contextmanager
+
+import torch
+
+from flashinfer.autotuner import TuningResult
+
+from ..core.selection import Collective, NoEligibleCandidate, plain, record_key, tuples
+from ..core.tuning_measurement import CaptureUnsupported
+from .config import MegaConfig, SplitConfig
+from .mega_layer import MoEEpMegaLayer
+from .split_layer import MoEEpSplitLayer
+
+
+def numerical_contract(config, prototype, fleet):
+    if isinstance(config, MegaConfig):
+        if not config.quantize_input or not config.preprocess_weights:
+            raise ValueError(
+                "EP selection currently requires canonical BF16 inputs and weights"
+            )
+        k = config.megakernel
+        if getattr(k, "input_norm_const", 1.0) != 1.0 or any(
+            getattr(k, name, None) is not None
+            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+        ):
+            raise ValueError(
+                "EP selection does not support Mega-only scaling overrides"
+            )
+        contract = prototype._kernel.ep_tuning_contract(fleet).copy()
+        contract.pop("revision")
+        return contract
+
+    from flashinfer.fused_moe.api import QuantFormat, SiTU, SwiGLU
+    from flashinfer.tllm_enums import DEFAULT_SWIGLU_LIMIT
+
+    if not hasattr(config.kernel, "moe_config"):
+        raise NotImplementedError(
+            "EP selection requires a FusedMoeKernelConfig for split candidates"
+        )
+    cfg = config.kernel.moe_config
+    if (
+        cfg.experts.num_fused_shared_experts
+        or cfg.routing.routed_scaling_factor not in (None, 1.0)
+    ):
+        raise ValueError(
+            "EP selection requires routed experts with unit output scaling"
+        )
+    if cfg.quant.output is not QuantFormat.BF16 or not cfg.finalize.do_finalize:
+        raise ValueError("EP selection requires finalized BF16 output")
+    kinds = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): "nvfp4",
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): "mxfp4_mxfp8",
+        (QuantFormat.MXFP4, QuantFormat.MXFP4): "mxfp4",
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8_e4m3",
+        (QuantFormat.BF16, QuantFormat.BF16): "bf16",
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): "deepseek_fp8",
+    }
+    act = cfg.activation
+    if isinstance(act, SwiGLU):
+        if act.alpha != 1.0 or act.beta != 0.0:
+            raise ValueError("EP selection requires standard SwiGLU alpha and beta")
+        activation, clamp, beta, linear = (
+            "swiglu",
+            (None if act.limit == DEFAULT_SWIGLU_LIMIT else act.limit),
+            None,
+            None,
+        )
+    elif isinstance(act, SiTU):
+        activation, clamp, beta, linear = (
+            "situ",
+            act.clamp_limit,
+            act.gate_scale,
+            act.linear_scale,
+        )
+    else:
+        raise ValueError("EP selection supports SwiGLU and SiTU")
+    return {
+        "quantization": kinds.get(cfg.quant.pair, str(cfg.quant.pair)),
+        "intermediate": cfg.experts.intermediate_size,
+        "top_k": cfg.routing.top_k,
+        "activation": activation,
+        "gate_up_clamp": clamp,
+        "situ_beta": beta,
+        "situ_linear_beta": linear,
+        "per_token_activation": bool(cfg.quant.per_token_scale),
+    }
+
+
+class MegaPlan:
+    def __init__(self, prototype, fleet, output, *, selected=None, fallback=False):
+        cfg = prototype._mega_config
+        kernel = cfg.megakernel
+        if selected is not None:
+            kernel = dataclasses.replace(kernel, **tuples(selected))
+        elif fallback and kernel.knobs == "auto":
+            kernel = prototype._kernel.ep_tuning_fallback()
+        self.layer = MoEEpMegaLayer(
+            dataclasses.replace(prototype._bootstrap, auto_bootstrap=False),
+            fleet,
+            None,
+            dataclasses.replace(
+                cfg,
+                megakernel=kernel,
+                preprocess_weights=False,
+                transformed_weights=prototype._get_transformed_weights(),
+            ),
+        )
+        self.output = output
+
+    def forward(self, tensors):
+        return self.layer.forward(
+            dataclasses.replace(
+                tensors,
+                output=tensors.output if tensors.output is not None else self.output,
+            )
+        )
+
+    def prepare(self, tensors, *, force_tune=False):
+        if self.layer._megakernel_config.knobs != "auto":
+
+            def prepare_fixed():
+                if self.layer._workspace is None:
+                    # Plans own their scratch independently of the process pool.
+                    self.layer._workspace = self.layer._kernel._allocate_workspace(
+                        self.layer._fleet_params
+                    )
+                self.layer.stage_inputs(tensors)
+                self.layer._kernel.ep_prepare_fixed(
+                    self.layer._workspace, self.layer._get_transformed_weights()
+                )
+
+            Collective(self.layer._bootstrap).prepare(prepare_fixed)
+            self.layer.compute_staged(
+                output=tensors.output if tensors.output is not None else self.output
+            )
+        elif force_tune:
+            self.layer._kernel.ep_force_tune(
+                self.layer._ensure_workspace(),
+                tensors,
+                self.layer._get_transformed_weights(),
+                tensors.output if tensors.output is not None else self.output,
+            )
+        else:
+            self.forward(tensors)
+
+    def selection(self):
+        layer = self.layer
+        cfg = layer._kernel.ep_selected_config(layer._ensure_workspace())
+        return {"kernel_variant": cfg.kernel_variant, "knobs": plain(cfg.knobs)}
+
+    def warmup(self, tensors):
+        layer = self.layer
+        Collective(layer._bootstrap).prepare(lambda: layer.stage_inputs(tensors))
+        return layer.compute_staged(
+            output=tensors.output if tensors.output is not None else self.output
+        )
+
+    def destroy(self):
+        self.layer.destroy()
+
+
+class SplitPlan:
+    def __init__(self, prototype, fleet, output, tensors):
+        self.layer = MoEEpSplitLayer(
+            dataclasses.replace(prototype._bootstrap, auto_bootstrap=False),
+            fleet,
+            None,
+            prototype._fleet_knobs,
+            backend=SplitConfig(prototype._comm_backend, prototype._kernel_config),
+            _prepared_weights=prototype._kernel._transformed_weights,
+        )
+        self.output = output
+        self.state = None
+        self.context = None
+        self.choices = None
+
+    def discover(self, tensors):
+        c = Collective(self.layer._bootstrap)
+        bound = c.prepare(
+            lambda: dataclasses.replace(
+                tensors, topk_weights=tensors.topk_weights.clone()
+            )
+        )
+        self.state = c.prepare(
+            lambda: self.layer.create_graph_state(bound, out=self.output),
+            optional=True,
+        )
+        if self.state is None:
+            raise NoEligibleCandidate("The split transport cannot prepare this profile")
+
+        # Complete the transport round trip even though setup only needs its
+        # received tensors. Some transports reset their state during combine.
+        def receive(ctx):
+            self.context = ctx
+            return torch.zeros(
+                *ctx.expert_tensors.shape[:2],
+                ctx.fleet_params.token_hidden_size,
+                device=ctx.expert_tensors.device,
+                dtype=torch.bfloat16,
+            )
+
+        self._warmup(tensors, compute=receive)
+        return self.context
+
+    @contextmanager
+    def _prepare_stage(self, stage):
+        if stage not in ("quantize", "compute"):
+            yield
+            return
+        failure = None
+        try:
+            yield
+        except Exception as exc:
+            failure = exc
+
+        def check():
+            if failure is not None:
+                raise failure
+
+        Collective(self.layer._bootstrap).prepare(check)
+
+    def _warmup(self, tensors, *, compute=None):
+        # Coordinate local packing and compute before dispatch and combine.
+        # Transport launch failures remain fatal; their peers may be blocked.
+        previous = self.layer.stage_hook
+        self.layer.stage_hook = self._prepare_stage
+        try:
+            return self.layer._forward_prepared(tensors, self.state, compute=compute)
+        finally:
+            self.layer.stage_hook = previous
+
+    def warmup(self, tensors):
+        return self._warmup(tensors)
+
+    def enumerate(self):
+        self.choices = self.layer._kernel.tuning_candidates(self.context)
+        return self.choices
+
+    def backend_config(self, index):
+        from flashinfer.fused_moe.api import BackendOptions
+
+        cfg = self.layer._kernel_config
+        moe = cfg.moe_config
+        return SplitConfig(
+            self.layer._comm_backend,
+            dataclasses.replace(
+                cfg,
+                moe_config=dataclasses.replace(
+                    moe, backend=BackendOptions(candidates=(tuple(moe.backend)[index],))
+                ),
+            ),
+        )
+
+    def prepare(self, selection):
+        self.layer._kernel.prepare_tactic(self.context, tuples(selection))
+
+    def forward(self, tensors):
+        out = self.layer._forward_prepared(tensors, self.state)
+        if tensors.output is not None and tensors.output.data_ptr() != out.data_ptr():
+            tensors.output.copy_(out)
+            return tensors.output
+        return out
+
+    def destroy(self):
+        # Received views must be released before their transport allocation.
+        self.context = None
+        self.choices = None
+        self.layer.destroy()
+        self.state = None
+
+
+class SplitProtocol:
+    def __init__(
+        self, plan, tensors, collective, contract, settings, *, fallback=False
+    ):
+        self.plan, self.tensors, self.collective = plan, tensors, collective
+        self.contract, self.settings = contract, settings
+        self.fallback = fallback
+
+    def run(self, context):
+        c, plan = self.collective, self.plan
+        choices = c.prepare(plan.enumerate)
+        all_choices = c.gather(plain(choices))
+        # A tactic must be legal on every rank. Runner positions identify
+        # distinct configurations of the same backend.
+        agreed = []
+        for choice in choices:
+            index = choice["runner"]
+            peers = [
+                next(
+                    (
+                        v
+                        for v in rank
+                        if v["runner"] == index
+                        and v["implementation"] == choice["implementation"]
+                    ),
+                    None,
+                )
+                for rank in all_choices
+            ]
+            if any(peer is None for peer in peers):
+                continue
+            tactics = [
+                tuples(t)
+                for t in peers[0]["tactics"]
+                if all(t in peer["tactics"] for peer in peers)
+            ]
+            if tactics:
+                agreed.append((choice, tactics, peers))
+        c.agree([(v[0]["runner"], plain(v[1])) for v in agreed], "split tactics")
+        if not agreed:
+            raise NoEligibleCandidate("No split tactic is supported on every EP rank")
+        if self.fallback or context.skipped:
+            selection = (agreed[0][0]["runner"], -1)
+            c.prepare(lambda: plan.prepare(selection))
+            return TuningResult({"selection": plain(selection)})
+        winners, measured = [], 0
+        for choice, tactics, peers in agreed:
+            runner_skipped = context.tuner.protocol_context(
+                f"moe_{choice['backend']}", force_tune=context.force_tune
+            ).skipped
+            if runner_skipped:
+                tactics = [-1]
+            contract = {
+                **self.contract,
+                "candidate": c.gather(plain(plan.backend_config(choice["runner"]))),
+                "runners": [
+                    {k: v for k, v in peer.items() if k != "tactics"} for peer in peers
+                ],
+                "measurement": self.settings,
+                "fallback": runner_skipped,
+            }
+            key = record_key(contract)
+
+            def compatible(record):
+                return (
+                    valid_score(record)
+                    and record.get("contract") == plain(contract)
+                    and isinstance(record.get("selection"), list)
+                    and len(record["selection"]) == 2
+                    and record["selection"][0] == choice["runner"]
+                    and record["selection"][1] in [plain(t) for t in tactics]
+                )
+
+            cached = None if context.force_tune else c.lookup(context, key, compatible)
+            if not context.tuning_enabled:
+                if cached is not None:
+                    winners.append(cached)
+                continue
+            trials = [tuples(cached["selection"])[1]] if cached else tactics
+            passing = []
+            for tactic in trials:
+                selection = (choice["runner"], tactic)
+                c.prepare(lambda: plan.prepare(selection))
+                try:
+                    score = c.measure(
+                        lambda: plan.forward(self.tensors),
+                        self.tensors.hidden_states.device,
+                        self.settings,
+                        warmup=lambda: plan.warmup(self.tensors),
+                    )
+                except CaptureUnsupported:
+                    continue
+                measured += 1
+                passing.append(
+                    {
+                        "selection": plain(selection),
+                        "p50_us": score,
+                        "contract": plain(contract),
+                    }
+                )
+            if not passing:
+                continue
+            winner = min(passing, key=lambda v: v["p50_us"])
+            winners.append(winner)
+            c.publish(context, key, winner)
+        if not winners and not context.tuning_enabled:
+            selection = (agreed[0][0]["runner"], -1)
+            c.prepare(lambda: plan.prepare(selection))
+            return TuningResult({"selection": plain(selection)})
+        if not winners:
+            raise RuntimeError("No split tactic completed full-EP measurement")
+        winner = min(winners, key=lambda v: v["p50_us"])
+        c.prepare(lambda: plan.prepare(winner["selection"]))
+        return TuningResult(
+            winner,
+            cache_hit=not context.tuning_enabled,
+            candidates=measured,
+            successful_candidates=measured,
+        )
+
+
+def valid_score(record):
+    return (
+        isinstance(record, dict)
+        and isinstance(record.get("p50_us"), (int, float))
+        and math.isfinite(record["p50_us"])
+        and record["p50_us"] > 0
+    )
