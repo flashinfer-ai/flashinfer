@@ -35,7 +35,7 @@ Every row times, for both modes, on identical generated inputs:
 
 Each package picks its kernels from the rows and the SM count.  The
 non-deterministic forward runs its short forward up to 48 rows per SM on
-SM100 and SM103 (64 on SM107) and past that a persistent forward (the mid,
+SM100 and SM103 (59 on SM107) and past that a persistent forward (the mid,
 long or extra-long one) by bands of rows per SM (``cake_jit.FORWARD_BANDS``).
 Its backward runs one cluster of 16 CTAs up to 1024 rows on SM100 and SM107
 and 620 on SM103 (with a BF16 weight gradient or

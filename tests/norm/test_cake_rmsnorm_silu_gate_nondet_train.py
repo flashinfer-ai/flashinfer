@@ -1266,7 +1266,7 @@ FORWARD_BANDS = {
         (None, "fwd_mid"),
     ),
     "sm_107a": (
-        (64, "fwd_short"),
+        (59, "fwd_short"),
         (200, "fwd_mid"),
         (520, "fwd_xlong"),
         (None, "fwd_mid"),
@@ -1466,15 +1466,15 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
             ):
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == loader.ROUTES[arch][role + tier], (arch, role, rows)
-    # the forward on sm_107a: the short forward up to 64 rows per SM, the mid
+    # the forward on sm_107a: the short forward up to 59 rows per SM, the mid
     # forward up to 200, the extra-long forward up to 520, the mid forward
     # past it (sm_107a routes no long forward)
     routes = loader.ROUTES["sm_107a"]
     for rows, role in (
         (1, "fwd_short"),
         (10 * sm_count + 1, "fwd_short"),
-        (64 * sm_count, "fwd_short"),
-        (64 * sm_count + 1, "fwd_mid"),
+        (59 * sm_count, "fwd_short"),
+        (59 * sm_count + 1, "fwd_mid"),
         (200 * sm_count, "fwd_mid"),
         (200 * sm_count + 1, "fwd_xlong"),
         (520 * sm_count, "fwd_xlong"),
@@ -1601,7 +1601,7 @@ MID_FORWARD_GRIDS = [
     ),  # GB300 second mid band's first row: 5226 blocks, 3 waves
     (976 * 152, 152, 5472),  # 9272 blocks, 6 waves
     (4097 * 48, 152, 6384),  # 12291 blocks, 7 waves of 912
-    (64 * 212 + 1, 212, 849),  # R200 first mid band's first row: 849 blocks
+    (59 * 212 + 1, 212, 782),  # R200 first mid band's first row: 782 blocks
     (200 * 212, 212, 2544),  # its last row: 2650 blocks, 2 waves
     (
         520 * 212 + 1,
@@ -1645,12 +1645,11 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
 
 
 # (rows, SMs) of the short forward: one CTA per 16-row block, up to 48 rows per
-# SM on sm_100a and sm_103a and 64 on sm_107a (each row count is checked on
+# SM on sm_100a and sm_103a and 59 on sm_107a (each row count is checked on
 # every architecture: past an architecture's band the next band's forward runs
-# it), so, at the SMs listed, at most one wave of the 4 CTAs per SM its launch
-# bounds give on the SMs less 16 on sm_100a and sm_103a (the bound needs 64 SMs
-# or more, SHORT_FORWARD_MIN_SMS) and on all the SMs on sm_107a (at 64 rows per
-# SM the grid is that whole wave).
+# it), so, at the SMs listed (the bound needs 64 or more on sm_100a and sm_103a
+# and 205 or more on sm_107a, SHORT_FORWARD_MIN_SMS), at most one wave of the 4
+# CTAs per SM its launch bounds give on the SMs less 16.
 SHORT_FORWARD_GRIDS = [
     (1, 148),
     (48, 148),  # T 1, H 48: 3 blocks
@@ -1666,28 +1665,27 @@ SHORT_FORWARD_GRIDS = [
     (30 * 212, 212),  # R200 at 30 rows per SM: 398 blocks
     (1786 * 7, 212),  # T 1786, H 7: 782 blocks, 58.97 rows per SM
     (59 * 212, 212),  # R200 at 59 rows per SM: 782 blocks
-    (1938 * 7, 212),  # T 1938, H 7: 848 blocks, 63.99 rows per SM
-    (64 * 212, 212),  # R200 at 64 rows per SM: 848 blocks
-    (64 * 216, 216),  # 216-SM R200 at 64 rows per SM: 864 blocks
+    (59 * 216, 216),  # 216-SM R200 at 59 rows per SM: 797 blocks
 ]
 # The most CTAs of the short forward's grid on sm_count SMs, from
 # SHORT_FORWARD_MIN_SMS SMs (on fewer SMs, as on a small MIG instance, the
 # grid at the end of the architecture's band has more): one wave of 4 CTAs per
-# SM on the SMs less 16 on sm_100a and sm_103a, on all the SMs on sm_107a.
+# SM on the SMs less 16.
 SHORT_FORWARD_MAX_CTAS = {
     "sm_100a": lambda sm_count: 4 * (sm_count - 16),
     "sm_103a": lambda sm_count: 4 * (sm_count - 16),
-    "sm_107a": lambda sm_count: 4 * sm_count,
+    "sm_107a": lambda sm_count: 4 * (sm_count - 16),
 }
 # The fewest SMs on which the short forward's grid at the end of the
 # architecture's band keeps SHORT_FORWARD_MAX_CTAS: ceil(48 * SMs / 16) <= 4 *
-# (SMs - 16) from 64 SMs on sm_100a and sm_103a; ceil(64 * SMs / 16) = 4 * SMs
-# on any SMs on sm_107a.
-SHORT_FORWARD_MIN_SMS = {"sm_100a": 64, "sm_103a": 64, "sm_107a": 1}
+# (SMs - 16) from 64 SMs on sm_100a and sm_103a, ceil(59 * SMs / 16) <= 4 *
+# (SMs - 16) from 205 SMs on sm_107a (212 and 216 keep it; a small MIG
+# instance does not).
+SHORT_FORWARD_MIN_SMS = {"sm_100a": 64, "sm_103a": 64, "sm_107a": 205}
 
 
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_FORWARD_GRIDS)
-def test_short_forward_grid_is_one_cta_a_block_within_one_wave(rows, sm_count):
+def test_short_forward_grid_is_one_cta_a_block_beside_16_held_sms(rows, sm_count):
     name = loader.ROUTES["sm_100a"]["fwd_short"]
     routed = []
     for arch in ("sm_100a", "sm_103a", "sm_107a"):

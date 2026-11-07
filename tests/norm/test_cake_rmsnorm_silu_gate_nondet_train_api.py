@@ -1440,11 +1440,10 @@ GATE_EDGE_VALUES = [
 ]
 # Forward inputs the short forward runs, and those at the end of its band on
 # sm_100a and sm_103a, 48 rows per SM, on 148 SMs (148x48, 1014x7, 222x32) and
-# on 152 SMs (152x48, 1042x7, 228x32), and on sm_107a, 64 rows per SM, on 212
-# SMs (282x48, 1938x7, 424x32), and one token past each (the next band's
+# on 152 SMs (152x48, 1042x7, 228x32), and on sm_107a, 59 rows per SM, on 212
+# SMs (260x48, 1786x7, 390x32), and one token past each (the next band's
 # forward), with the earlier ones at 12 rows per SM on 148 and 152 SMs (37x48,
-# 253x7, 55x32 and 38x48, 260x7, 57x32) and at 59 on 212 SMs (260x48, 1786x7,
-# 390x32).
+# 253x7, 55x32 and 38x48, 260x7, 57x32).
 GATE_EDGE_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(13, 48, id="13x48"),
@@ -1478,12 +1477,6 @@ GATE_EDGE_CASES = [
     pytest.param(1787, 7, id="1787x7"),
     pytest.param(390, 32, id="390x32"),
     pytest.param(391, 32, id="391x32"),
-    pytest.param(282, 48, id="282x48"),
-    pytest.param(283, 48, id="283x48"),
-    pytest.param(1938, 7, id="1938x7"),
-    pytest.param(1939, 7, id="1939x7"),
-    pytest.param(424, 32, id="424x32"),
-    pytest.param(425, 32, id="425x32"),
 ]
 
 

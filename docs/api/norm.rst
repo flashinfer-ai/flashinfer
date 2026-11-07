@@ -224,15 +224,16 @@ inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
 an autograd wrapper that saves only its inputs.  The forward runs one of several
 fixed-order modules chosen from the row count and the SM count (a short forward
-up to 48 rows per SM, 64 on SM107; past that, in bands of rows per SM,
+up to 48 rows per SM, 59 on SM107; past that, in bands of rows per SM,
 persistent forwards whose CTAs each walk a few row blocks); each module returns
 the same bits on every call.  Beside a kernel on another stream that holds ``k`` of the ``N``
 SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
 plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
 no later than the plain forward (within 2 % or 1.5 microseconds).
-On SM100 and SM103 with fewer than 64 SMs, as on a small MIG instance, the
-short forward's grid at 48 rows per SM is more than one wave on all SMs but 16,
-and this bound of the short forward is not shown there.
+On SM100 and SM103 with fewer than 64 SMs and on SM107 with fewer than 205, as
+on a small MIG instance, the short forward's grid at the end of its band (48
+rows per SM, 59 on SM107) is more than one wave on all SMs but 16, and this
+bound of the short forward is not shown there.
 
 .. rubric:: Mode and dispatch rules
 
@@ -352,7 +353,7 @@ inputs, and within the deterministic package's absolute bounds.
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
   of several modules chosen by bands of rows per SM: a short forward up to 48
-  rows per SM on SM100 and SM103 (64 on SM107); past that a persistent forward
+  rows per SM on SM100 and SM103 (59 on SM107); past that a persistent forward
   whose CTAs each walk at most 2 row blocks (mid), a long forward, or an
   extra-long forward that also prefetches its next block.  The bands: on
   SM100 mid up to 140 rows per SM, long up to 400, extra-long up to 1000, mid

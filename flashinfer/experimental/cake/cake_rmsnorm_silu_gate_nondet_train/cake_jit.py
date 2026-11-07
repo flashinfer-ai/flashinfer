@@ -1192,8 +1192,10 @@ ROUTES: dict[str, dict[str, str]] = {
 # ``(last, role)`` bands in increasing ``last`` (``None``: no end); a call of
 # ``rows`` rows on a device of ``sm_count`` SMs runs the module of the first
 # band's routed ``role`` with ``rows <= last * sm_count``.  The cuts are the
-# measured fastest program at each rows per SM (CUPTI, cold L2).  Host plan
-# only: a new cut needs no new program.
+# measured fastest program at each rows per SM (CUPTI, cold L2), except the
+# short forward's end on sm_107a, 59 rows per SM, where its grid of one
+# 16-row block a CTA still fits one wave of 4 CTAs per SM on all SMs but 16
+# (from 205 SMs).  Host plan only: a new cut needs no new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (48, "fwd_short"),
@@ -1209,7 +1211,7 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
         (None, "fwd_mid"),
     ),
     "sm_107a": (
-        (64, "fwd_short"),
+        (59, "fwd_short"),
         (200, "fwd_mid"),
         (520, "fwd_xlong"),
         (None, "fwd_mid"),

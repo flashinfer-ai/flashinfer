@@ -20,10 +20,10 @@ on another stream (the concurrent-launch contract of issues #7038 and #7548).
 The forward runs the program of its architecture's ``FORWARD_BANDS`` band
 of rows per SM.  The plain forward launches a grid of independent CTAs, one
 64-thread CTA per block of 8 rows.  Up to 48 rows per SM on SM100 and SM103
-(64 on SM107) the short forward launches one 256-thread CTA per block of 16
-rows (with 64 SMs or more on SM100 and SM103, as with 148 or 152, at most 4
-CTAs per SM on all SMs but 16, which fewer SMs do not keep at the end of the
-band; on SM107, at most 4 CTAs per SM on all SMs).  The mid forward launches
+(59 on SM107) the short forward launches one 256-thread CTA per block of 16
+rows (with 64 SMs or more on SM100 and SM103, as with 148 or 152, and 205 or
+more on SM107, as with 212 or 216, at most 4 CTAs per SM on all SMs but 16,
+which fewer SMs do not keep at the end of the band).  The mid forward launches
 whole waves of 6 CTAs per SM that each walk at most 2 blocks of 16 rows; the
 long and the extra-long forward launch whole waves of 3 CTAs per SM that each
 walk at most 6 blocks of 32 rows.  Their bands: on SM100 the mid forward up to 140 rows
@@ -93,7 +93,7 @@ fewest in the last band, which has no end: the mid forward 1 and 1 blocks of
 SM103 and SM107; the long forward 2 and 4 blocks of 32 rows on SM100; the
 extra-long forward 5 and 10 on SM100, 3 and 5 on SM103 and SM107.  The short
 forward at 1 row per SM and at the end of its band (48 rows per SM on SM100
-and SM103, also at 12; 64 on SM107, also at 10, 30 and 59) keeps
+and SM103, also at 12; 59 on SM107, also at 10 and 30) keeps
 its speed beside the one-thread kernel, starts beside the all-SM kernel with
 the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
 item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
@@ -828,13 +828,13 @@ def test_mid_forward_slows_in_proportion_to_the_sms_held(
 # The short forward: the rows per SM of its token counts on each architecture
 # (one row per SM and the end of its band, the largest, up to which the
 # architecture runs it: 48 on sm_100a and sm_103a, where 12 is probed as well,
-# 64 on sm_107a, where 10, 30 and 59 are probed as well), and the side kernels of the item 1 test beside it, the issue's three
+# 59 on sm_107a, where 10 and 30 are probed as well), and the side kernels of the item 1 test beside it, the issue's three
 # with the default carveout and 16 CTAs of 1024 threads with the max-shared
 # carveout.
 SHORT_FORWARD_ROWS_PER_SM = {
     "sm_100a": (1, 12, 48),
     "sm_103a": (1, 12, 48),
-    "sm_107a": (1, 10, 30, 59, 64),
+    "sm_107a": (1, 10, 30, 59),
 }
 SHORT_FORWARD_EDGES = tuple(sorted(set().union(*SHORT_FORWARD_ROWS_PER_SM.values())))
 SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
