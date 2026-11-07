@@ -1317,13 +1317,19 @@ def test_short_groups_on_two_concurrent_streams(form, out_dtype, monkeypatch):
     c = torch.empty_like(a)
     with torch.cuda.stream(streams[2]):
         torch.cuda._sleep(RESIDENT_SLEEP_CYCLES)
-    outs = [[], []]
+    # Each launch's output words are compared with the isolated launch's on the launch's
+    # own stream, before its next launch writes the output again.  A copy per launch would
+    # keep 32 copies of the output: 206 GB for the #6570 fp32 output, more than a B200 has.
+    words = _BIT_VIEWS[want.dtype]
+    want_words = want.view(words)
+    differ = [[], []]
     for _ in range(16):
         for index in range(2):
             with torch.cuda.stream(streams[index]):
                 _poison_tail_sums(device, streams[index])
                 launches[index].out.fill_(float("nan"))
-                outs[index].append(launches[index].launch().clone())
+                got = launches[index].launch().view(words)
+                differ[index].append(torch.ne(got, want_words).sum())
         with torch.cuda.stream(streams[3]):
             dst.copy_(src)
             torch.mm(a, a, out=c)
@@ -1340,8 +1346,10 @@ def test_short_groups_on_two_concurrent_streams(form, out_dtype, monkeypatch):
         f"splits={launch.plan['tail_splits']} overlap={overlap}"
     )
     for index in range(2):
-        for call, out in enumerate(outs[index]):
-            _assert_same_bits(out, want, f"stream {index} launch {call}")
+        for call, count in enumerate(differ[index]):
+            assert int(count) == 0, (
+                f"stream {index} launch {call}: {int(count)} elements differ"
+            )
     if form != "race6570":
         assert split, launch.plan
     if not split:
