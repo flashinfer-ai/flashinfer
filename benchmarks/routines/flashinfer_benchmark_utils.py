@@ -84,6 +84,8 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
+        "no_fused_finalize",
+        "enable_alltoall",
     ],
     "allreduce_comm": [
         "num_tokens",
