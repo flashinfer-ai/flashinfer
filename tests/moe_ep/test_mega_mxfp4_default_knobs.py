@@ -395,8 +395,9 @@ def test_mxfp4_legacy_phase_preserves_explicit_hint(hint):
 
 @pytest.mark.parametrize("failing_rank", [0, 1])
 @pytest.mark.parametrize("method", ["_workspace_config", "_active_clusters"])
-def test_mxfp4_workspace_failure_is_collective(failing_rank, method):
-    """Local and peer preparation failures stop every rank before pool lookup."""
+@pytest.mark.parametrize("operation", ["validate_init", "prepare_workspace"])
+def test_mxfp4_workspace_failure_is_collective(failing_rank, method, operation):
+    """Validation and preparation propagate both local and peer failures."""
     from contextlib import nullcontext
 
     import torch.distributed as dist
@@ -405,12 +406,12 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method):
     )
 
     backend = StandardMxfp8Mxfp4Backend(
-        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=256, top_k=2)
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=6400, top_k=2)
     )
     bootstrap = BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
     backend.bind_ep_bootstrap(bootstrap)
     backend._ep_comm_group = object()
-    fleet = FleetParams(num_experts=8, max_tokens_per_rank=32, token_hidden_size=256)
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=768, token_hidden_size=256)
     failure = f"RuntimeError: {method} failed"
 
     def gather(reports, report, **kwargs):
@@ -418,10 +419,13 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method):
         assert kwargs["group"] is backend._ep_comm_group
         error, proposal = report
         assert error == (failure if failing_rank == 0 else None)
-        assert (proposal is None) == (failing_rank == 0)
+        assert (proposal is None) == (operation == "validate_init" or failing_rank == 0)
         reports[:] = [report, (failure, None) if failing_rank == 1 else (None, None)]
 
     with (
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.standard_cutedsl.validate_mega_arch"
+        ),
         mock.patch.object(backend, "_active_clusters", return_value=76),
         mock.patch.object(dist, "all_gather_object", side_effect=gather) as collective,
         mock.patch.object(_StandardBlockScaledBackend, "prepare_workspace") as prepare,
@@ -430,6 +434,36 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method):
         else nullcontext(),
     ):
         with pytest.raises(MoEEpConfigError, match=f"rank {failing_rank}: {failure}"):
-            backend.prepare_workspace(bootstrap, fleet)
+            getattr(backend, operation)(bootstrap, fleet)
         collective.assert_called_once()
         prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("world_size,has_group", [(1, True), (2, False)])
+def test_mxfp4_validation_without_collective(world_size, has_group):
+    """Keep single-rank and pre-bootstrap validation local."""
+    import torch.distributed as dist
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.standard_cutedsl import (
+        _StandardBlockScaledBackend,
+    )
+
+    backend = StandardMxfp8Mxfp4Backend(
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=256, top_k=2)
+    )
+    bootstrap = BootstrapConfig(world_size=world_size, rank=0, auto_bootstrap=False)
+    backend.bind_ep_bootstrap(bootstrap)
+    backend._ep_comm_group = object() if has_group else None
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=32, token_hidden_size=256)
+    with (
+        mock.patch.object(dist, "is_initialized", return_value=False),
+        mock.patch.object(dist, "all_gather_object") as collective,
+        mock.patch.object(
+            _StandardBlockScaledBackend,
+            "validate_init",
+            side_effect=RuntimeError("local validation failed"),
+        ) as validate,
+    ):
+        with pytest.raises(RuntimeError, match="local validation failed"):
+            backend.validate_init(bootstrap, fleet)
+        validate.assert_called_once_with(bootstrap, fleet)
+        collective.assert_not_called()
