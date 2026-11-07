@@ -3519,10 +3519,9 @@ SPLIT_ROLES = ("fwd", "bwd")
 # at 64 < cv < 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C =
 # 224), the forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
 # vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
-# the programs are unchanged.  Every backward route takes the rule; the
-# ``fwd_dt`` forward route keeps one tile.
+# the programs are unchanged.  Every route of both roles takes the rule.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
-    "fwd": ("fwd", "fwd_bias"),
+    "fwd": ("fwd", "fwd_dt", "fwd_bias"),
     "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
@@ -3572,10 +3571,10 @@ def channel_split(
     single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
     threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 1016
     (three or four tiles) on every backward route, the forward's C = 576 to
-    768 on ``fwd`` / ``fwd_bias``, so C = 640 runs (32, 4, 3) instead of (80,
+    768 on every forward route, so C = 640 runs (32, 4, 3) instead of (80,
     1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
     the narrow plan's fixed order (bitwise reproducible).  Without a route,
-    and on ``fwd_dt``, the single tile stays.
+    the single tile stays.
     """
 
     return _channel_split(

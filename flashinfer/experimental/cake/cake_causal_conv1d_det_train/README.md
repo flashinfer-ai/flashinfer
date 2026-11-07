@@ -44,7 +44,7 @@ Below, "same call" means the same inputs, device architecture, package version a
 | `dbias` | same as `dweight` | same as `dweight` | FP32 output with `"fp32"`: measured worst 1.49e-7 rel-L2 |
 
 - With `silu_grad_preactivation="bf16"` (the default), SiLU' is evaluated at the BF16-rounded preactivation, the same boundary flash-linear-attention uses. With `"fp32"`, it is evaluated at the unrounded FP32 preactivation and the final reduction runs in FP64. The `"fp32"` program is slower.
-- This version runs 32-channel-vector tiles at C 224 and C 520-1016 on every backward route. At those widths, `dweight` and `dbias` bits therefore differ from the previous version. `y` and `dx` keep their bits, and the accuracy bounds are unchanged.
+- This version runs 32-channel-vector tiles at C 224 and C 520-1016 on every backward route, and at C 576-768 on the BF16-tap forward. At those backward widths, `dweight` and `dbias` bits therefore differ from the previous version. `y` and `dx` keep their bits, and the accuracy bounds are unchanged.
 - Because the backward recomputes the preactivation, a checkpointed (recomputed) forward gives the same `y` bits. The backward from it gives the same gradient bits.
 
 ### Keyword controls
