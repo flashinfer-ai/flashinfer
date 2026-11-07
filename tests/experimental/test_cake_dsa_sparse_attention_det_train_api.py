@@ -71,7 +71,8 @@ def _require_backward(program=cake_jit.PROGRAM):
 
 
 @pytest.mark.parametrize(
-    "value, expected", [(None, False), ("", False), ("0", False), ("1", True), ("x", True)]
+    "value, expected",
+    [(None, False), ("", False), ("0", False), ("1", True), ("x", True)],
 )
 def test_check_dst_map_environment(monkeypatch, value, expected):
     if value is None:
@@ -179,7 +180,9 @@ def test_public_entries_repeat_bit_for_bit(entry, mode, side):
     _require_backward(cake_jit.NOPE_PROGRAM if "nope" in entry else cake_jit.PROGRAM)
     inp = make_inputs([200, 120], [600, 360], seed=SEED, topk=256)
     S = inp.total_k
-    dkv_map = (torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)).contiguous()
+    dkv_map = (
+        torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)
+    ).contiguous()
     side_stream = torch.cuda.Stream()
     first = None
     for _ in range(REPEATS):

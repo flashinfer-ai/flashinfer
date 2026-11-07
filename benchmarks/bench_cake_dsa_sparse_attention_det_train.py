@@ -178,7 +178,9 @@ class ArmDetNope:
             inp.q.device, backward=True, program=program
         )
         if not cake_backend.generated_program_available(inp.q.device, program=program):
-            raise RuntimeError("skipped: the NoPE program is not registered for this device")
+            raise RuntimeError(
+                "skipped: the NoPE program is not registered for this device"
+            )
         self.program, self.inp = program, inp
         self.q = inp.q.detach().requires_grad_()
 
@@ -284,7 +286,6 @@ def measure(arm, steps):
         perf["step_ms"] = nb.median_ms(step, steps)
         perf["recompute_step_ms"] = nb.median_ms(recompute_step, steps)
         perf["bwd_ms"] = perf["step_ms"] - perf["fwd_ms"]
-    del st
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
@@ -320,7 +321,9 @@ def _run_arm(make, row, name, steps, entry):
     except Exception as exc:  # noqa: BLE001 -- optional dependency missing or arm unavailable here
         text = str(exc)
         entry["arms"][name] = dict(
-            error=text if text.startswith("skipped:") else f"{type(exc).__name__}: {text}"
+            error=text
+            if text.startswith("skipped:")
+            else f"{type(exc).__name__}: {text}"
         )
         _print(row, name, entry["arms"][name])
         return
@@ -355,8 +358,12 @@ def run_row(row, args, results):
             inp = nb._plant_holes(inp, spec["holes"])
         if spec.get("twin") == "stable":
             inp = nb.compacted_twin(inp)
-        arms = [(a, lambda cls=NOPE_ARMS[a]: cls(inp)) for a in args.arms if a in NOPE_ARMS]
-        entry = dict(row=row, total_q=inp.total_q, total_k=inp.total_k, K_slots=inp.topk, arms={})
+        arms = [
+            (a, lambda cls=NOPE_ARMS[a]: cls(inp)) for a in args.arms if a in NOPE_ARMS
+        ]
+        entry = dict(
+            row=row, total_q=inp.total_q, total_k=inp.total_k, K_slots=inp.topk, arms={}
+        )
     else:
         seq_q, seq_k = nb.ROWS[row]
         inp = nb.make_inputs(
@@ -369,7 +376,9 @@ def run_row(row, args, results):
         )
         layout = nb.Layout(inp, **nb.ROW_LAYOUTS.get(row, nb.DEFAULT_LAYOUT))
         arms = [
-            (a, lambda cls=ROPE_ARMS[a]: cls(inp, layout)) for a in args.arms if a in ROPE_ARMS
+            (a, lambda cls=ROPE_ARMS[a]: cls(inp, layout))
+            for a in args.arms
+            if a in ROPE_ARMS
         ]
         entry = dict(
             row=row,
@@ -386,8 +395,6 @@ def run_row(row, args, results):
     for name, make in arms:
         _run_arm(make, row, name, steps, entry)
     results["rows"].append(entry)
-    del inp
-    torch.cuda.empty_cache()
 
 
 def main():
@@ -424,6 +431,7 @@ def main():
     )
     for row in args.rows:
         run_row(row, args, results)
+        torch.cuda.empty_cache()  # the row's inputs are released with run_row's frame
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=2, default=str) + "\n")

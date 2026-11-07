@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 
-
 # Host backend of the Cake DSA sparse-attention training program whose every
 # output repeats bit for bit (SM100 / SM103 / SM107): input validation, the
 # storage plan of the backward, varlen index offsetting, the prepared runner,
@@ -267,7 +266,6 @@ def generated_program_available(
 def _program_stages(names: tuple[str, ...], program: str) -> tuple[str, ...]:
     """The RoPE program's stage ``names`` spelled for ``program`` (``nope_`` prefix on the NoPE program)."""
     return tuple(cake_jit.stage_name(name, program) for name in names)
-
 
 
 # ---------------------------------------------------------------------------
@@ -623,8 +621,6 @@ def _saved_optional(t: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tens
     return t if t is not None else like.new_empty(0)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Workspace and the accumulator region
 # ---------------------------------------------------------------------------
@@ -891,7 +887,6 @@ def _o_lo_bytes(o_lo: torch.Tensor) -> torch.Tensor:
     """The storage of a validated (contiguous) ``o_lo`` as a flat uint8 view: the bytes a backward that consumes it
     carves its accumulator region from.  A view, so ``o_lo``'s autograd version counter is untouched."""
     return o_lo.view(-1).view(torch.uint8)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1202,16 +1197,18 @@ def _stage_entry(
     return _StageEntry(stage, cake_launch.LAUNCH[stage], entry, grid)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Plans: the tensor-free part of a binding
 # ---------------------------------------------------------------------------
 
 # ``fold_mode`` of ``bwd_fold``: how the integers of the accumulator become the dK / dV results.
 FOLD_BF16 = 0  # fresh BF16 ``dkv_latent`` / ``dk_rope`` (every row written; an untouched row is zero)
-FOLD_FP32 = 1  # fresh natural-layout FP32 ``dkv_latent`` / ``dk_rope`` (``dkv_fp32=True``)
-FOLD_ACCUMULATE = 2  # ``dkv_acc[r] = prev + v`` (an element whose integer is zero keeps its bits)
+FOLD_FP32 = (
+    1  # fresh natural-layout FP32 ``dkv_latent`` / ``dk_rope`` (``dkv_fp32=True``)
+)
+FOLD_ACCUMULATE = (
+    2  # ``dkv_acc[r] = prev + v`` (an element whose integer is zero keeps its bits)
+)
 FOLD_IN_PLACE = 3  # NoPE: the fresh FP32 ``dkv`` that held the integers is rewritten as FP32 in place
 
 
@@ -1284,9 +1281,7 @@ def _check_accumulator_span(num_dst: int, columns: int, dkv_row_stride: int) -> 
     kernels' int32 element offsets."""
     _check_int32("the integer accumulator's element count", int(num_dst) * columns)
     if dkv_row_stride:
-        _check_int32(
-            "the dkv_acc element span", int(num_dst) * int(dkv_row_stride)
-        )
+        _check_int32("the dkv_acc element span", int(num_dst) * int(dkv_row_stride))
 
 
 def _det_constants(
@@ -1327,7 +1322,9 @@ def _det_constants(
     )
     if q_latent is not None:
         constants.update(
-            q_token_stride=_check_int32("the q_latent token stride", q_latent.stride(0)),
+            q_token_stride=_check_int32(
+                "the q_latent token stride", q_latent.stride(0)
+            ),
             q_head_stride=_check_int32("the q_latent head stride", q_latent.stride(1)),
             q_offset=0,  # validated 16-byte aligned: the launcher passes the view itself
         )
@@ -1443,7 +1440,9 @@ def _plan(
         torch.bfloat16,
     )
     dkv_dtype = torch.float32 if dkv_fp32 else torch.bfloat16
-    _check_output(outputs.get("dkv_latent"), "dkv_latent", (num_kv, D_LATENT), dkv_dtype)
+    _check_output(
+        outputs.get("dkv_latent"), "dkv_latent", (num_kv, D_LATENT), dkv_dtype
+    )
     _check_output(outputs.get("dk_rope"), "dk_rope", (num_kv, D_ROPE), dkv_dtype)
     num_dst = _num_dst(num_kv, dkv_acc, dkv_dst_map) if backward else 0
     storage = (
@@ -1459,7 +1458,9 @@ def _plan(
         else "workspace"
     )
     region = (
-        accumulator_region_layout(num_kv, num_dst) if backward else {"total": 0, "zero": 0}
+        accumulator_region_layout(num_kv, num_dst)
+        if backward
+        else {"total": 0, "zero": 0}
     )
     if backward:
         _check_accumulator_span(num_dst, D_QK, dst_row_stride)
@@ -1471,9 +1472,7 @@ def _plan(
         num_dst=num_dst if backward else None,
         region=storage == "workspace",
     )
-    fold_mode = (
-        FOLD_ACCUMULATE if accumulate else FOLD_FP32 if dkv_fp32 else FOLD_BF16
-    )
+    fold_mode = FOLD_ACCUMULATE if accumulate else FOLD_FP32 if dkv_fp32 else FOLD_BF16
     has_topk_length = topk_length is not None
     # the forward derives the row lengths into the vector when the caller gives none (or asks for it); the backward
     # stages of a binding without caller lengths keep the full-row semantics (has_topk_length = 0)
@@ -1584,7 +1583,9 @@ def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
         t["acc"] = _carve(
             flat, region, "acc", torch.int32, (R, accumulator_columns(plan.program))
         )
-    counters = _carve(flat, region, "counters", torch.int64, (R, COUNTER_BYTES_PER_ROW // 8))
+    counters = _carve(
+        flat, region, "counters", torch.int64, (R, COUNTER_BYTES_PER_ROW // 8)
+    )
     t["cnt64"] = counters.view(torch.uint64)
     t["cnt"] = counters.view(torch.int32).view(torch.uint32)
     t["row_bound"] = _carve(flat, region, "bounds", torch.int64, (R, parts)).view(
@@ -1699,7 +1700,9 @@ def _dkv_outputs(
             dkv_latent_fp32=dkv_latent
             if dkv_latent is not None
             else fresh((S, D_LATENT), torch.float32),
-            dk_rope_fp32=dk_rope if dk_rope is not None else fresh((S, D_ROPE), torch.float32),
+            dk_rope_fp32=dk_rope
+            if dk_rope is not None
+            else fresh((S, D_ROPE), torch.float32),
         )
     return dict(
         dkv_latent=dkv_latent
@@ -2020,7 +2023,9 @@ def prepare_dsa_train(
             else fresh((num_queries, NUM_HEADS, D_ROPE), torch.bfloat16)
         )
         if plan.accumulate_dkv:
-            t["dkv_acc"], _row_stride = _check_dkv_acc(dkv_acc, dkv_dst_map, plan.num_kv)
+            t["dkv_acc"], _row_stride = _check_dkv_acc(
+                dkv_acc, dkv_dst_map, plan.num_kv
+            )
             if dkv_dst_map is not None:
                 t["dkv_dst_map"] = dkv_dst_map
         t.update(_dkv_outputs(plan, dkv_latent, dk_rope, fresh))
@@ -2931,8 +2936,6 @@ def cake_dsa_sparse_attention_det_varlen(
         dkv_direct=dkv_direct,
         check_dst_map=check_dst_map,
     )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -4077,7 +4080,9 @@ class _NopeBackwardPrep:
             _saved_optional(topk_length, indices),
         )
 
-    def _replay_forward(self, q_latent, kv_latent, indices, out, lse, o_lo, topk_length):
+    def _replay_forward(
+        self, q_latent, kv_latent, indices, out, lse, o_lo, topk_length
+    ):
         """The forward again into the saved ``out`` / ``lse`` / ``o_lo`` (see the class docstring)."""
         lengths = topk_length
         if self.replay_derive:
@@ -4116,7 +4121,9 @@ class _NopeBackwardPrep:
                 dkv_dst_map=dst_map,
             )
         if self.o_lo_spent:
-            self._replay_forward(q_latent, kv_latent, indices, out, lse, o_lo, topk_length)
+            self._replay_forward(
+                q_latent, kv_latent, indices, out, lse, o_lo, topk_length
+            )
         key = (
             self.key_head
             + (_geometry(dout),)

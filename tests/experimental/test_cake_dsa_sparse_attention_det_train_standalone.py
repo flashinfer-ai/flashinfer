@@ -40,7 +40,9 @@ import flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train as pkg
 pytestmark = pytest.mark.cpu_only
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
-VENDORED_NAME = "vendored_dsa_sparse_attention_det"  # the copy's top-level name in the subprocess
+VENDORED_NAME = (
+    "vendored_dsa_sparse_attention_det"  # the copy's top-level name in the subprocess
+)
 
 
 def _dependency_paths():

@@ -37,7 +37,9 @@ from tests.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_jit")
 cake_launch = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_launch")
-nondet_backend = cake_package("cake.cake_dsa_sparse_attention_nondet_train", "cake_backend")
+nondet_backend = cake_package(
+    "cake.cake_dsa_sparse_attention_nondet_train", "cake_backend"
+)
 
 NUM_HEADS = cake_backend.NUM_HEADS
 D_LATENT = cake_backend.D_LATENT
@@ -163,10 +165,18 @@ def test_carve_condition(T, ratio):
     """``carve_fits`` is the documented closed form, and the limits are about 27.7 T (rope) and 31.5 T (NoPE)."""
     R = S = T * ratio
     rope = (
-        _align(R * 2304) + _align(R * 32) + _align(R * 16) + _align(R * 8) + _align(S * 4)
+        _align(R * 2304)
+        + _align(R * 32)
+        + _align(R * 16)
+        + _align(R * 8)
+        + _align(S * 4)
     )
     nope = (
-        _align(R * 2048) + _align(R * 32) + _align(R * 8) + _align(R * 4) + _align(S * 4)
+        _align(R * 2048)
+        + _align(R * 32)
+        + _align(R * 8)
+        + _align(R * 4)
+        + _align(S * 4)
     )
     assert cake_backend.carve_fits(T, S, R) == (rope <= 65536 * T)
     assert cake_backend.carve_fits(T, S, R, program=cake_jit.NOPE_PROGRAM) == (
@@ -190,9 +200,10 @@ def test_workspace_layout_keeps_delta_and_globals_out_of_the_region():
         assert layout["delta"][1] == 300 * NUM_HEADS * 4
         assert layout["qstat"][1] == 300 * 4 * 4
     assert "region" in with_region and "region" not in carved
-    assert with_region["region"][1] == cake_backend.accumulator_region_layout(
-        1000, 1000
-    )["total"]
+    assert (
+        with_region["region"][1]
+        == cake_backend.accumulator_region_layout(1000, 1000)["total"]
+    )
     assert set(forward) == {"topk_length", "total"}
 
 
@@ -253,7 +264,9 @@ def test_nope_forward_matches_nondet_bit_for_bit():
     inp = make_inputs([256], [1024], seed=SEED + 1, topk=512)
     q = inp.q_latent
     kv = inp.kv_latent
-    ref = nondet_backend.forward_nope(q, kv, inp.idx_global, topk_length=inp.topk_length)
+    ref = nondet_backend.forward_nope(
+        q, kv, inp.idx_global, topk_length=inp.topk_length
+    )
     for _ in range(REPEATS):
         got = cake_backend.forward_nope(
             q, kv, inp.idx_global, topk_length=inp.topk_length
@@ -364,7 +377,9 @@ def test_dkv_acc_is_previous_plus_fresh(with_map):
     S = inp.total_k
     if with_map:
         dst_rows = S // 2 + 3
-        dst_map = (torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)).contiguous()
+        dst_map = (
+            torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)
+        ).contiguous()
     else:
         dst_rows, dst_map = S + 3, None
     gen = torch.Generator(device="cuda").manual_seed(SEED)
