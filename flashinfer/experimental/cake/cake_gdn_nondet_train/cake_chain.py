@@ -1856,8 +1856,9 @@ TMA_ALIGN_BYTES = 16
 # q / k views that prep_tma reads in place run prep_tma inside the rule's plain band too (no copy of q / k); a
 # ``prep`` pin still decides
 VIEWS_TAKE_PREP_TMA = True
-# a strided q / k / v is copied into contiguous rows as 8-byte words where its strides allow (:func:`_dense`)
-_COPY_WORD = torch.int64
+# a strided q / k / v is copied into contiguous rows as the widest of these words its strides allow (:func:`_dense`):
+# 16 bytes (a pair of FP64 lanes, moved without arithmetic), else 8 bytes
+_COPY_WORDS = (torch.complex128, torch.int64)
 
 
 @cache
@@ -1935,23 +1936,26 @@ def _tma_rows(t: torch.Tensor) -> bool:
 
 def _dense(t: torch.Tensor) -> torch.Tensor:
     """``t`` as contiguous rows with the same bits: ``t`` itself when contiguous, else one copy.  A view with a unit
-    innermost stride whose row length, element offset and other strides are multiples of the 8-byte word (a head view
-    of a packed row) is copied as 8-byte words: the same bytes in a quarter of the elements of a BF16 copy."""
+    innermost stride whose row length, element offset and other strides are multiples of a word of
+    :data:`_COPY_WORDS` (a head view of a packed row) is copied as the widest such word: the same bytes in an eighth
+    (16-byte words) or a quarter (8-byte words) of the elements of a BF16 copy, which PyTorch's strided copy moves one
+    element per thread step.  The word copy is a plain load and store of each word, so every bit pattern survives."""
     if t.is_contiguous():
         return t
     out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
-    ratio = _COPY_WORD.itemsize // t.element_size()
-    if (
-        ratio > 1
-        and t.dim() > 0
-        and t.stride(-1) == 1
-        and t.size(-1) % ratio == 0
-        and t.storage_offset() % ratio == 0
-        and all(stride % ratio == 0 for stride in t.stride()[:-1])
-    ):
-        out.view(_COPY_WORD).copy_(t.view(_COPY_WORD))
-    else:
-        out.copy_(t)
+    size = t.element_size()
+    if t.dim() > 0 and t.stride(-1) == 1:
+        for word in _COPY_WORDS:
+            ratio = word.itemsize // size
+            if (
+                ratio > 1
+                and t.size(-1) % ratio == 0
+                and t.storage_offset() % ratio == 0
+                and all(stride % ratio == 0 for stride in t.stride()[:-1])
+            ):
+                out.view(word).copy_(t.view(word))
+                return out
+    out.copy_(t)
     return out
 
 

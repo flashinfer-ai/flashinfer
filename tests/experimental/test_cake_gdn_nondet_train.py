@@ -3255,16 +3255,14 @@ def test_packed_views_give_the_contiguous_bits(
 
 
 def test_dense_copies_the_bytes(device) -> None:
-    # the 8-byte-word copy of a strided view keeps every BF16 bit pattern (NaN payloads included); a view the word
-    # view cannot express (an odd element offset) takes the element copy
+    # the word copies of a strided view keep every BF16 bit pattern (NaN payloads included): head views at element
+    # offsets 0 and 512 take 16-byte words, at offset 4 8-byte words, at offset 3 the element copy
     words = torch.randint(
-        -(2**15), 2**15, (37, 1280), dtype=torch.int32, device=device
+        -(2**15), 2**15, (257, 1280), dtype=torch.int32, device=device
     ).to(torch.int16)
     row = words.view(torch.bfloat16)
-    for start, width in ((0, 256), (512, 768), (3, 256)):
-        view = row[:, start : start + width].unflatten(
-            -1, (-1, 1 if start == 3 else HEAD_DIM)
-        )
+    for start, width in ((0, 256), (512, 768), (4, 256), (3, 256)):
+        view = row[:, start : start + width].unflatten(-1, (-1, HEAD_DIM))
         dense = cake_chain._dense(view)
         assert dense.is_contiguous() and dense.shape == view.shape
         assert torch.equal(dense.view(torch.int16), view.contiguous().view(torch.int16))
