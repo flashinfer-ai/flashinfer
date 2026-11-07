@@ -719,12 +719,9 @@ def _stream_workspace_views(
     return views
 
 
-def _check_workspace(
-    workspace: torch.Tensor, device: torch.device, elements: int
-) -> torch.Tensor:
-    """The flat view of a caller's workspace of at least ``elements`` FP64
-    elements on ``device``; an FP32 tensor (the deterministic package's
-    workspace) is refused naming both modes' workspaces."""
+def _refuse_deterministic_workspace(workspace: Optional[torch.Tensor]) -> None:
+    """Refuse an FP32 tensor (the deterministic package's workspace), naming
+    both modes' workspaces."""
 
     if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float32:
         raise ValueError(
@@ -733,6 +730,16 @@ def _check_workspace(
             "the non-deterministic backward needs its own zero-filled FP64 "
             f"workspace ({__name__}.cake_rmsnorm_silu_gate_nondet_train_backward_workspace)"
         )
+
+
+def _check_workspace(
+    workspace: torch.Tensor, device: torch.device, elements: int
+) -> torch.Tensor:
+    """The flat view of a caller's workspace of at least ``elements`` FP64
+    elements on ``device``; an FP32 tensor (the deterministic package's
+    workspace) is refused naming both modes' workspaces."""
+
+    _refuse_deterministic_workspace(workspace)
     if (
         not isinstance(workspace, torch.Tensor)
         or workspace.device != device
@@ -809,6 +816,10 @@ def _backward(
             dw = grad_weight
     dx, dx_user = _output(grad_x, "grad_x", shape=shape, device=device)
     dz, dz_user = _output(grad_z, "grad_z", shape=shape, device=device)
+    # The other mode's workspace is refused for any row count, so before the
+    # return of a call with no rows; the size checks below depend on the
+    # backward module that the row count selects.
+    _refuse_deterministic_workspace(workspace)
     if rows == 0:
         if dw is not None and not accumulate_grad_weight:
             dw.zero_()
