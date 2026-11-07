@@ -38,9 +38,9 @@ class SwiGLUActivation:
         for i in cutlass.range_constexpr(cute.size(acc_u)):
             g, u = acc_g[i], acc_u[i]
             if cutlass.const_expr(self.swiglu_limit is not None):
-                g = cute.math.min(g, self.swiglu_limit)
-                u = cute.math.max(
-                    -self.swiglu_limit, cute.math.min(u, self.swiglu_limit)
+                g = cute.arch.fmin(g, self.swiglu_limit)
+                u = cute.arch.fmax(
+                    -self.swiglu_limit, cute.arch.fmin(u, self.swiglu_limit)
                 )
             sigmoid = cute.arch.rcp_approx(
                 1.0 + cute.math.exp(-g, fastmath=self.fastmath)

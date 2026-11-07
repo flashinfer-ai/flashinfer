@@ -606,6 +606,35 @@ class Sm120SfConfigFp8:
 
 
 @cute.jit
+def gmem_to_smem_tokens(atom, gA, gMap, target, begin, rows, kt):
+    lane = cute.arch.lane_idx()
+    K = cute.size(gA, mode=[1])
+    k_tiles = ceil_div(K, 128)
+    source_kt = cutlass.Int32(0)
+    if kt < k_tiles:
+        source_kt = kt
+    source_layout = cute.make_layout(((16, 1),), stride=((1, 0),))
+    pred = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Boolean)
+    for part in cutlass.range_constexpr(cute.size(target, mode=[1])):
+        row = (lane >> 3) + part * 4
+        token = cutlass.Int32(0)
+        if row < rows:
+            token = gMap[begin + row]
+        address = (
+            gA.iterator + cutlass.Int64(token) * K + source_kt * 128 + (lane & 7) * 16
+        )
+        pointer = cute.make_ptr(
+            cutlass.Float8E4M3FN,
+            address.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        source = cute.make_tensor(pointer, source_layout)
+        pred[0] = (row < rows) & (kt < k_tiles)
+        cute.copy(atom, source, target[None, part], pred=pred)
+
+
+@cute.jit
 def copy_scale_s2r(stage, tCsSFA, tCsSFB, tCrSFA, tCrSFB, tscale_mn):
     tscale_m, tscale_n = tscale_mn
     cute.autovec_copy(tCsSFA[None, None, None, stage], tCrSFA)

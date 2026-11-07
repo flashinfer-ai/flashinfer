@@ -102,7 +102,16 @@ def fp8_q0_route_workspace_shapes(
 
 
 def _byte_range(tensor: torch.Tensor):
-    return tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()
+    extent = (
+        0
+        if tensor.numel() == 0
+        else 1
+        + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    )
+    return tensor.data_ptr(), tensor.data_ptr() + extent * tensor.element_size()
 
 
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -228,12 +237,15 @@ def _fp8_q0_route_direct_kernel(
     s_qok: tl.constexpr,
     s_som: tl.constexpr,
     s_sok: tl.constexpr,
+    token_only: tl.constexpr = False,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     direct_block = tl.program_id(1)
     tile_ids = tl.arange(0, num_tiles)
     k_lane = tl.arange(0, tile_k)
-    cols = direct_block * direct_block_k + tile_ids[:, None] * tile_k + k_lane[None, :]
+    cols = (
+        direct_block * direct_block_k + tile_ids[:, None] * tile_k + k_lane[None, :]
+    ).to(tl.int64)
     valid_cols = cols < hidden_size
     values = tl.load(x + token_idx * s_xm + cols * s_xk, mask=valid_cols, other=0.0).to(
         tl.float32
@@ -241,23 +253,31 @@ def _fp8_q0_route_direct_kernel(
     amax = tl.maximum(tl.max(tl.abs(values), axis=1), 1.0e-4)
     scales = amax / 448.0
     quant = (values * (1.0 / scales[:, None])).to(q_out.dtype.element_ty)
-    scale_blocks = direct_block * num_tiles + tile_ids
-    for slot_idx in tl.static_range(0, top_k):
-        pair_idx = token_idx * top_k + slot_idx
-        routed_row = tl.load(dst_rows + pair_idx)
-        scale_row = tl.load(scale_dst_rows + pair_idx)
-        # dst_rows is -1 for an unrouted (negative expert id) pair: no row to fill.
-        routed = routed_row >= 0
+    scale_blocks = (direct_block * num_tiles + tile_ids).to(tl.int64)
+    if token_only:
+        tl.store(q_out + token_idx * s_qom + cols * s_qok, quant, mask=valid_cols)
         tl.store(
-            q_out + routed_row * s_qom + cols * s_qok,
-            quant,
-            mask=valid_cols & routed,
-        )
-        tl.store(
-            scale_out + scale_blocks * s_som + scale_row * s_sok,
+            scale_out + scale_blocks * s_som + token_idx * s_sok,
             scales,
-            mask=(scale_blocks < num_scale_blocks) & routed,
+            mask=scale_blocks < num_scale_blocks,
         )
+    else:
+        for slot_idx in tl.static_range(0, top_k):
+            pair_idx = token_idx * top_k + slot_idx
+            routed_row = tl.load(dst_rows + pair_idx).to(tl.int64)
+            scale_row = tl.load(scale_dst_rows + pair_idx).to(tl.int64)
+            # dst_rows is -1 for an unrouted (negative expert id) pair: no row to fill.
+            routed = routed_row >= 0
+            tl.store(
+                q_out + routed_row * s_qom + cols * s_qok,
+                quant,
+                mask=valid_cols & routed,
+            )
+            tl.store(
+                scale_out + scale_blocks * s_som + scale_row * s_sok,
+                scales,
+                mask=(scale_blocks < num_scale_blocks) & routed,
+            )
 
 
 def _validate(
@@ -292,6 +312,7 @@ def fp8_q0_route_triton(
     workspace: Optional[Fp8Q0RouteWorkspace] = None,
     workspace13: Optional[torch.Tensor] = None,
     workspace2: Optional[torch.Tensor] = None,
+    token_only: bool = False,
 ):
     _validate(x, topk_ids, topk_weights, num_experts)
     topk_ids = topk_ids.contiguous()
@@ -311,8 +332,12 @@ def fp8_q0_route_triton(
         for source in (x, topk_ids, topk_weights)
     ):
         raise ValueError("workspace must not alias an input")
+    q, sf = workspace.q_out, workspace.scale_out
+    if token_only:
+        q = q.reshape(-1)[: num_tokens * hidden_size].view(num_tokens, hidden_size)
+        sf = sf.reshape(-1)[: scale_blocks * num_tokens].view(scale_blocks, num_tokens)
     if total_pairs <= DECODE_BLOCK_N:
-        total_scale = scale_blocks * workspace.scale_out.shape[1]
+        total_scale = 0 if token_only else scale_blocks * workspace.scale_out.shape[1]
         grid = max(num_experts, total_pairs, ceil_div(total_scale, DECODE_BLOCK_N))
         _route_assign_decode_kernel[(grid,)](
             topk_ids,
@@ -335,7 +360,8 @@ def fp8_q0_route_triton(
         )
     else:
         block_n = 256
-        workspace.scale_out.zero_()
+        if not token_only:
+            workspace.scale_out.zero_()
         if num_experts <= PREFILL_FUSED_PREFIX_MAX_EXPERTS:
             workspace.counts.zero_()
             _count_routes_kernel[(ceil_div(total_pairs, block_n),)](
@@ -374,8 +400,8 @@ def fp8_q0_route_triton(
         x,
         workspace.dst_rows,
         workspace.scale_dst_rows,
-        workspace.q_out,
-        workspace.scale_out,
+        q,
+        sf,
         hidden_size,
         top_k,
         TILE_K,
@@ -384,10 +410,11 @@ def fp8_q0_route_triton(
         scale_blocks,
         x.stride(0),
         x.stride(1),
-        workspace.q_out.stride(0),
-        workspace.q_out.stride(1),
-        workspace.scale_out.stride(0),
-        workspace.scale_out.stride(1),
+        q.stride(0),
+        q.stride(1),
+        sf.stride(0),
+        sf.stride(1),
+        token_only=token_only,
         num_warps=4,
     )
     _record_workspace_stream(workspace)
@@ -395,8 +422,8 @@ def fp8_q0_route_triton(
         workspace.offsets,
         workspace.token_map,
         workspace.token_weights,
-        workspace.q_out,
-        workspace.scale_out,
+        q,
+        sf,
     )
 
 

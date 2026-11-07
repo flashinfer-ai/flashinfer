@@ -68,6 +68,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
         epi: EpiMethod = DEFAULT_EPI,
         enable_pdl=False,
         swiglu_limit=None,
+        gather=False,
     ):
         if not self.can_implement(
             n=n, k=k, tile=tile, out_dtype=out_dtype, activation=activation, epi=epi
@@ -79,6 +80,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
         self.n, self.k, self.tile, self.out_dtype = n, k, tuple(tile), out_dtype
         self.activation, self.epi, self.enable_pdl = activation, epi, enable_pdl
         self.swiglu_limit = swiglu_limit
+        self.gather = gather
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
         self.cfg = make_cfg(
@@ -88,6 +90,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
             activation=activation,
             enable_pdl=enable_pdl,
             swiglu_limit=swiglu_limit,
+            gather=gather,
         )
 
     @staticmethod
@@ -172,6 +175,7 @@ def _op(
     epi,
     enable_pdl=False,
     swiglu_limit=None,
+    gather=False,
 ) -> CuteDslSm120GroupedFp8Fc1ActQ1Op:
     return CuteDslSm120GroupedFp8Fc1ActQ1Op(
         n=n,
@@ -182,6 +186,7 @@ def _op(
         epi=epi,
         enable_pdl=enable_pdl,
         swiglu_limit=swiglu_limit,
+        gather=gather,
     )
 
 
@@ -189,6 +194,9 @@ _COMPILED: dict = {}
 
 
 def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
+    gather = len(sample_args) == 9
+    if gather != op.gather:
+        raise ValueError("gather configuration does not match the kernel arguments")
     key = (
         op.tactic,
         op.activation,
@@ -197,6 +205,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.swiglu_limit,
         grid_x,
         sm_version,
+        gather,
     )
     hit = _COMPILED.get(key)
     if hit is None:
@@ -256,9 +265,35 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
     swiglu_limit: float | None = None,
     out_q: torch.Tensor | None = None,
     out_sf: torch.Tensor | None = None,
+    token_map: torch.Tensor | None = None,
 ):
     swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     m, n, k = int(a_q.shape[0]), int(b_q.shape[1]) // 2, int(b_q.shape[2])
+    if token_map is not None:
+        if (
+            token_map.dtype is not torch.int32
+            or token_map.ndim != 1
+            or token_map.device != a_q.device
+            or not token_map.is_contiguous()
+        ):
+            raise ValueError(
+                "token_map must be contiguous rank-1 int32 on the input device"
+            )
+        if (
+            a_q.dtype is not torch.float8_e4m3fn
+            or a_q.ndim != 2
+            or not a_q.is_contiguous()
+            or a_q.shape[1] != k
+            or a_scale.dtype is not torch.float32
+            or a_scale.ndim != 2
+            or a_scale.shape[1] != a_q.shape[0]
+            or not a_scale.is_contiguous()
+            or a_scale.device != a_q.device
+        ):
+            raise ValueError(
+                "gather inputs must be token-major FP8 A and contiguous FP32 SF"
+            )
+        m = token_map.numel()
     assert not enable_pdl or (out_q is not None and out_sf is not None), (
         "PDL requires caller-owned out_q and out_sf"
     )
@@ -280,6 +315,7 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
         epi,
         enable_pdl,
         swiglu_limit,
+        token_map is not None,
     )
     q = (
         torch.empty(m, n, dtype=out_dtype, device=a_q.device)
@@ -317,6 +353,7 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
         m_indptr.to(torch.int32),
         op.cfg.epi,
         op.cfg.TILE,
+        token_map=token_map,
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return q, sf

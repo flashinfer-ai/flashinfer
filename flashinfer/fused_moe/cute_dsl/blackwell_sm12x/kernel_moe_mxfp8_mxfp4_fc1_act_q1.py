@@ -44,6 +44,7 @@ from ._moe_utils.sm12x_blockscaled_layout import (
     SF_M_ALIGN,
     UE8M0_PACK_NUM,
     Sm120SfConfigMxfp8Mxfp4,
+    gmem_to_smem_tokens,
 )
 
 GRANK_A, GRANK_B = 128, 32
@@ -131,35 +132,6 @@ def make_cfg(
 
 
 @cute.jit
-def gmem_to_smem_tokens(atom, gA, gMap, target, begin, rows, kt):
-    lane = cute.arch.lane_idx()
-    K = cute.size(gA, mode=[1])
-    k_tiles = ceil_div(K, 128)
-    source_kt = cutlass.Int32(0)
-    if kt < k_tiles:
-        source_kt = kt
-    source_layout = cute.make_layout(((16, 1),), stride=((1, 0),))
-    pred = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Boolean)
-    for part in cutlass.range_constexpr(cute.size(target, mode=[1])):
-        row = (lane >> 3) + part * 4
-        token = cutlass.Int32(0)
-        if row < rows:
-            token = gMap[begin + row]
-        address = (
-            gA.iterator + cutlass.Int64(token) * K + source_kt * 128 + (lane & 7) * 16
-        )
-        pointer = cute.make_ptr(
-            cutlass.Float8E4M3FN,
-            address.toint(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        source = cute.make_tensor(pointer, source_layout)
-        pred[0] = (row < rows) & (kt < k_tiles)
-        cute.copy(atom, source, target[None, part], pred=pred)
-
-
-@cute.jit
 def gmem_to_smem_token_sf(atom, gSF, gMap, target, begin, rows, pack):
     lane = cute.arch.lane_idx()
     packs = cute.size(gSF, mode=[0])
@@ -207,7 +179,6 @@ def load_tokens(
     stages,
     phase,
     swap: cutlass.Constexpr,
-    wait_copy: cutlass.Constexpr,
 ):
     extent = tile_mnk[1] if swap else tile_mnk[0]
     block = tile.n_block if cutlass.const_expr(swap) else tile.m_block
@@ -228,13 +199,8 @@ def load_tokens(
             gmem_to_smem_token_sf(
                 atom_sf, gSF, gMap, sSF[None, 0, sf_stage], begin, rows, pack
             )
-        if cutlass.const_expr(wait_copy):
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_warp()
-            cute.arch.mbarrier_arrive(full + stage)
-        else:
-            cute.arch.cp_async_mbarrier_arrive_noinc(full + stage)
+        cute.arch.sync_warp()
+        cute.arch.cp_async_mbarrier_arrive_noinc(full + stage)
         if stage == stages - 1:
             phase ^= 1
     return phase
@@ -1350,7 +1316,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                             cfg.ab_stage,
                             a_phase,
                             False,
-                            cfg.epi.METHOD == EpiMethod.WG_QUANT_R2S,
                         )
                     else:
                         a_phase = load_a_sfa(
@@ -1404,7 +1369,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                                 kt_per_pack_c,
                                 cfg.ab_stage,
                                 b_phase,
-                                True,
                                 True,
                             )
                         else:
