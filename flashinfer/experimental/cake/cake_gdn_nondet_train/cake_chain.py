@@ -2677,6 +2677,18 @@ def cake_gdn_nondet_train_backward(
         # value-head group (its workspace bounded by segmented launches), or the cluster kernel of a group of two or
         # three (GROUP_TAILS); the FP32-partial cluster tails write dq / dk / dv through their token-row strides, into
         # the caller's views (``grad_qkv``) when given
+        if groups is not None:
+            # R form: group A's dhu_tc2 (the caller's stream) first, so the host work that makes the tail's outputs
+            # below runs while it does
+            na, ca = groups.split, groups.split_chunk
+
+            def dhu_tc2(s0, s1):
+                _launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
+                        dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
+                        segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
+                        1 if has_initial_state else 0, scale)  # fmt: skip
+
+            dhu_tc2(0, na)
         if grad_qkv is not None and form in F32X_TAILS:
             dq, dk, dv = grad_qkv() if callable(grad_qkv) else grad_qkv
         else:
@@ -2753,17 +2765,8 @@ def cake_gdn_nondet_train_backward(
             # R form: the caller's stream runs dhu_tc2 of group A (the full rounds; sequences, or the segments of a
             # split plan's pass 2), then the tail of A while the side stream runs dhu_tc2 of group B (the partial
             # round), then joins it and runs the tail of B
-            na, ca = groups.split, groups.split_chunk
-
-            def dhu_tc2(s0, s1):
-                _launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
-                        dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
-                        segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
-                        1 if has_initial_state else 0, scale)  # fmt: skip
-
             main = torch.cuda.current_stream(index)
             side = _side_stream(index, main)
-            dhu_tc2(0, na)
             fork = torch.cuda.Event()
             fork.record(main)
             try:
