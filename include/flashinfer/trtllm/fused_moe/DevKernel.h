@@ -403,6 +403,9 @@ struct Data {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
+  // The GEMM producing inPtr already stored every token with exactly one local expert in outPtr
+  // (scaled by its expert weight); only zero rows and multi-expert tokens remain.
+  bool mSingleExpertTokensDone{false};
 
   void* inPtr;
   void* inPtr2 = nullptr;

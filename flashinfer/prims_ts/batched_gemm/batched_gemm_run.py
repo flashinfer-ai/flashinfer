@@ -4392,6 +4392,18 @@ class _BatchedGemmExecutable:
     torch_stream: object = None
 
 
+def _fused_finalize_args(io: dict) -> tuple:
+    """MoE output, expanded-to-permuted map and routing weight pointers of a
+    fused-finalize launch; other launches pass typed placeholders."""
+    names = ("finalize_out_dp", "expanded_idx_dp", "expert_weights_dp")
+    if io["cfg"].fused_finalize_top_k:
+        missing = [name for name in names if name not in io]
+        if missing:
+            raise ValueError(f"a fused-finalize launch needs {', '.join(missing)}")
+        return tuple(io[name] for name in names)
+    return (io["c0_dp"], io["route_map_dp"], io["scale_c_dp"])
+
+
 def _compile_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for ``cute.compile(gemm, ...)``.
 
@@ -4420,6 +4432,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        *_fused_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
@@ -4476,6 +4489,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        *_fused_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
