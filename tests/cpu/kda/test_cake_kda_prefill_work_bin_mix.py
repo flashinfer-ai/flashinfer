@@ -469,25 +469,22 @@ def test_preload_scope_and_program_lookup(monkeypatch):
 
 def test_shipped_loader_names_the_bounded_preload_build():
     # The TMEM-preload build of the bounded N32 plain module's work-binned
-    # build: one program for sm_103a alone, beside the work-binned program
-    # (the route of every other work-binned launch, and of every work-binned
-    # launch on sm_100a).
+    # build: one program for both architectures, beside the work-binned
+    # program (the route of every other work-binned launch).
     routes = registry._RENDERED_WORK_BIN_PRELOAD_ROUTES
     assert set(routes) == {"sm_100a", "sm_103a"}
-    assert routes["sm_100a"] == {}
-    lookup = runtime._work_bin_preload_program
-    work_bin = WORK["sm_100a"][PRELOADED]
-    assert lookup(work_bin, "sm_100a", [64] * 64, 16, 148, True, True) is None
-    arch, sm_count = "sm_103a", 152
-    assert list(routes[arch]) == [PRELOADED], arch
-    program = routes[arch][PRELOADED]
-    work_bin = WORK[arch][PRELOADED]
-    assert program != work_bin and program not in TURN[arch].values()
-    assert registry._RENDERED_MODULES[program]["arches"] == ["sm_103a"]
-    assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, True) == program
-    assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, False) is None
-    assert lookup(work_bin, arch, [64] * 64, 16, sm_count, False, True) is None
-    assert lookup(work_bin, arch, [33] * 64, 16, sm_count, True, True) is None
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        assert list(routes[arch]) == [PRELOADED], arch
+        program = routes[arch][PRELOADED]
+        work_bin = WORK[arch][PRELOADED]
+        assert program != work_bin and program not in TURN[arch].values()
+        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
+        lookup = runtime._work_bin_preload_program
+        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, True) == program
+        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, False) is None
+        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, False, True) is None
+        assert lookup(work_bin, arch, [33] * 64, 16, sm_count, True, True) is None
+    assert routes["sm_100a"] == routes["sm_103a"]
 
 
 def test_long_task_program_lookup(monkeypatch):

@@ -5083,7 +5083,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_f1b44af522065ced48f5": {
         "sources": [
@@ -5915,7 +5915,9 @@ _RENDERED_WORK_BIN_TURN_E128_ROUTES: dict[str, dict[str, str]] = {
 # ``BF16_WORK_BIN_PRELOAD_MAX_LEN`` tokens and that have more tasks than SMs;
 # every other launch keeps the work-bin build.
 _RENDERED_WORK_BIN_PRELOAD_ROUTES: dict[str, dict[str, str]] = {
-    "sm_100a": {},
+    "sm_100a": {
+        "cake_kda_bf16_02c6dae5d13691ae05c3": "cake_kda_prefill_e9905516380b49c87387",
+    },
     "sm_103a": {
         "cake_kda_bf16_02c6dae5d13691ae05c3": "cake_kda_prefill_e9905516380b49c87387",
     },
