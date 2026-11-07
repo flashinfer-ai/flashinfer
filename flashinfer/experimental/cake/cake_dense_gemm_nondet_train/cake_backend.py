@@ -1916,6 +1916,19 @@ class _VerdictTable(dict):
 #: table for that SM count.  A SIMT window comes first and may overlap the windows after it: on a device where the
 #: table's windows do not hold, the token count takes the next window that holds it (the ``"waves"`` window of hidden
 #: 5120 below 129 tokens, as before the SIMT windows).
+#:
+#: A ``"det_s<n>"`` window runs the weight gradient on the deterministic program at ``n`` splits
+#: (:func:`router_det_splits`): the partials added in a fixed order, so the result repeats bit for bit.  Its accuracy
+#: was checked against the reference implementation (FlashInfer commit ``2e989556``) on six input kinds (random
+#: normal, long sums, mirrored and permuted cancellation, concentrated values, values near the largest magnitude):
+#: within 1.1 times the reference's median error on every kind.  Hidden 4096 takes 16 splits at 16172 to 16384 tokens
+#: (1.5 to 4 % faster than six on GB200 and GB300 parts), hidden 6144 six splits from 16129 to 16384 tokens, where the
+#: deterministic package's three splits missed that check on every kind (up to 2.0 times) and six, the reference's
+#: count, met it at 1 to 3 % more time.  Hidden 5120 keeps the deterministic package's nine splits there.  The
+#: head/tail partitions these rows ran before (hidden 5120 ``"H0.5x3"`` on both architectures, ``sm_103a`` hidden 4096
+#: ``"H1x4p44"`` and 6144 ``"H1x5p44"``, ``sm_107a`` hidden 5120 ``"H0.5x4"``) were 3 to 23 % faster than the
+#: deterministic program but varied run to run and missed the check (up to 1.94 times the reference's error), so the
+#: rows run the deterministic program there.
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -2028,16 +2041,14 @@ ROUTER_RULES: dict[
     #   than the deterministic plan through it, in every run on one part (no slower in the backward pass and the
     #   checkpointed step, 1.4 to 2.0 % faster alone in CUDA graphs); at 16385 and 20480 tokens (six splits) it was
     #   no slower than that plan: the window is 16385 to 20480 tokens.
-    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
-    ("sm_100a", "nn_t", 5120, 256): (
-        (1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3"), (16400, 28672, "H0.5x3"),
-    ),
-    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
-    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16385, 20480, "H1x5p44")),
+    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (16172, 16384, "det_s16")),
+    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves")),
+    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
+    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (16172, 16384, "det_s16")),
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves")),
+    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
     ("sm_107a", "nn_t", 4096, 256): None,
-    ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", "nn_t", 5120, 256): None,
     ("sm_107a", "nn_t", 6144, 256): None,
     # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096
     # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144 (outside the windows: at 192 tokens, at 224 and 256 at
@@ -2103,6 +2114,13 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: against FP64 of at most 2.1e-7 at the 124 (B200) and 120 (B300) measured token counts of the windows (10 seeds,
 #: worst of 20 runs; 0.95 to 2.66 times the deterministic program's).  Every other row and token count of these parts
 #: runs the deterministic program.
+#: The ``"det_s<n>"`` windows of these tables follow the check of :data:`ROUTER_RULES`: hidden 6144 takes six splits
+#: from 16129 to 16384 tokens on 148-SM parts (the deterministic package's three missed the check on B200; B300 runs the
+#: same arithmetic, its time not measured), B200 hidden 4096 16 splits at 16384 tokens (2.4 % faster than six there,
+#: not at 16172 or 16231 tokens), and 212-SM ``sm_107a`` parts hidden 5120 12 splits at 16172 to 16384 tokens (0.90 to
+#: 0.92 times the time of six, the deterministic package's count there; hidden 4096 and 6144 keep six, which met the
+#: check).  The 208- and 212-SM ``sm_107a`` head/tail windows ``"H0.5x4"`` missed the check (2 to 6 kinds, up to 1.63
+#: times) and are gone: those rows run the deterministic program.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -2110,9 +2128,11 @@ ROUTER_RULES_BY_SM: dict[
 ] = _VerdictTable({
     ("sm_100a", 148): _VerdictTable({
         ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
-        ("sm_100a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
+        ("sm_100a", "nn_t", 4096, 256): (
+            (1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2"), (16384, 16384, "det_s16"),
+        ),
         ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
-        ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
         ("sm_100a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
         ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"), (64, 128, "simt_n64m32s4")),
         ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
@@ -2121,7 +2141,7 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
         ("sm_103a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
         ("sm_103a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
-        ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
         ("sm_103a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
         ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"),),
         ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
@@ -2129,7 +2149,7 @@ ROUTER_RULES_BY_SM: dict[
     ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
-        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 5120, 256): None,
         ("sm_107a", "nn_t", 6144, 256): None,
     }),
     ("sm_107a", 212): _VerdictTable({
@@ -2137,8 +2157,8 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_107a", "kk", 5120, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
         ("sm_107a", "kk", 6144, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
         ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
-        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "nn_t", 6144, 256): ((1, 224, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "det_s12")),
+        ("sm_107a", "nn_t", 6144, 256): ((1, 224, "simt_n128m64s2"),),
         ("sm_107a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
         ("sm_107a", "kn", 5120, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
         ("sm_107a", "kn", 6144, 256): ((1, 64, "simt_n64m32s8"),),
@@ -2346,6 +2366,35 @@ def _router_is_simt(spec: Union[str, int, None]) -> bool:
     )
 
 
+_ROUTER_DET_SPEC = re.compile(r"det_s(\d+)")
+
+
+def router_det_spec_splits(spec: Union[str, int, None]) -> Optional[int]:
+    """The split count of a ``"det_s<n>"`` window spec (the deterministic program at ``n`` splits), else ``None``."""
+    if not isinstance(spec, str):
+        return None
+    m = _ROUTER_DET_SPEC.fullmatch(spec)
+    return int(m[1]) if m else None
+
+
+def router_det_splits(
+    layout: str, *, arch: str, M: int, N: int, K: int, sm_count: int
+) -> Optional[int]:
+    """The split count the deterministic program runs a weight-gradient launch ``[M, N] = [M, K] @ [K, N]`` (layout
+    class ``nn_t``, the swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens) with on a device of ``sm_count`` SMs:
+    ``n`` of the ``"det_s<n>"`` spec of the row's token window that holds ``K`` (:data:`ROUTER_RULES`, or the table of
+    the device's own SM count in :data:`ROUTER_RULES_BY_SM`; :func:`router_rules`), on a device where the table's
+    windows hold.  ``None``: no such window -- another layout class, a token or SM count outside those windows -- and
+    a launch without a caller's split count takes the deterministic package's split count of the row
+    (``router_splits``).  The deterministic program adds a tile's ``n`` partials in a fixed order (its ``torch.sum``,
+    or this package's partial sum where it serves the launch), so the result repeats bit for bit."""
+    if layout != "nn_t" or not router_rules(arch, sm_count)[1]:
+        return None
+    return router_det_spec_splits(
+        _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
+    )
+
+
 def router_simt_template(
     tile: tuple[Union[int, str], ...], layout: str = "nn_t"
 ) -> str:
@@ -2544,7 +2593,8 @@ def router_partition(
       :func:`router_waves` gives a partition against the deterministic package's split count of the row, its
       ``router_splits``); a row, token count or SM count without one, or a head/tail partition the token count cannot
       hold (:func:`router_partition_fits`), runs the deterministic program.  A SIMT window is no partition (``None``):
-      the launch runs the SIMT program there (:func:`router_simt`).
+      the launch runs the SIMT program there (:func:`router_simt`); nor is a ``"det_s<n>"`` window: the launch runs the
+      deterministic program at ``n`` splits (:func:`router_det_splits`).
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
     cannot be a head/tail partition: ``ValueError`` otherwise."""
@@ -2576,7 +2626,11 @@ def router_partition(
             spec = router_waves(m_pairs, n_tiles, k_iters, sm_count, det_splits)
         elif not router_rules(arch, sm_count)[1]:
             return None
-        if spec is None or _router_is_simt(spec):
+        if (
+            spec is None
+            or _router_is_simt(spec)
+            or router_det_spec_splits(spec) is not None
+        ):
             return None
     if layout == "kk" and router_head_tail(spec) is not None:
         raise ValueError(
@@ -3028,6 +3082,19 @@ def _k2_row_without_verdict(
     the planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
     planner."""
     return _k2_geometry_without_verdict(_k2_geometry(A, B, out), arch, sm_count)
+
+
+def _k2_det_splits(
+    A: torch.Tensor, B: torch.Tensor, arch: str, sm_count: int
+) -> Optional[int]:
+    """:func:`router_det_splits` of a call ``out = A @ B`` of the weight-gradient class (both operands MN-major, the
+    swapped launch ``[N, M] = [N, K] @ [K, M]``) on a device of ``arch`` with ``sm_count`` SMs; ``None`` for another
+    class or view (the deterministic package's split count of the row)."""
+    if A.dim() != 2 or B.dim() != 2 or not (_router_a_mn(A) and _router_b_mn(B)):
+        return None
+    M, K = (int(s) for s in A.shape)
+    N = int(B.shape[1])
+    return router_det_splits("nn_t", arch=arch, M=N, N=M, K=K, sm_count=sm_count)
 
 
 @dataclass(slots=True)
@@ -3696,8 +3763,8 @@ def _atomic_k2(
     """This package's K2 GEMM ``out = A @ B`` (FP32 through the BF16x3 emulation, or a SIMT program) of the layout
     classes ``kk`` / ``kn`` / ``nn_t``: ``op`` is ``"plan"``, ``"prepare"`` or ``"launch"`` as for
     :func:`_atomic_k1`.  A plan or a prepared launch :func:`plan_atomic_router` keeps on the deterministic program is
-    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: its split count of the row,
-    ``router_splits``); a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`;
+    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: the row's split count in the
+    router tables, :func:`_k2_det_splits`, else the deterministic package's, ``router_splits``); a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`;
     ``views``: an entry point's own launch views).
     ``enable_pdl`` (default: the device supports it) launches the split and the program as programmatic dependent
     launches."""
@@ -3709,6 +3776,8 @@ def _atomic_k2(
     plan, _ = plan_atomic_router(A, B, out, arch=arch, sm_count=sm_count, splits=splits)
     if plan is None:
         det = deterministic_backend()
+        if splits is None:
+            splits = _k2_det_splits(A, B, arch, sm_count)
         if op == "plan":
             return det.cake_dense_gemm_det_train_router_plan(A, B, out, splits=splits)
         return det.cake_dense_gemm_det_train_router_prepare(
@@ -4099,6 +4168,9 @@ class _CachedAtomic:
     memo: Any = field(default=None, repr=False)
     # the plan's launch can vary run to run (``not plan.reproducible``): PyTorch's alert before every launch
     order_varying: bool = False
+    # K2 without a plan and without a caller's split count: the deterministic program's split count of the row in the
+    # router tables (:func:`router_det_splits`), ``None``: the deterministic package's own
+    det_splits: Optional[int] = None
 
 
 #: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
@@ -4709,22 +4781,25 @@ def _plan_atomic_k2(
 ) -> _CachedAtomic:
     """Plan this package's K2 program for a key of :func:`_launch_cached_atomic_k2` (under ``_ATOMIC_PLAN_LOCK``):
     :func:`plan_atomic_router` on the device's architecture and SM count (``plan=None``: the planner keeps the row on
-    the deterministic program), the program's and fused split's entries, the BF16x3 stack in the arena of (device
+    the deterministic program, at the split count of :func:`_k2_det_splits` without a caller's), the program's and
+    fused split's entries, the BF16x3 stack in the arena of (device
     ``index``, raw ``stream``) and the argument lists bound with the PDL flag ``pdl`` (0 or 1); ``memo`` is the
     router-table memo the call read (``None`` with a caller's split count)."""
     det = deterministic_backend()
     device = out.device
     arch = det.require_arch(device)
+    sm_count = det.device_facts(device).sm_count
     plan, _ = plan_atomic_router(
         A,
         B,
         out,
         arch=arch,
-        sm_count=det.device_facts(device).sm_count,
+        sm_count=sm_count,
         splits=splits,
     )
     if plan is None:
-        return _CachedAtomic(plan=None, arch=arch, memo=memo)
+        det_n = None if splits is not None else _k2_det_splits(A, B, arch, sm_count)
+        return _CachedAtomic(plan=None, arch=arch, memo=memo, det_splits=det_n)
     _, split_src = _k2_views(A, B, plan)
     if plan.simt is not None:
         # the SIMT program: no stack, no split; the arena holds the stream context its launches enter
@@ -4888,7 +4963,8 @@ def _launch_cached_atomic_k2(
                 )
     plan = entry.plan
     if plan is None:
-        return _launch_cached_splitk_k2(A, B, out, splits, index, geometry, pdl, views)
+        det_n = splits if splits is not None else entry.det_splits
+        return _launch_cached_splitk_k2(A, B, out, det_n, index, geometry, pdl, views)
     a_view, split_src = _launch_views(A, B, plan, views)
     _launch_atomic_k2_binding(
         det, entry, out, a_view, split_src, index, stream, out_ptr
@@ -5163,6 +5239,8 @@ def _plan_k2_entry(
     key = _k2_key(index, stream, (splits, pdl), A, B, out, geometry, out.data_ptr())
     launch: Optional[Union[_CachedSplitK2, _CachedAtomic]] = None
     atomic = False
+    # the deterministic program's split count: the caller's, else the row's in the router tables (the planner's)
+    det_n = splits
     # the forward without a split count while no table gives it a verdict does not read ROUTES
     layout = route = None
     if splits is not None or op != "fwd" or memo.forward_verdicts:
@@ -5184,13 +5262,19 @@ def _plan_k2_entry(
             )
         if cached.plan is not None:
             launch, atomic = cached, True
+        elif splits is None:
+            det_n = cached.det_splits
     if launch is None:
+        if det_n != splits:
+            key = _k2_key(
+                index, stream, (det_n, pdl), A, B, out, geometry, out.data_ptr()
+            )
         launch = det._cache_get(_K2_SPLITK_CACHE, key)
         if launch is None:
             launch = _cache_insert(
                 _K2_SPLITK_CACHE,
                 key,
-                _plan_splitk_k2(A, B, out, splits, index, stream, pdl),
+                _plan_splitk_k2(A, B, out, det_n, index, stream, pdl),
             )
     plan = launch.plan
     if (
