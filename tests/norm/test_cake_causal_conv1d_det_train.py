@@ -1034,7 +1034,7 @@ def _sm_cta_band(arch: str, C: int) -> bool:
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
-    if C >= BWD_STAGE8_FROM[arch]:
+    if BWD_STAGE8_FROM[arch] <= C:
         return BWD_STAGE8
     if arch == "sm_107a" and C >= 520:
         return BWD_C520_R200
@@ -1085,10 +1085,22 @@ def test_backward_selection_literal_table() -> None:
         "kind": "channels_at_least",
     }
     assert loader.MODULES[BWD_ROW_GROUP_R200]["arches"] == ["sm_107a"]
-    band, fallback = (loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"]))
-    assert loader.select_rule(band) == {"channels": {"sm_107a": 520}, "kind": "channels_at_least"}
+    band, fallback = (
+        loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"])
+    )
+    assert loader.select_rule(band) == {
+        "channels": {"sm_107a": 520},
+        "kind": "channels_at_least",
+    }
     assert band["arches"] == fallback["arches"] == ["sm_107a"]
-    for key in ("launch", "grid_rule", "workspace_rule", "arg_plan", "logical", "reduce"):
+    for key in (
+        "launch",
+        "grid_rule",
+        "workspace_rule",
+        "arg_plan",
+        "logical",
+        "reduce",
+    ):
         assert band[key] == fallback[key], key
     for arch in loader.ARCHES:
         for S in BWD_SELECTION_TOKENS:
