@@ -549,7 +549,7 @@ def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
 
 
 @pytest.mark.parametrize(
-    "topk,chunks_per_block,topk_len", [(128, 2, 111), (512, 6, 389)]
+    "topk,chunks_per_block,topk_len", [(128, 2, 111), (256, 3, 197), (512, 6, 389)]
 )
 @pytest.mark.parametrize("with_sink", [False, True])
 @pytest.mark.parametrize("page_size", [64, 32, 48])
