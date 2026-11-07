@@ -154,14 +154,17 @@ def cake_moe_grouped_gemm_det_train_wgrad(
     instead, ``out[e] += G[e].T @ X[e]`` (Megatron's gradient-accumulation
     fusion into an fp32 or bf16 ``main_grad``; ``out`` required, bfloat16 or
     float32, ``out_dtype`` None or its dtype, no overlap of ``out`` with itself,
-    ``g``, ``x`` or ``offs``: ``ValueError``), and returns ``out``: the
-    deterministic weight gradient in ``out``'s dtype is written into a scratch
-    of that dtype and added with ``out.add_`` on the same stream, so ``out``
-    holds AccumulateGrad's bits of it, bitwise reproducible run to run.  The
-    scratch takes ``E * N * K`` elements (``4 * E * N * K`` bytes for fp32)
-    for the call; ``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)``
-    keeps it with a prepared launch (CUDA-graph capturable; every launch and
-    replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
+    ``g``, ``x`` or ``offs``: ``ValueError``), and returns ``out``, which holds
+    AccumulateGrad's bits of the deterministic weight gradient in its dtype,
+    bitwise reproducible run to run: fused into the 512-wide k tile's programs
+    (the main stage and the ordered tail reduce add into ``out`` in place)
+    where the route serves their accumulate builds for ``out``'s dtype, else
+    the overwrite into a scratch of ``out``'s dtype (``E * N * K`` elements,
+    ``4 * E * N * K`` bytes for fp32) added with ``out.add_`` on the same
+    stream; both give the same bits
+    (``cake_moe_grouped_gemm_det_train_prepare_wgrad`` and the package README
+    give the routes; a prepared launch is CUDA-graph capturable and every
+    launch and replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
     """
     from .cake_backend import cake_moe_grouped_gemm_det_train_prepare_wgrad
 
