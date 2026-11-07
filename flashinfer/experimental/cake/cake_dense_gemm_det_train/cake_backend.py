@@ -1069,7 +1069,7 @@ def instance_key(
         or sk_slab
         or htail
         or cgrp
-        or batch_group
+        or batch_group == 1
         or stt
         or ovl
         or ovr
@@ -1083,17 +1083,21 @@ def instance_key(
         or hints != ("none", "none")
         or pf
         or sh
-        or store_hint != "none"
+        or store_hint not in ("none", "evict_last")
+        or (store_hint != "none" and batch_group <= 1)
         or store_ef
         or quad_store
         or f32_v8
     ):
         # the eight-warp CTA form is written for the kn bf16 row-major 128 x 256 pair tile with the one-slot TMA-store
-        # epilogue, whole tiles and none of the pair programs' pipeline knobs (the kernel's frozen configurations)
+        # epilogue, whole tiles and none of the pair programs' pipeline knobs (the kernel's frozen configurations); the
+        # head-interleaved batch raster (``batch_group`` G > 1) and, with it, the ``evict_last`` store hint are the
+        # kernel's own knobs (the batched MLA programs)
         raise ValueError(
             f"form (the eight-warp CTA form) must be one of {W8_FORMS} on the kn bf16 row-major 128 x 256 pair tile "
-            f"with the one-slot TMA-store epilogue, the default stage count, plain hints and no tail, raster or "
-            f"pipeline knob; got form={form!r}, a_mn={a_mn}, b_mn={b_mn}, out_f32={out_f32}, out_t={out_t}, "
+            f"with the one-slot TMA-store epilogue, the default stage count, plain hints and no tail, raster (but a "
+            f"batch group G > 1) or pipeline knob (but the evict_last store hint with a batch group); got "
+            f"form={form!r}, a_mn={a_mn}, b_mn={b_mn}, out_f32={out_f32}, out_t={out_t}, "
             f"cta1={cta1}, block_n={block_n}, cta_rows={cta_rows}, epi={epi!r}, slots={slots}, b_swz={b_swz}, "
             f"box_rows={box_rows}, stages={stages}, hints={hints}, pd={pd}, pro={pro}, lw={lw}, mg={mg}, sw={sw}, "
             f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, sk_slab={sk_slab}, htail={htail}, "
@@ -1336,8 +1340,11 @@ def _single_wgrad_swap(
 # row's measured launch parameter.  The two sm_100a 4096 -> 48 input-gradient T-exact keys (T 16231 and 16384, the GB
 # T-exact rules) carry ``w8r`` too: the eight-warp program with the early accumulator release, whole tiles through the
 # one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).  The batched MLA
-# absorbed-query forward (N 512, K 192) carries ``w8r``.  Both MLA rows measured faster than the row's previous program
-# at the three T on GB200 and GB300; sm_103a reads them through ``RULE_PARENT``.
+# absorbed-query forward (N 512, K 192) carries ``w8rs`` too.  Both MLA rows add the head-interleaved batch raster
+# (``_bg<G>``): the forward over all 64 heads (``_bg64``), the value-projection row over 8 heads with the evict_last
+# output stores (``_bg8_sol``), raster group 2 for the forward; each measured faster than cuBLASLt's batched kernel at
+# the three T on GB200 and GB300.  sm_103a reads the forward's rule through ``RULE_PARENT``; its value-projection key
+# follows below (raster group 2).
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1360,11 +1367,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
-    # the MLA absorbed-query forward (batched 512 -> 192): the eight-warp program with the early accumulator release
-    ('sm_100a', False, True, False, False, True, 512, 192, None): {"form": 'w8r'},
-    # the MLA value-projection input gradient (batched 512 -> 256): the eight-warp program with the loader-issued
-    # scheduling queries and 256-byte L2 promotion, raster group 4
-    ('sm_100a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "promo": 'l2_256b', "group_m": 4},
+    # the MLA absorbed-query forward (batched 512 -> 192): the eight-warp program with the early accumulator release and
+    # the loader-issued scheduling queries, the head-interleaved raster over all 64 heads, raster group 2
+    ('sm_100a', False, True, False, False, True, 512, 192, None): {"form": 'w8rs', "batch_group": 64, "group_m": 2},
+    # the MLA value-projection input gradient (batched 512 -> 256): the same program with the head-interleaved raster of
+    # 8 heads, the evict_last output stores and 256-byte L2 promotion, raster group 4
+    ('sm_100a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "batch_group": 8, "store_hint": "evict_last", "promo": 'l2_256b', "group_m": 4},
     ('sm_100a', False, True, True, False, False, 2048, 4096, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
@@ -1776,6 +1784,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    # the batched MLA value-projection input gradient (512 -> 256) on GB300: sm_100a's program, raster group 2
+    ('sm_103a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "batch_group": 8, "store_hint": "evict_last", "promo": 'l2_256b', "group_m": 2},
     ('sm_103a', False, True, True, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, True, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, True, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
@@ -3199,10 +3209,14 @@ def cake_dense_gemm_det_train_projection_plan(
         # round 19 (Cake W2): slab path of the synchronised fixup (0 off, 1 early arrival, 2 + bulk slab read, 3 + fp32
         # output as the slab)  [Cake launcher]
         sk_slab = int(rule.get("sk_slab", 0))
+    rule_batch_group = batch_group is None
     if batch_group is None:
         batch_group = rule.get("batch_group", 0)
     # the raster knob only exists for batched rows (one batch entry: identical raster)  [Cake launcher]
     batch_group = int(batch_group) if L > 1 else 0
+    if rule_batch_group and batch_group > 1 and L % batch_group:
+        # a rule's raster group that does not divide this call's batch count yields: the row's program without it
+        batch_group = 0
     if batch_group < 0 or (batch_group > 1 and L % batch_group):
         raise ValueError(
             f"cake_dense_gemm_det_train_projection: batch_group must be 0, 1 or a divisor of the batch size {L}, got {batch_group}"
@@ -3463,14 +3477,18 @@ def cake_dense_gemm_det_train_projection_plan(
             or sk_first
             or exact_plan is not None
             or sync_plan is not None
-            or batch_group
+            or batch_group == 1
             or any(_caller_knobs.get(k) is not None for k in _W8_FIXED)
         ):
             form = ""
         else:
             lw, mg, sw, pd, pro, stages = False, False, 0, 0, 0, None
             hints, pf, sh = _PLAIN_HINTS, 0, 0
-            store_hint, store_ef, quad_store, f32_v8 = "none", False, False, False
+            # the batched MLA programs: the head-interleaved raster G > 1 with the rule's evict_last store hint
+            store_hint = (
+                store_hint if batch_group > 1 and store_hint == "evict_last" else "none"
+            )
+            store_ef, quad_store, f32_v8 = False, False, False
     elif form and not whole_tiles:
         raise ValueError(
             f"cake_dense_gemm_det_train_projection: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
