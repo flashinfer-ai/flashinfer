@@ -14,6 +14,7 @@
 
 """Schedule-verification regressions for BatchedGemm TS schedules."""
 
+import re
 import sys
 
 import pytest
@@ -1429,7 +1430,9 @@ def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mod
     def waits(task):
         return any(isinstance(r, PdlWaitBarrier) for r in task.src_resources)
 
-    # No kernel-entry wait: the tasks wait, and so do inactive early-exit CTAs.
+    # No kernel-entry wait: the tasks own the PDL wait. Inactive early-exit CTAs
+    # run no task; test_compiled_early_exit_kernel_pdl_instructions checks their
+    # wait in the compiled kernel.
     assert _pdl_task_waits(cfg)
     assert not task_manager._assume_pdl_wait_completed
 
@@ -1495,6 +1498,88 @@ def test_entry_wait_and_pdl_off_schedules_have_no_task_waits(use_pdl):
     assert not any(isinstance(r, PdlWaitBarrier) for r in resources)
     assert any(isinstance(r, PdlLaunchBarrier) for r in resources) == bool(use_pdl)
     assert task_manager._assume_pdl_wait_completed == bool(use_pdl)
+
+
+def _compile_sm100_ptx(tmp_path, monkeypatch, **cfg_overrides):
+    """Compile a BF16 batched GEMM for SM100 and return its PTX (no GPU needed)."""
+    import cutlass
+    from cutlass.cute.runtime import make_fake_stream, make_ptr
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
+
+    bf16, i32, f32 = cutlass.BFloat16, cutlass.Int32, cutlass.Float32
+    pointer_types = (
+        ("a_dp", bf16),
+        ("b_dp", bf16),
+        ("sfa_dp", bf16),
+        ("sfb_dp", bf16),
+        ("c0_dp", bf16),
+        ("sf_c_dp", bf16),
+        ("tile_idx_dp", i32),
+        ("route_map_dp", i32),
+        ("mn_limit_dp", i32),
+        ("num_non_exiting_ctas_dp", i32),
+        ("act_dp", bf16),
+        ("per_token_sf_a_dp", f32),
+        ("per_token_sf_b_dp", f32),
+        ("bias_dp", f32),
+        ("scale_c_dp", f32),
+        ("scale_gate_dp", f32),
+        ("gemm1_alpha_dp", f32),
+        ("gemm1_beta_dp", f32),
+        ("gemm1_clamp_limit_dp", f32),
+    )
+    io = {
+        name: make_ptr(dtype, (1 << 20) + 4096 * slot, cutlass.AddressSpace.gmem, 16)
+        for slot, (name, dtype) in enumerate(pointer_types)
+    }
+    m, n, k, num_experts, num_tokens = 256, 512, 1024, 2, 256
+    io.update(
+        cfg=make_config(**cfg_overrides),
+        shape=(m, n, k, num_experts, num_tokens),
+        launch_early_exit_max_token_ctas=4,
+        c_row_stride=m,
+    )
+    monkeypatch.setenv(
+        "FLASHINFER_PRIMS_TS_COMPILE_OPTIONS",
+        f"--opt-level 2 --gpu-arch sm_100a --keep-ptx --dump-dir {tmp_path}",
+    )
+    _compile_for_launch(io, make_fake_stream())
+    (ptx_path,) = tmp_path.glob("*.ptx")
+    return ptx_path.read_text()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    ("pdl", "num_waits", "num_launches"),
+    (
+        (dict(use_pdl=0), 0, 0),
+        # The kernel-entry wait covers every CTA path.
+        (dict(use_pdl=1), 1, 1),
+        # MoE FC2 on the static scheduler: the activation loader, the epilogue
+        # and the inactive early-exit CTAs each wait.
+        (dict(use_pdl=1, skip_early_exit_pdl=1), 3, 1),
+    ),
+    ids=("pdl_off", "entry_wait", "skip_early_exit_pdl"),
+)
+def test_compiled_early_exit_kernel_pdl_instructions(
+    tmp_path, monkeypatch, pdl, num_waits, num_launches
+):
+    ptx = _compile_sm100_ptx(
+        tmp_path,
+        monkeypatch,
+        **_pdl_schedule_kwargs("bf16_batch_m"),
+        use_early_exit=1,
+        **pdl,
+    )
+
+    def count(instruction):
+        return len(re.findall(rf"^\s*{re.escape(instruction)};", ptx, re.MULTILINE))
+
+    assert count("griddepcontrol.wait") == num_waits
+    assert count("griddepcontrol.launch_dependents") == num_launches
 
 
 @pytest.mark.cpu_only
