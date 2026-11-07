@@ -208,6 +208,9 @@ def _run_decode_graph_check(
         graph_ctas_per_sm=None,
         window_left=-1,
     )
+    # The capture helper installs live page metadata after its capture replay.
+    backend.graph.replay()
+    torch.cuda.synchronize()
     reference, _ = paged_attention_reference(
         q,
         k_fp8,
@@ -913,6 +916,7 @@ def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
         False,
         False,
         int(workspace.plan.page_size),
+        use_fp8_pv_repack=False,
     )
     assert traits.cta_tile_q == 16
     assert traits.cta_tile_kv == 64
