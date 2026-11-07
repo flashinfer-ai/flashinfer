@@ -1102,8 +1102,8 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w388-192tok",
         ),
-        # Off-contract low-head width beyond the three sparse tiles one
-        # producer partition owns: no kernel is exported, rejected up front.
+        # Low-head width beyond the three sparse tiles one producer
+        # partition owns: the M64 body (no architecture given).
         pytest.param(
             torch.float8_e4m3fn,
             32,
@@ -1112,8 +1112,8 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             True,
             640,
             64,
-            ValueError,
-            id="lowhead-w640-rejected",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+            id="lowhead-w640-m64",
         ),
         # BF16 H8/H16 rows with a compressed cache outside the source-exact
         # shape lock have no kernel either.
@@ -1268,9 +1268,9 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
 @pytest.mark.parametrize(
     "num_heads,batch_size,page_size,expected",
     [
-        # FP8 prefill rows of 16, 32 and 64 heads run the single-CTA M64 body
-        # (heads past num_heads predicated) for every batch size and cache
-        # layout: 2.1-5.2x faster than the low-head prefill producer on the
+        # FP8 prefill rows of 8, 16, 32 and 64 heads run the single-CTA M64
+        # body (heads past num_heads predicated) for every batch size and
+        # cache layout: faster than the low-head prefill producer on the
         # contract's 512-8192-token rows (GB300).
         (64, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (64, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
@@ -1278,10 +1278,8 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
         (32, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (16, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
-        # Without an architecture (as on SM100 / SM103) 8-head prefill rows
-        # keep the low-head prefill producer; SM107 runs them on the M64 body
-        # (test_sm107a_fp8_h8_prefill_rows_take_the_m64_body).
-        (8, 1, 64, "fp8_lowhead_prefill"),
+        (8, 1, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (8, 2, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         # FP8/H128 rows with 16+ tokens use the persistent body for every
         # batch size and cache layout (measured 1.12-1.75x vs trtllm-gen on
         # the 16-256 token MTP rows, topk4x and topk128x alike).
@@ -2733,23 +2731,23 @@ _SM107_SM_COUNT = 216
         (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
         (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
     ],
 )
-def test_sm107a_fp8_h8_prefill_rows_take_the_m64_body(
+def test_fp8_lowhead_prefill_rows_take_the_m64_body(
     arch, sm_count, sparse_topk, page_size, m64
 ):
-    """FP8 8-head prefill rows (``max_q_len >= 257``) run the M64 body on SM107
-    at every token count: the single-tile program for the SWA-only width, the
-    multi-tile program for wider items of either compressed cache layout.
-    SM100, SM103 and an unknown architecture keep the low-head prefill
-    producer; 16- and 32-head prefill rows run the M64 body everywhere."""
-    expected = m64 if arch == "sm_107a" else "fp8_lowhead_prefill"
+    """FP8 8-, 16- and 32-head prefill rows (``max_q_len >= 257``) run the M64
+    body on every architecture at every token count: the single-tile program
+    for the SWA-only width, the multi-tile program for wider items of either
+    compressed cache layout."""
     for batch_size, max_q_len, tokens, ragged in (
         (1, 257, 257, True),
         (2, 257, 386, True),
         (2, 512, 1024, False),
         (2, 1024, 2048, True),
         (1, 2048, 2048, True),
+        (2, 5462, 8192, True),
     ):
         for num_heads in (8, 16, 32):
             route = _route(
@@ -2764,44 +2762,113 @@ def test_sm107a_fp8_h8_prefill_rows_take_the_m64_body(
                 sm_count=sm_count,
                 arch=arch,
             )
-            want = expected if num_heads == 8 else m64
-            assert route == want, (num_heads, batch_size, max_q_len, tokens, route)
+            assert route == m64, (num_heads, batch_size, max_q_len, tokens, route)
             if arch is not None:
                 assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("page_size", [2, 64])
-def test_fp8_h8_prefill_wider_than_1152_is_rejected(arch, page_size):
-    """8-head prefill items wider than 1152 sparse slots have no FP8 kernel:
-    the low-head prefill producer stages at most 1152 indices per item (nine
-    tiles of 128) and the M64 bindings require ``sparse_topk <= 1152``.  The
-    route raises instead of launching a producer that writes past its
-    shared-memory index buffer.  1152 itself still routes: the multi-tile M64
-    program on SM107, the low-head prefill producer elsewhere."""
-    assert cake._FP8_M64_MAX_WIDTH == 1152
-    assert cake._FP8_LOWHEAD_PREFILL_MAX_WIDTH == 1152
-    kwargs = dict(
-        dtype=torch.float8_e4m3fn,
-        num_heads=8,
-        batch_size=1,
-        max_q_len=1024,
-        ragged=True,
-        compressed_page_size=page_size,
-        num_query_tokens=1024,
-        sm_count=_SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT,
-        arch=arch,
+def test_fp8_wider_than_1152_is_rejected_on_every_path(arch, num_heads, page_size):
+    """No FP8 body takes an item wider than 1152 sparse slots (the persistent and
+    M64 bindings check it; the low-head producers would write past their
+    shared-memory index buffer).  Every FP8 path -- decode, MTP and prefill
+    rows of every head count -- raises one ValueError from the route before
+    any launch, naming the width, the limit, the C128 layers past 128K context
+    that reach it and the routes that run them; 1152 itself still routes."""
+    assert cake._FP8_MAX_WIDTH == 1152
+    sm_count = _SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT
+    shapes = (
+        (1, 1, 1, False),  # one decode token
+        (64, 1, 64, False),
+        (256, 1, 256, False),  # past one wave
+        (16, 4, 64, False),  # MTP
+        (3, 5, 9, True),  # ragged MTP
+        (1, 257, 257, True),  # prefill
+        (2, 2048, 4096, True),
     )
-    expected = (
-        "fp8_h64_prefill_source_persistent_m64_multi_tile"
-        if arch == "sm_107a"
-        else "fp8_lowhead_prefill"
-    )
-    assert _route(sparse_topk=1152, **kwargs) == expected
-    for sparse_topk in (1156, 1280, 2048):
-        with pytest.raises(ValueError, match=r"sparse_topk \d+ > 1152"):
-            _route(sparse_topk=sparse_topk, **kwargs)
+    for batch_size, max_q_len, tokens, ragged in shapes:
+        kwargs = dict(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            ragged=ragged,
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=sm_count,
+            arch=arch,
+        )
+        if arch != "sm_107a" or num_heads in (64, 128) or max_q_len >= 257:
+            assert _route(sparse_topk=1152, **kwargs).startswith("fp8_")
+        for sparse_topk in (1153, 1156, 1280, 2176, 4224):
+            with pytest.raises(ValueError) as excinfo:
+                _route(sparse_topk=sparse_topk, **kwargs)
+            message = str(excinfo.value)
+            assert f"sparse_topk {sparse_topk}" in message
+            assert "at most 1152 sparse slots" in message
+            assert "past 128K context" in message
+            assert "backend='trtllm-gen'" in message
+            assert "kv_cache_format='nvfp4'" in message
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, 152, _SM107_SM_COUNT])
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_fp8_lowhead_wide_decode_rows_take_the_persistent_or_m64_body(
+    arch, num_heads, sm_count, page_size
+):
+    """FP8 decode rows (``max_q_len < 257``) of 8, 16 or 32 heads wider than one
+    producer partition (385-1152 sparse slots: C4 at 640 or 1152, C128 past
+    32K context).  32 heads on SM100 and SM103 run the FP8/H128 persistent
+    body while its two CTAs per token fit one wave and the M64 body past it;
+    8 and 16 heads (whose O rows the persistent epilogue's 32-row boxes would
+    overrun), SM107 and an unknown architecture run the M64 body at every
+    token count.  Widths up to 384 keep the one-partition producer."""
+    m64 = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    for sparse_topk in (385, 512, 640, 1024, 1152):
+        for tokens in (1, 12, 13, 64, sm_count // 2, sm_count // 2 + 1, 256, 1024):
+            for max_q_len, ragged in ((1, False), (4, False), (6, True)):
+                if max_q_len > tokens:
+                    continue
+                route = _route(
+                    dtype=torch.float8_e4m3fn,
+                    num_heads=num_heads,
+                    batch_size=-(-tokens // max_q_len),
+                    max_q_len=max_q_len,
+                    ragged=ragged,
+                    sparse_topk=sparse_topk,
+                    compressed_page_size=page_size,
+                    num_query_tokens=tokens,
+                    sm_count=sm_count,
+                    arch=arch,
+                )
+                one_wave = 2 * tokens <= sm_count
+                if num_heads == 32 and arch in ("sm_100a", "sm_103a") and one_wave:
+                    expected = cake._fp8_persistent_program(tokens)
+                else:
+                    expected = m64
+                assert route == expected, (sparse_topk, tokens, max_q_len, route)
+                if arch is not None:
+                    assert route in _ARCH_REGISTRATIONS[arch]["variants"]
+    for sparse_topk in (260, 384):
+        route = _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=16,
+            max_q_len=1,
+            ragged=False,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=16,
+            sm_count=sm_count,
+            arch=arch,
+        )
+        assert route == "fp8_lowhead_one_partition"
 
 
 @pytest.mark.cpu_only
@@ -2892,7 +2959,8 @@ def test_sm107a_lowhead_m64_routes_need_the_low_head_workspace(
     num_heads, num_query_tokens, max_q_len, batch_size, sparse_topk, page_size
 ):
     """The sizing API routes by the architecture as the launch does; the M64
-    routes that replace the low-head prefill producer on SM107 carve the same
+    routes that replace the low-head prefill producer (on SM107 the SWA-only
+    decode rows past one wave, everywhere the prefill rows) carve the same
     one-split workspace (LSE region only)."""
     shape = dict(
         dtype=torch.float8_e4m3fn,
@@ -2907,8 +2975,8 @@ def test_sm107a_lowhead_m64_routes_need_the_low_head_workspace(
     )
     low = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
     m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
-    assert low.route == "fp8_lowhead_prefill"
     assert m64.route == cake._fp8_h64_m64_program(sparse_topk)
+    assert low.route == ("fp8_lowhead_prefill" if max_q_len < 257 else m64.route)
     assert m64.num_splits == 1 and m64.uses_workspace
     assert (low.single_launch_bytes, low.minimum_bytes) == (
         m64.single_launch_bytes,
