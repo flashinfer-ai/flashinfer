@@ -391,7 +391,7 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     here: the keyword-only ``p_rule`` on the GDN side, the private test hook on the KDA side)."""
     from tests.test_helpers.cake_package import cake_package
 
-    kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")  # the test only
+    kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")  # the test only
     # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with open(path) as fh:
