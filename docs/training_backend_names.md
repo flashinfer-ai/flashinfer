@@ -225,6 +225,7 @@ Family rename PRs:
 | LM head + loss | nondet | #8952 |
 | DSA indexer | det | #8936 |
 | GQA HD256 | nondet | #8939 |
+| KDA | nondet (single rank and KCP) | KDA family PR |
 
 ### GQA HD256: non-deterministic package
 
@@ -244,3 +245,28 @@ Family rename PRs:
 No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
 
 Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
+
+### KDA: non-deterministic packages (single rank and KCP)
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.cake_kda_train` (mode selector, `deterministic=` keyword) | `flashinfer.cake_kda_nondet_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.experimental.cake.cake_kda_train` | `flashinfer.experimental.cake.cake_kda_nondet_train` |
+| `chunk_kda` | `cake_kda_nondet` |
+| `chunk_kda_fwd` / `chunk_kda_bwd` | `cake_kda_nondet_train_forward` / `cake_kda_nondet_train_backward` |
+| `kda_train_arena`, `kda_train_workspace`, `kda_train_workspace_bytes`, `kda_train_saved_bytes` | `cake_kda_nondet_train_arena`, `cake_kda_nondet_train_workspace`, `cake_kda_nondet_train_workspace_bytes`, `cake_kda_nondet_train_saved_bytes` |
+| `is_kda_train_supported` | `is_cake_kda_nondet_train_supported` |
+| backend `ChunkKDAFunction`, `KdaWorkspace`, `KdaChunkSaved`, `KdaArena` | `CakeKDANondetFunction`, `CakeKDANondetWorkspace`, `CakeKDANondetChunkSaved`, `CakeKDANondetArena` |
+| module `flashinfer.cake_kda_train_kcp` | `flashinfer.cake_kda_nondet_train_kcp` (stable API, `@flashinfer_api`) |
+| package `flashinfer.experimental.cake_kda_train_kcp` | `flashinfer.experimental.cake.cake_kda_nondet_train_kcp` |
+| `chunk_kda_kcp` | `cake_kda_nondet_kcp` |
+| `chunk_kda_fwd_kcp` / `chunk_kda_bwd_kcp` | `cake_kda_nondet_train_kcp_forward` / `cake_kda_nondet_train_kcp_backward` |
+| `partition_kcp`, `build_context_kcp` | `cake_kda_nondet_train_kcp_partition`, `cake_kda_nondet_train_kcp_build_context` |
+| `kda_workspace_bytes_kcp`, `kda_saved_bytes_kcp`, `kda_comm_bytes_kcp`, `kda_handoff_bytes_kcp` | `cake_kda_nondet_train_kcp_workspace_bytes`, `cake_kda_nondet_train_kcp_saved_bytes`, `cake_kda_nondet_train_kcp_comm_bytes`, `cake_kda_nondet_train_kcp_handoff_bytes` |
+| `reduce_gate_param_grads_kcp`, `kcp_handoff_stats` | `cake_kda_nondet_train_kcp_reduce_gate_param_grads`, `cake_kda_nondet_train_kcp_handoff_stats` |
+| `ContextKcp`, `PartitionKcp`, `WorkspaceKcp`, `SavedKcp`, `RecomputeHandleKcp`, `OptionsKcp` | `CakeKDANondetKcpContext`, `CakeKDANondetKcpPartition`, `CakeKDANondetKcpWorkspace`, `CakeKDANondetKcpSaved`, `CakeKDANondetKcpRecomputeHandle`, `CakeKDANondetKcpOptions` |
+| backend `ChunkKDAFunctionKcp`, `CallKcp`, `FragmentKcp` | `CakeKDANondetKcpFunction`, `CakeKDANondetKcpCall`, `CakeKDANondetKcpFragment` |
+
+No aliases: the old names fail at import. No entry takes `deterministic=`; the former selector default (`deterministic=True` ran the deterministic package) is gone, so a caller of the deterministic path imports `flashinfer.cake_kda_det_train` / `flashinfer.cake_kda_det_train_kcp`. No launch of these packages is unordered: under `torch.use_deterministic_algorithms(True)` (also with `warn_only=True`) the entries run the non-deterministic package and raise no alert and no warning; nothing falls back to the deterministic package. A workspace, saved set or arena option of the deterministic package is refused with `ValueError` naming the mode.
+
+Build identities keep their names: program / library stems `cake_kda_train_<20 hex>[_kcp]`, kernel symbols, csrc file names and the `cake_jit` / `cake_kcp_jit` records; `build.json` changes only `"package"`, and the KCP package's `build.json` / `build.test.json` declare their single-rank sibling in `common.requires.packages` (`["cake_kda_nondet_train"]`). The KCP package imports that sibling by name from its own parent package (`_single_rank.py`), so vendoring builds ship the two directories side by side. Internal backend helpers (`plan`, `workspace_bytes`, `saved_bytes`, `kcp_plan`, `KcpPreconditionError`, ...) keep their names.

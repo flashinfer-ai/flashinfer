@@ -4924,6 +4924,118 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 411,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_spred_dpl_trows",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 411,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_fadd_dpl_trows",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": {
         "arches": [
             "sm_107a",
@@ -8141,6 +8253,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
+            "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows",
         ],
@@ -8893,6 +9007,13 @@ FWD_MAP_XNRM = {
     "sm_103a": ((64, 6144),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
+# FWD_MAP_XNRM_PATHS: extra _xn bands per architecture and call path (as PDL_PATHS);
+# the forward path runs fwd_prepare, the checkpoint path fwd_recompute. H 4096 only.
+FWD_MAP_XNRM_PATHS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {"checkpoint": ((7168, 7680),)},
+    "sm_103a": {},
+    "sm_107a": {},
+}
 # FWD_COEF_REGIMES: the coefficient pass's dispatch per architecture, in grid units of the 8-token CTA (grid =
 # ceil(T / 8) = mhc_det_fwd_coef.grid_rule(T, tokens_per_cta=8); every form bitwise the production chain). "round5" =
 # the `form_overrides(T, sm_count, P_K)` of record on sm_103a (P_K = the host rule's K-unit
@@ -9184,6 +9305,8 @@ BWD_REDUCE_GRID = {
     "s27_wcvt_fadd_fshfl_dpl": 411,
     "wpu4_fadd_dpl": 411,
     "wpu4_spred_dpl": 411,
+    "wpu4_fadd_dpl_trows": 411,
+    "wpu4_spred_dpl_trows": 411,
 }
 # BWD_DPL_BANDS: (above, at_most) token-count bands per architecture where the column-slab pass stores the dfn_part
 # partials with the L2 policy EVICT_LAST and the final reduction loads them EVICT_FIRST: the
@@ -9206,6 +9329,18 @@ BWD_DPL_BANDS = {
     "sm_100a": ((4095, 8192),),
     "sm_103a": (),
     "sm_107a": (),
+}
+# BWD_DPL_PATHS: extra _dpl bands per architecture and call path (backward / checkpoint:
+# both run bwd_finish). H 4096 only.
+BWD_DPL_PATHS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {
+        "backward": (
+            (8192, 15590),
+            (16132, 16263),
+        )
+    },
+    "sm_103a": {},
+    "sm_107a": {},
 }
 BWD_DPL_SLABS = ("dynl", "dynr")  # the K7 programs with a _dpl form
 # K5_GRID_BANDS: (above, at_most, grid_per_sm) per architecture -- the backward prepare's launch grid by token count
@@ -9530,7 +9665,7 @@ def fn_split_grid(
 
 
 def fwd_map_program(
-    T, sm_count, arch, hidden=HIDDEN
+    T, sm_count, arch, hidden=HIDDEN, path=None
 ):  # -> the mapping-pass program of record for T tokens
     program = _tab("FWD_MAP_PRODUCTION", hidden)
     for above, at_most, band in _tab("FWD_MAP_BANDS", hidden)[arch]:
@@ -9558,6 +9693,13 @@ def fwd_map_program(
     for above, at_most in _tab("FWD_MAP_XNRM", hidden)[arch]:  # the X loads hinted
         if above < T <= at_most:
             program += "_xn"
+    if (
+        path is not None
+        and int(hidden) == HIDDEN
+        and not program.endswith("_xn")
+        and _in_bands(T, FWD_MAP_XNRM_PATHS.get(arch, {}).get(path, ()))
+    ):  # the X loads hinted on this call path only
+        program += "_xn"
     return program
 
 
@@ -9663,7 +9805,7 @@ def bwd_token_program(
 
 
 def bwd_slab_program(
-    T, sm_count, arch, hidden=HIDDEN
+    T, sm_count, arch, hidden=HIDDEN, path=None
 ):  # -> the column-slab pass's program of record for T tokens
     program = _tab("BWD_SLAB_PROGRAM", hidden)[arch]
     for above, at_most, band in _tab("BWD_SLAB_BANDS", hidden)[
@@ -9682,9 +9824,17 @@ def bwd_slab_program(
             units <= sm_count or kept
         ):  # one round of K7 units, or a chunk count / (P, T) run the band keeps on xrsg
             program = fit[1]
-    if program in BWD_DPL_SLABS and _in_bands(
-        T, _tab("BWD_DPL_BANDS", hidden)[arch]
-    ):  # the dfn_part partials kept in L2 for the final reduction
+    if (
+        program in BWD_DPL_SLABS
+        and (
+            _in_bands(T, _tab("BWD_DPL_BANDS", hidden)[arch])
+            or (
+                path is not None
+                and int(hidden) == HIDDEN
+                and _in_bands(T, BWD_DPL_PATHS.get(arch, {}).get(path, ()))
+            )
+        )
+    ):  # the dfn_part partials kept in L2 for the final reduction (+ the call path's bands)
         program += "_dpl"
     return program
 
@@ -9696,7 +9846,7 @@ def _in_bands(
 
 
 def bwd_reduce_program(
-    T, sm_count, arch, hidden=HIDDEN
+    T, sm_count, arch, hidden=HIDDEN, path=None
 ):  # -> the final reduction's program of record for T tokens
     program = _tab("BWD_REDUCE_PROGRAM", hidden)[arch]
     for band, above, at_most in _tab("BWD_REDUCE_REGIMES", hidden)[arch]:
@@ -9710,7 +9860,7 @@ def bwd_reduce_program(
         for refined, p_min, p_max in parts:
             if p_min <= P and (p_max is None or p_max >= P):
                 program = refined
-    if bwd_slab_program(T, sm_count, arch, hidden).endswith(
+    if bwd_slab_program(T, sm_count, arch, hidden, path).endswith(
         "_dpl"
     ):  # the column-slab pass kept dfn_part in L2: the form loading it EVICT_FIRST
         program += "_dpl"
@@ -10149,6 +10299,7 @@ def carried_modules(
     rows: int,
     sm_count: int,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    path: Optional[str] = None,
 ) -> tuple[str, ...]:
     """:func:`selected_modules` of a checkpoint-carry call: ``fwd_recompute`` with the
     dual-layout fn split of :data:`FN_SPLIT_CARRY` in place of its fn split, ``bwd_finish``
@@ -10161,7 +10312,13 @@ def carried_modules(
             f"no checkpoint carry of the {route_key(hidden, kind)!r} route on {arch!r}"
         )
     names = selected_modules(
-        arch, hidden, kind, rows=rows, sm_count=sm_count, sinkhorn_iters=sinkhorn_iters
+        arch,
+        hidden,
+        kind,
+        rows=rows,
+        sm_count=sm_count,
+        sinkhorn_iters=sinkhorn_iters,
+        path=path,
     )
     if MODULES[names[0]]["role"] not in ("fn_split_fwd", "fn_split_bwd"):
         raise ValueError(
@@ -10186,6 +10343,8 @@ SELECT_RULE_KINDS = (
 # record: a call at another count needs the role's run-time-count record.
 RUN_TIME_ITERS_ROLES = ("fwd_coef", "bwd_token")
 # The host rules a ``program`` selection rule may name (the record's program key must equal the rule's value).
+# the program rules that read the call path
+PATH_PROGRAM_RULES = ("fwd_map_program", "bwd_slab_program", "bwd_reduce_program")
 PROGRAM_RULES = (
     "fwd_map_program",
     "fwd_coef_program",
@@ -10202,6 +10361,7 @@ def _selects(
     arch: str,
     sinkhorn_iters: int = SINKHORN_ITERS,
     hidden: int = HIDDEN,
+    path: Optional[str] = None,
 ) -> bool:
     if rule is None:
         return True
@@ -10215,7 +10375,11 @@ def _selects(
             raise ValueError(
                 f"unknown Cake mHC training program rule: {rule['rule']!r}"
             )
-        program = globals()[rule["rule"]](rows, sm_count, arch, hidden)
+        program = (
+            globals()[rule["rule"]](rows, sm_count, arch, hidden, path=path)
+            if rule["rule"] in PATH_PROGRAM_RULES
+            else globals()[rule["rule"]](rows, sm_count, arch, hidden)
+        )
         if (
             rule["rule"] == "bwd_reduce_program"
             and int(sinkhorn_iters) != SINKHORN_ITERS
@@ -10259,6 +10423,7 @@ def selected_modules(
     rows: int,
     sm_count: int,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    path: Optional[str] = None,
 ) -> tuple[str, ...]:
     """Ordered module names one public call launches on ``arch`` for ``rows`` tokens
     on a device of ``sm_count`` SMs.
@@ -10336,6 +10501,7 @@ def selected_modules(
             arch,
             sinkhorn_iters,
             MODULES[name]["hidden"],
+            path,
         )
     )
     if not names:

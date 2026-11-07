@@ -40,7 +40,6 @@ import gc
 import json
 import os
 import tempfile
-import types
 
 import pytest
 import torch
@@ -95,7 +94,9 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _setup(rank: int, W: int, row, port: int, local_id: int):
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
 
     lengths, _w, layout, Cs = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -104,8 +105,8 @@ def _setup(rank: int, W: int, row, port: int, local_id: int):
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
         part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
     )
     g = torch.Generator(device="cpu").manual_seed(7815)
@@ -349,11 +350,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         cake_kcp_plan as gplan,
     )
 
-    # ``_partition`` reads the partition function under the KDA plan module's name
-    gdn_plan = types.SimpleNamespace(
-        partition_det_kcp=gplan.cake_gdn_det_train_kcp_partition
-    )
-    gpart, _ = _partition(gdn_plan, row[0], W, row[2])
+    gpart, _ = _partition(gplan.cake_gdn_det_train_kcp_partition, row[0], W, row[2])
     gctx = gplan.cake_gdn_det_train_kcp_build_context(
         gpart, dist.group.WORLD, rank, device
     )

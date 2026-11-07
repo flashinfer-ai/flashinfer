@@ -745,6 +745,7 @@ def _route_plan(
             rows=rows,
             sm_count=sm_count,
             sinkhorn_iters=sinkhorn_iters,
+            path=path,
         ):
             record = _loader.MODULES[name]
             logical = record["logical"]
