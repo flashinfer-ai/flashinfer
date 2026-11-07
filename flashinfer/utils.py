@@ -1402,7 +1402,9 @@ def backend_requirement(
         the validation of that call. For a mode that replaces the backends altogether, e.g.
         ``mm_bf16(..., batch_invariant=True)``, which never runs a backend and raises its own typed errors:
         evaluating every backend's requirement checks and the auto heuristic for it is pure host overhead.
-        The predicate runs on every call, so keep it a cheap keyword lookup.
+        The predicate runs on every call, so keep it a cheap keyword lookup. It gets the call's arguments as passed
+        (no defaults applied, positional arguments not bound to names), so key it on a keyword-only parameter: a
+        positional-or-keyword flag passed by position would silently never bypass.
 
     Returns
     -------

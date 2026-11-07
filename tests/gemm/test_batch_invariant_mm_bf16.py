@@ -607,12 +607,15 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, layout, bi
 
 
 @needs_device
-def test_public_api_skips_backend_selection():
+def test_public_api_skips_backend_selection(monkeypatch):
     """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
     for it (host cost only): a selecting call rewrites `mm_bf16.suitable_auto_backends`, a bypassed one leaves it."""
     a, b = rnd_bf16(16, 4096, 121), rnd_bf16(4096, 4096, 122)
     sentinel = ["sentinel"]
-    flashinfer.mm_bf16.suitable_auto_backends = sentinel
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.mm_bf16, "suitable_auto_backends", sentinel, raising=False
+    )
     bi_mm(a, b)
     assert flashinfer.mm_bf16.suitable_auto_backends is sentinel
     flashinfer.mm_bf16(a, b, backend="auto")  # the regular path still selects
