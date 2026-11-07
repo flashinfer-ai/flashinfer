@@ -71,6 +71,7 @@ def gemm_kernel_persistent(
     GROUP_SIZE_M: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
+    """Multiply strided matrices with persistent CTAs and an FP32 alpha/beta epilogue."""
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -246,6 +247,7 @@ def gemm_kernel(
     BLOCK_SIZE_K: tl.constexpr,  #
     GROUP_SIZE_M: tl.constexpr,  #
 ):
+    """Multiply strided matrices with one program per tile and an FP32 epilogue."""
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)

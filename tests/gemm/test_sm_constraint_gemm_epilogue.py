@@ -16,6 +16,7 @@ from flashinfer.triton.kernels import sm_constraint_gemm
     ],
 )
 def test_sm_constraint_gemm_epilogue(kernel_name, dtype, value, alpha, beta, initial_c):
+    """Check scaling against an FP32 reference without intermediate output casts."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if torch.cuda.get_device_capability()[0] < 8:
