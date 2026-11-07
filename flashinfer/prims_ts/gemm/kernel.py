@@ -1671,6 +1671,9 @@ class GmemDResource(MemoryResource):
         tile. ``weight_scale`` for the tile-N-wide N tile is cooperatively
         staged to SMEM, then read while the tile is stored.
 
+    Optional ``delta`` of shape [M, N] (GEMM columns, BF16 output only) is
+    added after scale/bias, before the gated activation or QKNorm.
+
     Optional gated activation (after scale/bias): neighbouring GEMM columns
     are (gate, act) pairs from an interleaved weight layout. Each 32-wide
     TMEM subtile yields 16 outputs, ``gate * silu(act)``, stored to D of
@@ -1696,6 +1699,7 @@ class GmemDResource(MemoryResource):
     scale_c: Any = field(init=False, default=None)
     scale_gate: Any = field(init=False, default=None)
     qkv_scale: Any = field(init=False, default=None)
+    delta: Any = field(init=False, default=None)
     x_scale_reg: Any = field(init=False, default=None)
     weight_scale_smem: Any = field(init=False, default=None)
     mC_mn: Any = field(init=False, default=None)
@@ -1733,6 +1737,7 @@ class GmemDResource(MemoryResource):
         k_norm_weight: Optional[cute.Tensor] = None,
         cos_sin_cache: Optional[cute.Tensor] = None,
         positions: Optional[cute.Tensor] = None,
+        delta: Optional[cute.Tensor] = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -1750,6 +1755,7 @@ class GmemDResource(MemoryResource):
         self.k_norm_weight = k_norm_weight
         self.cos_sin_cache = cos_sin_cache
         self.positions = positions
+        self.delta = delta
         self.position_reg = cutlass.Int64(0)
         self.x_scale_reg = cutlass.Float32(1.0)
         self.norm_sum = cutlass.Float32(0.0)
@@ -2031,6 +2037,30 @@ class GmemDResource(MemoryResource):
         return value
 
     @cute.jit
+    def _delta_ptr(self, row, col):
+        safe_row = row
+        if row >= self.mC_mn.shape[0]:
+            safe_row = cutlass.Int32(0)
+        return (
+            self.delta.iterator.raw_ptr()
+            + cutlass.Int64(safe_row) * cutlass.Int64(self.delta.shape[1])
+            + cutlass.Int64(col)
+        )
+
+    @cute.jit
+    def _add_delta_vec(self, vec_f32, row, chunk_col, count: cutlass.Constexpr[int]):
+        delta_vec = (
+            self._delta_ptr(row, chunk_col)
+            .load(count=count, alignment=16)
+            .to(cutlass.Float32)
+        )
+        return vec_f32 + delta_vec
+
+    @cute.jit
+    def _add_delta_scalar(self, value, row, col_idx) -> cutlass.Float32:
+        return value + self._delta_ptr(row, col_idx).load().to(cutlass.Float32)
+
+    @cute.jit
     def _gated_pair_silu(self, vec_f32, count: cutlass.Constexpr[int]):
         """Neighbouring columns are (gate, act); return gate * silu(act)."""
         outs = []
@@ -2205,6 +2235,7 @@ class GmemDResource(MemoryResource):
             mma_tiler_mnk[1] // 2 // self.t2r_inst_repx
         )
         chunk_col = coordc_n + global_subtile_idx * self.t2r_inst_repx
+        row = coordc_m + tx % 128
         qkv_hidden = self.mC_mn.shape[1] // 3
         if chunk_col < 2 * qkv_hidden:
             bias_ptr = self.bias.iterator.raw_ptr() if self.bias is not None else None
@@ -2215,6 +2246,8 @@ class GmemDResource(MemoryResource):
                 scaled = self._apply_linear_epilogue_vec(
                     vec_f32, vec_col, local_col, bias_ptr, self.vsize
                 )
+                if cutlass.const_expr(self.delta is not None):
+                    scaled = self._add_delta_vec(scaled, row, vec_col, self.vsize)
                 # The unfused path writes BF16 from fp8_scaled_mm before the
                 # standalone QKNorm+RoPE kernel reads it back.
                 rounded = scaled.to(output_dtype).to(cutlass.Float32)
@@ -2394,6 +2427,10 @@ class GmemDResource(MemoryResource):
                 scaled_vec = self._apply_linear_epilogue_vec(
                     vec_f32, chunk_col, local_col, bias_ptr, self.vsize
                 )
+                if cutlass.const_expr(self.delta is not None):
+                    scaled_vec = self._add_delta_vec(
+                        scaled_vec, row, chunk_col, self.vsize
+                    )
                 if cutlass.const_expr(use_fused_qknorm_rope):
                     scaled_vec = self._apply_qknorm_rope_vec(
                         scaled_vec, chunk_col, self.vsize
@@ -2457,6 +2494,9 @@ class GmemDResource(MemoryResource):
                                     local_col + 2 * i + 1,
                                     bias_ptr,
                                 )
+                                if cutlass.const_expr(self.delta is not None):
+                                    gate = self._add_delta_scalar(gate, row, gate_col)
+                                    act = self._add_delta_scalar(act, row, act_col)
                                 output_local_col = j * out_vsize + i
                                 if cutlass.const_expr(use_tma_store):
                                     (
@@ -2482,6 +2522,8 @@ class GmemDResource(MemoryResource):
                             value = self._apply_linear_epilogue_scalar(
                                 vec_f32[i], col_idx, local_col + i, bias_ptr
                             )
+                            if cutlass.const_expr(self.delta is not None):
+                                value = self._add_delta_scalar(value, row, col_idx)
                             output_local_col = j * self.vsize + i
                             if cutlass.const_expr(use_tma_store):
                                 (
@@ -2662,6 +2704,7 @@ def create_gmem_d_resource(
     k_norm_weight: Optional[cute.Tensor] = None,
     cos_sin_cache: Optional[cute.Tensor] = None,
     positions: Optional[cute.Tensor] = None,
+    delta: Optional[cute.Tensor] = None,
 ) -> GmemDResource:
     """
     Create the global memory D (output) resource.
@@ -2681,6 +2724,7 @@ def create_gmem_d_resource(
         k_norm_weight=k_norm_weight,
         cos_sin_cache=cos_sin_cache,
         positions=positions,
+        delta=delta,
         name="GmemD",
     )
 
@@ -3429,6 +3473,7 @@ def _create_gemm_pipeline(
     act_b_mcast_template: int,
     act_cluster_shape_vmnk: object,
     clc_response_ptr: object = None,
+    delta: object = None,
 ) -> Tuple[TaskManager, Task, Task]:
     """Create resources, tasks, and a TaskManager (compile-time).
 
@@ -3519,6 +3564,7 @@ def _create_gemm_pipeline(
         k_norm_weight,
         cos_sin_cache,
         positions,
+        delta,
     )
     gmem_d_resource._weight_scale_alloc = weight_scale_alloc
     gmem_d_resource._output_alloc = output_alloc
@@ -3767,6 +3813,7 @@ def kernel(
     k_norm_weight: Optional[cute.Tensor] = None,
     cos_sin_cache: Optional[cute.Tensor] = None,
     positions: Optional[cute.Tensor] = None,
+    delta: Optional[cute.Tensor] = None,
 ) -> None:
     """Warp-specialised persistent GEMM kernel with optional fallback cluster support.
 
@@ -3972,6 +4019,7 @@ def kernel(
             act_b_mcast_template=_b_mcast_template,
             act_cluster_shape_vmnk=pref_vmnk,
             clc_response_ptr=clc_response_ptr,
+            delta=delta,
         )
         fb_tm, fb_mma, fb_store = _create_gemm_pipeline(
             smem_allocator,
@@ -4012,6 +4060,7 @@ def kernel(
             act_b_mcast_template=fb_b_mcast,
             act_cluster_shape_vmnk=fb_vmnk,
             clc_response_ptr=clc_response_ptr,
+            delta=delta,
         )
 
         # Runtime: detect actual cluster size and branch for execution only
@@ -4074,6 +4123,7 @@ def kernel(
             act_b_mcast_template=_b_mcast_template,
             act_cluster_shape_vmnk=pref_vmnk,
             clc_response_ptr=clc_response_ptr,
+            delta=delta,
         )
         _run_gemm_execution(
             tm,
@@ -4189,6 +4239,7 @@ def host_function(
     scale_c: Optional[cute.Tensor] = None,
     scale_gate: Optional[cute.Tensor] = None,
     qkv_scale: Optional[cute.Tensor] = None,
+    delta: Optional[cute.Tensor] = None,
 ) -> None:
     # Construct TMA Descriptors
     # A/B use cutlass to create tensormap descriptors (like fp16_gemm_0_prim.py)
@@ -4323,6 +4374,7 @@ def host_function(
             k_norm_weight,
             cos_sin_cache,
             positions,
+            delta,
         ).launch(
             grid=grid_shape,
             block=[block_size, 1, 1],
@@ -4354,6 +4406,7 @@ def host_function(
             k_norm_weight,
             cos_sin_cache,
             positions,
+            delta,
         ).launch(
             grid=grid_shape,
             block=[block_size, 1, 1],

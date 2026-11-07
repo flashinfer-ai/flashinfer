@@ -100,15 +100,43 @@ def test_fp8_output_scale_ownership_and_preallocated_payload():
     assert actual is supplied_payload
 
 
-def test_fp8_qkv_qknorm_rope_matches_torch_oracle():
-    _require_gemm_gpu()
-    m, n, k, head_dim = 128, 1536, 128, 128
-    a, w, a_scale, w_scale = _fp8_problem(m, n, k)
+def _qknorm_rope_oracle(base, q_weight, k_weight, cos_sin, num_heads, head_dim):
+    m = base.shape[0]
+    shaped = base.clone().view(m, 3, num_heads, head_dim)
+    half = head_dim // 2
+    cos, sin = cos_sin[:, None, :half], cos_sin[:, None, half:]
+    for part, norm_weight in ((0, q_weight), (1, k_weight)):
+        value = shaped[:, part]
+        value = (
+            value
+            * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+            * norm_weight.float()
+        )
+        pairs = value.view(m, num_heads, half, 2)
+        shaped[:, part] = torch.stack(
+            (
+                pairs[..., 0] * cos - pairs[..., 1] * sin,
+                pairs[..., 1] * cos + pairs[..., 0] * sin,
+            ),
+            -1,
+        ).flatten(-2)
+    return shaped.reshape_as(base)
+
+
+def _qkv_rope_inputs(m, head_dim):
     q_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
     k_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
     angles = torch.randn((m, head_dim // 2), device="cuda")
     cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
     positions = torch.arange(m, device="cuda", dtype=torch.int64)
+    return q_weight, k_weight, cos_sin, positions
+
+
+def test_fp8_qkv_qknorm_rope_matches_torch_oracle():
+    _require_gemm_gpu()
+    m, n, k, head_dim = 128, 1536, 128, 128
+    a, w, a_scale, w_scale = _fp8_problem(m, n, k)
+    q_weight, k_weight, cos_sin, positions = _qkv_rope_inputs(m, head_dim)
     actual = fp8_qkv_qknorm_rope(
         a,
         w,
@@ -127,23 +155,57 @@ def test_fp8_qkv_qknorm_rope_matches_torch_oracle():
         .bfloat16()
         .float()
     )
-    shaped = base.view(m, 3, 4, head_dim)
-    cos, sin = cos_sin[:, None, :64], cos_sin[:, None, 64:]
-    for part, norm_weight in ((0, q_weight), (1, k_weight)):
-        value = shaped[:, part]
-        value = (
-            value
-            * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
-            * norm_weight.float()
-        )
-        pairs = value.view(m, 4, 64, 2)
-        shaped[:, part] = torch.stack(
-            (
-                pairs[..., 0] * cos - pairs[..., 1] * sin,
-                pairs[..., 1] * cos + pairs[..., 0] * sin,
-            ),
-            -1,
-        ).flatten(-2)
-    torch.testing.assert_close(
-        actual.float(), shaped.reshape_as(base), atol=0.3, rtol=3e-2
+    expected = _qknorm_rope_oracle(base, q_weight, k_weight, cos_sin, 4, head_dim)
+    torch.testing.assert_close(actual.float(), expected, atol=0.3, rtol=3e-2)
+
+
+def test_fp8_linear_delta_matches_sum():
+    _require_gemm_gpu()
+    m, n, k = 200, 512, 256
+    a, w, a_scale, w_scale = _fp8_problem(m, n, k)
+    bias = torch.randn((n,), device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    base = fp8_linear(a, w, a_scale, w_scale, bias)
+    actual = fp8_linear(a, w, a_scale, w_scale, bias, delta=delta)
+    expected = base.float() + delta.float()
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)
+    with pytest.raises(ValueError, match="delta"):
+        fp8_linear(a, w, a_scale, w_scale, delta=delta, out_dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="delta"):
+        fp8_linear(a, w, a_scale, w_scale, delta=delta[:, :256].contiguous())
+
+
+def test_fp8_swiglu_delta_is_added_before_activation():
+    _require_gemm_gpu()
+    m, n, k = 200, 512, 256
+    a, w, a_scale, w_scale = _fp8_problem(m, n, k)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    actual = fp8_linear_swiglu(a, w, a_scale, w_scale, delta=delta)
+    linear = fp8_linear(a, w, a_scale, w_scale, delta=delta).float()
+    expected = linear[:, 0::2] * F.silu(linear[:, 1::2])
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)
+
+
+def test_fp8_qkv_delta_is_added_before_qknorm():
+    _require_gemm_gpu()
+    m, n, k, head_dim = 200, 1536, 256, 128
+    a, w, a_scale, w_scale = _fp8_problem(m, n, k)
+    q_weight, k_weight, cos_sin, positions = _qkv_rope_inputs(m, head_dim)
+    delta = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    actual = fp8_qkv_qknorm_rope(
+        a,
+        w,
+        a_scale,
+        w_scale,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_q_heads=4,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        delta=delta,
     )
+    base = fp8_linear(a, w, a_scale, w_scale, delta=delta).float()
+    expected = _qknorm_rope_oracle(base, q_weight, k_weight, cos_sin, 4, head_dim)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=1e-2)

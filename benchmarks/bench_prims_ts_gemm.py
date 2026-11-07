@@ -172,7 +172,7 @@ def _clear_cuda_error() -> None:
 def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale, rope=None):
     # Order matches PrimsTsGemmRunner.forward: a, weight, output, bias,
     # fp8 scales, q/k norm, cos_sin, positions, nvfp4 sfa/sfb, then the
-    # unused fused outputs.
+    # unused fused outputs and delta.
     q_norm = k_norm = cos_sin = positions = None
     if rope is not None:
         q_norm, k_norm, cos_sin, positions, _num_heads = rope
@@ -194,6 +194,7 @@ def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale, rope=None)
             None,
             None,
             None,
+            None,
         ]
     return [
         a,
@@ -208,6 +209,7 @@ def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale, rope=None)
         positions,
         a_scale,
         weight_scale,
+        None,
         None,
         None,
         None,
