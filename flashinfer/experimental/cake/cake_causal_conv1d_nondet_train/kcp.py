@@ -305,10 +305,21 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
 #   length, rank, slot); [7] launch form (fwd 0, bwd 1).
 AGREE_PROTOCOL = 0x4B43504650310001
 AGREE_MODE = 2  # nondet
-AGREE_FIELDS = ("protocol", "mode", "phase", "entry/tensors", "channels", "world/width", "partition", "form")
+AGREE_FIELDS = (
+    "protocol",
+    "mode",
+    "phase",
+    "entry/tensors",
+    "channels",
+    "world/width",
+    "partition",
+    "form",
+)
 _AGREE_PHASES = {"fwd": 1, "bwd": 2}
 _AGREED: "weakref.WeakKeyDictionary[Any, set]" = weakref.WeakKeyDictionary()
-_AGREED_PINNED: dict[int, tuple[Any, set]] = {}  # contexts that are not weak-referenceable (pinned)
+_AGREED_PINNED: dict[
+    int, tuple[Any, set]
+] = {}  # contexts that are not weak-referenceable (pinned)
 
 
 def _low63(digest: bytes) -> int:
@@ -329,7 +340,9 @@ def _partition_hash(part: Any) -> int:
     return _low63(hashlib.sha256(text.encode("utf-8")).digest())
 
 
-def _fingerprint(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool) -> list[int]:
+def _fingerprint(
+    ctx: Any, phase: str, channels: tuple[int, ...], multi: bool
+) -> list[int]:
     part = getattr(ctx, "partition", None)
     if part is None:
         raise TypeError(
@@ -337,7 +350,11 @@ def _fingerprint(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool) -
             "(the rank-agreement check hashes its partition)"
         )
     if multi:
-        width = _low63(hashlib.sha256(",".join(str(int(c)) for c in channels).encode("utf-8")).digest())
+        width = _low63(
+            hashlib.sha256(
+                ",".join(str(int(c)) for c in channels).encode("utf-8")
+            ).digest()
+        )
     else:
         width = int(channels[0])
     return [
@@ -359,7 +376,9 @@ def _agreed_phases(ctx: Any) -> set:
         return _AGREED_PINNED.setdefault(id(ctx), (ctx, set()))[1]
 
 
-def _agree(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool, device: torch.device) -> None:
+def _agree(
+    ctx: Any, phase: str, channels: tuple[int, ...], multi: bool, device: torch.device
+) -> None:
     """The rank-agreement check of a (context, phase): see the block comment above."""
 
     world = int(ctx.world_size)
@@ -373,17 +392,29 @@ def _agree(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool, device:
             f"the first {phase} call of a KCP context ran inside a CUDA-graph capture: the rank-agreement check of "
             "#8946 needs one eager call per context and phase before a capture"
         )
-    mine = torch.tensor(_fingerprint(ctx, phase, channels, multi), dtype=torch.int64, device=device)
+    mine = torch.tensor(
+        _fingerprint(ctx, phase, channels, multi), dtype=torch.int64, device=device
+    )
     every = torch.empty(world * len(AGREE_FIELDS), dtype=torch.int64, device=device)
     dist.all_gather_into_tensor(every, mine, group=ctx.group)
     rows = every.view(world, len(AGREE_FIELDS)).cpu().tolist()
     bad = [
-        (rank, [AGREE_FIELDS[i] for i, (a, b) in enumerate(zip(row, rows[0], strict=True)) if a != b])
+        (
+            rank,
+            [
+                AGREE_FIELDS[i]
+                for i, (a, b) in enumerate(zip(row, rows[0], strict=True))
+                if a != b
+            ],
+        )
         for rank, row in enumerate(rows)
         if row != rows[0]
     ]
     if bad:
-        detail = "; ".join(f"rank {rank} differs from rank 0 in {', '.join(fields)}" for rank, fields in bad)
+        detail = "; ".join(
+            f"rank {rank} differs from rank 0 in {', '.join(fields)}"
+            for rank, fields in bad
+        )
         raise ValueError(
             f"KCP rank agreement failed on the first {phase} call of this context (#8946: every rank passes the "
             f"same partition and calls the same entry, mode and channel counts): {detail}"
@@ -954,7 +985,8 @@ def cake_causal_conv1d_nondet_train_kcp_forward(
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
-    (``[1, C]`` when the rank receives no row).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
+    (``[0, C]`` when the rank receives no row; the program then reads a private one-row placeholder that is not
+    returned).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
     ``"replay"``): keyed CUDA-graph capture / replay of this call (the graph-replay option; see the section comment
     above: pointer-stable operands, private pools, eager fallback, :func:`cake_causal_conv1d_nondet_train_kcp_graph_cache_clear`).
     """
