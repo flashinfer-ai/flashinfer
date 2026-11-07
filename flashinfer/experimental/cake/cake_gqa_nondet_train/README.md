@@ -52,9 +52,9 @@ count, as FlashAttention's `max_seqlen_k`: a smaller value leaves key blocks
 out (their gradients are not computed, and with a row map the rows they
 would add are undefined).  It sizes the backward grids and the dS^T workspace
 chunks; without it the bound is `T_k`, which is always correct but plans
-more, mostly empty, key blocks: <pending: backward time with and without the
-hint on a 12-segment layout of 257K keys, per architecture>.  The backend
-package exposes the same entry points (`cake_gqa_nondet`,
+more, mostly empty, key blocks: on a GB200, the backward of 12 segments with
+30K query and 257K key tokens took 31.3 ms with the hint and 34.7 ms
+without.  The backend package exposes the same entry points (`cake_gqa_nondet`,
 `cake_gqa_nondet_train_forward`, `cake_gqa_nondet_train_backward`,
 `CakeGQANondetWorkspace`, `CakeGQANondetFunction`).
 
@@ -99,12 +99,19 @@ with atomics.  For one input, run to run:
 
 | output | run to run | error vs FP64, rel-L2 / max abs err over max abs ref (`sm_100a`, `sm_103a`, `sm_107a`) |
 |---|---|---|
-| `out` (BF16) | repeats bit for bit | <pending> |
-| `lse` (FP32) | repeats bit for bit | <pending> |
-| `dq` (BF16) | repeats bit for bit | <pending> |
-| `dk` / `dv`, BF16 | repeats bit for bit | <pending> |
-| `dk` / `dv`, FP32 window | repeats bit for bit | <pending> |
-| row-map adds into `dk_acc` / `dv_acc` | repeats bit for bit: destination row `r` becomes `((dst + w_j1) + w_j2) + ...` over its window rows `j1 < j2 < ...` | <pending> |
+| `out` (BF16) | repeats bit for bit | 2.35e-03 / 4.09e-03, 2.34e-03 / 3.91e-03, 2.34e-03 / 4.89e-03 |
+| `lse` (FP32) | repeats bit for bit | 7.86e-08 / 3.17e-07, 7.85e-08 / 3.16e-07, 7.85e-08 / 3.03e-07 |
+| `dq` (BF16) | repeats bit for bit | 2.46e-03 / 5.32e-03, 2.46e-03 / 5.55e-03, 2.46e-03 / 6.37e-03 |
+| `dk` / `dv`, BF16 | repeats bit for bit | 2.45e-03 / 4.39e-03, 2.44e-03 / 4.22e-03, 2.45e-03 / 4.41e-03 |
+| `dk` / `dv`, FP32 window | repeats bit for bit | 1.80e-03 / 3.09e-03, 1.79e-03 / 2.99e-03, 1.81e-03 / 3.04e-03 |
+| row-map adds into `dk_acc` / `dv_acc` | repeats bit for bit: destination row `r` becomes `((dst + w_j1) + w_j2) + ...` over its window rows `j1 < j2 < ...` | 1.80e-03 / 3.09e-03, 1.79e-03 / 2.93e-03, 1.81e-03 / 3.04e-03 |
+
+The errors are the worst of 5 runs over nine packed causal layouts (15K to
+37K query and 25K to 433K key tokens, 4 to 16 segments) with random BF16
+inputs, 24 query and 4 KV heads, against an FP64 reference from the same
+inputs: `sm_100a` on a GB200, `sm_103a` on a B300, `sm_107a` on an R200.  The
+`dk` / `dv` rows give the larger of the two; `dq` has the same error in every
+form.
 
 On one architecture the bits depend only on the shapes (`T_q`, `T_k`, `H_q`,
 `H_kv`, the segment lengths), `max_seqlen_k` and the workspace budget: not on
@@ -157,3 +164,9 @@ device stream gets its own default workspace.
 - `H_q / H_kv` must be even.
 - `dout` of the low-level backward must be contiguous (autograd makes it so).
 - `sm_100a`, `sm_103a` and `sm_107a` only.
+- Tiny calls are slower than the previous version of this package: a
+  training step (forward and backward, row-map form, 24 query and 4 KV heads)
+  with up to about 2K query and 8K key tokens, 0.1 to 0.4 ms long, takes 40
+  to 100 us more for the extra launches (`bwd_plan`, the dQ GEMM, the fold
+  and the row-map sort).  From 16K query and 25K key tokens up, a step is 2
+  to 9 % faster on a GB200 and 5 to 13 % faster on an R200.
