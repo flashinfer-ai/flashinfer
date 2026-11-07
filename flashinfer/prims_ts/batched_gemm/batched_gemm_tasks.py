@@ -469,14 +469,18 @@ def create_fused_load_a_sfa_task(
     work_queue,
     num_k_tiles: int,
     work_throttle=None,
+    pdl_wait_resource=None,
 ) -> Task:
     """Load the weight operand and its scale factors on the same warp.
 
     This is the swap-AB high-throughput schedule used by TRT-LLM Gen: one warp
     issues both TMA streams before committing either pipeline.
+    ``pdl_wait_resource`` orders the routing-metadata reads (``tile_idx``,
+    ``mn_limit``) that select the expert's weights after the grid wait.
     """
     is_persistent = _is_persistent(cfg)
     has_work_throttle = is_persistent and work_throttle is not None
+    has_pdl_wait = pdl_wait_resource is not None
     has_prepare_a_tile = hasattr(smem_a, "prepare_gather_tile")
     has_prepare_sfa_tile = hasattr(smem_sfa, "prepare_sfa_tile")
 
@@ -491,8 +495,12 @@ def create_fused_load_a_sfa_task(
         idx = 0
         throttle = extra[idx] if has_work_throttle else None
         idx += 1 if has_work_throttle else 0
+        pdl_wait = extra[idx] if has_pdl_wait else None
+        idx += 1 if has_pdl_wait else 0
         wq = extra[idx] if is_persistent else None
 
+        if pdl_wait is not None:
+            pdl_wait.wait_griddep()
         _ = gmem_a_res.init_coords_state()
         _ = gmem_sfa_res.init_coords_state()
         smem_a_res.init_load_state()
@@ -535,6 +543,8 @@ def create_fused_load_a_sfa_task(
     extra_resources = []
     if has_work_throttle:
         extra_resources.append(work_throttle)
+    if pdl_wait_resource is not None:
+        extra_resources.append(pdl_wait_resource)
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = fused_load_a_sfa_schedule(
@@ -547,7 +557,11 @@ def create_fused_load_a_sfa_task(
     return _make_task(
         cfg,
         cga_policy=_resource_cga_policy(cfg, smem_a),
-        src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
+        src_resources=(
+            [gmem_a, gmem_sfa]
+            + _pdl_wait_resources(pdl_wait_resource)
+            + ([work_queue] if cfg.is_persistent else [])
+        ),
         dst_resources=[smem_a, smem_sfa]
         + ([work_throttle] if has_work_throttle else []),
         warp_idx=cfg.warp_layout.load_a_warp_idx,
@@ -1654,7 +1668,15 @@ def create_epilogue_task(
     gmem_c,
     work_queue,
     num_k_tiles: int,
+    pdl_wait_resource=None,
 ) -> Task:
+    """Epilogue: drain TmemC and store C.
+
+    With ``pdl_wait_resource`` the epilogue waits before its first global
+    read (routing metadata, per-token SFs, bias and scales).  The epilogue runs
+    in every CTA, so ranks that run no loader holding the wait still execute
+    one before they exit.
+    """
     if cfg.is_swap_ab:
         epi_warpgroup_count = max(1, cfg.warp_layout.num_epilogue_warps // 4)
         epi_cols_per_call = cfg.epi_tile_n * epi_warpgroup_count
@@ -1662,12 +1684,17 @@ def create_epilogue_task(
     else:
         epi_subtile_cnt = cfg.non_swap_epilogue_subtile_cnt
     is_persistent = _is_persistent(cfg)
+    has_pdl_wait = pdl_wait_resource is not None
 
     @schedule
-    def epilogue_schedule(
-        tmem: MemoryResource, gmem: MemoryResource, wq: WorkQueue = None
-    ) -> None:
+    def epilogue_schedule(tmem: MemoryResource, gmem: MemoryResource, *extra) -> None:
+        idx = 0
+        pdl_wait = extra[idx] if has_pdl_wait else None
+        idx += 1 if has_pdl_wait else 0
+        wq = extra[idx] if is_persistent else None
         _ = tmem.init_epilogue_state()
+        if pdl_wait is not None:
+            pdl_wait.wait_griddep()
         gmem.init_store_state()
         with _work_tile_schedule_loop(cfg, wq):
             gmem.init_epilogue_tile_state()
@@ -1735,15 +1762,18 @@ def create_epilogue_task(
                 )
             tmem.release()
 
-    captured_schedule = _call_schedule_with_optional_work_queue(
-        epilogue_schedule,
-        is_persistent,
-        work_queue,
-        tmem_c,
-        gmem_c,
-    )
+    extra_resources = []
+    if pdl_wait_resource is not None:
+        extra_resources.append(pdl_wait_resource)
+    if is_persistent:
+        extra_resources.append(work_queue)
+    captured_schedule = epilogue_schedule(tmem_c, gmem_c, *extra_resources)
     return Task(
-        src_resources=[tmem_c] + ([work_queue] if cfg.is_persistent else []),
+        src_resources=(
+            [tmem_c]
+            + _pdl_wait_resources(pdl_wait_resource)
+            + ([work_queue] if cfg.is_persistent else [])
+        ),
         dst_resources=[gmem_c],
         warp_idx=cfg.warp_layout.epilogue_warp_idx,
         num_warps=cfg.warp_layout.num_epilogue_warps,
@@ -1827,6 +1857,7 @@ def create_epilogue_task_dsfp8(
     gmem_c,
     work_queue,
     num_k_tiles: int,
+    pdl_wait_resource=None,
 ) -> Task:
     """DeepSeek FP8 epilogue: per-K-tile TmemC drain scaled into registers.
 
@@ -1838,19 +1869,29 @@ def create_epilogue_task_dsfp8(
     Release ``SmemDeepSeekSfAb`` after the last sub-block.
     Tail (after the K-loop):
       - Cast the register accumulator to ``dtype_c`` and TMA/STG store.
+
+    ``pdl_wait_resource`` places the grid wait before the first global read,
+    as in :func:`create_epilogue_task`.
     """
     is_persistent = _is_persistent(cfg)
     dsfp8_k_subblocks = cfg.dsfp8_k_subblocks_per_tile
+    has_pdl_wait = pdl_wait_resource is not None
 
     @schedule
     def epi_schedule(
         tmem: MemoryResource,
         sf: MemoryResource,
         gmem: MemoryResource,
-        wq: WorkQueue = None,
+        *extra,
     ) -> None:
+        idx = 0
+        pdl_wait = extra[idx] if has_pdl_wait else None
+        idx += 1 if has_pdl_wait else 0
+        wq = extra[idx] if is_persistent else None
         _ = tmem.init_epilogue_state()
         _ = sf.init_epilogue_state()
+        if pdl_wait is not None:
+            pdl_wait.wait_griddep()
         gmem.init_store_state()
 
         def reset_work_tile_state():
@@ -1901,17 +1942,18 @@ def create_epilogue_task_dsfp8(
         # C-store lifetime and therefore needs the same once-per-kernel drain.
         gmem.drain_store_tail()
 
-    captured_schedule = _call_schedule_with_optional_work_queue(
-        epi_schedule,
-        is_persistent,
-        work_queue,
-        tmem_c,
-        smem_dsfp8_sfab,
-        gmem_c,
-    )
+    extra_resources = []
+    if pdl_wait_resource is not None:
+        extra_resources.append(pdl_wait_resource)
+    if is_persistent:
+        extra_resources.append(work_queue)
+    captured_schedule = epi_schedule(tmem_c, smem_dsfp8_sfab, gmem_c, *extra_resources)
     return Task(
-        src_resources=[tmem_c, smem_dsfp8_sfab]
-        + ([work_queue] if cfg.is_persistent else []),
+        src_resources=(
+            [tmem_c, smem_dsfp8_sfab]
+            + _pdl_wait_resources(pdl_wait_resource)
+            + ([work_queue] if cfg.is_persistent else [])
+        ),
         dst_resources=[gmem_c],
         warp_idx=cfg.warp_layout.epilogue_warp_idx,
         num_warps=cfg.warp_layout.num_epilogue_warps,

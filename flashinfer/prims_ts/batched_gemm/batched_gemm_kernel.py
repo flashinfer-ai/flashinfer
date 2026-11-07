@@ -154,6 +154,26 @@ def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
     return bool(cfg.use_pdl and cfg.use_early_exit and not cfg.skip_early_exit_pdl)
 
 
+def _pdl_task_waits(cfg: BatchedGemmConfig) -> bool:
+    """Whether tasks, rather than the kernel entry, issue ``griddepcontrol.wait``.
+
+    The activation loaders and the epilogue then wait through a
+    ``PdlWaitBarrier``, and inactive early-exit CTAs wait before they exit.
+    """
+    return bool(cfg.use_pdl and not _pdl_wait_completed_before_tasks(cfg))
+
+
+def _pdl_weight_loads_wait(cfg: BatchedGemmConfig) -> bool:
+    """Whether the weight-side loaders wait before reading routing metadata.
+
+    They read ``tile_idx`` and ``mn_limit`` to address the expert's weights and
+    weight scale factors. ``skip_early_exit_pdl`` keeps that path ahead of the
+    wait, which its precondition allows for routing outputs; every other
+    task-level-wait config orders it after the wait.
+    """
+    return bool(_pdl_task_waits(cfg) and not cfg.skip_early_exit_pdl)
+
+
 def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
     """Register SMEM barriers owned by resources whose data lives elsewhere.
 
@@ -902,11 +922,11 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             pipeline_config=pcfgs["work_throttle"],
             name="WorkThrottle",
         )
-    pdl_wait_completed_before_tasks = _pdl_wait_completed_before_tasks(cfg)
-    pdl_wait_resource = (
-        PdlWaitBarrier(name="PdlWait")
-        if cfg.use_pdl and not pdl_wait_completed_before_tasks
-        else None
+    pdl_wait_resource = PdlWaitBarrier(name="PdlWait") if _pdl_task_waits(cfg) else None
+    # Weight-side loaders (and the weight SF loaders below) take the wait only
+    # when skip_early_exit_pdl is off; see _pdl_weight_loads_wait.
+    weight_pdl_wait_resource = (
+        pdl_wait_resource if _pdl_weight_loads_wait(cfg) else None
     )
     pdl_launch_resource = PdlLaunchBarrier(name="PdlLaunch") if cfg.use_pdl else None
 
@@ -927,6 +947,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 work_queue,
                 num_k_tiles,
                 work_throttle=work_throttle,
+                pdl_wait_resource=weight_pdl_wait_resource,
             )
             gather = create_gather_task(
                 cfg,
@@ -957,6 +978,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 work_queue,
                 num_k_tiles,
                 work_throttle=work_throttle,
+                pdl_wait_resource=weight_pdl_wait_resource,
             )
             gather_smem, tma_smem = smem_gather, smem_b
             smem_a = smem_gather
@@ -994,6 +1016,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 work_queue,
                 num_k_tiles,
                 work_throttle=work_throttle,
+                pdl_wait_resource=weight_pdl_wait_resource,
             )
             load_b = create_load_b_task(
                 cfg,
@@ -1017,7 +1040,14 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 pdl_wait_resource=pdl_wait_resource,
                 pdl_launch_resource=pdl_launch_resource,
             )
-            load_b = create_load_b_task(cfg, gmem_b, smem_b, work_queue, num_k_tiles)
+            load_b = create_load_b_task(
+                cfg,
+                gmem_b,
+                smem_b,
+                work_queue,
+                num_k_tiles,
+                pdl_wait_resource=weight_pdl_wait_resource,
+            )
             smem_a = smem_tma_gather
             task_list = [load_a, load_b]
     else:
@@ -1028,7 +1058,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             work_queue,
             num_k_tiles,
             work_throttle=work_throttle,
-            pdl_wait_resource=None if cfg.is_swap_ab else pdl_wait_resource,
+            pdl_wait_resource=(
+                weight_pdl_wait_resource if cfg.is_swap_ab else pdl_wait_resource
+            ),
             pdl_launch_resource=None if cfg.is_swap_ab else pdl_launch_resource,
         )
         load_b = create_load_b_task(
@@ -1037,7 +1069,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             smem_b,
             work_queue,
             num_k_tiles,
-            pdl_wait_resource=pdl_wait_resource if cfg.is_swap_ab else None,
+            pdl_wait_resource=(
+                pdl_wait_resource if cfg.is_swap_ab else weight_pdl_wait_resource
+            ),
             pdl_launch_resource=pdl_launch_resource if cfg.is_swap_ab else None,
         )
         task_list = [load_a, load_b]
@@ -1062,7 +1096,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             smem_sfa,
             work_queue,
             num_k_tiles,
-            pdl_wait_resource=None if cfg.is_swap_ab else pdl_wait_resource,
+            pdl_wait_resource=(
+                weight_pdl_wait_resource if cfg.is_swap_ab else pdl_wait_resource
+            ),
             pdl_launch_resource=None if cfg.is_swap_ab else pdl_launch_resource,
         )
         cast_a = create_cast_a_task(
@@ -1169,6 +1205,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                     work_queue,
                     num_k_tiles,
                     work_throttle=work_throttle,
+                    pdl_wait_resource=weight_pdl_wait_resource,
                 ),
                 create_fused_gather_sfb_task(
                     cfg,
@@ -1189,7 +1226,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 smem_sfa,
                 work_queue,
                 num_k_tiles,
-                pdl_wait_resource=None if cfg.is_swap_ab else pdl_wait_resource,
+                pdl_wait_resource=(
+                    weight_pdl_wait_resource if cfg.is_swap_ab else pdl_wait_resource
+                ),
                 pdl_launch_resource=None if cfg.is_swap_ab else pdl_launch_resource,
             )
             load_sfb = create_load_sfb_task(
@@ -1198,7 +1237,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 smem_sfb,
                 work_queue,
                 num_k_tiles,
-                pdl_wait_resource=pdl_wait_resource if cfg.is_swap_ab else None,
+                pdl_wait_resource=(
+                    pdl_wait_resource if cfg.is_swap_ab else weight_pdl_wait_resource
+                ),
                 pdl_launch_resource=pdl_launch_resource if cfg.is_swap_ab else None,
             )
             task_list += [load_sfa, load_sfb]
@@ -1304,11 +1345,24 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             pdl_launch_resource=pdl_launch_resource,
         )
         epi = create_epilogue_task_dsfp8(
-            cfg, tmem_c, smem_dsfp8_sfab, gmem_c, work_queue, num_k_tiles
+            cfg,
+            tmem_c,
+            smem_dsfp8_sfab,
+            gmem_c,
+            work_queue,
+            num_k_tiles,
+            pdl_wait_resource=pdl_wait_resource,
         )
         task_list += [mma, load_sfab, epi]
     else:
-        epi = create_epilogue_task(cfg, tmem_c, gmem_c, work_queue, num_k_tiles)
+        epi = create_epilogue_task(
+            cfg,
+            tmem_c,
+            gmem_c,
+            work_queue,
+            num_k_tiles,
+            pdl_wait_resource=pdl_wait_resource,
+        )
         task_list += [mma, epi]
 
     if cfg.warp_layout.num_padding_warps > 0:
@@ -1393,14 +1447,18 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         resource_dependency_graph[pdl_launch_resource] = []
     if pdl_wait_resource is not None:
         resource_dependency_graph[pdl_wait_resource] = []
-        if cfg.is_swap_ab:
+        # Keep this block in sync with the GPU kernel body.
+        if cfg.is_swap_ab or weight_pdl_wait_resource is not None:
             resource_dependency_graph[gmem_b] = [pdl_wait_resource]
             if cfg.has_input_block_scaling:
                 resource_dependency_graph[gmem_sfb] = [pdl_wait_resource]
-        else:
+        if not cfg.is_swap_ab or weight_pdl_wait_resource is not None:
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
             if cfg.has_cast_a or cfg.has_input_block_scaling:
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
+        resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
+            pdl_wait_resource
+        ]
 
     # SMEM allocator
     smem_allocator = SmemAllocator()
@@ -2219,8 +2277,15 @@ def _batched_gemm_kernel_bf16_body(
         )
     pdl_wait_resource = (
         PdlWaitBarrier(name="PdlWait")
-        if cutlass.const_expr(cfg.use_pdl and not pdl_wait_completed_before_tasks)
+        if cutlass.const_expr(_pdl_task_waits(cfg))
         else None
+    )
+    # Under skip_early_exit_pdl the weight-side loaders (weights and weight
+    # SFs) read tile_idx/mn_limit and prefetch the expert's weights before the
+    # wait. The config's precondition makes those routing outputs complete
+    # before this grid launches; every other task-level-wait config waits.
+    weight_pdl_wait_resource = (
+        pdl_wait_resource if cutlass.const_expr(_pdl_weight_loads_wait(cfg)) else None
     )
     pdl_launch_resource = (
         PdlLaunchBarrier(name="PdlLaunch") if cutlass.const_expr(cfg.use_pdl) else None
@@ -2239,6 +2304,7 @@ def _batched_gemm_kernel_bf16_body(
                     work_queue,
                     k_tile_cnt,
                     work_throttle=work_throttle,
+                    pdl_wait_resource=weight_pdl_wait_resource,
                 )
                 gather = create_fused_gather_sfb_task(
                     cfg,
@@ -2259,6 +2325,7 @@ def _batched_gemm_kernel_bf16_body(
                     work_queue,
                     k_tile_cnt,
                     work_throttle=work_throttle,
+                    pdl_wait_resource=weight_pdl_wait_resource,
                 )
                 gather = create_gather_task(
                     cfg,
@@ -2289,6 +2356,7 @@ def _batched_gemm_kernel_bf16_body(
                 work_queue,
                 k_tile_cnt,
                 work_throttle=work_throttle,
+                pdl_wait_resource=weight_pdl_wait_resource,
             )
             gather_smem = smem_a
             tma_smem = smem_b
@@ -2317,7 +2385,9 @@ def _batched_gemm_kernel_bf16_body(
             k_tile_cnt,
             work_throttle=work_throttle,
             pdl_wait_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+                weight_pdl_wait_resource
+                if cutlass.const_expr(cfg.is_swap_ab)
+                else pdl_wait_resource
             ),
             pdl_launch_resource=(
                 None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
@@ -2330,7 +2400,9 @@ def _batched_gemm_kernel_bf16_body(
             work_queue,
             k_tile_cnt,
             pdl_wait_resource=(
-                pdl_wait_resource if cutlass.const_expr(cfg.is_swap_ab) else None
+                pdl_wait_resource
+                if cutlass.const_expr(cfg.is_swap_ab)
+                else weight_pdl_wait_resource
             ),
             pdl_launch_resource=(
                 pdl_launch_resource if cutlass.const_expr(cfg.is_swap_ab) else None
@@ -2346,7 +2418,9 @@ def _batched_gemm_kernel_bf16_body(
             work_queue,
             k_tile_cnt,
             pdl_wait_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+                weight_pdl_wait_resource
+                if cutlass.const_expr(cfg.is_swap_ab)
+                else pdl_wait_resource
             ),
             pdl_launch_resource=(
                 None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
@@ -2372,7 +2446,9 @@ def _batched_gemm_kernel_bf16_body(
             work_queue,
             k_tile_cnt,
             pdl_wait_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+                weight_pdl_wait_resource
+                if cutlass.const_expr(cfg.is_swap_ab)
+                else pdl_wait_resource
             ),
             pdl_launch_resource=(
                 None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
@@ -2385,7 +2461,9 @@ def _batched_gemm_kernel_bf16_body(
             work_queue,
             k_tile_cnt,
             pdl_wait_resource=(
-                pdl_wait_resource if cutlass.const_expr(cfg.is_swap_ab) else None
+                pdl_wait_resource
+                if cutlass.const_expr(cfg.is_swap_ab)
+                else weight_pdl_wait_resource
             ),
             pdl_launch_resource=(
                 pdl_launch_resource if cutlass.const_expr(cfg.is_swap_ab) else None
@@ -2479,11 +2557,24 @@ def _batched_gemm_kernel_bf16_body(
             pdl_launch_resource=pdl_launch_resource,
         )
         epi = create_epilogue_task_dsfp8(
-            cfg, tmem_c, smem_dsfp8_sfab, gmem_c, work_queue, k_tile_cnt
+            cfg,
+            tmem_c,
+            smem_dsfp8_sfab,
+            gmem_c,
+            work_queue,
+            k_tile_cnt,
+            pdl_wait_resource=pdl_wait_resource,
         )
         task_list += [mma, load_sfab, epi]
     else:
-        epi = create_epilogue_task(cfg, tmem_c, gmem_c, work_queue, k_tile_cnt)
+        epi = create_epilogue_task(
+            cfg,
+            tmem_c,
+            gmem_c,
+            work_queue,
+            k_tile_cnt,
+            pdl_wait_resource=pdl_wait_resource,
+        )
         task_list += [mma, epi]
 
     if cutlass.const_expr(cfg.warp_layout.num_padding_warps > 0):
@@ -2588,14 +2679,24 @@ def _batched_gemm_kernel_bf16_body(
         resource_dependency_graph[pdl_launch_resource] = []
     if cutlass.const_expr(pdl_wait_resource is not None):
         resource_dependency_graph[pdl_wait_resource] = []
-        if cutlass.const_expr(cfg.is_swap_ab):
+        # Declare every GMEM resource whose work reads predecessor-written
+        # memory so TaskManager verification checks the wait placement: the
+        # activation operand and its SFs always, the weight operand and its SFs
+        # unless skip_early_exit_pdl keeps them ahead of the wait, and GmemC,
+        # whose epilogue reads routing metadata, per-token SFs and scalars.
+        if cutlass.const_expr(cfg.is_swap_ab or weight_pdl_wait_resource is not None):
             resource_dependency_graph[gmem_b] = [pdl_wait_resource]
             if cutlass.const_expr(cfg.has_input_block_scaling):
                 resource_dependency_graph[gmem_sfb] = [pdl_wait_resource]
-        else:
+        if cutlass.const_expr(
+            not cfg.is_swap_ab or weight_pdl_wait_resource is not None
+        ):
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
             if cutlass.const_expr(cfg.has_cast_a or cfg.has_input_block_scaling):
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
+        resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
+            pdl_wait_resource
+        ]
     _verify_rank_gated_register_donation(task_list)
     task_manager_cls = (
         TaskManager if _task_manager_verify_enabled() else _ProductionTaskManager
@@ -2630,6 +2731,13 @@ def _batched_gemm_kernel_bf16_body(
             token_cta_idx = block_m
         token_cga_idx = token_cta_idx // Int32(cfg.token_cluster_dim)
         is_active_cta = token_cga_idx < num_non_exiting_ctas
+        if cutlass.const_expr(_pdl_task_waits(cfg)):
+            # Inactive CTAs run no task, so without the entry wait they would
+            # exit without waiting.  When every CTA is inactive (no locally
+            # routed tokens) the grid could then complete before its
+            # predecessor, and a later grid's wait would not cover it.
+            if token_cga_idx >= num_non_exiting_ctas:
+                cute.arch.griddepcontrol_wait()
     else:
         is_active_cta = True
 

@@ -72,21 +72,33 @@ manager is told the wait has completed (`assume_pdl_wait_completed`). No
 `PdlWaitBarrier` resource is built in that case. A kernel that follows another
 GEMM therefore cannot start until the predecessor has completed.
 
-`skip_early_exit_pdl=1` drops that entry wait. The wait then comes only from the
-`PdlWaitBarrier` resource on the GMEM A/B operand sourced from the predecessor,
-which the task manager verifies as usual, so the kernel's CTAs can become
-resident while the predecessor is still running. Validation requires
-`use_pdl=1` and `use_early_exit=1`. The default is `0`.
+`skip_early_exit_pdl=1` drops that entry wait. The wait then comes from the
+`PdlWaitBarrier` resource instead: the activation loaders and the epilogue wait
+before their first global access, which the task manager verifies through the
+`PdlWaitBarrier` edges on their GMEM resources. The epilogue runs in every CTA of
+a cluster, and an inactive early-exit CTA executes `griddepcontrol.wait` before
+it exits, so every CTA waits and a grid with no active CTA still completes after
+its predecessor. The kernel's CTAs can become resident while the predecessor is
+still running. Validation requires `use_pdl=1` and `use_early_exit=1`. The
+default is `0`.
 
-The count is read without waiting for the predecessor, so the option is correct
-only if the count was produced by a kernel that completed before the
-predecessor passed its own grid wait and triggered `launch_dependents`. In the
-MoE pipeline this is the intended FC2 arrangement: routing writes the count, FC1 waits on routing
-at kernel entry and triggers only afterwards, so FC2 can only launch once routing
-has completed. Do not set it on FC1 (whose predecessor is routing itself and
-needs the entry wait), or on a kernel whose predecessor does not wait before
-triggering. `launch_dependents` is emitted at the end of the load task, so the
+The count, and the `tile_idx`/`mn_limit` entries the weight loaders use to
+prefetch the expert's weights and weight scale factors, are read without waiting
+for the predecessor, so the option is correct only if they were complete before
+this grid could launch. In the MoE pipeline this is the intended FC2
+arrangement: routing writes them, FC1 waits on routing at kernel entry and
+triggers only afterwards, and every kernel enqueued after FC1 can launch only
+once FC1 has triggered. Routing has therefore completed before FC2 launches,
+including on the DeepSeek FP8 path, where the activation kernel between FC1 and
+FC2 triggers before its own wait. Do not set it on FC1 (whose predecessor is
+routing itself and needs the entry wait), or on a kernel that no earlier
+wait-before-trigger kernel separates from the producer of the count.
+`launch_dependents` is emitted at the end of the activation load task, so the
 overlap is with the predecessor's MMA and epilogue, not its loads.
+
+With `use_pdl=1` and `use_early_exit=0` there is no entry wait either. The
+activation loaders, the weight loaders and the epilogue each wait before their
+first global access.
 
 The MoE mapper enables `skip_early_exit_pdl` for FC2 when the launch uses PDL
 and the FC2 config uses early exit. FC1 always keeps the entry wait. A MoE JSON

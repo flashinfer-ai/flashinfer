@@ -692,14 +692,16 @@ class BatchedGemmConfig:
 
     Requires :attr:`use_pdl` and :attr:`use_early_exit`. By default that
     combination issues ``griddepcontrol.wait`` at kernel entry so that
-    ``num_non_exiting_ctas`` is visible. With ``1`` the entry wait is skipped
-    and the PDL wait comes only from the ``PdlWaitBarrier`` resource on the
-    GMEM A/B operand sourced from the predecessor, so this kernel's CTAs can
-    become resident while the predecessor is still running. The count is then
-    read without waiting for the predecessor, so it must have been produced by a
-    kernel that completed before the predecessor passed its own grid wait and
-    triggered ``launch_dependents`` (e.g. routing, with the predecessor waiting
-    on it before triggering).
+    ``num_non_exiting_ctas`` is visible. With ``1`` the entry wait is skipped:
+    the activation loaders and the epilogue wait through the
+    ``PdlWaitBarrier`` resource and inactive early-exit CTAs wait before they
+    exit, so this kernel's CTAs can become resident while the predecessor is
+    still running. The count, and the ``tile_idx``/``mn_limit`` entries the
+    weight loaders use to prefetch the expert's weights and weight scale
+    factors, are then read without waiting for the predecessor, so they must
+    have been produced by a kernel that completed before the predecessor passed
+    its own grid wait and triggered ``launch_dependents`` (e.g. routing, with
+    the predecessor waiting on it before triggering).
     """
 
     # Per-token scale factors. SF-A is consumed by the epilogue for plain FP8;
