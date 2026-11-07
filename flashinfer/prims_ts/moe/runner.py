@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Sequence
 
 import cuda.bindings.driver as cuda_drv
@@ -361,6 +361,31 @@ def _with_default_moe_tactic(valid_tactics: List[Any]) -> List[Any]:
 
 def _concrete_tactic(pair) -> list[int]:
     return [int(pair.tile_n), int(pair.moe_config_index)]
+
+
+# Tactic -1 picks its tile from a power-of-two bucket of tokens per expert, and
+# every such bucket holds a power-of-two token count.
+_UNTUNED_PROBE_TOKEN_COUNTS = tuple(1 << exponent for exponent in range(32))
+
+
+def untuned_moe_tactics(
+    runner: Any, moe_inputs: MoeRunnerInputs, kwargs: dict[str, Any]
+) -> tuple[list[int], ...]:
+    """Concrete tactics covering every configuration tactic -1 can launch.
+
+    Tactic -1 resolves its configurations from the token count, so running
+    ``forward`` with these on any batch compiles every kernel that untuned
+    launches of any size use. ``kwargs`` are the ones ``forward`` receives.
+    """
+    row = moe_inputs.hidden_states[:1]
+    tactics: dict[tuple[int, ...], None] = {}
+    for num_tokens in _UNTUNED_PROBE_TOKEN_COUNTS:
+        sized_inputs = replace(
+            moe_inputs, hidden_states=row.expand(num_tokens, *row.shape[1:])
+        )
+        pair = runner._map_tactic([-1, -1], sized_inputs, kwargs)
+        tactics[tuple(_concrete_tactic(pair))] = None
+    return tuple(list(tactic) for tactic in tactics)
 
 
 def _env_flag_enabled(name: str) -> bool:
