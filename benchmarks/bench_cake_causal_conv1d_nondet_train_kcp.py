@@ -15,7 +15,7 @@ limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed width-4 depthwise causal convolution + SiLU training step in its
 two numerical modes: the deterministic KCP package (``flashinfer.cake_causal_conv1d_det_train_kcp``:
-``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_multi_kcp``; a cooperative backward launch whose grid
+``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_kcp_multi``; a cooperative backward launch whose grid
 reduces the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
 (``flashinfer.cake_causal_conv1d_nondet_train_kcp``: ``cake_causal_conv1d_nondet_kcp`` /
 ``cake_causal_conv1d_nondet_kcp_multi``; one ordinary backward launch with unordered ``dweight`` accumulators), each
@@ -142,7 +142,7 @@ MODES: dict[str, dict[str, Callable]] = {
     "det": {
         "supported": det_conv.is_cake_causal_conv1d_det_train_supported,
         "single": det_kcp_api.cake_causal_conv1d_det_kcp,
-        "multi": det_kcp_api.cake_causal_conv1d_det_multi_kcp,
+        "multi": det_kcp_api.cake_causal_conv1d_det_kcp_multi,
     },
     "nondet": {
         "supported": nondet_conv.is_cake_causal_conv1d_nondet_train_supported,
@@ -815,7 +815,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=int,
         default=1,
         help="convolutions per layer: 1 runs cake_causal_conv1d_det_kcp / cake_causal_conv1d_nondet_kcp, more run "
-        "cake_causal_conv1d_det_multi_kcp / cake_causal_conv1d_nondet_kcp_multi",
+        "cake_causal_conv1d_det_kcp_multi / cake_causal_conv1d_nondet_kcp_multi",
     )
     parser.add_argument(
         "--layout",

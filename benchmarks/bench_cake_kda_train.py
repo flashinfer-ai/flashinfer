@@ -17,7 +17,7 @@ Benchmark of the Cake packed KDA chunked training kernels with a selectable
 numerical mode: the non-deterministic package
 (``flashinfer.experimental.cake.cake_kda_train``, ``deterministic=False``)
 against the deterministic package
-(``flashinfer.experimental.cake_kda_det_train``) and flash-linear-attention's
+(``flashinfer.experimental.cake.cake_kda_det_train``) and flash-linear-attention's
 ``chunk_kda`` (when it is installed), on the same inputs, on the boundaries of
 a training step:
 
@@ -159,7 +159,7 @@ from flashinfer.experimental.cake.cake_kda_train import (  # noqa: E402
     cake_backend as nd_backend,
 )
 from flashinfer.experimental.cake.cake_kda_train import cake_jit  # noqa: E402
-from flashinfer.experimental.cake_kda_det_train import (  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
@@ -340,7 +340,7 @@ def cake_workspace(
     ``deterministic=False``) for the row's gate mode and in-kernel Q/K L2 norm mode."""
     mode = {"gate": gate, "l2n": "fused" if l2n else "off"}
     if deterministic:
-        ws = det_backend.KdaDetWorkspace.for_problem(
+        ws = det_backend.CakeKDADetWorkspace.for_problem(
             seqlen, docs, heads, device, **mode
         )
     else:
@@ -361,9 +361,9 @@ def cake_boundaries(
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
     if deterministic:
-        fwd_fn = det_backend.chunk_kda_det_fwd
-        bwd_fn = det_backend.chunk_kda_det_bwd
-        autograd_fn = det_backend.chunk_kda_det
+        fwd_fn = det_backend.cake_kda_det_train_forward
+        bwd_fn = det_backend.cake_kda_det_train_backward
+        autograd_fn = det_backend.cake_kda_det
         mode = {}
     else:
         fwd_fn = nd_backend.chunk_kda_fwd
@@ -502,10 +502,10 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
     raw = _raw_kw(inputs)
     l2n = _l2n_kw(inputs)
     if deterministic:
-        out, saved = det_backend.chunk_kda_det_fwd(
+        out, saved = det_backend.cake_kda_det_train_forward(
             q, k, v, g, beta, cu, workspace=ws, **raw, **l2n
         )
-        grads = det_backend.chunk_kda_det_bwd(
+        grads = det_backend.cake_kda_det_train_backward(
             q,
             k,
             v,

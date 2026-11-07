@@ -659,6 +659,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a(int* __restrict__ t
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A), (sk_koff + (unsigned int)k) * 128, (unsigned int)cta_rank * 8, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         } else {
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A2), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF2), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         }

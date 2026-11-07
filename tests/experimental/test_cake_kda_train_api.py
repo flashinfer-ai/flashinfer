@@ -17,7 +17,7 @@ flashinfer public-API tests of the Cake packed KDA chunked training with a selec
 ``flashinfer.cake_kda_train`` and the non-deterministic package ``flashinfer.experimental.cake.cake_kda_train``.
 
 Every facade entry takes ``deterministic: bool = True``: ``True`` (the default) runs the deterministic package
-``flashinfer.experimental.cake_kda_det_train``, ``False`` the non-deterministic one, and torch's deterministic mode
+``flashinfer.experimental.cake.cake_kda_det_train``, ``False`` the non-deterministic one, and torch's deterministic mode
 turns ``False`` into the deterministic package with one ``UserWarning`` per process.  On the CPU this suite covers the
 facade's marking, signatures and dispatch table (the package functions replaced by recorders), its refusal of a
 non-bool mode, the refusal of every mode but ``deterministic=False`` by the package entries, its autograd node
@@ -65,28 +65,28 @@ from tests.test_helpers.cake_package import cake_package
 pkg = cake_package("cake.cake_kda_train")
 cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
-det_pkg = cake_package("cake_kda_det_train")
-det_backend = cake_package("cake_kda_det_train", "cake_backend")
+det_pkg = cake_package("cake.cake_kda_det_train")
+det_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")  # the order the backward returns
 # facade entry -> its deterministic facade name (the shared spellings of flashinfer.kda_train)
 NAME_MAP = {
-    "chunk_kda_fwd": "chunk_kda_det_fwd",
-    "chunk_kda_bwd": "chunk_kda_det_bwd",
-    "chunk_kda": "chunk_kda_det",
-    "kda_train_arena": "kda_det_train_arena",
-    "kda_train_workspace": "kda_det_train_workspace",
-    "kda_train_workspace_bytes": "kda_det_train_workspace_bytes",
-    "kda_train_saved_bytes": "kda_det_train_saved_bytes",
-    "is_kda_train_supported": "is_kda_det_train_supported",
+    "chunk_kda_fwd": "cake_kda_det_train_forward",
+    "chunk_kda_bwd": "cake_kda_det_train_backward",
+    "chunk_kda": "cake_kda_det",
+    "kda_train_arena": "cake_kda_det_train_arena",
+    "kda_train_workspace": "cake_kda_det_train_workspace",
+    "kda_train_workspace_bytes": "cake_kda_det_train_workspace_bytes",
+    "kda_train_saved_bytes": "cake_kda_det_train_saved_bytes",
+    "is_kda_train_supported": "is_cake_kda_det_train_supported",
 }
 EXPERIMENTAL_ENTRIES = ("chunk_kda_fwd", "chunk_kda_bwd", "chunk_kda")
 # The backend function each facade entry hands off to: (deterministic backend attribute, this package's).
 TARGETS = {
-    "chunk_kda_fwd": ("chunk_kda_det_fwd", "chunk_kda_fwd"),
-    "chunk_kda_bwd": ("chunk_kda_det_bwd", "chunk_kda_bwd"),
-    "chunk_kda": ("chunk_kda_det", "chunk_kda"),
+    "chunk_kda_fwd": ("cake_kda_det_train_forward", "chunk_kda_fwd"),
+    "chunk_kda_bwd": ("cake_kda_det_train_backward", "chunk_kda_bwd"),
+    "chunk_kda": ("cake_kda_det", "chunk_kda"),
     "kda_train_workspace_bytes": ("workspace_bytes", "workspace_bytes"),
     "kda_train_saved_bytes": ("saved_bytes", "saved_bytes"),
     "is_kda_train_supported": ("is_supported", "is_supported"),
@@ -233,7 +233,7 @@ def _recorders(monkeypatch) -> list:
 
             monkeypatch.setattr(module, attr, record)
     for side, cls in (
-        ("det", det_backend.KdaDetWorkspace),
+        ("det", det_backend.CakeKDADetWorkspace),
         ("nd", cake_backend.KdaWorkspace),
     ):
 
@@ -275,7 +275,7 @@ def _side_of(name: str, result) -> str:
     if name == "kda_train_arena":
         if isinstance(result, cake_backend.KdaArena):
             return "nd"
-        assert isinstance(result, det_backend.KdaDetArena), type(result)
+        assert isinstance(result, det_backend.CakeKDADetArena), type(result)
         return "det"
     return result
 
@@ -340,9 +340,9 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
     log = _recorders(monkeypatch)
     det_arena = facade.kda_train_arena(lean=True, tail_passes=2)
     nd_arena = facade.kda_train_arena(lean=True, tail_passes=2, deterministic=False)
-    assert isinstance(det_arena, det_backend.KdaDetArena)
+    assert isinstance(det_arena, det_backend.CakeKDADetArena)
     assert isinstance(nd_arena, cake_backend.KdaArena)
-    assert det_arena == det_backend.KdaDetArena(lean=True, tail_passes=2)
+    assert det_arena == det_backend.CakeKDADetArena(lean=True, tail_passes=2)
     assert nd_arena == cake_backend.KdaArena(lean=True, tail_passes=2)
     operands = tuple(object() for _ in range(6))
     with warnings.catch_warnings():
@@ -355,7 +355,7 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
     assert [side for _entry, side, _kw in log] == ["det", "nd", "det", "nd"]
     for (_entry, side, kwargs), source in zip(log, sources, strict=True):
         got = kwargs["arena"]
-        own = det_backend.KdaDetArena if side == "det" else cake_backend.KdaArena
+        own = det_backend.CakeKDADetArena if side == "det" else cake_backend.KdaArena
         assert isinstance(got, own), (side, type(got))
         assert dataclasses.astuple(got) == dataclasses.astuple(source)
         assert (got is source) is isinstance(source, own)
@@ -363,7 +363,7 @@ def test_facade_routes_the_arena_option_to_the_package(monkeypatch) -> None:
 
 def test_facade_routes_the_saved_set_to_the_package(monkeypatch) -> None:
     """A saved set of either package serves both backwards: a backward routed to the deterministic package
-    (``deterministic=True``, or ``False`` under torch's deterministic mode) hands it a ``KdaDetChunkSaved`` with the
+    (``deterministic=True``, or ``False`` under torch's deterministic mode) hands it a ``CakeKDADetChunkSaved`` with the
     same fields and tensors (the deterministic entries take their own type only), this package's backward the set as
     it is; the deterministic package's own set and ``None`` pass through."""
     log = _recorders(monkeypatch)
@@ -380,7 +380,7 @@ def test_facade_routes_the_saved_set_to_the_package(monkeypatch) -> None:
         lower_bound=LOWER_BOUND,
         qk_l2norm=True,
     )
-    det_saved = det_backend.KdaDetChunkSaved(**fields)
+    det_saved = det_backend.CakeKDADetChunkSaved(**fields)
     nd_saved = cake_backend.KdaChunkSaved(**fields)
     assert nd_saved.deterministic is False
     operands = tuple(object() for _ in range(7))
@@ -400,7 +400,7 @@ def test_facade_routes_the_saved_set_to_the_package(monkeypatch) -> None:
         if side == "nd" or source is not nd_saved:
             assert got is source, (side, source)
             continue
-        assert type(got) is det_backend.KdaDetChunkSaved
+        assert type(got) is det_backend.CakeKDADetChunkSaved
         for f in dataclasses.fields(got):
             assert getattr(got, f.name) is getattr(nd_saved, f.name), f.name
 
@@ -482,7 +482,7 @@ def test_importing_the_facade_imports_neither_package() -> None:
         "import json, sys\n"
         "import flashinfer.cake_kda_train\n"
         "print(json.dumps(sorted(m for m in sys.modules"
-        " if m.startswith('flashinfer.experimental.cake_kda_det_train')"
+        " if m.startswith('flashinfer.experimental.cake.cake_kda_det_train')"
         " or m.startswith('flashinfer.experimental.cake.cake_kda_train'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == []
@@ -730,7 +730,7 @@ def test_either_backward_reads_either_packages_saved_set_by_gate_mode() -> None:
         (cake_backend._check_saved_gate, cake_backend._GateParams(*params)),
         (det_backend._check_saved_gate, det_backend._GateParams(*params)),
     )
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
         raw = saved_type(
             4, t, t, None, 1, H, 1, scale, qg=t, gate="raw", lower_bound=-5.0
         )
@@ -922,7 +922,7 @@ def test_either_packages_check_reads_either_packages_l2n_saved_set() -> None:
     rstd = torch.zeros(2, S, H, dtype=torch.float32)
     checks = (cake_backend._check_saved_l2n, det_backend._check_saved_l2n)
     passed = 0
-    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.CakeKDADetChunkSaved):
         on = _l2n_saved(saved_type, S, H, qk_rstd=rstd, qk_l2norm=True)
         off = _l2n_saved(saved_type, S, H)
         assert (off.qk_rstd, off.qk_l2norm) == (None, False)
@@ -1130,13 +1130,13 @@ def test_package_exports_the_det_free_names_only() -> None:
     # the in-kernel Q/K L2 norm modes are the backend's, as in the deterministic package
     assert "L2N_MODES" in cake_backend.__all__ and "L2N_MODES" not in pkg.__all__
     for name in (
-        "chunk_kda_det",
-        "chunk_kda_det_fwd",
-        "chunk_kda_det_bwd",
-        "ChunkKDADetFunction",
-        "KdaDetChunkSaved",
-        "KdaDetWorkspace",
-        "KdaDetArena",
+        "cake_kda_det",
+        "cake_kda_det_train_forward",
+        "cake_kda_det_train_backward",
+        "CakeKDADetFunction",
+        "CakeKDADetChunkSaved",
+        "CakeKDADetWorkspace",
+        "CakeKDADetArena",
     ):
         assert not hasattr(pkg, name) and not hasattr(cake_backend, name), name
     assert pkg.__name__ == "flashinfer.experimental.cake.cake_kda_train"
@@ -1148,9 +1148,9 @@ def test_package_exports_the_det_free_names_only() -> None:
 
 def test_legacy_names_stay_deterministic() -> None:
     """The det names of ``flashinfer.cake_kda_det_train`` are the deterministic facade's objects, never this
-    facade's; the det package ``flashinfer.experimental.cake_kda_det_train`` is never this package; the test-alias
+    facade's; the det package ``flashinfer.experimental.cake.cake_kda_det_train`` is never this package; the test-alias
     keys follow."""
-    import flashinfer.experimental.cake_kda_det_train as legacy_pkg
+    import flashinfer.experimental.cake.cake_kda_det_train as legacy_pkg
     import flashinfer.cake_kda_det_train as legacy
 
     for name, det_name in NAME_MAP.items():
@@ -1162,16 +1162,16 @@ def test_legacy_names_stay_deterministic() -> None:
         )
     assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
     for name, det_name in (
-        ("chunk_kda", "chunk_kda_det"),
-        ("chunk_kda_fwd", "chunk_kda_det_fwd"),
-        ("chunk_kda_bwd", "chunk_kda_det_bwd"),
-        ("ChunkKDAFunction", "ChunkKDADetFunction"),
-        ("KdaChunkSaved", "KdaDetChunkSaved"),
-        ("KdaWorkspace", "KdaDetWorkspace"),
+        ("chunk_kda", "cake_kda_det"),
+        ("chunk_kda_fwd", "cake_kda_det_train_forward"),
+        ("chunk_kda_bwd", "cake_kda_det_train_backward"),
+        ("ChunkKDAFunction", "CakeKDADetFunction"),
+        ("KdaChunkSaved", "CakeKDADetChunkSaved"),
+        ("KdaWorkspace", "CakeKDADetWorkspace"),
     ):
         assert getattr(legacy_pkg, det_name) is getattr(det_pkg, det_name), name
         assert getattr(legacy_pkg, det_name) is not getattr(pkg, name), name
-    assert cake_package("cake_kda_det_train") is det_pkg
+    assert cake_package("cake.cake_kda_det_train") is det_pkg
     assert cake_package("cake.cake_kda_train") is pkg
     assert legacy_pkg is not pkg and det_pkg is not pkg
 
@@ -1448,7 +1448,7 @@ def _device_or_skip() -> torch.device:
         is None
     ):
         pytest.skip("not an exported compute capability")
-    for module in (cake_jit, cake_package("cake_kda_det_train", "cake_jit")):
+    for module in (cake_jit, cake_package("cake.cake_kda_det_train", "cake_jit")):
         if not (Path(module.__file__).resolve().parent / "build.json").exists():
             pytest.skip("a package has no build.json yet (not exported)")
     return torch.device("cuda", index)
@@ -1485,10 +1485,10 @@ def test_public_entries_run_the_packages(shape) -> None:
     q, k, v, g, beta, cu, dout = _operands(
         make_inputs(lengths, heads, device, batched=True)
     )
-    det_out, det_saved = det_backend.chunk_kda_det_fwd(
+    det_out, det_saved = det_backend.cake_kda_det_train_forward(
         q, k, v, g, beta, cu, scale=facade.DEFAULT_SCALE
     )
-    det_grads = det_backend.chunk_kda_det_bwd(
+    det_grads = det_backend.cake_kda_det_train_backward(
         q, k, v, g, beta, cu, dout, saved=det_saved, scale=facade.DEFAULT_SCALE
     )
     nd_out, nd_saved = cake_backend.chunk_kda_fwd(
@@ -1518,7 +1518,7 @@ def test_public_entries_run_the_packages(shape) -> None:
             own = (
                 cake_backend.KdaWorkspace
                 if mode.get("deterministic") is False
-                else det_backend.KdaDetWorkspace
+                else det_backend.CakeKDADetWorkspace
             )
             assert type(ws) is own, mode
             assert ws.bytes == facade.kda_train_workspace_bytes(S, N, heads, **mode)
@@ -1568,10 +1568,10 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
     device = _device_or_skip()
     lengths, heads = (129, 63), 16
     q, k, v, g, beta, cu, dout = _operands(make_inputs(lengths, heads, device))
-    out_want, saved = det_backend.chunk_kda_det_fwd(
+    out_want, saved = det_backend.cake_kda_det_train_forward(
         q, k, v, g, beta, cu, scale=facade.DEFAULT_SCALE
     )
-    grads_want = det_backend.chunk_kda_det_bwd(
+    grads_want = det_backend.cake_kda_det_train_backward(
         q, k, v, g, beta, cu, dout, saved=saved, scale=facade.DEFAULT_SCALE
     )
     with warnings.catch_warnings():
@@ -1590,7 +1590,7 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
                 out, saved = facade.chunk_kda_fwd(
                     q, k, v, g, beta, cu, workspace=workspace, deterministic=False
                 )
-                assert type(saved) is det_backend.KdaDetChunkSaved
+                assert type(saved) is det_backend.CakeKDADetChunkSaved
                 grads = facade.chunk_kda_bwd(
                     q,
                     k,
@@ -1610,7 +1610,7 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(monkeypatch) ->
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
             ]
             o = facade.chunk_kda(*leaves, cu, deterministic=False)
-            assert o.grad_fn._forward_cls is det_backend.ChunkKDADetFunction
+            assert o.grad_fn._forward_cls is det_backend.CakeKDADetFunction
             o.backward(dout)
             for leaf, want in zip(
                 leaves,
@@ -1641,7 +1641,11 @@ def test_autograd_records_the_forward_mode() -> None:
     want = {}
     for mode, fwd, bwd in (
         (False, cake_backend.chunk_kda_fwd, cake_backend.chunk_kda_bwd),
-        (True, det_backend.chunk_kda_det_fwd, det_backend.chunk_kda_det_bwd),
+        (
+            True,
+            det_backend.cake_kda_det_train_forward,
+            det_backend.cake_kda_det_train_backward,
+        ),
     ):
         extra = {} if mode else {"deterministic": False}
         _, saved = fwd(q, k, v, g, beta, cu, scale=facade.DEFAULT_SCALE, **extra)
@@ -1652,7 +1656,7 @@ def test_autograd_records_the_forward_mode() -> None:
         warnings.simplefilter("ignore", ExperimentalWarning)
         for mode, node in (
             (False, cake_backend.ChunkKDAFunction),
-            (True, det_backend.ChunkKDADetFunction),
+            (True, det_backend.CakeKDADetFunction),
         ):
             leaves = [
                 t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)
@@ -1677,7 +1681,7 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
     """This package's forward writes a saved set recording ``deterministic=False`` in the deterministic package's
     format: each package's backward reads the other's set and gives the gradients of its own (this package's backward
     the deterministic set as it is, the deterministic backward this package's set through the facade, which hands it
-    over as a ``KdaDetChunkSaved``)."""
+    over as a ``CakeKDADetChunkSaved``)."""
     device = _device_or_skip()
     lengths, heads = (63, 1, 65), 2
     q, k, v, g, beta, cu, dout = _operands(make_inputs(lengths, heads, device))
@@ -1686,7 +1690,7 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
         nd_out, nd_saved = cake_backend.chunk_kda_fwd(
             q, k, v, g, beta, cu, scale=scale, save_mode=save_mode, deterministic=False
         )
-        det_out, det_saved = det_backend.chunk_kda_det_fwd(
+        det_out, det_saved = det_backend.cake_kda_det_train_forward(
             q, k, v, g, beta, cu, scale=scale, save_mode=save_mode
         )
         assert nd_saved.deterministic is False and _bits_equal(nd_out, det_out)
@@ -1712,7 +1716,7 @@ def test_the_backward_reads_a_saved_set_of_either_package() -> None:
             deterministic=False,
         )
         assert _same(other, own), save_mode
-        det_own = det_backend.chunk_kda_det_bwd(
+        det_own = det_backend.cake_kda_det_train_backward(
             q, k, v, g, beta, cu, dout, saved=det_saved, scale=scale
         )
         with warnings.catch_warnings():

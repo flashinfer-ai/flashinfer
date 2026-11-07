@@ -205,7 +205,8 @@ def test_removed_package_paths_do_not_import(name):
 
 def test_former_entries_fail_at_import():
     """In a fresh interpreter, no former deterministic entry and no entry of this module imports from
-    ``flashinfer.chunked_lm_head`` (the module of the non-deterministic dispatchers)."""
+    ``flashinfer.chunked_lm_head`` (a removed module; its non-deterministic entries are now
+    ``flashinfer.cake_lm_head_nondet_train``)."""
     names = REMOVED_ENTRIES + ENTRIES
     code = (
         "import json\n"

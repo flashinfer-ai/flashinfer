@@ -19,7 +19,7 @@ arena, the saved set, the forward and backward launch sequences and the
 autograd Function.
 
 Numerical mode.  This package is the counterpart of
-``flashinfer.experimental.cake_kda_det_train`` (the deterministic package)
+``flashinfer.experimental.cake.cake_kda_det_train`` (the deterministic package)
 selected with ``deterministic=False``; it imports nothing from it and ships its
 own copies of every program.  The entry points :func:`chunk_kda_fwd`,
 :func:`chunk_kda_bwd` and :func:`chunk_kda`, the workspace :class:`KdaWorkspace`
@@ -2744,7 +2744,7 @@ class KdaChunkSaved:
     programs are copies of the deterministic package's, so both packages write the same versions in the same
     format, and the backward of either reads a set of the other in both gate modes and both in-kernel Q/K L2 norm
     modes: this package's backward reads the deterministic package's set as it is; the deterministic entries take
-    their own type only (``KdaDetChunkSaved``, with the same fields but ``deterministic``), so the facade's
+    their own type only (``CakeKDADetChunkSaved``, with the same fields but ``deterministic``), so the facade's
     deterministic route hands them this package's set as one, with the same tensors.
     """
 
@@ -4707,7 +4707,7 @@ def _require_deterministic_false(deterministic: object, entry: str) -> None:
         raise ValueError(
             f"{entry} is the non-deterministic packed KDA training (deterministic=False), got "
             f"deterministic={deterministic!r}; the deterministic programs are "
-            "flashinfer.experimental.cake_kda_det_train (or flashinfer.cake_kda_train with deterministic=True)"
+            "flashinfer.experimental.cake.cake_kda_det_train (or flashinfer.cake_kda_train with deterministic=True)"
         )
 
 

@@ -127,7 +127,7 @@ takes a ``deterministic`` keyword; passing one raises ``TypeError``.
      - no effect
    * - deterministic, context-parallel (KCP)
      - ``flashinfer.cake_causal_conv1d_det_train_kcp``:
-       ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_multi_kcp``
+       ``cake_causal_conv1d_det_kcp``, ``cake_causal_conv1d_det_kcp_multi``
      - ``y``, ``dx`` and the rank-local FP32 ``dweight`` partial bitwise
        reproducible
      - no effect
@@ -196,8 +196,10 @@ the halo collective of the KDA step's context.
     :toctree: ../generated
 
     cake_causal_conv1d_det_kcp
-    cake_causal_conv1d_det_multi_kcp
-    RecomputeHandleDetKcp
+    cake_causal_conv1d_det_kcp_multi
+    CakeCausalConv1dDetKcpFunction
+    CakeCausalConv1dDetKcpMultiFunction
+    CakeCausalConv1dDetKcpRecomputeHandle
 
 Training causal conv1d, non-deterministic (Cake)
 -------------------------------------------------
@@ -261,9 +263,10 @@ Each name of the two modules maps to the deterministic name with ``det`` in
 place of ``nondet`` (``cake_causal_conv1d_nondet`` ->
 ``cake_causal_conv1d_det``, ``CakeCausalConv1dNondetFunction`` ->
 ``CakeCausalConv1dDetFunction``,
-``cake_causal_conv1d_nondet_kcp`` -> ``cake_causal_conv1d_det_kcp``), except
-``cake_causal_conv1d_nondet_kcp_multi`` -> ``cake_causal_conv1d_det_multi_kcp``
-and ``CakeCausalConv1dNondetKcpRecomputeHandle`` -> ``RecomputeHandleDetKcp``.
+``cake_causal_conv1d_nondet_kcp`` -> ``cake_causal_conv1d_det_kcp``,
+``cake_causal_conv1d_nondet_kcp_multi`` -> ``cake_causal_conv1d_det_kcp_multi``,
+``CakeCausalConv1dNondetKcpRecomputeHandle`` ->
+``CakeCausalConv1dDetKcpRecomputeHandle``).
 Example::
 
     from flashinfer.cake_causal_conv1d_nondet_train import (
