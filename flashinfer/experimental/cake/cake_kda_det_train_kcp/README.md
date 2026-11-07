@@ -142,6 +142,16 @@ run its queued work.  Calls on one stream do neither.
 and sizes that call for the backward, so a first forward does not build a
 forward-only arena that the first backward replaces.
 
+A call without a workspace (`workspace=None`) runs on a default workspace of
+its context, device, stream, head count, direction and modes, kept in a bounded
+pool between calls (at most 64 keys, 2 workspaces per key). The call allocates
+its pools and local arena at its start and frees them at its end, as before,
+so between calls the pool holds host objects only: the plan, the layout views
+and the launch templates, which the next call reuses instead of building them
+again. The results are bitwise unchanged. The default workspaces of a
+collected context leave the pool at the next call; a call under CUDA-graph
+capture builds a workspace of its own.
+
 Saved set of a rank (`CakeKDADetKcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`

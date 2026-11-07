@@ -6849,6 +6849,82 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
         assert now == base, (i, now - base)
 
 
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_default_workspace_pool(device, lengths, H) -> None:
+    """``workspace=None`` keeps its default workspaces between calls (``cake_kcp._default_pool``; one rank): every
+    later call runs on the workspace object its key's first call built, bitwise the results of a held workspace (the
+    caching allocator's free blocks filled with NaN before each step: no result reads a byte the call did not write),
+    a forward without a saved set (the lazy pools) included; a pooled step peaks no higher than the first, and between
+    calls the pooled workspaces hold no device memory (``memory_allocated`` returns at most to its level before the
+    step).
+    Once the context is collected, its workspaces leave the pool at the next call."""
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+
+    def step(c, ws):
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(*args, c, workspace=ws)
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, c, ops["dout"], saved=saved, workspace=ws
+        )
+        light, none = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, c, workspace=ws, save_for_backward=False
+        )
+        assert none is None
+        res = (out, *written_tensors(saved), *grads, light)
+        return tuple(t.detach().clone() for t in res)
+
+    def pooled(c) -> dict:  # the context's pooled workspaces per key
+        return {
+            key: [e[0] for e in entries]
+            for key, entries in cake_kcp._default_pool.items()
+            if key[0] == id(c)
+        }
+
+    ref = step(ctx, cake_kcp.CakeKDADetKcpWorkspace())
+    peaks, shells = [], []
+    for i in range(3):
+        _poison(device)
+        gc.collect()
+        base = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        res = step(ctx, None)
+        torch.cuda.synchronize(device)
+        peaks.append(torch.cuda.max_memory_allocated(device) - base)
+        assert all(
+            torch.equal(_bits(a), _bits(b)) for a, b in zip(ref, res, strict=True)
+        ), i
+        del res
+        gc.collect()
+        torch.cuda.synchronize(device)
+        # nothing stays behind a step (the first may also free what the reference step left: 2 KiB on GB300)
+        assert torch.cuda.memory_allocated(device) <= base, i
+        mine = pooled(ctx)
+        assert sorted(key[4] for key in mine) == [False, True], mine  # fwd, bwd
+        for key, workspaces in mine.items():
+            for ws in workspaces:
+                storages = [t.untyped_storage() for t in ws._pools.values()]
+                storages += [t.untyped_storage() for t, _ in ws._parked.values()]
+                storages.append(ws.local.arena.untyped_storage())
+                assert all(s.nbytes() == 0 for s in storages), i
+                # the lazy pools wait parked (the forward's); from the second step on the ensure record stays (the
+                # first allocation of a lazy pool drops it once), so the next call takes the trimmed ensure path
+                assert bool(ws._parked) == (not key[4]), (i, key, list(ws._parked))
+                assert ws._fast or i == 0, (i, key)
+        shells.append({key: [id(ws) for ws in w] for key, w in mine.items()})
+    assert shells[0] == shells[1] == shells[2], shells
+    assert max(peaks[1:]) <= peaks[0], peaks
+    gone = [weakref.ref(ws) for w in pooled(ctx).values() for ws in w]
+    ctx_ref = weakref.ref(ctx)
+    del ctx, mine, workspaces, ws, storages
+    gc.collect()
+    assert ctx_ref() is None
+    ctx2, _ = _ckpt_problem(device, lengths, H)
+    out2, _ = cake_kcp.cake_kda_det_train_kcp_forward(*args, ctx2)
+    assert torch.equal(_bits(out2), _bits(ref[0]))
+    gc.collect()
+    assert all(r() is None for r in gone)
+
+
 def test_gpu_workspace_upgrade_releases_superseded_storage_first(device) -> None:
     """A backward ``ensure`` on a forward workspace releases the forward-only local arena and every pool it outgrows
     before allocating their successors: the old and the new storage never coexist, so the upgrade's allocation

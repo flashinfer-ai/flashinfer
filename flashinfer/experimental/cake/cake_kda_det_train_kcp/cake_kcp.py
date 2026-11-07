@@ -319,12 +319,14 @@ for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import dataclasses
 import functools
 import inspect
 import operator
 import sys
+import threading
 import types
 import warnings
 import weakref
@@ -3809,6 +3811,8 @@ class CakeKDADetKcpWorkspace:
         self._slices: dict[
             tuple[str, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}  # pool[:n] views per (name, n), at most SLICE_CACHE_MAX
+        # a pooled default workspace's lazy pools between calls (_default_release): name -> (pool, bytes), storage freed
+        self._parked: dict[str, tuple[torch.Tensor, int]] = {}
         if ctx is not None:
             if H is None:
                 raise ValueError("CakeKDADetKcpWorkspace: H is required with ctx")
@@ -4252,6 +4256,13 @@ class CakeKDADetKcpWorkspace:
             and n
             and self.device is not None
         ):
+            if self._parked:
+                # a pooled default workspace's lazy pool: its storage again at this first read, where a fresh workspace
+                # allocates it (the pool, its cached views and the ensure records stay as they were)
+                held = self._parked.pop(name, None)
+                if held is not None:
+                    self._pools[name] = held[0]
+                    held[0].untyped_storage().resize_(held[1])
             if self._grow(name, n, self.device):
                 if self._slices:
                     self._drop_stale_slices()
@@ -4798,6 +4809,8 @@ class CakeKDADetKcpCall:
         # the forward state walk program of the forward in progress (_forward sets it): kcp_fwdh_o, or kcp_fwdh_tape
         # where the forward keeps its tapes (the replay forward) or the knob asks for the previous form
         self.fwd_walk = "kcp_fwdh_tape"
+        # a workspace=None call on a pooled default workspace: (pool key, weak context); None otherwise (_prepare)
+        self.default: tuple[tuple[Any, ...], Any] | None = None
 
     # -- buffers
     def buf(self, name: str) -> torch.Tensor:
@@ -6279,6 +6292,165 @@ def _call_workspace(
     return workspace
 
 
+# The workspaces of the calls made without one (workspace=None), per (context, device, stream, H, direction, modes and
+# table signature), as the single-rank package keeps its default workspaces (cake_backend._entry_acquire /
+# _entry_release): the first such call builds a default workspace as before; at its end the device storage of every
+# pool and of the local arena is freed (untyped_storage().resize_(0), the caching allocator takes the blocks back on
+# the call's stream as when a per-call tensor dies) and the workspace -- its plan, layout views, ensure record and
+# launch templates -- is kept.  The next call with the key allocates the same bytes again, in the same order, on the
+# same stream (the views and templates follow their storage's new address), so between calls only host objects stay
+# and a call's device memory is that of a fresh workspace.  What a fresh workspace builds during a call is dropped at
+# release and built again by the next call: the identity tile's content, the intra record's scratch table set and the
+# existing backend's eye; a lazy pool keeps its tensor and gets its storage again at the next call's first read of it
+# (where a fresh workspace allocates it).  A workspace serves one call at a time; another stream or another context
+# takes its own.  A call under CUDA-graph capture, with another backend, CPU operands or a context without weak
+# references builds a fresh workspace of its own.  The workspaces of a collected context go at the next call.
+_DEFAULT_KEYS = 64
+_DEFAULT_PER_KEY = 2
+# key -> [(workspace, weak context, the storages and their bytes)], least recently released first
+_default_pool: collections.OrderedDict[tuple[Any, ...], list[tuple[Any, ...]]] = (
+    collections.OrderedDict()
+)
+_default_lock = threading.Lock()
+# the ids of collected contexts (appended by their weak references' callbacks, drained under the lock)
+_default_dead: collections.deque[int] = collections.deque()
+
+
+def _default_drain() -> None:
+    """Drop the pooled workspaces of collected contexts (the caller holds :data:`_default_lock`)."""
+    while _default_dead:
+        dead = _default_dead.popleft()
+        for key in [key for key in _default_pool if key[0] == dead]:
+            del _default_pool[key]
+
+
+def _default_workspace(
+    ctx: Any,
+    q: Any,
+    backend: Any,
+    save_mode: str,
+    gate: str,
+    l2n: bool,
+    device: torch.device | str | None,
+    backward: bool,
+    opts: CakeKDADetKcpOptions,
+) -> tuple[CakeKDADetKcpWorkspace, tuple[tuple[Any, ...], Any] | None, Any]:
+    """``workspace=None``: ``(workspace, (pool key, weak context) or None, (freed storages, eye tile) or None)``.  A pooled
+    workspace comes with the storages :func:`_default_release` freed (:func:`_default_unpark` allocates them before
+    the call's ``ensure``); otherwise a default workspace is built (:func:`_call_workspace`), pooled at the end of the
+    call where the key is not ``None``."""
+    key = None
+    if (
+        isinstance(backend, KernelBackend)
+        and isinstance(q, torch.Tensor)
+        and q.is_cuda
+        and q.dim() >= 2
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        index = q.device.index
+        key = (
+            id(ctx),
+            index,
+            _raw_stream(index),
+            int(q.shape[-2]),
+            bool(backward),
+            save_mode,
+            gate,
+            bool(l2n),
+            backend.dtypes["state"],
+            bool(backend.local_stages),
+            int(opts.fused_walks),
+            str(opts.walk_geometry),
+        )
+        with _default_lock:
+            if _default_dead:
+                _default_drain()
+            free = _default_pool.get(key)
+            entry = free.pop() if free else None
+        if entry is not None and entry[1]() is ctx:
+            return entry[0], (key, entry[1]), entry[2]
+    workspace = _call_workspace(None, backend, save_mode, gate, l2n, device)
+    if key is None:
+        return workspace, None, None
+    # a context without weak references: a workspace of this call alone
+    try:
+        ref = weakref.ref(ctx, lambda _, dead=key[0]: _default_dead.append(dead))
+    except TypeError:
+        return workspace, None, None
+    return workspace, (key, ref), None
+
+
+def _default_unpark(parked: Any) -> None:
+    """Allocate the storages of a pooled default workspace (their bytes, in the order a fresh workspace allocates
+    them) on the call's stream and rebuild the identity tile's content (the ``torch.eye`` a fresh workspace copies in,
+    written in place)."""
+    storages, eye = parked
+    for storage, nbytes in storages:
+        storage.resize_(nbytes)
+    if eye is not None:
+        torch.eye(D, out=eye)
+
+
+def _default_release(call: CakeKDADetKcpCall) -> None:
+    """The end of a ``workspace=None`` call on a pooled default workspace (nothing otherwise): free its device
+    storages and keep the workspace for the next call with its key (at most :data:`_DEFAULT_PER_KEY` per key and
+    :data:`_DEFAULT_KEYS` keys, the least recently released going first).  Not reached when the call raises: its
+    workspace then goes with it, as a fresh one does."""
+    if call.default is None:
+        return
+    key, ref = call.default
+    ws = call.ws
+    local = ws.local
+    if local is not None and local.__dict__.get(TAIL_COUNTS_ATTR) is not None:
+        return  # a lean arena (never a default workspace's): not pooled
+    # the lazily allocated pools are parked by name: the next call's first read allocates the storage again
+    # (CakeKDADetKcpWorkspace.pool), as a fresh workspace allocates the pool there
+    lazy = cake_kcp_plan.LAZY_POOLS + (
+        () if call.backward else cake_kcp_plan.FWD_LAZY_POOLS
+    )
+    freed: list[Any] = []
+    for name in lazy:
+        t = ws._pools.pop(name, None)
+        if t is not None:
+            storage = t.untyped_storage()
+            ws._parked[name] = (t, storage.nbytes())
+            freed.append(storage)
+    ws._tables.clear()  # the table_cache="workspace" knob's sets hold their context
+    parked: list[tuple[Any, int]] = []
+    seen: set[int] = set()
+    # each storage once (a SHARED_POOLS pair is one tensor), in allocation order
+    for t in ws._pools.values():
+        if id(t) not in seen:
+            seen.add(id(t))
+            storage = t.untyped_storage()
+            if storage.nbytes():
+                parked.append((storage, storage.nbytes()))
+    if local is not None:
+        storage = local.arena.untyped_storage()
+        parked.append((storage, storage.nbytes()))
+        # the next call builds a fresh eye and scratch table set, as a fresh arena does
+        local._eye_box[0] = None
+        local._epoch[0] = 0
+        for arena in (local, *ws._views.values()):
+            arena.__dict__.pop(SCRATCH_TABLES_ATTR, None)
+    for storage in [*freed, *(s for s, _ in parked)]:
+        storage.resize_(0)
+    # the identity tile, rebuilt by _default_unpark
+    eye = ws._pools.get("eye")
+    eye = eye.view(D, D) if eye is not None and eye.numel() else None
+    with _default_lock:
+        if _default_dead:
+            _default_drain()
+        if ref() is None:
+            return
+        free = _default_pool.setdefault(key, [])
+        _default_pool.move_to_end(key)
+        if len(free) < _DEFAULT_PER_KEY:
+            free.append((ws, ref, (parked, eye)))
+        while len(_default_pool) > _DEFAULT_KEYS:
+            _default_pool.popitem(last=False)
+
+
 def _prepare(
     q,
     k,
@@ -6301,6 +6473,8 @@ def _prepare(
 ):
     backend = get_backend()
     opts = options if isinstance(options, CakeKDADetKcpOptions) else _options(options)
+    # workspace=None: the pooled default workspace's key and storages (_default_workspace)
+    default = parked = None
     if save_mode not in SAVE_MODES:
         raise ValueError(f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
     if save_mode != "light":
@@ -6329,7 +6503,14 @@ def _prepare(
         # only (the context's device model, the workspace's modes): a rank with misaligned or no tokens raises as
         # the others do (the flag-off order is unchanged)
         ctx_dev = getattr(ctx, "device", None)
-        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, ctx_dev)
+        if workspace is None:
+            workspace, default, parked = _default_workspace(
+                ctx, q, backend, save_mode, gate, l2n, ctx_dev, backward, opts
+            )
+        else:
+            workspace = _call_workspace(
+                workspace, backend, save_mode, gate, l2n, ctx_dev
+            )
         workspace._require_l2n(ctx_dev)
     q, k, v, g, beta, T, H, batched = _operands(
         q, k, v, g, beta, ctx, dtypes=backend.dtypes, gate=gate, qk_l2norm=l2n
@@ -6340,7 +6521,14 @@ def _prepare(
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
     if not l2n:
-        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, device)
+        if workspace is None:
+            workspace, default, parked = _default_workspace(
+                ctx, q, backend, save_mode, gate, l2n, device, backward, opts
+            )
+        else:
+            workspace = _call_workspace(
+                workspace, backend, save_mode, gate, l2n, device
+            )
     # the in-kernel Q / K L2 norm's capability on this device, before the workspace binds anything: rank-independent
     # inputs only, so a rank without tokens raises as the others do (cake_kcp_plan.require_qk_l2norm; checked above
     # on the context's device, nothing again on the same architecture)
@@ -6349,6 +6537,8 @@ def _prepare(
     # a context prepared on another stream: order its uploads on this one (enqueue only)
     if wait_ready is not None:
         wait_ready()
+    if parked is not None:  # a pooled default workspace: its storages for this call
+        _default_unpark(parked)
     tb = workspace.ensure(
         ctx,
         H,
@@ -6377,6 +6567,7 @@ def _prepare(
     )
     call.gate, call.gate_params = gate, gp
     call.l2n, call.l2n_mode = l2n, workspace.l2n
+    call.default = default
     backend.begin_call(call)
     return call, batched
 
@@ -6491,6 +6682,7 @@ def cake_kda_det_train_kcp_forward(
     if opts.graph != "off":
         _graph_eager("fwd", entry)
     call.backend.end_call(call)
+    _default_release(call)
     return _ranked(out, batched), saved
 
 
@@ -6764,6 +6956,7 @@ def cake_kda_det_train_kcp_backward(
     if opts.graph != "off":
         _graph_eager("bwd", entry)
     call.backend.end_call(call)
+    _default_release(call)
     return _shaped_grads(grads, batched, g, gate_args, detach=False)
 
 
@@ -7464,6 +7657,7 @@ def _fwd_handle(
     call.scratch["recompute_handle"] = "capture" if entry is None else "replay"
     _record("fwd", call)
     call.backend.end_call(call)
+    _default_release(call)
     return _ranked(out, batched), saved
 
 
