@@ -101,6 +101,64 @@ def _unswizzle_mxfp8_scales_128x4(
     return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@torch.inference_mode()
+def test_mxfp8_preserves_min_scale_blocks(
+    backend: str,
+    device: str,
+    is_sf_swizzled_layout: bool,
+) -> None:
+    if not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device("cuda")):
+        pytest.skip("MXFP8 quantization requires SM100 or newer")
+    if backend == "cute-dsl":
+        if device == "cpu":
+            pytest.skip("CuTe-DSL only supports CUDA")
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe-DSL is not available")
+
+    values: torch.Tensor = torch.tensor(
+        [20, -20, 448, 896, 0.5, -0.5, 640, 0],
+        dtype=torch.float64,
+        device=device,
+    ) * (2.0**-127)
+    x: torch.Tensor = (
+        values.to(torch.bfloat16 if device == "cuda" else torch.float32)
+        .repeat_interleave(32)
+        .repeat((32, 1))
+    )
+    torch.testing.assert_close(
+        actual=x[0, ::32].double(), expected=values, rtol=0, atol=0
+    )
+
+    quantized, scales = mxfp8_quantize(
+        input=x, backend=backend, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+    linear_scales: torch.Tensor = (
+        _unswizzle_mxfp8_scales_128x4(sf=scales, row=x.shape[0], col=x.shape[1])
+        if is_sf_swizzled_layout
+        else scales.reshape((x.shape[0], -1))
+    )
+    expected_scales: torch.Tensor = torch.tensor(
+        [0, 0, 0, 1, 0, 0, 1, 0], dtype=torch.uint8, device=device
+    ).expand_as(linear_scales)
+    torch.testing.assert_close(
+        actual=linear_scales, expected=expected_scales, rtol=0, atol=0
+    )
+
+    decoded: torch.Tensor = quantized.view(torch.float8_e4m3fn).double() * torch.exp2(
+        linear_scales.double() - 127
+    ).repeat_interleave(repeats=32, dim=1)
+    torch.testing.assert_close(actual=decoded, expected=x.double(), rtol=0, atol=0)
+    _assert_mxfp8_quantize_exact(
+        a=x,
+        a_fp8=quantized,
+        a_sf=scales,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+    )
+
+
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
