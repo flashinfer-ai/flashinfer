@@ -819,6 +819,23 @@ def test_cake_fmha_context_nvfp4_calls_outside_the_exact_programs_take_the_runti
     assert route.pack_g == pack
 
 
+def _bf16_flag_form_box(target, causal, pack, batch, heads, q_len, kv_len):
+    """Whether a BF16 flag-form call lies in a box of
+    :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOXES` for its target, mask and JIT
+    pack (served by its form's program past the bounds)."""
+
+    boxes = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOXES.get(target, {})
+    return any(
+        (box_batch is None or batch <= box_batch)
+        and (box_keys is None or kv_len <= box_keys)
+        and (box_area is None or q_len * kv_len <= box_area)
+        and (box_work is None or batch * heads * q_len * kv_len <= box_work)
+        for box_batch, box_keys, box_area, box_work in boxes.get(causal, {}).get(
+            pack, ()
+        )
+    )
+
+
 def _bf16_form_program(target, form, kwargs):
     """The runtime-size program a BF16 call (``select_cake_fmha_context_route``
     inputs) of flag form ``form`` (sinks, LSE or not causal) takes when no exact
@@ -836,6 +853,8 @@ def _bf16_form_program(target, form, kwargs):
         (keys is not None and kv_len > keys)
         or (area is not None and q_len * kv_len > area)
         or (work is not None and kwargs["batch_size"] * heads * q_len * kv_len > work)
+    ) and not _bf16_flag_form_box(
+        target, form[0], pack, kwargs["batch_size"], heads, q_len, kv_len
     ):
         return None
     table = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][target]
@@ -912,7 +931,8 @@ def test_cake_fmha_context_bf16_flag_forms_take_the_runtime_program_of_their_for
 
 
 # Calls on either side of the bounds of the flag forms' BF16 runtime-size
-# programs (:data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`): (causal, batch,
+# programs (:data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`, with the boxes of
+# :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOXES` past them): (causal, batch,
 # max_q_len, max_kv_len, num_q_heads, num_kv_heads, served on sm100a, served on
 # sm103a by the runtime-size programs of the flag forms of that mask).
 _BF16_FLAG_BOUND_ROWS = [
@@ -921,12 +941,20 @@ _BF16_FLAG_BOUND_ROWS = [
     (True, 16, 512, 6144, 64, 4, False, True),
     (True, 8, 2048, 5120, 32, 8, True, True),
     (True, 8, 2048, 6144, 32, 8, False, True),
-    (True, 1, 8192, 8192, 32, 4, False, True),
+    (True, 1, 8192, 8192, 32, 4, True, True),
+    (True, 1, 8192, 8192, 64, 8, True, True),
+    (True, 1, 2048, 8192, 32, 4, True, True),
+    (True, 2, 8192, 8192, 32, 4, False, True),
+    (True, 1, 8192, 8192, 128, 16, False, True),
+    (True, 1, 8192, 8192, 64, 4, False, True),
     (True, 16, 512, 8192, 64, 4, False, True),
     (True, 1, 12288, 12288, 32, 4, False, False),
     (True, 1, 16384, 16384, 32, 4, False, False),
     (True, 1, 1024, 16384, 32, 4, False, False),
     (True, 1, 14336, 14336, 32, 32, True, True),
+    (True, 8, 1024, 16384, 32, 32, True, True),
+    (True, 1, 16384, 16384, 16, 16, True, True),
+    (True, 2, 8192, 16384, 32, 32, True, False),
     (True, 1, 16384, 16384, 32, 32, True, False),
     (True, 1, 32768, 32768, 32, 32, False, False),
     (False, 4, 4096, 4096, 32, 32, True, True),
@@ -947,6 +975,9 @@ _BF16_FLAG_BOUND_ROWS = [
     (False, 1, 16384, 12288, 16, 1, True, True),
     (False, 1, 16384, 12288, 64, 4, True, False),
     (False, 2, 8192, 16384, 64, 4, True, False),
+    (False, 4, 2048, 16384, 64, 4, True, True),
+    (False, 2, 8192, 8192, 64, 4, True, True),
+    (False, 2, 4096, 16384, 128, 8, True, False),
 ]
 
 
@@ -970,7 +1001,7 @@ def test_cake_fmha_context_bf16_flag_form_bounds_keep_the_jit_past_them(
         (keys is None or kv_len <= keys)
         and (area is None or q_len * kv_len <= area)
         and (work is None or batch * hq * q_len * kv_len <= work)
-    )
+    ) or _bf16_flag_form_box(target, causal, pack, batch, hq, q_len, kv_len)
     assert within == served, (row, pack, keys, area)
     forms = [
         form
@@ -1001,6 +1032,29 @@ def test_cake_fmha_context_bf16_flag_form_bounds_keep_the_jit_past_them(
             form,
             route.program,
         )
+
+
+def test_cake_fmha_context_bf16_flag_form_boxes_lie_past_the_bounds() -> None:
+    """Each box of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOXES` names a target,
+    mask and pack of the flag forms' runtime-size programs and reaches past
+    that pack's bounds in some size: a box only adds calls to the programs,
+    every call within the bounds keeps its program."""
+
+    forms = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"]
+    for target, masks in cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOXES.items():
+        for causal, packs in masks.items():
+            for pack, boxes in packs.items():
+                assert boxes, (target, causal, pack)
+                for form, tables in forms.items():
+                    if form[0] == causal and form != (True, False, False):
+                        assert (pack, None) in tables[target], (target, form, pack)
+                bound = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOUNDS[target][causal][pack]
+                for box in boxes:
+                    assert len(box) == 4, box
+                    assert any(
+                        limit is not None and (size is None or size > limit)
+                        for size, limit in zip(box[1:], bound, strict=True)
+                    ), (target, causal, pack, box)
 
 
 # --- The FP8 runtime-size route (host-only) ---------------------------------
