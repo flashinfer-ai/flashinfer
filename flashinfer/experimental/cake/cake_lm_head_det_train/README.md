@@ -320,7 +320,9 @@ keyword.
 * Memory rule (except the opt-in kept logits above): no logits, probability or
   `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
-  an empty `logp` and zero gradients without binding or launching.
+  an empty `logp` and zero gradients without binding or launching (`dW` is
+  the FP32 product `0 * g` of the upstream scalar `g` cast once, as for a
+  launched call: `-0` for a negative `g`, NaN for a non-finite one).
   `cake_backend.memory_report` reports the peak temporary bytes separately
   from the weights, the outputs and the FP32 accumulators.
 * Opt-in forms (`cake_backend_opt_in.py`): a call that passes `memory_mode`
@@ -566,7 +568,9 @@ row out of the gradient path:
   chunk-bounded buffers) into the same `[T]` output; without `return_logp`
   that pass does not run.
 * A call whose valid rows all have zero weight launches no gradient GEMM: both
-  gradients are zeros and the loss is the plain path's (`+0`).
+  gradients are zeros and the loss is the plain path's (`+0`).  It holds no
+  FP32 `[V, H]` weight-gradient accumulator from the forward to the
+  backward; the backward allocates the zero `dW` in its output dtype only.
 * The logp-only pass runs ahead of the chunk loop, except when the hidden
   valid-row count already holds chunk 0's buffers and either the chunk loop
   keeps no buffer until the backward (`W` without a gradient, or
@@ -641,9 +645,9 @@ without the split (`Cb = min(C, |G|) <= Cm = min(C, T_v)`):
 | phase | bytes added | bytes saved |
 | --- | --- | --- |
 | count (before the loop) | the `Z` mask and the second int32 scan, `T + 4 T` (released before the loop) | -- |
-| chunk loop | `Z` index `8 |Z|` (hidden valid-row count path only); the `Z` rows' `logp` `4 |Z|` when the pass ran first | compact rows `24 |Z|` (labels, `lse`, `logp`, `infer_logp`, `loss_weights`); `dX_acc` `4 H |Z|`; chunk buffers of `Cm - Cb` rows |
-| exact loss (after the loop, mode `"exact"`) | term array `4 T_v`, positions `8 |G|` (then `12 |Z|` for the `Z` slots); the two kept term buffers `4 |G| + 4 Cb` | the loop's statistics (`8 Cm ceil(V / 256)`), `lse` (`4 T_v`), `d` / `term` (`8 Cm`), gather buffer (`2 Cm H`) and, when compacted, `infer_logp` / labels (`12 T_v`), released before this phase; `dX_acc` `4 H |Z|` |
-| logp-only pass | its chunk buffers of `min(C, |Z|)` rows and `O(|Z|)` vectors | runs before the loop allocates (or after it released its buffers) |
+| chunk loop | `Z` index `8 \|Z\|` (hidden valid-row count path only); the `Z` rows' `logp` `4 \|Z\|` when the pass ran first | compact rows `24 \|Z\|` (labels, `lse`, `logp`, `infer_logp`, `loss_weights`); `dX_acc` `4 H \|Z\|`; chunk buffers of `Cm - Cb` rows |
+| exact loss (after the loop, mode `"exact"`) | term array `4 T_v`, positions `8 \|G\|` (then `12 \|Z\|` for the `Z` slots); the two kept term buffers `4 \|G\| + 4 Cb` | the loop's statistics (`8 Cm ceil(V / 256)`), `lse` (`4 T_v`), `d` / `term` (`8 Cm`), gather buffer (`2 Cm H`) and, when compacted, `infer_logp` / labels (`12 T_v`), released before this phase; `dX_acc` `4 H \|Z\|` |
+| logp-only pass | its chunk buffers of `min(C, \|Z\|)` rows and `O(\|Z\|)` vectors | runs before the loop allocates (or after it released its buffers) |
 
 The chunk loop and the exact-loss phase stay below the plain path's chunk
 loop for every `|Z| >= 1` within the documented geometry (the exact-loss
@@ -737,7 +741,11 @@ it handles these rows on the device, without a host synchronization:
 
 Bits.  Every output is the same on every run.  `logp` and `lse` come from
 the forward, which the skip does not change.  A skipped row's `dX` row is
-exact `+0`.  A live row's `dX` row is the same per-row arithmetic; its chunk
+exact `+0`, except when every valid row's `dlogp` is zero: the first valid
+row (the partition's `order[0]`) then still runs one GEMM tile as a live
+row, and its `dX` row is `+0` for finite inputs but NaN when that row's `X`,
+logits or `lse` (or `W`) are non-finite.  A live row's `dX` row is the same
+per-row arithmetic; its chunk
 can change (the live rows move to the front), and with it that chunk's dX
 K-slice count, so its bits can differ from a call without the skip within
 the accuracy budgets.  `dW` sums the same nonzero products over the live
@@ -751,7 +759,9 @@ in `dW`, as without the skip).  A non-finite `X` row or logit of a
 zero-gradient row makes `dW` NaN without the skip (`0 * inf`); with the
 skip it still does when the row falls within the 63 rows after a chunk's
 live rows (the weight-gradient GEMM's last 64-row K step), and not
-elsewhere.  Its `dX` row is an exact zero either way.
+elsewhere.  With the skip its `dX` row is exact `+0` (except the first
+valid row when every `dlogp` is zero, above); without the skip a
+zero-gradient row's `dX` row can be NaN (`0 * NaN`).
 
 The skip applies to a compacted backward that reuses the forward's row index
 (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
