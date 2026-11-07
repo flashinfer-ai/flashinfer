@@ -4,7 +4,8 @@
 
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
-proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``). ``README.md``
+proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -260,7 +261,9 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization classes register themselves here (their module keeps the mode's registry generic).
+# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
 from .quantization.classes import register as _register_quantization  # noqa: E402
+from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
+_register_sampling(CLASSES, ClassInfo)
