@@ -916,6 +916,21 @@ the whole build container, so diagnostics include compiler processes owned by
 the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
 
+The PR `AOT Build Import` lane applies the release architecture rules too, so a
+module that emits another provider's CUDA target (or PTX) fails the PR rather than
+the next nightly. Before compiling, `scripts/check_jit_spec_gencodes.py --provider
+<arch>` generates the spec list for each provider (`flashinfer.aot.generate_jit_specs`;
+needs torch and nvcc, not a GPU) and checks every explicit `-gencode` flag with
+`provider_flag_issues` in `flashinfer/jit/_cuda_architecture.py`; modules without
+explicit gencodes follow the provider-filtered compilation context. The PR
+`Provider Spec Lint (cuXXX)` job (`scripts/task_check_jit_spec_gencodes.sh`, no GPU)
+runs it per CUDA image ahead of the hours-long AOT builds, and is part of `Test
+Results Summary`; the AOT lanes repeat it first. After the
+provider wheels build, `scripts/verify_jit_cache_provider_architectures.py` runs the
+same `cuobjdump` inspection the release builds use. Register a module whose source
+serves several architectures only for the targets in
+`current_compilation_context.TARGET_CUDA_ARCHS` (see `gen_ulysses_lowp_module`).
+
 PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
 which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
 and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository

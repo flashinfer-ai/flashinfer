@@ -114,6 +114,8 @@ jobs:
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
       h100_disabled: ${{ steps.matrix.outputs.h100_disabled }}
+      spec_lint_matrix: ${{ steps.matrix.outputs.spec_lint_matrix }}
+      spec_lint_count: ${{ steps.matrix.outputs.spec_lint_count }}
       checkout_sha: ${{ steps.scope.outputs.checkout_sha || github.sha }}
       snapshot_base: ${{ steps.scope.outputs.snapshot_base }}
       snapshot_tree: ${{ steps.scope.outputs.snapshot_tree }}
@@ -409,6 +411,21 @@ jobs:
           echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
           echo "count=$(jq '.include | length' matrix.json)" >> $GITHUB_OUTPUT
           jq -r '.include[].name' matrix.json
+
+          # Provider spec lint: one quick lane per published CUDA image, ahead of the
+          # hours-long AOT builds it guards, so a spec naming a CUDA target its
+          # provider cannot carry fails the PR in minutes. Dropped with the AOT lanes.
+          {
+            if [ "$SKIP_AOT" != "true" ]; then
+              for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
+                if grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                  jq -nc --arg cuda "$cuda" '{cuda: $cuda}'
+                fi
+              done
+            fi
+          } | jq -sc '{include: .}' > spec-lint-matrix.json
+          echo "spec_lint_matrix=$(cat spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "spec_lint_count=$(jq '.include | length' spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Tests - AOT build imports and GPU unit tests
@@ -798,6 +815,49 @@ jobs:
 
 
   # ---------------------------------------------------------------------------
+  # Provider spec lint - quick CUDA-target check ahead of the AOT builds
+  #
+  # The AOT lanes build every provider wheel (hours). The release builds reject a
+  # provider whose modules carry another architecture's CUDA target or PTX, which
+  # a PR used to find out only from the nightly. This generates each provider's
+  # spec list (no compiling, no GPU) and checks the explicit -gencode flags. The
+  # AOT lanes repeat it first thing, so their fail-fast still stops the matrix.
+  # ---------------------------------------------------------------------------
+  spec-lint:
+    name: Provider Spec Lint (${{ matrix.cuda }})
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      needs.setup.outputs.spec_lint_count != '0'
+    runs-on: [self-hosted, linux, x64, cpu, on-demand]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.spec_lint_matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker ps -q | xargs -r docker stop 2>/dev/null || true
+          docker ps -aq | xargs -r docker rm 2>/dev/null || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/* || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/.[!.]* || true
+          docker image prune -f || true
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.setup.outputs.checkout_sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Lint provider spec CUDA targets
+        run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/task_check_jit_spec_gencodes.sh
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
@@ -807,6 +867,7 @@ jobs:
       - gate
       - setup
       - test
+      - spec-lint
     runs-on: ubuntu-latest
     steps:
       - name: Check Authorization
@@ -1195,6 +1256,15 @@ jobs:
             echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
             echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # The provider spec lint is its own job, so the matrix result above does
+          # not cover it; a skipped lint (no published image, skip_aot) is not a failure.
+          SPEC_LINT="${{ needs.spec-lint.result }}"
+          echo "Provider spec lint: $SPEC_LINT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SPEC_LINT" == "failure" ] || [ "$SPEC_LINT" == "cancelled" ]; then
+            echo "Result: Tests Failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
