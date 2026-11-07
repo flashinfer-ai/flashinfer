@@ -53,6 +53,9 @@ struct MLAParams {
   IdType* kv_start;
   IdType* kv_end;
   IdType* work_indptr;
+  const IdType* batch_q_indptr = nullptr;
+  const IdType* device_kv_len = nullptr;
+  uint32_t batch_size = 0;
 
   PROFILER_PARAMS_DECL
 
