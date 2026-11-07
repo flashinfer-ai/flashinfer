@@ -28,6 +28,20 @@
 
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
+Complete prefill pipelines (Q RoPE + attention + inverse RoPE/FP8 output)::
+
+    python -m benchmarks.bench_sparse_mla_sm120 --mega \
+        --q-lengths 256 512 1024 2048 4096 8192 \
+        --old-module /path/to/pre-pr/sparse_mla_sm120.so --output timings.json
+
+This mode uses B=1, H=64, D=512, KV=4*Q, a 128-entry sliding window and up to
+512 causal compressed candidates. ``old`` means the archived unfused pipeline;
+``unfused`` uses the current attention kernel with the same separate transforms.
+Speedups are old latency / new latency (>1 is faster). Omitting --old-module
+reports only current fused/unfused timings. Setup and reference checks are not
+timed; JSON output includes individual samples and the old module's SHA-256.
+
+
 Sweeps representative shapes:
 
 * DSv4   (d_qk=512, page_block_size=64, 584 B/token)
@@ -507,6 +521,16 @@ def bench_sparse_mla_sm120_dsv41(
 
 
 if __name__ == "__main__":
+    import argparse
+    from benchmarks.sparse_mla_sm120_mega import add_arguments, run
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_arguments(parser)
+    args = parser.parse_args()
+    if args.mega:
+        run(args)
+        raise SystemExit(0)
+
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
 

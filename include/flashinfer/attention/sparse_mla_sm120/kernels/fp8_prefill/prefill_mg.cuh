@@ -262,11 +262,11 @@ __device__ __forceinline__ void prefill_mg_impl(
           Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
       if constexpr (QkMode == QkComputeMode::BF16) {
         load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
-                                              q_base_g, VALID_HPB);
+                                              q_base_g, VALID_HPB, cold.mega.row(s_i));
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
                                              sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
-                                             VALID_HPB);
+                                             VALID_HPB, cold.mega.row(s_i));
       }
     }
 
@@ -825,7 +825,11 @@ __device__ __forceinline__ void prefill_mg_impl(
           int h = idx / STORES_PER_HEAD;
           int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
           uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
-          *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+          if (cold.mega.output) {
+            mega_store8(v, out_base + h * h_stride + d8, s_i, cold.mega);
+          } else {
+            *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+          }
         }
       }
 

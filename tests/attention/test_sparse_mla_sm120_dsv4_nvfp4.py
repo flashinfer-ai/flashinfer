@@ -625,9 +625,16 @@ def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
     torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
 
+    # Prefill must honor page pitch rather than deriving it from page size.
+    page_bytes = page_size * _BYTES_PER_TOKEN
+    storage = torch.full(
+        (num_pages, page_bytes + 16), 0xA5, dtype=torch.uint8, device="cuda"
+    )
+    pitched_cache = storage[:, :page_bytes].view_as(cache)
+    pitched_cache.copy_(cache)
     prefill_output, prefill_lse = _nvfp4_sparse_mla_prefill(
         q,
-        cache,
+        pitched_cache,
         indices,
         sm_scale,
         topk_length=topk_length,

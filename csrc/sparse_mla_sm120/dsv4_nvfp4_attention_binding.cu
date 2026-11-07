@@ -4,8 +4,8 @@
 #include "../tvm_ffi_utils.h"
 #include "attention_descriptor.h"
 #include "attention_dispatch.h"
-#include "attention_validation.h"
 #include "dsv4_nvfp4_validation.h"
+#include "input_validation.h"
 
 using tvm::ffi::Optional;
 
@@ -24,7 +24,8 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
                Optional<TensorView> attn_sink, Optional<TensorView> extra_kv_cache,
                Optional<TensorView> extra_indices, Optional<TensorView> extra_topk_length,
                int64_t cpb, bool stage1_only, bool prefill,
-               const execution::ExecutionPlan* prepared = nullptr, double lse_scale = 1.0) {
+               const execution::ExecutionPlan* prepared = nullptr, double lse_scale = 1.0,
+               SparseMlaMegaParams mega = {}) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   check_attention_alignment(q, alignof(__nv_bfloat162), "q");
   CHECK_CUDA(kv_cache);
@@ -63,6 +64,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   const auto layout = parse_nvfp4_paged_layout(kv_cache);
   TVM_FFI_ICHECK_GT(layout.page_size, 0) << "NVFP4 attention requires a positive page_size";
   Dsv4Nvfp4AttentionParams p{};
+  p.mega = mega;
   p.q = static_cast<const bf16*>(q.data_ptr());
   p.cache = static_cast<const uint8_t*>(kv_cache.data_ptr());
   p.indices = static_cast<const int32_t*>(indices.data_ptr());
@@ -237,6 +239,27 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
             extra_cache, extra_indices, extra_lengths, plan.cpb,
             plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale);
 }
+void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorView cache,
+                                 TensorView indices, Optional<TensorView> mid,
+                                 Optional<TensorView> mlse, TensorView output, TensorView lse,
+                                 double scale, Optional<TensorView> lengths,
+                                 Optional<TensorView> sink, Optional<TensorView> extra_cache,
+                                 Optional<TensorView> extra_indices,
+                                 Optional<TensorView> extra_lengths, double lse_scale,
+                                 TensorView positions, TensorView cos_sin, TensorView fp8_output,
+                                 TensorView output_scales) {
+  const auto& plan = execution::unpack_plan(descriptor, true);
+  TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == plan.metadata.tokens &&
+                 q.size(1) == plan.metadata.heads)
+      << "DSV4 NVFP4 execution plan query mismatch";
+  const auto mega =
+      check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
+  TVM_FFI_ICHECK(plan.merge != execution::Merge::Stage1) << "mega requires a final output plan";
+  attention(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, scale, lengths, sink,
+            extra_cache, extra_indices, extra_lengths, plan.cpb,
+            plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale,
+            mega);
+}
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4
 
@@ -248,3 +271,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_nvfp4_decode,
                               flashinfer::sparse_mla_sm120::nvfp4::SparseMlaSm120NVFP4Decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_nvfp4_prefill,
                               flashinfer::sparse_mla_sm120::nvfp4::SparseMlaSm120NVFP4Prefill);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_nvfp4_execute_attention_rope_fp8,
+                              flashinfer::sparse_mla_sm120::nvfp4::ExecuteAttentionRopeFp8Plan);

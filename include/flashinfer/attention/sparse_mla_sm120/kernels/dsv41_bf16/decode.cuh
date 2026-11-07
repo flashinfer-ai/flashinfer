@@ -1,9 +1,9 @@
 // Copyright (c) 2026 FlashInfer team.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
+#include "../../compute/mega.cuh"
 #include "../../compute/packed_to_bf16.cuh"
 #include "../../model/dsv41_layout.cuh"
 #include "resources.cuh"
@@ -22,7 +22,8 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int pbs_extra,
         size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
         int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
-        size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
+        size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size,
+        SparseMlaMegaParams mega = {}) {
   using R = Dsv41Bf16Resources;
   using Geometry = R::Geometry;
   using Cache = Dsv41Bf16Cache<MT>;

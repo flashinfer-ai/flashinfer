@@ -31,6 +31,7 @@
 #include "../arch/barrier.cuh"
 #include "../arch/common.cuh"
 #include "../model/kv_cache_traits.cuh"
+#include "mega.cuh"
 #include "tile_traits.cuh"
 
 constexpr int Q_STAGE_BARRIER = 2;
@@ -57,7 +58,8 @@ constexpr int Q_STAGE_BARRIER = 2;
 // for the QkComputeMode::BF16 QK path.
 template <ModelType MT, int _MATH_THREADS>
 __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_rope,
-                                                    const bf16* q_base, int valid_hpb = HPB) {
+                                                    const bf16* q_base, int valid_hpb = HPB,
+                                                    const float* mega_cs = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int D_ROPE = KV::D_ROPE;
@@ -67,13 +69,20 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
   for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
     int h = idx / D_NOPE, d = idx % D_NOPE;
     q_nope_bf16[h * BF16_STRIDE + d] =
-        (h < valid_hpb) ? q_base[h * DIM + d] : __float2bfloat16(0.f);
+        (h < valid_hpb) ? __float2bfloat16_rn(
+                              mega_rotate(__bfloat162float(q_base[h * DIM + d]),
+                                          __bfloat162float(q_base[h * DIM + (d ^ 1)]), d, mega_cs))
+                        : __float2bfloat16(0.f);
   }
   if constexpr (D_ROPE > 0) {
     for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
       int h = i / D_ROPE, d = i % D_ROPE;
       q_rope[h * D_ROPE + d] =
-          (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+          (h < valid_hpb)
+              ? __float2bfloat16_rn(mega_rotate(
+                    __bfloat162float(q_base[h * DIM + D_NOPE + d]),
+                    __bfloat162float(q_base[h * DIM + D_NOPE + (d ^ 1)]), D_NOPE + d, mega_cs))
+              : __float2bfloat16(0.f);
     }
   }
   bar_sync_t<Q_STAGE_BARRIER, _MATH_THREADS>();
@@ -147,10 +156,13 @@ __device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(const bf16*
 // Called by the math threads only; the trailing bar:2 syncs the math group.
 // q_base must be 16B-aligned row-wise: every row offset is a multiple of
 // D_QK * 2 bytes, and D_QK * 2 % 16 == 0 for every supported model type.
-template <ModelType MT, int _MATH_THREADS>
+// Rotation: 0 checks the optional RoPE table, 1 skips RoPE, 2 requires RoPE.
+// Decode selects 1 or 2 at compile time to omit the null-table check.
+template <ModelType MT, int _MATH_THREADS, int Rotation = 0>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                    bf16* q_rope, const bf16* q_base,
-                                                   int valid_hpb = HPB) {
+                                                   int valid_hpb = HPB,
+                                                   const float* mega_cs = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int D_ROPE = KV::D_ROPE;
@@ -169,6 +181,8 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
       const int h = v / ROPE_VECS_PER_HEAD, r = v % ROPE_VECS_PER_HEAD;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (h < valid_hpb) val = *reinterpret_cast<const uint4*>(q_base + h * DIM + D_NOPE + r * 8);
+      if constexpr (Rotation != 1)
+        val = mega_rotate8 < Rotation != 2 > (val, D_NOPE + r * 8, mega_cs);
       *reinterpret_cast<uint4*>(q_rope + h * D_ROPE + r * 8) = val;
     }
   }
@@ -201,6 +215,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
 
     uint4 pk = make_uint4(0, 0, 0, 0);
     if (load) pk = *reinterpret_cast<const uint4*>(q_base + h * DIM + d0);
+    if constexpr (Rotation != 1) pk = mega_rotate8 < Rotation != 2 > (pk, d0, mega_cs);
     const bf16* e = reinterpret_cast<const bf16*>(&pk);
 
     // Per-thread absmax over this thread's 8 elements, then across the tile's
@@ -208,8 +223,18 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     // old zero-initialized amax; fmaxf on exact |values| is order-independent,
     // so the result is bitwise identical to the atomicMax reduction.
     float a = 0.f;
+    if constexpr (Rotation == 2) {
+      // A balanced reduction shortens the fused Q prologue's dependency chain.
+      float av[8];
 #pragma unroll
-    for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(__bfloat162float(e[j])));
+      for (int j = 0; j < 8; ++j) av[j] = fabsf(__bfloat162float(e[j]));
+      a = fmaxf(fmaxf(fmaxf(av[0], av[1]), fmaxf(av[2], av[3])),
+                fmaxf(fmaxf(av[4], av[5]), fmaxf(av[6], av[7])));
+      a = fmaxf(a, 0.f);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; j++) a = fmaxf(a, fabsf(__bfloat162float(e[j])));
+    }
 #pragma unroll
     for (int m = 1; m < LANES_PER_TILE; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
 
