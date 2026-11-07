@@ -414,7 +414,6 @@ def test_kcp_entries_take_no_deterministic_keyword() -> None:
     for name in conv_kcp.__all__:
         if name.isupper() or name in (
             "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear",
-            "plan_cache_clear",
         ):
             continue
         assert "nondet" in name.lower(), name
