@@ -7,7 +7,8 @@ conventions: A (M, K) and B (N, K) e4m3 with K contiguous (the block-scaled inst
 the 4-bit formats the byte-packed (M, K / 2) and (N, K / 2) uint8 tensors; SFA / SFB flat uint8 buffers in the 128x4 swizzled
 layout; C (M, N) N-major -- or, under the swapped decode record, the kernel's A is the weight, its B the tokens and its C
 the M-major (N, M) view of the output -- fp32 accumulate; the 4-bit classes' direct stores take ``alpha`` as a 1-element
-fp32 tensor.
+fp32 tensor. :func:`compile_blockscaled` is the shared compile closure: the mixed classes' module
+(``compile_blockscaled_mixed.py``) runs it with its own plans, each operand in its own storage.
 """
 
 from __future__ import annotations
@@ -20,9 +21,9 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
-from ..spec import ALPHA_GIVEN, ELEM_BITS_OF, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
-from .blockscaled import BlockScaledGemm, ScaledBlockScaledGemm
-from .operands import ALIGN, IN_DT, OUT_DT
+from ..spec import ALPHA_GIVEN, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
+from .blockscaled import PLANS, BlockScaledGemm, ScaledBlockScaledGemm
+from .operands import ALIGN, OUT_DT
 
 MODULE = "batch_invariant_gemm_blockscaled"
 SF_BUFFER_DIVISIBILITY = (
@@ -58,13 +59,29 @@ def get_compiled_blockscaled(
     C)`` operand views, the output with L = 1) -- convert in the epilogue; the fixed-chunk split (batch index = K chunk)
     stores fp32 partials that the dense module's fixup folds and converts. ``clusters`` and ``family`` are part of the cache
     key as for the dense kernels (``blocks/compile.py``): placements, never the bits."""
-    in_dt, al = IN_DT[in_fmt], ALIGN[in_fmt]
-    packed = (
-        ELEM_BITS_OF[in_fmt] == 4
-    )  # the 4-bit operands arrive byte-packed: K / 2 bytes per row
-    fake_dt = cutlass.Uint8 if packed else in_dt
+    return compile_blockscaled(cfg, chunks, clusters, in_fmt, out_fmt, MODULE)
+
+
+def compile_blockscaled(
+    cfg: Knobs,
+    chunks: int,
+    clusters: int,
+    in_fmt: str,
+    out_fmt: str,
+    module: str,
+    plan_cls=None,
+):
+    """The compile closure behind :func:`get_compiled_blockscaled`, in cache module ``module`` with the record's plan class
+    (default: the format's in ``PLANS``; the mixed classes pass their own, the swapped records' with the operand formats
+    exchanged). Each operand's fake tensor takes the kernel-side operand's storage: its own dtype for an 8-bit element,
+    bytes (two elements each) for a 4-bit one; a row's extent and strides are 16-byte multiples in either."""
+    plan_cls = plan_cls or PLANS[in_fmt]
+    a_packed, b_packed = plan_cls.A_DT.width == 4, plan_cls.B_DT.width == 4
+    a_fake_dt = cutlass.Uint8 if a_packed else plan_cls.A_DT
+    b_fake_dt = cutlass.Uint8 if b_packed else plan_cls.B_DT
+    al = ALIGN[in_fmt]
     al_k = (
-        al // 2 if packed else al
+        al // 2 if (a_packed or b_packed) else al
     )  # the operand row's divisibility in its own units (16 bytes either way)
     swap_ab = cfg.swap_ab
     in_cluster = cfg.cluster_k > 1
@@ -89,18 +106,20 @@ def get_compiled_blockscaled(
         # K elements per row, a multiple of 16 (K is a multiple of 32: one whole scale block); the row and chunk strides
         # are 16-byte multiples too. The kernel's N extent is the output's contiguous extent (aligned), except under the
         # swapped record, where it is the token count (any value) and the kernel's M extent (the weights' N) is the aligned one.
+        # The mixed classes' operands have different K extents in their own units (K bytes against K / 2): one symbol each.
         sym_m = cute.sym_int(32)
         sym_n = cute.sym_int(32) if swap_ab else cute.sym_int(32, divisibility=oal)
-        sym_k = cute.sym_int(32, divisibility=al_k)
+        sym_ka = cute.sym_int(32, divisibility=al_k)
+        sym_kb = cute.sym_int(32, divisibility=al_k) if a_packed != b_packed else sym_ka
         a_fake = cute.runtime.make_fake_tensor(
-            fake_dt,
-            (sym_m, sym_k, L),
+            a_fake_dt,
+            (sym_m, sym_ka, L),
             (cute.sym_int64(divisibility=al_k), 1, cute.sym_int64(divisibility=al_k)),
             assumed_align=16,
         )
         b_fake = cute.runtime.make_fake_tensor(
-            fake_dt,
-            (sym_n, sym_k, L),
+            b_fake_dt,
+            (sym_n, sym_kb, L),
             (cute.sym_int64(divisibility=al_k), 1, cute.sym_int64(divisibility=al_k)),
             assumed_align=16,
         )
@@ -137,7 +156,7 @@ def get_compiled_blockscaled(
                 cutlass.Float32, (1,), (1,), assumed_align=4
             )
             return cute.compile(
-                ScaledBlockScaledGemm(cfg, in_fmt, body_out, L),
+                ScaledBlockScaledGemm(cfg, in_fmt, body_out, L, plan_cls=plan_cls),
                 a_fake,
                 b_fake,
                 sfa_fake,
@@ -149,7 +168,7 @@ def get_compiled_blockscaled(
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            BlockScaledGemm(cfg, in_fmt, body_out, L),
+            BlockScaledGemm(cfg, in_fmt, body_out, L, plan_cls=plan_cls),
             a_fake,
             b_fake,
             sfa_fake,
@@ -160,4 +179,4 @@ def get_compiled_blockscaled(
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(MODULE, name, compile_fn)
+    return jit.build_and_load(module, name, compile_fn)

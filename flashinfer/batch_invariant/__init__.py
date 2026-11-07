@@ -140,6 +140,18 @@ def _mm_fp4_fingerprint(
     )
 
 
+def _mm_mxfp4w8a_fingerprint(
+    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp4w8a_mxfp8a"))
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_mxfp4w8a_mxfp8a"), chunks_for(N, K, fmt), fmt
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
@@ -162,6 +174,15 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
+    ),
+    # the mixed MX classes (e2m1 weights x e4m3 activations, UE8M0 scales per 32 on both): the mode's own entry
+    # `gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant` (FlashInfer has no dense operator for the pair); the
+    # architecture is a dimension as for mm_mxfp8 (gemm.mxfp4w8a.*64 on SM107, gemm.mxfp4w8a.* elsewhere)
+    "mm_mxfp4w8a_mxfp8a": ClassInfo(
+        "gemm.mxfp4w8a",
+        ("N", "K", "out_dtype"),
+        _mm_mxfp4w8a_fingerprint,
+        ("arch",),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class

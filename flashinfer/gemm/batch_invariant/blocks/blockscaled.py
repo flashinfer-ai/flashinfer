@@ -73,7 +73,6 @@ from .operands import (
     BAR_EPILOGUE,
     BAR_TMEM_ALLOC,
     EPILOGUE_WARPS,
-    IN_DT,
     MBAR_RESERVE_BYTES,
     MMA_WARP,
     NUM_C_STAGE_MIN,
@@ -126,6 +125,15 @@ class BlockScaledPlan:
     TMEM_COLS = TMEM_COLS  # the TMEM budget planned against
     TMEM_ALLOC_ARCH = TMEM_ARCH  # the allocator's architecture: "sm_100" allows powers of two to 512, "sm_107" also the whole 576
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
+    #: The smem container of each operand (None: the operand's own dtype, packed). The sm_100 / sm_103 ``kind::mxf8f6f4``
+    #: instruction reads a sub-byte operand from an 8-bit container per element (CUTLASS's `float_e2m1_unpacksmem_t`): the
+    #: TMA unpacks the packed global values into it (``*_TMA_INTERNAL``: the 8-bit internal type that selects the unpacking
+    #: tensor-map format). The mixed classes set these for their e2m1 operand (``blockscaled_mx_mixed.py``); a placement:
+    #: the same values reach the instruction.
+    A_SMEM_DT = None
+    B_SMEM_DT = None
+    A_TMA_INTERNAL = None
+    B_TMA_INTERNAL = None
 
     def make_tiled_mma(
         self, cta_group, tile_mn, breuse: bool = False, b_collector=None
@@ -183,6 +191,9 @@ class BlockScaledPlan:
         )  # chunks folded inside the CTA (1: none)
         self.block = MainloopBlock(self.IN_FMT)
         self.a_dtype, self.b_dtype = self.A_DT, self.B_DT
+        # the smem containers (the hooks above): the operand's own dtype unless the instruction reads an unpacked one
+        self.a_smem_dtype = self.A_SMEM_DT or self.A_DT
+        self.b_smem_dtype = self.B_SMEM_DT or self.B_DT
         self.sf_dtype, self.sf_vec = self.SF_DT, self.SF_VEC
         self.c_dtype, self.c_layout = c_dtype, c_layout
         self.use_2cta_instrs = knobs.use_2cta_instrs
@@ -301,10 +312,10 @@ class BlockScaledPlan:
         )
         self.num_ab_stage, self.num_c_stage = self._stages()
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
-            self.tiled_mma, self.mma_tiler, self.a_dtype, self.num_ab_stage
+            self.tiled_mma, self.mma_tiler, self.a_smem_dtype, self.num_ab_stage
         )
         self.b_smem_layout_staged = utils.sm100.make_smem_layout_b(
-            self.tiled_mma, self.mma_tiler, self.b_dtype, self.num_ab_stage
+            self.tiled_mma, self.mma_tiler, self.b_smem_dtype, self.num_ab_stage
         )
         self.sfa_smem_layout_staged = bs_layout.make_smem_layout_sfa(
             self.tiled_mma, self.mma_tiler, self.sf_vec, self.num_ab_stage
@@ -321,10 +332,10 @@ class BlockScaledPlan:
         stages; the leftover becomes extra C stages (the dense rule with the scale factors in the stage); the A ring
         below ``A_RING_MAX_BYTES``."""
         a_one = utils.sm100.make_smem_layout_a(
-            self.tiled_mma, self.mma_tiler, self.a_dtype, 1
+            self.tiled_mma, self.mma_tiler, self.a_smem_dtype, 1
         )
         b_one = utils.sm100.make_smem_layout_b(
-            self.tiled_mma, self.mma_tiler, self.b_dtype, 1
+            self.tiled_mma, self.mma_tiler, self.b_smem_dtype, 1
         )
         sfa_one = bs_layout.make_smem_layout_sfa(
             self.tiled_mma, self.mma_tiler, self.sf_vec, 1
@@ -335,10 +346,10 @@ class BlockScaledPlan:
         c_one = utils.sm100.make_smem_layout_epi(
             self.c_dtype, self.c_layout, self.epi_tile, 1
         )
-        a_bytes = cute.size_in_bytes(self.a_dtype, a_one)
+        a_bytes = cute.size_in_bytes(self.a_smem_dtype, a_one)
         ab_bytes = (
             a_bytes
-            + cute.size_in_bytes(self.b_dtype, b_one)
+            + cute.size_in_bytes(self.b_smem_dtype, b_one)
             + cute.size_in_bytes(self.sf_dtype, sfa_one)
             + cute.size_in_bytes(self.sf_dtype, sfb_one)
         )
@@ -503,15 +514,29 @@ class BlockScaledTmaSetup:
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         a_one = cute.slice_(st.a_smem_layout_staged, (None, None, None, 0))
+        # `internal_type` on a sub-byte global operand with an 8-bit container: the TMA's unpacking format (one element
+        # per smem byte); None keeps the operand's own format
         self.atom_a, self.tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, a, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            a,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.A_TMA_INTERNAL,
         )
         b_op = utils.sm100.cluster_shape_to_tma_atom_B(
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         b_one = cute.slice_(st.b_smem_layout_staged, (None, None, None, 0))
         self.atom_b, self.tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, b, b_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            b_op,
+            b,
+            b_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.B_TMA_INTERNAL,
         )
         sfa_op = utils.sm100.cluster_shape_to_tma_atom_A(
             st.cluster_shape_mn, st.tiled_mma.thr_id
@@ -559,6 +584,8 @@ class BlockScaledTmaSetup:
                 tensor_sfb.iterator, cute.make_layout(new_shape, stride=new_stride)
             )
         self.tensor_sfb = tensor_sfb
+        # the transaction bytes are the GLOBAL bytes the TMA moves: the operand's own width on the stage's element count (an
+        # unpacked sub-byte operand lands in twice the smem bytes, but the mbarrier counts the bytes read)
         self.tx_bytes = (
             cute.size_in_bytes(st.a_dtype, a_one)
             + cute.size_in_bytes(st.b_dtype, b_one)
@@ -1231,12 +1258,17 @@ class BlockScaledGemm:
 
     scaled = False
 
-    def __init__(self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1):
+    def __init__(
+        self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1, plan_cls=None
+    ):
         """``chunks``: the operands' batch extent L (1, or the split class's chunk count: the K chunk is the batch index of
-        the workspace split AND of the in-CTA chunk fold, whose C has L = 1 and whose CTA folds the chunks itself)."""
+        the workspace split AND of the in-CTA chunk fold, whose C has L = 1 and whose CTA folds the chunks itself).
+        ``plan_cls``: the record's plan (default: the format's in :data:`PLANS`; the mixed classes hand over their own,
+        the swapped decode records' with the operand formats exchanged: ``blocks/blockscaled_mx_mixed.py``)."""
         self.knobs = knobs
         self.in_fmt = in_fmt
-        self.plan_cls = PLANS[in_fmt]
+        self.plan_cls = plan_cls or PLANS[in_fmt]
+        assert in_fmt == self.plan_cls.IN_FMT, (in_fmt, self.plan_cls.IN_FMT)
         self.cluster_shape_mn = knobs.cluster_shape_mn
         self.chunks = chunks
         self.cta_chunks = chunks if (knobs.cta_chunks and chunks > 1) else 1
@@ -1260,11 +1292,11 @@ class BlockScaledGemm:
     # host side (trace time)
     def _launch(self, a, b, sfa, sfb, c, max_active_clusters, stream, alpha):
         plan_cls = self.plan_cls
+        # the API's byte-packed 4-bit operands as fp4 tensors of the logical K, per operand (the mixed classes pack one)
         if cutlass.const_expr(plan_cls.A_DT.width == 4):
-            a, b = (
-                fp4_view(a),
-                fp4_view(b),
-            )  # the API's byte-packed operands as fp4 tensors of the logical K
+            a = fp4_view(a)
+        if cutlass.const_expr(plan_cls.B_DT.width == 4):
+            b = fp4_view(b)
         sfa_t = sf_view(
             sfa, a.shape[0], a.shape[1], a.shape[2], plan_cls.SF_VEC, plan_cls.SF_DT
         )
@@ -1276,10 +1308,7 @@ class BlockScaledGemm:
         )
         self.st = st
         assert OUT_DT[self.out_fmt] is c.element_type, (self.out_fmt, c.element_type)
-        assert (
-            a.element_type is IN_DT[self.in_fmt]
-            and b.element_type is IN_DT[self.in_fmt]
-        ), (
+        assert a.element_type is plan_cls.A_DT and b.element_type is plan_cls.B_DT, (
             self.in_fmt,
             a.element_type,
             b.element_type,
@@ -1470,13 +1499,13 @@ class BlockScaledGemm:
 
         # --- operand staging: smem rings (A, B swizzled; SFA, SFB plain), multicast masks, global tiles, partitions
         sA = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=st.a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sB = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=st.b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
