@@ -1396,6 +1396,12 @@ cudaError_t RopeQuantize(
     size_t k_nope_in_stride_h, size_t k_rope_out_stride, size_t k_rope_out_stride_h,
     size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv,
     bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
+  if (rope_dim == 0 || rope_dim % 2 != 0) {
+    std::ostringstream err_msg;
+    err_msg << "rope_dim (" << rope_dim << ") must be positive and even";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1682,6 +1688,11 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
     FLASHINFER_ERROR(err_msg.str());
   }
+  if (rotary_dim % 2 != 0) {
+    std::ostringstream err_msg;
+    err_msg << "rotary_dim (" << rotary_dim << ") must be even";
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
   // We have better performance with this kernel with these head_dim instead of RopeQuantize. Its
   // vectors have the same limits on rotary_dim and on tensor alignment.
@@ -1691,7 +1702,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
       RopeVectorsAligned(q, q_stride_n, q_stride_h) &&
       RopeVectorsAligned(k, k_stride_n, k_stride_h) &&
       RopeVectorsAligned(q_rope, q_rope_stride_n, q_rope_stride_h) &&
-      RopeVectorsAligned(k_rope, k_rope_stride_n, k_rope_stride_h)) {
+      RopeVectorsAligned(k_rope, k_rope_stride_n, k_rope_stride_h) &&
+      RopeVectorsAligned(cos_sin_cache, 0, 0)) {
     bool two_heads = false;
     FLASHINFER_CUDA_CALL(RopeUseTwoHeadsPerStep(two_heads));
 

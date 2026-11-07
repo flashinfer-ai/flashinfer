@@ -493,6 +493,51 @@ def test_rope_cos_sin_cache_tensor_not_16b_aligned(head_size, is_neox_style):
     torch.testing.assert_close(key.float(), key_ref, atol=atol, rtol=0)
 
 
+@pytest.mark.parametrize("head_size", [64, 96])
+@pytest.mark.parametrize("is_neox_style", [True, False])
+def test_rope_cos_sin_cache_cache_not_16b_aligned(head_size, is_neox_style):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_tokens, num_q_heads, num_kv_heads = 21, 4, 2
+    rope_ref = RotaryEmbedding(
+        head_size, head_size, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    cache = rope_ref.cos_sin_cache
+    # One float off the 16-byte boundary, with the same contents.
+    shifted_cache = torch.empty(cache.numel() + 1, dtype=torch.float32, device=device)[
+        1:
+    ].view(cache.shape)
+    shifted_cache.copy_(cache)
+    pos_ids = torch.arange(num_tokens, device=device)
+    query = torch.randn(
+        num_tokens, num_q_heads * head_size, dtype=torch.bfloat16, device=device
+    )
+    key = torch.randn(
+        num_tokens, num_kv_heads * head_size, dtype=torch.bfloat16, device=device
+    )
+    query_ref, key_ref = rope_ref.forward_native(pos_ids, query, key)
+    flashinfer.apply_rope_with_cos_sin_cache_inplace(
+        pos_ids, query, key, head_size, shifted_cache, is_neox_style
+    )
+    atol = 8 * torch.finfo(torch.bfloat16).eps
+    torch.testing.assert_close(query.float(), query_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(key.float(), key_ref, atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize("head_size, rotary_dim", [(64, 25), (96, 25), (96, 0)])
+def test_rope_cos_sin_cache_rejects_bad_rotary_dim(head_size, rotary_dim):
+    device = "cuda"
+    num_tokens = 4
+    pos_ids = torch.arange(num_tokens, device=device)
+    query = torch.zeros(num_tokens, head_size, dtype=torch.bfloat16, device=device)
+    key = torch.zeros(num_tokens, head_size, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(num_tokens, rotary_dim, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="even"):
+        flashinfer.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids, query, key, head_size, cache, True
+        )
+
+
 @pytest.mark.parametrize(
     "rope_dim, no_rope_dim",
     [(16, 48), (48, 16), (80, 16), (40, 24), (24, 72), (96, 32), (64, 64)],
@@ -519,7 +564,10 @@ def test_rope_quantize_fp8_any_rope_dim(
         k_shape = (num_tokens, num_kv_heads, head_dim)
     k_in = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
     q_ref, k_ref = rope_ref.forward_native(pos_ids, q_in, k_in)
-    q_ref, k_ref = q_ref.to(quant_dtype).float(), k_ref.to(quant_dtype).float()
+    # Distinct scales, so a kernel that applies the wrong one fails.
+    quant_scale_q, quant_scale_kv = 2.0, 0.5
+    q_ref = (q_ref * quant_scale_q).to(quant_dtype).float()
+    k_ref = (k_ref * quant_scale_kv).to(quant_dtype).float()
 
     # rope_quantize_fp8 stores to caller-owned output tensors, with a row to spare.
     q_out = torch.zeros(num_tokens + 1, num_qo_heads, head_dim, dtype=quant_dtype)
@@ -537,8 +585,8 @@ def test_rope_quantize_fp8_any_rope_dim(
         k_rope_out=k_out[:num_tokens, ..., :rope_dim],
         q_nope_out=q_out[:num_tokens, ..., rope_dim:],
         k_nope_out=k_out[:num_tokens, ..., rope_dim:],
-        quant_scale_q=1.0,
-        quant_scale_kv=1.0,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
     )
     torch.testing.assert_close(q_out[:num_tokens].float(), q_ref, atol=0.5, rtol=0.25)
     torch.testing.assert_close(k_out[:num_tokens].float(), k_ref, atol=0.5, rtol=0.25)
@@ -580,8 +628,8 @@ def test_rope_quantize_fp8_any_rope_dim(
         positions,
         page_size=page_size,
         quantize_dtype=quant_dtype,
-        quant_scale_q=1.0,
-        quant_scale_kv=1.0,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
         is_neox=is_neox_style,
     )
     torch.testing.assert_close(
@@ -599,6 +647,11 @@ def test_rope_quantize_fp8_any_rope_dim(
         else cache[0][page_iter, entry_idx]
     )
     torch.testing.assert_close(k_cached.float(), k_ref, atol=0.5, rtol=0.25)
+    if attention_type == "gqa":
+        v_ref = (v_in * quant_scale_kv).to(quant_dtype).float()
+        torch.testing.assert_close(
+            cache[1][page_iter, entry_idx].float(), v_ref, atol=0.5, rtol=0.25
+        )
 
 
 def _run_rope_variant(kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace):
