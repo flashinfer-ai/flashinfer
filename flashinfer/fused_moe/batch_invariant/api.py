@@ -317,10 +317,13 @@ def route_plan(
     method: Union[S.RoutingMethod, str] = S.SOFTMAX_RENORM,
     bias: Optional[torch.Tensor] = None,
     scaling_factor: Optional[Union[float, torch.Tensor]] = None,
+    align: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
-    route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``."""
+    route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``.
+    ``align > 1``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing) and ``src`` of the
+    padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them."""
     from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
 
@@ -360,16 +363,19 @@ def route_plan(
         s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
     else:
         s = _const(dev, 1, float(scaling_factor))
+    if align < 1 or align & (align - 1):
+        raise ValueError(f"route_plan: align {align} must be a power of two")
     n = T * top_k
+    n_src = n if align == 1 else -(-(n + (align - 1) * min(E, n)) // align) * align
     experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     weights = torch.empty(T, top_k, dtype=torch.float32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
     dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
+    src = torch.empty(n_src, dtype=torch.int32, device=dev)
     if T:
-        get_compiled_route_plan(expert_bucket(E), top_k, method, _IN[logits.dtype])(
-            logits, b, s, experts, weights, counts, dest, src, T, E
-        )
+        get_compiled_route_plan(
+            expert_bucket(E), top_k, method, _IN[logits.dtype], align
+        )(logits, b, s, experts, weights, counts, dest, src, T, E)
     else:
         counts.zero_()
     return experts, weights, counts, dest.view(T, top_k), src
