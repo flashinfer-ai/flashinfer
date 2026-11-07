@@ -47,10 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
-
 #include <math_constants.h>
 
 
@@ -103,7 +99,7 @@ kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_b
     for (int i = 0; i < 2; i++) {
         int local = local0 + i * 16 + half;
         int load_token = ((seg_start + (local >> 1)) < (T_q - 1) ? (seg_start + (local >> 1)) : (T_q - 1));
-        unsigned long long row_offset = ((unsigned long long)load_token * (unsigned long long)H_q + (unsigned long long)(2 * pair + (local & 1))) * 256 + (unsigned long long)col;
+        unsigned long long row_offset = ((unsigned long long)load_token * (unsigned long long)H_q + (unsigned long long)(2 * pair + (local & 1))) * 256ull + (unsigned long long)col;
         {
             asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                 : "=r"(o_words[i * 8 + 0]), "=r"(o_words[i * 8 + 1]), "=r"(o_words[i * 8 + 2]), "=r"(o_words[i * 8 + 3]), "=r"(o_words[i * 8 + 4]), "=r"(o_words[i * 8 + 5]), "=r"(o_words[i * 8 + 6]), "=r"(o_words[i * 8 + 7]) : "l"((const void*)((const char*)(O + row_offset + 0) + 0)) : "memory");
@@ -122,7 +118,7 @@ kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_b
     for (int j = 0; j < 8; j++) {
         zeros[j] = 0;
     }
-    unsigned long long chunk_base = stats_base * 256 + (unsigned long long)(tid * 8);
+    unsigned long long chunk_base = stats_base * 256ull + (unsigned long long)(tid * 8);
     #pragma unroll
     for (int i_1 = 0; i_1 < 2; i_1++) {
         unsigned long long elem = chunk_base + (unsigned long long)(i_1 * 4096);
@@ -136,7 +132,7 @@ kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_b
             const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(zeros);
             asm volatile(
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                :: "l"((void*)(reinterpret_cast<unsigned int*>(dQ_accum + (elem + 2048)))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
+                :: "l"((void*)(reinterpret_cast<unsigned int*>(dQ_accum + (elem + 2048ull)))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
         }
     }
     #pragma unroll
