@@ -2,6 +2,7 @@
 
 import importlib
 import importlib.abc
+import importlib.metadata
 import importlib.util
 from pathlib import Path
 import sys
@@ -34,6 +35,34 @@ class _AliasFinder(importlib.abc.MetaPathFinder):
         )
 
 
+class _StandaloneFinder(importlib.abc.MetaPathFinder):
+    """Explain imports of modules that only the standalone b12x wheel installs.
+
+    Both wheels install b12x/__init__.py. With this package in place, modules
+    such as the standalone vLLM plugins are outside the search path.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if not fullname.startswith("b12x."):
+            return None
+        try:
+            dist = importlib.metadata.distribution("b12x")
+        except importlib.metadata.PackageNotFoundError:
+            return None
+        stem = fullname.replace(".", "/")
+        files = {str(file) for file in dist.files or ()}
+        if f"{stem}.py" not in files and f"{stem}/__init__.py" not in files:
+            return None
+        raise ModuleNotFoundError(
+            f"No module named {fullname!r}: it belongs to the standalone b12x "
+            f"{dist.version} distribution, but flashinfer-python provides the "
+            "top-level b12x package. Uninstall b12x, then reinstall "
+            "flashinfer-python: both install b12x/__init__.py, so the "
+            "uninstall removes FlashInfer's copy too.",
+            name=fullname,
+        )
+
+
 _flashinfer = importlib.util.find_spec("flashinfer")
 if _flashinfer is None or _flashinfer.origin is None:
     raise ImportError("The b12x compatibility package requires flashinfer-python.")
@@ -49,3 +78,5 @@ except BaseException:
     sys.modules.pop(__name__, None)
     raise
 sys.meta_path.insert(0, _AliasFinder())
+# Consulted only after the regular finders fail.
+sys.meta_path.append(_StandaloneFinder())
