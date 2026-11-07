@@ -1523,10 +1523,15 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
 def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
     monkeypatch,
 ):
-    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
-    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
-    launch and, inside a graph, reads the query the copy right before it writes."""
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program (the
+    route on SM100; SM103 routes them to the persistent body, so the test
+    selects the program there); as a programmatic dependent it is bitwise
+    equal to the plain launch and, inside a graph, reads the query the copy
+    right before it writes."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    monkeypatch.setattr(cake, "_route", lambda **kwargs: "fp8_lowhead_h64")
     calls = _count_dispatches(monkeypatch)
     case = _build_case(
         num_heads=64,
@@ -1637,7 +1642,12 @@ def test_fixed_128mib_workspace_admits_1024_fp8_h128_rows(monkeypatch):
         alias_compressed=True,
     )
     req = case.requirement()
-    assert req.route == "fp8_h128_prefill_source_persistent" and req.num_splits == 1
+    # SM103 keeps SWA-only decode launches on the uniform-gather program.
+    assert req.route in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+    )
+    assert req.num_splits == 1
     assert req.single_launch_bytes <= WORKSPACE_128MIB
     assert req.rows_per_launch(WORKSPACE_128MIB) == 1024
     workspace = _workspace_128mib()
@@ -1843,7 +1853,7 @@ _OUT_ALIGN_CASES = [
     _align_case(
         "fp8_h128_prefill_source_persistent_uniform", 128, _FP8, [4] * 3, width=1024
     ),
-    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64]),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64], width=512),
     _align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512),
     _align_case("fp8_h8_h16_source_exact", 16, _FP8, [5, 3, 4], "ragged", 128),
     _align_case("bf16_h8_h16_source_exact", 16, _BF16, [5, 3, 4], "ragged", 128),
@@ -1887,6 +1897,9 @@ def test_misaligned_caller_out_matches_aligned(
     _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
     import flashinfer.mla.cake_dsv4 as cake
 
+    if route == "fp8_lowhead_h64":
+        # The route on SM100; SM103 runs these rows on the persistent body.
+        monkeypatch.setattr(cake, "_route", lambda **kwargs: route)
     calls = _count_dispatches(monkeypatch)
     launched: list = []
     original = cake._prepare_variant
@@ -1941,28 +1954,39 @@ def test_misaligned_caller_out_matches_aligned(
 # The rows DeepSeek-V4 serves, FP8 cache: every layer has the 128-token window
 # (sglang's table: column j holds position pos - j, newest first); a C4 layer
 # adds the top 512 (Flash) or 1024 (Pro) compressed rows, a C128 layer one row
-# per 128 positions (page 2), 128 + context / 128 slots wide.  Flash runs 64
+# per 128 positions (page 2), 128 + context / 128 slots wide; in decode the
+# C128 table is as wide as the server's context allows (padded to 64), so a
+# 16K server's rows hold 128 + 128 live slots of 320.  Flash runs 64
 # heads per rank under DP attention and 32 / 16 / 8 at TP2 / TP4 / TP8; Pro
 # runs 128, and 64 / 32 / 16 at TP2 / TP4 / TP8.  Decode batches reach past one
 # wave of two CTAs per token; MTP rows take 4 tokens per request; prefill is
 # two ragged requests.
 
-# layer -> (compressed width, compressed page size)
+# layer -> (compressed width, compressed page size, live compressed slots or
+# None: every slot the position has produced)
 _DSV4_LAYERS = {
-    "swa": (0, 64),
-    "c4flash": (512, 64),
-    "c4pro": (1024, 64),
-    "c128-16k": (128, 2),
-    "c128-64k": (512, 2),
-    "c128-128k": (1024, 2),
+    "swa": (0, 64, None),
+    "c4flash": (512, 64, None),
+    "c4pro": (1024, 64, None),
+    "c128-16k": (128, 2, None),
+    "c128-16k-server": (192, 2, 128),
+    "c128-64k": (512, 2, None),
+    "c128-128k": (1024, 2, None),
 }
-_DSV4_FLASH_LAYERS = ("swa", "c4flash", "c128-16k", "c128-64k", "c128-128k")
+_DSV4_FLASH_LAYERS = (
+    "swa",
+    "c4flash",
+    "c128-16k",
+    "c128-16k-server",
+    "c128-64k",
+    "c128-128k",
+)
 _DSV4_ROWS = [
     pytest.param(h, layer, id=f"h{h}-{layer}")
     for h in (64, 32, 16, 8)
     for layer in _DSV4_FLASH_LAYERS
 ] + [pytest.param(h, "c4pro", id=f"h{h}-c4pro") for h in (128, 64, 32, 16)]
-_DSV4_FORMS = ["decode-b64", "decode-b256", "mtp-b32q4", "prefill"]
+_DSV4_FORMS = ["decode-b8", "decode-b64", "decode-b256", "mtp-b32q4", "prefill"]
 
 
 def _dsv4_layer_case(h_q: int, layer: str, form: str, width: Optional[int] = None):
@@ -1972,7 +1996,7 @@ def _dsv4_layer_case(h_q: int, layer: str, form: str, width: Optional[int] = Non
     rows its position has produced, so its active count grows with the
     position inside a request (``width`` overrides the layer's compressed
     width)."""
-    compressed, page = _DSV4_LAYERS[layer]
+    compressed, page, live = _DSV4_LAYERS[layer]
     if width is not None:
         compressed = width - SWA_WINDOW
     if form.startswith("decode"):
@@ -1988,11 +2012,13 @@ def _dsv4_layer_case(h_q: int, layer: str, form: str, width: Optional[int] = Non
     else:
         raise ValueError(form)
     lens = None
-    if compressed and page == 2:
+    rows = sum(q_lens)
+    if live is not None:
+        lens = [live] * rows
+    elif compressed and page == 2:
         lens = []
         for q in q_lens:
             lens += [max(compressed - (q - 1 - i) // 128, 1) for i in range(q)]
-    rows = sum(q_lens)
     return _build_case(
         num_heads=h_q,
         dtype=torch.float8_e4m3fn,

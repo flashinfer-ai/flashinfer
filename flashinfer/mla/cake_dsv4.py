@@ -981,14 +981,29 @@ _FP8_PERSISTENT_SHORT_QUERY_UNIFORM = {
 }
 
 
+# Architectures whose SWA-only decode launches (``max_q_len < 257``) keep the
+# uniform-gather route at every row count.  GB300 (152 SMs), 128 heads, q_len
+# 1, newest-first windows, 128-2048 rows: lane-issued route (its PDL-free twin
+# from 384 rows) 11.58-84.75 us -> uniform 11.17-84.18 us (1.002-1.044x).
+_FP8_PERSISTENT_SWA_DECODE_UNIFORM = frozenset({"sm_103a"})
+
+
 def _fp8_persistent_program(
     num_query_tokens: int,
     *,
     max_q_len: Optional[int] = None,
     topk4x: bool = False,
     arch: Optional[str] = None,
+    swa: bool = False,
 ) -> str:
     if num_query_tokens < _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS:
+        return "fp8_h128_prefill_source_persistent_uniform"
+    if (
+        swa
+        and arch in _FP8_PERSISTENT_SWA_DECODE_UNIFORM
+        and max_q_len is not None
+        and max_q_len < 257
+    ):
         return "fp8_h128_prefill_source_persistent_uniform"
     entries = _FP8_PERSISTENT_SHORT_QUERY_UNIFORM.get(arch, ()) if arch else ()
     if max_q_len is not None and any(
@@ -1015,6 +1030,11 @@ _FP8_H64_PERSISTENT_ONE_TILE_MIN_WIDTH = {"sm_107a": (192, 176)}
 # so widths 353-383 keep the persistent body.
 _FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4 = {"sm_107a": {1: 177, 2: 353}}
 
+# Architectures whose FP8/H64 rows of two complete sparse tiles and a partial
+# third (widths 257-383) run the persistent body up to 12 tokens as well, in
+# place of the H64 cluster body (:func:`_fp8_h64_uses_cluster_body`).
+_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES = frozenset({"sm_103a"})
+
 
 def _fp8_h64_uses_persistent_body(
     sparse_topk: int,
@@ -1036,9 +1056,19 @@ def _fp8_h64_uses_persistent_body(
     Launches whose multi-tile M64 route runs its four-stage sibling (``kv4``)
     take the minimum widths up to 16 tokens from
     ``_FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4`` where it has an entry.
+
+    On SM103 the rows of two complete tiles and a partial third (widths
+    257-383) run it up to 12 tokens too
+    (``_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES``).  GB300 (152 SMs), q_len 1,
+    1-12 tokens: widths 260-380 with every slot live, H64 cluster body
+    9.38-10.19 -> persistent body 8.22-9.17 us
+    (1.08-1.20x); width 320 with 256 live (a C128 table padded to the
+    server's context) 8.90-9.31 -> 7.52-7.62 us (1.18-1.23x).
     """
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
+        if arch in _FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES and full_tiles == 2:
+            return sparse_topk > 2 * _TILE_KV
         return full_tiles >= 3
     if kv4 and num_query_tokens <= 16:
         short_min_width = _FP8_H64_PERSISTENT_SHORT_MIN_WIDTH_KV4.get(arch, {}).get(
@@ -1214,9 +1244,10 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
-# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
-# registers no program for it.
-_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``) and route
+# rows to it; SM107 registers no program for it, and SM103 runs its rows on the
+# persistent body (``_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES``).
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a"})
 
 
 def _fp8_h64_uses_cluster_body(
@@ -1229,7 +1260,8 @@ def _fp8_h64_uses_cluster_body(
     260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
     9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
     vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
-    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    tile keep the M64 body; so does ``arch=None`` (unknown device).  On SM103
+    the persistent body leads both (:func:`_fp8_h64_uses_persistent_body`)."""
     return (
         arch in _FP8_LOWHEAD_H64_ARCHES
         and num_query_tokens <= 12
@@ -1239,9 +1271,8 @@ def _fp8_h64_uses_cluster_body(
 
 # Architectures where the 8/16/32-head SWA-only decode rows past one wave
 # leave the low-head prefill producer for the single-CTA M64 body
-# (``_fp8_lowhead_swa_uses_m64_body``).  Measured on SM107 only; SM100, SM103
-# and ``arch=None`` keep the producer on those rows.
-_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_107a"})
+# (``_fp8_lowhead_swa_uses_m64_body``); ``arch=None`` keeps the producer.
+_FP8_LOWHEAD_M64_ARCHES = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 
 # Architectures where the 32-head decode rows wider than one producer
 # partition (``_FP8_ONE_PARTITION_MAX_WIDTH``) run the FP8/H128 persistent body
@@ -1276,6 +1307,26 @@ def _fp8_lowhead_wide_uses_persistent_body(
     )
 
 
+def _fp8_lowhead_narrow_uses_one_partition(
+    num_query_tokens: int, sm_count: int, arch: Optional[str]
+) -> bool:
+    """FP8 decode rows (``max_q_len < 257``) of 8, 16 or 32 heads with a
+    compressed cache and at most ``_FP8_ONE_PARTITION_MAX_WIDTH`` sparse slots
+    that run the one-partition producer; the rest run the M64 body.
+
+    The producer launches two CTAs per token and runs these rows while they
+    fit one wave.  Past it the M64 body (one CTA per token) leads at every
+    width and fill: GB300 (152 SMs), q_len 1, newest-first windows, widths
+    192-384 with every slot live and width 320 with 256 live (a C128 table
+    padded to the server's context), 128 and 256 tokens: 15.2-36.5 us ->
+    9.2-18.3 us (1.49-2.42x) at 8, 16 and 32 heads.  Within the wave neither
+    body leads everywhere (M64 0.81-1.33x of the producer, behind on the
+    rows whose slots are all live).  SM107 builds no one-partition program
+    and runs the M64 body at every token count.
+    """
+    return arch != "sm_107a" and 2 * num_query_tokens <= sm_count
+
+
 def _fp8_lowhead_swa_uses_m64_body(
     num_query_tokens: int, sm_count: int, arch: Optional[str]
 ) -> bool:
@@ -1287,9 +1338,12 @@ def _fp8_lowhead_swa_uses_m64_body(
     single-CTA M64 body (one CTA per token) saves.  R200 (sm_107a, 216 SMs),
     q_len 4, CUDA graph + PDL, per call: 112-256 tokens 6.71-10.45 us ->
     4.06-5.69 us (1.56-1.85x) at 8, 16 and 32 heads; 96 and 108 tokens (one
-    wave) 0.98-1.01x, which keep the producer.  A rule of its own, kept apart
-    from the 64-head one (``_fp8_h64_uses_m64_body``), and on the
-    architectures of ``_FP8_LOWHEAD_M64_ARCHES`` only.
+    wave) 0.98-1.01x, which keep the producer.  GB300 (152 SMs), q_len 1,
+    newest-first windows: 77-256 tokens 10.7-21.5 us -> 7.3-10.9 us
+    (1.43-1.99x) at 8, 16 and 32 heads; 64 and 76 tokens 0.92-0.97x, which
+    keep the producer.  A rule of its own, kept apart from the 64-head one
+    (``_fp8_h64_uses_m64_body``), and on the architectures of
+    ``_FP8_LOWHEAD_M64_ARCHES`` only.
     """
     return arch in _FP8_LOWHEAD_M64_ARCHES and 2 * num_query_tokens > sm_count
 
@@ -1482,7 +1536,11 @@ def _route(
             # former per-(token, split) cluster producer on the 12-token
             # decode rows and beat trtllm-gen 1.12-1.75x on the MTP rows.
             return _fp8_persistent_program(
-                num_query_tokens, max_q_len=max_q_len, topk4x=is_topk4x, arch=arch
+                num_query_tokens,
+                max_q_len=max_q_len,
+                topk4x=is_topk4x,
+                arch=arch,
+                swa=is_swa,
             )
         if num_heads not in (8, 16, 32, 64):
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
@@ -1560,9 +1618,11 @@ def _route(
             return "fp8_lowhead_prefill"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
-        # on the width-260 rows).
+        # on the width-260 rows); past one wave the M64 body runs them.
         if sparse_topk <= _FP8_ONE_PARTITION_MAX_WIDTH:
-            return "fp8_lowhead_one_partition"
+            if _fp8_lowhead_narrow_uses_one_partition(num_query_tokens, sm_count, arch):
+                return "fp8_lowhead_one_partition"
+            return _fp8_h64_m64_program(sparse_topk)
         # Wider rows (C4 at 640 or 1152, C128 past 32K context) run the
         # persistent or the M64 body.
         if _fp8_lowhead_wide_uses_persistent_body(
