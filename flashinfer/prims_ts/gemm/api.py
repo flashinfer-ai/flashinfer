@@ -625,7 +625,12 @@ class PreparedFp4Linear:
     Q/K normalization weights are resolved once. Steady-state calls pass Torch
     tensors directly to a cached TVM-FFI launcher on the caller's current
     stream; DLPack adaptation is confined to compilation. ``enable_pdl`` is
-    part of the kernel configuration, so it is resolved once as well.
+    part of the kernel configuration, so it is resolved once as well: ``None``
+    (default) enables PDL on devices that support it, and with an explicit
+    ``config`` ``None`` keeps ``config.enable_pdl`` while a bool must equal it.
+    Under PDL the kernel reads the prepared weights and weight scales before
+    its wait for the preceding kernel, so a kernel that may still be running
+    must not write them.
     """
 
     def __init__(
@@ -1604,8 +1609,9 @@ def fp4_linear(
             ``None`` (default) enables it on devices that support PDL.
             The kernel then waits in-kernel for the preceding kernel
             before it reads the other inputs or writes the output, but
-            reads ``weight_packed`` and ``weight_block_scale`` before that wait, so a kernel that may
-            still be running must not write them.
+            reads ``weight_packed`` and ``weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1671,8 +1677,9 @@ def fp4_linear_swiglu(
             ``None`` (default) enables it on devices that support PDL.
             The kernel then waits in-kernel for the preceding kernel
             before it reads the other inputs or writes the output, but
-            reads ``weight_packed`` and ``weight_block_scale`` before that wait, so a kernel that may
-            still be running must not write them.
+            reads ``weight_packed`` and ``weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The output tensor. FP8 output with no ``output_quant_scale``
@@ -1757,8 +1764,9 @@ def fp4_qkv_qknorm_rope(
             ``None`` (default) enables it on devices that support PDL.
             The kernel then waits in-kernel for the preceding kernel
             before it reads the other inputs or writes the output, but
-            reads ``qkv_weight_packed`` and ``qkv_weight_block_scale`` before that wait, so a kernel that may
-            still be running must not write them.
+            reads ``qkv_weight_packed`` and ``qkv_weight_block_scale`` before that
+            wait, so a kernel that may still be running must not write
+            them.
 
     Returns:
         The ``[M, N]`` bfloat16 output tensor.
