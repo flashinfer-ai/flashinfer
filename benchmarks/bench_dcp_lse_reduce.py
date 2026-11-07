@@ -3,6 +3,9 @@
 Example:
   torchrun --standalone --nproc-per-node=4 \
     benchmarks/bench_dcp_lse_reduce.py --label fused
+
+The workspace uses the process's default torch symmetric-memory backend unless
+--symm-mem-backend selects one.
 """
 
 import argparse
@@ -13,6 +16,7 @@ from typing import Callable
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 from flashinfer.comm import (
     decode_cp_a2a_lse_reduce,
@@ -238,6 +242,9 @@ def _benchmark_case(
         "local_heads": local_heads,
         "head_dim": head_dim,
         "dtype": str(dtype).removeprefix("torch."),
+        "symm_mem_backend": symm_mem.get_backend(
+            torch.device("cuda", torch.cuda.current_device())
+        ),
         "eager_max_rank_median_us": _max_rank_median(eager_us, world_size),
         "nccl_baseline_max_rank_median_us": _max_rank_median(
             nccl_baseline_us, world_size
@@ -259,6 +266,11 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--launches-per-sample", type=int, default=50)
     parser.add_argument("--graph-launches-per-replay", type=int, default=50)
+    parser.add_argument(
+        "--symm-mem-backend",
+        choices=["CUDA", "NCCL", "NVSHMEM"],
+        help="torch symmetric-memory backend for the workspace (default: the process's)",
+    )
     args = parser.parse_args()
     if args.graph_launches_per_replay <= 0:
         parser.error("--graph-launches-per-replay must be greater than zero")
@@ -266,6 +278,9 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    # torch only accepts set_backend() for a backend other than its default.
+    if args.symm_mem_backend not in (None, symm_mem.get_backend(device)):
+        symm_mem.set_backend(args.symm_mem_backend)
     # Eagerly create the NCCL communicator before the symmetric-memory
     # rendezvous. This registers the group's host communicator for this
     # concrete CUDA device on released PyTorch builds.

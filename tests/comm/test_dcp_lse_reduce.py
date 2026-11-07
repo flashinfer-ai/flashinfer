@@ -18,6 +18,9 @@ Run with one process per GPU:
 
   torchrun --standalone --nproc-per-node=4 \
     -m pytest tests/comm/test_dcp_lse_reduce.py -v -s
+
+The tests use the process's default torch symmetric-memory backend (CUDA). Set
+FLASHINFER_TEST_SYMM_MEM_BACKEND=NCCL, with cuMem enabled, to run them on NCCL.
 """
 
 import os
@@ -26,6 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch._C._distributed_c10d import _SymmetricMemory
 
 from flashinfer.comm import (
     decode_cp_a2a_lse_reduce,
@@ -34,33 +38,30 @@ from flashinfer.comm import (
 )
 
 
-def _backend_available() -> bool:
-    if not torch.cuda.is_available() or "RANK" not in os.environ:
-        return False
-    try:
-        symm_mem.set_backend("NCCL")
-        return symm_mem.get_backend(torch.device("cuda")) == "NCCL"
-    except (RuntimeError, AttributeError):
-        return False
-
-
 @pytest.fixture(scope="module")
 def process_group():
-    if not _backend_available():
-        pytest.skip(
-            "Requires torchrun, CUDA, and torch's NCCL symmetric-memory backend"
-        )
+    """Yields the name of the symmetric-memory backend the tests run on."""
+    if not torch.cuda.is_available() or "RANK" not in os.environ:
+        pytest.skip("Requires torchrun and CUDA")
+    device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
+    requested = os.environ.get("FLASHINFER_TEST_SYMM_MEM_BACKEND")
+    # Process-wide and frozen by the first symmetric allocation; torch only
+    # accepts set_backend() for a backend other than its default.
+    if requested and requested != symm_mem.get_backend(device):
+        symm_mem.set_backend(requested)
+    backend = symm_mem.get_backend(device)
+    if backend is None:
+        pytest.skip("torch symmetric memory has no backend for CUDA devices")
     created = False
     if not dist.is_initialized():
-        device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
         torch.cuda.set_device(device)
         dist.init_process_group("nccl", device_id=device)
-        # Symmetric memory needs the process group's NCCL host communicator,
-        # which is created by the first eager collective in released PyTorch.
+        # The NCCL symmetric-memory backend needs the process group's NCCL host
+        # communicator, which is created by the first eager collective.
         warmup = torch.zeros(1, device=device)
         dist.all_reduce(warmup)
         created = True
-    yield
+    yield backend
     if created:
         dist.destroy_process_group()
 
@@ -93,8 +94,9 @@ def _reference_lse_reduce(
 
 
 def test_workspace_size():
-    payload_offset = (16 + 2 * 4 * 4 + 15) // 16 * 16
-    expected = payload_offset + 2 * 4 * 8 * 2 * (128 * 2 + 4)
+    # 128 bytes of metadata, then per (slot, source, row): 128 bf16 values are 32
+    # eight-byte words -> 3 lines of 15 words (128 bytes each) + 1 LSE line of 16.
+    expected = 128 + 2 * 4 * 8 * 2 * (3 * 128 + 16)
     assert (
         decode_cp_a2a_lse_reduce_workspace_size(
             max_tokens=8,
@@ -251,3 +253,245 @@ def test_lse_reduce(process_group, dtype, lse_mode):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_out, expected, rtol=1e-2, atol=1e-3)
+
+
+def _attention_output_case(
+    batch: int,
+    local_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    lse_mode: str,
+    seed: int,
+    group=None,
+):
+    """This rank's attention output and LSE for ``cp_size * local_heads`` heads,
+    viewed as the ``[batch, local_heads, cp_size, ...]`` inputs of the op (head
+    ``h`` goes to peer ``h // local_heads``), and this rank's expected result."""
+    group = group or dist.group.WORLD
+    cp_rank = dist.get_rank(group)
+    cp_size = dist.get_world_size(group)
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    gen = torch.Generator(device=device).manual_seed(seed * 131 + cp_rank)
+    heads = cp_size * local_heads
+    out = torch.randn(batch, heads, head_dim, dtype=dtype, device=device, generator=gen)
+    lse = 4 * torch.randn(
+        batch, heads, dtype=torch.float32, device=device, generator=gen
+    )
+    all_out = [torch.empty_like(out) for _ in range(cp_size)]
+    all_lse = [torch.empty_like(lse) for _ in range(cp_size)]
+    dist.all_gather(all_out, out, group=group)
+    dist.all_gather(all_lse, lse, group=group)
+    mine = slice(cp_rank * local_heads, (cp_rank + 1) * local_heads)
+    recv_o = torch.stack([o[:, mine] for o in all_out], dim=-2)
+    recv_lse = torch.stack([s[:, mine] for s in all_lse], dim=-1)
+    expected = _reference_lse_reduce(recv_o, recv_lse, lse_mode)
+    partial_o = out.unflatten(1, (cp_size, local_heads)).permute(0, 2, 1, 3)
+    partial_lse = lse.unflatten(1, (cp_size, local_heads)).permute(0, 2, 1)
+    return partial_o, partial_lse, expected
+
+
+def _workspace(
+    max_tokens: int, local_heads: int, head_dim: int, dtype: torch.dtype, group=None
+):
+    group = group or dist.group.WORLD
+    return decode_cp_a2a_lse_reduce_create_workspace(
+        max_tokens=max_tokens,
+        local_heads=local_heads,
+        cp_size=dist.get_world_size(group),
+        head_dim=head_dim,
+        dtype=dtype,
+        group=group,
+    )
+
+
+def _reduce(partial_o, partial_lse, workspace, lse_mode="base2", group=None):
+    group = group or dist.group.WORLD
+    return decode_cp_a2a_lse_reduce(
+        partial_o,
+        partial_lse,
+        workspace,
+        cp_rank=dist.get_rank(group),
+        cp_size=dist.get_world_size(group),
+        lse_mode=lse_mode,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+@pytest.mark.parametrize("local_heads,head_dim", [(16, 512), (2, 128), (4, 64)])
+def test_lse_reduce_strided_input(
+    process_group, dtype, lse_mode, local_heads, head_dim
+):
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    ws = _workspace(8, local_heads, head_dim, dtype)
+    for batch in (1, 3, 8):
+        partial_o, partial_lse, expected = _attention_output_case(
+            batch, local_heads, head_dim, dtype, lse_mode, seed=batch
+        )
+        strided = _reduce(partial_o, partial_lse, ws, lse_mode)
+        packed = _reduce(partial_o.contiguous(), partial_lse.contiguous(), ws, lse_mode)
+        torch.testing.assert_close(strided, expected, rtol=1e-2, atol=2e-3)
+        # The input layout must not change the result.
+        assert torch.equal(strided, packed)
+
+
+def test_lse_reduce_row_counts(process_group):
+    # One workspace serves calls with different row counts, in any order.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    ws = _workspace(32, local_heads, head_dim, dtype)
+    for i, batch in enumerate((7, 1, 32, 3, 1, 32, 2)):
+        partial_o, partial_lse, expected = _attention_output_case(
+            batch, local_heads, head_dim, dtype, "base2", seed=100 + i
+        )
+        torch.testing.assert_close(
+            _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+        )
+
+
+def _set_call_counter(workspace: torch.Tensor, value: int) -> None:
+    # White-box: the first workspace word is the device-side call counter that
+    # selects the slot and the flag value.
+    torch.cuda.synchronize()
+    dist.barrier()
+    workspace[:4].view(torch.int32).fill_(
+        value - (1 << 32) if value >= 1 << 31 else value
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def test_lse_reduce_call_counter_reuse_and_wrap(process_group):
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    ws = _workspace(8, local_heads, head_dim, dtype)
+    # A repeated call number with new data must not return the previous call's lines.
+    for i in range(3):
+        _set_call_counter(ws, 10)
+        partial_o, partial_lse, expected = _attention_output_case(
+            8, local_heads, head_dim, dtype, "base2", seed=200 + i
+        )
+        torch.testing.assert_close(
+            _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+        )
+    # Calls keep working across the 32-bit wrap of the counter.
+    _set_call_counter(ws, (1 << 32) - 3)
+    for i, batch in enumerate((8, 1, 5, 8, 2, 8)):
+        partial_o, partial_lse, expected = _attention_output_case(
+            batch, local_heads, head_dim, dtype, "base2", seed=300 + i
+        )
+        torch.testing.assert_close(
+            _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+        )
+    assert int(ws[:4].view(torch.int32).item()) == 3
+
+
+def test_lse_reduce_graph_many_calls(process_group):
+    # Every replay of a graph with many captured calls advances the device-side
+    # call counter through both slots.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    cases = [
+        _attention_output_case(
+            1 + i % 4, local_heads, head_dim, dtype, "base2", seed=400 + i
+        )
+        for i in range(16)
+    ]
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ws = _workspace(4, local_heads, head_dim, dtype)
+        # An eager call binds the workspace to the capture stream.
+        for partial_o, partial_lse, expected in cases:
+            torch.testing.assert_close(
+                _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+            )
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outs = [_reduce(o, lse, ws) for o, lse, _ in cases]
+    dist.barrier()
+    for _ in range(50):
+        graph.replay()
+    torch.cuda.synchronize()
+    for (_, _, expected), out in zip(cases, outs, strict=True):
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=2e-3)
+
+
+def test_workspace_leaves_symm_mem_backend_alone(process_group):
+    # The backend is process-wide: creating a workspace must not select one.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device("cuda", torch.cuda.current_device())
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    ws = _workspace(4, local_heads, head_dim, dtype)
+    assert symm_mem.get_backend(device) == process_group
+    partial_o, partial_lse, expected = _attention_output_case(
+        4, local_heads, head_dim, dtype, "base2", seed=500
+    )
+    torch.testing.assert_close(
+        _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+    )
+
+
+def test_lse_reduce_alongside_earlier_symm_alloc(process_group):
+    # Another user of torch symmetric memory allocates first, as SGLang's custom
+    # all-reduce does for every group; the workspace must coexist with it.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device("cuda", torch.cuda.current_device())
+    group = dist.group.WORLD
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    numel = 1 << 16
+    # Only the CUDA backend accepts a group name at allocation.
+    name = group.group_name if process_group == "CUDA" else None
+    other = _SymmetricMemory.empty_strided_p2p(
+        (numel,), (1,), torch.uint8, device, name
+    )
+    other.fill_(rank + 1)
+    torch.cuda.synchronize()
+    other_handle = symm_mem.rendezvous(other, group)
+
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    ws = _workspace(8, local_heads, head_dim, dtype)
+    for i, batch in enumerate((8, 3)):
+        partial_o, partial_lse, expected = _attention_output_case(
+            batch, local_heads, head_dim, dtype, "base2", seed=510 + i
+        )
+        torch.testing.assert_close(
+            _reduce(partial_o, partial_lse, ws), expected, rtol=1e-2, atol=2e-3
+        )
+    assert symm_mem.get_backend(device) == process_group
+    torch.cuda.synchronize()
+    dist.barrier()
+    for peer in range(world):
+        peer_buf = other_handle.get_buffer(peer, (numel,), torch.uint8)
+        assert torch.all(peer_buf == peer + 1)
+
+
+def test_lse_reduce_on_reordered_group(process_group):
+    # cp_rank is the rank within the workspace's group, not the global rank.
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    world = dist.get_world_size()
+    group = dist.new_group(list(reversed(range(world))))
+    dist.all_reduce(torch.zeros(1, device="cuda"), group=group)
+    local_heads, head_dim, dtype = 16, 512, torch.bfloat16
+    ws = _workspace(4, local_heads, head_dim, dtype, group=group)
+    partial_o, partial_lse, expected = _attention_output_case(
+        4, local_heads, head_dim, dtype, "base2", seed=600, group=group
+    )
+    torch.testing.assert_close(
+        _reduce(partial_o, partial_lse, ws, group=group),
+        expected,
+        rtol=1e-2,
+        atol=2e-3,
+    )
+    if world > 1:
+        # Every rank rejects a rank that does not match the group before launching.
+        with pytest.raises(RuntimeError, match="cp_rank"):
+            decode_cp_a2a_lse_reduce(
+                partial_o,
+                partial_lse,
+                ws,
+                cp_rank=(dist.get_rank(group) + 1) % world,
+                cp_size=world,
+            )
