@@ -19,7 +19,7 @@ import sys
 import pytest
 
 
-def _fused_operand_sf_config(**overrides):
+def _fused_operand_sf_kwargs(**overrides):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
         BatchMode,
@@ -27,8 +27,6 @@ def _fused_operand_sf_config(**overrides):
         RouteImpl,
         SfLayout,
         TileScheduler,
-        compute_warp_layout,
-        make_config,
     )
 
     values = dict(
@@ -59,7 +57,16 @@ def _fused_operand_sf_config(**overrides):
         use_early_exit=1,
     )
     values.update(overrides)
-    cfg = make_config(**values)
+    return values
+
+
+def _fused_operand_sf_config(**overrides):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_warp_layout,
+        make_config,
+    )
+
+    cfg = make_config(**_fused_operand_sf_kwargs(**overrides))
     compute_warp_layout(cfg)
     return cfg
 
@@ -1307,6 +1314,187 @@ def test_skip_early_exit_pdl_requires_pdl_and_early_exit(overrides):
 
     with pytest.raises(ValueError, match="skip_early_exit_pdl requires"):
         validate_config(_skip_early_exit_pdl_config(**overrides))
+
+
+def _pdl_schedule_kwargs(name):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        DType,
+        TileScheduler,
+        uniform_pipeline_stage_overrides,
+    )
+
+    if name == "bf16_batch_m":
+        # LoadA reads the activations and LoadB the weights.
+        return dict(
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            dtype_a=int(DType.BF16),
+            dtype_b=int(DType.BF16),
+            dtype_c=int(DType.BF16),
+            tile_n=16,
+            tile_k=128,
+            mma_m=128,
+            mma_n=16,
+            mma_k=16,
+            epi_tile_n=16,
+            **uniform_pipeline_stage_overrides(4),
+        )
+    if name == "nvfp4_batch_m":
+        # Separate loaders for the activation SFA and the weight SFB.
+        return dict(
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.BF16),
+            tile_n=64,
+            tile_k=256,
+            mma_m=128,
+            mma_n=64,
+            mma_k=64,
+            epi_tile_n=64,
+        )
+    if name == "nvfp4_swap_fused_ldgsts":
+        # One fused loader for the weights and the weight SFs.
+        return _fused_operand_sf_kwargs(tile_scheduler=int(TileScheduler.STATIC))
+    if name == "mxfp4_bf16_cast_a":
+        # Swap-AB with the weight SFs on their own loader.
+        return dict(
+            dtype_a=int(DType.MXE2M1),
+            dtype_b=int(DType.BF16),
+            dtype_c=int(DType.BF16),
+            tile_k=256,
+            mma_k=16,
+            tile_n=16,
+            num_stages_a=1,
+            num_stages_tmem_acc=1,
+        )
+    if name == "deepseek_fp8":
+        # DeepSeek FP8 epilogue and SFAB loader.
+        return dict(
+            dtype_a=int(DType.E4M3),
+            dtype_b=int(DType.E4M3),
+            dtype_c=int(DType.E4M3),
+            tile_n=8,
+            tile_k=128,
+            mma_m=64,
+            mma_n=8,
+            mma_k=32,
+            epi_tile_n=8,
+            use_deepseek_fp8=1,
+        )
+    raise AssertionError(f"unknown schedule config {name}")
+
+
+_TASK_LEVEL_PDL_MODES = {
+    # MoE FC2: the weight loaders keep reading routing metadata before the wait.
+    "skip_early_exit_pdl": dict(use_pdl=1, use_early_exit=1, skip_early_exit_pdl=1),
+    "no_early_exit": dict(use_pdl=1, use_early_exit=0),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("mode", sorted(_TASK_LEVEL_PDL_MODES))
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "bf16_batch_m",
+        "nvfp4_batch_m",
+        "nvfp4_swap_fused_ldgsts",
+        "mxfp4_bf16_cast_a",
+        "deepseek_fp8",
+    ),
+)
+def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mode):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _pdl_task_waits,
+        build_batched_gemm_task_manager,
+    )
+    from flashinfer.prims_ts.batched_gemm.mixed_cga_ts import CgaTask
+    from flashinfer.prims_ts.batched_gemm.pdl_resources import (
+        PdlLaunchBarrier,
+        PdlWaitBarrier,
+    )
+
+    kwargs = {**_pdl_schedule_kwargs(config_name), **_TASK_LEVEL_PDL_MODES[mode]}
+    cfg = make_config(**kwargs)
+    task_manager = build_batched_gemm_task_manager(
+        num_experts=2, num_tokens=256, top_k=1, verbose=False, **kwargs
+    )
+    weight_loads_wait = mode != "skip_early_exit_pdl"
+
+    def waits(task):
+        return any(isinstance(r, PdlWaitBarrier) for r in task.src_resources)
+
+    # No kernel-entry wait: the tasks wait, and so do inactive early-exit CTAs.
+    assert _pdl_task_waits(cfg)
+    assert not task_manager._assume_pdl_wait_completed
+
+    # The epilogue runs in every CTA and waits before its first global read.
+    (epilogue,) = [t for t in task_manager.tasks if t.name.startswith("EpilogueTask0")]
+    assert not isinstance(epilogue, CgaTask)
+    assert epilogue.run_only_on_cta_id is None
+    assert waits(epilogue)
+
+    weight_names = {"GmemA", "GmemSfA"} if cfg.is_swap_ab else {"GmemB", "GmemSfB"}
+    weight_loaders = [
+        t
+        for t in task_manager.tasks
+        if weight_names & {r.name for r in t.src_resources}
+    ]
+    assert weight_loaders
+    assert all(waits(t) == weight_loads_wait for t in weight_loaders)
+
+    # Only tasks that waited release the dependent grid.
+    for task in task_manager.tasks:
+        if any(isinstance(r, PdlLaunchBarrier) for r in task.dst_resources):
+            assert waits(task), task.name
+
+    graph = {
+        downstream.name: {upstream.name for upstream in upstreams}
+        for downstream, upstreams in task_manager.resource_dependency_graph.items()
+    }
+    assert "PdlWait" in graph["GmemC"]
+    weight_resources = {
+        r.name for t in weight_loaders for r in t.src_resources
+    } & weight_names
+    for name in weight_resources:
+        assert ("PdlWait" in graph.get(name, set())) == weight_loads_wait, name
+    task_manager._verify_pdl_wait_ordering()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_pdl", (0, 1), ids=("pdl_off", "entry_wait"))
+def test_entry_wait_and_pdl_off_schedules_have_no_task_waits(use_pdl):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _pdl_task_waits,
+        build_batched_gemm_task_manager,
+    )
+    from flashinfer.prims_ts.batched_gemm.pdl_resources import (
+        PdlLaunchBarrier,
+        PdlWaitBarrier,
+    )
+
+    kwargs = {
+        **_pdl_schedule_kwargs("bf16_batch_m"),
+        "use_pdl": use_pdl,
+        "use_early_exit": 1,
+    }
+    task_manager = build_batched_gemm_task_manager(
+        num_experts=2, num_tokens=256, top_k=1, verbose=False, **kwargs
+    )
+    resources = [
+        r for t in task_manager.tasks for r in t.src_resources + t.dst_resources
+    ]
+
+    assert not _pdl_task_waits(make_config(**kwargs))
+    assert not any(isinstance(r, PdlWaitBarrier) for r in resources)
+    assert any(isinstance(r, PdlLaunchBarrier) for r in resources) == bool(use_pdl)
+    assert task_manager._assume_pdl_wait_completed == bool(use_pdl)
 
 
 @pytest.mark.cpu_only

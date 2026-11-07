@@ -195,3 +195,20 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
     assert spec.module_dir_name == f"{compile_cache._DISK_MODULE_NAME}_sm103a_cute_dsl"
     assert spec.expected_meta["arch"] == "sm103a"
     assert spec.kernel_name.startswith("fc1_sm103_")
+
+
+@pytest.mark.cpu_only
+def test_stable_config_hash_separates_pdl_modes():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+
+    # use_pdl decides the launch attribute and the griddepcontrol instructions,
+    # skip_early_exit_pdl where the wait goes, so each is a different kernel.
+    hashes = [
+        compile_cache.stable_config_hash(make_config(use_early_exit=1, **pdl))
+        for pdl in (
+            dict(use_pdl=0),
+            dict(use_pdl=1),
+            dict(use_pdl=1, skip_early_exit_pdl=1),
+        )
+    ]
+    assert len(set(hashes)) == len(hashes)
