@@ -20,7 +20,7 @@ backward launch sequences with their collectives, the saved set
 ``cake_gdn_nondet_kcp`` / ``cake_gdn_nondet_train_kcp_forward`` / ``cake_gdn_nondet_train_kcp_backward``.
 
 Provenance: adapted from ``flashinfer/experimental/cake_kda_train/cake_kcp.py`` (now
-``flashinfer/experimental/cake_kda_det_train_kcp/cake_kcp.py``)
+``flashinfer/experimental/cake/cake_kda_det_train_kcp/cake_kcp.py``)
 at FlashInfer ``13d7fcf4041635f5b7f573bb0dbab23570ae1034`` (the KDA KCP host
 module).  Verbatim parts: the compact pools and chains (``Indexed``,
 ``Chains``), the exchange tables (``_Tables``), the per-call state
