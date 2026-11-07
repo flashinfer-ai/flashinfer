@@ -1408,9 +1408,31 @@ def _serial_adjoint_plan(
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
 # grid needs a second, short wave, slots < CTAs <= window x slots, prep_tma elsewhere.  Both give the same bits.  The
-# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.
+# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.  The tensor maps read q and k
+# through their strides, so prep_tma takes head views of a packed row (token stride (2 H + HV) x 128) in place; the
+# plain prep reads contiguous rows only.
 PREP_TMA_CONSTANTS = ("ctas_per_sm", "window")
 TMA_ALIGN_BYTES = 16
+
+
+def _tma_rows(t: torch.Tensor) -> bool:
+    """Whether the ``prep_tma`` tensor map of ``t`` (``[..., T, H, 128]``) reads it in place: a unit channel stride,
+    16-byte aligned head and token strides and address, and leading axes that fold into the token axis (the binding's
+    ``check_dense_leading_dims``)."""
+    if t.dim() < 3 or t.stride(-1) != 1 or t.stride(-3) <= 0:
+        return False
+    size = t.element_size()
+    head_bytes, token_bytes = t.stride(-2) * size, t.stride(-3) * size
+    if head_bytes % TMA_ALIGN_BYTES or token_bytes % TMA_ALIGN_BYTES:
+        return False
+    if t.data_ptr() % TMA_ALIGN_BYTES:
+        return False
+    expected = t.stride(-3)
+    for axis in range(t.dim() - 4, -1, -1):
+        expected *= t.size(axis + 1)
+        if t.size(axis) > 1 and t.stride(axis) != expected:
+            return False
+    return True
 
 
 @cache
@@ -1987,7 +2009,14 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    # q and k stay views when prep_tma reads them in place (a packed row's head views); v is read as contiguous rows
+    in_place = _tma_rows(q) and _tma_rows(k)
+    if not in_place:
+        q, k = q.contiguous(), k.contiguous()
+    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
+    if prep != "prep_tma" and in_place:
+        q, k = q.contiguous(), k.contiguous()
+    v = v.contiguous()
     g32 = g.contiguous()
     if g32.dtype != torch.float32:
         g32 = g32.float()
@@ -2004,7 +2033,6 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
     rstd_q = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     rstd_k = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     g_cs = torch.empty((total_tokens, num_v_heads), dtype=torch.float32, device=device)
-    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
     _launch(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks, num_heads if prep == "prep_tma" else num_v_heads,
             1, q, k, g32, beta, beta32, qn, kn, rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads,
             num_v_heads, 1 if normalize_qk else 0)  # fmt: skip
