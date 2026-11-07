@@ -8009,6 +8009,471 @@ def test_routes_table():
 
 
 # ---------------------------------------------------------------------------
+# Bounded convenience state, the router's FP32 contract and the alert of fixed-order launches (CPU)
+# ---------------------------------------------------------------------------
+
+#: The token counts of one K1 handle (the weights of one layer) whose ``T`` changes from call to call: ragged counts,
+#: tile edges and the GLM-5.2 per-rank token counts.
+K1_CHANGING_T = (255, 257, 1000, 1001, 2048, 4095, 4097, 8191, 8193, 12345, 16172, 16231, 16384)  # fmt: skip
+
+
+def _k1_convenience_caches() -> list:
+    """The K1 convenience caches of this package (every ``_K1_*_CACHE`` of ``cake_backend``)."""
+    return [
+        cache
+        for name, cache in vars(cake_backend).items()
+        if name.startswith("_K1_")
+        and name.endswith("_CACHE")
+        and isinstance(cache, dict)
+    ]
+
+
+def test_k1_convenience_cache_bounded_under_changing_tokens(monkeypatch):
+    """One K1 handle called with a changing token count: every forward, input gradient (BF16 and FP32 out) and
+    weight gradient (BF16 and FP32 out; the FP32 row with a verdict, so this package's split-K program and its slots
+    and tickets) is a new key, yet each K1 convenience cache holds at most the deterministic backend's
+    ``CONVENIENCE_CACHE_SIZE`` entries after every call.  The calls share one arena on their stream, whose bytes stay
+    within four times the largest requirement of each workspace kind (a live buffer below twice it, the buffers a
+    growth retired below the live one), and a second pass over the same token counts grows nothing (CPU binding,
+    nothing loaded or launched)."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    monkeypatch.setattr(det_backend, "CONVENIENCE_CACHE_SIZE", 4)
+    key = ("sm_103a", 1, 4096, 128, "f32")
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (128, 2))
+    monkeypatch.delitem(cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False)
+    largest: dict[str, int] = {}
+    require = cake_backend._AtomicArena.require
+
+    def recording_require(arena, kind, numel):
+        need = max(int(numel), cake_backend._ATOMIC_ARENA_MIN_ELEMS)
+        largest[kind] = max(largest.get(kind, 0), need)
+        return require(arena, kind, numel)
+
+    monkeypatch.setattr(cake_backend._AtomicArena, "require", recording_require)
+    bf16, f32 = torch.bfloat16, torch.float32
+    W = torch.empty(128, 4096, dtype=bf16)
+    caches = _k1_convenience_caches()
+    assert len(caches) >= 2
+    calls = 0
+
+    def sweep():
+        nonlocal calls
+        for T in K1_CHANGING_T:
+            X, G = torch.empty(T, 4096, dtype=bf16), torch.empty(T, 128, dtype=bf16)
+            launches = (
+                lambda: cake_backend.cake_dense_gemm_nondet_train_projection_forward(
+                    X, W, torch.empty(T, 128, dtype=bf16)
+                ),
+                lambda: cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(
+                    G, W, torch.empty(T, 4096, dtype=bf16)
+                ),
+                lambda: cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(
+                    G, W, torch.empty(T, 4096, dtype=f32)
+                ),
+                lambda: cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(
+                    G, X, torch.empty(128, 4096, dtype=bf16)
+                ),
+                lambda: cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(
+                    G, X, torch.empty(128, 4096, dtype=f32)
+                ),
+            )
+            for launch in launches:
+                launch()
+                calls += 1
+                assert all(
+                    len(c) <= det_backend.CONVENIENCE_CACHE_SIZE for c in caches
+                ), (T, [len(c) for c in caches])
+
+    def arena_bound() -> int:
+        """Four times the largest requirement of every kind the arena served, in bytes."""
+        kinds = cake_backend._ATOMIC_ARENA_KINDS
+        return sum(
+            4 * n * torch.empty(0, dtype=kinds[kind][0]).element_size()
+            for kind, n in largest.items()
+        )
+
+    sweep()
+    assert len(entry_fn.calls) == calls == 5 * len(K1_CHANGING_T)
+    assert list(cake_backend._ATOMIC_ARENAS) == [(0, 0)]
+    (arena,) = cake_backend._ATOMIC_ARENAS.values()
+    # the weight gradient's split-K program and the deterministic programs' stream-K workspace both used the arena
+    assert {"k1_slots", "k1_tickets"} <= set(largest), sorted(largest)
+    assert 0 < arena.nbytes() <= arena_bound(), (arena.nbytes(), largest)
+    nbytes, version = arena.nbytes(), arena.version
+    sweep()
+    assert len(entry_fn.calls) == calls
+    assert list(cake_backend._ATOMIC_ARENAS) == [(0, 0)]
+    assert cake_backend._ATOMIC_ARENAS[(0, 0)] is arena
+    assert (arena.nbytes(), arena.version) == (nbytes, version)
+
+
+# A router call on fresh CPU tensors: (op, the entry point's call of its three tensors, split count).  "gemm" is the
+# GEMM entry point of the forward's views, "gemm_wgrad" of the weight gradient's (``G.T @ X``).
+ROUTER_DTYPE_CASES = {
+    "gemm": ("gemm", None),
+    "gemm_two_splits": ("gemm", 2),
+    "gemm_wgrad": ("gemm_wgrad", None),
+    "plan": ("plan", None),
+    "prepare": ("prepare", None),
+    "forward": ("fwd", None),
+    "forward_two_splits": ("fwd", 2),
+    "dgrad": ("dgrad", None),
+    "wgrad": ("wgrad", None),
+    "wgrad_two_splits": ("wgrad", 2),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("position", [0, 1, 2], ids=["first", "second", "out"])
+@pytest.mark.parametrize("case", sorted(ROUTER_DTYPE_CASES))
+def test_router_refuses_tensors_that_are_not_fp32(monkeypatch, case, position, dtype):
+    """The router GEMM is FP32 in and out: a first operand, second operand or ``out`` of another dtype raises
+    ``ValueError`` at every router entry point -- the GEMM (both layout classes, with and without a split count), its
+    plan and prepared launch, the forward (with and without a split count), the input gradient and the weight gradient
+    (with and without one) -- before anything is launched: no BF16x3 split, no fill of ``out``, no program; nothing
+    converts the tensor or runs a BF16 or TF32 GEMM instead (CPU binding, nothing loaded or launched)."""
+    entry_fn, fill = _cpu_k2_launches(monkeypatch)
+    split = Recorder()
+    monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
+    op, splits = ROUTER_DTYPE_CASES[case]
+    T, H, E = 192, 5120, 256
+    shapes = {
+        "gemm": ((T, H), (E, H), (T, E)),
+        "plan": ((T, H), (E, H), (T, E)),
+        "prepare": ((T, H), (E, H), (T, E)),
+        "fwd": ((T, H), (E, H), (T, E)),
+        "gemm_wgrad": ((T, E), (T, H), (E, H)),
+        "dgrad": ((T, E), (E, H), (T, H)),
+        "wgrad": ((T, E), (T, H), (E, H)),
+    }[op]
+    P, Q, out = (
+        torch.empty(shape, dtype=dtype if i == position else torch.float32)
+        for i, shape in enumerate(shapes)
+    )
+    kw = {} if splits is None else {"splits": splits}
+    call = {
+        "gemm": lambda: cake_backend.cake_dense_gemm_nondet_train_router(P, Q.t(), out, **kw),
+        "plan": lambda: cake_backend.cake_dense_gemm_nondet_train_router_plan(P, Q.t(), out),
+        "prepare": lambda: cake_backend.cake_dense_gemm_nondet_train_router_prepare(P, Q.t(), out),
+        "gemm_wgrad": lambda: cake_backend.cake_dense_gemm_nondet_train_router(P.t(), Q, out, **kw),
+        "fwd": lambda: cake_backend.cake_dense_gemm_nondet_train_router_forward(P, Q, out, **kw),
+        "dgrad": lambda: cake_backend.cake_dense_gemm_nondet_train_router_dgrad(P, Q, out),
+        "wgrad": lambda: cake_backend.cake_dense_gemm_nondet_train_router_wgrad(P, Q, out, **kw),
+    }[op]  # fmt: skip
+    for _ in range(2):  # the first call and a call with the same tensors again
+        with pytest.raises(ValueError, match="must be fp32"):
+            call()
+    assert not entry_fn.calls and not fill.calls and not split.calls
+    assert out.dtype == (dtype if position == 2 else torch.float32)
+
+
+def test_router_planner_refuses_tensors_that_are_not_fp32():
+    """:func:`plan_atomic_router` takes FP32 views only: a BF16, FP16 or FP64 operand or ``out`` raises
+    ``ValueError`` on every layout class, before the planner reads a rule table."""
+    T, H, E = 64, 5120, 256
+    views = {
+        "kk": lambda d: (torch.empty(T, H, dtype=d[0]), torch.empty(E, H, dtype=d[1]).t(), torch.empty(T, E, dtype=d[2])),
+        "kn": lambda d: (torch.empty(T, E, dtype=d[0]), torch.empty(E, H, dtype=d[1]), torch.empty(T, H, dtype=d[2])),
+        "nn_t": lambda d: (torch.empty(T, E, dtype=d[0]).t(), torch.empty(T, H, dtype=d[1]), torch.empty(E, H, dtype=d[2])),
+    }  # fmt: skip
+    f32 = torch.float32
+    for layout, make in views.items():
+        plan, _ = cake_backend.plan_atomic_router(
+            *make((f32, f32, f32)), arch="sm_103a", sm_count=152, splits=2
+        )
+        assert plan is None or plan.layout == layout, layout
+        for other in (torch.bfloat16, torch.float16, torch.float64):
+            for position in range(3):
+                dtypes = [f32, f32, f32]
+                dtypes[position] = other
+                with pytest.raises(ValueError, match="must be fp32"):
+                    cake_backend.plan_atomic_router(
+                        *make(dtypes), arch="sm_103a", sm_count=152, splits=2
+                    )
+
+
+def _single_k1_entry():
+    """The one entry of the K1 convenience caches (each test call starts from empty caches)."""
+    entries = [e for cache in _k1_convenience_caches() for e in cache.values()]
+    assert len(entries) == 1, len(entries)
+    return entries[0]
+
+
+def _call_under_the_mode(launch) -> RuntimeError | None:
+    """``launch()`` under ``torch.use_deterministic_algorithms(True)``: the ``RuntimeError`` of PyTorch's alert, or
+    ``None`` after a launch that raised and warned nothing (the mode is off again afterwards)."""
+    torch.use_deterministic_algorithms(True)
+    try:
+        with _no_warnings():
+            launch()
+    except RuntimeError as exc:
+        assert "does not have a deterministic implementation" in str(exc), exc
+        return exc
+    finally:
+        torch.use_deterministic_algorithms(False)
+    return None
+
+
+def test_k1_forward_and_input_gradient_alert_only_when_order_varying(
+    monkeypatch, torch_determinism
+):
+    """Under ``torch.use_deterministic_algorithms(True)`` the forward and input-gradient calls -- the entry points of
+    the forward and of the input gradient (BF16 and FP32 out), the GEMM entry point of their layouts and the prepared
+    launches -- alert exactly before a launch whose result can vary run to run: a call whose cached launch repeats bit
+    for bit (``order_varying`` false), and a prepared launch of a deterministic program or of a reproducible plan, runs
+    without an alert or a warning on its planning call and from its cached key, and launches (CPU binding, nothing
+    loaded or launched)."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16, f32 = torch.bfloat16, torch.float32
+    fixed = varying = 0
+    for K, N in ((4096, 128), (4096, 512), (6144, 2048)):
+        for T in (1000, 4097, 16231):
+            X, W, G = (
+                torch.empty(T, K, dtype=bf16),
+                torch.empty(N, K, dtype=bf16),
+                torch.empty(T, N, dtype=bf16),
+            )
+            out_f = torch.empty(T, N, dtype=bf16)
+            out_d, out_d32 = torch.empty(T, K, dtype=bf16), torch.empty(T, K, dtype=f32)
+            # the entry point's call and the prepared launch of the same GEMM
+            cases = (
+                (lambda: cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, out_f), (X, W.t(), out_f)),
+                (lambda: cake_backend.cake_dense_gemm_nondet_train_projection(X, W.t(), out_f), (X, W.t(), out_f)),
+                (lambda: cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out_d), (G, W, out_d)),
+                (lambda: cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out_d32), (G, W, out_d32)),
+                (lambda: cake_backend.cake_dense_gemm_nondet_train_projection(G, W, out_d32), (G, W, out_d32)),
+            )  # fmt: skip
+            for call, views in cases:
+                cake_backend._drop_convenience_entries()
+                # the planning call, then the call from the cached key
+                for _ in range(2):
+                    before = len(entry_fn.calls)
+                    alert = _call_under_the_mode(call)
+                    entry = _single_k1_entry()
+                    assert (alert is not None) == bool(entry.order_varying), (K, N, T)
+                    assert len(entry_fn.calls) == before + (alert is None)
+                fixed += not entry.order_varying
+                varying += bool(entry.order_varying)
+                prepared = cake_backend.cake_dense_gemm_nondet_train_projection_prepare(
+                    *views
+                )
+                plan = getattr(prepared, "plan", None)
+                order_varying = (
+                    isinstance(
+                        prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch
+                    )
+                    and not plan.reproducible
+                )
+                before = len(entry_fn.calls)
+                alert = _call_under_the_mode(prepared.launch)
+                assert (alert is not None) == order_varying, (K, N, T)
+                assert len(entry_fn.calls) == before + (alert is None)
+    print(
+        f"K1_FWD_DGRAD_ALERT fixed-order calls {fixed}, order-varying calls {varying}"
+    )
+
+
+# (op, arch, T, hidden): a router call in a SIMT window of the shipped router tables on a 152-SM part.
+ROUTER_SIMT_CALLS = {
+    "fwd": ("sm_103a", 64, 5120),
+    "dgrad": ("sm_100a", 64, 5120),
+    "wgrad": ("sm_103a", 64, 5120),
+}
+
+
+@pytest.mark.parametrize("op", sorted(ROUTER_SIMT_CALLS))
+def test_router_simt_launches_do_not_alert(monkeypatch, torch_determinism, op):
+    """The router's SIMT programs store every element of ``out`` once, their partial sums merged in a fixed order, so
+    their output repeats bit for bit: under ``torch.use_deterministic_algorithms(True)`` the entry point's planning
+    call, its calls from the cached key and the prepared launch of the same GEMM run the SIMT program without an alert
+    or a warning (no split, no fill of ``out``; CPU binding, nothing loaded or launched)."""
+    arch, T, H = ROUTER_SIMT_CALLS[op]
+    entry_fn, fill = _cpu_k2_launches(monkeypatch, arch)
+    split = Recorder()
+    monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
+    E = 256
+    X, W, G = torch.empty(T, H), torch.empty(E, H), torch.empty(T, E)
+    P, Q, out, A, B = {
+        "fwd": (X, W, torch.empty(T, E), X, W.t()),
+        "dgrad": (G, W, torch.empty(T, H), G, W),
+        "wgrad": (G, X, torch.empty(E, H), G.t(), X),
+    }[op]
+    call = {
+        "fwd": cake_backend.cake_dense_gemm_nondet_train_router_forward,
+        "dgrad": cake_backend.cake_dense_gemm_nondet_train_router_dgrad,
+        "wgrad": cake_backend.cake_dense_gemm_nondet_train_router_wgrad,
+    }[op]
+    torch.use_deterministic_algorithms(True)
+    with _no_warnings():
+        for _ in range(3):  # the planning call, then the calls from the cached key
+            assert call(P, Q, out) is out
+        prepared = cake_backend.cake_dense_gemm_nondet_train_router_prepare(A, B, out)
+        assert prepared.launch() is out
+    launches = [e for e in cake_backend._K2_ATOMIC_CACHE.values() if e.plan is not None]
+    assert launches, "the call did not plan this package's program"
+    for launch in launches:
+        assert launch.plan.simt is not None and launch.plan.reproducible
+        assert not launch.order_varying
+    assert isinstance(prepared, cake_backend.CakeDenseGemmNondetRouterLaunch)
+    assert prepared.plan.simt is not None and prepared.plan.reproducible
+    assert len(entry_fn.calls) == 4
+    assert not fill.calls and not split.calls
+
+
+# ---------------------------------------------------------------------------
+# The benchmark's row classes, acceptance bar and reports (CPU)
+# ---------------------------------------------------------------------------
+
+BENCH_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "benchmarks"
+    / "bench_cake_dense_gemm_nondet_train.py"
+)
+
+
+@functools.cache
+def _bench() -> ModuleType:
+    """The benchmark script as a module (its functions only: nothing runs on import)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bench_cake_dense_gemm_nondet_train", BENCH_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_bench_row_classes():
+    """Every row of the benchmark carries one class: ``router``, ``batched`` (the MLA head batch), ``large`` (a
+    projection whose in and out features both exceed 1024) or ``small-output`` (every other projection: at most 1024
+    out features, for its forward, input gradient and weight gradient alike)."""
+    bench = _bench()
+    rows = bench.row_table()
+    seen = set()
+    for label, spec in rows.items():
+        klass = bench.row_class(spec)
+        seen.add(klass)
+        if spec["family"] == "router":
+            assert klass == "router", label
+        elif spec["family"] == "mla":
+            assert klass == "batched", label
+        elif min(spec["K"], spec["N"]) > 1024:
+            assert klass == "large", label
+        else:
+            assert klass == "small-output", label
+            assert spec["N"] <= 1024, label
+    assert seen == set(bench.CLASSES)
+    expected = {
+        "4096to1024_fwd_bf16_t16231": "small-output",
+        "kv_a_dgrad_bf16_t16231": "small-output",
+        "indexer_hw_wgrad_f32_t16172": "small-output",
+        "4096to4096_fwd_bf16_t16231": "large",
+        "q_a_wgrad_f32_t16172": "large",
+        "o_proj_dgrad_f32_t16231": "large",
+        "mla_qabs_fwd_bf16_t16172": "batched",
+        "mla_vproj_wgrad_bf16_t16231": "batched",
+        "router_h5120_wgrad_t16231": "router",
+    }
+    assert {label: bench.row_class(rows[label]) for label in expected} == expected
+
+
+def test_bench_acceptance_bar_is_three_percent():
+    """A row ships this package's program only when every paired group is faster than the deterministic package
+    and the median ratio is below 0.97 (at least 3 % faster)."""
+    bench = _bench()
+    assert bench.ACCEPT_RATIO == 0.97
+
+    def accept(ratios):
+        medians = {"eager": {"det": [1.0] * len(ratios), "atomic": list(ratios)}}
+        verdict = bench.summarize(medians, medians, {})["eager"]["atomic_over_det"]
+        return verdict["accept"]
+
+    assert accept([0.96] * 5)
+    assert not accept([0.975] * 5)
+    assert not accept([0.99] * 5)
+    assert not accept([0.9, 0.9, 0.9, 0.9, 1.01])  # one group slower
+
+
+def _bench_entry(bench, label, ms):
+    rows = bench.row_table()
+    rec = dict(
+        ms=ms,
+        p5_ms=dict(ms),
+        p95_ms=dict(ms),
+        groups_ms={name: [value] for name, value in ms.items()},
+        errors={},
+        sota_arm="cublas",
+        sota_ms=ms["cublas"],
+        atomic_over_det=dict(median=ms["atomic"] / ms["det"], accept=False),
+        atomic_shim_over_det=dict(median=ms["atomic_shim"] / ms["det"]),
+    )
+    return {
+        "row": label,
+        "spec": rows[label],
+        "class": bench.row_class(rows[label]),
+        "atomic_program": True,
+        "accept": False,
+        "atomic_plan": dict(template="program", reproducible=True),
+        "bits_repeat": {
+            name: dict(runs=5, equal=name != "cublas")
+            for name in ("det", "atomic", "atomic_shim", "cublas")
+        },
+        "cupti": dict(timed_calls=10, fallbacks=0, note=None),
+        "modes": {"graph": rec},
+    }
+
+
+def test_bench_reports_carry_the_class_shape_and_baselines():
+    """A CSV line names the row's family, class, operation, K, N, batch, T, output dtype, architecture and SM count,
+    with the plain cuBLAS and package-path latencies and the bit-repeat results; the per-class summary groups rows by
+    class, operation and mode; the markdown report has both and says whether CUPTI timed every call."""
+    bench = _bench()
+    for field in (
+        "family", "class", "op", "K", "N", "T", "dtype", "arch", "sm_count", "cublas_ms", "atomic_shim_ms",
+        "atomic_bits_repeat", "cupti_fallbacks",
+    ):  # fmt: skip
+        assert field in bench.CSV_FIELDS
+    ms = dict(det=2.0, atomic=1.0, atomic_shim=1.1, cublas=1.5)
+    entry = _bench_entry(bench, "mla_vproj_dgrad_bf16_t16231", ms)
+    header = dict(arch="sm_100a", sm_count=152)
+    (row,) = bench.csv_rows(entry, ("graph",), header)
+    assert set(row) <= set(bench.CSV_FIELDS)
+    keys = ("family", "class", "op", "K", "N", "batch", "T", "dtype", "arch", "sm_count")  # fmt: skip
+    want = ("mla", "batched", "dgrad", 512, 256, 64, 16231, "bf16", "sm_100a", 152)
+    assert tuple(row[k] for k in keys) == want
+    assert row["det_over_atomic"] == 2.0 and row["cublas_over_atomic"] == 1.5
+    assert row["atomic_shim_over_atomic"] == pytest.approx(1.1)
+    assert row["atomic_bits_repeat"] is True and row["cublas_bits_repeat"] is False
+    assert row["bit_runs"] == 5 and row["cupti_fallbacks"] == 0
+    other = _bench_entry(bench, "4096to128_fwd_bf16_t16231", dict(ms, det=4.0))
+    summary = bench.class_summary([entry, other], ("graph",))
+    assert [(g["class"], g["op"], g["mode"]) for g in summary] == [
+        ("small-output", "fwd", "graph"),
+        ("batched", "dgrad", "graph"),
+    ]
+    small = summary[0]
+    assert (small["rows"], small["atomic_program"], small["accepted"]) == (1, 1, 0)
+    assert (small["bits_checked"], small["bits_repeat"]) == (1, 1)
+    assert small["det_over_atomic_geomean"] == pytest.approx(4.0)
+    assert small["shim_over_atomic_geomean"] == pytest.approx(1.1)
+    results = dict(
+        device="GPU", arch="sm_100a", sm_count=152, versions={}, image={}, groups=1, steps=1, lt_algos=8,
+        bit_runs=5, cupti=dict(timed_calls=20, fallbacks=0, note=None), rows=[entry, other],
+    )  # fmt: skip
+    text = bench.markdown(results, ("graph",))
+    assert "cuBLAS (torch.matmul) latency" in text and "public entry point" in text
+    assert "| small-output | fwd | graph | 1 | 1 | 0 | 1 of 1 |" in text
+    assert "CUPTI timed all 20 timing calls." in text
+    results["cupti"] = dict(timed_calls=20, fallbacks=2, note="no CUPTI")
+    assert "2 of 20 timing calls fell back to CUDA events" in bench.markdown(
+        results, ("graph",)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry, names and workspace (CPU)
 # ---------------------------------------------------------------------------
 
