@@ -29,12 +29,3 @@ def main : IO Unit := do
     IO.println s!"lseout {N} {temp} entropy {osexpr (Sampling.specEntropy N kb lseRow T)}"
   -- the entropy chain over symbolic statistics (the kernel-decided pin `lse_entropy_chain` states the same string)
   IO.println s!"lsechain {osexpr (some (Sampling.entropyNat (Sampling.lg2 (Term.sym "s")) (Term.sym "W") (Term.sym "s")))}"
-  -- the tensor-parallel protocol (SamplingTP.lean): the merge of the ranks' pieces followed by the lane tree prints the
-  -- spec's maximum / sum (a term identity), the first pieces of rank 1, and the production layouts' piece tables
-  for (N, kb, i, bounds) in tpCases do
-    IO.println s!"tp {N} {i} max {osexpr (SamplingTP.tpMax N kb lseRow bounds)}"
-    IO.println s!"tp {N} {i} sum {osexpr (SamplingTP.tpSumOfMax N kb lseRow none bounds)}"
-  for (N, kb, i, lane, L, idx) in tpPieceCases do
-    IO.println s!"tppiece {N} {i} {lane} {L} {idx} {osexpr (SamplingTP.subtree .fmaxc kb (SamplingTP.laneLeafMax N kb lseRow (SamplingTP.natToBits 5 lane)) L idx)}"
-  for (name, kb, bounds) in tpLayoutCases do
-    IO.println s!"tplayout {name} {SamplingTP.layoutTable kb bounds}"

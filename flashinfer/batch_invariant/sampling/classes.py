@@ -8,11 +8,7 @@ The four APIs run one class, ``lse.row``, whose specification is a function of t
 the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact widenings, so
 ``softmax`` with ``out_dtype=torch.float32`` is the fp32 input's specification) and whether a temperature enters the
 scale (``c = LOG2E`` or ``div(LOG2E, T)``). The entropy member (``entropy``, and ``log_probs(return_entropy=True)``)
-carries its own fingerprint: its third tree and chain; the input dtype does not enter it. The tensor-parallel entries
-(``log_probs_tp_partials``, ``log_probs_tp_merge``, ``log_probs_tp``, ``log_softmax_tp``, ``softmax_tp``; ``tp_api.py``)
-are the class itself on a vocabulary shard: a rank's partials are the class's own sub-trees and the merge rebuilds its
-trees, so their outputs carry the class's fingerprint -- the wire format (``shards.ShardLayout``) is a layout, not a
-class."""
+carries its own fingerprint: its third tree and chain; the input dtype does not enter it."""
 
 from __future__ import annotations
 
@@ -77,14 +73,3 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
     classes["log_softmax"] = class_info("lse.row", dims, _lse_row_fingerprint)
     classes["log_probs"] = class_info("lse.row", dims, _lse_row_fingerprint)
     classes["entropy"] = class_info("lse.row", dims, _entropy_fingerprint)
-    # the tensor-parallel protocol (tp_api.py): the same class and fingerprint -- a rank's partials are the class's own
-    # sub-trees over its shard and the merge rebuilds the class's trees, so the merged statistics and every sharded output
-    # are the full-row bits; the wire format (shards.ShardLayout) is a layout of those sub-trees, not a class
-    for tp_op in (
-        "log_probs_tp_partials",
-        "log_probs_tp_merge",
-        "log_probs_tp",
-        "log_softmax_tp",
-        "softmax_tp",
-    ):
-        classes[tp_op] = class_info("lse.row", dims, _lse_row_fingerprint)

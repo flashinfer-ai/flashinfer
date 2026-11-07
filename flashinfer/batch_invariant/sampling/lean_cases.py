@@ -20,11 +20,6 @@ the maximum and the placements only). No ``native_decide``: the file adds nothin
 ``canon.apply_step``, a placement or the spec's chains that is not reflected in the Lean model makes ``lake build``
 fail; a regenerated file that differs from the committed one fails the device-free test, which needs no toolchain.
 
-The tensor-parallel protocol (``sampling/shards.py``, ``SamplingTP.lean``) adds, per toy tiling of :data:`TP_CASES`, the
-merged maximum and sum of the ranks' pieces (a term identity with the spec's: the maximum and three pieces pinned in the
-kernel at N = 300, every case printed and compared), the tiling fact and the protocol theorems instantiated; per
-production sharding of :data:`TP_PROD` the tiling fact, the protocol theorem for any row and temperature, and the
-layout table printed by the executable against the Python ``ShardLayout`` tables.
     python -m flashinfer.batch_invariant.sampling.lean_cases     # rewrite lean/BIKernels/SamplingCases.lean
 """
 
@@ -37,7 +32,6 @@ from typing import Dict, List, Tuple
 from .. import canon
 from . import schedule as ssched
 from . import spec as sspec
-from . import shards as sshards
 from . import sterm as term
 
 LEAN_DIR = os.path.join(
@@ -227,94 +221,12 @@ def entropy_chain_sexpr() -> str:
     return term.sexpr(sspec.entropy_nat(alg, sspec.lg2(alg, s), W, s))
 
 
-# ---- the tensor-parallel protocol (`sampling/shards.py` vs `SamplingTP.lean`): toy tilings (two shards; four equal shards; a
-# one-slot first shard with a partial-slot-free tail) on the class's toy vocabularies, and the production layouts as tables
-#: The toy tilings ``(N, bounds)``.
-TP_CASES: List[Tuple[int, List[Tuple[int, int]]]] = [
-    (300, [(0, 152), (152, 300)]),
-    (1000, [(0, 248), (248, 504), (504, 752), (752, 1000)]),
-    (1000, [(0, 8), (8, 504), (504, 1000)]),
-]
-#: The production shardings ``(N, TP)``: the trainers' vocabularies at their tensor-parallel degrees and Megatron's padded
-#: vocabularies (``make_vocab_size_divisible_by=128``: 152064 -> 152576 and 128256 -> 129024 at TP = 8).
-TP_PROD: List[Tuple[int, int]] = [
-    (32000, 8),
-    (32768, 2),
-    (128256, 8),
-    (151936, 4),
-    (152064, 8),
-    (262144, 8),
-    (152576, 8),
-    (129024, 8),
-]
-#: The toy vocabularies whose merged maximum and pieces are pinned by ``decide +kernel`` (the merged sums' strings are the
-#: class's sum strings: carried and compared through the executable, as the row class's are at these vocabularies).
-TP_PIN_NS = (300,)
-
-
-@functools.lru_cache(maxsize=None)
-def tp_cases() -> Tuple[Dict, ...]:
-    """Per toy tiling: the spec's ``m`` and ``s`` (the merge rebuilds them: a term identity checked on the Python side by
-    ``shards.verify_merge`` and proved on the Lean side by ``tp_protocol``) and the first pieces of rank 1 at lanes 0 and
-    31 as S-expressions."""
-    out = []
-    for N, bounds in TP_CASES:
-        sp = sspec.LSESpec(N)
-        kb = ssched.padded_blocks(N).bit_length() - 1
-        red_m = sp.max_reduction(0)
-        for red in (red_m, sp.sum_reduction(0)):
-            sshards.verify_merge(red, sp.alg, bounds, N)
-        lay = sshards.ShardLayout(bounds[1][0], bounds[1][1], N)
-        parts = sshards.shard_block_partials(red_m, sp.alg, lay.lo, lay.hi, N)
-        pieces = [
-            (lane, L, i, term.sexpr(parts[("block", lane, L, i)]))
-            for lane in (0, 31)
-            for (L, i) in lay.pieces[lane][:3]
-        ]
-        out.append(
-            dict(
-                N=N,
-                kb=kb,
-                bounds=bounds,
-                m=term.sexpr(sp.m(0)),
-                s=term.sexpr(sp.s(0)),
-                pieces=pieces,
-            )
-        )
-    return tuple(out)
-
-
-def tp_layout_cases() -> List[Tuple[str, int, List[Tuple[int, int]], int, str]]:
-    """Per production ``(N, TP)``: the name, ``N``, the bounds, ``kb`` and the literal of every rank's every lane's pieces
-    sorted by ``(level, idx)`` -- the string ``toString (SamplingTP.layoutTable kb bounds)`` prints."""
-    out = []
-    for N, tp in TP_PROD:
-        bounds = sshards.tp_shards(N, tp)
-        kb = ssched.padded_blocks(N).bit_length() - 1
-        ranks = []
-        for lo, hi in bounds:
-            lay = sshards.ShardLayout(lo, hi, N)
-            ranks.append(
-                "["
-                + ", ".join(
-                    "["
-                    + ", ".join(f"({L}, {i})" for (L, i) in sorted(lay.pieces[lane]))
-                    + "]"
-                    for lane in range(32)
-                )
-                + "]"
-            )
-        out.append((f"{N}_{tp}", N, bounds, kb, "[" + ", ".join(ranks) + "]"))
-    return out
-
-
 def render() -> str:
     """The content of ``SamplingCases.lean``."""
     L = [
         "import BIKernels.Canon",
         "import BIKernels.QuantExport",
         "import BIKernels.Sampling",
-        "import BIKernels.SamplingTP",
         "namespace BIK",
         "-- GENERATED by flashinfer/batch_invariant/sampling/lean_cases.py from the Python engine / spec; do not edit.",
         "set_option maxRecDepth 8192",
@@ -445,80 +357,6 @@ def render() -> str:
         )
         + "]"
     )
-    # ---- the tensor-parallel protocol (`sampling/shards.py` vs `SamplingTP.lean`)
-    L.append("")
-    L.append(
-        "/-! The tensor-parallel protocol (`sampling/shards.py`, `sampling/tp_kernel.py` vs `SamplingTP.lean`): per toy "
-        "tiling the merge of the ranks' pieces followed by the lane tree prints the spec's maximum and sum (the maximum and "
-        "three pieces of rank 1 pinned in the kernel at N = 300; every case printed by the executable and compared), the "
-        "tiling fact, and the theorems `tpMax_eq_specMax` / `tp_protocol` / `tpOutputs_eq_specOutputs` instantiated; per "
-        "production sharding the tiling fact, the protocol theorem for any row and temperature, and the layout table "
-        "(`layoutTable`) printed by the executable against the Python `ShardLayout` tables. -/"
-    )
-    tcs = tp_cases()
-    for i, c in enumerate(tcs):
-        N, kb = c["N"], c["kb"]
-        L.append(
-            f"def tpB{i} : List (Nat × Nat) := [{', '.join(f'({lo}, {hi})' for lo, hi in c['bounds'])}]  -- N={N} R={len(c['bounds'])}"
-        )
-        L.append(
-            f"theorem tp{i}_tiling : SamplingTP.tiling tpB{i} 0 {N} = true := by decide +kernel"
-        )
-        if N in TP_PIN_NS:
-            mref, m_sx = mdefs[N]
-            assert c["m"] == m_sx, N
-            L.append(
-                f"theorem tp{i}_max : osexpr (SamplingTP.tpMax {N} {kb} lseRow tpB{i}) = {mref} := by decide +kernel"
-            )
-            for j, (lane, Lv, idx, sx) in enumerate(c["pieces"]):
-                L.append(
-                    f"theorem tp{i}_piece{j} : osexpr (SamplingTP.subtree .fmaxc {kb} (SamplingTP.laneLeafMax {N} {kb} lseRow (SamplingTP.natToBits 5 {lane})) {Lv} {idx}) = {lean_str(sx)} := by decide +kernel"
-                )
-        L.append(
-            f"theorem tp{i}_max_eq : SamplingTP.tpMax {N} {kb} lseRow tpB{i} = Sampling.specMax {N} {kb} lseRow :="
-        )
-        L.append(f"  SamplingTP.tpMax_eq_specMax _ _ _ _ tp{i}_tiling (by decide)")
-        L.append(
-            f"theorem tp{i}_protocol : SamplingTP.tpSumOfMax {N} {kb} lseRow none tpB{i} = Sampling.specSumOfMax {N} {kb} lseRow none :="
-        )
-        L.append(f"  SamplingTP.tp_protocol _ _ _ _ _ tp{i}_tiling (by decide)")
-        L.append(
-            f'theorem tp{i}_outputs : SamplingTP.tpOutputs "bf16" {N} {kb} lseRow none tpB{i} = Sampling.specOutputs "bf16" {N} {kb} lseRow none :='
-        )
-        L.append(
-            f"  SamplingTP.tpOutputs_eq_specOutputs _ _ _ _ _ _ tp{i}_tiling (by decide)"
-        )
-    L.append(
-        "def tpCases : List (Nat × Nat × Nat × List (Nat × Nat)) := ["
-        + ", ".join(f"({c['N']}, {c['kb']}, {i}, tpB{i})" for i, c in enumerate(tcs))
-        + "]"
-    )
-    L.append(
-        "def tpPieceCases : List (Nat × Nat × Nat × Nat × Nat × Nat) := ["
-        + ", ".join(
-            f"({c['N']}, {c['kb']}, {i}, {lane}, {Lv}, {idx})"
-            for i, c in enumerate(tcs)
-            for (lane, Lv, idx, _) in c["pieces"]
-        )
-        + "]"
-    )
-    tls = tp_layout_cases()
-    for name, N, bounds, kb, _table in tls:
-        L.append(
-            f"def tpProd_{name} : List (Nat × Nat) := [{', '.join(f'({lo}, {hi})' for lo, hi in bounds)}]"
-        )
-        L.append(
-            f"theorem tpProd_{name}_tiling : SamplingTP.tiling tpProd_{name} 0 {N} = true := by decide +kernel"
-        )
-        L.append(
-            f"theorem tpProd_{name}_protocol (row : Nat → Term) (T : Option Term) : SamplingTP.tpSumOfMax {N} {kb} row T tpProd_{name} = Sampling.specSumOfMax {N} {kb} row T :="
-        )
-        L.append(f"  SamplingTP.tp_protocol _ _ _ _ _ tpProd_{name}_tiling (by decide)")
-    L.append(
-        "def tpLayoutCases : List (String × Nat × List (Nat × Nat)) := ["
-        + ", ".join(f'("{name}", {kb}, tpProd_{name})' for name, _, _, kb, _ in tls)
-        + "]"
-    )
     L.append("end BIK")
     return "\n".join(L) + "\n"
 
@@ -527,7 +365,7 @@ def summary() -> str:
     lcs = lse_cases()
     return (
         f"sampling lean_cases coverage: placements={len(lcs)} (with sum={sum(c['with_sum'] for c in lcs)}) "
-        f"output cases={len(lse_out_cases()) * len(LSE_OUT_WHICH)} tp tilings={len(tp_cases())} tp layouts={len(tp_layout_cases())}"
+        f"output cases={len(lse_out_cases()) * len(LSE_OUT_WHICH)}"
     )
 
 

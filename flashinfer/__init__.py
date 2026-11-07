@@ -505,11 +505,6 @@ from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
 from .sampling import entropy as entropy
 from .sampling import log_probs as log_probs
 from .sampling import log_softmax as log_softmax
-from .sampling import log_probs_tp as log_probs_tp
-from .sampling import log_probs_tp_merge as log_probs_tp_merge
-from .sampling import log_probs_tp_partials as log_probs_tp_partials
-from .sampling import log_softmax_tp as log_softmax_tp
-from .sampling import softmax_tp as softmax_tp
 from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
 from .sampling import softmax as softmax
