@@ -444,9 +444,9 @@ def _mm_fp4_init(
     )
     return {
         "a": a,
-        "b": mat2_fp4.T.contiguous(),
+        "b": mat2_fp4.T,
         "a_descale": a_descale,
-        "b_descale": mat2_descale.T.contiguous(),
+        "b_descale": mat2_descale.T,
         "block_size": int(block_size),
     }
 
@@ -2267,8 +2267,8 @@ def _mm_M1_16_K7168_N256_init(
     if not 1 <= M <= 16:
         raise ValueError(f"M must be in [1, 16], got {M}")
     mat_a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    mat_b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
-    out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
+    mat_b = torch.randn(N, K, dtype=torch.bfloat16, device=device).T  # [K, N] col-major
+    out = torch.empty(M, N, dtype=torch.float32, device=device)
     return {"mat_a": mat_a, "mat_b": mat_b, "out": out}
 
 
@@ -2290,7 +2290,7 @@ mm_M1_16_K7168_N256_trace = TraceTemplate(
         "out": Tensor(["M", "N"], description="In-place output."),
     },
     outputs={
-        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+        "out": Tensor(["M", "N"], dtype="float32"),
     },
     tags=["status:verified", "moe"],
     reference=_mm_M1_16_K7168_N256_reference,
@@ -2314,6 +2314,18 @@ def _mm_M1_16_K6144_N256_reference(
     return out
 
 
+def _mm_M1_16_K6144_N256_init(
+    *,
+    M: int,
+    K: int = 6144,
+    N: int = 256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the GLM-MoE-DSA router GEMM. Mutates ``out``."""
+    return _mm_M1_16_K7168_N256_init(M=M, K=K, N=N, device=device, seed=seed)
+
+
 mm_M1_16_K6144_N256_trace = TraceTemplate(
     op_type="gemm_bf16",
     name_prefix="mm_M1_16_K6144_N256",
@@ -2332,10 +2344,11 @@ mm_M1_16_K6144_N256_trace = TraceTemplate(
         "out": Tensor(["M", "N"], description="In-place output."),
     },
     outputs={
-        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+        "out": Tensor(["M", "N"], dtype="float32"),
     },
     tags=["status:verified", "moe"],
     reference=_mm_M1_16_K6144_N256_reference,
+    init=_mm_M1_16_K6144_N256_init,
 )
 
 

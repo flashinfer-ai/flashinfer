@@ -752,7 +752,7 @@ def _heuristic_func_mm_bf16(
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
 )
-@flashinfer_api(trace=mm_bf16_trace)
+@flashinfer_api(trace=mm_bf16_trace, pdl_static=("b",))
 def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -795,9 +795,11 @@ def mm_bf16(
         without and with PDL and the faster variant is cached; without a
         tuned entry they run without PDL. These entries use the op name
         ``"bf16_gemm_pdl_auto"``, while ``skip_ops={"bf16_gemm"}`` still
-        skips such calls. PDL kernels may read ``b`` and ``bias`` before
-        waiting for the preceding kernel, so pass ``pdl=False`` if a kernel
-        that may still be running writes them. Defaults to ``False`` so
+        skips such calls. PDL kernels may read ``b`` before waiting for the
+        preceding kernel, so pass ``pdl=False`` if a kernel that may still
+        be running writes it. The TinyGEMM backend and the CuTeDSL warp
+        split-K kernel currently read ``bias`` before the wait too, so the
+        same applies to ``bias`` there. Defaults to ``False`` so
         autotuning cannot silently enable this input-dependency assumption.
 
     out: Optional[torch.Tensor]
@@ -3449,7 +3451,7 @@ def _cutedsl_low_latency_blockscaled_tgv_requirement(
     return True
 
 
-@flashinfer_api(trace=tgv_gemm_sm100_trace)
+@flashinfer_api(trace=tgv_gemm_sm100_trace, pdl_static=("b", "b_descale"))
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -10092,7 +10094,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
-@flashinfer_api(trace=mm_fp4_trace)
+@flashinfer_api(trace=mm_fp4_trace, pdl_static=("b", "b_descale"))
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,

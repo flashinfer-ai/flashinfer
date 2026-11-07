@@ -1644,8 +1644,8 @@ def shuffle_matrix_sf_a(
 
 @flashinfer_api(trace=nvfp4_quantize_trace)
 def nvfp4_quantize(
-    a,
-    a_global_sf,
+    a: torch.Tensor,
+    a_global_sf: Union[torch.Tensor, float],
     sfLayout=SfLayout.layout_128x4,
     do_shuffle=False,
     sf_vec_size=16,
@@ -1934,6 +1934,10 @@ def nvfp4_quantize(
         else:
             is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
             is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
+        if not isinstance(a_global_sf, torch.Tensor):
+            raise TypeError(
+                "a_global_sf must be a tensor unless per_token_activation=True"
+            )
 
         # Forward the caller's setting, not the resolved recipe: fp4_quantize
         # is a public boundary that resolves for itself, and only an explicit
