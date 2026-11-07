@@ -8904,11 +8904,11 @@ def select_cake_fmha_context_route(
                 # A call whose tiles hold at most one stage of query tokens:
                 # the one-stage program of its form and pack, where the
                 # target names one.
-                one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {}).get(
+                form_one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {}).get(
                     (form, pack, None)
                 )
-                if one_stage is not None:
-                    program, stages = one_stage, 1
+                if form_one_stage is not None:
+                    program, stages = form_one_stage, 1
             if program is not None:
                 pack_g = pack
                 tok_per_stage = 128 // pack
