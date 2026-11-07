@@ -36,6 +36,7 @@ from .gemm_base import (
     _get_cudnn_plan_index_for_tactic,
     _get_cudnn_workspace_size,
     _cudnn_graph_engine_knob_tactics,
+    _retain_cudnn_graph_if_capturing,
     _finalize_cudnn_graph_for_tactic,
     _get_cudnn_override_graph,
     _torch_data_type_to_cudnn_data_type,
@@ -266,6 +267,7 @@ def execute_cudnn_bf16_fp4_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     variant_pack = _bf16_fp4_variant_pack(a, b, b_descale, alpha, out)
 
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
@@ -295,6 +297,7 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
     tactic=-1,
 ):
     """Execute the bf16 x fp4 graph, overriding A / output to the real M."""
+    _retain_cudnn_graph_if_capturing(graph)
     m, k = int(a.shape[0]), int(a.shape[1])
     n = int(b.shape[0])
     batch = 1
