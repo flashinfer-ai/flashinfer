@@ -26,6 +26,8 @@ from .jit.sampling import gen_sampling_module
 from .topk import _get_row_states_buffer
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
+    log_probs_trace,
+    log_softmax_trace,
     min_p_sampling_trace,
     sampling_from_logits_trace,
     sampling_from_probs_trace,
@@ -1055,7 +1057,7 @@ def softmax(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=log_probs_trace)
 def log_probs(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
@@ -1138,7 +1140,7 @@ def log_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=log_softmax_trace)
 def log_softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
