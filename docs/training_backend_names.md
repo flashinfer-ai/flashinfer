@@ -16,6 +16,7 @@ run-to-run bitwise results.
 1. **Module:** `flashinfer.cake_<op>_<mode>_train[_kcp]`. `mode` is `det` or `nondet`.
    - The public facade module always sits at the top level of `flashinfer`.
    - The backend package always sits at `flashinfer/experimental/cake/<module>/`.
+   - Exception: a `_kcp` route may live in the backend package of its single-rank module as a submodule (`kcp.py`, `kcp_jit.py`). This applies when the route runs the single-rank programs and adds only its own boundary work. The route's libraries are then listed in that package's `build.json`. The `_kcp` facade still sits at the top level and imports the submodule lazily. Today only causal conv1d uses this form: its KCP route is the single-rank convolution plus a halo exchange, and a separate package would have to either copy the single-rank programs or import across packages.
 2. **Autograd functional:** `cake_<op>_<mode>[_kcp]`.
 3. **Autograd class:** `Cake<Op><Mode>[Kcp]Function`.
 4. **Other functions:** the module name plus `_<verb>`, for example `_forward`, `_backward`, `_forward_workspace_bytes`, `_partition` or `_build_context`.
@@ -90,6 +91,7 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
 - **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
+- **Causal conv1d KCP stays inside the single-rank backend packages.** `cake_causal_conv1d_det_train` and `cake_causal_conv1d_nondet_train` each carry a `kcp` submodule behind the top-level `cake_causal_conv1d_<mode>_train_kcp` facades (rule 1 exception).
 - **Missing versions keep their reserved names:** DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
 
 ## Current names
