@@ -462,6 +462,11 @@ class B12XFP4ExpertWeights:
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # In-tree relative import: the planner and in-tree preparation code
+        # bind MoEWeightPreparationPlan from this same module, so the
+        # isinstance check below accepts the plans they produce.
+        from .._shared.execution import MoEWeightPreparationPlan
+
         if not isinstance(self.plan, MoEWeightPreparationPlan):
             raise TypeError("plan must be a MoEWeightPreparationPlan")
         for name, tensor in (

@@ -305,8 +305,10 @@ def _golden_topk(
         logit = (
             torch.relu(torch.einsum("hd,td->ht", qf[r], kr)) * weights[r].unsqueeze(1)
         ).sum(0) * sc
+        # The fused radix selector orders the raw float32 values (no index
+        # epsilon); equal final-key candidates emit in arrival order.
         tk = torch.topk(logit, topk, largest=True, sorted=True)
-        vals.append(tk.values)
+        vals.append(logit[tk.indices])
         idxs.append(set(tk.indices.tolist()))
         scores.append(logit)
     if return_scores:
