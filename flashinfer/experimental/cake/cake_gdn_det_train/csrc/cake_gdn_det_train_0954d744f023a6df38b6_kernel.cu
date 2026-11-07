@@ -126,7 +126,7 @@ __device__ __forceinline__ void tcgen05_commit_leader(
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_det_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, __nv_bfloat16* __restrict__ v, float* __restrict__ g_cs, float* __restrict__ beta, __nv_bfloat16* __restrict__ A_out, __nv_bfloat16* __restrict__ w_out, __nv_bfloat16* __restrict__ u_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, int recompute)
+kernel_cake_gdn_det_train_0954d744f023a6df38b6(__nv_bfloat16* __restrict__ kn, __nv_bfloat16* __restrict__ v, float* __restrict__ g_cs, float* __restrict__ beta, __nv_bfloat16* __restrict__ A_out, __nv_bfloat16* __restrict__ w_out, __nv_bfloat16* __restrict__ u_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, int recompute, int v_row_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -275,7 +275,7 @@ kernel_cake_gdn_det_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, _
             :: "r"(a_dst + 6144), "l"(A_out + (a_src + 48ll * a_stride)), "r"((n_valid > ra + 48) ? 16 : 0));
         int r0_0 = tid / 16;
         int c0_0 = tid % 16 * 8;
-        long long row_stride_0 = (long long)num_v_heads * 128ll;
+        long long row_stride_0 = (long long)v_row_heads * 128ll;
         long long src_row_0 = (long long)(tok0 + r0_0) * row_stride_0 + (long long)hv * 128ll + (long long)c0_0;
         unsigned int dst0_0 = s_v_addr + (unsigned int)(c0_0 / 64 * 8192 + (r0_0 * 128 + c0_0 % 64 * 2 ^ (r0_0 * 128 + c0_0 % 64 * 2 >> 7 & 7) << 4));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
@@ -3571,7 +3571,7 @@ kernel_cake_gdn_det_train_969371cd5760127281dd(__nv_bfloat16* __restrict__ kn, _
     if (recompute == 0) {
         int r0_1 = tid / 16;
         int c0_1 = tid % 16 * 8;
-        long long row_stride_1 = (long long)num_v_heads * 128ll;
+        long long row_stride_1 = (long long)v_row_heads * 128ll;
         long long src_row_1 = (long long)(tok0 + r0_1) * row_stride_1 + (long long)hv * 128ll + (long long)c0_1;
         unsigned int dst0_1 = s_v_addr + (unsigned int)(c0_1 / 64 * 8192 + (r0_1 * 128 + c0_1 % 64 * 2 ^ (r0_1 * 128 + c0_1 % 64 * 2 >> 7 & 7) << 4));
         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"

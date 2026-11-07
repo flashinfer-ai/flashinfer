@@ -126,7 +126,7 @@ __device__ __forceinline__ void tcgen05_commit_leader(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, __nv_bfloat16* __restrict__ dw, __nv_bfloat16* __restrict__ du, float* __restrict__ g_cs, float* __restrict__ beta, __nv_bfloat16* __restrict__ dk2_out, __nv_bfloat16* __restrict__ dv_out, __nv_bfloat16* __restrict__ dbeta_out, float* __restrict__ dg2_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads)
+kernel_cake_gdn_det_train_20a2d9fdce30f83e398e(__nv_bfloat16* __restrict__ kn, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, __nv_bfloat16* __restrict__ dw, __nv_bfloat16* __restrict__ du, float* __restrict__ g_cs, float* __restrict__ beta, __nv_bfloat16* __restrict__ dk2_out, __nv_bfloat16* __restrict__ dv_out, __nv_bfloat16* __restrict__ dbeta_out, float* __restrict__ dg2_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, int v_row_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -278,7 +278,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
         :: "r"(dst0_0 + 6144), "l"(du + (src_row_0 + 48ll * row_stride_0)), "r"((n_valid > r0_0 + 48) ? 16 : 0));
     int r0_1 = tid / 16;
     int c0_1 = tid % 16 * 8;
-    long long row_stride_1 = (long long)num_v_heads * 128ll;
+    long long row_stride_1 = (long long)v_row_heads * 128ll;
     long long src_row_1 = (long long)(tok0 + r0_1) * row_stride_1 + (long long)hv * 128ll + (long long)c0_1;
     unsigned int dst0_1 = s_v_addr + (unsigned int)(c0_1 / 64 * 8192 + (r0_1 * 128 + c0_1 % 64 * 2 ^ (r0_1 * 128 + c0_1 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"

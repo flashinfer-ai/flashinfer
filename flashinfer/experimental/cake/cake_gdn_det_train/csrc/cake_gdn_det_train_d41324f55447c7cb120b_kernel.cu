@@ -151,7 +151,7 @@ __device__ __forceinline__ void tcgen05_commit_leader(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_gdn_det_train_b0f17bcb1f51d381d453(__nv_bfloat16* __restrict__ qn, __nv_bfloat16* __restrict__ kn, float* __restrict__ rstd_q, float* __restrict__ rstd_k, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ do_, __nv_bfloat16* __restrict__ dv2, __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ dh, float* __restrict__ g_cs, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, float* __restrict__ beta, __nv_bfloat16* __restrict__ dq_out, __nv_bfloat16* __restrict__ dk_out, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dv_out, float* __restrict__ dbeta_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, float scale, int normalize_qk)
+kernel_cake_gdn_det_train_d41324f55447c7cb120b(__nv_bfloat16* __restrict__ qn, __nv_bfloat16* __restrict__ kn, float* __restrict__ rstd_q, float* __restrict__ rstd_k, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ do_, __nv_bfloat16* __restrict__ dv2, __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ dh, float* __restrict__ g_cs, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ A, float* __restrict__ beta, __nv_bfloat16* __restrict__ dq_out, __nv_bfloat16* __restrict__ dk_out, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dv_out, __nv_bfloat16* __restrict__ dbeta_out, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int num_heads, int num_v_heads, float scale, int normalize_qk, int v_row_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -871,7 +871,7 @@ kernel_cake_gdn_det_train_b0f17bcb1f51d381d453(__nv_bfloat16* __restrict__ qn, _
     asm volatile("tcgen05.fence::before_thread_sync;");
     int r0_4 = tid / 16;
     int c0_4 = tid % 16 * 8;
-    long long row_stride_4 = (long long)num_v_heads * 128ll;
+    long long row_stride_4 = (long long)v_row_heads * 128ll;
     long long src_row_4 = (long long)(tok0 + r0_4) * row_stride_4 + (long long)hv * 128ll + (long long)c0_4;
     unsigned int dst0_4 = s_v_addr + (unsigned int)(c0_4 / 64 * 8192 + (r0_4 * 128 + c0_4 % 64 * 2 ^ (r0_4 * 128 + c0_4 % 64 * 2 >> 7 & 7) << 4));
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
@@ -2259,7 +2259,7 @@ kernel_cake_gdn_det_train_b0f17bcb1f51d381d453(__nv_bfloat16* __restrict__ qn, _
         float colsum = s_col[tid_2] + s_col[64 + tid_2] + s_col[128 + tid_2] + s_col[192 + tid_2];
         float db_row = s_dbp[tid_2] + s_dbp[64 + tid_2];
         float dg_row = s_dgp[tid_2] + s_dgp[64 + tid_2];
-        dbeta_out[gate_row_index] = db_row;
+        dbeta_out[gate_row_index] = (__nv_bfloat16)db_row;
         s_dg2[tid_2] = dg_row - colsum;
     }
     float f0[32];
