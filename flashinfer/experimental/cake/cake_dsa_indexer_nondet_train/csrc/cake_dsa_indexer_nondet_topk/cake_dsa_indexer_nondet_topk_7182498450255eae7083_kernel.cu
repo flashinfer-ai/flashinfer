@@ -82,21 +82,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
 
 
 
@@ -104,8 +89,6 @@ union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
 };
-
-
 
 
 
@@ -178,19 +161,6 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 }
 
 
-
-__device__ __forceinline__ void tcgen05_commit_cg1_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
-}
-
-
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
@@ -200,8 +170,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, float* __restrict__ K_scale, unsigned int* __restrict__ TicketWord)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsa_indexer_nondet_topk_7182498450255eae7083(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, float* __restrict__ K_scale, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -224,17 +194,13 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
     #define umma_full_addr (mbar_base + 80)
     #define umma_empty_addr (mbar_base + 96)
     #define verdict_bar_addr (mbar_base + 112)
-    #define peer_bar_addr (mbar_base + 120)
-    #define verdict_ack_addr (mbar_base + 128)
+    #define tk_ack_addr (mbar_base + 120)
+    #define verdict_ack_addr (mbar_base + 136)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 2;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    const int cta_rank = 0;
 
     // Prologue
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -251,15 +217,15 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
     const int s_tau_addr = smem + 194632;
     int* s_fail = reinterpret_cast<int*>(smem_raw + 194776);
     const int s_fail_addr = smem + 194776;
-    int* s_pfail = reinterpret_cast<int*>(smem_raw + 194808);
-    const int s_pfail_addr = smem + 194808;
+    int* s_tk = reinterpret_cast<int*>(smem_raw + 194840);
+    const int s_tk_addr = smem + 194840;
 
     // Kernel setup ops
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
-    // Mbarrier init (17 barriers at smem_raw[0..136))
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 13) {
         uint32_t leader = elect_sync();
@@ -275,11 +241,11 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
-            // k_empty: 4 barriers, init_count=2
-            mbarrier_init(smem + 48, 2);
-            mbarrier_init(smem + 56, 2);
-            mbarrier_init(smem + 64, 2);
-            mbarrier_init(smem + 72, 2);
+            // k_empty: 4 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
             // --- pipeline 'tmem_pipe' ---
             // umma_full: 2 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
@@ -290,12 +256,13 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             // --- pipeline 'verdict_pipe' ---
             // verdict_bar: 1 barriers, init_count=12
             mbarrier_init(smem + 112, 12);
-            // --- pipeline 'peer_pipe' ---
-            // peer_bar: 1 barriers, init_count=1
-            mbarrier_init(smem + 120, 1);
+            // --- pipeline 'tk_pipe' ---
+            // tk_ack: 2 barriers, init_count=14
+            mbarrier_init(smem + 120, 14);
+            mbarrier_init(smem + 128, 14);
             // --- pipeline 'verdict_pipe' ---
             // verdict_ack: 1 barriers, init_count=2
-            mbarrier_init(smem + 128, 2);
+            mbarrier_init(smem + 136, 2);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -303,16 +270,14 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
     __syncwarp();
 
     // TMEM alloc (512 columns, 384 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 136);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 144);
     if (warp == 14) {
-        int _tmem_hold = smem + 136;
+        int _tmem_hold = smem + 144;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const unsigned int taddr = tmem_addr_storage[0];
@@ -320,8 +285,30 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
 
     // Kernel post-init ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (warp == 0) {
+        if (elect_sync()) {
+            int n_total_0 = 0;
+            #pragma unroll 1
+            for (int s_t = 0; s_t < num_segments; s_t++) {
+                int lq_t = cu_seqlens_q[s_t + 1] - cu_seqlens_q[s_t];
+                int nb_t = (lq_t + 6 - 1) / 6;
+                n_total_0 += nb_t;
+            }
+            int tk_limit_0 = n_total_0 + grid_ctas - 1;
+            s_tk[2] = tk_limit_0;
+            s_tk[3] = n_total_0;
+            if (n_total_0 <= grid_ctas) {
+                s_tk[0] = (int)bid;
+                s_tk[1] = n_total_0;
+            } else {
+                uint32_t _atomic_fetch_inc_0;
+                asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                    : "=r"(_atomic_fetch_inc_0) : "l"(TicketWord), "r"(static_cast<uint32_t>((unsigned int)tk_limit_0)) : "memory");
+                s_tk[0] = (int)_atomic_fetch_inc_0;
+            }
+        }
+    }
+    __syncthreads();
 
     // ---- Role: load_q ----
     if (warp == 12) {
@@ -329,29 +316,36 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
         { // load_q_main
             unsigned int _phase_q_empty = 1;
             unsigned int _phase_verdict_ack = 1;
+            unsigned int _phase_tk_ack = 1;
             unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
-                int rank_q = (int)bid & 1;
+                int tk_q = s_tk[0];
+                int tkp_q = 1;
+                unsigned int tk_limit_q = (unsigned int)s_tk[2];
+                int n_tot_q = s_tk[3];
+                int g_units_q = grid_ctas;
+                unsigned int ack_q = 0;
+                ack_q += 1;
+                if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
+                int nunit_q = 0;
                 #pragma unroll 1
                 for (int seg = 0; seg < num_segments; seg++) {
                     int q0 = cu_seqlens_q[seg];
                     int lq = cu_seqlens_q[seg + 1] - q0;
                     int nb = (lq + 6 - 1) / 6;
+                    int cnt_q = nb;
                     #pragma unroll 1
-                    for (int rnd = unit_base_q / (grid_ctas / 2); rnd < (unit_base_q + (nb + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd++) {
-                        int bid_i = (int)bid;
-                        int pos_e = bid_i / 2;
-                        int unit = rnd * (grid_ctas / 2) + pos_e;
-                        int _min_0 = ((unit - unit_base_q) < (unit_base_q + (nb + 1) / 2 - 1 - unit) ? (unit - unit_base_q) : (unit_base_q + (nb + 1) / 2 - 1 - unit));
+                    for (int rnd = 0; rnd < cnt_q + 1; rnd++) {
+                        int unit = tk_q;
+                        if (unit >= unit_base_q + cnt_q) {
+                            break;
+                        }
+                        tkp_q ^= 1;
+                        int _min_0 = ((unit - unit_base_q) < (unit_base_q + nb - 1 - unit) ? (unit - unit_base_q) : (unit_base_q + nb - 1 - unit));
                         if (_min_0 >= 0) {
-                            int rel = unit - unit_base_q;
-                            int blk0 = nb - 1 - 2 * rel;
-                            int blk = blk0 - rank_q;
-                            if (blk < 0) {
-                                blk = 0;
-                            }
+                            int blk = nb - 1 - (unit - unit_base_q);
                             #pragma unroll 1
                             for (int attempt = 0; attempt < 2; attempt++) {
                                 mbarrier_wait(q_empty_addr, _phase_q_empty);
@@ -361,19 +355,40 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                     mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
                                     _phase_verdict_ack ^= 1;
                                 }
+                                if (attempt == 0) {
+                                    if (nunit_q >= 1) {
+                                        mbarrier_wait(tk_ack_addr + (ack_q) * 8, _phase_tk_ack);
+                                    }
+                                    if (n_tot_q > g_units_q) {
+                                        uint32_t _atomic_fetch_inc_1;
+                                        asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                                            : "=r"(_atomic_fetch_inc_1) : "l"(TicketWord), "r"(static_cast<uint32_t>(tk_limit_q)) : "memory");
+                                        int drawn_q = (int)_atomic_fetch_inc_1;
+                                        s_tk[tkp_q ^ 1] = drawn_q;
+                                        tk_q = drawn_q;
+                                    } else {
+                                        tk_q = n_tot_q;
+                                    }
+                                }
                                 mbarrier_arrive_expect_tx(q_full_addr, 49920);
                                 _phase_q_empty ^= 1;
                                 if (attempt == 0) {
                                     mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
                                     _phase_verdict_bar ^= 1;
-                                    if (s_pfail[1] == 0) {
+                                    ack_q += 1;
+                                    if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
+                                    nunit_q += 1;
+                                    int f = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
+                                    f = f | s_fail[4];
+                                    f = f | s_fail[5];
+                                    if (f == 0) {
                                         break;
                                     }
                                 }
                             }
                         }
                     }
-                    unit_base_q += (nb + 1) / 2;
+                    unit_base_q += nb;
                 }
             }
             __syncwarp();
@@ -388,23 +403,29 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             if (elect_sync()) {
                 int unit_base_k = 0;
                 unsigned int vphase_k = 0;
-                int rank_k = (int)bid & 1;
+                int tk_k = s_tk[0];
+                int tkp_k = 1;
+                unsigned int ack_k = 0;
+                mbarrier_arrive(tk_ack_addr + (ack_k) * 8);
+                ack_k += 1;
+                if (ack_k == 2) { ack_k = 0; }
                 #pragma unroll 1
                 for (int seg_1 = 0; seg_1 < num_segments; seg_1++) {
                     int q0_1 = cu_seqlens_q[seg_1];
                     int lq_1 = cu_seqlens_q[seg_1 + 1] - q0_1;
                     int k0 = cu_seqlens_k[seg_1];
                     int nb_1 = (lq_1 + 6 - 1) / 6;
+                    int cnt_k = nb_1;
                     #pragma unroll 1
-                    for (int rnd_1 = unit_base_k / (grid_ctas / 2); rnd_1 < (unit_base_k + (nb_1 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_1++) {
-                        int bid_i_1 = (int)bid;
-                        int pos_e_1 = bid_i_1 / 2;
-                        int unit_1 = rnd_1 * (grid_ctas / 2) + pos_e_1;
-                        int _min_0_1 = ((unit_1 - unit_base_k) < (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1));
+                    for (int rnd_1 = 0; rnd_1 < cnt_k + 1; rnd_1++) {
+                        int unit_1 = tk_k;
+                        if (unit_1 >= unit_base_k + cnt_k) {
+                            break;
+                        }
+                        tkp_k ^= 1;
+                        int _min_0_1 = ((unit_1 - unit_base_k) < (unit_base_k + nb_1 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + nb_1 - 1 - unit_1));
                         if (_min_0_1 >= 0) {
-                            int rel_1 = unit_1 - unit_base_k;
-                            int blk0_1 = nb_1 - 1 - 2 * rel_1;
-                            int blk_1 = blk0_1 - rank_k;
+                            int blk_1 = nb_1 - 1 - (unit_1 - unit_base_k);
                             int q0_1_1 = cu_seqlens_q[seg_1];
                             int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_1_1;
                             int lk = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
@@ -415,7 +436,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 off = (long long)lk - (long long)lq_0;
                             }
                             long long off_1 = off;
-                            int last_u = ((blk0_1 * 6 + 5) < (lq_0 - 1) ? (blk0_1 * 6 + 5) : (lq_0 - 1));
+                            int last_u = ((blk_1 * 6 + 5) < (lq_0 - 1) ? (blk_1 * 6 + 5) : (lq_0 - 1));
                             long long num = off_1 + (long long)last_u + 1ll;
                             int vis = 0;
                             if (num > 0ll) {
@@ -438,6 +459,19 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                     }
                                 }
                             }
+                            if (max_tiles >= 2) {
+                                if (n_tiles_3 * 128 + 128 <= cand_cap) {
+                                    if (n_tiles_3 * 64 > top_k) {
+                                        int cap_fit = ((max_tiles) < (8) ? (max_tiles) : (8));
+                                        if (cap_fit >= 2) {
+                                            stride = (n_tiles_3 + cap_fit - 1) / cap_fit;
+                                            if (stride >= 2) {
+                                                n_sample = (n_tiles_3 + stride - 1) / stride;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             #pragma unroll 1
                             for (int attempt_1 = 0; attempt_1 < 2; attempt_1++) {
                                 int n_s_k = n_sample;
@@ -451,11 +485,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                     int tile = d_k;
                                     tile = n_tiles_3 - 1 - d_k;
                                     mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
-                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(smem_k_addr + load_k_stage * 32768 + (unsigned int)(rank_k * 16384)), "l"((&K)), "r"(0), "r"(k0 + tile * 128), "r"(rank_k),
-                                           "r"(k_full_addr + (load_k_stage) * 8), "h"((uint16_t)(3)) : "memory");
+                                    tma_3d_gmem2smem(smem_k_addr + load_k_stage * 32768, (&K), 0, k0 + tile * 128, 0, k_full_addr + (load_k_stage) * 8);
                                     mbarrier_arrive_expect_tx(k_full_addr + (load_k_stage) * 8, 32768);
                                     load_k_stage += 1;
                                     if (load_k_stage == 4) { load_k_stage = 0; _phase_k_empty ^= 1; }
@@ -480,22 +510,22 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 if (attempt_1 == 0) {
                                     mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
                                     _phase_verdict_bar_1 ^= 1;
-                                    int pword_k = s_pfail[1];
+                                    tk_k = s_tk[tkp_k ^ 1];
+                                    mbarrier_arrive(tk_ack_addr + (ack_k) * 8);
+                                    ack_k += 1;
+                                    if (ack_k == 2) { ack_k = 0; }
+                                    int f_1 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
+                                    f_1 = f_1 | s_fail[4];
+                                    f_1 = f_1 | s_fail[5];
                                     mbarrier_arrive(verdict_ack_addr);
-                                    if (pword_k == 0) {
+                                    if (f_1 == 0) {
                                         break;
                                     }
                                 }
                             }
                         }
                     }
-                    unit_base_k += (nb_1 + 1) / 2;
-                }
-                #pragma unroll
-                for (int _d = 0; _d < 4; _d++) {
-                    mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
-                    load_k_stage += 1;
-                    if (load_k_stage == 4) { load_k_stage = 0; _phase_k_empty ^= 1; }
+                    unit_base_k += nb_1;
                 }
             }
             __syncwarp();
@@ -508,7 +538,19 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             unsigned int mma_tmem_stage = 0;
             int unit_base_m = 0;
             unsigned int vphase_m = 0;
-            int rank_m = (int)bid & 1;
+            int tk_m = 0;
+            if (lane == 0) {
+                tk_m = s_tk[0];
+            }
+            int _shfl_sync_0 = __shfl_sync(0xFFFFFFFF, tk_m, 0);
+            tk_m = _shfl_sync_0;
+            int tkp_m = 1;
+            unsigned int ack_m = 0;
+            if (lane == 0) {
+                mbarrier_arrive(tk_ack_addr + (ack_m) * 8);
+            }
+            ack_m += 1;
+            if (ack_m == 2) { ack_m = 0; }
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_umma_empty = 1;
@@ -518,16 +560,17 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                 int q0_2 = cu_seqlens_q[seg_2];
                 int lq_2 = cu_seqlens_q[seg_2 + 1] - q0_2;
                 int nb_2 = (lq_2 + 6 - 1) / 6;
+                int cnt_m = nb_2;
                 #pragma unroll 1
-                for (int rnd_2 = unit_base_m / (grid_ctas / 2); rnd_2 < (unit_base_m + (nb_2 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_2++) {
-                    int bid_i_2 = (int)bid;
-                    int pos_e_2 = bid_i_2 / 2;
-                    int unit_2 = rnd_2 * (grid_ctas / 2) + pos_e_2;
-                    int _min_0_2 = ((unit_2 - unit_base_m) < (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2));
-                    if (_min_0_2 >= 0) {
-                        int rel_2 = unit_2 - unit_base_m;
-                        int blk0_2 = nb_2 - 1 - 2 * rel_2;
-                        int blk_2 = blk0_2 - rank_m;
+                for (int rnd_2 = 0; rnd_2 < cnt_m + 1; rnd_2++) {
+                    int unit_2 = tk_m;
+                    if (unit_2 >= unit_base_m + cnt_m) {
+                        break;
+                    }
+                    tkp_m ^= 1;
+                    int _min_1 = ((unit_2 - unit_base_m) < (unit_base_m + nb_2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + nb_2 - 1 - unit_2));
+                    if (_min_1 >= 0) {
+                        int blk_2 = nb_2 - 1 - (unit_2 - unit_base_m);
                         int q0_2_1 = cu_seqlens_q[seg_2];
                         int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_2_1;
                         int lk_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
@@ -538,7 +581,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                             off_2 = (long long)lk_1 - (long long)lq_2_1;
                         }
                         long long off_1_1 = off_2;
-                        int last_u_1 = ((blk0_2 * 6 + 5) < (lq_2_1 - 1) ? (blk0_2 * 6 + 5) : (lq_2_1 - 1));
+                        int last_u_1 = ((blk_2 * 6 + 5) < (lq_2_1 - 1) ? (blk_2 * 6 + 5) : (lq_2_1 - 1));
                         long long num_1 = off_1_1 + (long long)last_u_1 + 1ll;
                         int vis_1 = 0;
                         if (num_1 > 0ll) {
@@ -559,8 +602,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 if (elect_sync()) {
                                     mbarrier_wait(umma_empty_addr + (mma_tmem_stage) * 8, _phase_umma_empty);
                                     asm volatile("tcgen05.fence::after_thread_sync;");
-                                    int _smem_desc_lo_1 = (((smem_k_addr) >> 4) & 0x7FFF) + (mma_k_stage) * 2048;
-                                    int _smem_desc_lo_2 = (((smem_q_addr) >> 4) & 0x7FFF) + (0) * 3072;
+                                    int _smem_desc_lo_2 = (((smem_k_addr) >> 4) & 0x7FFF) + (mma_k_stage) * 2048;
+                                    int _smem_desc_lo_3 = (((smem_q_addr) >> 4) & 0x7FFF) + (0) * 3072;
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -614,9 +657,9 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_1), "r"(_smem_desc_lo_2), "r"((tmem_tmem_acc + (mma_tmem_stage * 192))), "r"(0) : "memory");
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem_acc + (mma_tmem_stage * 192))), "r"(0) : "memory");
                                     tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
-                                    tcgen05_commit_cg1_multicast(k_empty_addr + (mma_k_stage) * 8, (uint16_t)(3));
+                                    tcgen05_commit(k_empty_addr + (mma_k_stage) * 8);
                                     mma_tmem_stage += 1;
                                     if (mma_tmem_stage == 2) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
                                 }
@@ -631,12 +674,27 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
                                 _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
+                                int tread_m = 0;
                                 if (lane == 0) {
-                                    uint32_t _shared_weak_0;
-                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_0) : "r"(static_cast<uint32_t>(s_pfail_addr + 4)));
-                                    vread_m = (int)_shared_weak_0;
+                                    uint32_t shared_weak;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
+                                    unsigned int f_2 = shared_weak;
+                                    for (int fw = 1; fw < 6; fw++) {
+                                        uint32_t shared_weak_1;
+                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
+                                        f_2 = f_2 | shared_weak_1;
+                                    }
+                                    vread_m = (int)f_2;
+                                    uint32_t tk_word_m;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(tk_word_m) : "r"(static_cast<uint32_t>(s_tk_addr + (unsigned int)((tkp_m ^ 1) * 4))));
+                                    tread_m = (int)tk_word_m;
+                                    mbarrier_arrive(tk_ack_addr + (ack_m) * 8);
                                 }
                                 int vword_m = __shfl_sync(0xFFFFFFFF, vread_m, 0);
+                                int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, tread_m, 0);
+                                tk_m = _shfl_sync_4;
+                                ack_m += 1;
+                                if (ack_m == 2) { ack_m = 0; }
                                 if (lane == 0) {
                                     mbarrier_arrive(verdict_ack_addr);
                                 }
@@ -647,7 +705,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                         }
                     }
                 }
-                unit_base_m += (nb_2 + 1) / 2;
+                unit_base_m += nb_2;
             }
         }
     // ---- Role: spare ----
@@ -668,7 +726,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             int pair = warp_in_wg / 2;
             int half = warp_in_wg % 2;
             int pair_bar = 5 + wg * 2 + pair;
-            int bid_i_3 = (int)bid;
+            int bid_i = (int)bid;
             unsigned int one_u = 1;
             unsigned int lower_lanes = (one_u << (unsigned int)lane) - 1;
             int hist_base = (wg * 2 + pair) * 256;
@@ -683,19 +741,32 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             unsigned int math_tmem_stage = 0;
             unsigned int math_tmem_phase = 0;
             int unit_base = 0;
-            int rank_u = bid_i_3 & 1;
+            int tk_u = 0;
+            if (lane == 0) {
+                tk_u = s_tk[0];
+            }
+            int _shfl_sync_0_1 = __shfl_sync(0xFFFFFFFF, tk_u, 0);
+            tk_u = _shfl_sync_0_1;
+            int tkp_u = 1;
+            int tk_in_u = 0;
+            unsigned int ack_u = 0;
+            if (lane == 0) {
+                mbarrier_arrive(tk_ack_addr + (ack_u) * 8);
+            }
+            ack_u += 1;
+            if (ack_u == 2) { ack_u = 0; }
             int verdict_unit = 0;
             int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
             int trigger_room = 128 * check_period;
             unsigned int _phase_q_full_1 = 0;
             unsigned int _phase_umma_full = 0;
-            unsigned int _phase_peer_bar = 0;
             #pragma unroll 1
             for (int seg_3 = 0; seg_3 < num_segments; seg_3++) {
                 int q0_3 = cu_seqlens_q[seg_3];
                 int lq_3 = cu_seqlens_q[seg_3 + 1] - q0_3;
                 int lk_2 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
                 int nb_3 = (lq_3 + 6 - 1) / 6;
+                int cnt_u = nb_3;
                 long long off_3 = 0;
                 if (has_offsets != 0) {
                     off_3 = q_offsets[seg_3];
@@ -704,16 +775,15 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                 }
                 long long dst = off_3;
                 #pragma unroll 1
-                for (int rnd_3 = unit_base / (grid_ctas / 2); rnd_3 < (unit_base + (nb_3 + 1) / 2 - 1) / (grid_ctas / 2) + 1; rnd_3++) {
-                    int bid_i_0 = (int)bid;
-                    int pos_e_3 = bid_i_0 / 2;
-                    int unit_3 = rnd_3 * (grid_ctas / 2) + pos_e_3;
-                    int _min_0_3 = ((unit_3 - unit_base) < (unit_base + (nb_3 + 1) / 2 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + (nb_3 + 1) / 2 - 1 - unit_3));
-                    if (_min_0_3 >= 0) {
-                        int rel_3 = unit_3 - unit_base;
-                        int blk0_3 = nb_3 - 1 - 2 * rel_3;
-                        int blk_3 = blk0_3 - rank_u;
-                        int dummy = ((blk_3 < 0) ? 1 : 0);
+                for (int rnd_3 = 0; rnd_3 < cnt_u + 1; rnd_3++) {
+                    int unit_3 = tk_u;
+                    if (unit_3 >= unit_base + cnt_u) {
+                        break;
+                    }
+                    tkp_u ^= 1;
+                    int _min_1_1 = ((unit_3 - unit_base) < (unit_base + nb_3 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + nb_3 - 1 - unit_3));
+                    if (_min_1_1 >= 0) {
+                        int blk_3 = nb_3 - 1 - (unit_3 - unit_base);
                         int u_base = blk_3 * 6;
                         int q0_3_1 = cu_seqlens_q[seg_3];
                         int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_3_1;
@@ -725,7 +795,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                             off_3_1 = (long long)lk_0 - (long long)lq_3_1;
                         }
                         long long off_1_2 = off_3_1;
-                        int last_u_2 = ((blk0_3 * 6 + 5) < (lq_3_1 - 1) ? (blk0_3 * 6 + 5) : (lq_3_1 - 1));
+                        int last_u_2 = ((blk_3 * 6 + 5) < (lq_3_1 - 1) ? (blk_3 * 6 + 5) : (lq_3_1 - 1));
                         long long num_2 = off_1_2 + (long long)last_u_2 + 1ll;
                         int vis_2 = 0;
                         if (num_2 > 0ll) {
@@ -748,16 +818,26 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 }
                             }
                         }
+                        if (max_tiles_1 >= 2) {
+                            if (n_tiles_5 * 128 + 128 <= cand_cap) {
+                                if (n_tiles_5 * 64 > top_k) {
+                                    int cap_fit_1 = ((max_tiles_1) < (8) ? (max_tiles_1) : (8));
+                                    if (cap_fit_1 >= 2) {
+                                        stride_1 = (n_tiles_5 + cap_fit_1 - 1) / cap_fit_1;
+                                        if (stride_1 >= 2) {
+                                            n_sample_1 = (n_tiles_5 + stride_1 - 1) / stride_1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         int row_valid[2];
                         int visible[2];
                         unsigned long long tau[2];
                         int buf_base[2];
-                        int buf_unit = (bid_i_3 * 6 + wg * 2) * cand_cap;
+                        int buf_unit = (bid_i * 6 + wg * 2) * cand_cap;
                         int u_q = u_base + wg * 2;
                         int valid_q = ((u_q < lq_3) ? 1 : 0);
-                        if (dummy != 0) {
-                            valid_q = 0;
-                        }
                         row_valid[0] = valid_q;
                         int vis_q = 0;
                         if (valid_q != 0) {
@@ -775,9 +855,6 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                         buf_base[0] = buf_unit;
                         int u_q_6 = u_base + wg * 2 + 1;
                         int valid_q_7 = ((u_q_6 < lq_3) ? 1 : 0);
-                        if (dummy != 0) {
-                            valid_q_7 = 0;
-                        }
                         row_valid[1] = valid_q_7;
                         int vis_q_8 = 0;
                         if (valid_q_7 != 0) {
@@ -814,6 +891,18 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                             }
                             asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
                             mbarrier_wait(q_full_addr, _phase_q_full_1);
+                            if (lane == 0) {
+                                tk_u = s_tk[tk_in_u + (tkp_u ^ 1)];
+                                if (attempt_3 == 0) {
+                                    mbarrier_arrive(tk_ack_addr + (ack_u) * 8);
+                                }
+                            }
+                            int _shfl_sync_2 = __shfl_sync(0xFFFFFFFF, tk_u, 0);
+                            tk_u = _shfl_sync_2;
+                            if (attempt_3 == 0) {
+                                ack_u += 1;
+                                if (ack_u == 2) { ack_u = 0; }
+                            }
                             float weights_reg[64];
                             int weight_stage_base = 0 * 192 + (unsigned int)(wg * 64);
                             #pragma unroll
@@ -888,8 +977,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 int above = ((key >= tau[0]) ? 1 : 0);
                                 int emit = row_valid[0] & in_prefix & above;
                                 emit2[0] = emit;
-                                unsigned int _warp_vote_1 = __ballot_sync(0xFFFFFFFF, emit != 0);
-                                ballot2[0] = _warp_vote_1;
+                                unsigned int _warp_vote_3 = __ballot_sync(0xFFFFFFFF, emit != 0);
+                                ballot2[0] = _warp_vote_3;
                                 float2 sum0_0 = make_float2(0.0f, 0.0f);
                                 float2 sum1_0 = make_float2(0.0f, 0.0f);
                                 #pragma unroll
@@ -917,16 +1006,16 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                 int above_12 = ((key_10 >= tau[1]) ? 1 : 0);
                                 int emit_13 = row_valid[1] & in_prefix_11 & above_12;
                                 emit2[1] = emit_13;
-                                unsigned int _warp_vote_2 = __ballot_sync(0xFFFFFFFF, emit_13 != 0);
-                                ballot2[1] = _warp_vote_2;
+                                unsigned int _warp_vote_4 = __ballot_sync(0xFFFFFFFF, emit_13 != 0);
+                                ballot2[1] = _warp_vote_4;
                                 int cnt_lane = (int)(unsigned int)__popc(ballot2[1]);
                                 if (lane_0 == 0) {
                                     cnt_lane = (int)(unsigned int)__popc(ballot2[0]);
                                 }
                                 int reservation = 0;
                                 if (lane_0 < 2) {
-                                    int _atomic_fetch_add_3 = atomicAdd(s_count + (wg * 2 + lane_0), cnt_lane);
-                                    reservation = _atomic_fetch_add_3;
+                                    int _atomic_fetch_add_5 = atomicAdd(s_count + (wg * 2 + lane_0), cnt_lane);
+                                    reservation = _atomic_fetch_add_5;
                                 }
                                 int slot_base_1_0 = __shfl_sync(0xFFFFFFFF, reservation, 0);
                                 if (emit2[0] != 0) {
@@ -984,8 +1073,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                             if (row_valid[0] != 0) {
                                                 int vis_abs_1_0 = visible[0];
                                                 int vis_c_1_0 = vis_abs_1_0;
-                                                int _max_4 = ((vis_c_1_0 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_0 - (n_tiles_5 - 1) * 128) : (0));
-                                                int n_diag_1_0 = ((_max_4) < (128) ? (_max_4) : (128));
+                                                int _max_6 = ((vis_c_1_0 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_0 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_0 = ((_max_6) < (128) ? (_max_6) : (128));
                                                 int c_far_1_0 = c_q_1_0 - n_diag_1_0;
                                                 int v_far_1_0 = vis_c_1_0 - n_diag_1_0;
                                                 if (v_far_1_0 > 0) {
@@ -994,8 +1083,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                                     if (r_shift_1_0 < c_far_1_0) {
                                                         need_q_1_0 = 1;
                                                         kw_q_1_0 = r_shift_1_0;
-                                                        int _min_5 = ((r_shift_1_0 + 64) < (keep_cap) ? (r_shift_1_0 + 64) : (keep_cap));
-                                                        km_q_1_0 = _min_5;
+                                                        int _min_7 = ((r_shift_1_0 + 64) < (keep_cap) ? (r_shift_1_0 + 64) : (keep_cap));
+                                                        km_q_1_0 = _min_7;
                                                         sk_q_1_0 = n_diag_1_0;
                                                     }
                                                 }
@@ -1018,8 +1107,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                             if (row_valid[1] != 0) {
                                                 int vis_abs_1_1 = visible[1];
                                                 int vis_c_1_1 = vis_abs_1_1;
-                                                int _max_6 = ((vis_c_1_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_1 - (n_tiles_5 - 1) * 128) : (0));
-                                                int n_diag_1_1 = ((_max_6) < (128) ? (_max_6) : (128));
+                                                int _max_8 = ((vis_c_1_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_1 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_1 = ((_max_8) < (128) ? (_max_8) : (128));
                                                 int c_far_1_1 = c_q_1_1 - n_diag_1_1;
                                                 int v_far_1_1 = vis_c_1_1 - n_diag_1_1;
                                                 if (v_far_1_1 > 0) {
@@ -1028,8 +1117,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                                     if (r_shift_1_1 < c_far_1_1) {
                                                         need_q_1_1 = 1;
                                                         kw_q_1_1 = r_shift_1_1;
-                                                        int _min_7 = ((r_shift_1_1 + 64) < (keep_cap) ? (r_shift_1_1 + 64) : (keep_cap));
-                                                        km_q_1_1 = _min_7;
+                                                        int _min_9 = ((r_shift_1_1 + 64) < (keep_cap) ? (r_shift_1_1 + 64) : (keep_cap));
+                                                        km_q_1_1 = _min_9;
                                                         sk_q_1_1 = n_diag_1_1;
                                                     }
                                                 }
@@ -1284,15 +1373,15 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                             unsigned int lo = (unsigned int)s_tau[wg * 2 * 2];
                                             unsigned int hi = (unsigned int)s_tau[wg * 2 * 2 + 1];
                                             unsigned long long tau_new = (unsigned long long)hi << 32ull | (unsigned long long)lo;
-                                            unsigned long long _max_8 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
-                                            tau[0] = _max_8;
+                                            unsigned long long _max_10 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
+                                            tau[0] = _max_10;
                                         }
                                         if (need[1] != 0) {
                                             unsigned int lo_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2];
                                             unsigned int hi_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2 + 1];
                                             unsigned long long tau_new_1 = (unsigned long long)hi_1 << 32ull | (unsigned long long)lo_1;
-                                            unsigned long long _max_9 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
-                                            tau[1] = _max_9;
+                                            unsigned long long _max_11 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
+                                            tau[1] = _max_11;
                                         }
                                     }
                                 }
@@ -1307,8 +1396,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                             if (attempt_3 == 0) {
                                 int fail_pair = 0;
                                 if (valid_pair != 0) {
-                                    int _min_10 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
-                                    if (c_final < _min_10) {
+                                    int _min_12 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
+                                    if (c_final < _min_12) {
                                         fail_pair = 1;
                                     }
                                 }
@@ -1318,46 +1407,11 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                     }
                                 }
                                 asm volatile("barrier.sync 4, 384;" ::: "memory");
-                                int vread = 0;
-                                if (lane_0 == 0) {
-                                    uint32_t shared_weak;
-                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
-                                    unsigned int f = shared_weak;
-                                    for (int fw = 1; fw < 6; fw++) {
-                                        uint32_t shared_weak_1;
-                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
-                                        f = f | shared_weak_1;
-                                    }
-                                    vread = (int)f;
-                                }
-                                int _shfl_sync_11 = __shfl_sync(0xFFFFFFFF, vread, 0);
-                                verdict = _shfl_sync_11;
-                                if (warp == 0) {
-                                    if (elect_sync()) {
-                                        int peer_u = rank_u ^ 1;
-                                        mbarrier_arrive_expect_tx(peer_bar_addr, 4);
-                                        uint32_t _cluster_mapa_12;
-                                        asm volatile(
-                                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                                            : "=r"(_cluster_mapa_12) : "r"(s_pfail_addr), "r"(peer_u));
-                                        uint32_t _mbar_peer_13;
-                                        asm(
-                                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                                            : "=r"(_mbar_peer_13) : "r"(peer_bar_addr), "r"(peer_u));
-                                        asm volatile(
-                                            "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                            :: "r"(_cluster_mapa_12), "r"(verdict), "r"(_mbar_peer_13) : "memory");
-                                    }
-                                }
-                                mbarrier_wait_cluster_hint(peer_bar_addr, _phase_peer_bar, 10000000);
-                                _phase_peer_bar ^= 1;
-                                verdict = verdict | s_pfail[0];
-                                if (warp == 0) {
-                                    if (elect_sync()) {
-                                        s_pfail[1] = verdict;
-                                    }
-                                }
-                                if (lane_0 == 0) {
+                                int f_3 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
+                                f_3 = f_3 | s_fail[4];
+                                f_3 = f_3 | s_fail[5];
+                                verdict = f_3;
+                                if (elect_sync()) {
                                     mbarrier_arrive(verdict_bar_addr);
                                 }
                                 verdict_unit += 1;
@@ -1595,8 +1649,8 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                                 }
                                                 unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, keep_k != 0);
                                                 if (keep_k != 0) {
-                                                    int rank_k_1 = pos_k + (int)(unsigned int)__popc(_vote_1 & lower_lanes);
-                                                    long long slot_k = row_base + (long long)rank_k_1;
+                                                    int rank_k = pos_k + (int)(unsigned int)__popc(_vote_1 & lower_lanes);
+                                                    long long slot_k = row_base + (long long)rank_k;
                                                     float score_k = 0.0f;
                                                     unsigned int key32_e = (unsigned int)(cur_k[u_10] >> 32ull);
                                                     unsigned int lo_e = (unsigned int)cur_k[u_10];
@@ -1649,9 +1703,9 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                                                 }
                                                 unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, keep_k_1 != 0);
                                                 if (keep_k_1 != 0) {
-                                                    int rank_k_2 = pos_k_1 + (int)(unsigned int)__popc(_vote_2 & lower_lanes);
-                                                    rank_k_2 = n_sel - 1 - rank_k_2;
-                                                    long long slot_k_1 = row_base + (long long)rank_k_2;
+                                                    int rank_k_1 = pos_k_1 + (int)(unsigned int)__popc(_vote_2 & lower_lanes);
+                                                    rank_k_1 = n_sel - 1 - rank_k_1;
+                                                    long long slot_k_1 = row_base + (long long)rank_k_1;
                                                     float score_k_1 = 0.0f;
                                                     unsigned int key32_e_1 = (unsigned int)(cur_k_1[u_14] >> 32ull);
                                                     unsigned int lo_e_1 = (unsigned int)cur_k_1[u_14];
@@ -1689,7 +1743,7 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
                         }
                     }
                 }
-                unit_base += (nb_3 + 1) / 2;
+                unit_base += nb_3;
             }
             asm volatile("barrier.sync 4, 384;" ::: "memory");
             if (warp == 0) {
@@ -1697,10 +1751,6 @@ kernel_cake_dsa_indexer_nondet_topk_7d1b556b2aedea7f5249(const __grid_constant__
             }
         }
     }
-
-    // Kernel teardown ops
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // Cleanup
 }
