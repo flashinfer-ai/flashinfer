@@ -1120,7 +1120,12 @@ def test_backward_selection_literal_table() -> None:
             for name in loader.route_modules(arch, kind):
                 rule = loader.select_rule(loader.MODULES[name])
                 channels_only = rule is None or rule["kind"] == "channels_at_least"
-                assert channels_only, (arch, kind, name)
+                # Besides ``bwd``, only the sm_107a forward routes' two-stage programs carry a token floor.
+                assert channels_only or (
+                    arch == "sm_107a"
+                    and loader.route_role(kind) == "fwd"
+                    and rule["tokens"] == {"sm_107a": 65536}
+                ), (arch, kind, name)
 
 
 def test_backward_launches_the_whole_rank_grid(monkeypatch) -> None:
@@ -1414,8 +1419,9 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
 @pytest.mark.parametrize("kind", ("fwd", "fwd_dt", "fwd_bias"))
 def test_forward_programs_switch_on_channel_count(kind) -> None:
     """Exactly one forward program of the route runs per call, every program of the route runs for some channel
-    count, and on both sides of each channel threshold ``y`` matches the reference and equals, bit for bit, the
-    route's fallback program launched on its own (every forward program rounds ``y`` as the static one does)."""
+    count, and on both sides of each channel threshold (at a floored program's token floor as well) ``y`` matches
+    the reference and equals, bit for bit, the route's fallback program launched on its own (every forward program
+    rounds ``y`` as the static one does)."""
 
     _require_route(kind)
     arch = _arch()
@@ -1429,50 +1435,59 @@ def test_forward_programs_switch_on_channel_count(kind) -> None:
     record = loader.MODULES[fallback]
     device = _device()
     channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    rows = [
+        (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
+    ]
+    # A program with a token floor runs from it: both sides of its channel threshold at the floor.
+    rows += [
+        (floor, "perf", C)
+        for floored, floor in _token_floors(arch, kind).values()
+        for T in floored
+        for C in (T - 8, T, T + 8)
+    ]
     launched = set()
-    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
-        for C in channels:
-            selected = loader.selected_modules(arch, kind, C=C, S=S)
-            assert len(selected) == 1, f"S={S} C={C}: {selected}"
-            launched.add(selected[0])
-            x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
-            label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
-            y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-            _assert_within(
-                y,
-                reference_forward(x, w, cu, b),
-                atol=Y_ATOL,
-                rtol=Y_RTOL,
-                label=f"y {label}",
-            )
-            scalars = loader.plan(
-                S,
-                C,
-                int(cu.numel()) - 1,
-                geometry=record["grid_rule"]["geometry"],
-                role=record["role"],
-            )
-            y_fallback = torch.full_like(y, float("nan"))
-            values = {
-                "x": x,
-                "w": w,
-                "cu": cu,
-                "y": y_fallback,
-                "work": torch.zeros(
-                    loader.counter_words(record, scalars["n_ch_tiles"]),
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
-                "flags": pkg._flags(w, b=b),
-            }
-            if b is not None:
-                values["b"] = b
-            loader.run_module(fallback, values, device_index=device.index)
-            torch.cuda.synchronize(device)
-            assert torch.equal(y, y_fallback), (
-                f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
-            )
+    for S, docs, C in rows:
+        selected = loader.selected_modules(arch, kind, C=C, S=S)
+        assert len(selected) == 1, f"S={S} C={C}: {selected}"
+        launched.add(selected[0])
+        x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
+        label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
+        y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+        _assert_within(
+            y,
+            reference_forward(x, w, cu, b),
+            atol=Y_ATOL,
+            rtol=Y_RTOL,
+            label=f"y {label}",
+        )
+        scalars = loader.plan(
+            S,
+            C,
+            int(cu.numel()) - 1,
+            geometry=record["grid_rule"]["geometry"],
+            role=record["role"],
+        )
+        y_fallback = torch.full_like(y, float("nan"))
+        values = {
+            "x": x,
+            "w": w,
+            "cu": cu,
+            "y": y_fallback,
+            "work": torch.zeros(
+                loader.counter_words(record, scalars["n_ch_tiles"]),
+                dtype=torch.int32,
+                device=device,
+            ),
+            **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
+            "flags": pkg._flags(w, b=b),
+        }
+        if b is not None:
+            values["b"] = b
+        loader.run_module(fallback, values, device_index=device.index)
+        torch.cuda.synchronize(device)
+        assert torch.equal(y, y_fallback), (
+            f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
+        )
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
