@@ -94,7 +94,9 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _setup(rank: int, W: int, row, port: int, local_id: int):
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
 
     lengths, _w, layout, Cs = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -103,8 +105,8 @@ def _setup(rank: int, W: int, row, port: int, local_id: int):
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
         part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
     )
     g = torch.Generator(device="cpu").manual_seed(7815)
@@ -344,10 +346,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     info["retained_bytes"] = retained
     flags["retained"] = retained["plain"] == 0 and retained["handle"] == pool_bytes
     # the GDN package's context (duck-typed, the other call path): the same bits and counts
-    from flashinfer.experimental.cake_gdn_det_train_kcp import cake_kcp_plan as gplan
+    from flashinfer.experimental.cake.cake_gdn_det_train_kcp import (
+        cake_kcp_plan as gplan,
+    )
 
-    gpart, _ = _partition(gplan, row[0], W, row[2])
-    gctx = gplan.build_context_det_kcp(gpart, dist.group.WORLD, rank, device)
+    gpart, _ = _partition(gplan.cake_gdn_det_train_kcp_partition, row[0], W, row[2])
+    gctx = gplan.cake_gdn_det_train_kcp_build_context(
+        gpart, dist.group.WORLD, rank, device
+    )
     g_single, cg_single = run(False, "direct", c=gctx)
     g_multi, cg_multi = run(True, "direct", c=gctx)
     g_handle, cg_handle = run(

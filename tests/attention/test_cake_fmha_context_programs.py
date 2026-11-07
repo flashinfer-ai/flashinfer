@@ -3324,41 +3324,44 @@ def test_cake_context_bf16_runtime_tail_order_follows_the_makespan_model(
     assert first["full_sections"] == 1
 
 
-@pytest.mark.parametrize("form", sorted(f for f in _BF16_FLAG_FORMS if f[0]))
-def test_cake_context_bf16_flag_form_programs_keep_the_plain_tail_order(
+@pytest.mark.parametrize("form", sorted(_BF16_FLAG_FORMS))
+def test_cake_context_bf16_flag_form_tail_order_follows_causality(
     monkeypatch, form
 ) -> None:
     """A causal runtime-size program of a flag form (sinks or an LSE output)
-    runs its tail units in the plain order: the launch on which the program
-    of the causal form without LSE or sink takes the interleaved order keeps
-    bit 31 of ``full_sections`` clear."""
+    takes the tail order of the causal program without LSE or sink: bit 31 of
+    ``full_sections`` is set on the same launches.  A non-causal one keeps it
+    clear."""
 
-    _, return_lse, enable_sink = form
+    is_causal, return_lse, enable_sink = form
     identifier = f"RUNTIME_PACK8_{_BF16_FLAG_FORMS[form]}"
-    assert identifier in cake_api._CONTEXT_BF16_FLAG_FORM_PROGRAMS
-    assert "RUNTIME_PACK8" not in cake_api._CONTEXT_BF16_FLAG_FORM_PROGRAMS
     tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)
-    sizes = dict(batch=1, max_q_len=8192, max_kv_len=16384, is_causal=True)
-    plain = _launch_values(
-        monkeypatch,
-        tables,
-        shared=True,
-        module=_stand_in_module("context_bf16", "RUNTIME_PACK8"),
-        **sizes,
-    )
-    assert plain["full_sections"] == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE
-    values = _launch_values(
-        monkeypatch,
-        tables,
-        shared=True,
-        module=_stand_in_module("context_bf16", identifier, form=form),
+    plain = _stand_in_module("context_bf16", "RUNTIME_PACK8")
+    flag = _stand_in_module("context_bf16", identifier, form=form)
+
+    def full_sections(module, max_q_len, **flags):
+        return _launch_values(
+            monkeypatch,
+            tables,
+            shared=True,
+            module=module,
+            batch=1,
+            max_q_len=max_q_len,
+            max_kv_len=16384,
+            **flags,
+        )["full_sections"]
+
+    flags = dict(
+        is_causal=is_causal,
         lse=torch.zeros((64, 32)) if return_lse else None,
         lse_stride_tokens=32 if return_lse else 0,
         lse_stride_heads=1 if return_lse else 0,
         attention_sinks=torch.zeros(32) if enable_sink else None,
-        **sizes,
     )
-    assert values["full_sections"] == 0
+    assert full_sections(plain, 8192) == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE
+    for max_q_len in (8192, 8320):
+        want = full_sections(plain, max_q_len) if is_causal else 0
+        assert full_sections(flag, max_q_len, **flags) == want
 
 
 def test_cake_context_one_stage_program_takes_one_stage_m_blocks(

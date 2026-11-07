@@ -196,6 +196,34 @@ module's argument plan by keyword (`bind_launch`, fails closed on an unknown
 name).  Given the same device the result is bitwise identical to the Cake
 launcher's.
 
+### Three-chain FP32 weight gradient (`sm_107a`)
+
+`CHAIN_RANGES_BY_SM[(arch, sm_count)]` maps a weight-gradient row
+`(N, K, M)` (`K` the token count) to token ranges `(lo, hi, (block_n,
+chains), over_exact)`.  Inside a range the FP32 weight gradient plans
+`ChainGemmPlan`: one CTA pair per output tile computes the whole K
+reduction, its `chains` TMEM accumulators each own a fixed contiguous range
+of K blocks (`chain_bounds`), and the chains are added in a fixed order in
+the epilogue (`chain_det_gemm_nn_n{block_n}_f32_t_c{chains}`).  There is no
+workspace, no atomic and no split of K across CTAs, so the result is bitwise
+identical from run to run on one device.  An exact `ROW_RULES` key of the
+row keeps precedence unless the range sets `over_exact`; a part without an
+entry (the 208-SM `sm_107a` parts, every other architecture), a caller knob
+other than `transposed_out` / `sk` / `arch`, a batched or non-FP32 output
+and an unregistered template all plan as before.  The ranges list the
+`sm_107a` 212- and 216-SM parts for the 5120 -> 1024 and 5120 -> 512 rows.  Three ragged `sm_107a`
+weight-gradient rules sit beside them: the 4096 -> 512 and 4096 -> 1024 FP32
+rows plan the programs of their T 16231 keys at every token count without an
+exact key (the 4096 -> 512 rule yields to the plan without it up to T 960),
+and the 5120 -> 1024 BF16 row plans the 224-column tile with the
+column-grouped raster (`_n224_hne_cg_pro15`).
+
+Determinism scope: a planned launch gives the same bits on every run of one
+package version on one device.  The bits are not promised across versions,
+across plans (a change of `ROW_RULES`, `CHAIN_RANGES_BY_SM` or the SM count
+selects a different summation order) or across devices; every plan meets
+the same absolute accuracy budget against an FP64 reference.
+
 ### The swapped small-token forward
 
 The convenience path (`cake_dense_gemm_det_train_projection`) runs a batched forward row
@@ -248,7 +276,9 @@ split take `enable_pdl` too and wait before their first global access.
   device: by architecture, SM count, layout, hidden size H and token-count
   window T 16129-16384:
   `sm_100a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
-  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits.
+  `sm_100a` at 148 / 152 SMs, weight gradient H 6144: 3 splits;
+  `sm_103a` at 148 / 152 SMs, weight gradient H 5120: 9 splits;
+  `sm_103a` at 148 / 152 SMs, weight gradient H 6144: 3 splits.
 * Every `launch()` re-splits the second operand into the retained
   `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
   split, no allocation: one launch of the fused split program

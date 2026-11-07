@@ -2054,17 +2054,6 @@ _CONTEXT_RUNTIME_FLAG_ROUTES: dict[
         (False, True, False): _CONTEXT_BF16_RUNTIME_NONCAUSAL_LSE_ROUTES,
     },
 }
-# The runtime-size BF16 programs of the flag forms (every form but the causal
-# one without LSE or sink): they run the units past the last whole section in
-# the plain order and take no tail-order bit
-# (:data:`_CONTEXT_BF16_TAIL_INTERLEAVE`).
-_CONTEXT_BF16_FLAG_FORM_PROGRAMS = frozenset(
-    name
-    for form, routes in _CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].items()
-    if form != (True, False, False)
-    for table in routes.values()
-    for name in table.values()
-)
 # Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
 # JIT pack above 1 whose ``max_q_len`` is a power of two of at least
 # ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
@@ -2503,12 +2492,13 @@ _CONTEXT_BF16_RUNTIME_PARAMS = (
     "page_shift",
 )
 
-# The tail order of a causal runtime-size BF16 launch.  Its work units past the
-# last whole 8-unit section run one unit's m-blocks after another, or, with
-# this bit of ``full_sections`` set, interleaved like a section: every tail
-# unit's m-block, the largest first.  The order moves no tile's work, so the
-# output is the same bit for bit; the launch takes the order of the shorter
-# modelled makespan (:func:`_context_bf16_tail_interleave`).
+# The tail order of a causal runtime-size BF16 launch, with or without sinks
+# or an LSE output.  Its work units past the last whole 8-unit section run one
+# unit's m-blocks after another, or, with this bit of ``full_sections`` set,
+# interleaved like a section: every tail unit's m-block, the largest first.
+# The order moves no tile's work, so the output is the same bit for bit; the
+# launch takes the order of the shorter modelled makespan
+# (:func:`_context_bf16_tail_interleave`).
 _CONTEXT_BF16_TAIL_INTERLEAVE = 1 << 31
 # The tail-order model: a tile costs its KV blocks plus this many; the
 # interleaved order must be shorter by this fraction; a launch of more waves
@@ -9245,7 +9235,6 @@ class CakeFmhaContextProgramModule:
                     | (
                         _CONTEXT_BF16_TAIL_INTERLEAVE
                         if is_causal
-                        and route.program not in _CONTEXT_BF16_FLAG_FORM_PROGRAMS
                         and _context_bf16_tail_interleave(
                             int(batch_size),
                             int(max_q_len),

@@ -52,13 +52,14 @@ per SM, the long forward keeping the rows from its own start up to there, and
 on sm_107a from the long forward's 1740 rows per SM); on sm_100a and sm_103a
 from 12000 rows per SM a backward whose thread 0 warms the next row block of
 packed rows in L2 with one bulk prefetch a tensor, launched with 5 CTAs per SM,
-and on sm_107a from 1024 the backward with 128-thread CTAs, ``dx`` and ``dz``
+and on sm_107a from 3200 the backward with 128-thread CTAs, ``dx`` and ``dz``
 the same bits.  On sm_100a and sm_103a the backward's mid roles
 (``bwd_bf16_mid``, ``bwd_f32_mid``) run from 800 and 700 rows per SM
 respectively up to there the same bulk backward whose threads keep their
 folded FP32 runs, and whose CTAs add their column sums, as FP32 two-sum pairs
 converted once to FP64 (a column whose pair sum is not finite takes the sum
-alone), ``dx`` and ``dz`` the same bits.
+alone), ``dx`` and ``dz`` the same bits; on sm_107a they run from 1024 rows per
+SM up to 3200 the 128-thread backward with the same folds.
 An architecture may also route the forward's short role (``fwd_short``), whose
 module runs in the role's place up to ``max_rows_per_sm`` rows per SM of its
 grid rule (:func:`max_rows_per_sm`: one count, or one per architecture of the
@@ -727,7 +728,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # the gate on packed FP32 pairs, four FP64 accumulator slots (build
     # {"lanes": 16, "math": "x2", "out": "bf16", "prefetch": "rows",
     # "rows_per_thread": 1, "slots": 4, "threads": 128, "width": 128}), from
-    # 1024 rows per SM.
+    # 3200 rows per SM (below it the mid backward).
     "cake_rmsnorm_silu_gate_train_8b61372f6a32eeca4d10": {
         "arches": [
             "sm_107a",
@@ -762,7 +763,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "ctas_per_sm": 8,
             "kind": "row_claims",
-            "min_rows_per_sm": 1024,
+            "min_rows_per_sm": 3200,
             "rows_per_cta": 8,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_8b61372f6a32eeca4d10",
@@ -798,6 +799,86 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "bwd_bf16_long",
+    },
+    # The mid backward into a BF16 weight gradient (sm_107a): the long
+    # backward's 128-thread build whose threads keep their folded FP32 runs, and
+    # whose CTAs add their column sums, as FP32 two-sum pairs converted once to
+    # FP64 for the atomic add (a column whose pair sum is not finite takes the
+    # sum alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "bf16",
+    # "prefetch": "rows", "rows_per_thread": 1, "slots": 4, "threads": 128,
+    # "width": 128}), from 1024 rows per SM up to the long backward's 3200.
+    "cake_rmsnorm_silu_gate_train_195842e606c6dfb8e998": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_sums"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dw_slots": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 8,
+            "kind": "row_claims",
+            "min_rows_per_sm": {
+                "sm_107a": 1024,
+            },
+            "rows_per_cta": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_195842e606c6dfb8e998",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_195842e606c6dfb8e998",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 10496,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_195842e606c6dfb8e998",
+        "logical": {
+            "accumulate": "accumulate",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_sums": "dw_sums",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16_mid",
     },
     # The short backward into a BF16 weight gradient:
     # one cluster of 16 CTAs of 256 threads, the backward's row arithmetic
@@ -1118,7 +1199,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # the gate on packed FP32 pairs, four FP64 accumulator slots (build
     # {"lanes": 16, "math": "x2", "out": "f32", "prefetch": "rows",
     # "rows_per_thread": 1, "slots": 4, "threads": 128, "width": 128}), from
-    # 1024 rows per SM.
+    # 3200 rows per SM (below it the mid backward).
     "cake_rmsnorm_silu_gate_train_4c6188a9425364b78977": {
         "arches": [
             "sm_107a",
@@ -1153,7 +1234,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "ctas_per_sm": 8,
             "kind": "row_claims",
-            "min_rows_per_sm": 1024,
+            "min_rows_per_sm": 3200,
             "rows_per_cta": 8,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_4c6188a9425364b78977",
@@ -1189,6 +1270,86 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "bwd_f32_long",
+    },
+    # The mid backward into an FP32 weight gradient (sm_107a): the long
+    # backward's 128-thread build whose threads keep their folded FP32 runs, and
+    # whose CTAs add their column sums, as FP32 two-sum pairs converted once to
+    # FP64 for the atomic add (a column whose pair sum is not finite takes the
+    # sum alone) (build {"fold": "ff", "lanes": 16, "math": "x2", "out": "f32",
+    # "prefetch": "rows", "rows_per_thread": 1, "slots": 4, "threads": 128,
+    # "width": 128}), from 1024 rows per SM up to the long backward's 3200.
+    "cake_rmsnorm_silu_gate_train_d1031b4d8133fbe01754": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_sums"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dw_slots": 4,
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 8,
+            "kind": "row_claims",
+            "min_rows_per_sm": {
+                "sm_107a": 1024,
+            },
+            "rows_per_cta": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_d1031b4d8133fbe01754",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_d1031b4d8133fbe01754",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 10496,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_d1031b4d8133fbe01754",
+        "logical": {
+            "accumulate": "accumulate",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_sums": "dw_sums",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_f32_mid",
     },
     # The short backward into a FP32 weight gradient:
     # one cluster of 16 CTAs of 256 threads, the backward's row arithmetic
@@ -1302,9 +1463,11 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_short": "cake_rmsnorm_silu_gate_train_de5df3c9a4a5a804fcf2",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_8b61372f6a32eeca4d10",
+        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_195842e606c6dfb8e998",
         "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d",
         "bwd_f32_long": "cake_rmsnorm_silu_gate_train_4c6188a9425364b78977",
+        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_d1031b4d8133fbe01754",
         "bwd_f32_short": "cake_rmsnorm_silu_gate_train_c447141e8f19dd798212",
     },
 }

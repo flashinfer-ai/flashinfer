@@ -44,7 +44,11 @@ In-tree checks (``--in-tree``, the default):
 * every package a package requires (``Package.requires``: a package it imports
   as its sibling, as the non-deterministic ``cake_dense_gemm_nondet_train`` imports
   the deterministic ``cake_dense_gemm_det_train``) is a row of this table with the
-  same parent package.
+  same parent package;
+* ``common.requires.packages`` of ``build.json`` lists the directory names of
+  the packages it requires (``Package.requires``), sorted and without
+  duplicates, and is absent when it requires none: a consumer that vendors the
+  package from its manifest learns which siblings to vendor beside it.
 
 Vendored gate (``--vendored-gate``; combinable with ``--package``): the form
 of a consumer that vendors a package and builds it from ``build.json`` with its
@@ -362,7 +366,7 @@ class Package:
     requires: tuple[str, ...] = ()
 
 
-# dsa_train, kda_det_train (and its non-deterministic counterpart cake.cake_kda_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# dsa_train, cake.cake_kda_det_train (and cake.cake_kda_nondet_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
 # variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
@@ -449,6 +453,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.experimental.cake.cake_mhc_head_nondet_train",
+        "flashinfer/experimental/cake/cake_mhc_head_nondet_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.cake.cake_mhc_nondet_train",
         "flashinfer/experimental/cake/cake_mhc_nondet_train",
         "cake_jit.py",
@@ -479,32 +489,36 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_kda_train",
-        "flashinfer/experimental/cake/cake_kda_train",
+        "flashinfer.experimental.cake.cake_kda_nondet_train",
+        "flashinfer/experimental/cake/cake_kda_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_kda_det_train_kcp",
-        "flashinfer/experimental/cake_kda_det_train_kcp",
+        "flashinfer.experimental.cake.cake_kda_det_train_kcp",
+        "flashinfer/experimental/cake/cake_kda_det_train_kcp",
         "cake_kcp_jit.py",
         refs_shipped_modules,
+        # each rank runs the deterministic single-rank package's chunk stages (its ``_single_rank``)
+        requires=("flashinfer.experimental.cake.cake_kda_det_train",),
     ),
     Package(
-        "flashinfer.experimental.cake_kda_train_kcp",
-        "flashinfer/experimental/cake_kda_train_kcp",
+        "flashinfer.experimental.cake.cake_kda_nondet_train_kcp",
+        "flashinfer/experimental/cake/cake_kda_nondet_train_kcp",
         "cake_kcp_jit.py",
         refs_shipped_modules,
+        # each rank runs the non-deterministic single-rank package's chunk stages (its ``_single_rank``)
+        requires=("flashinfer.experimental.cake.cake_kda_nondet_train",),
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_det_train_kcp",
-        "flashinfer/experimental/cake_gdn_det_train_kcp",
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp",
+        "flashinfer/experimental/cake/cake_gdn_det_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_train_kcp",
-        "flashinfer/experimental/cake_gdn_train_kcp",
+        "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
+        "flashinfer/experimental/cake/cake_gdn_nondet_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
@@ -619,14 +633,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_det_train",
-        "flashinfer/experimental/cake_gdn_det_train",
+        "flashinfer.experimental.cake.cake_gdn_det_train",
+        "flashinfer/experimental/cake/cake_gdn_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_gdn_train",
-        "flashinfer/experimental/cake/cake_gdn_train",
+        "flashinfer.experimental.cake.cake_gdn_nondet_train",
+        "flashinfer/experimental/cake/cake_gdn_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -1012,6 +1026,45 @@ def check_requires(package: Package) -> list[Finding]:
     return found
 
 
+def check_required_packages(
+    package: Package, manifest: dict[str, Any]
+) -> list[Finding]:
+    """``common.requires.packages`` of the manifest is the sorted list of the
+    directory names of ``package.requires``, without duplicates, and is absent
+    when the package requires none."""
+    expected = sorted({name.rsplit(".", 1)[-1] for name in package.requires})
+    common = manifest.get("common")
+    requires = common.get("requires") if isinstance(common, dict) else None
+    if not isinstance(requires, dict):
+        requires = {}
+    if expected:
+        if "packages" not in requires:
+            return [
+                Finding(
+                    package.name,
+                    f"common.requires.packages is missing; expected {expected!r} "
+                    "(the sorted directory names of Package.requires, without duplicates)",
+                )
+            ]
+        if requires["packages"] != expected:
+            return [
+                Finding(
+                    package.name,
+                    f"common.requires.packages {requires['packages']!r} != {expected!r} "
+                    "(the sorted directory names of Package.requires, without duplicates)",
+                )
+            ]
+    elif "packages" in requires:
+        return [
+            Finding(
+                package.name,
+                f"common.requires.packages {requires['packages']!r} is declared, "
+                "but Package.requires is empty",
+            )
+        ]
+    return []
+
+
 def run_in_tree(root: Path, packages: list[Package]) -> list[Finding]:
     findings: list[Finding] = []
     for package in packages:
@@ -1039,6 +1092,7 @@ def run_in_tree(root: Path, packages: list[Package]) -> list[Finding]:
         checked[package.name] = package_dir
         findings.extend(check_manifest(package, package_dir, manifest))
         findings.extend(check_cuda_toolkit_floor(package, manifest))
+        findings.extend(check_required_packages(package, manifest))
         findings.extend(check_references(package, package_dir, manifest))
         findings.extend(check_package_data(package, manifest, table))
         findings.extend(check_tvm_ffi_pin(package, manifest, root / "requirements.txt"))

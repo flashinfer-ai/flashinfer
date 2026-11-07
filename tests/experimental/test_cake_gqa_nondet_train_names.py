@@ -207,8 +207,8 @@ def test_the_shared_mode_rules_hold():
 
 def test_public_names_carry_the_mode():
     """Every backend object the facade forwards to or re-exports carries ``nondet`` after the op (the shared rule,
-    applied to the backend's names); every package ``__all__`` name is such an object, an ALL_CAPS constant or the
-    internal ``default_workspace`` helper."""
+    applied to the backend's names); every package ``__all__`` name is such an object or an ALL_CAPS constant, and
+    the backend's internal helpers (``default_workspace``, ``load``, ``record``, ...) are not package attributes."""
     backend = _backend("cake_backend")
     package = _backend()
     assert_mode_names(package, names=FORWARDED)
@@ -216,11 +216,15 @@ def test_public_names_carry_the_mode():
         assert name in backend.__all__ and name in package.__all__, name
         assert getattr(package, name) is getattr(backend, name), name
     for name in package.__all__:
-        assert (
-            re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
-            or name in FORWARDED
-            or name == "default_workspace"
-        ), name
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*", name) or name in FORWARDED, name
+    internal = [
+        name
+        for name in backend.__all__
+        if name not in FORWARDED and not re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
+    ]
+    assert "default_workspace" in internal
+    for name in internal:
+        assert not hasattr(package, name), name
 
 
 def test_no_entry_takes_a_mode_keyword():

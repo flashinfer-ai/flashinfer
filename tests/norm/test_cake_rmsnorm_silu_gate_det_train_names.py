@@ -38,7 +38,9 @@ loads no module of either backend package.  The family's ``flashinfer``
 top-level names are rows of the lazy-export table ``flashinfer._LAZY_EXPORTS``
 (bound on first access): each mode's facade module, its functional, forward,
 backward, workspace size and autograd class, all with a mode word (checked in
-this process and in fresh interpreters).  The JIT
+this process and in fresh interpreters).  The shared checks of the
+mode-in-name rule (``tests/test_helpers/cake_mode_names.py``) run over all four
+namespaces; the checks here add what is particular to this family.  The JIT
 library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
 ``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
 names, and are unchanged.
@@ -61,6 +63,7 @@ import flashinfer.cake_rmsnorm_silu_gate_det_train as det_facade
 import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd_facade
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train as det_backend
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train as nd_backend
+from tests.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 
@@ -229,15 +232,50 @@ def test_the_mode_word_is_a_whole_word() -> None:
 
 
 @pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
-def test_no_entry_has_a_deterministic_parameter(key) -> None:
-    """No entry binds a ``deterministic`` keyword: not the functions, and not
-    the autograd class's ``forward`` and ``backward``."""
+def test_shared_mode_name_checks(key) -> None:
+    """The shared checks of the mode-in-name rule (``assert_cake_mode_module``)
+    over each namespace: the mode word and its place in every public name; no
+    entry point binds a ``deterministic`` keyword (the functions, and the
+    autograd class's ``forward`` and ``backward``); the namespace, the
+    ``flashinfer`` top level (its lazy-export rows included) and, for a facade,
+    its backend package bind each object of the namespace only under its own
+    name; and in a fresh interpreter the former modules fail at import, and so
+    do the former names from the namespace (and, with a facade, from the top
+    level)."""
+    mode, kind = key
+    module = NAMESPACES[key]
+    if kind == "facade":
+        backend = NAMESPACES[(mode, "backend")]
+        assert_cake_mode_module(
+            module,
+            namespaces=[flashinfer, backend],
+            forwards=[
+                (name, getattr(backend, name))
+                for name in sorted(PUBLIC[mode] - {CLASS[mode]})
+            ],
+            old_modules=OLD_MODULES,
+            old_names=[
+                (path, name)
+                for path in ("flashinfer", module.__name__)
+                for name in OLD_NAMES
+            ],
+        )
+    else:
+        assert_cake_mode_module(
+            module,
+            namespaces=[flashinfer],
+            old_names=[(module.__name__, name) for name in OLD_NAMES],
+        )
+
+
+@pytest.mark.parametrize("key", list(NAMESPACES), ids=NAMESPACE_IDS)
+def test_entry_points_and_the_autograd_forward(key) -> None:
+    """The entry points are the functions and the autograd class's ``forward``
+    and ``backward`` (their ``deterministic`` check is the shared one,
+    :func:`test_shared_mode_name_checks`); the autograd ``forward`` takes
+    exactly ``(ctx, x, z, weight, eps)``."""
     entries = _entries(NAMESPACES[key])
     assert len(entries) == len(PUBLIC[key[0]]) + 1, key
-    for name, entry in entries.items():
-        assert "deterministic" not in inspect.signature(entry).parameters, (key, name)
-        with pytest.raises(TypeError):
-            inspect.signature(entry).bind_partial(deterministic=False)
     cls = getattr(NAMESPACES[key], CLASS[key[0]])
     assert list(inspect.signature(cls.forward).parameters) == [
         "ctx",
@@ -402,8 +440,10 @@ def test_top_level_binds_only_mode_names() -> None:
 
 
 # Each import form in a fresh interpreter: a plain ``import flashinfer`` (it
-# binds none of the family's names; each binds on first access), the old modules
-# and names (each fails), and the backend submodules first.
+# binds none of the family's names; each binds on first access), the backend
+# packages on first use, and the backend submodules first.  The old modules and
+# names fail in the fresh interpreter of the shared check
+# (test_shared_mode_name_checks).
 FRESH = {
     "top_level": (
         "import re, flashinfer\n"
@@ -416,24 +456,6 @@ FRESH = {
         "for n in want:\n"
         "    getattr(flashinfer, n)\n"
         "assert family(vars(flashinfer)) == want, family(vars(flashinfer))\n"
-    ),
-    "old_modules": (
-        "import importlib\n"
-        f"for m in {list(OLD_MODULES)!r}:\n"
-        "    try:\n"
-        "        importlib.import_module(m)\n"
-        "    except ModuleNotFoundError:\n"
-        "        continue\n"
-        "    raise AssertionError(m)\n"
-    ),
-    "old_names": (
-        f"for n in {list(OLD_NAMES)!r}:\n"
-        f"    for m in {['flashinfer', FACADE['det'], FACADE['nondet']]!r}:\n"
-        "        try:\n"
-        "            exec(f'from {m} import {n}', {})\n"
-        "        except ImportError:\n"
-        "            continue\n"
-        "        raise AssertionError((m, n))\n"
     ),
     "backends_load_on_first_use": (
         "import sys, flashinfer\n"

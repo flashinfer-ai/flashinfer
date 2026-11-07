@@ -3214,7 +3214,8 @@ _DET_KINDS: dict[str, tuple[type, str, str]] = {
 
 def _check_det_package(**objects: Any) -> None:
     """Refuse a ``workspace`` / ``saved`` / ``arena`` argument that is not this package's type with ``ValueError``
-    naming the mode.  The non-deterministic package's ``KdaWorkspace`` / ``KdaChunkSaved`` / ``KdaArena`` carry the
+    naming the mode.  The non-deterministic package's ``CakeKDANondetWorkspace`` / ``CakeKDANondetChunkSaved`` /
+    ``CakeKDANondetArena`` carry the
     attributes the other checks read, so the type alone tells them apart; ``None`` passes."""
     for name, value in objects.items():
         cls, kind, source = _DET_KINDS[name]
@@ -3223,7 +3224,7 @@ def _check_det_package(**objects: Any) -> None:
         raise ValueError(
             f"{name}: a {type(value).__name__} from {type(value).__module__} is not a deterministic-package "
             f"{kind}; the deterministic entries take a {cls.__name__} ({source}); the non-deterministic package "
-            "is flashinfer.cake_kda_train / flashinfer.cake_kda_train_kcp (deterministic=False)"
+            "is flashinfer.cake_kda_nondet_train / flashinfer.cake_kda_nondet_train_kcp"
         )
 
 

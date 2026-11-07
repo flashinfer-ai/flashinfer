@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-The lean local arena of the KCP backward (``WorkspaceDetKcp(local_arena="lean")``, opt-in; ``"replay"`` is the
+The lean local arena of the KCP backward (``CakeKDADetKcpWorkspace(local_arena="lean")``, opt-in; ``"replay"`` is the
 default): this route's ``LOCAL_LAYOUT_BWD_LEAN`` layout registered on the existing backend's arenas (3460 B per
 internal token-head; ``kcp_dav``'s ``dAqk`` to a dead sink, the tail stages once per chunk range on per-pass buffers;
 two tail passes unless ``lean_passes`` says otherwise) against the ``"replay"`` arena (4488 B).  Host rows: the
@@ -22,7 +22,7 @@ registered layout, line for line), the registration rules, the fused-gradient re
 record bound (the tail ranges' item bounds from the arena's tail-count table) and the byte prediction.  GPU rows: bitwise out / saved set / gradients against the replay arena on the unit rows
 (H 1-64, P > 1, ragged packs, both boundary modes, checkpointed autograd, recompute handles, graph replay, the overlap
 schedule) with the arena NaN-filled and the sink / per-pass buffers NaN-filled before every write, the workspace
-bytes equal to ``kda_det_workspace_bytes_kcp``, no allocation or blocking in steady calls, and the multi-GPU rows (W = 2 / 4 /
+bytes equal to ``cake_kda_det_train_kcp_workspace_bytes``, no allocation or blocking in steady calls, and the multi-GPU rows (W = 2 / 4 /
 8) in the launch forms of ``test_cake_kda_det_train_kcp_shared_ws.py``.
 """
 
@@ -62,11 +62,11 @@ from tests.test_helpers.cake_host_sync import (
 from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
+kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
 cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
 
 LEAN = kp.LOCAL_LAYOUT_BWD_LEAN
 CONTRACT_HEADS = (1, 2, 4, 8, 16, 32, 64)
@@ -80,8 +80,8 @@ PASS_BUFFERS = ("dq_f", "dk_f", "dg_f", "db_f", "dAkk", "dAqk", "dg_int", "db_in
 
 
 def _lean(**kw) -> int:
-    """``kda_det_workspace_bytes_kcp`` of the lean arena."""
-    return kp.kda_det_workspace_bytes_kcp(local_arena="lean", **kw)
+    """``cake_kda_det_train_kcp_workspace_bytes`` of the lean arena."""
+    return kp.cake_kda_det_train_kcp_workspace_bytes(local_arena="lean", **kw)
 
 
 def _passes_of(local) -> int | None:
@@ -91,7 +91,7 @@ def _passes_of(local) -> int | None:
 
 def _ws(local_arena: str = "lean", lean_passes: int | None = None):
     backend = cake_kcp.get_backend()
-    return cake_kcp.WorkspaceDetKcp(
+    return cake_kcp.CakeKDADetKcpWorkspace(
         state_dtype=backend.dtypes["state"],
         local=backend.local_stages,
         local_arena=local_arena,
@@ -423,7 +423,9 @@ def test_lean_stage_values_cover_the_records(H, arch) -> None:
     grids at the range's chunk count; the gate epilogue only where it launches; the replay layout's launch list
     with one tail range is the earlier one."""
     sm = ARCH_SMS[arch]
-    ctx = kp.build_context_det_kcp(_part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm)
+    ctx = kp.cake_kda_det_train_kcp_build_context(
+        _part(PROXY_PACK), None, 0, "cpu", 4, sm_count=sm
+    )
     plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
     passes = kp.local_lean_passes(plan)
     assert passes > 1
@@ -569,7 +571,7 @@ def test_lean_stage_values_cover_the_records(H, arch) -> None:
 
 
 def test_lean_byte_prediction_on_the_host() -> None:
-    """``kda_det_workspace_bytes_kcp`` (host only) under the lean arena: one context's local arena is
+    """``cake_kda_det_train_kcp_workspace_bytes`` (host only) under the lean arena: one context's local arena is
     ``local_arena_bytes`` plus the tail-count table, the list form takes the first of the largest arenas with its
     table, ``local_arena="replay"`` (and the default, ``None``) gives the existing backend's arena, a forward-only
     workspace is the same under either; the lean bytes are below the replay ones on every row."""
@@ -579,14 +581,18 @@ def test_lean_byte_prediction_on_the_host() -> None:
             parts = [_part(lengths, W, layout) for lengths in (*PACKS, PROXY_PACK)]
             for r in range(W):
                 ctxs = [
-                    kp.build_context_det_kcp(p, None, r, "cpu", 4, sm_count=152)
+                    kp.cake_kda_det_train_kcp_build_context(
+                        p, None, r, "cpu", 4, sm_count=152
+                    )
                     for p in parts
                 ]
                 for H in (4, 12, 64):
-                    replay = kp.kda_det_workspace_bytes_kcp(
+                    replay = kp.cake_kda_det_train_kcp_workspace_bytes(
                         ctxs, H=H, local_arena="replay"
                     )
-                    assert kp.kda_det_workspace_bytes_kcp(ctxs, H=H) == replay
+                    assert (
+                        kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, H=H) == replay
+                    )
                     # the pools and the scratch tables: the same under either arena
                     rest = replay - max(
                         cake_backend.workspace_bytes(
@@ -615,7 +621,7 @@ def test_lean_byte_prediction_on_the_host() -> None:
                     assert got == max(local) + rest, (W, layout, r, H)
                     for c, a in zip(ctxs, local, strict=True):
                         single = _lean(ctx=c, H=H)
-                        assert single == a + kp.kda_det_workspace_bytes_kcp(
+                        assert single == a + kp.cake_kda_det_train_kcp_workspace_bytes(
                             c, H=H, local_arena="replay"
                         ) - (
                             cake_backend.workspace_bytes(
@@ -636,16 +642,20 @@ def test_lean_byte_prediction_on_the_host() -> None:
                     for c in ctxs:
                         assert _lean(
                             ctx=c, H=H, backward=False
-                        ) == kp.kda_det_workspace_bytes_kcp(
+                        ) == kp.cake_kda_det_train_kcp_workspace_bytes(
                             c, H=H, backward=False, local_arena="replay"
                         )
                     seen += 1
     assert seen > 0
     with pytest.raises(ValueError):
-        kp.kda_det_workspace_bytes_kcp(ctxs, H=64, local_arena="tiny")
+        kp.cake_kda_det_train_kcp_workspace_bytes(ctxs, H=64, local_arena="tiny")
     with pytest.raises(ValueError):
-        cake_kcp.WorkspaceDetKcp(local_arena="tiny")
-    assert cake_kcp.WorkspaceDetKcp().local_arena == kp.LOCAL_ARENA_DEFAULT == "replay"
+        cake_kcp.CakeKDADetKcpWorkspace(local_arena="tiny")
+    assert (
+        cake_kcp.CakeKDADetKcpWorkspace().local_arena
+        == kp.LOCAL_ARENA_DEFAULT
+        == "replay"
+    )
 
 
 # the explicit pass-count variants of the lean arena (``lean_passes``; two is the default): fewer tail launches for
@@ -659,11 +669,13 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
     smallest arena; a forward-only workspace ignores it; the knob is validated and needs the lean arena (the
     public byte query forwards both arguments)."""
     part = _part(PROXY_PACK)
-    ctx = kp.build_context_det_kcp(part, None, 0, "cpu", 4, sm_count=152)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", 4, sm_count=152)
     fi_kcp = pytest.importorskip("flashinfer.cake_kda_det_train_kcp")
     for H in (4, 64):
         p = cake_backend.plan(ctx.T_r, ctx.n_frag, H, ctx.sm_count)
-        replay = kp.kda_det_workspace_bytes_kcp(ctx, H=H, local_arena="replay")
+        replay = kp.cake_kda_det_train_kcp_workspace_bytes(
+            ctx, H=H, local_arena="replay"
+        )
         default = _lean(ctx=ctx, H=H)
         assert default == _lean(ctx=ctx, H=H, lean_passes=2) < replay
         sizes = [kp.local_lean_bytes(p, b) for b in range(1, kp.LEAN_MAX_PASSES + 1)]
@@ -685,18 +697,18 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
             assert got == default - lean2 + lean, (H, b)
             assert prev is None or got <= prev, (H, b, prev, got)
             assert (
-                fi_kcp.kda_det_workspace_bytes_kcp(
+                fi_kcp.cake_kda_det_train_kcp_workspace_bytes(
                     ctx, H=H, local_arena="lean", lean_passes=b
                 )
                 == got
             )
             prev = got
             print(f"LEAN_PASSES_HOST H={H} b={b} bytes={got} replay={replay}")
-        assert fi_kcp.kda_det_workspace_bytes_kcp(ctx, H=H) == replay
+        assert fi_kcp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H) == replay
         # no effect off the lean arena's rows: forward-only workspaces
         assert _lean(
             ctx=ctx, H=H, backward=False, lean_passes=1
-        ) == kp.kda_det_workspace_bytes_kcp(ctx, H=H, backward=False)
+        ) == kp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H, backward=False)
     for bad in (0, kp.LEAN_MAX_PASSES + 1, 2.0, True, "2"):
         with pytest.raises(ValueError):
             kp.check_lean_passes(bad)
@@ -704,9 +716,12 @@ def test_lean_passes_knob_bytes_on_the_host() -> None:
             _lean(ctx=ctx, H=64, lean_passes=bad)
     for arena in ("replay", None):
         with pytest.raises(ValueError):
-            cake_kcp.WorkspaceDetKcp(local_arena=arena, lean_passes=2)
-    assert cake_kcp.WorkspaceDetKcp(local_arena="lean", lean_passes=3).lean_passes == 3
-    assert cake_kcp.WorkspaceDetKcp(local_arena="lean").lean_passes is None
+            cake_kcp.CakeKDADetKcpWorkspace(local_arena=arena, lean_passes=2)
+    assert (
+        cake_kcp.CakeKDADetKcpWorkspace(local_arena="lean", lean_passes=3).lean_passes
+        == 3
+    )
+    assert cake_kcp.CakeKDADetKcpWorkspace(local_arena="lean").lean_passes is None
 
 
 # --------------------------------------------------------------------------- GPU
@@ -781,7 +796,8 @@ def test_gpu_single_rank_workspace_views_and_route_layouts(device) -> None:
 
 def _packs_on(device, H: int, packs) -> tuple[list, list]:
     ctxs = [
-        kp.build_context_det_kcp(_part(lengths), None, 0, device) for lengths in packs
+        kp.cake_kda_det_train_kcp_build_context(_part(lengths), None, 0, device)
+        for lengths in packs
     ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
     return ctxs, ops
@@ -817,7 +833,7 @@ def test_gpu_lean_arena_is_bitwise_the_replay_arena(device, H, which) -> None:
     before every forward and a lean workspace per pack: out, the written saved sets and every gradient bitwise;
     every pack ran the lean layout, two tail passes (the default) on a pack's own workspace and on the reserved
     workspace's largest pack (a smaller pack's view takes the fewest passes that fit the reserved arena, one where
-    it fits whole); the lean bytes equal ``kda_det_workspace_bytes_kcp`` and are below the replay ones; no pointer
+    it fits whole); the lean bytes equal ``cake_kda_det_train_kcp_workspace_bytes`` and are below the replay ones; no pointer
     moved."""
     packs = PACKS if which == "packs" else (PROXY_PACK,)
     ctxs, ops = _packs_on(device, H, packs)
@@ -864,7 +880,7 @@ def test_gpu_lean_pass_variants_are_bitwise_the_replay_arena(
 ) -> None:
     """A lean arena sized for ``b`` tail passes (``lean_passes``), one workspace per pack and ONE reserved for all
     packs, the arena NaN-filled before every forward: out, the written saved sets and every gradient bitwise those
-    of the replay arena; the largest pack runs ``b`` passes; the bytes equal ``kda_det_workspace_bytes_kcp(...,
+    of the replay arena; the largest pack runs ``b`` passes; the bytes equal ``cake_kda_det_train_kcp_workspace_bytes(...,
     local_arena="lean", lean_passes=b)``; no pointer moved."""
     packs = PACKS if which == "packs" else (PROXY_PACK,)
     ctxs, ops = _packs_on(device, H, packs)
@@ -1078,7 +1094,7 @@ def _run_lean_rank(
 ) -> dict:
     """One rank: the row's packs on the replay arena, one workspace per pack (the reference), then on ONE reserved
     lean workspace (two rounds of the interleaved schedule, the arena NaN-filled before every forward of the first):
-    bitwise out / saved sets / gradients, the bytes equal ``kda_det_workspace_bytes_kcp`` and below the replay ones, no
+    bitwise out / saved sets / gradients, the bytes equal ``cake_kda_det_train_kcp_workspace_bytes`` and below the replay ones, no
     pointer moved, every pack of the rank on the lean layout.  The verdicts are gathered to every rank."""
     _packs_, H, _w, _layout, exchange = row
     _device, ctxs, ops = _rank_packs(rank, W, row, rdzv)
@@ -1123,7 +1139,7 @@ def _run_lean_rank(
         if _pointers(ws) != ptrs:
             report["fail"].append(f"pointers moved r{rnd}")
     if report["lean_bytes"] != report["pred_bytes"]:
-        report["fail"].append("bytes != kda_det_workspace_bytes_kcp(ctxs)")
+        report["fail"].append("bytes != cake_kda_det_train_kcp_workspace_bytes(ctxs)")
     if ws.local is not None and not report["lean_bytes"] < max(report["replay_bytes"]):
         report["fail"].append("lean bytes not below the replay workspace")
     if any(b is None for b in report["passes"]):

@@ -1559,8 +1559,8 @@ def _assert_route(route, prepared):
     if route == "m64-hybrid" and not hybrid:
         route = "pair-share"  # a loader without the build keeps the pair-share one
     if route == "m64-hybrid":
-        if (arch, _sm_count()) != HYBRID_PART:
-            pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+        if (arch, _sm_count()) not in HYBRID_PARTS:
+            pytest.skip(f"the hybrid rule rows are for {HYBRID_PARTS}")
         assert schedule == HYBRID_SCHEDULE, schedule
         assert loaded & hybrid
         return
@@ -3157,10 +3157,11 @@ def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
     _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
 
 
-# The M64 owner/helper hybrid build: equal-length launches of 37 to 48 tasks
-# at 2048 tokens or more that the pair-share rule takes (the shipped one-helper
-# row of a 148-SM sm_100a part), on a grid (tasks, 3).
-HYBRID_PART = ("sm_100a", 148)
+# The M64 owner/helper hybrid build: equal-length launches at 2048 tokens or
+# more that the pair-share rule takes, of 37 to 48 tasks on a 148-SM sm_100a
+# part and 37 to 50 on a 152-SM sm_103a part (the shipped one-helper rows), on
+# a grid (tasks, 3).
+HYBRID_PARTS = (("sm_100a", 148), ("sm_103a", 152))
 HYBRID_SCHEDULE = "fused_m64_independent_dvsplit_fp32_state_owner1helper_hybrid"
 M64_HYBRID_ROWS = [
     pytest.param([4096] * 4, 12, id="4x4096-h12"),
@@ -3176,8 +3177,8 @@ def _m64_hybrid_programs():
     programs = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
     if not programs:
         pytest.skip(f"the loader names no M64 owner/helper hybrid build on {arch}")
-    if (arch, _sm_count()) != HYBRID_PART:
-        pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+    if (arch, _sm_count()) not in HYBRID_PARTS:
+        pytest.skip(f"the hybrid rule rows are for {HYBRID_PARTS}")
     return programs
 
 
@@ -3239,8 +3240,13 @@ def test_refused_m64_owner_helper_hybrid_launch_runs_its_fallback(monkeypatch):
     assert tasks * 3 > _sm_count()
     d = _inputs(lengths, heads)
     monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
-    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", ((tasks, 2048, 1),))
-    monkeypatch.setattr(runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN", ((tasks, 2048),))
+    for suffix in ("", "_GB300"):
+        monkeypatch.setattr(
+            runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN" + suffix, ((tasks, 2048, 1),)
+        )
+        monkeypatch.setattr(
+            runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN" + suffix, ((tasks, 2048),)
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     if runtime._probe_m64_pair_cluster_capacity(device) < tasks:
         pytest.skip(f"fewer 2-CTA clusters than {tasks} tasks")

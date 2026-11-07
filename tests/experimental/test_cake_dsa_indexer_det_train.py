@@ -35,6 +35,7 @@ import itertools
 import json
 import os
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -123,6 +124,8 @@ _COMMON = dict(
     wide_pair_snake_only=False,
     snake_default=False,
     snake_cap_rule=None,
+    snake_packed_rule=None,
+    snake_l6_fallback_waves=None,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
@@ -136,6 +139,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    lsf_single_rule=None,
     static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
@@ -747,11 +751,65 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
-        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], each >= 0, or None
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], or that with
+        # [top_k (an int >= 1), exponent, packed minimum (>= the one-segment one), rise per wave, waves (an int >= 1),
+        # low wave ratio (>= the second element), its tile coefficient, its packed coefficient], each >= 0, or None
         dict(wide_wave_rule=1.6),
         dict(wide_wave_rule=[]),
         dict(wide_wave_rule=[1.6, 1.3]),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0]),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                1.0,
+            ]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048.0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, True, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, -1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 64.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, -3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 0, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14.0, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.2, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, -40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, True, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, -9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, True]
+        ),
         dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
         dict(wide_wave_rule=[1.6, 1.3, True]),
         # the descending-walk kinds: [unsampled kinds, sampled kinds], ascending lists of physical scan kinds, or None
@@ -791,6 +849,37 @@ def test_policy_record_round_trip_and_validation():
         dict(snake_cap_rule=[1, 0]),
         dict(snake_cap_rule=[1.0, 40]),
         dict(snake_cap_rule=[True, 40]),
+        # the FP8 one-segment longest-first rule: [min mean unit tiles >= 0] or None
+        dict(lsf_single_rule=64.0),
+        dict(lsf_single_rule=[]),
+        dict(lsf_single_rule=[64.0, 1]),
+        dict(lsf_single_rule=[-1.0]),
+        dict(lsf_single_rule=[True]),
+        dict(lsf_single_rule=["64"]),
+        # the snake order of packed calls: [ascending program kinds but split, min mean tiles sampled, min mean tiles
+        # unsampled or None, max waves >= 1 or None]
+        dict(snake_packed_rule=48.0),
+        dict(snake_packed_rule=[]),
+        dict(snake_packed_rule=[["l6"], 48.0, None]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 7, 1]),
+        dict(snake_packed_rule=["l6", 48.0, None, 7]),
+        dict(snake_packed_rule=[[], 48.0, None, 7]),
+        dict(snake_packed_rule=[["split_l6"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["split"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["pair_l6", "l6"], 48.0, None, 7]),
+        dict(snake_packed_rule=[["l6"], -1.0, None, 7]),
+        dict(snake_packed_rule=[["l6"], None, None, 7]),
+        dict(snake_packed_rule=[["l6"], True, None, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, -1.0, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, False, 7]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 0]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, 7.0]),
+        dict(snake_packed_rule=[["l6"], 48.0, None, True]),
+        # the waves of the plain-order l6 fallback with sampling off: an integer >= 1 or None
+        dict(snake_l6_fallback_waves=0),
+        dict(snake_l6_fallback_waves=310.0),
+        dict(snake_l6_fallback_waves=True),
+        dict(snake_l6_fallback_waves=[310]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -873,6 +962,14 @@ def test_policy_record_round_trip_and_validation():
     assert not capped.snake_copy_fits(65536, 1, 6, 212)
     assert not capped.snake_copy_fits(32768, 2, 6, 212)
     assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
+    single = DispatchPolicy.from_record(dict(record, lsf_single_rule=(64,)))
+    assert single.record()["lsf_single_rule"] == [64]
+    assert DispatchPolicy.from_record(single.record()) == single
+    # mean unit tiles (Tkv - T / (2 ratio)) / S / 128: 16384 x 16384 take 64, 16384 x 15360 take 56
+    assert single.lsf_single_fits(16384, 16384, 1, 1)
+    assert not single.lsf_single_fits(16384, 15360, 1, 1)
+    assert not single.lsf_single_fits(32768, 32768, 2, 1)
+    assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
     walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
     assert walked.desc_walk_kinds == [["wide"], []]
     assert walked.record()["desc_walk_kinds"] == [["wide"], []]
@@ -880,6 +977,43 @@ def test_policy_record_round_trip_and_validation():
     assert walked.desc_walk_for("wide", sampled=False)
     assert not walked.desc_walk_for("wide", sampled=True)
     assert not walked.desc_walk_for("l6", sampled=False)
+    packed = DispatchPolicy.from_record(
+        dict(record, snake_packed_rule=(("l6", "pair_l6"), 48, None, 7))
+    )
+    assert packed.record()["snake_packed_rule"] == [["l6", "pair_l6"], 48, None, 7]
+    assert DispatchPolicy.from_record(packed.record()) == packed
+    fallback = DispatchPolicy.from_record(dict(record, snake_l6_fallback_waves=310))
+    assert fallback.record()["snake_l6_fallback_waves"] == 310
+    assert DispatchPolicy.from_record(fallback.record()) == fallback
+    # waves of the planned program: 8-query CTA pairs on 212 CTAs (106 slots) take 310 waves for 262144 queries and 619
+    # for 524288; the unpaired 6-query unit takes 207 for 262144; only with the sampled first threshold off
+    assert fallback.snake_l6_fallback_for(262144, 8, True, 212, sampled=False)
+    assert not fallback.snake_l6_fallback_for(524288, 8, True, 212, sampled=False)
+    assert fallback.snake_l6_fallback_for(262144, 6, False, 212, sampled=False)
+    assert not fallback.snake_l6_fallback_for(262144, 8, True, 212, sampled=True)
+    assert not DispatchPolicy.from_record(record).snake_l6_fallback_for(
+        4096, 8, True, 212, sampled=False
+    )
+    scaled = DispatchPolicy.from_record(
+        dict(
+            record,
+            wide_wave_rule=(1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0),
+        )
+    )
+    assert scaled.record()["wide_wave_rule"] == [
+        1.6,
+        1.3,
+        80.0,
+        2048,
+        1.1,
+        112.0,
+        3.5,
+        14,
+        1.3,
+        40.0,
+        9.0,
+    ]
+    assert DispatchPolicy.from_record(scaled.record()) == scaled
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1556,6 +1690,77 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert unit(712, 4096, K=256) == 8
     # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
     assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
+    # an eleven-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9] (no low wave-ratio minimum: its ratio is the
+    # second element's): the same decisions on one document of at least 14 wide waves at top_k <= 2048 (16384
+    # queries: 14 wide waves, 19 l6 waves)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            wide_wave_rule=[1.7, 1.3, 84.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0],
+        )
+    )
+
+    def scaled_unit(T, Tkv, K=2048, S=1):
+        return scaled.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    for T, Tkv in ((16384, 20480), (16384, 18432), (8192, 8192), (4096, 65536)):
+        assert scaled_unit(T, Tkv) == unit(T, Tkv)
+    assert scaled_unit(16384, 18432, K=1024) == unit(16384, 18432, K=1024) == 6
+    # 8192 queries take 7 wide waves (10 l6 waves): the floor rises by 3.5 x 7 to 108.5, so 96 mean tiles keep l6
+    # where the three-element rule takes the wide unit, and 128 take it
+    assert unit(8192, 16384) == 8
+    assert scaled_unit(8192, 16384) == 6
+    assert scaled_unit(8192, 20480) == 8
+    # two packed documents of 16384 queries in all need 112 mean tiles: 104 keep l6, 112 take the wide unit
+    assert scaled_unit(16384, 34816, S=2) == 6
+    assert scaled_unit(16384, 36864, S=2) == 8
+    # above top_k 2048 the floor grows as (top_k / 2048) ** 1.1: 131.2 at 3072, 180.1 at 4096
+    assert scaled_unit(16384, 24576, K=3072) == 6
+    assert scaled_unit(16384, 26624, K=3072) == 8
+    assert unit(16384, 20480, K=4096) == 8
+    assert scaled_unit(16384, 20480, K=4096) == 6
+    assert scaled_unit(16384, 32768, K=4096) == 8
+    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9]: below a wave ratio W = 1.26 the minimum is at least
+    # 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5 l6
+    # waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
+    # the 99-tile minimum of 4 wide waves; 8520 queries take 8 wide waves against 10 l6 waves (W = 1.25) and need 160
+    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324; 8192
+    # queries (7 wide waves, 10 l6 waves) keep the 88.5-tile minimum
+    low = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024, 512],
+            wide_wave_rule=[
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+            ],
+        )
+    )
+
+    def low_unit(T, Tkv, K=2048, S=1):
+        return low.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    assert low_unit(4096, 16384) == 6
+    assert low_unit(4096, 2048 + 159 * 128) == 6
+    assert low_unit(4096, 2048 + 160 * 128) == 8
+    assert low_unit(4096, 2048 + 159 * 256, S=2) == 6
+    assert low_unit(4096, 2048 + 160 * 256, S=2) == 8
+    assert low_unit(8520, 4260 + 159 * 128) == 6
+    assert low_unit(8520, 4260 + 160 * 128) == 8
+    assert low_unit(6144, 3072 + 239 * 128) == 6
+    assert low_unit(6144, 3072 + 240 * 128) == 8
+    assert low_unit(6144, 3072 + 323 * 256, S=2) == 6
+    assert low_unit(6144, 3072 + 324 * 256, S=2) == 8
+    assert low_unit(8192, 4096 + 89 * 128) == 8
 
 
 def test_sample_shift_rule_precedence():
@@ -1802,18 +2007,19 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
     assert (
         solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1" and base.kind == "pair_wide"
     )
-    # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes
+    # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes (in the
+    # plain unit order: snake_packed_rule)
     for sample in (None, 0):
         rule, base = plans(65536, 65536, 8, sample)
-        assert solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1", sample
+        assert solo(rule) and rule.scan_key == "scan:l6:u1:s0:f1", sample
         assert base.scan_key == "scan:pair_l6:u1:s1:f1", sample
     # one sampled document of 100 mean tiles (<= 128): unpaired l6
     rule, base = plans(16384, 16384 // 2 + 100 * 128, 1, None)
     assert solo(rule) and base.kind != "l6"
-    # one causal 256k document (1024 mean tiles, no sampled fit): the unpaired l6 key would be scan:l6:u1:s1:f0, which is not
-    # registered, so the unsampled call keeps the pair wide program
+    # one causal 512k document (2048 mean tiles, no sampled fit): the unpaired l6 key would be scan:l6:u1:s1:f0, which is not
+    # registered, so the unsampled call keeps the pair wide program (619 waves, beyond snake_l6_fallback_waves)
     assert "scan:l6:u1:s1:f0" not in keys
-    rule, base = plans(262144, 262144, 1, 0)
+    rule, base = plans(524288, 524288, 1, 0)
     assert rule == base and base.scan_key == "scan:pair_wide:u1:s1:f0"
     # a split call keeps its split (4 queries over 22018 keys: 12 narrow splits, split_fit_rule)
     rule, base = plans(4, 22018, 1, 0)
@@ -2133,6 +2339,110 @@ def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
         elif base.kind == "pair_wide" and got.kind == "wide":
             counts["unpaired"] += 1
     assert counts["kept"] and counts["dropped"] and counts["unpaired"], counts
+
+
+def test_snake_packed_rule_and_snake_l6_fallback_waves_on_sm_107a():
+    """sm_107a's ``snake_packed_rule`` [["l6"], 48.0, None, 7]: an l6 call of two or more segments walks the snake order
+    only sampled and from 48 mean unit tiles on, or within 7 waves of the l6 persistent grid (one document keeps
+    ``snake_rule`` alone); ``snake_l6_fallback_waves`` 310: a
+    sampling-off call the l6 preference moves runs ``scan:l6:u1:s0:f0`` where ``scan:l6:u1:s1:f0`` is not registered and
+    the planned program needs at most 310 waves of its persistent grid.  On a grid of shapes in both modes every plan is
+    the plan of the record with both fields off but for the unit order of an l6 program and, with sampling off, the
+    unpaired plain-order l6 unit of the fallback.  The other architectures and every FP8 record leave both fields off."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p, keys = policy_for("sm_107a"), cake_jit.PROGRAM_KEYS["sm_107a"]
+    assert p.snake_packed_rule == [["l6"], 48.0, None, 7]
+    assert p.snake_l6_fallback_waves == 310
+    for arch in ("sm_100a", "sm_103a"):
+        other = policy_for(arch)
+        assert other.snake_packed_rule is None, arch
+        assert other.snake_l6_fallback_waves is None, arch
+    for arch, fields in cake_jit.POLICY_FP8.items():
+        assert fields["snake_packed_rule"] is None, arch
+        assert fields["snake_l6_fallback_waves"] is None, arch
+    off = DispatchPolicy.from_record(
+        dict(p.record(), snake_packed_rule=None, snake_l6_fallback_waves=None)
+    )
+    assert "scan:l6:u1:s1:f0" not in keys
+
+    def plan(policy, T, Tkv, S, sample, top_k=2048, grid=212):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=keys,
+        )
+
+    # packed equal documents: eight 8k documents (32 mean tiles, 52 waves) leave the snake order in both modes; two 16k
+    # documents (64 mean tiles, 26 waves) keep it sampled only; two 4k-query documents over 8k keys each (48 mean tiles)
+    # and two 4k documents over 6k keys each (32 mean tiles) need 7 waves of 6-query units on 212 CTAs: both keep it
+    for sample in (None, 0):
+        assert plan(off, 65536, 65536, 8, sample).scan_key == "scan:l6:u1:s1:f1"
+        assert plan(p, 65536, 65536, 8, sample).scan_key == "scan:l6:u1:s0:f1"
+        assert plan(p, 8192, 16384, 2, sample).scan_key == "scan:l6:u1:s1:f1"
+        assert plan(p, 8192, 12288, 2, sample).scan_key == "scan:l6:u1:s1:f1"
+    assert plan(p, 32768, 32768, 2, None).scan_key == "scan:l6:u1:s1:f1"
+    assert plan(p, 32768, 32768, 2, 0).scan_key == "scan:l6:u1:s0:f1"
+    assert p.snake_for("l6", 8192, 16384, 2, 1, sampled=False, grid=212)
+    assert not p.snake_for(
+        "l6", 8192, 16384, 2, 1, sampled=False
+    )  # no grid: no waves clause
+    assert not p.snake_for(
+        "l6", 16384, 32768, 2, 1, sampled=False, grid=212
+    )  # 13 waves
+    # one document keeps the snake order in both modes
+    for sample in (None, 0):
+        assert plan(p, 8192, 8192, 1, sample).scan_key == "scan:l6:u1:s1:f1"
+    # sampling off, one causal document: 16k queries over 32k keys (20 waves of the pair wide plan) and 256k queries
+    # (310 waves) take the plain-order l6 program; 512k queries (619 waves) keep the snake pair wide program
+    for T, Tkv in ((16384, 32768), (262144, 262144)):
+        assert plan(off, T, Tkv, 1, 0).scan_key == "scan:pair_wide:u1:s1:f0", T
+        got = plan(p, T, Tkv, 1, 0)
+        assert (got.scan_key, got.kind, got.pair, got.snake) == (
+            "scan:l6:u1:s0:f0",
+            "l6",
+            False,
+            False,
+        ), T
+        assert plan(p, T, Tkv, 1, None) == plan(off, T, Tkv, 1, None), T
+    assert plan(p, 524288, 524288, 1, 0) == plan(off, 524288, 524288, 1, 0)
+    # four 16k-query documents over 32k keys each: sampling off the packed rule already takes the plain-order l6 key
+    assert plan(p, 65536, 131072, 4, 0).scan_key == "scan:l6:u1:s0:f0"
+    counts = dict(same=0, order=0, fallback=0)
+    for q, k, S, top_k, sample in itertools.product(
+        (4, 64, 256, 1024, 2048, 4096, 8192, 16384),
+        (8192, 16384, 32768, 65536, 131072, 262144),
+        (1, 2, 4, 8),
+        (512, 2048),
+        (None, 0),
+    ):
+        if q > k:
+            continue
+        args = (q * S, k * S, S, sample)
+        base = plan(off, *args, top_k=top_k)
+        got = plan(p, *args, top_k=top_k)
+        assert got.scan_key in keys, (args, top_k, got.scan_key)
+        if got == base:
+            counts["same"] += 1
+        elif base.kind == "l6" and got.kind == "l6":
+            # the unit order alone: a packed l6 call below the rule's floor
+            assert S >= 2 and base.snake and not got.snake, (args, top_k)
+            assert got == replace(
+                base, snake=False, scan_key=base.scan_key.replace(":s1:", ":s0:")
+            ), (args, top_k)
+            counts["order"] += 1
+        else:
+            # the plain-order l6 fallback (sampling off) or the packed rule's l6 key now registered for the l6 preference
+            assert sample == 0 and base.snake and not got.snake, (args, top_k)
+            assert (got.kind, got.pair, got.n_split) == ("l6", False, 1), (args, top_k)
+            counts["fallback"] += 1
+    assert counts["same"] and counts["order"] and counts["fallback"], counts
 
 
 def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_the_grid():

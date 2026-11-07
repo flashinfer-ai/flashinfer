@@ -85,7 +85,9 @@ def _run_rank(
     from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
         kcp as conv_kcp,
     )
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
     from tests.test_helpers.cake_package import cake_package
 
     det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
@@ -98,8 +100,10 @@ def _run_rank(
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(part, group, rank, device, conv_kernel_size=WIDTH)
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
+        part, group, rank, device, conv_kernel_size=WIDTH
+    )
     T = cu[-1]
     g = torch.Generator(device="cpu").manual_seed(7815)
     x_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
