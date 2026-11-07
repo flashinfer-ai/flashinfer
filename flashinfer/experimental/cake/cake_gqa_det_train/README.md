@@ -86,7 +86,7 @@ entry takes a `deterministic=` keyword.
 |---|---|
 | `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 256 query rows of one (segment, query head), persistent tile tickets from a self-resetting counter |
 | `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
-| `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 16384 pairs of 128 query rows) |
+| `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 1024 pairs of 128 query rows) |
 | `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head): S^T, dP^T and dV (FP32 window or BF16), dS^T stored to the workspace |
 | `bwd_dk_fp32` / `bwd_dk_bf16` | per chunk: dK = dS^T Q over the workspace, a CTA pair per two key blocks (FP32 window or BF16) |
 | `bwd_dq` | per chunk: dQ = dS K over the workspace into the FP32 accumulator (persistent over the Q-tile pairs) |
@@ -116,8 +116,12 @@ and the row-map form adds two FP32 window gradients `[T_k, H_kv, 256]`.
 max_seqlen_k=, row_map=, budget_bytes=)` returns the total.  A workspace keeps
 only the scratch, at the largest size seen (`.nbytes`, `.release()`); the dS^T
 chunk and the window gradients come from PyTorch's caching allocator for each
-backward call and are freed when it returns.  One workspace serves one stream
-at a time; without one, each device stream gets its own default workspace.
+backward call and are freed when it returns; they are never filled under
+`torch.use_deterministic_algorithms(True)` (the kernels write every element
+they read).  One workspace serves one stream at a time; without one, each
+device stream gets its own default workspace.  Autograd keeps only a weak
+reference to the workspace: a backward whose workspace was dropped after the
+forward uses a new one with the same `budget_bytes`, and the same bits.
 
 ## Checkpointing
 
@@ -127,6 +131,17 @@ a weak reference to the workspace.  Under
 `torch.utils.checkpoint(..., use_reentrant=False)` a forward retains nothing,
 and the replay gives the gradients of the run without checkpointing bit for
 bit.
+
+## CUDA graphs
+
+The forward and the backward can be captured in a CUDA graph: they read
+nothing on the host and never synchronize.  Give each graph its own explicit
+workspace, used by an eager call of the captured shape before the capture,
+and keep that workspace alive and away from other shapes while the graph
+exists: the graph records the addresses of its scratch and tile counter, and
+a larger shape would move the scratch.  The dS^T chunk, the window gradients
+and the plan tables come from the graph's memory pool.  Graphs that may
+replay at the same time need separate workspaces.
 
 ## Build and check
 

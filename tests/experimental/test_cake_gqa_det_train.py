@@ -30,10 +30,15 @@ into non-zero destinations included), beside resident kernels on other streams a
 workspace budgets (KV-head and key-block chunks) under the same accuracy budget, bitwise reproducible, with the
 dK / dV bits of the unchunked call; the row-map adds equal, bit for bit, to the ordered FP32 fold of the FP32 window
 gradients; document isolation (bitwise); dynamic shapes through one reused workspace; launches on the operands'
-device and stream while another device is current; non-reentrant checkpointing (nothing retained, gradients
-bitwise equal to the saved-set run); no device synchronization in steady state; the speed of the forward and the
-backward beside a kernel resident on another stream; under ``torch.use_deterministic_algorithms(True)``, strict and
-with ``warn_only=True``, no alert and no warning, and the bits of a run outside that mode.
+device and stream while another device is current, and on the current side stream; non-reentrant checkpointing
+(no byte retained, gradients bitwise equal to the saved-set run); no device synchronization in steady state and no
+call waiting for the device; CUDA graph replay (bitwise); the speed of the forward and the backward beside a kernel
+resident on another stream; under ``torch.use_deterministic_algorithms(True)``, strict and with ``warn_only=True``,
+no alert and no warning, the bits of a run outside that mode, and no extra kernel (the package's own buffers are not
+filled).  Also: the issue's rows (the benchmark's layouts) bitwise over repeated runs, alone and beside a resident
+kernel; a key range past 64 key blocks; the package's buffers filled with 0xFF before use (no unwritten read); the
+small-budget chunks the backward launches; a workspace dropped between the forward and the backward (same budget,
+same bits); the plan kernel's dispatch bound.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer.
 """
@@ -42,6 +47,8 @@ from __future__ import annotations
 
 import ast
 import bisect
+import collections
+import gc
 import hashlib
 import itertools
 import json
@@ -52,6 +59,7 @@ import statistics
 import subprocess
 import sys
 import warnings
+import weakref
 from pathlib import Path
 
 import pytest
@@ -86,8 +94,8 @@ BUDGET = 1.10
 # (2^9 times below one BF16 step there).  O, LSE, dK and dV of two budgets are compared bitwise.
 DQ_RTOL = 2**-7
 DQ_ATOL_FRACTION = 2**-16
-# Checkpointing: memory kept after a checkpointed forward, less the output storage.
-CKPT_RETAINED_LIMIT_MIB = 2.0
+# Checkpointing: device bytes requested and still held after a checkpointed forward, less the output storage.
+CKPT_RETAINED_BYTES = 0
 # Beside a resident side-stream kernel: busy over alone within MAX_RATIO or at most MAX_EXTRA_MS above it.
 SIDE_SLEEP_CYCLES = 10_000_000
 PRE_SLEEP_CYCLES = 1_000_000
@@ -97,6 +105,8 @@ MAX_RATIO = 1.5
 MAX_EXTRA_MS = 0.020
 # Run-to-run repetitions of the bitwise reproducibility test.
 REPEATS = 5
+# A default-stream sleep (about a second) that outlasts a side-stream forward, backward and comparison.
+BEHIND_SLEEP_CYCLES = 2_000_000_000
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -109,8 +119,16 @@ LAYOUTS = (
     ("zigzag_cp2", (250, 250, 129, 130), (250, 1000, 129, 517), 24, 4),
     ("long_keys", (256, 255), (4099, 2049), 24, 4),
     ("group_2", (300, 77), (513, 77), 8, 4),
+    # 133 key blocks: the dQ GEMM flushes its accumulator every 64 key blocks.
+    ("over_64_blocks", (200, 64), (9000, 17000), 24, 4),
 )
 LAYOUT_IDS = [layout[0] for layout in LAYOUTS]
+LAYOUTS_BY_NAME = {layout[0]: layout for layout in LAYOUTS}
+# The issue's (T_q, T_k, segments, max Q, max K) rows, as the benchmark generates them (H_q 24, H_kv 4).
+ISSUE_LAYOUTS = ("issue1", "issue2", "issue3")
+BENCHMARK = (
+    Path(__file__).resolve().parents[2] / "benchmarks" / "bench_cake_gqa_det_train.py"
+)
 DKV_FORMS = ("bf16", "fp32", "rowmap")
 OUTPUTS = ("out", "lse", "dq", "dk", "dv")
 # The stages whose CTAs run as pairs (``cta_group::2``), and the first kernel parameter of each stage's plan.
@@ -744,6 +762,36 @@ def _row_maps(x):
     return {"windows": _window_row_map(x), "scattered": _scattered_row_map(x)}
 
 
+def _issue_layout(name):
+    """The benchmark's layout of an issue row: ``(q_lens, k_lens, window starts, destination rows)``.  Only its
+    ``ISSUE_ROWS`` table and ``issue_case`` generator run, from the benchmark's source: nothing else is imported."""
+    if not BENCHMARK.is_file():
+        pytest.skip(f"no benchmark source at {BENCHMARK}")
+    tree = ast.parse(BENCHMARK.read_text())
+    keep = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name == "issue_case")
+        or (
+            isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "ISSUE_ROWS" for t in node.targets)
+        )
+    ]
+    assert len(keep) == 2, [type(node).__name__ for node in keep]
+    namespace: dict = {"random": random}
+    exec(
+        compile(ast.Module(body=keep, type_ignores=[]), str(BENCHMARK), "exec"),
+        namespace,
+    )
+    rows = namespace["ISSUE_ROWS"]
+    return namespace["issue_case"](*rows[name], seed=list(rows).index(name))
+
+
+def _requested_bytes() -> int:
+    """Device bytes the caching allocator has handed out and not taken back, as requested (unrounded)."""
+    return torch.cuda.memory_stats()["requested_bytes.all.current"]
+
+
 def _destinations(n_dst, h_kv, device, seed=1):
     """Two non-zero FP32 destinations ``[n_dst, H_kv, 256]``."""
     g = torch.Generator(device=device).manual_seed(seed)
@@ -818,9 +866,54 @@ def _assert_matches_reference(label, x, form, got, ref, dst_init=None, row_map=N
 # On SM100 / SM103 / SM107
 
 
-def test_the_plan_kernel_writes_the_pytorch_tables(device) -> None:
-    """``bwd_plan`` (one CTA) writes the integers of the PyTorch plan: random layouts with empty and one-row segments,
-    more segments than the CTA has threads, the pair bound at the kernel's limit, and the PyTorch fallback past it."""
+def test_the_plan_kernel_writes_the_pytorch_tables(device, monkeypatch) -> None:
+    """``bwd_plan`` (one CTA) writes the integers of the PyTorch plan, and the backward launches it up to
+    ``PLAN_KERNEL_PAIRS`` pair positions, the PyTorch ops past that.  The kernel, allowed up to its capacity
+    ``PLAN_MAX_PAIRS`` here, on random layouts with empty and one-row segments, more segments than the CTA has
+    threads, and the pair bound at its capacity (the PyTorch ops one past it)."""
+    assert cake_jit.PLAN_KERNEL_PAIRS <= cake_jit.PLAN_MAX_PAIRS
+    launched = []
+    launch = cake_backend._launch
+
+    def record(stage, *args, **kwargs):
+        launched.append(stage)
+        return launch(stage, *args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_launch", record)
+
+    def check(label, q_lens, k_lens, limit):
+        total_q, total_k = sum(q_lens), sum(k_lens)
+        blocks = cake_jit.key_blocks(total_k, max(k_lens))
+        dims = {
+            "total_q": total_q,
+            "total_k": total_k,
+            "num_heads_q": 8,
+            "num_heads_kv": 2,
+            "num_segments": len(q_lens),
+        }
+        cu_q = torch.tensor(_cu(q_lens), dtype=torch.int32)
+        cu_k = torch.tensor(_cu(k_lens), dtype=torch.int32)
+        launched.clear()
+        got = cake_backend._plan_tables(
+            cu_q.to(device), cu_k.to(device), blocks, total_q, dims, device.index
+        )
+        bound = cake_jit.pair_bound(total_q, len(q_lens))
+        assert launched == (["bwd_plan"] if bound <= limit else []), (label, bound)
+        want = cake_backend._tile_plan(cu_q, cu_k, blocks, total_q)
+        for name, g, w in zip(
+            ("tile_base", "pair_base", "pair_order"), got, want, strict=True
+        ):
+            assert g.dtype == torch.int32 and g.device == device, (label, name)
+            assert torch.equal(g.cpu(), w), (label, name)
+
+    def one_segment(pairs):
+        q = 2 * cake_jit.BWD_TILE_ROWS * (pairs - 1)
+        assert cake_jit.pair_bound(q, 1) == pairs
+        return [q], [q + 77]
+
+    for pairs in (cake_jit.PLAN_KERNEL_PAIRS, cake_jit.PLAN_KERNEL_PAIRS + 1):
+        check(f"dispatch at {pairs}", *one_segment(pairs), cake_jit.PLAN_KERNEL_PAIRS)
+    monkeypatch.setattr(cake_jit, "PLAN_KERNEL_PAIRS", cake_jit.PLAN_MAX_PAIRS)
     rng = random.Random(7076)
     layouts = []
     for _ in range(40):
@@ -833,31 +926,10 @@ def test_the_plan_kernel_writes_the_pytorch_tables(device) -> None:
         layouts.append((q_lens, k_lens))
     many = [rng.randint(0, 300) for _ in range(1100)]
     layouts.append((many, [q + rng.randint(0, 200) for q in many]))
-    for extra in (0, 1):
-        q = 2 * cake_jit.BWD_TILE_ROWS * (cake_jit.PLAN_MAX_PAIRS - 1 + extra)
-        assert cake_jit.pair_bound(q, 1) == cake_jit.PLAN_MAX_PAIRS + extra
-        layouts.append(([q], [q]))
+    for pairs in (cake_jit.PLAN_MAX_PAIRS, cake_jit.PLAN_MAX_PAIRS + 1):
+        layouts.append(one_segment(pairs))
     for trial, (q_lens, k_lens) in enumerate(layouts):
-        total_q, total_k = sum(q_lens), sum(k_lens)
-        blocks = cake_jit.key_blocks(total_k, max(k_lens))
-        dims = {
-            "total_q": total_q,
-            "total_k": total_k,
-            "num_heads_q": 8,
-            "num_heads_kv": 2,
-            "num_segments": len(q_lens),
-        }
-        cu_q = torch.tensor(_cu(q_lens), dtype=torch.int32)
-        cu_k = torch.tensor(_cu(k_lens), dtype=torch.int32)
-        got = cake_backend._plan_tables(
-            cu_q.to(device), cu_k.to(device), blocks, total_q, dims, device.index
-        )
-        want = cake_backend._tile_plan(cu_q, cu_k, blocks, total_q)
-        for name, g, w in zip(
-            ("tile_base", "pair_base", "pair_order"), got, want, strict=True
-        ):
-            assert g.dtype == torch.int32 and g.device == device, (trial, name)
-            assert torch.equal(g.cpu(), w), (trial, name)
+        check(f"layout {trial}", q_lens, k_lens, cake_jit.PLAN_MAX_PAIRS)
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
@@ -922,6 +994,39 @@ def _timed(call, *, sides=()):
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
+@pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
+def test_no_kernel_reads_package_memory_it_did_not_write(
+    layout, form, device, monkeypatch
+) -> None:
+    """The package's own buffers (the scratch, the dS^T workspace, the window gradients, the plan tables, the row-map
+    order) allocated full of 0xFF bytes (NaN, -1 for integers) give the bits of a run without that fill."""
+    name, q_lens, k_lens, h_q, h_kv = layout
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    row_map, n_dst = _scattered_row_map(x)
+    dst_init = _destinations(n_dst, h_kv, device)
+
+    def run():
+        ws = cake_backend.CakeGQADetWorkspace(device)
+        return _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
+
+    clean = run()
+    uninitialized = cake_backend._uninitialized
+    filled = []
+
+    def poisoned(shape, dtype, device):
+        t = uninitialized(shape, dtype, device)
+        t.untyped_storage().fill_(0xFF)
+        filled.append(t.untyped_storage().nbytes())
+        return t
+
+    monkeypatch.setattr(cake_backend, "_uninitialized", poisoned)
+    got = run()
+    torch.cuda.synchronize()
+    assert filled, name
+    _assert_outputs_same_bits(got, clean, f"{name} {form} after 0xFF")
+
+
+@pytest.mark.parametrize("form", DKV_FORMS)
 def test_the_bits_do_not_depend_on_resident_kernels(form, device) -> None:
     """Kernels resident on other streams change which SMs the launches get, not the bits."""
     x = _inputs((3000, 1100, 77), (3000, 17000, 300), 24, 4, device, seed=5)
@@ -939,6 +1044,34 @@ def test_the_bits_do_not_depend_on_resident_kernels(form, device) -> None:
         _assert_outputs_same_bits(
             got, reference, f"{form} beside {count} resident kernel(s)"
         )
+
+
+@pytest.mark.parametrize("name", ISSUE_LAYOUTS)
+def test_the_issue_shapes_repeat_bit_for_bit(name, device) -> None:
+    """At the issue's rows (the benchmark's layouts, H_q 24, H_kv 4), ``REPEATS`` runs of every form alone and
+    ``REPEATS`` beside a kernel resident on another stream give the bits of the first run: out, lse, dq and dK / dV
+    (BF16, FP32 window, and row-map adds into non-zero destinations, the two segments of each document adding into
+    the same destination rows)."""
+    q_lens, k_lens, starts, n_dst = _issue_layout(name)
+    x = _inputs(q_lens, k_lens, 24, 4, device, seed=11)
+    rows = [
+        s + j for s, k_len in zip(starts, k_lens, strict=True) for j in range(k_len)
+    ]
+    assert len(set(rows)) < len(rows), name
+    row_map = torch.tensor(rows, dtype=torch.int32, device=device)
+    dst_init = _destinations(n_dst, 4, device)
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    side = torch.cuda.Stream(device)
+    for form in DKV_FORMS:
+
+        def call(form=form):
+            return _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
+
+        first = _timed(call)[1]
+        for i in range(1, 2 * REPEATS):
+            got = _timed(call, sides=(side,) if i >= REPEATS else ())[1]
+            _assert_outputs_same_bits(got, first, f"{name} {form} run {i}")
+            del got
 
 
 BUDGET_KINDS = ("kv_heads", "key_blocks", "minimum")
@@ -1022,6 +1155,94 @@ def test_a_small_budget_matches_the_reference_and_repeats(layout, kind, device) 
         )
         _assert_dq_close(got["dq"], base["dq"])
         _assert_matches_reference(label, x, form, got, ref, dst_init, row_map)
+
+
+@pytest.mark.parametrize("kind", BUDGET_KINDS)
+@pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
+def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -> None:
+    """Under a small budget the backward launches main, dK and dQ once per chunk of the expected size, in that order:
+    the chunks cover every (KV head, key block) once, and the first key-block chunk of each KV-head chunk stores
+    where the later ones add."""
+    name, q_lens, k_lens, h_q, h_kv = layout
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    budget, (h_chunk, n_chunk), default = _budget_plan(kind, x, h_q, h_kv)
+    blocks = default["key_blocks"]
+    launches = []
+    launch = cake_backend._launch
+
+    def record(stage, values, dims, device_index, **chunk):
+        if stage.startswith(("bwd_main", "bwd_dk", "bwd_dq")):
+            launches.append(
+                (stage.split("_")[1],)
+                + tuple(values[key] for key in ("h0", "hc", "n0", "n1", "accumulate"))
+            )
+        return launch(stage, values, dims, device_index, **chunk)
+
+    monkeypatch.setattr(cake_backend, "_launch", record)
+    ws = cake_backend.CakeGQADetWorkspace(device, budget_bytes=budget)
+    _run(x, "bf16", workspace=ws, max_seqlen_k=_longest_k(x))
+    torch.cuda.synchronize()
+    assert [stage for stage, *_ in launches] == ["main", "dk", "dq"] * (
+        len(launches) // 3
+    )
+    chunks = launches[::3]
+    for i, chunk in enumerate(chunks):
+        assert launches[3 * i + 1][1:] == launches[3 * i + 2][1:] == chunk[1:], (
+            name,
+            kind,
+        )
+    width = min(n_chunk, blocks)
+    assert len(chunks) == -(-h_kv // h_chunk) * -(-blocks // width), (
+        name,
+        kind,
+        chunks,
+    )
+    covered = collections.Counter()
+    for _stage, h0, hc, n0, n1, accumulate in chunks:
+        assert hc == min(h_chunk, h_kv - h0) and n1 - n0 == min(width, blocks - n0), (
+            name,
+            kind,
+        )
+        assert accumulate == (1 if n0 else 0), (name, kind, n0)
+        covered.update(itertools.product(range(h0, h0 + hc), range(n0, n1)))
+    assert covered == collections.Counter(itertools.product(range(h_kv), range(blocks)))
+
+
+def test_a_dropped_workspace_keeps_its_budget(device) -> None:
+    """A workspace dropped between the forward and the backward: autograd's backward uses a new one of the same
+    budget, so the gradients keep the bits of the run that keeps it (the default budget's dQ differs here)."""
+    _name, q_lens, k_lens, h_q, h_kv = LAYOUTS_BY_NAME["over_64_blocks"]
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    budget = _budget_plan("minimum", x, h_q, h_kv)[0]
+
+    def step(budget_bytes, drop):
+        ws = (
+            None
+            if budget_bytes is None
+            else cake_backend.CakeGQADetWorkspace(device, budget_bytes=budget_bytes)
+        )
+        q, k, v = (x[t].clone().requires_grad_() for t in ("q", "k", "v"))
+        out = pkg.cake_gqa_det(
+            q, k, v, x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+        )
+        if drop:
+            gone = weakref.ref(ws)
+            del ws
+            gc.collect()
+            assert gone() is None
+        out.backward(x["dout"])
+        return {"out": out.detach(), "dq": q.grad, "dk": k.grad, "dv": v.grad}
+
+    kept = step(budget, drop=False)
+    dropped = step(budget, drop=True)
+    default = step(None, drop=False)
+    torch.cuda.synchronize()
+    _assert_outputs_same_bits(
+        dropped, kept, "dropped workspace", ("out", "dq", "dk", "dv")
+    )
+    assert not torch.equal(
+        kept["dq"].view(torch.int16), default["dq"].view(torch.int16)
+    )
 
 
 @pytest.mark.parametrize("map_name", ("windows", "scattered"))
@@ -1124,6 +1345,7 @@ def test_the_backward_frees_its_ds_workspace_and_windows(device) -> None:
     for call in range(2):
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated(device)
+        requested = _requested_bytes()
         torch.cuda.reset_peak_memory_stats(device)
         dq, _dk, _dv = cake_backend.cake_gqa_det_train_backward(
             x["q"],
@@ -1144,8 +1366,8 @@ def test_the_backward_frees_its_ds_workspace_and_windows(device) -> None:
         torch.cuda.synchronize()
         assert torch.cuda.max_memory_allocated(device) - before >= transient, call
         if call:
-            kept = torch.cuda.memory_allocated(device) - before
-            assert kept == -(-dq.untyped_storage().nbytes() // 512) * 512, kept
+            kept = _requested_bytes() - requested
+            assert kept == dq.untyped_storage().nbytes(), kept
         del dq
     held = ws.nbytes - ws.tile_counter().untyped_storage().nbytes()
     assert held == cake_jit.scratch_bytes(sum(q_lens), h_q, len(q_lens))
@@ -1179,20 +1401,46 @@ def test_launches_on_the_operands_device_and_stream(device) -> None:
     _assert_outputs_same_bits(got, ref, "beside another current device")
 
 
-def _ckpt_retained_mib(fn, *inputs) -> float:
+def test_launches_on_the_current_stream(device) -> None:
+    """With a side stream current, every launch runs on it: the side-stream run and its comparison finish while the
+    default stream still runs a long sleep, with the bits of a default-stream run."""
+    x = _inputs((700, 300, 41), (2000, 300, 900), 24, 4, device, seed=3)
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    ref = _run(x, "fp32", workspace=ws)
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    default = torch.cuda.current_stream(device)
+    side = torch.cuda.Stream(device)
+    torch.cuda._sleep(BEHIND_SLEEP_CYCLES)
+    with torch.cuda.stream(side):
+        got = _run(x, "fp32", workspace=ws)
+        same = {
+            t: torch.equal(
+                got[t].view(_BITS[got[t].dtype]), ref[t].view(_BITS[ref[t].dtype])
+            )
+            for t in OUTPUTS
+        }
+    busy = not default.query()
+    torch.cuda.synchronize()
+    assert busy, (
+        "the default stream's sleep ended before the side-stream check: lengthen it"
+    )
+    assert all(same.values()), same
+
+
+def _ckpt_retained_bytes(fn, *inputs) -> int:
+    torch.cuda.synchronize()
+    before = _requested_bytes()
     out = checkpoint(fn, *inputs, use_reentrant=False)
     torch.cuda.synchronize()
-    kept = torch.cuda.memory_allocated() - before - out.untyped_storage().nbytes()
+    kept = _requested_bytes() - before - out.untyped_storage().nbytes()
     del out
-    return kept / MIB
+    return kept
 
 
 def _autograd(x, form, *, workspace, row_map=None, dst_init=None, use_checkpoint=False):
     """``cake_gqa_det`` forward and backward through autograd: ``{"out", "dq", "dk", "dv"}`` (dk / dv: the leaves'
     BF16 gradients, the FP32 window or the row-map destinations, by form), with ``max_seqlen_k`` as ``_run`` passes
-    it; under non-reentrant checkpointing when asked, then also ``"retained_mib"``."""
+    it; under non-reentrant checkpointing when asked, then also ``"retained_bytes"``."""
     holder: dict = {}
 
     def dkv_acc():
@@ -1221,7 +1469,7 @@ def _autograd(x, form, *, workspace, row_map=None, dst_init=None, use_checkpoint
     q, k, v = (x[t].clone().requires_grad_() for t in ("q", "k", "v"))
     result: dict = {}
     if use_checkpoint:
-        result["retained_mib"] = _ckpt_retained_mib(fn, q, k, v)
+        result["retained_bytes"] = _ckpt_retained_bytes(fn, q, k, v)
         out = checkpoint(fn, q, k, v, use_reentrant=False)
     else:
         out = fn(q, k, v)
@@ -1250,7 +1498,7 @@ def test_checkpoint_keeps_nothing_alive_and_matches_the_saved_set(form, device) 
     eager2 = _autograd(x, form, **kwargs)
     low = _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
     torch.cuda.synchronize()
-    assert ckpt["retained_mib"] <= CKPT_RETAINED_LIMIT_MIB, ckpt["retained_mib"]
+    assert ckpt["retained_bytes"] == CKPT_RETAINED_BYTES, ckpt["retained_bytes"]
     names = ("out", "dq", "dk", "dv")
     _assert_outputs_same_bits(ckpt, eager, f"{form} checkpointed", names)
     _assert_outputs_same_bits(eager2, eager, f"{form} eager again", names)
@@ -1305,6 +1553,51 @@ def test_steady_state_does_not_synchronize(form, device) -> None:
     finally:
         torch.cuda.set_sync_debug_mode(previous)
     torch.cuda.synchronize()
+
+
+def test_no_call_waits_for_the_device(device) -> None:
+    """Behind a long sleep on the stream, the forward and the backward of every form return before it ends: nothing
+    waits for the device, with the tile tables from the plan kernel and (more pair positions than
+    ``PLAN_KERNEL_PAIRS``) from the PyTorch ops."""
+    layouts = (((700, 77), (3000, 77)), ((1,) * 1100, (3,) * 1100))
+    bounds = [cake_jit.pair_bound(sum(q), len(q)) for q, _k in layouts]
+    assert bounds[0] <= cake_jit.PLAN_KERNEL_PAIRS < bounds[1], bounds
+    for q_lens, k_lens in layouts:
+        x = _inputs(q_lens, k_lens, 24, 4, device)
+        row_map, n_dst = _window_row_map(x)
+        dst_init = _destinations(n_dst, 4, device)
+        ws = cake_backend.CakeGQADetWorkspace(device)
+
+        def every_form():
+            for form in DKV_FORMS:
+                _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
+
+        every_form()
+        torch.cuda.synchronize()
+        torch.cuda._sleep(BEHIND_SLEEP_CYCLES)
+        every_form()
+        busy = not torch.cuda.current_stream(device).query()
+        torch.cuda.synchronize()
+        assert busy, (len(q_lens), "a call waited for the device")
+
+
+@pytest.mark.parametrize("form", DKV_FORMS)
+def test_a_cuda_graph_replays_the_eager_bits(form, device) -> None:
+    """Captured with an explicit workspace an eager call of the shape has warmed, the forward and the backward replay
+    the bits of the eager call."""
+    x = _inputs((700, 300, 41), (2000, 300, 900), 24, 4, device, seed=4)
+    row_map, n_dst = _window_row_map(x)
+    dst_init = _destinations(n_dst, 4, device)
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    eager = _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run(x, form, workspace=ws, dst_init=dst_init, row_map=row_map)
+    for replay in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_outputs_same_bits(captured, eager, f"{form} replay {replay}")
 
 
 @pytest.mark.parametrize("stage", ("fwd", "bwd"))
@@ -1420,9 +1713,8 @@ def test_deterministic_mode_raises_no_alert_and_keeps_the_bits(
     form, warn_only, device, deterministic_algorithms
 ) -> None:
     """Under ``torch.use_deterministic_algorithms(True)``, strict or ``warn_only=True``: no alert, no warning, and
-    the two halves and autograd give the bits of a run outside that mode.  The workspaces of the run in the mode are
-    allocated in it, so PyTorch fills their uninitialized memory (and the outputs') with NaN: the bits also show
-    that no kernel reads memory it did not write."""
+    the two halves and autograd give the bits of a run outside that mode.  The outputs of the run in the mode are
+    allocated in it, so PyTorch fills them with NaN: the bits also show that every output element is written."""
     x = _inputs((130, 77, 300), (200, 77, 301), 24, 4, device)
     row_map, n_dst = _scattered_row_map(x)
     dst_init = _destinations(n_dst, 4, device)
@@ -1457,6 +1749,70 @@ def test_deterministic_mode_raises_no_alert_and_keeps_the_bits(
     _assert_outputs_same_bits(
         got_auto, base_auto, f"{form} autograd", ("out", "dq", "dk", "dv")
     )
+
+
+@pytest.mark.parametrize("form", DKV_FORMS)
+def test_deterministic_mode_adds_no_kernel_to_the_backward(
+    form, device, deterministic_algorithms
+) -> None:
+    """The mode fills every ``torch.empty`` result with NaN; the backward's own buffers (the dS^T workspace, the window
+    gradients, the plan tables, the row-map order) skip that fill, so with the outputs given the backward launches the
+    same kernels in the mode as outside it."""
+    x = _inputs((3000, 77), (9000, 77), 24, 4, device, seed=3)
+    row_map, n_dst = _window_row_map(x)
+    dst_init = _destinations(n_dst, 4, device)
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    out, lse = cake_backend.cake_gqa_det_train_forward(
+        x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+    )
+    kwargs = {"dq": torch.empty_like(x["q"])}
+    if form == "rowmap":
+        kwargs.update(
+            dk_acc=dst_init[0].clone(), dv_acc=dst_init[1].clone(), row_map=row_map
+        )
+    else:
+        dtype = torch.bfloat16 if form == "bf16" else torch.float32
+        kwargs.update(
+            dkv_dtype=dtype,
+            dk=torch.empty(x["k"].shape, dtype=dtype, device=device),
+            dv=torch.empty(x["v"].shape, dtype=dtype, device=device),
+        )
+
+    def kernels():
+        torch.cuda.synchronize()
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        with torch.profiler.profile(activities=activities) as prof:
+            cake_backend.cake_gqa_det_train_backward(
+                x["q"],
+                x["k"],
+                x["v"],
+                out,
+                lse,
+                x["dout"],
+                x["cu_q"],
+                x["cu_k"],
+                softmax_scale=SCALE,
+                workspace=ws,
+                max_seqlen_k=_longest_k(x),
+                **kwargs,
+            )
+            torch.cuda.synchronize()
+        return collections.Counter(
+            e.name
+            for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        )
+
+    torch.use_deterministic_algorithms(False)
+    kernels()
+    outside = kernels()
+    torch.use_deterministic_algorithms(True)
+    inside = kernels()
+    assert sum(outside.values()) >= 5, outside
+    assert inside == outside, (inside - outside, outside - inside)
 
 
 def test_deterministic_mode_runs_an_empty_backward(

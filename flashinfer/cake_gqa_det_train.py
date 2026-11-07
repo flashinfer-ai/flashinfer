@@ -30,8 +30,9 @@ has one fixed order: ``out``, ``lse``, dQ and every dK / dV form (BF16, FP32
 window, FP32 row-map adds with repeated destination rows) repeat bit for bit
 run to run, for one shape, one ``max_seqlen_k`` and one workspace budget.
 The backward stores dS^T into a workspace and computes dK and dQ as GEMMs
-over it, in chunks of at most the workspace's ``budget_bytes`` (default
-16 GiB); it raises no PyTorch determinism alert.  The interface matches the
+over it, in chunks that fit the workspace's ``budget_bytes`` (default
+16 GiB; the smallest chunk, one KV head and two key blocks, runs even past
+it); it raises no PyTorch determinism alert.  The interface matches the
 non-deterministic counterpart ``flashinfer.cake_gqa_nondet_train``.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
@@ -367,8 +368,8 @@ def cake_gqa_det_train_workspace_bytes(
     num_heads_q: int,
     num_segments: int,
     *,
-    total_k: int = 0,
-    num_heads_kv: int = 0,
+    total_k: Optional[int] = None,
+    num_heads_kv: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     row_map: bool = False,
     budget_bytes: Optional[int] = None,
@@ -384,11 +385,13 @@ def cake_gqa_det_train_workspace_bytes(
     num_segments : int
         ``B``, the segments (``len(cu_seqlens_q) - 1``).
     total_k, num_heads_kv : int, optional
-        ``T_k`` and ``H_kv``; with both given the dS^T workspace is included.
+        ``T_k`` and ``H_kv``, given together; with them the dS^T workspace is included.  One without the other
+        raises ``ValueError``.
     max_seqlen_k : int, optional
         As in :func:`cake_gqa_det`.
     row_map : bool
-        Include the two FP32 ``[T_k, H_kv, 256]`` window gradients of a row-map call.
+        Include the two FP32 ``[T_k, H_kv, 256]`` window gradients of a row-map call (needs ``total_k`` and
+        ``num_heads_kv``, else ``ValueError``).
     budget_bytes : int, optional
         As in :func:`cake_gqa_det_train_workspace`.
 

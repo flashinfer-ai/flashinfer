@@ -418,9 +418,13 @@ DS_TILE_LINES = 256
 # Row-map fold: one warp per (window row, key head), eight per CTA.
 FOLD_ITEMS_PER_CTA = 8
 # The tile tables (``bwd_plan``): one CTA; it keeps one count per Q-tile pair
-# position in shared memory, so a call with more positions than this builds
-# the tables with PyTorch ops instead.
+# position in shared memory, at most PLAN_MAX_PAIRS positions.  It ranks the
+# positions in time quadratic in their number, so the backward launches it up
+# to PLAN_KERNEL_PAIRS positions and builds the tables with PyTorch ops past
+# that (GB300: 0.06 ms at 1024 positions, 0.14 ms at 1536, 0.23 ms at 2048,
+# against about 0.12 ms for the PyTorch ops).
 PLAN_MAX_PAIRS = 16384
+PLAN_KERNEL_PAIRS = 1024
 # Pack-2 scratch: scratch head ``s`` holds query heads ``2 s`` and ``2 s + 1``;
 # every segment starts on a 128-row tile.  The preprocess runs one CTA per 32
 # packed rows of one scratch head, the postprocess one per 64 (each program's
@@ -599,6 +603,7 @@ __all__ = [
     "MANIFEST",
     "MODULES",
     "PACKAGE",
+    "PLAN_KERNEL_PAIRS",
     "PLAN_MAX_PAIRS",
     "POST_ROWS_PER_CTA",
     "PRE_ROWS_PER_CTA",

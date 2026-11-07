@@ -245,19 +245,28 @@ def cake_gqa_det_train_workspace_bytes(
     num_heads_q: int,
     num_segments: int,
     *,
-    total_k: int = 0,
-    num_heads_kv: int = 0,
+    total_k: Optional[int] = None,
+    num_heads_kv: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     row_map: bool = False,
     budget_bytes: int = cake_jit.DEFAULT_WORKSPACE_BUDGET,
 ) -> int:
     """Device bytes one backward call of these sizes needs beside its operands and outputs: the scratch a workspace
     keeps (FP32 ``dq_accum [H_q / 2, rows_pad, 256]``, ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``, ``rows_pad =
-    round_up(2 T_q + 128 B, 128)``), plus, allocated for the call and freed when it returns, with ``total_k`` /
+    round_up(2 T_q + 128 B, 128)``), plus, allocated for the call and freed when it returns, with ``total_k`` and
     ``num_heads_kv`` given the dS^T chunk of ``budget_bytes`` (:func:`.cake_jit.chunk_plan`) and with ``row_map``
-    the two FP32 window gradients ``[T_k, H_kv, 256]``."""
+    also the two FP32 window gradients ``[T_k, H_kv, 256]``.  Without ``total_k`` / ``num_heads_kv`` the result is
+    the scratch alone: ``total_k`` and ``num_heads_kv`` go together, and ``row_map`` needs both."""
+    if (total_k is None) != (num_heads_kv is None):
+        raise ValueError(
+            "total_k and num_heads_kv go together: give both to include the dS^T chunk, or neither"
+        )
+    if row_map and total_k is None:
+        raise ValueError(
+            "row_map=True needs total_k and num_heads_kv (the window gradients are [T_k, H_kv, 256])"
+        )
     need = cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
-    if total_q and total_k and num_heads_kv:
+    if total_k is not None and num_heads_kv is not None and total_q and total_k:
         plan = cake_jit.chunk_plan(
             total_q=int(total_q),
             total_k=int(total_k),
@@ -281,10 +290,11 @@ class CakeGQADetWorkspace:
     come from PyTorch's caching allocator for each backward call and are freed when it returns, so between calls
     their memory serves other tensors.  ``budget_bytes`` bounds the dS^T workspace of one backward call (default
     :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`, 16 GiB): a call whose dS^T exceeds it runs in chunks (KV heads first,
-    then key-block ranges).  The chunks depend on the shape, ``max_seqlen_k`` and the budget only, so one budget gives
-    the same bits on every run; a different budget may round dQ differently.  One workspace serves one stream at a
-    time: two launches running concurrently on different streams need two workspaces.  Autograd keeps only a weak
-    reference to it, so a checkpointed forward retains nothing through it.
+    then key-block ranges); the smallest chunk, one KV head and two key blocks, runs even when it exceeds the budget.
+    The chunks depend on the shape, ``max_seqlen_k`` and the budget only, so one budget gives the same bits on every
+    run; a different budget may round dQ differently.  One workspace serves one stream at a time: two launches running
+    concurrently on different streams need two workspaces.  Autograd keeps only a weak reference to it, so a
+    checkpointed forward retains nothing through it.
     """
 
     def __init__(
@@ -338,7 +348,7 @@ class CakeGQADetWorkspace:
         if self._scratch is None or self._scratch.numel() < need:
             self._views = None
             self._scratch = None
-            self._scratch = torch.empty(need, dtype=torch.uint8, device=self.device)
+            self._scratch = _uninitialized((need,), torch.uint8, self.device)
         views = tuple(
             self._scratch[offset : offset + 4 * math.prod(shape)]
             .view(torch.float32)
@@ -357,11 +367,24 @@ class CakeGQADetWorkspace:
         self._scratch = None
 
 
+def _uninitialized(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """A contiguous tensor of uninitialized memory from PyTorch's caching allocator on ``device``'s current stream.
+
+    Unlike ``torch.empty`` it is never filled under ``torch.use_deterministic_algorithms(True)`` (that mode writes
+    NaN into every ``torch.empty`` result): the package's own buffers are written by its kernels before they are
+    read, and the fill would cost a pass over up to the whole dS^T workspace in every backward call."""
+    with torch.cuda.device(device):
+        storage = torch.UntypedStorage(math.prod(shape) * dtype.itemsize, device=device)
+    return torch.empty(0, dtype=dtype, device=device).set_(storage, 0, shape)
+
+
 def _ds_tiles(tiles: int, device: torch.device) -> torch.Tensor:
     """The dS^T workspace of one backward call as BF16 ``[tiles * 256, 64]`` (``tiles`` 32 KiB tiles; the last one,
     the zero tile, zeroed here)."""
     lines = tiles * cake_jit.DS_TILE_LINES
-    ds = torch.empty((lines, 64), dtype=torch.bfloat16, device=device)
+    ds = _uninitialized((lines, 64), torch.bfloat16, device)
     ds[lines - cake_jit.DS_TILE_LINES :].zero_()
     return ds
 
@@ -370,9 +393,7 @@ def _windows(
     total_k: int, num_heads_kv: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The FP32 window gradients ``(dk_win, dv_win)``, each ``[T_k, H_kv, 256]``, of one row-map call."""
-    both = torch.empty(
-        (2, total_k, num_heads_kv, HEAD_DIM), dtype=torch.float32, device=device
-    )
+    both = _uninitialized((2, total_k, num_heads_kv, HEAD_DIM), torch.float32, device)
     return both[0], both[1]
 
 
@@ -720,14 +741,18 @@ def cake_gqa_det_train_backward(
             _launch("bwd_dq", at, dims, device_index, **chunk)
     if mode == "rowmap":
         # Window rows sorted by destination row, ties in window order; each destination row adds its run in order.
-        dst_rows, perm = torch.sort(row_map, stable=True)
-        run_end = torch.searchsorted(dst_rows, dst_rows, right=True, out_int32=True)
+        dst_rows = _uninitialized((total_k,), torch.int32, device)
+        order = _uninitialized((total_k,), torch.int64, device)
+        torch.sort(row_map, stable=True, out=(dst_rows, order))
+        run_end = _uninitialized((total_k,), torch.int32, device)
+        torch.searchsorted(dst_rows, dst_rows, right=True, out_int32=True, out=run_end)
+        perm = _uninitialized((total_k,), torch.int32, device).copy_(order)
         _launch(
             "bwd_fold",
             {
                 "dk_win": win_k,
                 "dv_win": win_v,
-                "perm": perm.to(torch.int32),
+                "perm": perm,
                 "dst_rows": dst_rows,
                 "run_end": run_end,
                 "dk_out": dk_out,
@@ -751,15 +776,15 @@ def _plan_tables(
     device_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The tables of :func:`_tile_plan` from one ``bwd_plan`` launch (one CTA) into one int32 buffer, or from the
-    PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions.  Both write the same
+    PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_KERNEL_PAIRS` pair positions.  Both write the same
     integers."""
     segments = dims["num_segments"]
     bound = cake_jit.pair_bound(total_q, segments)
-    if bound > cake_jit.PLAN_MAX_PAIRS:
+    if bound > cake_jit.PLAN_KERNEL_PAIRS:
         return _tile_plan(cu_seqlens_q, cu_seqlens_k, key_blocks, total_q)
     tiles = (key_blocks + 1) * segments
-    tables = torch.empty(
-        tiles + segments + 1 + bound, dtype=torch.int32, device=cu_seqlens_q.device
+    tables = _uninitialized(
+        (tiles + segments + 1 + bound,), torch.int32, cu_seqlens_q.device
     )
     tile_base = tables[:tiles]
     pair_base = tables[tiles : tiles + segments + 1]
@@ -871,7 +896,8 @@ def _resolve_dkv_acc(
 class CakeGQADetFunction(torch.autograd.Function):
     """``(out, lse) = attention(q, k, v)``; the saved set is ``(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)``
     through ``ctx.save_for_backward`` alone, with scalars, the ``dkv_acc`` callable and a weak reference to the
-    workspace on ``ctx`` (a checkpointed forward keeps no tensor alive through ``ctx``)."""
+    workspace on ``ctx`` (a checkpointed forward keeps no tensor alive through ``ctx``).  A backward whose workspace
+    is gone by then uses a new one of the same ``budget_bytes``, so it gives the same bits."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -900,6 +926,7 @@ class CakeGQADetFunction(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.dkv_acc = dkv_acc
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
+        ctx.budget_bytes = None if workspace is None else workspace.budget_bytes
         ctx.mark_non_differentiable(lse)
         return out, lse
 
@@ -909,6 +936,9 @@ class CakeGQADetFunction(torch.autograd.Function):
     ) -> tuple[Optional[torch.Tensor], ...]:
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
+        if workspace is None and ctx.budget_bytes is not None:
+            # The caller dropped its workspace after the forward: one for this call with its budget keeps the bits.
+            workspace = CakeGQADetWorkspace(q.device, budget_bytes=ctx.budget_bytes)
         if dout is None:
             dout = torch.zeros_like(out)
         elif not dout.is_contiguous():

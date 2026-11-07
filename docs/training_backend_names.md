@@ -92,7 +92,7 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
 - **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
 - **Causal conv1d KCP stays inside the single-rank backend packages.** `cake_causal_conv1d_det_train` and `cake_causal_conv1d_nondet_train` each carry a `kcp` submodule behind the top-level `cake_causal_conv1d_<mode>_train_kcp` facades (rule 1 exception).
-- **Missing versions keep their reserved names:** DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
+- **Missing versions keep their reserved names:** DSA indexer `nondet` and DSA sparse attention `det`.
 
 ## Current names
 
