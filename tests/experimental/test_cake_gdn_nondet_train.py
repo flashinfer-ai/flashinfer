@@ -3980,15 +3980,22 @@ def test_host_plans_take_the_split_or_the_serial_table(monkeypatch) -> None:
 SPLIT_LAYOUT = (700, 1500, 230)
 SPLIT_HEADS = (2, 4)
 SPLIT_SMS = 40
-_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm", "stitch")
+_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 
 
-def _split_device(monkeypatch, device, *, split: bool) -> str:
+def _split_device(monkeypatch, device, *, split: bool, chain: str | None = None) -> str:
     """The small device of :func:`_small_device` with SPLIT_SMS SMs, the device's architecture in
-    ADJOINT_SPLIT_ARCHS and costs that select the split (``split``) or the serial table."""
+    ADJOINT_SPLIT_ARCHS and costs that select the split (``split``) or the serial table; ``chain`` pins the stage that
+    composes the end adjoints (``ADJOINT_CHAIN_STAGES``' preference otherwise)."""
     arch = cake_backend.device_arch(cake_chain._device_index(device))
     if not all(cake_chain._available(stage, arch) for stage in _SPLIT_STAGES):
         pytest.skip(f"the split's stages are not delivered for {arch}")
+    if chain is not None:
+        if not cake_chain._available(chain, arch):
+            pytest.skip(f"{chain} is not delivered for {arch}")
+        monkeypatch.setattr(cake_chain, "ADJOINT_CHAIN_STAGES", (chain,))
+    if cake_chain._adjoint_chain_stage(arch) is None:
+        pytest.skip(f"no chain stage is delivered for {arch}")
     _small_device(monkeypatch, device, SPLIT_SMS)
     monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset({arch}))
     costs = {"walk": 1.0, "summary": 1.0, "serial_low": 1.0, "serial_full": 1.0, "stitch": 0.0, "stitch_piece": 0.0,
@@ -3997,10 +4004,25 @@ def _split_device(monkeypatch, device, *, split: bool) -> str:
     return arch
 
 
-@pytest.mark.parametrize("lpt", [True, False], ids=["lpt", "caller-order"])
-@pytest.mark.parametrize("states", [True, False], ids=["h0-dht", "no-states"])
+@pytest.mark.parametrize(
+    "lpt, states, chain",
+    [
+        (True, True, None),
+        (True, False, None),
+        (False, True, None),
+        (False, False, None),
+        (True, True, "stitch"),
+    ],
+    ids=[
+        "lpt-h0-dht",
+        "lpt-no-states",
+        "caller-order-h0-dht",
+        "caller-order-no-states",
+        "lpt-h0-dht-stitch",
+    ],
+)
 def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
-    lpt, states, device, monkeypatch
+    lpt, states, chain, device, monkeypatch
 ) -> None:
     seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
     index = cake_chain._device_index(device)
@@ -4019,7 +4041,8 @@ def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
     runs = {}
     for split in (True, False):
         with monkeypatch.context() as m:
-            _split_device(m, device, split=split)
+            arch = _split_device(m, device, split=split, chain=chain)
+            composer = cake_chain._adjoint_chain_stage(arch)
             options = cake_chain.make_options(lpt=lpt)
             cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
             meta = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1], options,
@@ -4046,9 +4069,10 @@ def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
                     stages.count("dhu_tc2_dvl32_modes") == 6
                     and stages.count("dhu_tc2_dvl32_gm") == 3
                 ), stages
-                assert stages.count("stitch") >= 3, (
-                    stages
-                )  # the backward's (the forward's plan may stitch too)
+                # the backward's composition, once per run (the forward's plan may stitch too)
+                assert stages.count(composer) >= 3, (composer, stages)
+                if composer == "piece_chain":
+                    assert stages.count("piece_chain") == 3, stages
                 assert not [
                     s for s in stages if s.startswith(("dhu_pre", "dv_local", "dhu_r"))
                 ], stages

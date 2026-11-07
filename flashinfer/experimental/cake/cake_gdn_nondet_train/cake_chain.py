@@ -133,6 +133,8 @@ __all__ = [
     "TAIL_WORKSPACE_TILES",
     "ADJOINT_SPLIT_ARCHS",
     "ADJOINT_SPLIT_COSTS",
+    "ADJOINT_CHAIN_STAGES",
+    "CHAIN_VSPLIT",
     "AdjointSplit",
     "adjoint_split_lists",
     "adjoint_split_pricing",
@@ -202,6 +204,7 @@ REG_SCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (32, 1), (64, 1))
 PRESCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (64, 1))
 SCAN_KINDS = ("fwd_h", "dhu")
 STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
+CHAIN_VSPLIT = 8  # CTAs per (sequence, value head) of the piece chain launch
 
 # The tag of this package's forward tape: the backward reads only a tape that carries it (the deterministic package's
 # tape has no ``"mode"`` key, so it is refused).
@@ -222,6 +225,8 @@ _FWD_H_SPLIT_ARGS = _FWD_H_ARGS + ("seg_flag",)
 _FWD_H_PRE_ARGS = _FWD_H_SPLIT_ARGS + ("warmup_thresh_log2",)
 _STITCH_ARGS = ("seg_state", "init_state", "state_out", "seq_seg_start", "seg_flag", "num_v_heads", "use_init",
                 "reverse")  # fmt: skip
+# the piece chain: the stitch's arguments without ``reverse`` (the chain walks backward)
+_CHAIN_ARGS = _STITCH_ARGS[:-1]
 _FWD_HO_ARGS = ("qn_tma", "kn_tma", "w_tma", "u_tma", "g_cs", "h0", "seg_start", "h_tma", "v_new_tma", "v_new",
                 "o_tma", "o_out", "final_state", "chunk_start", "chunk_len", "seg_chunk_start", "seg_seq",
                 "seq_chunk_start", "walk", "num_heads", "num_v_heads", "use_initial_state", "store_final_state",
@@ -275,6 +280,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "fwd_ho": _FWD_HO_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
+    "piece_chain": _CHAIN_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
     "dhu_tc2_dvl32": _DHU_TC2_ARGS,
@@ -1953,29 +1959,34 @@ def split_r_form(
 # tapes and stores the adjoint it reaches at the piece's start, while ``dhu_tc2_dvl32_gm`` (on a side stream) walks
 # each middle piece's affine map ``[B | M]`` (``B`` from zero, ``M`` from the identity); the stitch composes the end
 # adjoint of every other piece; wave 2: ``dhu_tc2_dvl32_modes`` walks those pieces from their end adjoints with their
-# tapes, the first piece storing ``dh0``.  A sequence of one piece is walked whole in wave 1.  Every chunk's walk is
-# the serial walk's from the same end adjoint, which the split computes exactly up to the stitch's FP32 composition
-# of the maps (no warm-up bound, so the plan and its cost do not depend on the gates).  :func:`adjoint_split_pricing`
-# selects it over the serial table, both at their full cost.
+# tapes, the first piece storing ``dh0``.  A sequence of one piece is walked whole in wave 1.  The end adjoints come
+# from ``piece_chain`` (FP32 FFMA, one dot product per element and step) where it is delivered, else from the stitch
+# (3xBF16 products, about 16 mantissa bits per step).  Every chunk's walk is the serial walk's from the same end
+# adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
+# cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
+# full cost.
 ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a"})
-ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm", "stitch")
+ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
+# the stages that compose the end adjoints, in preference order
+ADJOINT_CHAIN_STAGES = ("piece_chain", "stitch")
 # the mode bits of an entry of the forms (``seg_mode``): seed the walk from ``dht`` (row of the segment, or of its
 # sequence with SPLIT_SEED_SEQ), write the dh / dv2 tapes, store the adjoint at the segment's start into the B half of
 # ``seg_state`` (the stitch's layout)
 SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
-# Per architecture, microseconds: the step of the walk with its tapes in a full wave (``walk``) and of the summary
-# (``summary``); the step of the serial walk at an empty and at a full wave (``serial_low`` / ``serial_full``,
-# interpolated by the fill); the stitch's fixed cost and its cost per composed piece; the split's fixed cost (its
-# extra launches and the stream fork and join).
+# Per architecture, microseconds: the step of the walk with its tapes in a full wave (``walk``) and of wave 1, the
+# summaries beside the last pieces' walks (``summary``); the step of the serial walk at an empty and at a full wave
+# (``serial_low`` / ``serial_full``, interpolated by the fill); the composition's fixed cost and its cost per
+# composed piece (``stitch`` / ``stitch_piece``); the split's fixed cost (its extra launches and the stream fork and
+# join).
 ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
     "sm_100a": {
-        "walk": 2.72,
-        "summary": 3.9,
+        "walk": 2.69,
+        "summary": 2.77,
         "serial_low": 2.29,
         "serial_full": 2.72,
         "stitch": 10.5,
         "stitch_piece": 3.0,
-        "fixed": 10.0,
+        "fixed": 15.0,
     },
 }
 
@@ -2051,11 +2062,18 @@ def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) ->
     return out
 
 
+def _adjoint_chain_stage(arch: str) -> str | None:
+    """The stage that composes the split's end adjoints on ``arch``: the first of
+    ``ADJOINT_CHAIN_STAGES`` delivered."""
+    delivered = [stage for stage in ADJOINT_CHAIN_STAGES if _available(stage, arch)]
+    return delivered[0] if delivered else None
+
+
 def _adjoint_split_length(
     seq_lens, num_v_heads: int, device_index: int, options: ChainOptions
 ) -> int | None:
     """``L`` of the one-wave split a host layout takes on device ``device_index``, ``None`` for the other plans: the
-    device's architecture in ``ADJOINT_SPLIT_ARCHS`` with the forms and the stitch delivered, no plan or ``dhu_scan``
+    device's architecture in ``ADJOINT_SPLIT_ARCHS`` with the forms and a chain stage delivered, no plan or ``dhu_scan``
     pin, and :func:`adjoint_split_pricing` selecting it."""
     index = int(device_index)
     arch = cake_backend.device_arch(index)
@@ -2066,6 +2084,8 @@ def _adjoint_split_length(
     ):
         return None
     if not all(_available(stage, arch) for stage in ADJOINT_SPLIT_STAGES):
+        return None
+    if _adjoint_chain_stage(arch) is None:
         return None
     chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
     priced = adjoint_split_pricing(
@@ -2776,10 +2796,11 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
                         scale: float, table, workspaces: Workspaces, index: int, device) -> None:  # fmt: skip
     """The adjoint walk of a table's segments as the one-wave split (:class:`AdjointSplit`): wave 1, the last and
     one-piece walks (``dhu_tc2_dvl32_modes``, caller's stream) beside the middle pieces' summaries
-    (``dhu_tc2_dvl32_gm``, side stream, joined back); the stitch of the pieces' end adjoints (``reverse``: each
-    sequence's last piece starts from ``dht``, the piece before it from the B half its walk stored, every earlier one
-    from ``M x + B`` of the piece after it); wave 2, the other pieces' walks from those end adjoints.  ``dh`` / ``dv2``
-    receive every chunk's tapes, ``dh0`` each sequence's start adjoint (with ``has_initial_state``)."""
+    (``dhu_tc2_dvl32_gm``, side stream, joined back); the composition of the pieces' end adjoints (``piece_chain``, or
+    the stitch with ``reverse``: each sequence's last piece ends at ``dht``, the piece before it at the B half its walk
+    stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other pieces' walks from those end
+    adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's start adjoint (with
+    ``has_initial_state``)."""
     hv = num_v_heads
     seg_state = workspaces.take(table, "b_seg_state", (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), torch.float32,
                                 device)  # fmt: skip
@@ -2825,8 +2846,12 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
         torch.float32,
         device,
     )
-    _launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
-            split1.seg_flag, hv, use_dht, 1)  # fmt: skip
+    if _adjoint_chain_stage(cake_backend.device_arch(index)) == "piece_chain":
+        _launch("piece_chain", meta.num_seqs, hv, CHAIN_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
+                split1.seg_flag, hv, use_dht)  # fmt: skip
+    else:
+        _launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
+                split1.seg_flag, hv, use_dht, 1)  # fmt: skip
     walk("dhu_tc2_dvl32_modes", split1.front, split1.num_front, dh_end, 1, store0)
 
 
