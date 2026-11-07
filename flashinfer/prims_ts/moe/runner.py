@@ -1170,7 +1170,9 @@ class _PrimsTsMoERunnerMixin:
             # The join above fully orders both partition outputs eagerly.
             # Under graph capture, a PDL finalize launch instead receives one
             # programmatic parent from each FC2 grid and waits before reading
-            # either output.
+            # either output. It reads the token permutation and the top-k
+            # routing weights before that wait; FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -1566,6 +1568,9 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -1908,6 +1913,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -2370,6 +2378,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -2642,6 +2653,9 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -3008,6 +3022,9 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
@@ -3327,6 +3344,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_fn(*self._launch_args(fc1_io, stream))
 
         if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            # This kernel triggers before its own PDL wait, so FC2's pre-wait
+            # routing reads rely on FC1 having waited on routing before it
+            # triggered (see config_mapper._with_pdl_pair).
             self.moe_op.trtllm_moe_run_deepseek_fp8_activation(
                 gemm1_output,
                 gemm1_output_scale,
@@ -3350,6 +3370,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
+            # Finalize reads the token permutation and the top-k routing
+            # weights before its own PDL wait. FC1's wait-before-trigger order
+            # (see config_mapper._with_pdl_pair) has completed routing by then.
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
                 output,
