@@ -93,7 +93,7 @@ POLICY_FIELDS = (
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
-    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6(, the top_k up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call, the tiles a one-segment minimum rises per wide wave below the next element, the wide waves from which it holds, the l6 / wide wave ratio W below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2)] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
+    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6(, the top_k up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call, the tiles a one-segment minimum rises per wide wave below the next element, the wide waves from which it holds, the l6 / wide wave ratio W below which the minimum is at least the next element / (W - 1) and on a packed call at least element 10 / (W - 1) ** 2, and from which the minimum of a one-document call of fewer wide waves than element 7 is at most element 11 / (W - 1) ** 2, on two or more wide waves at most the larger of that and element 12, from element 13 wide waves on of that and element 14)] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
     "desc_walk_kinds",  # [physical scan kinds whose descending-walk twin (key kind "<kind>_desc") a call with the sampled first threshold off runs, the same for a sampled call], or None; see select_program
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
@@ -488,10 +488,10 @@ class DispatchPolicy:
             )
         waves = raw["wide_wave_rule"]
         if waves is not None and (
-            len(waves) not in (3, 11)
+            len(waves) not in (3, 15)
             or not all(_is_number(v) and v >= 0 for v in waves)
             or (
-                len(waves) == 11
+                len(waves) == 15
                 and not (
                     _is_int(waves[3])
                     and waves[3] >= 1
@@ -499,11 +499,13 @@ class DispatchPolicy:
                     and _is_int(waves[7])
                     and waves[7] >= 1
                     and waves[8] >= waves[1]
+                    and _is_int(waves[13])
+                    and waves[13] >= 1
                 )
             )
         ):
             raise ValueError(
-                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or that with [the top_k (an int >= 1) up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call (>= the one-segment minimum), the tiles the one-segment minimum rises per wide wave below the next element, the wide waves (an int >= 1) from which it holds, the l6 / wide wave ratio W (>= the second element) below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2], each >= 0, or None, got {waves!r}"
+                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or that with [the top_k (an int >= 1) up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call (>= the one-segment minimum), the tiles the one-segment minimum rises per wide wave below the next element, the wide waves (an int >= 1) from which it holds, the l6 / wide wave ratio W (>= element 1) below which the minimum is at least the next element / (W - 1) and on a packed call at least element 10 / (W - 1) ** 2, and from which the minimum of a one-document call of fewer wide waves than element 7 is at most element 11 / (W - 1) ** 2, on two or more wide waves at most the larger of that and element 12, from element 13 (an int >= 1) wide waves on of that and element 14], each >= 0, or None, got {waves!r}"
             )
         desc = raw["desc_walk_kinds"]
         if desc is not None and (
@@ -1000,15 +1002,18 @@ class DispatchPolicy:
         waves = self.wide_wave_rule
         if waves is not None:
             # the unit the other rules leave (three-warpgroup or narrow) against the wide unit, in waves of the
-            # persistent grid: the wide unit when the other unit needs at least the record's ratio of the wide
-            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on).  An eleven-element
-            # rule raises that count by waves[6] tiles per wide wave below waves[7] (a short call's last waves cost
-            # the wide unit more), to at least waves[5] on a packed call (two or more segments) and to at least
-            # waves[9] / (W - 1) while the wave ratio W of the three-warpgroup unit to the wide unit stays below
-            # waves[8] (the fewer waves the wide unit saves, the more tiles its longer units need to pay for them),
-            # on a packed call then also to at least waves[10] / (W - 1) ** 2,
-            # and multiplies it by (top_k / waves[3]) ** waves[4] above top_k = waves[3] (each unit selects more
-            # candidates)
+            # persistent grid: the wide unit when the other unit needs at least the record's ratio of the wide unit's
+            # waves (against the three-warpgroup unit also from a mean unit tile count on).  A fifteen-element rule
+            # raises that count by waves[6] tiles per wide wave below waves[7] (a short call's last waves cost the wide
+            # unit more) but on one document to at most waves[11] / (W - 1) ** 2, from two wide waves on to at most the
+            # larger of that and waves[12] (from waves[13] wide waves on, of that and waves[14]: there the wide unit
+            # measured slower up to more tiles), while the wave ratio W of the three-warpgroup unit to the wide unit is
+            # at least waves[8] (the more waves the wide unit saves, the shorter the units that pay for its last wave;
+            # one wide wave has no last wave to pay for), to at least waves[5] on a packed call (two or more segments)
+            # and to at least waves[9] / (W - 1) while W stays below waves[8] (the fewer waves the wide unit saves, the
+            # more tiles its longer units need to pay for them), on a packed call then also to at least waves[10] /
+            # (W - 1) ** 2, and multiplies it by (top_k / waves[3]) ** waves[4] above top_k = waves[3] (each unit
+            # selects more candidates)
             other = self.block_q_l6 if three_wg else self.block_q_narrow
             ctas = max(1, int(grid))
             waves_wide = -(-units_wide // ctas)
@@ -1018,6 +1023,23 @@ class DispatchPolicy:
                 floor = waves[2]
                 if len(waves) > 3:
                     floor += waves[6] * max(0, int(waves[7]) - waves_wide)
+                    if (
+                        int(num_segments) < 2
+                        and waves_wide < int(waves[7])
+                        and waves_other > waves_wide
+                        and waves_other >= waves[8] * waves_wide
+                    ):
+                        # 1 / (W - 1)
+                        inv = waves_wide / (waves_other - waves_wide)
+                        cap = waves[11] * inv * inv
+                        if waves_wide > 1:
+                            cap = max(
+                                cap,
+                                waves[14]
+                                if waves_wide >= int(waves[13])
+                                else waves[12],
+                            )
+                        floor = min(floor, cap)
                     if int(num_segments) >= 2:
                         floor = max(floor, waves[5])
                     if waves_other < waves[8] * waves_wide:
