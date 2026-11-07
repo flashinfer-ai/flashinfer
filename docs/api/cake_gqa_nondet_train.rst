@@ -16,8 +16,8 @@ bitwise reproducible run to run.  Under
 ``torch.use_deterministic_algorithms(True)`` the backward raises PyTorch's
 alert after its checks and before it allocates or launches anything; with
 ``warn_only=True`` it warns and runs.  It never falls back to a deterministic
-implementation.  The deterministic package ``flashinfer.cake_gqa_det_train`` is
-planned.
+implementation.  The deterministic package with the same interface is
+:ref:`apicake_gqa_det_train`.
 
 ``cake_gqa_nondet`` is the autograd entry (its Function is
 ``CakeGQANondetFunction``); the forward and backward halves, the workspace and

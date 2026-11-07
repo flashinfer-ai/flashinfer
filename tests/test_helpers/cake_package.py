@@ -57,6 +57,7 @@ PACKAGES: dict[str, str] = {
     "cake_gdn_nondet_train": "flashinfer.experimental.cake.cake_gdn_nondet_train",
     # the non-deterministic GQA HD256 training package; its key carries the namespace
     "cake.cake_gqa_nondet_train": "flashinfer.experimental.cake.cake_gqa_nondet_train",
+    "cake.cake_gqa_det_train": "flashinfer.experimental.cake.cake_gqa_det_train",
     "cake.cake_mhc_nondet_train": "flashinfer.experimental.cake.cake_mhc_nondet_train",
     "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }

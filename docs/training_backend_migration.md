@@ -64,6 +64,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | DSA indexer | `flashinfer.cake_dsa_indexer_det_train` | det | single rank | #8936 |
 | DSA sparse attention | `flashinfer.cake_dsa_sparse_attention_nondet_train` | nondet | single rank | #8942 |
 | GQA HD256 | `flashinfer.cake_gqa_nondet_train` | nondet | single rank | #8939 |
+|  | `flashinfer.cake_gqa_det_train` | det | single rank | __PR__ |
 
 ## Calls that took `deterministic=`
 
@@ -557,4 +558,3 @@ On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the name
 
 - `flashinfer.cake_dsa_indexer_nondet_train`: DSA indexer `nondet`, not implemented.
 - `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.
-- `flashinfer.cake_gqa_det_train` (`cake_gqa_det`, `CakeGQADetFunction`): GQA HD256 `det`, not implemented.

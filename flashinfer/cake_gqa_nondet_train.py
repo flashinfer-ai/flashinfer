@@ -32,7 +32,7 @@ reductions, so its gradients are not bitwise reproducible run to run.  Under
 alert after its checks and before it allocates or launches anything
 (``warn_only=True``: it warns and runs this backward); it never falls back
 to a deterministic implementation.  The
-deterministic counterpart ``flashinfer.cake_gqa_det_train`` is planned.
+deterministic counterpart is ``flashinfer.cake_gqa_det_train``.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
 wrappers: the checks, the launch plan, the workspace, the autograd Function

@@ -71,7 +71,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
 | DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
 | | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | `cake_dsa_sparse_attention_nondet`, `cake_dsa_sparse_attention_nondet_varlen`, `cake_dsa_sparse_attention_nondet_nope`, `cake_dsa_sparse_attention_nondet_nope_varlen` | `CakeDSASparseAttentionNondetFunction` (both rope entries), `CakeDSASparseAttentionNondetNopeFunction`, `CakeDSASparseAttentionNondetNopeVarlenFunction` | `experimental.cake_dsa_train` / `dsa_sparse_attention.dsa_sparse_attention{,_varlen,_nope,_nope_varlen}` |
-| GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | planned |
+| GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | new; no former name |
 | | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
 
 ### KCP entries: KDA det as the example
@@ -244,7 +244,7 @@ Family rename PRs:
 | backend `Workspace` | `CakeGQANondetWorkspace` |
 | backend `DkvAccSource` | `CakeGQANondetDkvAccSource` |
 
-No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
+No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; the deterministic backward is `flashinfer.cake_gqa_det_train` (no alert, run-to-run identical bits), a separate module with the same interface.
 
 Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
 
