@@ -8072,6 +8072,98 @@ def _check_mm_fp4_problem_size(
     return True
 
 
+def _fp4_short_scale_problem(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    block_size: int,
+    a_is_128x4: bool = True,
+) -> Optional[str]:
+    """Return a message when a block-scale tensor cannot hold the layout a backend reads.
+
+    A 128x4 backend reads scale rows padded to a multiple of 128 and scale
+    columns padded to a multiple of 4, from the data pointer, whatever the
+    tensor's shape. TRT-LLM's 8x4 A scales pad rows to a multiple of 8 instead.
+    A tensor with fewer bytes behind its data pointer is read past its end. A
+    row-major tensor with fewer rows than the padded layout is read in the wrong
+    order. Both give wrong values with no error, so both are rejected. A view or
+    reshape that keeps all the buffer's rows and bytes behind the data pointer
+    passes.
+
+    Returns ``None`` when both scale tensors pass. Otherwise returns one message
+    per rejected tensor, joined with spaces.
+    """
+    sf_m, sf_n, sf_k = _calculate_block_scale_dims(
+        a.shape[0], b.shape[1], a.shape[1] * 2, block_size
+    )
+    if not a_is_128x4:
+        sf_m = (a.shape[0] + 7) // 8 * 8
+
+    def storage_bytes(t: torch.Tensor) -> int:
+        return t.untyped_storage().nbytes() - t.storage_offset() * t.element_size()
+
+    def too_short(name: str, t: torch.Tensor, rows: int, cols: int) -> Optional[str]:
+        have, need = storage_bytes(t), rows * cols * t.element_size()
+        if have >= need:
+            return None
+        eight_by_four = name == "a_descale" and not a_is_128x4
+        return (
+            f"{name} has {have} bytes of storage behind its data pointer, but the "
+            f"{'8x4' if eight_by_four else '128x4'} block-scale layout for this "
+            f"call reads {need} ({rows} padded rows of {cols} scales, in the "
+            f"quantizer's row-major orientation); the backend would read past the "
+            f"tensor's end. Quantize with that layout (fp4_quantize's "
+            f"{'is_sf_8x4_layout=True' if eight_by_four else 'default'}) rather "
+            f"than passing a linear "
+            f"({a.shape[0] if name == 'a_descale' else b.shape[1]}, "
+            f"{a.shape[1] * 2 // block_size}) array of scales."
+            + (
+                ""
+                if name == "a_descale"
+                else " Pass B's scales transposed, as the quantizer's output .T."
+            )
+        )
+
+    # The byte count alone misses some linear arrays (the plain row-major
+    # (m, k // block_size) output of SfLayout.layout_linear). nvfp4_quantize pads
+    # their storage to a multiple of 16 rows. At m = 120 and k = 512 the (120, 32)
+    # array therefore sits on 128 x 32 = 4096 bytes, as many as the 128x4 layout
+    # reads. The same happens for every m from 113 to 127 above a multiple of 128.
+    # Such an array has fewer rows than the padded layout. A row slice like
+    # a_descale[:-1] has the same shape, strides and storage, so both are rejected.
+    # The quantizers return 128x4 and 8x4 scales with all the padded rows.
+    def too_few_rows(name: str, t: torch.Tensor, rows: int, cols: int) -> Optional[str]:
+        # B's scales are passed transposed; look at them as the quantizer wrote them.
+        if t.dim() != 2:
+            return None
+        q = t if name == "a_descale" else t.T
+        row_major = q.shape[1] == cols and tuple(q.stride()) == (cols, 1)
+        if not row_major or q.shape[0] >= rows:
+            return None
+        eight_by_four = name == "a_descale" and not a_is_128x4
+        return (
+            f"{name} is a row-major tensor of {q.shape[0]} rows of {cols} scales, "
+            f"but the {'8x4' if eight_by_four else '128x4'} block-scale layout for "
+            f"this call has {rows} padded rows. A tensor with fewer rows than the "
+            f"padded layout is a linear array or a row slice, not the layout's "
+            f"output, so the backend would read scales in the wrong order. "
+            f"Quantize with that layout (fp4_quantize's "
+            f"{'is_sf_8x4_layout=True' if eight_by_four else 'default'}) and pass "
+            f"all of its rows."
+        )
+
+    problems = []
+    for name, t, rows in (
+        ("a_descale", a_descale, sf_m),
+        ("b_descale", b_descale, sf_n),
+    ):
+        short = too_short(name, t, rows, sf_k) or too_few_rows(name, t, rows, sf_k)
+        if short is not None:
+            problems.append(short)
+    return " ".join(problems) if problems else None
+
+
 def _fp4_scale_byte_order_problem(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -8092,10 +8184,19 @@ def _fp4_scale_byte_order_problem(
     copies of an ``(r, c)`` quantizer output when ``r != c``: a contiguous ``(c,
     r)`` tensor (a contiguous copy of the transpose) and an ``(r, c)`` tensor with
     transposed strides (that copy transposed back). The quantizer output reshaped to
-    ``(c, r)`` looks the same as the first copy and is rejected too. Every other
-    layout, including 1-D and 3-D scale tensors, is left to the backend. A's scales
-    are checked only when ``a_is_128x4`` (TRT-LLM can take them in its 8x4 layout).
-    Returns ``None`` when neither scale tensor is such a copy, else a message.
+    ``(c, r)`` looks the same as the first copy and is rejected too. This check
+    looks only at 2-D shapes and strides; other layouts, 3-D tensors included,
+    are left to the backend. A's scales are checked only when ``a_is_128x4``;
+    TRT-LLM can take them in its 8x4 layout.
+
+    ``_fp4_short_scale_problem`` runs first. It rejects a scale tensor with fewer
+    bytes behind its data pointer than the backend reads, whatever its rank.
+    One limit remains: a tensor of the full size with its scales in a different
+    order looks the same in shape, strides and storage, so neither check can
+    see it.
+
+    Returns ``None`` when neither scale tensor is a transposed copy or too short,
+    else a message.
     """
     sf_m, sf_n, sf_k = _calculate_block_scale_dims(
         a.shape[0], b.shape[1], a.shape[1] * 2, block_size
@@ -8108,6 +8209,9 @@ def _fp4_scale_byte_order_problem(
             return tuple(t.shape) == (cols, rows)
         return tuple(t.shape) == (rows, cols) and t.t().is_contiguous()
 
+    short = _fp4_short_scale_problem(a, b, a_descale, b_descale, block_size, a_is_128x4)
+    if short is not None:
+        return short
     problems = []
     if a_is_128x4 and transposed_copy(a_descale, sf_m, sf_k):
         problems.append(
@@ -8173,6 +8277,19 @@ def _cudnn_gemm_fp4_requirement(
         if backend != "cudnn":
             return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
+
+    # cuDNN reads the scale bytes at the data pointer as a 128x4 layout. A linear
+    # 2-D array or a short 3-D tensor holds fewer bytes than that, so cuDNN reads
+    # past its end and gives wrong values with no error. cuDNN's 2-D shape check
+    # below cannot catch the 3-D case. The storage check _fp4_short_scale_problem
+    # runs before that shape check and catches both the linear 2-D array and the
+    # short 3-D tensor. With backend="cudnn" the call raises. In auto mode this
+    # requirement returns False instead, so cuDNN is skipped.
+    short = _fp4_short_scale_problem(a, b, a_descale, b_descale, block_size)
+    if short is not None:
+        if backend != "cudnn":
+            return False
+        raise ValueError(short)
 
     # cuDNN builds its block-scale descriptors from the scale tensors' shapes and
     # reads their bytes in the 128x4-swizzled order that fp4 quantization writes.
