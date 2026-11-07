@@ -383,6 +383,20 @@ class TestPrimsTsUnifiedValidation:
         swiglu = self._runner(_config())._gemm1_oa_launch_kwargs(view)
         assert swiglu["gemm1_alpha"] is alpha
 
+    def test_tuning_key_separates_pdl(self, monkeypatch):
+        def runner(enable_pdl):
+            return PrimsTsRunner(
+                _config(execution=ExecutionConfig(enable_pdl=enable_pdl)),
+                torch.device("cpu"),
+            )
+
+        pdl_on, pdl_off = runner(True), runner(False)
+        assert pdl_on.get_cache_key_extras([]) != pdl_off.get_cache_key_extras([])
+        assert hash(pdl_on) != hash(pdl_off)
+        # enable_pdl=None follows device support.
+        monkeypatch.setattr("flashinfer.utils.device_support_pdl", lambda _: True)
+        assert runner(None).get_cache_key_extras([]) == pdl_on.get_cache_key_extras([])
+
     def test_staged_routing_placeholders_match_bf16_runner(self):
         runner = self._runner(_config(execution=ExecutionConfig(enable_pdl=False)))
         hidden = torch.zeros(4, 8, dtype=torch.bfloat16)
