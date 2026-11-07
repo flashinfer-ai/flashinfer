@@ -169,7 +169,10 @@ s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j, d])
   grid), in its sampled-fit form,
   with the decided tile unroll where an FP8 program of it is registered
   (else the smallest registered one) and in the longest-first order where
-  the BF16 rule picks it and an FP8 copy exists.  A fallback kind takes its
+  the BF16 rule picks it and an FP8 copy exists, or where the call is one
+  document of the `wide` unit within the FP8 record's `lsf_single_rule`
+  (`sm_103a`: from 64 mean unit tiles on; the copy walks the same units in
+  the same order there and measured faster).  A fallback kind takes its
   own `sample_class_rule` class and `check_period_kind_overrides` period
   (`cake_policy.fallback_knobs`): an `l6` program run for a `wide` decision
   samples like an `l6` decision, while the FP8 `wide` program keeps the
@@ -274,6 +277,7 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 | unpaired wide unit | where the record sets `wide_pair_snake_only` (sm_107a), a sampled call keeps the CTA pair of the wide unit only where the pair program walks the snake order; elsewhere it runs the unpaired wide program when that program is registered |
 | unpaired three-warpgroup preference | a call whose plan does not split takes the `block_q_l6` unit without a CTA pair: with the sampled first threshold off (`sample_tiles_max=0`), where the record sets `l6_solo_unsampled_max_queries` (sm_100a, sm_103a: 16384) only a call planned on the CTA-pair l6 unit of at most that many queries (other units keep their plan), else always where the record sets `l6_solo_rule` (sm_107a); on a sampled call, where the record sets `l6_solo_rule`, with at least `l6_solo_rule[1]` segments or at most `l6_solo_rule[0]` mean unit tiles; only where the l6 unit would not split either and the program it picks is registered (`PROGRAM_KEYS[arch]`, which the backend passes to `select_program`; without it the preference stays off), else the plan of the rows above |
 | unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors; an FP8 call runs a snake program only within `snake_cap_rule` [max segments, max waves of the persistent grid] (the FP8 record of `sm_107a`: [1, 40]; None elsewhere) |
+| segment order | the longest-first copy (`:lsf`) where the record sets `lsf_programs` and the call packs at least two key segments that are not all equal (`max_seqlen_k` decides; without it the copy runs); an FP8 call of the `wide` unit on one segment also runs it from `lsf_single_rule[0]` mean unit tiles on (the FP8 record of `sm_103a`: [64.0]; None elsewhere) |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
 | sampled rank shift | `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`; an explicit `sample_shift_permille=` knob overrides both.  A launch scalar only: it sets how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or an output bit; unsampled calls (`sample_tiles_max=0`) do not read it |

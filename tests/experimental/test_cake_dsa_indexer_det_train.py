@@ -136,6 +136,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    lsf_single_rule=None,
     static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
@@ -791,6 +792,13 @@ def test_policy_record_round_trip_and_validation():
         dict(snake_cap_rule=[1, 0]),
         dict(snake_cap_rule=[1.0, 40]),
         dict(snake_cap_rule=[True, 40]),
+        # the FP8 one-segment longest-first rule: [min mean unit tiles >= 0] or None
+        dict(lsf_single_rule=64.0),
+        dict(lsf_single_rule=[]),
+        dict(lsf_single_rule=[64.0, 1]),
+        dict(lsf_single_rule=[-1.0]),
+        dict(lsf_single_rule=[True]),
+        dict(lsf_single_rule=["64"]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -873,6 +881,14 @@ def test_policy_record_round_trip_and_validation():
     assert not capped.snake_copy_fits(65536, 1, 6, 212)
     assert not capped.snake_copy_fits(32768, 2, 6, 212)
     assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
+    single = DispatchPolicy.from_record(dict(record, lsf_single_rule=(64,)))
+    assert single.record()["lsf_single_rule"] == [64]
+    assert DispatchPolicy.from_record(single.record()) == single
+    # mean unit tiles (Tkv - T / (2 ratio)) / S / 128: 16384 x 16384 take 64, 16384 x 15360 take 56
+    assert single.lsf_single_fits(16384, 16384, 1, 1)
+    assert not single.lsf_single_fits(16384, 15360, 1, 1)
+    assert not single.lsf_single_fits(32768, 32768, 2, 1)
+    assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
     walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
     assert walked.desc_walk_kinds == [["wide"], []]
     assert walked.record()["desc_walk_kinds"] == [["wide"], []]
