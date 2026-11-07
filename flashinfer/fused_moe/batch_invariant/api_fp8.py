@@ -117,8 +117,14 @@ class MoEWeightsE4M3:
         dev = fc1.device
         w1i = fc1.contiguous() if (interleaved or not gated) else interleave_fc1(fc1)
         m_w1, m_w2 = weight_multipliers(w1i), weight_multipliers(fc2)
-        w1q = quantize_e4m3_static(w1i, m_w1.view(E, 1, 1)).contiguous()
-        w2q = quantize_e4m3_static(fc2.contiguous(), m_w2.view(E, 1, 1)).contiguous()
+        # per expert: the vectorised rounding holds several fp32-sized temporaries, so a whole [E, N, K] at once would need
+        # a multiple of the bf16 weights' memory
+        w1q = torch.stack(
+            [quantize_e4m3_static(w1i[e], m_w1[e]) for e in range(E)]
+        ).contiguous()
+        w2q = torch.stack(
+            [quantize_e4m3_static(fc2[e], m_w2[e]) for e in range(E)]
+        ).contiguous()
         m_x = _scale_tensor(
             hidden_states_scale_global, "hidden_states_scale_global", dev
         )
