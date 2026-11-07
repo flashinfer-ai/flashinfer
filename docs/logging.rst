@@ -347,7 +347,12 @@ Public wrappers that delegate to an internal custom op must declare mutations
 at the logged boundary, using ``@flashinfer_api(mutates_args=("q", "k"))``.
 The internal custom op's declaration alone does not describe its caller's
 arguments. The public in-place RoPE APIs carry these declarations; arbitrary
-undeclared mutations cannot be inferred by the logger.
+undeclared mutations cannot be inferred by the logger. The stateful APIs
+``append_paged_kv_cache``, ``rope_quantize_fp8_append_paged_kv_cache``,
+``gated_delta_rule_decode*``, ``gated_delta_rule_mtp`` and
+``selective_state_update`` still lack these declarations and are tracked as a
+follow-up in issue #7934. Until then, a snapshot of such a call records
+post-call state and must not be treated as a verified pre-call replay.
 
 For APIs returning ``None``, the mutated tensors are saved under
 ``mutated_input__<input-key>`` in ``outputs.pt``. ``replay_from_dump(...,
