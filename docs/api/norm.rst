@@ -221,18 +221,18 @@ Training SiLU-gated RMSNorm (Cake)
 backward for training on SM100, SM103 and SM107: rows of 128 (``[T, H, 128]``
 or ``[T * H, 128]``) normalized per head with FP32 statistics and gate, BF16
 inputs, outputs and gradients, a weight shared by every token and head whose
-gradient is summed in a fixed order (repeated calls return the same bits), and
-an autograd wrapper that saves only its inputs.  The forward runs one of several
-fixed-order modules chosen from the row count and the SM count (a short forward
-up to 12 rows per SM, 59 on SM107; from 976 rows per SM, 800 on SM107,
-persistent forwards whose CTAs each walk a few row blocks); every module returns
-the same bits.  Beside a kernel on another stream that holds ``k`` of the ``N``
-SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
-plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
-no later than the plain forward (within 2 % or 1.5 microseconds).
-On SM107 with fewer than 205 SMs, as on a small MIG instance, the short
-forward's grid at 59 rows per SM is more than one wave, and this bound of the
-short forward is not shown there.
+gradient is summed in FP32 runs of at most 16 rows and added exactly in fixed
+point (repeated calls with the same row count on a device with the same SM
+count return the same bits), and an autograd wrapper that saves only its
+inputs.  The forward computes ``rstd`` and the gate with the approximate FP32
+reciprocal square root, base-2 exponential and reciprocal, so ``y`` can differ
+from the correctly rounded FP32 formula by one BF16 unit in the last place near
+a BF16 rounding boundary.  The forward's CTAs each walk at most two row blocks,
+and the backward's CTAs claim row blocks past one wave.  Beside a kernel on
+another stream that holds ``k`` of the ``N`` SMs, the forward takes at most
+``N / (N - k)`` times its time alone, plus one CTA's share of the row blocks,
+plus 0.02.  The backward's workspace (18952 bytes, zero-filled) is left zero
+by every call, so one workspace serves every later call on its stream.
 
 .. rubric:: Mode and dispatch rules
 
@@ -262,11 +262,10 @@ short forward is not shown there.
    host: a CUDA Graph checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
-   and run the backward of their own package.  A backward workspace holds the
-   raw partial sums of one package and serves only that package (FP32 for the
-   deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``), also in a call
-   with no rows.
+   and run the backward of their own package.  A backward workspace serves
+   only its own package (the deterministic package's is FP32, the
+   non-deterministic package's is not): each backward refuses the other
+   package's workspace (``ValueError``), also in a call with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
@@ -318,7 +317,7 @@ From v0.7.4rc1 a former entry ran the deterministic package by default
       - ``cake_rmsnorm_silu_gate_det_train_backward_workspace``
       - ``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``
     * - ``cake_rmsnorm_silu_gate_train_reset_workspace``
-      - (none: the deterministic workspace needs no reset)
+      - ``cake_rmsnorm_silu_gate_det_train_reset_workspace``
       - ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``
     * - ``is_cake_rmsnorm_silu_gate_train_supported``
       - ``is_cake_rmsnorm_silu_gate_det_train_supported``
@@ -334,6 +333,7 @@ From v0.7.4rc1 a former entry ran the deterministic package by default
     cake_rmsnorm_silu_gate_det_train_backward
     cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
     cake_rmsnorm_silu_gate_det_train_backward_workspace
+    cake_rmsnorm_silu_gate_det_train_reset_workspace
     CakeRMSNormSiLUGateDetFunction
     is_cake_rmsnorm_silu_gate_det_train_supported
 

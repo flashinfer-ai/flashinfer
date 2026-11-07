@@ -19,33 +19,31 @@ Forward, per row of 128 of ``x`` and the matching row of the separate gate
 input ``z`` (``[T, H, 128]`` or ``[T * H, 128]``, BF16; ``weight`` ``[128]``
 shared by every token and head)::
 
-    rstd = 1 / sqrt(mean(x^2) + eps)                     # FP32
+    rstd = 1 / sqrt(mean(x^2) + eps)                     # FP32, approximate rsqrt
     y    = BF16(((x * rstd) * weight) * silu(z))         # FP32, one rounding
 
 This is ``RMSNorm(x) * weight * SiLU(z)``, not :func:`flashinfer.norm.fused_rmsnorm_silu`
 (``SiLU(RMSNorm(x))``).  The backward recomputes the statistics and the gate
 from ``x`` and ``z`` and returns BF16 ``dx`` and ``dz`` and the weight
-gradient summed over every token and head (FP32 per CTA chunk, FP64 over the
-chunks in an order fixed by the row count, one rounding), so repeated calls
-return the same bits.  The autograd function saves only its inputs, which keeps
+gradient summed over every token and head (FP32 runs of at most 16 rows, added
+exactly in fixed point, one rounding), so repeated calls with the same row
+count on a device with the same SM count return the same bits.  The autograd
+function saves only its inputs, which keeps
 ``torch.utils.checkpoint(..., use_reentrant=False)`` free of FP32 temporaries.
 No call synchronizes the host or the device; ``T`` and ``H`` are runtime values.
 
-The forward runs one of several fixed-order modules, chosen from the row count
-and the device's SM count: a short forward up to 12 rows per SM (59 on SM107),
-the plain forward, and from 976 rows per SM (800 on SM107) persistent forwards
-whose CTAs each walk a few row blocks.  Every module computes a row with the
-same FP32 operations in the same order, so ``y`` is the same bits on every
-route, and the backward reads only the upstream gradient, ``x``, ``z`` and
-``weight``.  No module waits for another CTA or grid.  Beside a kernel on
-another stream that holds ``k`` of the ``N`` SMs, a persistent forward takes
-at most ``N / (N - k)`` times its time alone, plus the share of one CTA's row
-blocks in the call, plus 0.02 (a CTA whose slot that kernel holds walks all of
-its blocks once it starts); the short forward ends no later than the plain
-forward beside the same kernel, within 2 % or 1.5 microseconds.  On SM107 with
-fewer than 205 SMs, as on a small MIG instance, the short forward's grid at
-59 rows per SM is more than one wave, and this bound of the short forward is
-not shown there.
+The forward computes ``rstd`` and the gate with the approximate FP32
+reciprocal square root, base-2 exponential and reciprocal, so ``y`` can differ
+from the correctly rounded FP32 formula by one BF16 unit in the last place
+where that value lies within a few FP32 units in the last place of a BF16
+rounding boundary; for finite ``z`` below about ``-87.3`` the gate is ``-0``.  The
+forward's CTAs each walk at most two blocks of 16 rows, and the backward's
+CTAs, past one wave, claim chunks of row blocks from a counter, so a CTA that
+becomes resident late takes only the blocks left.  No kernel waits for another
+CTA or grid.  Beside a kernel on another stream that holds ``k`` of the ``N``
+SMs, the forward takes at most ``N / (N - k)`` times its time alone, plus the
+share of one CTA's row blocks in the call, plus 0.02 (a CTA whose slot that
+kernel holds walks all of its blocks once it starts).
 
 Mode and dispatch rules (the same in
 :mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` and
@@ -77,11 +75,10 @@ Mode and dispatch rules (the same in
    host: a CUDA Graph checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
-   and run the backward of their own package.  A backward workspace holds the
-   raw partial sums of one package and serves only that package (FP32 for the
-   deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``), also in a call
-   with no rows.
+   and run the backward of their own package.  A backward workspace serves
+   only its own package (the deterministic package's is FP32, the
+   non-deterministic package's is not): each backward refuses the other
+   package's workspace (``ValueError``), also in a call with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.  The SiLU-gated RMSNorm section
@@ -94,7 +91,8 @@ Usage::
     y = cake_rmsnorm_silu_gate_det_train_forward(x, z, weight, eps)
     dx, dz, dw = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, weight, eps)
 
-    # FP32 main-grad accumulation and a caller-owned workspace
+    # FP32 main-grad accumulation and a caller-owned workspace (zero-filled;
+    # every backward leaves it zero, so it serves every later call on its stream)
     ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(T * H, x.device)
     cake_rmsnorm_silu_gate_det_train_backward(
         dy, x, z, weight, eps, grad_weight=main_grad, accumulate_grad_weight=True,
@@ -163,8 +161,10 @@ def cake_rmsnorm_silu_gate_det_train_forward(
 ) -> torch.Tensor:
     r"""SiLU-gated RMSNorm forward: ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
-    ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128), in FP32;
-    ``silu(z) = z / (1 + exp(-z))`` in FP32; one rounding to BF16 at the end.
+    ``rstd = 1 / sqrt(mean(x^2) + eps)`` over the last dimension (128) and
+    ``silu(z) = z / (1 + exp(-z))``, in FP32 with the approximate reciprocal
+    square root, base-2 exponential and reciprocal; one rounding to BF16 at the
+    end.  The same inputs give the same bits at every call.
 
     Parameters
     ----------
@@ -194,8 +194,10 @@ def cake_rmsnorm_silu_gate_det_train_forward(
 def cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
     rows: int, device: torch.device
 ) -> int:
-    """Bytes of the backward's FP32 weight-gradient partial buffer for ``rows``
-    rows (``T * H``) on ``device``: ``chunks * 128 * 4``.
+    """Bytes of the caller-owned backward workspace for ``rows`` rows
+    (``T * H``) on ``device``: the weight gradient's fixed-point digit
+    counters, one flag word a column, the arrival ticket and the claim counter,
+    18952 bytes whatever ``rows``.
 
     Parameters
     ----------
@@ -219,9 +221,12 @@ def cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
 def cake_rmsnorm_silu_gate_det_train_backward_workspace(
     rows: int, device: torch.device
 ) -> torch.Tensor:
-    """A caller-owned backward workspace for ``rows`` rows: an uninitialized
-    FP32 tensor of :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
-    bytes (the backward writes every element it reads).
+    """A caller-owned backward workspace for ``rows`` rows: a zero-filled FP32
+    tensor of :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
+    bytes.  The backward leaves it zero after every call, so it serves every
+    later call on its stream (any ``T`` and ``H``, BF16 or FP32 weight
+    gradient) and every CUDA Graph replay without a reset; a backward that may
+    run at the same time on another stream needs its own workspace.
 
     Parameters
     ----------
@@ -233,10 +238,36 @@ def cake_rmsnorm_silu_gate_det_train_backward_workspace(
     Returns
     -------
     torch.Tensor
-        The uninitialized FP32 workspace on ``device``.
+        The zero-filled FP32 workspace on ``device``.
     """
 
     return _backend().cake_rmsnorm_silu_gate_det_train_backward_workspace(rows, device)
+
+
+@flashinfer_api
+def cake_rmsnorm_silu_gate_det_train_reset_workspace(workspace: torch.Tensor) -> None:
+    """Return a caller-owned backward workspace to its first-use state (all
+    zero).
+
+    Every backward leaves its workspace zero, so reuse across calls, shapes,
+    weight-gradient dtypes and CUDA Graph replays needs no reset.  A workspace
+    that did not come from
+    :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace`, or that
+    something else wrote into (a launch that did not complete, another use of
+    the buffer), must be reset before its next backward.  The fill runs on the
+    current stream without a host synchronization (it can be captured in a CUDA
+    Graph).
+
+    Parameters
+    ----------
+    workspace : torch.Tensor
+        A contiguous, 16-byte aligned FP32 CUDA tensor of at least
+        :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`
+        bytes; a workspace of the non-deterministic package is refused
+        (``ValueError``).
+    """
+
+    _backend().cake_rmsnorm_silu_gate_det_train_reset_workspace(workspace)
 
 
 @flashinfer_api
@@ -263,8 +294,9 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         dw = sum over every token and head of a * n
 
     in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
-    is accumulated in FP32 per CTA chunk and in FP64 over the chunks, in an
-    order fixed by the row count, and rounded once.
+    is summed in FP32 runs of at most 16 rows, added exactly in fixed point
+    whatever the order of the CTAs, and rounded once: the same row count on a
+    device with the same SM count gives the same bits.
 
     Parameters
     ----------
@@ -283,13 +315,13 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         Add the gradient to ``grad_weight``'s current value before the one
         rounding (needs ``grad_weight``).
     compute_grad_weight : bool
-        ``False`` skips the weight-gradient reduction and returns ``None`` for it.
+        ``False`` skips the weight-gradient result and returns ``None`` for it.
     workspace : torch.Tensor, optional
-        FP32 tensor of at least
+        Zero-filled FP32 workspace of at least
         :func:`cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes` bytes,
-        contiguous; allocated on the current stream when omitted.  The FP64
-        workspace of the non-deterministic package is refused
-        (``ValueError``), also in a call with no rows.
+        contiguous and 16-byte aligned, left zero by the call; the stream's
+        own workspace when omitted.  A workspace of the non-deterministic
+        package is refused (``ValueError``), also in a call with no rows.
 
     Returns
     -------
@@ -359,5 +391,6 @@ __all__ = [
     "cake_rmsnorm_silu_gate_det_train_backward_workspace",
     "cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_det_train_forward",
+    "cake_rmsnorm_silu_gate_det_train_reset_workspace",
     "is_cake_rmsnorm_silu_gate_det_train_supported",
 ]
