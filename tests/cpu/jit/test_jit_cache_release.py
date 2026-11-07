@@ -279,6 +279,23 @@ def test_release_build_workflow_defines_expected_jobs():
     }
 
 
+def test_shim_builds_on_runner_without_builder_image():
+    """The metadata-only shim must not pay for the builder image or torch."""
+    steps = _workflow("release-build.yml")["jobs"]["build-flashinfer-jit-cache-shim"][
+        "steps"
+    ]
+    checkout = next(step for step in steps if step.get("name") == "Checkout code")
+    build = next(step for step in steps if step.get("name") == "Build shim wheel")
+
+    assert "submodules" not in checkout["with"]
+    assert any(
+        str(step.get("uses", "")).startswith("actions/setup-python@") for step in steps
+    )
+    assert build["run"] == "bash scripts/build_jit_cache_shim_wheel.sh"
+    assert "DOCKER_IMAGE" not in build["env"]
+    assert "PYTORCH_INDEX" not in build["env"]
+
+
 def test_release_pr_dry_run_watches_shared_workflow():
     release = _workflow("release.yml")
     paths = release.get("on", release.get(True))["pull_request"]["paths"]
