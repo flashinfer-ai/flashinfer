@@ -1249,6 +1249,13 @@ def top_p_sampling_from_probs(
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
 
+    Sort by probability descending, then original token index ascending. Keep
+    the shortest prefix reaching ``top_p``, including the crossing token.
+    This selected set is independent of ``deterministic``.
+    Compare cumulative input probabilities directly with ``top_p``; the threshold
+    is not scaled by the row sum. Supply nonnegative, normalized probabilities.
+    ``top_p >= 1`` disables top-p filtering.
+
     Parameters
     ----------
     probs: torch.Tensor
@@ -1379,6 +1386,10 @@ def top_k_sampling_from_probs(
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
+
+    Keep exactly ``min(top_k, num_classes)`` positions by probability descending,
+    then original token index ascending. This selected set is independent of
+    ``deterministic`` and matches :func:`top_k_renorm_probs`.
 
     Parameters
     ----------
@@ -1677,23 +1688,28 @@ def _top_k_first_fast_path(
     """Shared "top_k_first" fast path for both the logits and probs entry points.
 
     Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
-    top-p sampling over only those k entries. ``sorted=True`` gives an identical,
-    deterministic ordering for both logits and probs inputs, so the two entry points
-    reduce to the same ``probs_k`` and stay sample-aligned. Passing ``indices`` through
-    the compact sampling step also keeps the exact-k boundary-tie behavior independent
-    of whether ``indices`` is provided, without expanding the compact rows.
+    top-p sampling over only those k entries. Restore original-index order before
+    normalization so ties created by softmax rounding use the same order as the
+    full-vocab path. Passing ``indices`` through the compact sampling step also
+    keeps the exact-k boundary convention independent of whether ``indices`` is
+    provided, without expanding the compact rows.
 
     A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
     its own k leaves exactly its top-k.
     """
     # Local import avoids a module-level cycle between sampling and topk.
-    from .topk import top_k as _radix_top_k
+    from .topk import TopKTieBreak, top_k as _radix_top_k
 
-    # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
-    # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
+    # Selection must obey SMALL even for nondeterministic random draws. Keeping
+    # deterministic index order also avoids sorting scalar-k outputs; tensor
+    # thresholds first need value order to mask each row past its own k.
     select_k = top_k if isinstance(top_k, int) else top_k_max
     values, gathered_indices = _radix_top_k(
-        x, select_k, sorted=True, deterministic=deterministic
+        x,
+        select_k,
+        sorted=not isinstance(top_k, int),
+        deterministic=True,
+        tie_break=TopKTieBreak.SMALL,
     )
     values = values.float()
     if not isinstance(top_k, int):
@@ -1704,6 +1720,11 @@ def _top_k_first_fast_path(
         values = values.masked_fill(
             cols >= row_k, float("-inf") if from_logits else 0.0
         )
+        # The subsequent top-p kernel sees gathered column indices. Sorting
+        # these by original index also handles ties introduced by normalization.
+        original_order = gathered_indices.argsort(dim=-1)
+        gathered_indices = gathered_indices.gather(1, original_order)
+        values = values.gather(1, original_order)
     if from_logits:
         # softmax over the k retained logits == top-k-masked softmax over the full vocab.
         probs_k = torch.softmax(values, dim=-1)
@@ -1760,6 +1781,11 @@ def top_k_top_p_sampling_from_logits(
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
+
+    Both filters rank by value descending, then original token index ascending.
+    Top-k keeps exactly k positions; top-p keeps the shortest prefix reaching its
+    threshold, including the crossing token. ``deterministic`` does not change
+    this convention. The two filter orders retain their normalization semantics.
 
     Parameters
     ----------
@@ -1940,6 +1966,16 @@ def top_k_top_p_sampling_from_probs(
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
 
+    Both filters rank by probability descending, then original token index
+    ascending. Top-k keeps exactly k positions; top-p keeps the shortest prefix
+    reaching its threshold, including the crossing token. ``deterministic`` does
+    not change this convention. The two filter orders retain their normalization
+    semantics.
+
+    For probability inputs, top-p compares cumulative input mass directly with
+    ``top_p`` (after top-k renormalization for ``top_k_first``). Supply
+    nonnegative, normalized probabilities; ``top_p >= 1`` disables top-p filtering.
+
     Parameters
     ----------
     probs: torch.Tensor
@@ -2110,6 +2146,13 @@ def top_p_renorm_probs(
 
     Uses AIR Top-P algorithm (radix-based) for efficient threshold finding.
 
+    Sort by probability descending, then original token index ascending. Keep
+    the shortest prefix reaching ``top_p``, including the crossing token, and
+    renormalize its mass. This matches :func:`top_p_sampling_from_probs`.
+    Compare cumulative input probabilities directly with ``top_p``, without
+    scaling it by the row sum. Supply nonnegative, normalized probabilities.
+    ``top_p >= 1`` disables filtering and only normalizes the input.
+
     Parameters
     ----------
     probs: torch.Tensor
@@ -2119,8 +2162,8 @@ def top_p_renorm_probs(
         re-normalizing probabilities, should be in ``(0, 1)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
-        We mask out the probabilities less than `threshold` where the cumulative sum
-        of ``probs[probs >= threshold]`` is `top_p`, and renormalize the probabilities.
+        Keep the shortest prefix in descending probability and ascending index order
+        whose probability mass reaches ``top_p``, then renormalize.
     is_deterministic: bool
         If True, use deterministic integer accumulation for reproducible results. This will affect performance.
         Default is False.
@@ -2196,6 +2239,10 @@ def top_k_renorm_probs(
     is_deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
+
+    Keep exactly ``min(top_k, num_classes)`` positions by probability descending,
+    then original token index ascending, and renormalize their mass. The selected
+    set is independent of ``is_deterministic`` and matches :func:`top_k_sampling_from_probs`.
 
     Parameters
     ----------
@@ -2277,6 +2324,9 @@ def top_k_mask_logits(
     logits: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
     r"""Fused GPU kernel for masking logits by top-k thresholding.
+
+    Keep exactly ``min(top_k, num_classes)`` positions by logit descending,
+    then original token index ascending. Set all other positions to negative infinity.
 
     Parameters
     ----------
