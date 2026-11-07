@@ -59,6 +59,8 @@ E128_TURN = "cake_kda_prefill_0000000000000000e128"
 PRELOAD_BIN = "cake_kda_prefill_000000000000000071e0"
 # The bounded N32 plain module: its work-binned program has a TMEM-preload build.
 PRELOADED = "cake_kda_bf16_02c6dae5d13691ae05c3"
+# The N16 module whose work-binned program has a TMEM-preload build.
+PRELOADED_N16 = "cake_kda_bf16_51e813006f17147a02a5"
 REFUSED = RuntimeError(
     f"kernel_{BIN_MIX}: cudaLaunchKernelExC failed: too many blocks in cooperative launch"
 )
@@ -467,24 +469,38 @@ def test_preload_scope_and_program_lookup(monkeypatch):
             assert lookup(other, arch, [64] * 64, 16, 148, True, True) is None, module
 
 
-def test_shipped_loader_names_the_bounded_preload_build():
-    # The TMEM-preload build of the bounded N32 plain module's work-binned
-    # build: one program for both architectures, beside the work-binned
-    # program (the route of every other work-binned launch).
+@pytest.mark.parametrize(
+    ("module", "heads", "arches"),
+    [(PRELOADED, 16, ["sm_100a", "sm_103a"]), (PRELOADED_N16, 12, ["sm_103a"])],
+    ids=["n32", "n16"],
+)
+def test_shipped_loader_names_the_bounded_preload_build(module, heads, arches):
+    # The TMEM-preload builds of the bounded N32 plain module's and the N16
+    # module's work-binned builds, beside the work-binned program (the route of
+    # every other work-binned launch): the N32 build for both architectures,
+    # the N16 build for sm_103a alone (every N16 work-binned launch on sm_100a
+    # keeps the work-binned program).
     routes = registry._RENDERED_WORK_BIN_PRELOAD_ROUTES
     assert set(routes) == {"sm_100a", "sm_103a"}
+    assert list(routes["sm_100a"]) == [PRELOADED]
+    assert sorted(routes["sm_103a"]) == sorted([PRELOADED, PRELOADED_N16])
+    assert routes["sm_100a"][PRELOADED] == routes["sm_103a"][PRELOADED]
+    lookup = runtime._work_bin_preload_program
     for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
-        assert list(routes[arch]) == [PRELOADED], arch
-        program = routes[arch][PRELOADED]
-        work_bin = WORK[arch][PRELOADED]
+        work_bin = WORK[arch][module]
+        if arch not in arches:
+            assert module not in routes[arch], arch
+            assert (
+                lookup(work_bin, arch, [64] * 64, heads, sm_count, True, True) is None
+            )
+            continue
+        program = routes[arch][module]
         assert program != work_bin and program not in TURN[arch].values()
-        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
-        lookup = runtime._work_bin_preload_program
-        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, True) == program
-        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, True, False) is None
-        assert lookup(work_bin, arch, [64] * 64, 16, sm_count, False, True) is None
-        assert lookup(work_bin, arch, [33] * 64, 16, sm_count, True, True) is None
-    assert routes["sm_100a"] == routes["sm_103a"]
+        assert registry._RENDERED_MODULES[program]["arches"] == arches
+        assert lookup(work_bin, arch, [64] * 64, heads, sm_count, True, True) == program
+        assert lookup(work_bin, arch, [64] * 64, heads, sm_count, True, False) is None
+        assert lookup(work_bin, arch, [64] * 64, heads, sm_count, False, True) is None
+        assert lookup(work_bin, arch, [33] * 64, heads, sm_count, True, True) is None
 
 
 def test_long_task_program_lookup(monkeypatch):
