@@ -27241,7 +27241,8 @@ void SeedAccumulator(TensorView out, TensorView accumulator) {
 // The aligned entry's copy back from its FP32 accumulator, -0 at rest (block nvfp4_batch_drain):
 // out = bf16_rn(accumulator + float32(out)), the FP32 sum rounded to nearest with no flush of a subnormal sum, then
 // accumulator = -0, the additive identity, so the next call on the stream starts from it without a fill and an
-// element no route reaches keeps its exact bits, including -0; eight values per thread. The
+// element no route reaches keeps its value, including -0 (a NaN stays a NaN, but the add may change its payload);
+// eight values per thread. The
 // kernel reads and writes 16-byte vectors: out contiguous with a multiple of eight elements, both tensors 16-byte
 // aligned and disjoint.
 void DrainAccumulator(TensorView accumulator, TensorView out) {

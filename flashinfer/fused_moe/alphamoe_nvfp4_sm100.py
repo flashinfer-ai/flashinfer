@@ -301,7 +301,8 @@ def get_alphamoe_nvfp4_sm100_module():
 # the FP32 additive identity, whenever no call on its stream is in flight: a
 # call adds every route into it, and its last launch, the drain, writes
 # out = bf16(accumulator + float32(out)) and stores -0 back, so an element no
-# route reaches keeps its exact BF16 bits, including -0. The lock keeps one
+# route reaches keeps its BF16 value, including -0 (a NaN stays a NaN, but the
+# add may change its payload). The lock keeps one
 # call's launches together when several host threads share a stream.
 _ALIGNED_ACCUMULATORS: collections.OrderedDict[tuple[int, int], torch.Tensor] = (
     collections.OrderedDict()
@@ -511,7 +512,8 @@ def alphamoe_nvfp4_aligned_moe(
     accumulator that starts at negative zero, the additive identity; the last
     launch adds it to the caller-owned BF16 ``out`` with one rounding,
     ``out = bf16(accumulator + float32(out))``, and stores negative zero back.
-    An element no route reaches keeps its exact bits, including ``-0``.
+    An element no route reaches keeps its value, including ``-0``; a NaN stays
+    a NaN, but the add may change its payload.
 
     Outside CUDA graph capture the accumulator is reused across calls: one
     buffer per device and stream, sized by the largest output of at most
