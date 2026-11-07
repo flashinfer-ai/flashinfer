@@ -127,9 +127,9 @@ def test_single_rank_entries_raise_no_deterministic_alert(name, make, kw) -> Non
 
 def _one_rank_context(lens, cuts, device):
     """A one-rank KCP context (the KDA KCP plan) over documents ``lens`` cut into fragments ``cuts``."""
-    from flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan import (
-        build_context_det_kcp,
-        partition_det_kcp,
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp.cake_kcp_plan import (
+        cake_kda_det_train_kcp_build_context,
+        cake_kda_det_train_kcp_partition,
     )
 
     cu = [0]
@@ -144,8 +144,12 @@ def _one_rank_context(lens, cuts, device):
             frags.append((d, p - cu[d], e - p))
             p = e
         pos = end
-    part = partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, fragments=[frags])
-    return build_context_det_kcp(part, None, 0, device, conv_kernel_size=WIDTH)
+    part = cake_kda_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, fragments=[frags]
+    )
+    return cake_kda_det_train_kcp_build_context(
+        part, None, 0, device, conv_kernel_size=WIDTH
+    )
 
 
 @pytest.mark.parametrize("cooperative", [True, False], ids=["cooperative", "split"])

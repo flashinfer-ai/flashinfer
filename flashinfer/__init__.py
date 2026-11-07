@@ -207,6 +207,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_causal_conv1d_det_train",
         "cake_causal_conv1d_det_train_forward_workspace_bytes",
     ),
+    "cake_gdn_det_train": (".cake_gdn_det_train", None),
+    "cake_gdn_det_train_kcp": (".cake_gdn_det_train_kcp", None),
+    "cake_gdn_nondet_train": (".cake_gdn_nondet_train", None),
+    "cake_gdn_nondet_train_kcp": (".cake_gdn_nondet_train_kcp", None),
     "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
     "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
     "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
@@ -277,6 +281,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_rmsnorm_silu_gate_nondet_train",
         "CakeRMSNormSiLUGateNondetFunction",
     ),
+    # KDA chunked training (Cake), both modes, single rank and KCP: the facade
+    # modules; each imports its backend package (under
+    # flashinfer.experimental.cake) on first use.
+    "cake_kda_det_train": (".cake_kda_det_train", None),
+    "cake_kda_det_train_kcp": (".cake_kda_det_train_kcp", None),
+    "cake_kda_nondet_train": (".cake_kda_nondet_train", None),
+    "cake_kda_nondet_train_kcp": (".cake_kda_nondet_train_kcp", None),
 }
 
 

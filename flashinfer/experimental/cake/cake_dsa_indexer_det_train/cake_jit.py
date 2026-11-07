@@ -984,6 +984,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "lsf_single_rule": None,
         "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1066,6 +1067,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "lsf_single_rule": None,
         "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1164,6 +1166,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": None,
         "lsf_programs": False,
+        "lsf_single_rule": None,
         "static_scan_kinds": ["l6", "pair_l6"],
         "far_sample": 0,
         "check_period_max": 32,
@@ -1202,23 +1205,37 @@ POLICY: dict[str, dict[str, Any]] = {
 # record with these fields replaced (``cake_policy.fp8_policy_record``); each
 # names its own ``static_scan_kinds``: on sm_107a every FP8 scan program keeps
 # the static unit enumeration.  sm_107a keeps no split-fit rule until the FP8
-# split programs are measured under one.  On sm_100a the FP8 wide program
-# decides by waves of the persistent grid (wide_wave_rule): it takes a call
-# from the narrow unit when the narrow units need at least 1.7 times its waves,
-# and from the three-warpgroup unit when those need at least 1.3 times its
-# waves over at least 84 mean unit tiles.  On sm_107a a call the snake rule
-# marks runs the snake copy of the FP8 l6 program only as one document within
-# 40 waves of the persistent grid (snake_cap_rule): packed documents and longer
-# calls are faster in the plain order.  No FP8 call walks its key tiles in
-# descending order (desc_walk_kinds None): the descending-walk programs are
-# BF16 programs.
+# split programs are measured under one.  On sm_100a and sm_103a the FP8 wide
+# program decides by waves of the persistent grid (wide_wave_rule): it takes a
+# call from the narrow unit when the narrow units need at least 1.7 times its
+# waves, and from the three-warpgroup unit when those need at least 1.3
+# (sm_100a) or 1.15 (sm_103a) times its waves over at least 84 mean unit tiles
+# (sm_100a).  On sm_103a that minimum is 64 mean unit tiles for one document of
+# at least 14 wide waves, 3.5 more per wide wave below that, at least 112 for
+# packed documents and 40 / (W - 1) while the three-warpgroup unit needs W <
+# 1.26 times its waves (160 at W = 1.25, 240 at W = 7 / 6), on packed documents
+# then also 9 / (W - 1) ** 2 (225 at W = 1.2, 324 at W = 7 / 6), and grows as
+# (top_k / 2048) ** 1.1 above top_k 2048 (137 and 240 at top_k 4096); below it
+# the three-warpgroup unit measured faster.  On sm_107a a call the snake rule
+# marks runs the snake copy of the FP8 l6 program only as one document within 40
+# waves of the persistent grid (snake_cap_rule): packed documents and longer
+# calls are faster in the plain order.  On sm_103a a one-document call of the
+# FP8 wide unit runs its :lsf copy from 64 mean unit tiles on (lsf_single_rule):
+# the same units in the same order, measured faster there and slower on shorter
+# units.  No FP8 call walks its key tiles in descending order (desc_walk_kinds
+# None): the descending-walk programs are BF16 programs.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {
         "static_scan_kinds": [],
         "wide_wave_rule": [1.7, 1.3, 84.0],
         "desc_walk_kinds": None,
     },
-    "sm_103a": {"static_scan_kinds": [], "desc_walk_kinds": None},
+    "sm_103a": {
+        "static_scan_kinds": [],
+        "wide_wave_rule": [1.7, 1.15, 64.0, 2048, 1.1, 112.0, 3.5, 14, 1.26, 40.0, 9.0],
+        "lsf_single_rule": [64.0],
+        "desc_walk_kinds": None,
+    },
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
         "split_fit_rule": None,

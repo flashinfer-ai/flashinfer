@@ -2807,6 +2807,185 @@ def test_fp8_h8_prefill_wider_than_1152_is_rejected(arch, page_size):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
+def test_sm107a_fp8_h64_source_exact_row_takes_the_m64_body(arch, sm_count):
+    """The FP8/H64 source-exact row (two ragged requests of up to 257 tokens,
+    topk4x items 640 wide) runs the multi-tile M64 program on SM107, which
+    registers no source-exact program, as its dense twin does; SM100, SM103
+    and an unknown architecture keep the source-exact program.  The route
+    reads the requests through ``max_q_len`` only: 2 x 257, 257 + 100 and the
+    contract's 129 + 257 tokens route alike, with and without the four-stage
+    edges."""
+    for name, registration in _ARCH_REGISTRATIONS.items():
+        on_m64 = name in cake._FP8_H64_SOURCE_EXACT_M64_ARCHES
+        assert ("fp8_h64_source_exact" in registration["variants"]) != on_m64, name
+    m64 = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    expected = m64 if arch == "sm_107a" else "fp8_h64_source_exact"
+    for tokens in (514, 357, _canonical_query_tokens(2, 257, True)):
+        for kv4 in (False, True):
+            route = _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                batch_size=2,
+                max_q_len=257,
+                ragged=True,
+                sparse_topk=640,
+                compressed_page_size=64,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+                kv4=kv4,
+            )
+            assert route == expected, (tokens, kv4, route)
+            if arch is not None:
+                assert get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    # The dense twin runs the M64 program on every architecture.
+    twin = _route(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        batch_size=2,
+        max_q_len=257,
+        ragged=False,
+        sparse_topk=640,
+        compressed_page_size=64,
+        num_query_tokens=514,
+        sm_count=sm_count,
+        arch=arch,
+    )
+    assert twin == m64
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [514, 357])
+def test_sm107a_fp8_h64_source_exact_row_launches_the_m64_program(monkeypatch, tokens):
+    """On SM107 the ragged source-exact row launches the multi-tile M64 program
+    (its four-stage sibling where this process can launch it), one CTA per
+    token with the LSE region of one split, and sizes its workspace as every
+    one-split M64 launch does; SM100 keeps the source-exact program, which
+    takes no workspace."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        num_query_tokens=tokens,
+        sm_count=_SM107_SM_COUNT,
+        sparse_topk=640,
+        compressed_page_size=64,
+        max_q_len=257,
+        batch_size=2,
+        ragged=True,
+    )
+    route = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    assert (m64.route, m64.num_splits, m64.uses_workspace) == (route, 1, True)
+    layout = cake_dsv4_workspace_layout(tokens, 64, 1)
+    assert m64.single_launch_bytes == layout.total_bytes
+    bound = get_cake_dsv4_workspace_bytes(tokens, 64, 640, torch.float8_e4m3fn)
+    assert m64.single_launch_bytes <= bound
+    exact = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_100a")
+    assert (exact.route, exact.uses_workspace) == ("fp8_h64_source_exact", False)
+    assert cake.cake_dsv4_out_phase(route, num_heads=64, sparse_topk=640) is None
+    registered = set(_ARCH_REGISTRATIONS["sm_107a"]["variants"])
+    for launchable, program in ((True, f"{route}_kv4"), (False, route)):
+        monkeypatch.setattr(
+            cake, "_kv4_sibling_launchable", lambda arch, device: launchable
+        )
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=torch.empty(0),
+            num_query_tokens=tokens,
+            num_heads=64,
+            sparse_topk=640,
+            max_q_len=257,
+            batch_size=2,
+            enable_pdl=True,
+        )
+        cake._dispatch_route(route, L)
+        parts = L.partials(1)
+        launch = {"grid": (tokens, 1, 1), "total_work_items": tokens, **parts}
+        assert L.calls == [(program, launch)]
+        assert program in registered
+
+
+# FP8 routes SM107 refuses by design: it builds no low-head decode program for
+# compressed items (get_cake_dsv4_spec names the programs it runs), so
+# run_cake_dsv4 raises for them.  Per route, the head counts that reach it.
+_SM107_REFUSED_FP8_ROUTES = {
+    # 8/16/32-head decode rows over compressed items up to 384 wide.
+    "fp8_lowhead_one_partition": (8, 16, 32),
+    # The 8/16-head shape lock of three ragged requests of up to 5 tokens.
+    "fp8_h8_h16_source_exact": (8, 16),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("kv4", [False, True])
+@pytest.mark.parametrize("sm_count", [208, 212, _SM107_SM_COUNT])
+def test_every_sm107a_fp8_route_result_has_a_registered_kernel_or_is_refused(
+    monkeypatch, sm_count, kv4
+):
+    """Over the route sweep of the SM100 / SM103 guard, at the SM counts of the
+    SM107 parts and with and without the four-stage edges, every FP8 route
+    ``_route`` returns on SM107 launches registered SM107 programs only, or is
+    one of ``_SM107_REFUSED_FP8_ROUTES`` at one of its head counts; every
+    entry of that list is reached and none of them is registered.  The
+    dispatch sees the same SM count and four-stage launch check as the route."""
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    monkeypatch.setattr(cake, "_kv4_sibling_launchable", lambda arch, device: kv4)
+    registered = set(_ARCH_REGISTRATIONS["sm_107a"]["variants"])
+    refused: dict[str, set] = {}
+    routed = rejected = 0
+    for num_heads in (8, 16, 32, 64, 128):
+        for sparse_topk, page_size in _SWEEP_WIDTHS:
+            for batch_size, max_q_len, ragged in _SWEEP_QUERIES:
+                tokens = _canonical_query_tokens(batch_size, max_q_len, ragged)
+                try:
+                    route = _route(
+                        dtype=torch.float8_e4m3fn,
+                        num_heads=num_heads,
+                        max_q_len=max_q_len,
+                        ragged=ragged,
+                        sparse_topk=sparse_topk,
+                        batch_size=batch_size,
+                        compressed_page_size=page_size,
+                        num_query_tokens=tokens,
+                        sm_count=sm_count,
+                        arch="sm_107a",
+                        kv4=kv4,
+                    )
+                except ValueError:
+                    rejected += 1
+                    continue
+                heads = _SM107_REFUSED_FP8_ROUTES.get(route)
+                if heads is not None:
+                    assert num_heads in heads, (route, num_heads)
+                    refused.setdefault(route, set()).add(num_heads)
+                    continue
+                L = _RecordingLauncher(
+                    "sm_107a",
+                    Q=torch.empty(0),
+                    num_query_tokens=tokens,
+                    num_heads=num_heads,
+                    sparse_topk=sparse_topk,
+                    max_q_len=max_q_len,
+                    batch_size=batch_size,
+                )
+                cake._dispatch_route(route, L)
+                launched = [name for name, _ in L.calls]
+                assert launched, route
+                missing = [name for name in launched if name not in registered]
+                assert missing == [], (num_heads, sparse_topk, max_q_len, route)
+                routed += 1
+    assert routed > 0 and rejected > 0
+    want = {route: set(heads) for route, heads in _SM107_REFUSED_FP8_ROUTES.items()}
+    assert refused == want
+    for route in _SM107_REFUSED_FP8_ROUTES:
+        assert route not in registered, route
+        with pytest.raises(ValueError, match="SM107 runs the FP8 decode route"):
+            get_cake_dsv4_spec(route, arch="sm_107a")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 @pytest.mark.parametrize("sm_count", [_SM_COUNT, _SM107_SM_COUNT])
 def test_sm107a_lowhead_swa_decode_rows_take_the_m64_body_past_one_wave(

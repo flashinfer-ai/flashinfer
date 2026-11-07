@@ -1218,6 +1218,13 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
+# Architectures that run the FP8/H64 source-exact row (``_route``: two ragged
+# requests of up to 257 tokens over topk4x items 640 wide) on the multi-tile
+# M64 body, as its dense twin: SM107 registers no ``fp8_h64_source_exact``
+# program.  SM100, SM103 and ``arch=None`` keep the source-exact program.
+_FP8_H64_SOURCE_EXACT_M64_ARCHES = frozenset({"sm_107a"})
+
+
 # Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
 # registers no program for it.
 _FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
@@ -1429,9 +1436,11 @@ def _route(
     FP8/H64 decode rows, and on SM107 the FP8 8/16/32-head SWA-only decode
     rows, pick their body by the waves of its grid) and ``arch`` its
     ``sm_XYa`` target (``None``: the architecture-independent choice, which
-    SM107 may not build: it has no BF16 programs).  ``kv4``: the call's
-    multi-tile M64 launches run the four-stage sibling
-    (:func:`_fp8_h64_kv4_edges`); only the FP8/H64 decode rows read it."""
+    may name a program SM107 does not build: it has no BF16 programs, no FP8
+    source-exact program and no FP8 low-head cluster or one-partition
+    program).  ``kv4``: the call's multi-tile M64 launches run the four-stage
+    sibling (:func:`_fp8_h64_kv4_edges`); only the FP8/H64 decode rows read
+    it."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1455,7 +1464,10 @@ def _route(
             and ragged
             and is_topk4x
             and sparse_topk == 640
+            and arch not in _FP8_H64_SOURCE_EXACT_M64_ARCHES
         ):
+            # The source-exact body where it is built; SM107 runs the row on
+            # the M64 body below (_FP8_H64_SOURCE_EXACT_M64_ARCHES).
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
             if num_heads in (16, 32, 64):
@@ -1828,18 +1840,25 @@ def cake_dsv4_workspace_requirement(
     of the device the call runs on (``None``: the current CUDA device's; the
     workspace numbers do not depend on it, the route name may), ``arch`` = its
     ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
-    available, else the architecture-independent route, which SM107 may not
-    build: it has no BF16 programs; the workspace numbers do not depend on it
-    either), ``kv4`` = whether the call's multi-tile M64 launches run the
-    four-stage sibling (:func:`_fp8_h64_kv4_edges`; ``None``: the current CUDA
-    device's answer when ``arch`` is ``None`` and CUDA is available, else
-    ``False``; the workspace numbers do not depend on it either). Raises
+    available, else the architecture-independent route, which may name a
+    program SM107 does not build; the workspace numbers do not depend on it
+    either, except as noted below), ``kv4`` = whether the call's multi-tile
+    M64 launches run the four-stage sibling (:func:`_fp8_h64_kv4_edges`;
+    ``None``: the current CUDA device's answer when ``arch`` is ``None`` and
+    CUDA is available, else ``False``; the workspace numbers do not depend on
+    it either). Raises
     ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
     ``single_launch_bytes`` covers the SM107 split-KV launch of the shape
     (:func:`_k64_split_plan`, with or without PDL) on every architecture.
-    The one exception to the independence above: below 69 SMs some 64-head
+    Two exceptions to the independence above.  Below 69 SMs some 64-head
     split shapes take an M64 route, which never splits, so their
     ``single_launch_bytes`` can depend on ``sm_count``, ``arch`` and ``kv4``.
+    The FP8/H64 source-exact row (two ragged requests, ``max_q_len`` 257,
+    topk4x items 640 wide) takes no workspace where its source-exact program
+    runs (SM100, SM103 and the architecture-independent route) and the LSE
+    region of one split on SM107, which runs it on the M64 route
+    (``_FP8_H64_SOURCE_EXACT_M64_ARCHES``); size it with ``arch="sm_107a"``
+    or :func:`get_cake_dsv4_workspace_bytes`.
     """
     device_arch = arch is None
     if sm_count is None:
