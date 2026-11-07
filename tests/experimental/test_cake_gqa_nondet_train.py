@@ -596,10 +596,13 @@ def _inputs(q_lens, k_lens, h_q, h_kv, device, seed=0):
 
 
 def _reference(x, scale=SCALE):
-    """FP64 out, lse and gradients of the same BF16 inputs (bottom-right causal per segment)."""
-    q = x["q"].double().requires_grad_()
-    k = x["k"].double().requires_grad_()
-    v = x["v"].double().requires_grad_()
+    """FP64 out, lse and gradients of the same BF16 inputs (bottom-right causal per segment), computed on the CPU and
+    returned on the inputs' device: on a GPU, PyTorch may run some FP64 ops of this graph (the outer products of
+    one-row segments) as Triton kernels, which need a ptxas that knows the GPU."""
+    device = x["q"].device
+    q = x["q"].cpu().double().requires_grad_()
+    k = x["k"].cpu().double().requires_grad_()
+    v = x["v"].cpu().double().requires_grad_()
     group = q.shape[1] // k.shape[1]
     outs, lses = [], []
     for b in range(len(x["cq"]) - 1):
@@ -621,14 +624,15 @@ def _reference(x, scale=SCALE):
         lses.append(lse.detach().masked_fill(~has_key[None, :], -math.inf))
     out = torch.cat(outs)
     lse = torch.cat(lses, dim=1)
-    out.backward(x["dout"].double())
-    return {
+    out.backward(x["dout"].cpu().double())
+    ref = {
         "out": out.detach(),
         "lse": lse.detach(),
         "dq": q.grad,
         "dk": k.grad,
         "dv": v.grad,
     }
+    return {name: t.to(device) for name, t in ref.items()}
 
 
 def _assert_dq_close(got: torch.Tensor, ref: torch.Tensor) -> None:
