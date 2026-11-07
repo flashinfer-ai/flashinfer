@@ -97,10 +97,9 @@ Name map (the same verbs in both modes)::
       CakeMHCDetFinishFunction                      CakeMHCNondetFinishFunction
       cake_mhc_det_train_route_key                  cake_mhc_nondet_train_route_key
 
-The model's head has no cross-token reduction and no counterpart in this mode:
-use the deterministic head module ``flashinfer.cake_mhc_head_det_train``
-(``cake_mhc_head_det_train_forward`` / ``cake_mhc_head_det_train_backward`` /
-``cake_mhc_head_det``).
+The model's head is a module of its own in this mode:
+``flashinfer.cake_mhc_head_nondet_train`` (``cake_mhc_head_nondet_train_forward``
+/ ``cake_mhc_head_nondet_train_backward`` / ``cake_mhc_head_nondet``).
 
 Usage::
 
