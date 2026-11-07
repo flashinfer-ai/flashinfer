@@ -177,6 +177,9 @@ def pytest_addoption(parser):
     with contextlib.suppress(argparse.ArgumentError):
         parser.getgroup("flashinfer").addoption(
             "--full",
+            # The sharding plugin also registers --full; pytest>=9.2 rejects a
+            # second option mapping to the same dest unless it is explicit.
+            dest="full",
             action="store_true",
             default=False,
             help="run full parameter matrices instead of regular subsets",

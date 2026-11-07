@@ -32,10 +32,10 @@ def test_batch_attention_run_reference_correctness(
     page_size,
     stride_mode,
     tmp_path,
-    monkeypatch,
+    cuda_matmul_flags,
 ):
     """Check the actual persistent API, including one strided trace-emission case."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     inputs = batch_attention_run_trace.init(
         device="cuda",
         num_qo_tokens=query_tokens,
