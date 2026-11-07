@@ -10,4 +10,5 @@ import BIKernels.Quant
 import BIKernels.QuantExport
 import BIKernels.QuantCases
 import BIKernels.MoE
+import BIKernels.MoEFp8
 import BIKernels.MoECases
