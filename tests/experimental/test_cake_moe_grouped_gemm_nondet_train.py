@@ -23,9 +23,11 @@ kernel); the 512-wide k tile's weight gradient finishes its split tail in the sa
 launch, summing the units' fp32 slots in slot order.
 Every output is checked against a per-group fp64 reference under the
 deterministic package's budgets (bf16: atol = rtol = 1e-2; fp32 weight
-gradient: rel-L2 1e-4), and every repeated launch (the output refilled, the
-split-tail slots poisoned with garbage bytes) must give the first launch's
-bits; the split tail's tickets are checked at rest (zero) after the launches.
+gradient: rel-L2 1e-4, but on the one-group E1 rows, which the reproducibility
+file holds to the deterministic package's error), and every repeated launch
+(the output refilled, the split-tail slots poisoned with garbage bytes) must
+give the first launch's bits; the split tail's tickets are checked at rest
+(zero) after the launches.
 Only this package is imported (through ``cake_package``), so the suite also runs
 against a vendored copy of it.
 
@@ -154,6 +156,15 @@ CUSTOMER_ROWS = tuple(
     (f"e{e}_m{sum_m}_balanced", _aligned_balanced(sum_m, e))
     for sum_m in (112576, 136064)
     for e in (1, 8, 16, 32)
+)
+# The E1 rows reduce 112,576 / 136,064 rows in one group.  There the deterministic
+# package's own fp32 weight gradient has rel-L2 1.17e-4 / 1.41e-4 against the fp64
+# reference on GB300, above FP32_REL_L2, so the fp32 outputs of these rows are held to
+# the deterministic package's error at the same inputs instead (rel-L2 and worst / max
+# |ref| each at most 1.1x, test_e1_fp32_wgrad_error_within_det in the reproducibility
+# file).  Here they keep the bf16 budget, the bitwise repeats and the plan checks.
+DET_RELATIVE_FP32_ROWS = frozenset(
+    label for label, sizes in CUSTOMER_ROWS if len(sizes) == 1
 )
 # Every #5678 row the accuracy tests check: the benchmark rows and the customer rows.
 ACCURACY_ROWS = BENCH_WGRAD_ROWS + CUSTOMER_ROWS
@@ -1148,8 +1159,9 @@ def test_bench_row_ops_match_reference(op, proj, label, sizes):
 def test_bench_wgrad_rows_match_reference(proj, label, sizes, out_dtype):
     """The #5678 MoE projection rows (gate/up K 6144, down K 2048; the benchmark rows
     and the E1 / E8-32 customer rows) of the weight gradient: the first launch within
-    the budget against the fp64 reference with empty groups exact zeros, and a repeat
-    (output refilled, split-tail slots poisoned) with the same bits."""
+    the budget against the fp64 reference (but the fp32 outputs of
+    ``DET_RELATIVE_FP32_ROWS``) with empty groups exact zeros, and a repeat (output
+    refilled, split-tail slots poisoned) with the same bits."""
     device = _require_program("wgrad", out_dtype)
     n, k = BENCH_PROJ[proj]
     x, _w, g, offs = _inputs(sizes, n, k, device, seed=len(label))
@@ -1161,7 +1173,11 @@ def test_bench_wgrad_rows_match_reference(proj, label, sizes, out_dtype):
     worst = []
 
     def check(out):
-        worst.append(_assert_wgrad_close(out, ref))
+        if out.dtype == torch.float32 and label in DET_RELATIVE_FP32_ROWS:
+            # Judged against the deterministic package in the reproducibility file.
+            worst.append(float((out - ref).norm() / ref.norm().clamp_min(1e-30)))
+        else:
+            worst.append(_assert_wgrad_close(out, ref))
         _assert_empty_groups_zero(out, sizes)
 
     _repeat_bits(launch, device, 2, check=check)

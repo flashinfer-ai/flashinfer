@@ -35,6 +35,10 @@ deterministic package's determinism suite (seeded fixed inputs per case):
   ordered one-launch tail builds give the deterministic builds' bits (every
   whole tile is reduced in the deterministic order);
 * the cases reach the ordered split tail on this device for both output dtypes;
+* on the one-group E1 rows (``E1_SUM_M``), where the deterministic package's own
+  fp32 weight gradient exceeds ``FP32_REL_L2``, the non-deterministic fp32 weight
+  gradient's rel-L2 and worst / max |ref| against the fp64 reference are each at
+  most ``DET_ERROR_RATIO`` times the deterministic package's at the same inputs;
 * row-padded ``g`` and ``x`` on the shape of the 256-wide k tile's ``main_wave``
   weight gradient give the deterministic package's bits.
 
@@ -67,6 +71,13 @@ RACE_REPEATS = 50  # the flashinfer-ai/flashinfer#6570 shape
 FILL_BYTE = 0x5A
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient
+# The #5678 E1 customer rows reduce 112,576 / 136,064 rows in one group.  There the
+# deterministic package's own fp32 weight gradient has rel-L2 1.17e-4 / 1.41e-4
+# against the fp64 reference on GB300, above FP32_REL_L2, so these rows use the
+# deterministic package's error at the same inputs as the bar: per output, rel-L2 and
+# worst / max |ref| each at most DET_ERROR_RATIO times the deterministic package's.
+E1_SUM_M = (112576, 136064)
+DET_ERROR_RATIO = 1.1
 
 # The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py.
 BENCH_PROJ = {"gate_up": (4096, 6144), "down": (6144, 2048)}
@@ -784,6 +795,76 @@ def test_row_padded_wgrad_gives_the_deterministic_bits(out_dtype):
     det.launch()
     torch.cuda.synchronize(device)
     assert torch.equal(_bits(out), _bits(det_out))
+
+
+@pytest.mark.parametrize("sum_m", E1_SUM_M)
+@pytest.mark.parametrize("proj", list(BENCH_PROJ))
+def test_e1_fp32_wgrad_error_within_det(proj, sum_m, record_property):
+    """The fp32 weight gradient of an E1 customer row (one group of ``sum_m`` rows):
+    against the fp64 reference, its rel-L2 and worst / max |ref| are each at most
+    ``DET_ERROR_RATIO`` times the deterministic package's at the same inputs, and a
+    repeat (output refilled, split-tail slots poisoned) gives the first launch's bits.
+    On a supported GPU a missing program of either package fails instead of skipping,
+    and a deterministic output that is not finite fails the comparison."""
+    device = _device()
+    case = _case(
+        f"{proj}_e1_m{sum_m}_balanced",
+        "wgrad",
+        BENCH_PROJ[proj],
+        [sum_m],
+        out_dtype=torch.float32,
+    )
+    for backend in (cb, det_cb):
+        assert backend.generated_program_available(
+            device, op="wgrad", out_dtype=torch.float32
+        ), f"no fp32 wgrad program for {backend.arch_for(device)} in {backend.__name__}"
+    a, b, offs = _inputs(case, device)
+    # The per-group fp64 reference, rounded to fp32 (one group).
+    ref = (a.double().T @ b.double()).float().unsqueeze(0)
+    det_out = _out(case, device)
+    det = _prepare(det_cb, case, a, b, offs, det_out)
+    det_out.fill_(float("nan"))
+    det.launch()
+    out = _out(case, device)
+    launch = _prepare(cb, case, a, b, offs, out)
+    first = None
+    for fill in (0, FILL_BYTE):
+        _poison_tail_sums(device)
+        out.view(torch.uint8).fill_(fill)
+        launch.launch()
+        if first is None:
+            first = out.clone()
+        else:
+            assert torch.equal(_bits(out), _bits(first)), f"fill 0x{fill:02x}"
+    torch.cuda.synchronize(device)
+    ref64 = ref.double()
+    ref_max = float(ref64.abs().max())
+
+    def errors(t):
+        diff = t.double() - ref64
+        return float(diff.norm() / ref64.norm()), float(diff.abs().max()) / ref_max
+
+    rel_l2, worst = errors(first)
+    det_rel_l2, det_worst = errors(det_out)
+    record = dict(
+        case=case.label,
+        arch=cb.arch_for(device),
+        sm_count=cb.sm_count(device),
+        stages=list(launch.stages),
+        det_stages=list(det.stages),
+        plan=_plan_record(launch),
+        rel_l2=rel_l2,
+        det_rel_l2=det_rel_l2,
+        worst=worst,
+        det_worst=det_worst,
+        equal_to_det=bool(torch.equal(_bits(first), _bits(det_out))),
+    )
+    print("E1VSDET " + json.dumps(record, sort_keys=True))
+    record_property("e1_vs_det", json.dumps(record, sort_keys=True))
+    assert math.isfinite(det_rel_l2) and math.isfinite(det_worst), record
+    assert det_rel_l2 > 0.0 and det_worst > 0.0, record
+    assert rel_l2 <= DET_ERROR_RATIO * det_rel_l2, record
+    assert worst <= DET_ERROR_RATIO * det_worst, record
 
 
 def test_cases_exercise_the_ordered_tail(record_property):

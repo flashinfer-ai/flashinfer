@@ -468,7 +468,11 @@ The tests and the accuracy measurement hold the outputs to these tolerances:
   (`test_cake_moe_grouped_gemm_nondet_train.py`,
   `test_cake_moe_grouped_gemm_nondet_train_reproducibility.py`).
 - G3, fp32 `dW`: rel-L2 is at most `1e-4` against the fp64 reference (the
-  same two files).
+  same two files). The one-group E1 rows of 112,576 and 136,064 rows are the
+  exception: there the in-tree deterministic package's own fp32 `dW` has
+  rel-L2 `1.17e-4` / `1.41e-4` on GB300, so rel-L2 and worst / max |ref| are
+  each at most 1.1 times that package's error at the same inputs
+  (`test_e1_fp32_wgrad_error_within_det` in the reproducibility test).
 - G4, repeats: the backend suite checks the first launch against the fp64
   reference and requires every repeat (the output refilled, the split-tail
   slots filled with garbage bytes) to give its bits. The reproducibility test
