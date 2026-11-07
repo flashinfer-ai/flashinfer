@@ -138,7 +138,7 @@ builds and a ``tail_reduce`` stage on those routes in the registry (a new
 render), which the host's two-launch path (``partials`` and the tail reduce,
 as for the 256-wide k tile) then binds.  The preparation raises ``ValueError``
 for an architecture in both lists, and for one in neither whose route serves
-no ``tail_reduce`` stage there.
+no ``tail_reduce`` stage there or whose bound build takes the one-launch tail.
 
 Stream workspaces.  The forward and data-gradient programs take a scheduler
 workspace (``sched``: ``sched_words`` u32 words whose first three rest at
@@ -2095,6 +2095,20 @@ def _prepare_wgrad(
             stage_binding(reduce_name, "tail_reduce", arch)["program"]
         ]
         reduce_threads = int(reduce_program["launch"]["block"][0])
+    # The bound main build must take the split tail the host plans: slots and tickets for a
+    # one-launch tail, fp32 partials for the two-launch tail reduce.  (A constants override
+    # can list an architecture in neither list while its route binds a one-launch build
+    # whose reduce route serves a ``tail_reduce`` stage: sm_107a's ``main_halves_k256t``.)
+    main_args = PROGRAMS[stage_binding(name, main_stage, arch)["program"]]["arg_plan"]
+    takes_slots = any(tuple(item) == ("buffer", "tail_sums") for item in main_args)
+    if takes_slots != one_launch:
+        raise ValueError(
+            f"cake_moe_grouped_gemm_nondet_train_prepare_wgrad: route {name!r} binds a "
+            f"{'one-launch' if takes_slots else 'two-launch'} split-tail build for stage "
+            f"{main_stage!r} on {arch}, but the host plan constants give it the "
+            f"{'one-launch' if one_launch else 'two-launch'} tail (ordered_tail_archs / "
+            "unordered_tail_archs)"
+        )
     plan = plan_wgrad(
         sum_m=sum_m,
         num_groups=num_groups,
