@@ -113,6 +113,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         self._workspace_config(fleet_params)
 
     def _default_knobs(self, fleet):
+        """Return the inherited block-scaled profile for this buffer capacity."""
         from .....kernel_src.sm100.cutedsl_megamoe import default_knobs
 
         return default_knobs(
@@ -592,6 +593,7 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
     _PHASE_INTERLEAVE_MIN_TILES_PER_CLUSTER = 7
 
     def _active_clusters(self, cluster_size):
+        """Query cached cluster occupancy on the bound EP device."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             max_active_clusters,
         )
@@ -608,28 +610,44 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
             return max_active_clusters(cluster_size)
 
     def prepare_workspace(self, bootstrap, fleet_params):
+        """Agree on workspace proposals or local failures before pool lookup."""
         self._ensure_ep_bootstrap(bootstrap)
         if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
             import dataclasses
             import torch.distributed as dist
 
-            config = self._workspace_config(fleet_params)
-            cluster = config.cluster_shape_mn
+            error, proposal = None, None
+            try:
+                config = self._workspace_config(fleet_params)
+                cluster = config.cluster_shape_mn
+                proposal = (
+                    dataclasses.replace(config, rank=0),
+                    self._active_clusters(cluster[0] * cluster[1]),
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
             # Agree before pool lookup so every rank participates even when
-            # another layer already owns a matching workspace on some ranks.
-            proposal = (
-                dataclasses.replace(config, rank=0),
-                self._active_clusters(cluster[0] * cluster[1]),
-            )
-            proposals = [None] * self.ep_world_size
-            dist.all_gather_object(proposals, proposal, group=self.ep_comm_group)
-            if any(p != proposal for p in proposals):
+            # a peer's probe failed or another layer owns a matching workspace.
+            reports = [None] * self.ep_world_size
+            dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
+            failures = [
+                f"rank {rank}: {error}"
+                for rank, (error, _) in enumerate(reports)
+                if error is not None
+            ]
+            if failures:
+                raise MoEEpConfigError(
+                    "MXFP4 workspace preparation failed on EP ranks: "
+                    + "; ".join(failures)
+                )
+            if any(p != proposal for _, p in reports):
                 raise MoEEpConfigError(
                     "MXFP4 configuration or active cluster count differs across EP ranks"
                 )
         return super().prepare_workspace(bootstrap, fleet_params)
 
     def _default_knobs(self, fleet):
+        """Choose MXFP4 defaults by expert fill and FC1 work per cluster."""
         # Deliberately retain the validated epi flag batches (2, 4) and
         # the token-back switch at capacity 2048 from the MXFP8 profile.
         knobs = super()._default_knobs(fleet)
@@ -662,8 +680,9 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
                 and len(policy) == 2
                 and policy[0] == "phase_interleave"
             ):
-                # Explicit phase scheduling needs atomic claims by default.
+                # Phase scheduling needs atomic claims and derives its own hint.
                 knobs["load_balance_mode"] = "atomic_counter"
+                knobs["group_hint"] = None
             # Custom geometry/claims are outside the measured depth heuristic.
             # Keep grouped as the compatible default; explicit schedules win later.
             return knobs
