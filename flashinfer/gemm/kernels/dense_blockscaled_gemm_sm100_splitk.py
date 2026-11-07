@@ -34,6 +34,7 @@ from typing import Optional, Tuple, Union
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -114,6 +115,22 @@ def _store_shared_remote_v4(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
+    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 class _SplitKOneTileScheduler:
@@ -1614,7 +1631,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
                                     * 4,
                                 )
-                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
+                        _mbarrier_wait_acquire_cluster(reduce_mbar_ptr, Int32(0))
 
                         local_thread_base = (
                             subtile_mailbox_base + epi_tidx * values_per_thread
