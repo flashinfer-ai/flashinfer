@@ -738,10 +738,16 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
         )  # compiled before the profiled launch
         torch.cuda.synchronize()
         if traced:
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                mm_bf16_batch_invariant(a, b, config=cfg, out=out)
-                torch.cuda.synchronize()
-            events = kernel_events(prof)
+            # CUPTI can drop a launch's record (#8967): retry; zeroing `out` makes the bits check prove each launch ran.
+            for _ in range(3):
+                out.zero_()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    mm_bf16_batch_invariant(a, b, config=cfg, out=out)
+                    torch.cuda.synchronize()
+                assert torch.equal(bits(out), ref), cfg.describe()
+                events = kernel_events(prof)
+                if events:
+                    break
             assert events, "no kernel in the trace"
             grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
             launched = grid[0] * grid[1] * grid[2]
