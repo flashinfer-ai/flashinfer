@@ -21,6 +21,12 @@ import cutlass
 
 import cutlass.cute as cute
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._experimental_warnings import warn_experimental_api_once
+
+# ``TupleDict`` lives in the DSL-free ``cudnn._tupledict`` (the QSA front doors return it without importing this module, whose import
+# executes the DSL) and is re-exported here, so every ``from cudnn.api_base import TupleDict`` keeps resolving.
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _tupledict as _tupledict_mod
+
+TupleDict = _tupledict_mod.TupleDict  # the re-export: ``from cudnn.api_base import TupleDict`` keeps resolving
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.datatypes import _convert_to_cutlass_data_type, _convert_to_cutlass_data_type_or_none
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.tensor_adapter import (
     Device,
@@ -1144,38 +1150,6 @@ class APIBase(ABC):
             stride_order=stride_order,
             assumed_align=assumed_align,
         )
-
-
-class TupleDict(dict):
-    """A dictionary that supports tuple unpacking.
-
-    This class extends dict to allow unpacking like a tuple while still
-    providing dictionary-style key access. The unpacking order is determined
-    by the _keys attribute which preserves insertion order.
-
-    Example:
-        >>> result = TupleDict(a=1, b=2, c=3)
-        >>> x, y, z = result  # Unpacks as (1, 2, 3)
-        >>> result['a']  # Returns 1
-        >>> result[0]  # Returns 1 (integer indexing)
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Store keys in order for tuple unpacking
-        self._keys = list(self.keys())
-
-    def __iter__(self):
-        """Iterate over values in insertion order for tuple unpacking."""
-        return (self[k] for k in self._keys)
-
-    def __getitem__(self, key):
-        """Support both string keys and integer indices."""
-        if isinstance(key, int):
-            if key < 0 or key >= len(self._keys):
-                raise IndexError(f"index {key} out of range for TupleDict with {len(self._keys)} items")
-            return super().__getitem__(self._keys[key])
-        return super().__getitem__(key)
 
 
 # Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is

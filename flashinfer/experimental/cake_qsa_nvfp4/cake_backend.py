@@ -39,7 +39,12 @@ ties every measured alternative there.  On an RTX PRO 6000 (188 SMs, two CTAs
 per SM) the formula gives 33, 33, 33, 23, 11, 5, 2, 1 and the table replaces
 rows 4, 8, 16 and 32 with 16, 11, 5 and 3 (measured whole call in both forms,
 both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
-16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush).
+16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush)
+and rows 64 with 1: one whole-tile CTA of 33 tiles per (row, KV head) and no
+merge, +5 to +13 % whole call over the formula's two splits on three units
+(both layouts, both L2 flushes, calls back to back, behind an L2 flush in the
+stream and lone synchronous calls), whose 256 CTAs run two per SM on 68 SMs
+and add the merge; rows 128 keep the formula's 1.
 That is the *plain* split count (:func:`plain_splits`).  Where the persistent
 walk serves the call (:func:`select_walk`, below) ``num_splits`` is instead the
 walk's partial slots per (row, KV head), :func:`cake_jit.walk_splits` -- 2 for
@@ -129,8 +134,13 @@ num_qo_heads, 256]``, ``partial_lse`` FP32 ``[splits, rows, num_qo_heads]``)
 and the fused form's counters (uint32 ``[rows * num_kv_heads]``) come from the
 caller's ``workspace_buffer`` when one is given (a contiguous uint8 tensor on
 the device of ``q``, 256-byte aligned, at least :func:`qsa_workspace_bytes`
-bytes; checked on every call that passes one, one split included; carved, never
-copied; the counters are zeroed once, the first time a buffer's *storage* is
+bytes; a tensor's first call checks it as any first use -- and carves it above
+one split; at one split the call launches without partials -- its second call
+does so once per call shape into a plan that every later call passing the
+same tensor reuses; the plan is dropped
+when the tensor dies, when it is rebound to other bytes or by
+:func:`reset_workspace`; nothing is copied; the counters are zeroed
+once, the first time a buffer's *storage* is
 seen for a ``rows * num_kv_heads`` -- a new buffer the allocator places at a
 freed buffer's address is a new storage and is zeroed again -- and reset
 themselves after every launch), so a call with a workspace allocates nothing
@@ -210,6 +220,8 @@ WIDE_BOUNDS = cake_jit.MODULES["decode_whole_tile"]["select_rule"]["grid"]
 # Every workspace slot starts on a 256-byte boundary.
 ALIGN = 256
 _LOG2E = math.log2(math.e)
+# ``head_dim == HEAD_DIM`` is checked on every call, so the score scale divides by this constant (the same double).
+_SQRT_HEAD_DIM = math.sqrt(HEAD_DIM)
 # The measured split table: ``(sm_count, rows) -> splits`` where the fastest split count of the acceptance fixture
 # (2 KV heads, a selection of 2051 tokens = 33 tiles) differs from the formula.  Keyed by the SM count, never by a
 # product name.  H100 (132 SMs): rows 4 take 16 splits and rows 8 take 8; A100 (108 SMs): rows 64 take 4 and rows
@@ -219,7 +231,10 @@ _LOG2E = math.log2(math.e)
 # RTX PRO 6000 (188 SMs, the mma.sync decode's two CTAs per SM): rows 4 take 16 splits, rows 8 take 11, rows 16 take 5
 # and rows 32 take 3 (about half the formula's 33 / 23 / 11 / 5: fewer CTAs of two to seven tiles beat the formula's
 # one-tile CTAs whole call in both forms, both layouts, both flushes); rows 1 and 2 keep 33 (16 splits win after a memset
-# flush yet lose 7 % after a read flush) and rows 64 and 128 keep the formula (4 and 2 splits lose 3 to 7 %).
+# flush yet lose 7 % after a read flush); rows 64 take 1 (one whole-tile CTA of 33 tiles per (row, KV head), no merge:
+# +5 to +13 % whole call over the formula's 2 splits on three units, both layouts, both flushes, back-to-back / flushed-
+# stream / lone-call regimes -- the two-split cut's 256 CTAs run two per SM on 68 SMs and add the merge; 4 splits lose
+# 3 to 7 %) and rows 128 keep the formula (2 splits lose 3 to 7 %).
 SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (132, 4): 16,
     (132, 8): 8,
@@ -229,6 +244,7 @@ SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (188, 8): 11,
     (188, 16): 5,
     (188, 32): 3,
+    (188, 64): 1,
 }
 
 
@@ -482,6 +498,10 @@ _zeroed_counters: weakref.WeakKeyDictionary[torch.UntypedStorage, _CounterSlots]
 )
 
 
+_Layout = tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+_Views = tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+
+
 def _check_workspace(
     workspace: torch.Tensor,
     device: torch.device,
@@ -489,42 +509,47 @@ def _check_workspace(
     num_qo_heads: int,
     num_kv_heads: int,
     splits: int,
-) -> torch.Tensor:
-    """The caller's ``workspace`` as a flat uint8 view after its checks (device of ``q``, uint8, contiguous, at
-    least ``qsa_workspace_bytes`` bytes for this call, 256-byte aligned); run on every call that passes a buffer,
-    whatever the split count, so that a buffer's verdict does not depend on the device's SM count."""
+) -> _Layout:
+    """The slot layout (:func:`_layout`) of a call of these sizes in the caller's ``workspace`` after its checks
+    (device of ``q``, uint8, contiguous, at least ``qsa_workspace_bytes`` bytes for this call, 256-byte aligned);
+    run the first time a buffer is passed for a call shape, whatever the split count, so that a buffer's verdict
+    does not depend on the device's SM count."""
     _check(
         workspace.device == device
         and workspace.dtype == torch.uint8
         and workspace.is_contiguous(),
         "workspace_buffer must be a contiguous uint8 CUDA tensor on the device of q",
     )
-    raw = workspace.reshape(-1)
-    need = qsa_workspace_bytes(num_rows, num_qo_heads, num_kv_heads, splits)
+    layout = _layout(num_rows, num_qo_heads, num_kv_heads, splits)
+    need = _round_up(layout[2][0] + layout[2][1], ALIGN)
+    numel = workspace.numel()
     _check(
-        raw.numel() >= need,
-        f"workspace_buffer needs at least {need} bytes for this call (qsa_workspace_bytes), got {raw.numel()}",
+        numel >= need,
+        f"workspace_buffer needs at least {need} bytes for this call (qsa_workspace_bytes), got {numel}",
     )
     _check(
-        raw.data_ptr() % ALIGN == 0, f"workspace_buffer must be {ALIGN}-byte aligned"
+        workspace.data_ptr() % ALIGN == 0,
+        f"workspace_buffer must be {ALIGN}-byte aligned",
     )
-    return raw
+    return layout
 
 
 def _carve(
     raw: torch.Tensor,
+    layout: _Layout,
     num_rows: int,
     num_qo_heads: int,
     num_kv_heads: int,
     splits: int,
     *,
     counters: bool,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """The partial outputs, the partial LSEs and (when ``counters``) the zeroed group counters as views of the
-    checked flat workspace ``raw`` (:func:`_check_workspace`); nothing is allocated or copied."""
-    slot_counters, slot_out, slot_lse = _layout(
-        num_rows, num_qo_heads, num_kv_heads, splits
-    )
+) -> _Views:
+    """The partial outputs, the partial LSEs and (when ``counters``) the zeroed group counters at the slots of
+    ``layout`` as views of ``raw``, the checked workspace (:func:`_check_workspace`) flat: the caller's tensor
+    itself on a first use, or a plan's own flat tensor set on the workspace's storage (:func:`_workspace_views`),
+    so that the views a plan keeps hold the storage alone and the caller's tensor dies when the caller drops it.
+    Nothing is allocated or copied."""
+    slot_counters, slot_out, slot_lse = layout
     partial_out = (
         raw[slot_out[0] : slot_out[0] + slot_out[1]]
         .view(torch.float32)
@@ -550,10 +575,170 @@ def _carve(
     return partial_out, partial_lse, group_counters
 
 
+class _WorkspacePlan:
+    """The carve of one caller workspace tensor object: a weak reference to the tensor (the plan dies with it),
+    the facts a later call re-reads (device index, data pointer, element count and dtype: a tensor rebound to
+    other bytes by ``set_`` / ``resize_`` / ``.data =`` misses and is checked again), the flat uint8 tensor set on
+    the workspace's storage that its views are carved from (:func:`_carve`) and the carved views per call shape,
+    ``(num_rows, num_qo_heads, num_kv_heads, splits, counters)`` -- ``None`` for a single-split shape, which the
+    call launches without partials: checked, never carved."""
+
+    __slots__ = ("ref", "device_index", "data_ptr", "numel", "dtype", "raw", "views")
+
+    def __init__(
+        self,
+        ref: weakref.ReferenceType[torch.Tensor],
+        device_index: int,
+        data_ptr: int,
+        numel: int,
+        dtype: torch.dtype,
+        raw: torch.Tensor,
+    ) -> None:
+        self.ref = ref
+        self.device_index = device_index
+        self.data_ptr = data_ptr
+        self.numel = numel
+        self.dtype = dtype
+        self.raw = raw
+        self.views: dict[tuple[int, int, int, int, bool], Optional[_Views]] = {}
+
+
+# The plans of the live caller workspaces, by tensor id (module docstring, "Workspace rule"); bounded, and an
+# entry leaves with its tensor (the weak reference's callback) or with :func:`reset_workspace`.
+_WORKSPACE_PLANS_MAX = 64
+_WORKSPACE_VIEWS_MAX = 64
+_workspace_plans: dict[int, _WorkspacePlan] = {}
+
+# The first sightings of caller workspaces since their last plan, by tensor id, each a weak reference to the
+# tensor seen (never a strong one): a plan is built when the same live tensor is passed a second time, so a
+# buffer passed once pays the first-use carve and one dictionary entry.  A transient view object (a new slice of
+# the caller's buffer on every call) dies between calls and may hand its id to the next one; its sighting is then
+# stale (the reference is dead), the next view is a first use again, and a caller passing a new view every call
+# never builds a plan.  The bytes a plan stands for are guarded on the plan itself.  First in, first out; bounded.
+_SEEN_ONCE_MAX = 16
+_seen_once: dict[int, weakref.ReferenceType[torch.Tensor]] = {}
+# "No entry" in a plan's views (``None`` there is a single-split shape).
+_UNCARVED: Any = object()
+# Threads may share a workspace (and one may call :func:`reset_workspace` meanwhile): every change to these two
+# tables is one dictionary operation that tolerates an entry another thread removed, and the hit path only reads.
+
+
+def _evict_oldest(table: dict[int, Any]) -> None:
+    """Drop the oldest entry of ``table`` (first in, first out), or nothing when another thread emptied it first."""
+    try:  # noqa: SIM105 - no context manager on the per-call path; a try block is free here
+        del table[next(iter(table))]
+    except (StopIteration, KeyError, RuntimeError):
+        pass
+
+
+def _drop_workspace_plan(ident: int) -> Callable[[Any], None]:
+    """The weak-reference callback that forgets the plan of the dead tensor ``ident``, unless the id was reused."""
+
+    def drop(ref: Any) -> None:
+        plan = _workspace_plans.get(ident)
+        if plan is not None and plan.ref is ref:
+            _workspace_plans.pop(ident, None)
+
+    return drop
+
+
+def _workspace_views(
+    workspace: torch.Tensor,
+    device: torch.device,
+    device_index: int,
+    num_rows: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    splits: int,
+    counters: bool,
+) -> Optional[_Views]:
+    """``(partial_out, partial_lse, counters)`` of the caller's ``workspace`` for a call of these sizes, or ``None``
+    at one split (the call launches without partials): the views its plan keeps when the same tensor object,
+    bound to the same bytes and on the device of ``q``, was checked for this shape before; else
+    :func:`_check_workspace` and, above one split, :func:`_carve` run as for any first use (every refusal raises
+    as it always did).  A tensor's first sighting is carved from the tensor itself and only noted (``_seen_once``,
+    weakly); its second sighting, the same tensor still alive, builds its plan, which keeps the result of this
+    and every later shape."""
+    ident = id(workspace)
+    plan = _workspace_plans.get(ident)
+    key = (num_rows, num_qo_heads, num_kv_heads, splits, counters)
+    if plan is not None:
+        if (
+            plan.ref() is workspace
+            and plan.device_index == device_index
+            and plan.data_ptr == workspace.data_ptr()
+            and plan.numel == workspace.numel()
+            and plan.dtype == workspace.dtype
+        ):
+            views = plan.views.get(key, _UNCARVED)
+            if views is not _UNCARVED:
+                return views
+        else:
+            _workspace_plans.pop(ident, None)
+            plan = None
+    layout = _check_workspace(
+        workspace, device, num_rows, num_qo_heads, num_kv_heads, splits
+    )
+    if plan is None:
+        seen = _seen_once.get(ident)
+        if seen is None or seen() is not workspace:
+            if seen is None and len(_seen_once) >= _SEEN_ONCE_MAX:
+                _evict_oldest(_seen_once)
+            _seen_once[ident] = weakref.ref(workspace)
+            if splits == 1:
+                return None
+            flat = workspace if workspace.dim() == 1 else workspace.reshape(-1)
+            return _carve(
+                flat,
+                layout,
+                num_rows,
+                num_qo_heads,
+                num_kv_heads,
+                splits,
+                counters=counters,
+            )
+        _seen_once.pop(ident, None)
+        if len(_workspace_plans) >= _WORKSPACE_PLANS_MAX:
+            _evict_oldest(_workspace_plans)
+        numel = workspace.numel()
+        raw = torch.empty(0, dtype=torch.uint8, device=workspace.device).set_(
+            workspace.untyped_storage(), workspace.storage_offset(), (numel,)
+        )
+        plan = _WorkspacePlan(
+            weakref.ref(workspace, _drop_workspace_plan(ident)),
+            device_index,
+            workspace.data_ptr(),
+            numel,
+            workspace.dtype,
+            raw,
+        )
+        _workspace_plans[ident] = plan
+    elif len(plan.views) >= _WORKSPACE_VIEWS_MAX:
+        plan.views.clear()
+    views = (
+        None
+        if splits == 1
+        else _carve(
+            plan.raw,
+            layout,
+            num_rows,
+            num_qo_heads,
+            num_kv_heads,
+            splits,
+            counters=counters,
+        )
+    )
+    plan.views[key] = views
+    return views
+
+
 def reset_workspace(workspace: torch.Tensor) -> None:
-    """Forget that ``workspace`` (its storage) was seen: the next call carving it zeroes its counters again (for a
-    buffer whose bytes another use overwrote)."""
+    """Forget that ``workspace`` (its storage) was seen, every kept carve and every noted first sighting: the next
+    call carving it checks it again and zeroes its counters again (for a buffer whose bytes another use
+    overwrote)."""
     _zeroed_counters.pop(workspace.untyped_storage(), None)
+    _workspace_plans.clear()
+    _seen_once.clear()
 
 
 # The three CUDA state queries of the per-call path, bound to their C entries
@@ -950,9 +1135,16 @@ def qsa_sparse_paged_attention(
     splits, fused, launches = _resolve(
         num_rows, num_kv_heads, num_qo_heads, tiles, device_index, capturing
     )
-    raw = (
-        _check_workspace(
-            workspace_buffer, q_device, num_rows, num_qo_heads, num_kv_heads, splits
+    views = (
+        _workspace_views(
+            workspace_buffer,
+            q_device,
+            device_index,
+            num_rows,
+            num_qo_heads,
+            num_kv_heads,
+            splits,
+            fused,
         )
         if workspace_buffer is not None
         else None
@@ -985,7 +1177,7 @@ def qsa_sparse_paged_attention(
         table_stride[0],
         out_stride[0],
         out_stride[1],
-        float(k_scale) * _LOG2E / math.sqrt(head_dim),  # score_scale
+        float(k_scale) * _LOG2E / _SQRT_HEAD_DIM,  # score_scale
         float(v_scale),  # output_scale
         num_rows,
         table_shape[0],  # num_requests
@@ -1001,12 +1193,12 @@ def qsa_sparse_paged_attention(
     stream = _current_raw_stream(device_index)
     if splits == 1:
         _launch(launches, arguments, device_index, stream)
-    elif raw is not None:
+    elif views is not None:
         (
             arguments[_SLOT_PARTIAL_OUT],
             arguments[_SLOT_PARTIAL_LSE],
             arguments[_SLOT_COUNTERS],
-        ) = _carve(raw, num_rows, num_qo_heads, num_kv_heads, splits, counters=fused)
+        ) = views
         _launch(launches, arguments, device_index, stream)
     elif _current_stream_capturing() or device_index != _current_device():
         # The graph's private pool: a capture records no buffer the host may later replace.  The

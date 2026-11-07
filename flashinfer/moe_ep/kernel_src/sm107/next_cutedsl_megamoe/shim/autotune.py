@@ -16,6 +16,11 @@ import math
 import statistics
 from typing import Any, Dict, List, Optional
 
+
+class NoPassingCandidate(RuntimeError):
+    """All candidates were rejected after agreement across EP ranks."""
+
+
 # Knob keys = Sm107BlockScaledMoeConfig field names (the shim owns the dialect;
 # the backends map their config field names onto these).
 KNOB_KEYS = (
@@ -59,13 +64,18 @@ def sm107_candidates(
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    Inference uses 16 candidates (32 with the ikr axis):
+    Inference uses 32 candidates (64 with the ikr axis). The first 16 retain:
 
     - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
+
+    The remaining candidates use uniform clusters (2,1) or (4,1) with
+    phase-interleave/atomic launches and epi flag batches (2,4): N64 at the
+    kind's base and doubled K depths, plus N128/N256 at the base K depth.
+    FC2 bulk stores use one stage for N64 and two for the wider tiles.
 
     Default GenPhase candidates use cluster (4, 1) and require FC2 bulk stores.
     MXFP8 E4M3 and mixed FP4/FP8 additionally include the N64 decode tile,
@@ -75,7 +85,7 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
-    tile_k = 256 if quant_kind == "nvfp4" else 128
+    tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     launches = (
         # (cluster, fallback, schedule_policy, work_id_mode)
         ((2, 1), None, ("grouped", None), "grid_stride"),
@@ -108,6 +118,36 @@ def sm107_candidates(
                                 "fc2_use_bulk": fc2_bulk,
                                 "fc2_tma_stages": 2 if fc2_bulk else None,
                                 "epi_flag_batches": epi,
+                                "token_in_flag_batch": 1,
+                                "token_back_mode": "epi_warps",
+                                "reduce_topk_in_kernel": ikr,
+                            }
+                        )
+    if kernel_variant == "inference":
+        # Preserve the original prefix for callers using --max-candidates.
+        for tile_n, depth in (
+            (64, tile_k),
+            (64, 2 * tile_k),
+            (128, tile_k),
+            (256, tile_k),
+        ):
+            for cluster in ((2, 1), (4, 1)):
+                for fc2_bulk in (False, True):
+                    for ikr in (
+                        (False, True) if allow_in_kernel_fc2_reduce else (False,)
+                    ):
+                        out.append(
+                            {
+                                "mma_tiler_mnk": (256, tile_n, depth),
+                                "cluster_shape_mn": cluster,
+                                "fallback_cluster_shape_mn": None,
+                                "schedule_policy": ("phase_interleave", None),
+                                "work_id_mode": "atomic_counter",
+                                "fc2_use_bulk": fc2_bulk,
+                                "fc2_tma_stages": (1 if tile_n == 64 else 2)
+                                if fc2_bulk
+                                else None,
+                                "epi_flag_batches": (2, 4),
                                 "token_in_flag_batch": 1,
                                 "token_back_mode": "epi_warps",
                                 "reduce_topk_in_kernel": ikr,
@@ -190,12 +230,17 @@ def _sweep_sm107_block_scaled_mega_moe(
     timed_iters: int = 10,
     process_group=None,
     measurement=None,
+    make_trial=None,
 ) -> tuple[Dict[str, Any], float, int]:
     """Validate candidates against a sampled Torch oracle and time survivors.
 
     Every EP rank must participate. GPU allocation, compile, or launch errors
     abort the sweep: run distributed tuning under a worker supervisor with
     a timeout. Continuing after a rank-local CUDA fault is unsafe.
+
+    ``make_trial`` can wrap each prepared workspace with a ``launch(l1, l2)``
+    that includes input staging and output handling. The same launch is used
+    for warmup, measurement and correctness checks.
     """
     import dataclasses
 
@@ -222,7 +267,7 @@ def _sweep_sm107_block_scaled_mega_moe(
     if num_tokens is None or not 0 <= num_tokens <= cfg.max_tokens_per_rank:
         raise ValueError("stage a valid num_tokens before autotuning.")
 
-    if y is None:
+    if y is None and make_trial is None:
         y = torch.empty(
             num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
         )
@@ -239,7 +284,7 @@ def _sweep_sm107_block_scaled_mega_moe(
             )
         spec = dataclasses.asdict(cfg)
         spec.pop("rank")
-        proposal = (spec, candidates, warmup_iters, timed_iters)
+        proposal = (spec, candidates, warmup_iters, timed_iters, make_trial is not None)
         proposals = [None] * cfg.world_size
         dist.all_gather_object(proposals, proposal, group=process_group)
         if any(p != proposal for p in proposals):
@@ -260,7 +305,7 @@ def _sweep_sm107_block_scaled_mega_moe(
         num_tokens,
         process_group=process_group,
     )
-    tolerance = 0.06 if cfg.quant_kind == "nvfp4" else 0.02
+    tolerance = 0.06 if cfg.quant_kind in ("nvfp4", "mxfp4") else 0.02
     scores = []
     errors = []
     for knobs in candidates:
@@ -305,14 +350,19 @@ def _sweep_sm107_block_scaled_mega_moe(
             cfg.world_size,
             process_group,
         )
+        measured_trial = trial if make_trial is None else make_trial(trial)
         barrier()
         for _ in range(warmup_iters):
-            sm107_block_scaled_mega_moe(
-                y, transformed_l1, transformed_l2, trial, num_tokens=num_tokens
-            )
+            if make_trial is None:
+                sm107_block_scaled_mega_moe(
+                    y, transformed_l1, transformed_l2, trial, num_tokens=num_tokens
+                )
+            else:
+                measured_trial.launch(transformed_l1, transformed_l2)
         torch.cuda.synchronize()
+        actual = y if y is not None else trial.output_activation[:num_tokens]
         error = torch.tensor(
-            output_error(y, indices, expected), dtype=torch.float64, device="cuda"
+            output_error(actual, indices, expected), dtype=torch.float64, device="cuda"
         )
         if collective:
             dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
@@ -325,7 +375,7 @@ def _sweep_sm107_block_scaled_mega_moe(
 
         try:
             samples = measure_samples(
-                trial,
+                measured_trial,
                 (transformed_l1, transformed_l2),
                 timed_iters,
                 measurement
@@ -348,8 +398,13 @@ def _sweep_sm107_block_scaled_mega_moe(
         if collective:
             # Reduce each matched sample before taking its median.
             dist.all_reduce(times, op=dist.ReduceOp.MAX, group=process_group)
+        actual = (
+            y
+            if make_trial is not None and y is not None
+            else trial.output_activation[:num_tokens]
+        )
         error = torch.tensor(
-            output_error(trial.output_activation[:num_tokens], indices, expected),
+            output_error(actual, indices, expected),
             dtype=torch.float64,
             device="cuda",
         )
@@ -364,7 +419,7 @@ def _sweep_sm107_block_scaled_mega_moe(
 
     best = min(range(len(scores)), key=scores.__getitem__)
     if not math.isfinite(scores[best]):
-        raise RuntimeError(
+        raise NoPassingCandidate(
             "no SM107 candidate passed configuration and sampled correctness checks"
         )
     winner = candidates[best]
@@ -393,16 +448,14 @@ def autotune_sm107_block_scaled_mega_moe(
     install_winner: bool = False,
     allow_nondeterministic: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run the native sweep through FlashInfer's autotuner.
+    """Measure already-staged kernels through FlashInfer's autotuner.
 
-    Explicit calls search afresh. Online callers pass ``force_tune=False``
-    and ``install_winner=True`` to honor the shared context and prepare the
-    winner in the caller's workspace. A disabled cache miss returns None.
+    Explicit calls search afresh. Set ``force_tune=False`` to honor the shared
+    context and ``install_winner=True`` to prepare the winner in this workspace.
+    A disabled cache miss returns None. Layer and CLI tuning measure complete
+    forwards through the same protocol with a staging-aware execution trial.
     """
-    from flashinfer import autotune_v2
-    from flashinfer.autotuner import AutoTuner
-
-    from .tuning_protocol import NAMESPACE, RubinTuningProtocol
+    from .tuning_protocol import RubinTuningProtocol
 
     protocol = RubinTuningProtocol(
         y,
@@ -417,6 +470,14 @@ def autotune_sm107_block_scaled_mega_moe(
         install_winner=install_winner,
         allow_nondeterministic=allow_nondeterministic,
     )
+    return _choose_protocol(protocol, force_tune=force_tune)
+
+
+def _choose_protocol(protocol, *, force_tune):
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import AutoTuner
+    from .tuning_protocol import NAMESPACE
+
     tuner = AutoTuner.get()
     if force_tune and not tuner._in_v2_context:
         store = tuner._active_managed_store

@@ -76,7 +76,8 @@ give bitwise the same outputs: the kernels reduce in a fixed order.
 
 Programmatic dependent launch is a per-plan switch (:func:`pdl_for`, reported
 as ``route_metadata["pdl"]``): when the plan has a split merge and its decode
-is one wave of clusters (``items <= units``), the decode and the merge launch
+is one hardware wave (``items <= units + pairs``: the clusters of four plus
+the pairs the device holds resident), the decode and the merge launch
 with the programmatic attribute, so the decode's prologue overlaps the
 quantizer's tail and the merge's the decode's (the quantizer triggers its
 dependents once its rows are stored, the decode once a role runs out of
@@ -127,6 +128,9 @@ WORKSPACE_SLOTS = ("partial_o", "partial_lse", "lse_scratch", "plan_block")
 
 # The decode cost model's constants (:func:`mla2_plan`).
 MLA2_ITEM_COST = 7  # the mixed-cluster kernel's ramp and epilogue per item in 128-key tile times (fitted on sweeps)
+# A half tile's time per 128-key tile in a cluster's, when one request holds one full and one half tile (fitted
+# on forced plans: the class's half items pace the wave; 0.6 elsewhere, where the full items do).
+MLA2_HALF_ONE_FULL_HALF = 0.75
 MLA2_SHAVE_TILES = 48  # a shaved one-wave plan's short range per full tile, in 128-key tiles (:func:`mla2_plan`)
 
 # Clusters of four the GPU holds at once and pair clusters on the SMs the fours leave, by SM count, for devices
@@ -175,8 +179,10 @@ def mla2_plan(
     free, each item its tiles plus ``item_cost`` (ramp and epilogue), plus the partials written and merged (``2 n +
     1`` rows of 1 KB per query row with ``n`` partials, at ``merge_rows_per_tile`` rows per tile-time; the merge
     variant is chosen to load every row in one round, so no second-batch term); the
-    plan within ``slack`` of the least cost with equal lengths, else two, then the smallest counts, and at those counts
-    the couples' scale the model puts at least 1 % under equal lengths. One wave of at least ``0.8 units`` full tiles
+    plan within ``slack`` of the least cost: for a one-tile request and one request of a full and a half tile the one
+    that fills the wave (``units + pairs // 2`` items, 52 on 208 SMs, which the half tile's grid of counts misses),
+    then equal lengths, else two, then the smallest counts, and at those counts the couples' scale the model puts at
+    least 1 % under equal lengths. One wave of at least ``0.8 units`` full tiles
     of 1024 key tiles or more also prices the shaved plan: every tile in a long range and a short one of ``shave``
     tiles, the long ranges emitted first (the clusters' wave) and the short ones after them, which the clusters the
     wave leaves and the couples take as they free (48 tiles on 50 clusters and 2 couples otherwise leave 16 of 208
@@ -208,6 +214,10 @@ def mla2_plan(
     # A one-wave plan: full tiles only, no more of them than clusters (every item starts at once).
     one_wave = not half_tiles and 0 < len(full_tiles) <= units
     one_tile = one_wave and len(full_tiles) == 1
+    # One request of a full tile and a half tile (257-384 rows: H96 x 4 at B1): the candidates below add its
+    # wave-filling pair of counts (``units + couples`` items, 52 on 208 SMs) and the choice prefers that pair, as
+    # it does a one-tile request's.  Measured on 208 SMs; a batch of two such requests is not in the class.
+    one_full_half = len(q_lens) == 1 and len(full_tiles) == 1 and len(half_tiles) == 1
 
     def makespan(costs):
         """Greedy list scheduling of ``costs`` (cluster time, double flag) in order over the clusters of four and
@@ -321,7 +331,8 @@ def mla2_plan(
         )
         tps_h = -(-k_max // s_h) if half_tiles else 0
         costs = [(ranges[t][i][1] + item_cost, False) for t, i in order]
-        costs += [(0.6 * tps_h + item_cost, True)] * (len(half_tiles) * s_h)
+        phi_h = MLA2_HALF_ONE_FULL_HALF if one_full_half else 0.6
+        costs += [(phi_h * tps_h + item_cost, True)] * (len(half_tiles) * s_h)
         merge = 0.0
         if full_tiles and s_t:
             rows_tail = sum(
@@ -357,6 +368,18 @@ def mla2_plan(
                 # would otherwise plan 86 slots).
                 if s_h <= cap and 2 * s_h <= MAX_SPLITS:
                     cands.add((s_f if full_tiles else 1, s_h))
+            if one_full_half:
+                # The pair of counts that fills the wave (``units + couples`` items: ``fill_cap`` below), which the
+                # ``f`` grid misses (31 x 0.7 rounds to 22, 32 x 0.6 to 19); the choice below takes the pair when
+                # the model puts it within the slack, at the counts ``MLA2_HALF_ONE_FULL_HALF`` sets (forced
+                # 52-item plans on 208 SMs, the package call with the decode one wave):
+                # Q4 H96 B1, 208 SMs, package call: 52-item forced plans against the 50-item pin (us, 64K / 128K):
+                # 32 / 20 -0.21 / -0.48, 31 / 21 -0.33 / -0.80, 30 / 22 -0.05 / -0.98,
+                # 29 / 23 -0.46 / -1.53, 28 / 24 +0.63 / +0.30;
+                # 0.75 puts the choice at 29 / 23 on both tables (50 / 4, 49 / 6); the pin's 0.6 reaches 32 / 20.
+                s_h = units + couples - s_f
+                if 1 <= s_h <= cap and 2 * s_h <= MAX_SPLITS:
+                    cands.add((s_f, s_h))
             if s_f <= 2:
                 cands |= {(s_f if full_tiles else 1, 1), (s_f if full_tiles else 1, 2)}
         if half_tiles and len(full_tiles) > units + couples:
@@ -365,15 +388,16 @@ def mla2_plan(
             cands = {c for c in cands if c[0] >= 2}
         costs = {(c, sc): cost(*c, sc) for c in cands for sc in scales}
         best = min(costs.values())
-        # Within the slack (the model's accuracy across split counts): a one-tile request fills the wave first
-        # (up to the clusters and couples: 52 items on 208 SMs; two-tile rows at 25 splits measured +0.9 % on one
-        # board and -1.0 % on another, so more tiles keep the old order), then equal lengths, then fewer splits;
-        # then, at those counts, a couple scale the model puts at least 1 % under equal lengths.
+        # Within the slack (the model's accuracy across split counts): a one-tile request, and one request of a full
+        # and a half tile, fill the wave first (up to the clusters and couples: 52 items on 208 SMs; two-tile rows at
+        # 25 splits measured +0.9 % on one board and -1.0 % on another, and three-tile rows at 17-18 splits 0.86 and
+        # 0.70 of 16, so more tiles keep the old order), then equal lengths, then fewer splits; then, at those
+        # counts, a couple scale the model puts at least 1 % under equal lengths.
         fill_cap = units + couples
 
         def wave_fill(k):
-            n = k[0][0]
-            return n if one_tile and n <= fill_cap else 0
+            n = k[0][0] + (k[0][1] if half_tiles else 0)
+            return n if (one_tile or one_full_half) and n <= fill_cap else 0
 
         (s_f, s_h), scale = min(
             (k for k, v in costs.items() if v <= (1 + slack) * best),
@@ -584,14 +608,17 @@ class Plan:
 def pdl_for(plan: Plan) -> bool:
     """Whether the plan's decode and merge launch with programmatic dependent launch.
 
-    On when the plan has a split merge (``max_splits > 1``) and the decode is one wave of clusters (``items <=
-    units``): the merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off
-    otherwise: without a merge there is nothing behind the decode to overlap, and a decode of more items than
-    resident clusters would lose SMs of its second wave to the early-launched merge.  Off launches every program
-    plain, the merge included (a merge under the attribute behind a decode that never triggers starts later than a
-    plain launch).
+    On when the plan has a split merge (``max_splits > 1``) and the decode is one hardware wave (``items <= units +
+    pairs``: the clusters of four and the pairs the device holds resident at once, 50 + 4 on a 208-SM board): the
+    merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off otherwise: without a
+    merge there is nothing behind the decode to overlap, and a decode of more items than the device holds resident
+    would lose SMs of its second wave to the early-launched merge.  Off launches every program plain, the merge
+    included (a merge under the attribute behind a decode that never triggers starts later than a plain launch).
+    The plans of 51-52 items (204-208 CTAs, still one hardware wave) run 1-4 % faster with the attribute on R200
+    (52 items: 24.7 against 25.6 us), and the 53-54-item plans, whose second wave holds one or two items, 0.7-2 %
+    faster still (31.5 against 32.1, 33.8 against 34.0 us): the bound stays ``units + pairs``.
     """
-    return plan.max_splits > 1 and plan.items <= plan.units
+    return plan.max_splits > 1 and plan.items <= plan.units + plan.pairs
 
 
 def _round_up(n: int, m: int) -> int:

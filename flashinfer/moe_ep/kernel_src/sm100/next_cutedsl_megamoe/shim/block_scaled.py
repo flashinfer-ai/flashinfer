@@ -16,6 +16,8 @@ import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
 
+from flashinfer.moe_ep.core.tuning_state import AutoTuningState
+
 from . import comm
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
@@ -129,6 +131,7 @@ class BlockScaledMoeConfig:
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
 
     def __post_init__(self) -> None:
+        """Validate dtype, geometry, epilogue and architecture-specific constraints."""
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
         if self.kernel_variant not in ("inference", "genphase"):
@@ -355,7 +358,7 @@ class BlockScaledMoeConfig:
                 self.cluster_shape_mn in ((2, 1), (4, 1))
                 and tiler == (256, 64, 128)
                 and (
-                    self.quant_kind == "mxfp8_e4m3"
+                    self.quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2")
                     or (
                         self.quant_kind == "mxfp4_mxfp8"
                         and self.cluster_shape_mn == (4, 1)
@@ -467,7 +470,8 @@ class BlockScaledSymmBuffer:
         comm.ensure_not_capturing("block-scaled mega workspace allocation")
         self._require_device()
         self._configure_dsl()
-        self.config = config
+        self._tuning_state = AutoTuningState()
+        self.config: BlockScaledMoeConfig = config
         self.device = torch.device("cuda", torch.cuda.current_device())
         cfg = config
 
@@ -553,7 +557,9 @@ class BlockScaledSymmBuffer:
         self.local_workspace = torch.zeros(
             (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
         )
-        self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
+        self.shared_workspace: torch.Tensor | None = comm.sym_zeros(
+            (max(shared_bytes, 1),), torch.uint8
+        )
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         if not cfg.reduce_topk_in_kernel:
@@ -757,12 +763,12 @@ class BlockScaledSymmBuffer:
             },
         }
 
-    def launch(
+    def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile and bind the kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
@@ -793,6 +799,12 @@ class BlockScaledSymmBuffer:
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+
+    def launch(self, transformed_l1, transformed_l2) -> None:
+        """Launch a prepared kernel and retain capture ownership."""
+        if torch.cuda.is_current_stream_capturing():
+            self._tuning_state.graph_captured = True
+        self.prepare(transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -810,6 +822,46 @@ class BlockScaledSymmBuffer:
                     invalid.unsqueeze(-1), sf_byte
                 )
         self._compiled(**self._launch_kwargs)
+
+    def install_tuned_knobs(self, knobs, transformed_l1, transformed_l2) -> None:
+        """Replace execution scratch before capture, keeping staged inputs alive."""
+        from .tuning import is_valid_sm100_knobs
+
+        comm.ensure_not_capturing("Blackwell tuning winner installation")
+        if self._destroyed or self._tuning_state.graph_captured:
+            raise RuntimeError(
+                "cannot tune a destroyed or captured Blackwell workspace"
+            )
+        if not is_valid_sm100_knobs(knobs, self.config):
+            raise ValueError("invalid Blackwell tuning knobs")
+        config = dataclasses.replace(self.config, **knobs)
+        if config != self.config:
+            kernel = self._build_kernel(config)
+            sf_cols = int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if config.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            )
+            if sf_cols != self.sf_cols:
+                raise ValueError("tuning cannot change the staged scale layout")
+            torch.cuda.synchronize()
+            self._compiled = self._launch_key = self._launch_kwargs = None
+            self._launch_weights = None
+            self._pre_reduced_activation = self._pre_reduced_activation_sf = None
+            comm.free_sym_tensor(self.shared_workspace)
+            self.shared_workspace = self.local_workspace = None
+            if config.reduce_topk_in_kernel != self.config.reduce_topk_in_kernel:
+                if self.config.reduce_topk_in_kernel:
+                    comm.free_sym_tensor(self.output_activation)
+                shape = (config.padded_tokens_per_rank, config.hidden)
+                self.output_activation = (
+                    comm.sym_zeros(shape, torch.bfloat16)
+                    if config.reduce_topk_in_kernel
+                    else torch.zeros(shape, dtype=torch.bfloat16, device=self.device)
+                )
+            self.config, self.kernel = config, kernel
+            self._allocate_kernel_workspace(kernel)
+        self.prepare(transformed_l1, transformed_l2)
 
     def destroy(self) -> None:
         if self._destroyed:

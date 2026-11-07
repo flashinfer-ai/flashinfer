@@ -34,11 +34,14 @@ cache the kernel reads is filled by ``tests.test_helpers.cake_qsa_nvfp4_referenc
 port of FlashInfer's NVFP4 paged writer (the API file compares the two).
 """
 
+import gc
 import hashlib
 import json
 import math
 import re
+import sys
 import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -615,6 +618,201 @@ def test_caller_workspace_allocates_nothing():
         _run(q, cache, selection, gate, out, workspace_buffer=workspace[:-1])
 
 
+def test_caller_workspace_is_carved_once(monkeypatch):
+    """A caller workspace is checked and carved as a first use on its first call and
+    once more on its second, which builds its plan; every later call that passes the
+    same tensor reuses the plan; a call it is too small for is checked afresh and
+    refused; a plan whose dtype no longer matches, or a tensor rebound to other bytes,
+    is checked again; ``reset_workspace`` drops the plans and the noted sightings; and
+    the plan dies with the tensor (its views hold the storage, not it)."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 8, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "HND", 23)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    workspace = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(workspace)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(5):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+        assert checks[0] == min(call + 1, 2)
+        if call == 0:
+            assert id(workspace) not in cake_backend._workspace_plans
+            assert len(cake_backend._seen_once) == 1
+    assert not cake_backend._seen_once
+    plan = cake_backend._workspace_plans[id(workspace)]
+    assert plan.ref() is workspace and len(plan.views) == 1
+    partial_out, partial_lse, counters = next(iter(plan.views.values()))
+    assert partial_out.data_ptr() >= workspace.data_ptr()
+    assert partial_lse.data_ptr() > partial_out.data_ptr()
+    assert partial_out._base is not workspace
+    assert partial_lse._base is not workspace
+    # A call the buffer is too small for (more query heads) is checked and refused.
+    wide_q, _, _, wide_gate = _inputs(rows, 32, num_kv_heads, "HND", 24)
+    with pytest.raises(ValueError):
+        _run(wide_q, cache, selection, wide_gate, workspace_buffer=workspace)
+    assert checks[0] == 3 and len(plan.views) == 1
+    # A plan that reads another dtype for the same tensor is dropped; the tensor is
+    # then a first use again (checked, carved, noted) and gets a new plan on the call
+    # after.
+    plan.dtype = torch.int8
+    out.fill_(math.nan)
+    _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+    assert torch.equal(out, expected) and checks[0] == 4
+    assert id(workspace) not in cake_backend._workspace_plans
+    _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+    assert checks[0] == 5
+    assert cake_backend._workspace_plans[id(workspace)] is not plan
+    # A tensor rebound to bytes of another dtype is refused like any other first use.
+    rebound = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    _run(q, cache, selection, gate, out, workspace_buffer=rebound)
+    rebound.data = torch.zeros(nbytes, dtype=torch.int8, device=device)
+    with pytest.raises(ValueError):
+        _run(q, cache, selection, gate, out, workspace_buffer=rebound)
+    # reset_workspace drops every plan, every noted sighting and the zero-once record
+    # of the storage.
+    cake_backend.reset_workspace(workspace)
+    assert not cake_backend._workspace_plans and not cake_backend._seen_once
+    assert workspace.untyped_storage() not in cake_backend._zeroed_counters
+    before = checks[0]
+    for _ in range(3):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+    assert checks[0] == before + 2
+    plan = cake_backend._workspace_plans[id(workspace)]
+    # The plan dies with the tensor and releases the buffer.
+    ident = id(workspace)
+    ref = weakref.ref(workspace)
+    torch.cuda.synchronize()
+    held = torch.cuda.memory_allocated()
+    del plan, partial_out, partial_lse, counters, workspace
+    gc.collect()
+    assert ref() is None and ident not in cake_backend._workspace_plans
+    assert torch.cuda.memory_allocated() <= held - nbytes
+
+
+def test_alternating_caller_workspaces_reach_their_plans(monkeypatch):
+    """Two workspaces passed turn about are each checked twice (first use, then the
+    plan's build on the second sighting) and reuse their plans from their third call
+    on."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 4, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 31)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    buffers = [torch.zeros(nbytes, dtype=torch.uint8, device=device) for _ in range(2)]
+    cake_backend.reset_workspace(buffers[0])  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(8):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffers[call % 2])
+        assert torch.equal(out, expected)
+        assert checks[0] == min(call + 1, 4)
+    assert all(id(b) in cake_backend._workspace_plans for b in buffers)
+    assert not cake_backend._seen_once
+    cake_backend.reset_workspace(buffers[0])
+    assert not cake_backend._workspace_plans
+
+
+def test_fresh_caller_workspace_views_build_no_plan(monkeypatch):
+    """A caller that passes a new view object of its buffer on every call is checked and
+    carved on every call, as before the plans, and never builds one: the view dies
+    between calls, so a later view with the same id and bytes is a first use again."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 8, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 37)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    buffer = torch.zeros(nbytes + 256, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(buffer)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(6):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[:nbytes])
+        assert torch.equal(out, expected)
+        assert checks[0] == call + 1
+        assert not cake_backend._workspace_plans
+    assert all(ref() is None for ref in cake_backend._seen_once.values())
+    cake_backend.reset_workspace(buffer)
+    assert not cake_backend._seen_once
+
+
+def test_single_split_caller_workspace_is_checked_not_carved(monkeypatch):
+    """At one split the call launches without partials: a caller workspace is checked
+    (on a first use and on the plan's build) but never carved, a plan hit skips both,
+    and a buffer too small for the call is refused as at any other split."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 128, 24, 2
+    splits = _splits(rows, num_kv_heads, device)
+    if splits != 1:
+        pytest.skip(f"{rows} rows take {splits} splits on this device")
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 41)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, 1)
+    counts = {"check": 0, "carve": 0}
+    real_check, real_carve = cake_backend._check_workspace, cake_backend._carve
+
+    def counted_check(*args):
+        counts["check"] += 1
+        return real_check(*args)
+
+    def counted_carve(*args, **kwargs):
+        counts["carve"] += 1
+        return real_carve(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    monkeypatch.setattr(cake_backend, "_carve", counted_carve)
+    expected = _run(q, cache, selection, gate)
+    buffer = torch.zeros(nbytes + 256, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(buffer)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for _ in range(3):  # a fresh view every call: checked every call, never carved
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[:nbytes])
+        assert torch.equal(out, expected)
+    assert counts == {"check": 3, "carve": 0}
+    workspace = buffer[:nbytes]  # one tensor object: checked twice, then plan hits
+    for _ in range(4):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+    assert counts == {"check": 5, "carve": 0}
+    plan = cake_backend._workspace_plans[id(workspace)]
+    assert list(plan.views.values()) == [None]
+    with pytest.raises(ValueError):
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[: nbytes - 256])
+    cake_backend.reset_workspace(buffer)
+
+
 def test_cuda_graph_replay():
     _device_or_skip()
     q, cache, selection, gate = _inputs(8, 24, 2, "HND", 7)
@@ -951,7 +1149,7 @@ def test_split_formula_fills_the_device_capacity():
         2,
     ]
     # sm_120a (the RTX PRO 6000 Blackwell, 188 SMs): the mma.sync decode's two CTAs per SM; the table's rows 4, 8,
-    # 16 and 32 (16, 11, 5, 3) replace the formula's 33, 23, 11, 5.
+    # 16, 32 and 64 (16, 11, 5, 3, 1) replace the formula's 33, 23, 11, 5, 2.
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
         33,
         33,
@@ -959,7 +1157,7 @@ def test_split_formula_fills_the_device_capacity():
         11,
         5,
         3,
-        2,
+        1,
         1,
     ]
     assert [_formula(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
@@ -1024,6 +1222,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
         (188, 8): 11,
         (188, 16): 5,
         (188, 32): 3,
+        (188, 64): 1,
     }
     assert all(
         isinstance(sm, int) and isinstance(rows, int) and 1 <= s <= MAX_SPLITS
@@ -1031,7 +1230,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
     )
     table_132 = [33, 33, 16, 8, 8, 4, 2, 1]
     table_108 = [33, 33, 27, 13, 6, 3, 4, 2]
-    table_188 = [33, 33, 16, 11, 5, 3, 2, 1]
+    table_188 = [33, 33, 16, 11, 5, 3, 1, 1]
     assert [num_splits(r, 2, WIDTH, 132, "sm_90a") for r in ROWS] == table_132
     assert [num_splits(r, 2, WIDTH, 108, "sm_80") for r in ROWS] == table_108
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == table_188
@@ -1437,3 +1636,87 @@ def test_workspace_at_a_recycled_address_is_zeroed_again():
     out.fill_(math.nan)
     _run(q, cache, selection, gate, out, workspace_buffer=second)
     assert torch.equal(out, expected)
+
+
+def test_threads_sharing_a_caller_workspace_raise_nothing():
+    """Threads that pass one workspace, while another thread calls ``reset_workspace``
+    on it, raise nothing and get bitwise-equal outputs: every change to the plan and
+    sighting tables is one dictionary operation that tolerates an entry another thread
+    removed.  Calls above one split are serialized by a lock, as a shared stream asks
+    of its callers (one call's decode and merge launches must not interleave with
+    another's partials); the table changes and the resets are not serialized.  Calls
+    at one split launch without partials and run unserialized.  A tiny switch interval
+    makes the interpreter change threads between the table operations."""
+    device = _device_or_skip()
+    num_qo_heads, num_kv_heads, threads, calls = 24, 2, 4, 12
+    shapes = [(8, _splits(8, num_kv_heads, device))]
+    if _splits(64, num_kv_heads, device) == 1:
+        shapes.append((64, 1))
+    nbytes = max(
+        cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+        for rows, splits in shapes
+    )
+    workspace = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(workspace)  # no plan or sighting from another test
+    cases = []
+    for seed, (rows, splits) in enumerate(shapes, start=41):
+        q, cache, selection, gate = _inputs(
+            rows, num_qo_heads, num_kv_heads, "HND", seed
+        )
+        cases.append(
+            (splits, q, cache, selection, gate, _run(q, cache, selection, gate))
+        )
+    lock = threading.Lock()
+    done = threading.Event()
+    errors: list[BaseException] = []
+    mismatches = [0]
+
+    def caller():
+        try:
+            for splits, q, cache, selection, gate, expected in cases:
+                out = torch.full_like(q, math.nan)
+                for _ in range(calls):
+                    out.fill_(math.nan)
+                    if splits == 1:
+                        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+                    else:
+                        with lock:
+                            _run(
+                                q,
+                                cache,
+                                selection,
+                                gate,
+                                out,
+                                workspace_buffer=workspace,
+                            )
+                    if not torch.equal(out, expected):
+                        mismatches[0] += 1
+        except BaseException as exc:  # every failure is reported below
+            errors.append(exc)
+
+    def resetter():
+        try:
+            while not done.is_set():
+                cake_backend.reset_workspace(workspace)
+        except BaseException as exc:
+            errors.append(exc)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)
+    try:
+        workers = [threading.Thread(target=caller) for _ in range(threads)]
+        reset_thread = threading.Thread(target=resetter)
+        reset_thread.start()
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        done.set()
+        reset_thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert not errors, errors
+    assert mismatches[0] == 0
+    assert len(cake_backend._seen_once) <= cake_backend._SEEN_ONCE_MAX
+    assert len(cake_backend._workspace_plans) <= cake_backend._WORKSPACE_PLANS_MAX
+    cake_backend.reset_workspace(workspace)

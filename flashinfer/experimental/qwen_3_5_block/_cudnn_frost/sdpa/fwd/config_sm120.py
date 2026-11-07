@@ -14,6 +14,9 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.sf_layou
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
+# Q tiles of the DECODE tile (sm120/decode_f16.py): 16 or 32 packed rows per CTA,
+# the consumer warps spread over the KEY axis instead of the rows.
+DECODE_Q_TILES = (16, 32)
 HEAD_TILE_GRANULE = 16
 SUPPORTED_HEAD_TILE_MIN = 16
 GENERAL_HEAD_TILE_MAX = 256
@@ -64,12 +67,78 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
     """The (q_tile, kv_tile) pairs the kernel serving these head dims is built for.
 
     The d512 flavor has one tile; the general and d256 templates take any Q tile
-    with a 128- or 64-key KV tile. The ranking and the adapter intersect their
-    SMEM fit with this set, so no tile is proposed that declines at build.
+    with a 128- or 64-key KV tile. The half decode tile (any head tile up to
+    256) adds its 16- and 32-row Q tiles, whose KV tile is the stage width
+    ``decode_kv_stage`` fixes for the head tiles. The ranking and the adapter
+    intersect their SMEM fit with this set, so no tile is proposed that
+    declines at build.
     """
     if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
         return frozenset({FP8_D512_TILE if fp8 else D512_TILE})
-    return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
+    domain = frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
+    tiles = head_tiles(d_qk, d_v, HEAD_TILE_GRANULE)
+    if not fp8 and max(tiles) <= GENERAL_HEAD_TILE_MAX:
+        domain |= frozenset((m, decode_kv_stage(*tiles)) for m in DECODE_Q_TILES)
+    return domain
+
+
+def is_decode_tile(q_tile: int) -> bool:
+    """Whether a Q tile names the decode tile (sm120/decode_f16.py) rather than a prefill template."""
+    return q_tile in DECODE_Q_TILES
+
+
+# The decode tile streams K/V in stages of at most DECODE_STAGE_BYTES (the K and
+# V halves of ``decode_kv_stage`` keys) wherever the 16-key floor allows: head
+# tiles summing past 256 overrun it, up to twice at 256 + 256. Every key group
+# owns its own slots of the ring (``decode_slots_per_group`` each, at most
+# DECODE_MAX_SLOTS_PER_GROUP), so several stages of every group are in flight
+# while its warps compute and every slot has one waiter, which consumes its uses
+# in order (an mbarrier parity wait cannot tell a phase from the one two phases
+# later).
+DECODE_STAGE_BYTES = 8192
+DECODE_MAX_SLOTS_PER_GROUP = 6
+# Consumer warps of the decode tile: ``q_tile // 16`` M-groups x the key groups
+# that share them. One producer warp and three idle warps complete the second
+# warpgroup, so setmaxregister moves registers per whole warpgroup.
+DECODE_CONSUMER_WARPS = 4
+# Each K and V region of a stage starts on a 1024-byte boundary: the period of
+# the widest (128-byte) TMA swizzle, which the ldmatrix addressing assumes.
+DECODE_REGION_ALIGN = 1024
+
+
+def decode_kv_groups(q_tile: int) -> int:
+    """Key groups of the decode tile: the consumer warps sharing one M-group."""
+    return DECODE_CONSUMER_WARPS // (q_tile // 16)
+
+
+def decode_kv_stage(head_tile_qk: int, head_tile_v: int) -> int:
+    """Keys per K/V stage of the decode tile: the largest multiple of 16 (one
+    P@V k-step) whose K and V half tiles fit DECODE_STAGE_BYTES, clamped to
+    16..64 -- at equal Q/K and V head tiles 64 up to 32, 32 at 48 and 64, 16
+    from 80. The 16-key floor overruns DECODE_STAGE_BYTES once the head tiles
+    sum past 256 (a 256 + 256 stage is 16 KiB); :func:`decode_stage_bytes` is
+    the stage's actual size."""
+    keys = DECODE_STAGE_BYTES // (2 * (head_tile_qk + head_tile_v))
+    return max(16, min(64, keys // 16 * 16))
+
+
+def decode_region_bytes(keys: int, head_tile: int) -> int:
+    """SMEM bytes of one K or V region of a decode stage: ``keys`` half rows of
+    ``head_tile`` columns, rounded up to DECODE_REGION_ALIGN."""
+    return -(-keys * head_tile * 2 // DECODE_REGION_ALIGN) * DECODE_REGION_ALIGN
+
+
+def decode_stage_bytes(head_tile_qk: int, head_tile_v: int) -> int:
+    """SMEM bytes of one decode K/V stage: the K region, then the V region."""
+    keys = decode_kv_stage(head_tile_qk, head_tile_v)
+    return decode_region_bytes(keys, head_tile_qk) + decode_region_bytes(keys, head_tile_v)
+
+
+def decode_merge_bytes(head_tile_v: int, q_tile: int) -> int:
+    """SMEM bytes the decode epilogue's key-group merge stages in the (drained)
+    ring: every consumer warp but the first of its M-group spills its fp32 O
+    accumulator plus its two rows' (max, sum) per lane."""
+    return (decode_kv_groups(q_tile) - 1) * (q_tile // 16) * 32 * (head_tile_v // 2 + 4) * 4
 
 
 MXFP8_KV64_MIN_HEAD_TILE_QK = 224
@@ -89,6 +158,24 @@ def kv_tile_preference(d_qk: int, mxfp8: bool = False) -> tuple[int, ...]:
 # authoritative number at build time; this constant lets the ranking answer
 # "would this tile even fit" without importing the DSL.
 SMEM_CAPACITY_BYTES = 101376
+
+
+def decode_slots_per_group(head_tile_qk: int, head_tile_v: int, q_tile: int) -> int:
+    """Ring slots each key group of the decode tile owns: as many as fit
+    SMEM_CAPACITY_BYTES with their full/empty mbarriers, at most
+    DECODE_MAX_SLOTS_PER_GROUP. 0 when not even one slot per group fits, or the
+    ring cannot hold the epilogue's key-group merge."""
+    stage = decode_stage_bytes(head_tile_qk, head_tile_v)
+    kv_groups = decode_kv_groups(q_tile)
+    slots = min(DECODE_MAX_SLOTS_PER_GROUP, SMEM_CAPACITY_BYTES // ((stage + 16) * kv_groups))
+    if slots < 1 or slots * kv_groups * stage < decode_merge_bytes(head_tile_v, q_tile):
+        return 0
+    return slots
+
+
+def decode_num_stages(head_tile_qk: int, head_tile_v: int, q_tile: int) -> int:
+    """Ring depth of the decode tile: every key group's slots (0 = no ring fits)."""
+    return decode_kv_groups(q_tile) * decode_slots_per_group(head_tile_qk, head_tile_v, q_tile)
 
 
 def register_budgets(q_tile: int) -> tuple[int, int]:
@@ -129,10 +216,21 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     tile and ``MXFP8_D512_K_SF_STAGE_BYTES`` of staged K scale words: there is
     no room beside the exchange for a K tile.
 
+    The half decode tile (``is_decode_tile(q_tile)``) is its K/V stage ring
+    (``decode_num_stages`` stages of ``decode_stage_bytes``) plus one full and
+    one empty mbarrier per stage; its epilogue stages through the drained ring.
+    A head tile it cannot ring reports more than any SM120 part provides.
+
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
     list fills with entries that decline at build.
     """
+    if is_decode_tile(q_tile):
+        hq, hv = head_tiles(d_qk, d_v, HEAD_TILE_GRANULE)
+        stages = decode_num_stages(hq, hv, q_tile) if itemsize == 2 and not mxfp8 and max(hq, hv) <= GENERAL_HEAD_TILE_MAX else 0
+        if stages == 0:
+            return SMEM_CAPACITY_BYTES + 1
+        return stages * (decode_stage_bytes(hq, hv) + 16)
     flavor = pick_flavor(d_qk, d_v, fp8=itemsize == 1)
     if flavor == D512_FLAVOR:
         d_qk, d_v = D512_FLAVOR
@@ -202,6 +300,7 @@ def validate_params(
     allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allowed_o_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
+    decode_tile: bool = False,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -211,7 +310,10 @@ def validate_params(
     FP16/BF16 template's sets (which stores O at the input dtype and plumbs no
     quantizing epilogue); the FP8 template passes its own — FP8 in, any of its
     four quantizing-store epilogues out. ``allow_right_band=False`` rejects a
-    widened right band for templates that do not plumb one.
+    widened right band for templates that do not plumb one. ``decode_tile``
+    names the decode tile (sm120/decode_f16.py), which takes the
+    ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
+    built for the ``SEQ_Q_TILES``.
     """
 
     if params.dtype_qkv not in allowed_dtypes:
@@ -243,9 +345,18 @@ def validate_params(
         raise ValueError("SM120 SDPA: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
     if params.window_left is not None and params.window_left < 0:
         raise ValueError(f"SM120 SDPA: window_left must be non-negative; got {params.window_left}")
-    if params.q_tile not in SEQ_Q_TILES:
-        raise ValueError(f"SM120 SDPA: q_tile must be one of {SEQ_Q_TILES}; got {params.q_tile}")
-    if params.kv_tile not in SEQ_KV_TILES:
+    q_tiles = DECODE_Q_TILES if decode_tile else SEQ_Q_TILES
+    if params.q_tile not in q_tiles:
+        raise ValueError(f"SM120 SDPA: this template's q_tile must be one of {q_tiles}; got {params.q_tile}")
+    if decode_tile:
+        # The decode tile's KV tile is its stage width (decode_kv_stage), fixed by the head tiles.
+        if params.kv_tile not in (16, 32, 64):
+            raise ValueError(f"SM120 SDPA: the decode tile's kv_tile is its stage width (16, 32 or 64); got {params.kv_tile}")
+        if params.thd_varlen:
+            raise ValueError("SM120 SDPA: the decode tile is dense-only (THD keeps the prefill templates)")
+        if params.sched_policy != SCHED_NATURAL:
+            raise ValueError(f"SM120 SDPA: the decode tile runs SCHED_NATURAL only; got sched_policy={params.sched_policy}")
+    elif params.kv_tile not in SEQ_KV_TILES:
         raise ValueError(f"SM120 SDPA: kv_tile must be one of {SEQ_KV_TILES}; got {params.kv_tile}")
     if params.thd_varlen:
         if not params.seq_kv_lens_present:

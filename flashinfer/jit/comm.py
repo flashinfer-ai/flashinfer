@@ -307,6 +307,53 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
+def gen_ulysses_lowp_module() -> JitSpec:
+    # Byte-parity contract: the golden reference (SageAttention fork) compiles
+    # with --use_fast_math (the gen_jit_spec default, do NOT override) and
+    # targets sm_120a.  The explicit 120a gencode matters: the default
+    # compilation context normalizes SM 12.0 to compute_120f, whose FMA
+    # semantics can drift from the anchored sm_120a golden by ULPs.
+    #
+    # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
+    # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
+    # source file covers both architectures. Only emit requested targets:
+    # each AOT provider must contain binaries compatible with its own arch.
+    # A multi-device JIT context may still request both architectures.
+    from .core import check_cuda_arch, sm89_nvcc_flags, sm120a_nvcc_flags
+
+    # Preserve gen_jit_spec's retry when import-time device detection was empty.
+    check_cuda_arch()
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    nvcc_flags = []
+    if (8, "9") in targets:
+        nvcc_flags.extend(sm89_nvcc_flags)
+    if targets & {(12, "0"), (12, "0a"), (12, "0f")}:
+        nvcc_flags.extend(sm120a_nvcc_flags)
+    if not nvcc_flags:
+        raise RuntimeError("Ulysses Lowp requires an SM89 or SM120 compilation target.")
+    return gen_jit_spec(
+        "ulysses_lowp",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_ulysses_lowp_sm90_module() -> JitSpec:
+    # SM90 (Hopper H100/H200) variant: Q_GROUP=16, K_GROUP=128 to match
+    # SageAttention2's WGMMA-based SM90 kernel tile sizes.
+    from .core import sm90a_nvcc_flags
+
+    return gen_jit_spec(
+        "ulysses_lowp_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags,
+    )
+
+
 def gen_ulysses_pcie_module() -> JitSpec:
     """Build the optional single-node PCIe/mlx5 Ulysses transport.
 
@@ -401,7 +448,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
 
     Includes the CFT counted-write path, which is compiled in when the CUDA
     toolkit provides the logical-endpoint API (13.4+) and resolved from the
-    driver at runtime.
+    driver at runtime, and the Lamport path for small steps.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
@@ -412,6 +459,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
         "nvlink_one_sided_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"

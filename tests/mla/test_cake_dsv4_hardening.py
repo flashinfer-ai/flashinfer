@@ -26,6 +26,7 @@ import torch
 
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 from flashinfer.mla.cake_dsv4 import (
+    _route,
     cake_dsv4_workspace_layout,
     cake_dsv4_workspace_requirement,
     cake_dsv4_workspace_reset,
@@ -66,13 +67,17 @@ SEED_BASE = ref.TEST_SEED_BASE + 10_000
 _seed_counter = 0
 
 
-def _skip_unless_cake_gpu() -> None:
+def _skip_unless_cake_gpu(*, sm107: bool = False) -> None:
+    """Skip unless the GPU is SM100 or SM103, or SM107 when ``sm107`` is set
+    (the tests whose programs SM107 builds)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CAKE DSv4 hardening tests")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability not in ((10, 0), (10, 3)):
+    supported = ((10, 0), (10, 3), (10, 7)) if sm107 else ((10, 0), (10, 3))
+    if compute_capability not in supported:
+        names = "SM100/SM103/SM107" if sm107 else "SM100/SM103"
         pytest.skip(
-            "CAKE DeepSeek V4 sparse MLA requires SM100/SM103, "
+            f"CAKE DeepSeek V4 sparse MLA requires {names}, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
         )
 
@@ -90,13 +95,14 @@ def _make_case(
     varlen: bool,
     all_invalid: bool = False,
     seed: int | None = None,
+    batch: int = BATCH,
 ):
     global _seed_counter
     if seed is None:
         seed = SEED_BASE + _seed_counter
         _seed_counter += 1
     param = ref.RawTestParamForDecode(
-        b=BATCH,
+        b=batch,
         h_q=h_q,
         s_q=s_q,
         h_kv=1,
@@ -181,6 +187,7 @@ class _Inputs:
         metadata_rows: int | None = None,
         backend: str = "cake",
         multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         rows = self.num_tokens if metadata_rows is None else metadata_rows
         kwargs = dict(
@@ -196,7 +203,7 @@ class _Inputs:
             kv_layout="HND",
             cum_seq_lens_q=self.cum_seq_lens_q,
             max_q_len=self.max_q_len,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             backend=backend,
             sparse_topk_lens_offset=lens_offset,
         )
@@ -410,6 +417,72 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     # The reference must be evaluated on the mutated testcase's own tensors.
     _assert_close(_rows(eager_out, static), mutated.reference_rows(), dtype)
     assert torch.equal(out, eager_out)
+
+
+@pytest.mark.parametrize(
+    "h_q,batch,s_q",
+    [
+        pytest.param(64, BATCH, 4, id="h64-persistent"),
+        pytest.param(64, 64, 4, id="h64-m64"),
+        pytest.param(128, BATCH, 4, id="h128-persistent"),
+        # 64 requests of 6-12 tokens: 576 rows, the twin's range on SM103.
+        pytest.param(128, 64, 12, id="h128-persistent-twin"),
+        # 2 requests of up to 257 tokens: the twin's range on SM100.
+        pytest.param(128, 2, 257, id="h128-persistent-prefill"),
+    ],
+)
+def test_enable_pdl_matches_and_waits_for_the_query_producer(
+    monkeypatch, h_q, batch, s_q
+):
+    """FP8 programs launched as programmatic dependents: bitwise equal to the
+    plain launch (the H128 persistent route's PDL-free twin on SM103 from 384
+    rows, on SM100 from a 257-token request), and inside a graph they read the
+    query the kernel before them writes (the copy that fills it in place)."""
+    _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
+    dtype = torch.float8_e4m3fn
+    p, tc = _make_case(h_q, dtype, s_q, varlen=True, batch=batch)
+    static = _Inputs(p, tc)
+    workspace = _workspace(static)
+    plain = _out_like(static, fill=0.0)
+    pdl = _out_like(static, fill=0.0)
+    static.run(out=plain, workspace=workspace)
+    plain_variants, launched[:] = list(launched), []
+    static.run(out=pdl, workspace=workspace, enable_pdl=True)
+    torch.cuda.synchronize()
+    assert torch.equal(plain, pdl)
+    (route,) = set(launched)
+    capability = tuple(get_compute_capability(torch.device("cuda")))
+    rows = static.swa_indices.shape[0]
+    twin = route in cake._NO_PDL_TWIN_ROUTES and (
+        (capability == (10, 3) and rows >= 384)
+        or (capability == (10, 0) and static.max_q_len >= 257)
+    )
+    assert set(plain_variants) == {f"{route}_no_pdl" if twin else route}
+
+    p2, tc2 = _make_case(h_q, dtype, s_q, varlen=True, seed=p.seed + 7_000, batch=batch)
+    mutated = _Inputs(p2, tc2)
+    static.copy_from(mutated)
+    source = mutated.query.clone()
+    static.query.copy_(_Inputs(p, tc).query)
+    torch.cuda.synchronize()
+    out = _out_like(static, fill=0.0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static.query.copy_(source)
+        static.run(out=out, workspace=workspace, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_close(_rows(out, static), mutated.reference_rows(), dtype)
 
 
 # --------------------------------------------------------------------------- trtllm-gen host hardening
@@ -635,6 +708,7 @@ class _Case:
         out: Optional[torch.Tensor] = None,
         backend: str = "cake",
         float_scales: bool = False,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         result = trtllm_batch_decode_sparse_mla_dsv4(
             query=self.query,
@@ -651,7 +725,7 @@ class _Case:
             kv_layout="HND",
             cum_seq_lens_q=self.cum_seq_lens_q,
             max_q_len=self.max_q_len if self.ragged else None,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             backend=backend,
         )
         return result.reshape(-1, self.num_heads, 512)
@@ -1315,9 +1389,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
     """sglang's DSv4 trtllm-backend call shapes (FP8 query, float scales).
 
     decode: ``[B, 1, H, 512]`` with one ``seq_lens`` entry per row; mtp-dense:
-    ``[B, 4, H, 512]``; mtp-flat: the same batch as sglang passes it (one row per
-    draft token, per-row causal ``seq_lens``); prefill: ragged rows with
-    ``cum_seq_lens_q`` / ``max_q_len`` and 64-row tile-padded tables.
+    ``[B, 4, H, 512]``; mtp-wide: the same with 17 requests (68 rows); mtp-flat:
+    the same batch as mtp-dense as sglang passes it (one row per draft token,
+    per-row causal ``seq_lens``); prefill: ragged rows with ``cum_seq_lens_q`` /
+    ``max_q_len`` and 64-row tile-padded tables.
     """
     width = _compressed_width(h_q) if compressed else 0
     kwargs = dict(
@@ -1338,8 +1413,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
             compressed_lens=_mixed_compressed_lens(rows, width) if width else None,
             **kwargs,
         )
-    if form in ("mtp-dense", "mtp-flat"):
+    if form in ("mtp-dense", "mtp-flat", "mtp-wide"):
         seq = [4, 70, 127, 300, 2048]
+        if form == "mtp-wide":
+            seq = seq * 3 + [513, 1025]
         rows = 4 * len(seq)
         case = _build_case(
             seq_lens=seq,
@@ -1377,6 +1454,106 @@ def test_sglang_swa_only_convention(h_q, form, tail):
     assert bool((case.sparse_topk_lens == SWA_WINDOW).all())
     assert case.sparse_indices.shape[1] == SWA_WINDOW
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
+
+
+@pytest.mark.parametrize("form", ["decode", "mtp-dense", "mtp-wide"])
+def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
+    monkeypatch, form
+):
+    """The SWA-only FP8/H64 rows of one wave run the low-head prefill route: on
+    SM107 its early-PV sibling up to 64 rows (8 and 20 rows) and the route's
+    program above (68 rows), elsewhere the route's program.  As a programmatic
+    dependent each is bitwise equal to the plain launch and, inside a graph,
+    reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu(sm107=True)
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
+    case = _sglang_case(64, form, compressed=False, tail="minus_one")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    route = _route(
+        dtype=case.dtype,
+        num_heads=case.num_heads,
+        max_q_len=case.max_q_len,
+        ragged=case.ragged,
+        sparse_topk=SWA_WINDOW,
+        batch_size=case.batch_size,
+        compressed_page_size=int(case.compressed_kv_cache.shape[-2]),
+        num_query_tokens=case.rows,
+        sm_count=sm_count,
+    )
+    assert route == "fp8_lowhead_prefill", route
+    sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
+    early = sm107 and case.rows <= 64 * min(sm_count, 216) // 216
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    assert set(launched) == {f"{route}_overlap" if early else route}, launched
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain, pdl)
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.reshape(plain.shape), plain)
+
+
+def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
+    monkeypatch,
+):
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
+    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
+    launch and, inside a graph, reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    case = _build_case(
+        num_heads=64,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(3)],
+        q_lens=[5, 4, 3],
+        layout="ragged",
+        compressed_width=132,
+        compressed_page=2,
+    )
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert {route for route, _ in calls} == {"fp8_lowhead_h64"}, calls
+    assert torch.isfinite(plain).all()
+    _assert_valid(plain, case)
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain.view(torch.int16), pdl.view(torch.int16))
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out.reshape(plain.shape).view(torch.int16), plain.view(torch.int16)
+    )
 
 
 @pytest.mark.parametrize("h_q", _SGLANG_HEADS)
@@ -1621,3 +1798,132 @@ def test_workspace_requirement_matches_the_launch(monkeypatch):
     assert calls == [(req.route, 1)] * 12
     with pytest.raises(ValueError, match="needs at least"):
         case.run(workspace=minimum[: req.minimum_bytes - 128], out=case.nan_out())
+
+
+# ---------------------------------------------------------- caller out off the store alignment
+_BF16 = torch.bfloat16
+_FP8 = torch.float8_e4m3fn
+
+
+def _align_case(route, heads, dtype, q_lens, layout="dense", width=0, page=64, form=""):
+    """One call of ``route`` (SWA-only when ``width`` is 0)."""
+    args = (route, heads, dtype, q_lens, layout, width, page)
+    return pytest.param(*args, id=f"{route}-{form}" if form else route)
+
+
+# One call per route, and per O-writing program of the multi-program routes.
+_OUT_ALIGN_CASES = [
+    _align_case(
+        "fp8_lowhead_one_partition",
+        32,
+        _FP8,
+        [4, 2, 3],
+        "ragged",
+        256,
+        form="q4-ragged",
+    ),
+    _align_case("fp8_lowhead_one_partition", 32, _FP8, [4] * 3, width=256, form="q4"),
+    _align_case("fp8_lowhead_one_partition", 32, _FP8, [1] * 3, width=256, form="q1"),
+    _align_case("fp8_lowhead_prefill", 32, _FP8, [4] * 3),
+    # 66 tokens: above SM107's early-PV sibling ceiling, the route's own program there.
+    _align_case("fp8_lowhead_prefill", 32, _FP8, [22] * 3, form="66-rows"),
+    # 12 tokens, sparse_topk 260: two complete tiles and a partial third.
+    _align_case("fp8_lowhead_h64", 64, _FP8, [5, 4, 3], "ragged", 132, page=2),
+    _align_case("fp8_h64_prefill_source_persistent_m64", 32, _FP8, [257]),
+    _align_case(
+        "fp8_h64_prefill_source_persistent_m64_multi_tile", 32, _FP8, [257], width=256
+    ),
+    _align_case(
+        "fp8_h128_prefill_source_persistent_uniform", 128, _FP8, [4] * 3, width=1024
+    ),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64]),
+    _align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512),
+    _align_case("fp8_h8_h16_source_exact", 16, _FP8, [5, 3, 4], "ragged", 128),
+    _align_case("bf16_h8_h16_source_exact", 16, _BF16, [5, 3, 4], "ragged", 128),
+    _align_case("bf16_h8_swa128_v43", 8, _BF16, [4] * 3),
+    _align_case("bf16_h16_h32_swa128_v44", 32, _BF16, [4] * 3),
+    _align_case("bf16_h32_topk128x_early_v47", 32, _BF16, [4] * 3, width=256),
+    _align_case("bf16_h64_prefill", 64, _BF16, [257]),
+    _align_case("bf16_h64_guard_q_tma_batch_r25", 64, _BF16, [8, 8]),
+    _align_case("bf16_swa128_single_cta", 64, _BF16, [4] * 3),
+    _align_case("bf16_h64_compressed_q8_v38", 64, _BF16, [4] * 3, width=512),
+    _align_case("bf16_h128_prefill_v42", 128, _BF16, [64]),
+    _align_case("bf16_h128_swa128", 128, _BF16, [4] * 3),
+    _align_case("bf16_h128_topk4x_v52", 128, _BF16, [4] * 3, width=1024),
+    # Split owners + reducer (12 tokens), V-split row-first owners (24), row-first (40).
+    _align_case(
+        "bf16_h128_topk128x", 128, _BF16, [4] * 3, width=256, page=2, form="split4"
+    ),
+    _align_case(
+        "bf16_h128_topk128x", 128, _BF16, [8] * 3, width=256, page=2, form="vsplit"
+    ),
+    _align_case(
+        "bf16_h128_topk128x", 128, _BF16, [20] * 2, width=256, page=2, form="row_first"
+    ),
+]
+
+
+@pytest.mark.parametrize("offset_bytes", [2, 16])
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _OUT_ALIGN_CASES
+)
+def test_misaligned_caller_out_matches_aligned(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page, offset_bytes
+):
+    """Every route stores O with 16- or 32-byte vectors or a TMA store
+    (``_OUT_ALIGN_BY_ROUTE``). A contiguous caller ``out`` 2 or 16 bytes off a
+    32-byte boundary gets bitwise the aligned call's result through an aligned
+    staging buffer, the bytes around it stay untouched, and an aligned ``out``
+    allocates nothing.  On SM107 the low-head prefill cases run the early-PV
+    sibling up to its row ceiling (12 rows) and the route's program above it
+    (66 rows); elsewhere they run the route's program."""
+    _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
+    import flashinfer.mla.cake_dsv4 as cake
+
+    calls = _count_dispatches(monkeypatch)
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(len(q_lens))],
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+    )
+    workspace = _workspace_128mib()
+    aligned = case.nan_out()
+    assert aligned.data_ptr() % 32 == 0
+    case.run(workspace=workspace, out=aligned, float_scales=True)
+    torch.cuda.synchronize()
+    assert calls and {r for r, _ in calls} == {route}
+    if route == "fp8_lowhead_prefill":
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
+        early = sm107 and sum(q_lens) <= 64 * min(sm_count, 216) // 216
+        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+
+    again = case.nan_out()
+    after_alloc = _allocation_requests()
+    case.run(workspace=workspace, out=again, float_scales=True)
+    torch.cuda.synchronize()
+    assert _allocation_requests() == after_alloc, "an aligned out must not be staged"
+    assert torch.equal(again.view(torch.int16), aligned.view(torch.int16))
+
+    numel = aligned.numel()
+    pad = offset_bytes // aligned.element_size()
+    raw = torch.full((numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0")
+    start = ((-raw.data_ptr()) % 32) // raw.element_size() + pad
+    view = raw[start : start + numel].view(aligned.shape)
+    assert view.is_contiguous() and view.data_ptr() % 32 == offset_bytes
+    case.run(workspace=workspace, out=view, float_scales=True)
+    torch.cuda.synchronize()
+    assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
+    assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()

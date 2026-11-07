@@ -90,7 +90,7 @@ void Run(TensorView a_gemm2, int64_t a_row_stride, int64_t a_rows, TensorView a_
   check_same_device(a_gen, a_gemm2, "gen", "gemm2");
   TVM_FFI_CHECK((a_n_tok <= a_slots), ValueError)
       << KERNEL_NAME << ": requires (n_tok <= slots)";
-  TVM_FFI_CHECK((a_n_tok >= 1), ValueError)
+  TVM_FFI_CHECK((a_n_tok >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (n_tok >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

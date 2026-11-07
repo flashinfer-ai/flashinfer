@@ -25,8 +25,8 @@ from moe_hopper_fp8.fused_comm_policy import resolve_fused_comm_optimizations
 from moe_hopper_fp8.epilogue_fp8_swapab import (
     SwapABFp8GluEpilogue,
     SwapABTileMChoices,
-    SwapABTokenTileNChoices,
     WarpThreadCount,
+    swapab_token_tile_n_choices,
 )
 from moe_hopper_fp8.kernel_fp8_glu_fc12 import (
     Sm90SwigluFp8Fc12Kernel as _Sm90Fp8Fc12KernelBase,
@@ -169,13 +169,27 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 "limited to independent 1CTA WGMMA; "
                 "use_2cta_instrs must be False."
             )
-        if m not in SwapABTileMChoices or n not in SwapABTokenTileNChoices:
+        token_tile_n_choices = swapab_token_tile_n_choices(fp8_scale_mode)
+        if m not in SwapABTileMChoices or n not in token_tile_n_choices:
             raise ValueError(
                 "Sm90SwapABSwigluFp8Fc12Kernel only supports "
                 f"mma_tiler M in {SwapABTileMChoices} and N in "
-                f"{SwapABTokenTileNChoices} with "
+                f"{token_tile_n_choices} with "
                 "use_2cta_instrs=False; "
                 f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
+            )
+        if n in (72, 80) and m != 256:
+            raise ValueError(
+                "Sm90SwapABSwigluFp8Fc12Kernel token tiles N72/N80 require M=256; "
+                f"got mma_tiler_mnk={mma_tiler_mnk}."
+            )
+        if fp8_scale_mode in ("blockwise", "mxfp4_hybrid") and sf_padding_block % n:
+            # The activation-SF TMA addresses token tile t of an expert as
+            # (expert SF base + t * N) // N, so every SF base must divide by N;
+            # per-tensor scaling has no activation-SF TMA.
+            raise ValueError(
+                f"sf_padding_block={sf_padding_block} must be a multiple of the "
+                f"token tile N={n}."
             )
 
         # Store ab_dtype so workspace-size helpers can use it without tensors.
@@ -419,6 +433,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             stride=(1, self.wgmma_warpgroup_count),
         )
 
+    def _weight_sf_stage_count(self) -> int:
+        return self.num_ab_stage
+
+    @cute.jit
+    def _allocate_weight_aux_smem(self, smem, layout, tidx):
+        return smem.allocate_tensor(
+            element_type=self._weight_aux_smem_dtype(),
+            layout=layout,
+            byte_alignment=16,
+        )
+
     def _bind_static_fc1_weight(
         self,
         fc1_weight: cute.Tensor,
@@ -470,10 +495,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         m, n, k = self.mma_tiler_mnk
         cm, cn = self.cluster_shape_mn
 
-        if m not in SwapABTileMChoices or n not in SwapABTokenTileNChoices:
+        token_tile_n_choices = swapab_token_tile_n_choices(self.fp8_scale_mode)
+        if m not in SwapABTileMChoices or n not in token_tile_n_choices:
             raise ValueError(
                 "Swap-AB Hopper FP8 requires M in "
-                f"{SwapABTileMChoices} and N in {SwapABTokenTileNChoices}, "
+                f"{SwapABTileMChoices} and N in {token_tile_n_choices}, "
                 f"got ({m}, {n})."
             )
 
@@ -1804,6 +1830,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             sched_params, ext, num_drain_warps=0
         )
 
+        weight_sf_stages = self._weight_sf_stage_count()
         if cutlass.const_expr(self.pingpong):
             @cute.struct
             class SharedStorage:
@@ -1811,7 +1838,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     cutlass.Int64, self.num_ab_stage * 2
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.num_ab_stage * 2
+                    cutlass.Int64, weight_sf_stages * 2
                 ]
                 math_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
                 epi_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
@@ -1823,7 +1850,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     cutlass.Int64, self.num_ab_stage * 2
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.num_ab_stage * 2
+                    cutlass.Int64, weight_sf_stages * 2
                 ]
                 fc1_offload_full_mbar_ptr: cute.struct.MemRange[
                     cutlass.Int64, self.num_c_stage
@@ -1878,7 +1905,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         if cutlass.const_expr(self._uses_weight_aux_pipeline()):
             weight_sf_pipeline = pipeline.PipelineCpAsync.create(
                 barrier_storage=storage.weight_sf_mbar_ptr.data_ptr(),
-                num_stages=self.num_ab_stage,
+                num_stages=weight_sf_stages,
                 producer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread, 32
                 ),
@@ -2004,10 +2031,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             weight_sf_smem_layout_staged = (
                 self._weight_aux_smem_layout_staged()
             )
-            sWeightSf = smem.allocate_tensor(
-                element_type=self._weight_aux_smem_dtype(),
-                layout=weight_sf_smem_layout_staged,
-                byte_alignment=16,
+            sWeightSf = self._allocate_weight_aux_smem(
+                smem, weight_sf_smem_layout_staged, tidx
             )
         else:
             sWeightSf = sB

@@ -8,7 +8,8 @@ Mirrors the SM100 package's shim layer
 this layer.  ``comm`` holds dist / symmetric-heap / compile helpers;
 ``hopper_fp8`` and ``hopper_mxfp4`` hold format-specific lazy-compile
 frontends plus their symmetric-buffer + fused-launch wrappers;
-``hopper_bf16`` is the BF16 twin (``tuner_bf16`` / ``autotune_bf16`` are
+``nvfp4_tuner`` / ``nvfp4_autotune`` own the independent NVFP4 candidate
+surface; ``hopper_bf16`` is the BF16 twin (``tuner_bf16`` / ``autotune_bf16`` are
 its knob surface; the knob cache is shared).
 """
 
@@ -37,6 +38,8 @@ from .autotune import (
     hopper_fp8_candidates,
 )
 from .mxfp4_optimization import hopper_mxfp4_candidates
+from .nvfp4_autotune import autotune_hopper_nvfp4_mega_moe
+from .nvfp4_tuner import hopper_nvfp4_candidates
 from .knob_cache import (
     knob_cache_path,
     lookup_knobs,
@@ -113,7 +116,32 @@ from .hopper_bf16 import (
     hopper_bf16_mega_moe,
 )
 
+from .hopper_nvfp4 import (
+    MegaMoEHopperNvfp4Config,
+    MegaMoEHopperNvfp4Frontend,
+    MegaMoEHopperNvfp4Inputs,
+    MegaMoEHopperNvfp4SymmBuffer,
+    TransformedNvfp4Weights,
+    _get_symm_buffer_for_hopper_nvfp4_mega_moe_from_resolved_config,
+    _resolve_hopper_nvfp4_mega_moe_config,
+    get_symm_buffer_for_hopper_nvfp4_mega_moe,
+    hopper_nvfp4_mega_launch_thunk,
+    hopper_nvfp4_mega_moe,
+    resolve_hopper_nvfp4_knobs,
+)
+
 __all__ = [
+    "MegaMoEHopperNvfp4Config",
+    "MegaMoEHopperNvfp4Frontend",
+    "MegaMoEHopperNvfp4Inputs",
+    "MegaMoEHopperNvfp4SymmBuffer",
+    "TransformedNvfp4Weights",
+    "_get_symm_buffer_for_hopper_nvfp4_mega_moe_from_resolved_config",
+    "_resolve_hopper_nvfp4_mega_moe_config",
+    "get_symm_buffer_for_hopper_nvfp4_mega_moe",
+    "hopper_nvfp4_mega_launch_thunk",
+    "hopper_nvfp4_mega_moe",
+    "resolve_hopper_nvfp4_knobs",
     # paths
     "bootstrap_paths",
     # comm
@@ -126,6 +154,8 @@ __all__ = [
     # tuner / knob cache / autotune
     "autotune_hopper_fp8_mega_moe",
     "autotune_hopper_mxfp4_mega_moe",
+    "autotune_hopper_nvfp4_mega_moe",
+    "hopper_nvfp4_candidates",
     "autotune_knobs",
     "default_knobs",
     "hopper_fp8_candidates",

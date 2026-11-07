@@ -43,8 +43,13 @@ class CollectiveStoreSm80:
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
         tid: cutlass.Int32,
+        tok_begin=None,
     ):
-        """Write one O tile up to the sequence end; every thread must call it."""
+        """Write one O tile up to the sequence end; every thread must call it.
+
+        ``tok_begin``: the sequence's first row when ``work_desc`` may start
+        before it (virtual left padding); earlier rows are not written.
+        """
         cute.arch.barrier()
 
         gO_head = gO[None, None, work_desc.o_head_idx(num_q_heads, num_v_heads)]
@@ -78,14 +83,22 @@ class CollectiveStoreSm80:
         thread_row = tid // cutlass.Int32(self.lanes_per_row)
         for rep in cutlass.range_constexpr(cute.size(tSrc, mode=[2])):
             row = cutlass.Int32(rep * self.rows_at_a_time) + thread_row
-            if tok_base + row < tok_end:
-                # The token stride is a runtime multiple of the vector width;
-                # the entry point checks it, so assert the 16 B alignment.
-                dst = cute.make_tensor(
-                    tDst[None, 0, rep].iterator.align(_ALIGN_BYTES),
-                    tDst[None, 0, rep].layout,
-                )
-                cute.copy(atom, tSrc[None, 0, rep], dst)
+            if cutlass.const_expr(tok_begin is None):
+                if tok_base + row < tok_end:
+                    # The token stride is a runtime multiple of the vector width;
+                    # the entry point checks it, so assert the 16 B alignment.
+                    dst = cute.make_tensor(
+                        tDst[None, 0, rep].iterator.align(_ALIGN_BYTES),
+                        tDst[None, 0, rep].layout,
+                    )
+                    cute.copy(atom, tSrc[None, 0, rep], dst)
+            else:
+                if tok_base + row < tok_end and tok_base + row >= tok_begin:
+                    dst = cute.make_tensor(
+                        tDst[None, 0, rep].iterator.align(_ALIGN_BYTES),
+                        tDst[None, 0, rep].layout,
+                    )
+                    cute.copy(atom, tSrc[None, 0, rep], dst)
 
         cute.arch.barrier()
 

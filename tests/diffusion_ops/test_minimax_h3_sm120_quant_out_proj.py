@@ -47,9 +47,9 @@ E4M3_MAX = 448.0
 ACT_AMAX = 4.0
 # Tail lengths around the 128-row tile, plus multi-tile shapes.
 ROWS = [1, 127, 128, 129, 257, 4097]
-# The host runs program 1 (warp-private epilogue staging) on devices with this many SMs and
-# program 0 elsewhere; the two programs produce identical bits.
-PROGRAM_1_SMS = 188
+# The host runs program 1 (warp-private epilogue staging) on devices with these SM counts, per
+# quant (0 = FP8, 1 = NVFP4), and program 0 elsewhere; the two programs produce identical bits.
+PROGRAM_1_SMS = {0: (188,), 1: (188, 170)}
 
 
 def _supported() -> bool:
@@ -425,22 +425,26 @@ def test_out_proj_rejects_bad_inputs() -> None:
         )
 
 
-def _routed_program() -> int:
+def _routed_program(quant: int) -> int:
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    return 1 if sms == PROGRAM_1_SMS else 0
+    return 1 if sms in PROGRAM_1_SMS[quant] else 0
 
 
 @requires_sm120
 def test_out_proj_routes_by_device() -> None:
     module = _get_module()
-    assert module.minimax_h3_sm120_out_proj_program(0) == _routed_program()
+    program_of = module.minimax_h3_sm120_out_proj_program
+    for quant in (0, 1):
+        assert program_of(0, quant) == _routed_program(quant)
     try:
         for program in (0, 1):
             module.minimax_h3_sm120_out_proj_force_program(program)
-            assert module.minimax_h3_sm120_out_proj_program(0) == program
+            for quant in (0, 1):
+                assert program_of(0, quant) == program
     finally:
         module.minimax_h3_sm120_out_proj_force_program(-1)
-    assert module.minimax_h3_sm120_out_proj_program(0) == _routed_program()
+    for quant in (0, 1):
+        assert program_of(0, quant) == _routed_program(quant)
 
 
 @requires_sm120

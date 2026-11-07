@@ -32,10 +32,69 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from .batched_gemm_config import BatchedGemmConfig, DType
+from .batched_gemm_cga import (
+    CgaPolicy,
+    cga_tma_masks,
+    has_multiple_umma_atoms,
+    needs_extended_tma_multicast,
+)
+from .mixed_cga_ts import (
+    override_tma_umma_pipeline,
+    override_umma_atom_pipeline,
+)
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
+from .smem_descriptor import build_tcgen05_smem_desc
 from cutlass.experimental import primitives as prims
+from cutlass.pipeline.sm100 import PipelineTmaUmma
 
 Constexpr = cutlass.Constexpr
+
+
+def _smem_k_box_elems(tile_k: int, smem_bits: int) -> int:
+    """Return one at-most-128-byte swizzled K box."""
+    max_box_k = 64 if smem_bits == 16 else (256 if smem_bits == 4 else 128)
+    return min(tile_k, max_box_k)
+
+
+def _native_mx_fp4_smem_desc_params(
+    tile_rows: int, tile_k: int
+) -> tuple[int, int, int]:
+    """Return Rubin native-MXFP4 descriptor leading, stride, and layout.
+
+    Native 4-bit rows shorter than 256 K elements share one 128-byte SMEM
+    row.  The MMA descriptor must encode the resulting narrower swizzle;
+    treating a 64-byte row as s128b makes the MMA address beyond its stage.
+    """
+    row_bytes = _smem_k_box_elems(tile_k, 4) // 2
+    if row_bytes == 128:
+        rows_per_smem_row, rows_per_swizzle, layout = 1, 8, 2
+    elif row_bytes == 64:
+        rows_per_smem_row, rows_per_swizzle, layout = 2, 4, 4
+    elif row_bytes == 32:
+        rows_per_smem_row, rows_per_swizzle, layout = 4, 2, 6
+    else:
+        raise ValueError(
+            "native MXFP4 MMA requires a 32-, 64-, or 128-byte SMEM row, "
+            f"got tile_k={tile_k} ({row_bytes} bytes)"
+        )
+
+    rows_per_slice = (
+        tile_rows if tile_k > 256 else max(1, tile_rows // rows_per_smem_row)
+    )
+    return 128 * rows_per_slice, 128 * rows_per_swizzle, layout
+
+
+def _uses_native_mx_fp4_operand(cfg: BatchedGemmConfig, dtype_kind: int) -> bool:
+    return cfg.uses_native_mx_fp4_operands and dtype_kind == int(DType.MXE2M1)
+
+
+@cute.jit
+def _cta_rank_in_umma_atom(cfg: cutlass.Constexpr[BatchedGemmConfig]) -> Int32:
+    """Return the CTA's 0/1 position inside its physical 2-CTA UMMA atom."""
+    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    if cutlass.const_expr(has_multiple_umma_atoms(cfg)):
+        return cta_rank & Int32(1)
+    return cta_rank
 
 
 @dataclass(kw_only=True)
@@ -48,6 +107,17 @@ class SmemAResource(MemoryResource):
     _alloc_a: Constexpr[Optional[SmemAllocation]] = None
     desc_a_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_a_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    mixed_cga_policy: Constexpr[int] = int(CgaPolicy.MCAST_A)
+    mixed_cga_kind: Constexpr[str] = "a"
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        # Every physical 2-CTA UMMA atom needs rank-relative full/empty
+        # barrier routing, even when A's TMA payload remains CTA-local.  The
+        # operand-specific multicast decision is applied separately in load().
+        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
+            return override_tma_umma_pipeline(self.cfg, result, "a")
+        return result
 
     def __post_init__(self):
         if self._alloc_a is None:
@@ -110,20 +180,17 @@ class SmemAResource(MemoryResource):
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_a):
                 a_box_k = self.cfg.tile_k
-            elif cutlass.const_expr(self.cfg.dtype_a_kind == int(DType.BF16)):
+            elif cutlass.const_expr(self.cfg.dtype_a == int(DType.BF16)):
                 if cutlass.const_expr(self.cfg.use_bf16_kbox_tma_a):
                     a_box_k = self.cfg.tile_k
                 else:
-                    a_box_k = 64
+                    a_box_k = _smem_k_box_elems(
+                        self.cfg.tile_k, self.cfg.dtype_a_smem_bits
+                    )
             elif cutlass.const_expr(self.cfg.has_cast_a):
                 a_box_k = self.cfg.tile_k
-            elif cutlass.const_expr(
-                self.cfg.dtype_a_kind
-                in (int(DType.MXE2M1), int(DType.MXE4M3), int(DType.E4M3))
-            ):
-                a_box_k = 128
             else:
-                a_box_k = 256
+                a_box_k = _smem_k_box_elems(self.cfg.tile_k, self.cfg.dtype_a_smem_bits)
 
             if cutlass.const_expr(self.cfg.tile_k > a_box_k):
                 box_bytes = a_box_k * self.cfg.tile_m * self.cfg.dtype_a_smem_bits // 8
@@ -201,15 +268,21 @@ class SmemAResource(MemoryResource):
                 barrier,
                 [],
             )
-        elif cutlass.const_expr(self.cfg.has_cluster):
+        elif cutlass.const_expr(self.cfg.uses_two_cta_mma):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
-                self.cfg.cluster_m
-            )
-            barrier = prims.mapa(barrier, lead_cta_rank)
-            # TODO-NVVM: remove cvta_to once mbarrier intrinsics accept AS7.
-            barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
+            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "a")):
+                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "a")
+                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
+                barrier = prims.mapa(barrier, lead_cta_rank)
+                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
+            else:
+                mcast_mask = Int32(1) << cta_rank
+                lead_cta_rank = nonnegative_div(
+                    cta_rank, self.cfg.umma_cta_count
+                ) * Int32(self.cfg.umma_cta_count)
+                barrier = prims.mapa(barrier, lead_cta_rank)
+                # TODO-NVVM: remove cvta_to once mbarrier intrinsics accept AS7.
+                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
             prims.cp_async_bulk_tensor_shared_cluster_global(
                 smem_dst,
                 tma_desc,
@@ -244,22 +317,36 @@ class SmemAResource(MemoryResource):
     @cute.jit
     def _build_mma_desc_a_impl(self, stage_idx) -> tuple[Int64, Int64]:
         stage_base = self.smem_buf.subview(self.cfg.num_bytes_a_per_stage * stage_idx)
-        if cutlass.const_expr(self.cfg.is_fp8_mma):
-            desc_a_mma_base = prims.Tcgen05SmemDesc.build(
+        if cutlass.const_expr(_uses_native_mx_fp4_operand(self.cfg, self.cfg.dtype_a)):
+            leading, stride, layout = _native_mx_fp4_smem_desc_params(
+                self.cfg.tile_m, self.cfg.tile_k
+            )
+            desc_a_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
+                stage_base,
+                leading_byte_offset=leading,
+                stride_byte_offset=stride,
+                layout=layout,
+            )
+        elif cutlass.const_expr(self.cfg.is_fp8_mma):
+            desc_a_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16384,
                 stride_byte_offset=1024,
                 layout=2,
             )
         elif cutlass.const_expr(self.cfg.uses_f16_mma):
-            desc_a_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_a_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=self.cfg.num_bytes_a_per_stage,
                 stride_byte_offset=1024,
                 layout=2,
             )
         else:
-            desc_a_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_a_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=1024,
@@ -278,6 +365,16 @@ class SmemBResource(MemoryResource):
     _alloc_b: Constexpr[Optional[SmemAllocation]] = None
     desc_b_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_b_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    mixed_cga_policy: Constexpr[int] = int(CgaPolicy.MCAST_B)
+    mixed_cga_kind: Constexpr[str] = "b"
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        # Barrier routing follows physical UMMA atoms independently of whether
+        # B uses extended TMA payload multicast.
+        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
+            return override_tma_umma_pipeline(self.cfg, result, "b")
+        return result
 
     def __post_init__(self):
         if self._alloc_b is None:
@@ -330,9 +427,9 @@ class SmemBResource(MemoryResource):
         """TMA load B into SMEM using the generated K-box split."""
         split_b_across_ctas = cutlass.const_expr(self.cfg.split_b_across_ctas)
         if cutlass.const_expr(split_b_across_ctas and not self.cfg.use_tma_oob_opt_b):
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            coord_b_mn = coord_b_mn + cta_rank * Int32(
-                self.cfg.tile_n // self.cfg.cluster_m
+            cta_rank_in_atom = _cta_rank_in_umma_atom(self.cfg)
+            coord_b_mn = coord_b_mn + cta_rank_in_atom * Int32(
+                self.cfg.tile_n // self.cfg.umma_cta_count
             )
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_b_smem_per_stage * stage_info.stage_idx
@@ -340,15 +437,8 @@ class SmemBResource(MemoryResource):
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_b):
                 b_box_k = self.cfg.tile_k
-            elif cutlass.const_expr(self.cfg.dtype_b_kind == int(DType.BF16)):
-                b_box_k = 64
-            elif cutlass.const_expr(
-                self.cfg.dtype_b_kind
-                in (int(DType.MXE2M1), int(DType.MXE4M3), int(DType.E4M3))
-            ):
-                b_box_k = 128
             else:
-                b_box_k = 256
+                b_box_k = _smem_k_box_elems(self.cfg.tile_k, self.cfg.dtype_b_smem_bits)
 
             if cutlass.const_expr(self.cfg.tile_k > b_box_k):
                 box_bytes = (
@@ -391,8 +481,10 @@ class SmemBResource(MemoryResource):
         if cutlass.const_expr(self.cfg.use_tma_oob_opt_b):
             cta_row_offset = Int32(0)
             if cutlass.const_expr(split_b_across_ctas):
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                cta_row_offset = cta_rank * Int32(self.cfg.tile_n // self.cfg.cluster_m)
+                cta_rank_in_atom = _cta_rank_in_umma_atom(self.cfg)
+                cta_row_offset = cta_rank_in_atom * Int32(
+                    self.cfg.tile_n // self.cfg.umma_cta_count
+                )
             return self._tma_oob_coords(
                 coord_k, coord_mn, mn_limit, cta_row_offset, self.cfg.tile_n
             )
@@ -414,9 +506,12 @@ class SmemBResource(MemoryResource):
     @cute.jit
     def _tma_load(self, smem_dst, tma_desc, coords, barrier):
         """Single-CTA or cluster TMA load. Per-CTA mask for 2×1 cluster."""
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            mcast_mask = Int32(1) << cta_rank
+            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "b")):
+                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "b")
+            else:
+                mcast_mask = Int32(1) << cta_rank
             if cutlass.const_expr(self.cfg.split_b_across_ctas):
                 lead_cta_rank = nonnegative_div(cta_rank, 2) * Int32(2)
                 barrier = prims.mapa(barrier, lead_cta_rank)
@@ -458,10 +553,25 @@ class SmemBResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_b_smem_per_stage * stage_idx
         )
-        if cutlass.const_expr(self.cfg.has_cast_a):
+        if cutlass.const_expr(_uses_native_mx_fp4_operand(self.cfg, self.cfg.dtype_b)):
+            tile_rows = self.cfg.tile_n // (
+                self.cfg.umma_cta_count if self.cfg.uses_two_cta_mma else 1
+            )
+            leading, stride, layout = _native_mx_fp4_smem_desc_params(
+                tile_rows, self.cfg.tile_k
+            )
+            desc_b_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
+                stage_base,
+                leading_byte_offset=leading,
+                stride_byte_offset=stride,
+                layout=layout,
+            )
+        elif cutlass.const_expr(self.cfg.has_cast_a):
             # The CastA-generated BF16 MMA path uses the B
             # descriptor packing: tileN=8 -> 1024, tileN=16 -> 2048, etc.
-            desc_b_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_b_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=max(
                     1024, self.cfg.tile_n * (16384 // self.cfg.mma_m)
@@ -470,21 +580,24 @@ class SmemBResource(MemoryResource):
                 layout=2,
             )
         elif cutlass.const_expr(self.cfg.is_fp8_mma):
-            desc_b_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_b_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=max(1024, self.cfg.tile_n * 64),
                 stride_byte_offset=1024,
                 layout=2,
             )
         elif cutlass.const_expr(self.cfg.uses_f16_mma):
-            desc_b_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_b_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=self.cfg.num_bytes_b_smem_per_stage,
                 stride_byte_offset=1024,
                 layout=2,
             )
         else:
-            desc_b_mma_base = prims.Tcgen05SmemDesc.build(
+            desc_b_mma_base = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=1024,
@@ -523,6 +636,12 @@ class SmemGatherResource(MemoryResource):
     desc_b_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_a_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_b_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
 
     def __post_init__(self):
         if self._alloc is None:
@@ -569,19 +688,23 @@ class SmemGatherResource(MemoryResource):
         is_operand_b = cutlass.const_expr(self._operand == "b")
         tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
         tile_rows_per_cta = (
-            tile_rows // self.cfg.cluster_m
-            if is_operand_b and self.cfg.has_cluster
+            tile_rows // self.cfg.umma_cta_count
+            if is_operand_b and self.cfg.uses_two_cta_mma
             else tile_rows
         )
         copy_bytes = 16
         dtype_bits = (
             self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
         )
-        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        box_k = _smem_k_box_elems(self.cfg.tile_k, dtype_bits)
         copies_per_row_box = box_k * dtype_bits // 8 // copy_bytes
         num_k_boxes = self.cfg.tile_k // box_k
         total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
-        num_threads = self.cfg.num_gather_warps * 32
+        num_threads = (
+            self.cfg.warp_layout.num_load_b_warps
+            if self.cfg.is_swap_ab
+            else self.cfg.warp_layout.num_load_a_warps
+        ) * 32
         copies_per_thread = (total_copies + num_threads - 1) // num_threads
         reuse_route_across_k_boxes = (
             num_threads == tile_rows_per_cta * copies_per_row_box
@@ -609,10 +732,10 @@ class SmemGatherResource(MemoryResource):
         tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
         is_operand_b = cutlass.const_expr(self._operand == "b")
         tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
-        if cutlass.const_expr(is_operand_b and self.cfg.has_cluster):
-            tile_rows_per_cta = tile_rows // self.cfg.cluster_m
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+        if cutlass.const_expr(is_operand_b and self.cfg.uses_two_cta_mma):
+            tile_rows_per_cta = tile_rows // self.cfg.umma_cta_count
+            cta_rank_in_atom = _cta_rank_in_umma_atom(self.cfg)
+            cta_row_offset = cta_rank_in_atom * Int32(tile_rows_per_cta)
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -624,25 +747,35 @@ class SmemGatherResource(MemoryResource):
             coord_tile = tile_coord_m * Int32(tile_rows)
             token_tile = tile_coord_m
 
+        token_cga = nonnegative_div(token_tile, self.cfg.token_cluster_dim)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0],
+            self.mn_limit.load(idx=token_cga, vector_size=1)[0],
             token_tile,
             tile_rows,
         )
 
         tidx, _, _ = cute.arch.thread_idx()
-        local_tid = tidx - Int32(self.cfg.gather_warp_idx * 32)
+        local_tid = tidx - Int32(
+            (
+                self.cfg.warp_layout.load_b_warp_idx
+                if self.cfg.is_swap_ab
+                else self.cfg.warp_layout.load_a_warp_idx
+            )
+            * 32
+        )
         copy_bytes = 16
         dtype_bits = (
             self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
         )
-        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        box_k = _smem_k_box_elems(self.cfg.tile_k, dtype_bits)
         copies_per_row_box = box_k * dtype_bits // 8 // copy_bytes
         num_k_boxes = self.cfg.tile_k // box_k
         total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
-        num_threads = self.cfg.num_gather_warps * 32
+        num_threads = (
+            self.cfg.warp_layout.num_load_b_warps
+            if self.cfg.is_swap_ab
+            else self.cfg.warp_layout.num_load_a_warps
+        ) * 32
         copies_per_thread = (total_copies + num_threads - 1) // num_threads
         reuse_route_across_k_boxes = cutlass.const_expr(
             num_threads == tile_rows_per_cta * copies_per_row_box
@@ -713,7 +846,8 @@ class SmemGatherResource(MemoryResource):
         global to shared memory). Each thread copies 16 bytes. Packed inputs
         use bit-width-based byte offsets.
         Route map provides the physical GMEM row for each logical token.
-        s128b swizzle applied to SMEM destination.
+        The SMEM destination uses the swizzle selected by the physical row
+        width (s128b normally, s64b for native MXFP4 with tile_k=128).
         """
         is_operand_b = cutlass.const_expr(self._operand == "b")
         bytes_per_stage = (
@@ -722,10 +856,10 @@ class SmemGatherResource(MemoryResource):
             else self.cfg.num_bytes_a_per_stage
         )
         tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
-        if cutlass.const_expr(is_operand_b and self.cfg.has_cluster):
-            tile_rows_per_cta = tile_rows // self.cfg.cluster_m
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+        if cutlass.const_expr(is_operand_b and self.cfg.uses_two_cta_mma):
+            tile_rows_per_cta = tile_rows // self.cfg.umma_cta_count
+            cta_rank_in_atom = _cta_rank_in_umma_atom(self.cfg)
+            cta_row_offset = cta_rank_in_atom * Int32(tile_rows_per_cta)
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -733,18 +867,31 @@ class SmemGatherResource(MemoryResource):
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
 
         tidx, _, _ = cute.arch.thread_idx()
-        local_tid = tidx - Int32(self.cfg.gather_warp_idx * 32)
+        local_tid = tidx - Int32(
+            (
+                self.cfg.warp_layout.load_b_warp_idx
+                if self.cfg.is_swap_ab
+                else self.cfg.warp_layout.load_a_warp_idx
+            )
+            * 32
+        )
 
         copy_bytes = 16
         dtype_bits = (
             self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
         )
-        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        box_k = _smem_k_box_elems(self.cfg.tile_k, dtype_bits)
         row_box_bytes = box_k * dtype_bits // 8
+        rows_per_smem_row = 128 // row_box_bytes
+        rows_per_swizzle = 8 // rows_per_smem_row
         copies_per_row_box = row_box_bytes // copy_bytes
         num_k_boxes = self.cfg.tile_k // box_k
         total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
-        num_threads = self.cfg.num_gather_warps * 32
+        num_threads = (
+            self.cfg.warp_layout.num_load_b_warps
+            if self.cfg.is_swap_ab
+            else self.cfg.warp_layout.num_load_a_warps
+        ) * 32
         copies_per_thread = (total_copies + num_threads - 1) // num_threads
         reuse_route_across_k_boxes = cutlass.const_expr(
             num_threads == tile_rows_per_cta * copies_per_row_box
@@ -761,12 +908,16 @@ class SmemGatherResource(MemoryResource):
             row_in_tile = nonnegative_div(copy_in_box, copies_per_row_box)
             col_chunk = nonnegative_mod(copy_in_box, copies_per_row_box)
 
-            # SMEM destination with s128b swizzle
+            # Pack short logical rows into 128-byte physical rows before
+            # applying the physical row's s128b/s64b/s32b XOR pattern.
             smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * row_box_bytes)
             smem_row_bytes = row_in_tile * Int32(row_box_bytes)
             smem_col_bytes = col_chunk * Int32(copy_bytes)
             smem_off_bytes = smem_kbox_bytes + smem_row_bytes + smem_col_bytes
-            swizzle_mask = nonnegative_mod(row_in_tile, 8) * Int32(copy_bytes)
+            physical_row = nonnegative_div(row_in_tile, rows_per_smem_row)
+            swizzle_mask = nonnegative_mod(physical_row, rows_per_swizzle) * Int32(
+                copy_bytes
+            )
             swizzled_off = smem_off_bytes ^ swizzle_mask
             smem_ptr = stage_base.subview(swizzled_off)
 
@@ -820,7 +971,7 @@ class SmemGatherResource(MemoryResource):
 
     @cute.jit
     def _build_mma_desc_impl(self, stage_idx):
-        """Build SMEM descriptor for MMA operand (s128b swizzle)."""
+        """Build the SMEM descriptor for the gathered MMA operand."""
         is_operand_b = cutlass.const_expr(self._operand == "b")
         bytes_per_stage = (
             self.cfg.num_bytes_b_smem_per_stage
@@ -829,26 +980,44 @@ class SmemGatherResource(MemoryResource):
         )
 
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_idx)
-        if cutlass.const_expr(self.cfg.is_fp8_mma):
+        dtype_kind = self.cfg.dtype_b if is_operand_b else self.cfg.dtype_a
+        if cutlass.const_expr(_uses_native_mx_fp4_operand(self.cfg, dtype_kind)):
+            tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
+            if cutlass.const_expr(is_operand_b and self.cfg.uses_two_cta_mma):
+                tile_rows //= self.cfg.umma_cta_count
+            leading, stride, layout = _native_mx_fp4_smem_desc_params(
+                tile_rows, self.cfg.tile_k
+            )
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
+                stage_base,
+                leading_byte_offset=leading,
+                stride_byte_offset=stride,
+                layout=layout,
+            )
+        elif cutlass.const_expr(self.cfg.is_fp8_mma):
             if cutlass.const_expr(is_operand_b):
                 leading_byte_offset = max(1024, self.cfg.tile_n * 64)
             else:
                 leading_byte_offset = 16384
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=leading_byte_offset,
                 stride_byte_offset=1024,
                 layout=2,
             )
         elif cutlass.const_expr(self.cfg.uses_f16_mma):
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=bytes_per_stage,
                 stride_byte_offset=1024,
                 layout=2,
             )
         else:
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=1024,
@@ -885,9 +1054,13 @@ def _tma_gather4_cluster(
     """Emit cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."""
     smem_ptr = smem_dst.data_ptr()
     tma_ptr = tma_desc.data_ptr() if hasattr(tma_desc, "data_ptr") else tma_desc
-    # Route completion to the lead CTA's mbarrier so the cluster converges on
-    # mapa(leadCtaRank) before cluster gather4.
-    lead_barrier = prims.cvta_to(prims.mapa(barrier, Int32(0)), prims.CvtaSpace.SHARED)
+    # Route completion to this 2-CTA UMMA atom's leader.  Rank zero is correct
+    # only for the first atom of a wider physical CGA.
+    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    atom_leader = cta_rank & Int32(~1)
+    lead_barrier = prims.cvta_to(
+        prims.mapa(barrier, atom_leader), prims.CvtaSpace.SHARED
+    )
     bar_ptr = lead_barrier.data_ptr()
     mcast_mask_u16 = Uint16(multicast_mask)
     prims.inline_ptx_hl(
@@ -946,7 +1119,11 @@ def _tma_gather4_cluster_x4(
     smem_ptr2 = smem_dst2.data_ptr()
     smem_ptr3 = smem_dst3.data_ptr()
     tma_ptr = tma_desc.data_ptr() if hasattr(tma_desc, "data_ptr") else tma_desc
-    lead_barrier = prims.cvta_to(prims.mapa(barrier, Int32(0)), prims.CvtaSpace.SHARED)
+    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    atom_leader = cta_rank & Int32(~1)
+    lead_barrier = prims.cvta_to(
+        prims.mapa(barrier, atom_leader), prims.CvtaSpace.SHARED
+    )
     bar_ptr = lead_barrier.data_ptr()
     mcast_mask_u16 = Uint16(multicast_mask)
     suffix = (
@@ -1017,16 +1194,30 @@ class SmemTmaGatherResource(MemoryResource):
     desc_b_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_a_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_b_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    mixed_cga_policy: Constexpr[int] = int(CgaPolicy.ALL)
+    mixed_cga_kind: Constexpr[str] = ""
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        # A TMA-gather pipeline still synchronizes with the current physical
+        # UMMA atom when its payload mask is local.
+        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
+            return override_tma_umma_pipeline(self.cfg, result, self._operand)
+        return result
 
     def __post_init__(self):
+        self.mixed_cga_kind = self._operand
+        self.mixed_cga_policy = int(
+            CgaPolicy.MCAST_B if self._operand == "b" else CgaPolicy.MCAST_A
+        )
         if self._alloc is None:
             is_b = self._operand == "b"
             tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
             dtype_bits = (
                 self.cfg.dtype_b_smem_bits if is_b else self.cfg.dtype_a_smem_bits
             )
-            if self.cfg.has_cluster and is_b:
-                tile_rows //= self.cfg.cluster_m
+            if self.cfg.uses_two_cta_mma and is_b:
+                tile_rows //= self.cfg.umma_cta_count
             nbytes = tile_rows * self.cfg.tile_k * dtype_bits // 8
             self._alloc = SmemAllocation(
                 f"{self.name}_g4",
@@ -1061,11 +1252,13 @@ class SmemTmaGatherResource(MemoryResource):
         )
         is_b = self._operand == "b"
         tile_rows = (self.cfg.tile_n if is_b else self.cfg.tile_m) // (
-            self.cfg.cluster_m if self.cfg.has_cluster and is_b else 1
+            self.cfg.umma_cta_count if self.cfg.uses_two_cta_mma and is_b else 1
         )
         num_gather4_per_kbox = tile_rows // 4
         num_load_warps = (
-            self.cfg.num_load_b_warps if is_b else self.cfg.num_load_a_warps
+            self.cfg.warp_layout.num_load_b_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_a_warps
         )
         route_cache_groups = max(
             1, (num_gather4_per_kbox + num_load_warps - 1) // num_load_warps
@@ -1113,10 +1306,10 @@ class SmemTmaGatherResource(MemoryResource):
 
         is_b = cutlass.const_expr(self._operand == "b")
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
-        if cutlass.const_expr(self.cfg.has_cluster and is_b):
-            tile_rows_per_cta = tile_rows // self.cfg.cluster_m
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma and is_b):
+            tile_rows_per_cta = tile_rows // self.cfg.umma_cta_count
+            cta_rank_in_atom = _cta_rank_in_umma_atom(self.cfg)
+            cta_row_offset = cta_rank_in_atom * Int32(tile_rows_per_cta)
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -1124,21 +1317,19 @@ class SmemTmaGatherResource(MemoryResource):
         if cutlass.const_expr(is_b):
             coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
             token_tile = tile_coord_n
-            num_load_warps = self.cfg.num_load_b_warps
-            load_warp_idx = self.cfg.load_b_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_b_warps
+            load_warp_idx = self.cfg.warp_layout.load_b_warp_idx
         else:
             coord_mn = tile_coord_m * Int32(self.cfg.tile_m)
             token_tile = tile_coord_m
-            num_load_warps = self.cfg.num_load_a_warps
-            load_warp_idx = self.cfg.load_a_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_a_warps
+            load_warp_idx = self.cfg.warp_layout.load_a_warp_idx
 
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
+            token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(
-                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
-                    vector_size=1,
-                )[0],
+                self.mn_limit.load(idx=token_cga, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
@@ -1233,33 +1424,31 @@ class SmemTmaGatherResource(MemoryResource):
         # Rows to gather = tile dimension of the operand this resource replaces
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         dtype_bits = self.cfg.dtype_b_smem_bits if is_b else self.cfg.dtype_a_smem_bits
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        if cutlass.const_expr(self.cfg.has_cluster and is_b):
-            tile_rows_per_cta = tile_rows // self.cfg.cluster_m
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma and is_b):
+            tile_rows_per_cta = tile_rows // self.cfg.umma_cta_count
         else:
             tile_rows_per_cta = tile_rows
         bytes_per_stage = tile_rows_per_cta * self.cfg.tile_k * dtype_bits // 8
 
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
 
-        # Each gather4 call loads 4 rows × box_k elements.
-        # BF16: box_k = 64 (128 bytes/row for s128b).
-        # FP8/MX: box_k = 128 (128 bytes/row for s128b).
-        # FP4:  box_k = 256 (128 bytes/row for s128b).
-        if cutlass.const_expr(self.cfg.is_bf16_mma):
-            box_k = 64
-        elif cutlass.const_expr(self.cfg.is_mx_mma or self.cfg.is_fp8_mma):
-            box_k = 128
-        else:
-            box_k = 256
-
+        # Each gather4 call loads four rows from an at-most-128-byte K box.
+        box_k = _smem_k_box_elems(self.cfg.tile_k, dtype_bits)
+        row_box_bytes = box_k * dtype_bits // 8
         num_k_boxes = self.cfg.tile_k // box_k
         num_gather4_per_kbox = tile_rows_per_cta // 4
         num_load_warps = (
-            self.cfg.num_load_b_warps if is_b else self.cfg.num_load_a_warps
+            self.cfg.warp_layout.num_load_b_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_a_warps
         )
-        load_warp_idx = self.cfg.load_b_warp_idx if is_b else self.cfg.load_a_warp_idx
+        load_warp_idx = (
+            self.cfg.warp_layout.load_b_warp_idx
+            if is_b
+            else self.cfg.warp_layout.load_a_warp_idx
+        )
         warp_batches = (num_gather4_per_kbox + num_load_warps - 1) // num_load_warps
         all_gathers_valid = num_gather4_per_kbox % num_load_warps == 0
 
@@ -1271,17 +1460,24 @@ class SmemTmaGatherResource(MemoryResource):
             for ki in cutlass.range_constexpr(num_k_boxes):
                 k_offset = coord_k + Int32(ki * box_k)
                 if cutlass.const_expr(
-                    self.cfg.has_cluster and all_gathers_valid and warp_batches == 4
+                    self.cfg.uses_two_cta_mma
+                    and all_gathers_valid
+                    and warp_batches == 4
                 ):
                     smem_offset0 = Int32(
-                        ki * tile_rows_per_cta * 128
-                    ) + warp_in_task * Int32(4 * 128)
-                    smem_delta = Int32(num_load_warps * 4 * 128)
+                        ki * tile_rows_per_cta * row_box_bytes
+                    ) + warp_in_task * Int32(4 * row_box_bytes)
+                    smem_delta = Int32(num_load_warps * 4 * row_box_bytes)
                     smem_dst0 = stage_base.subview(smem_offset0)
                     smem_dst1 = stage_base.subview(smem_offset0 + smem_delta)
                     smem_dst2 = stage_base.subview(smem_offset0 + smem_delta * Int32(2))
                     smem_dst3 = stage_base.subview(smem_offset0 + smem_delta * Int32(3))
-                    mcast_mask = Int32(1) << cta_rank
+                    if cutlass.const_expr(
+                        needs_extended_tma_multicast(self.cfg, self._operand)
+                    ):
+                        mcast_mask, _, _, _ = cga_tma_masks(self.cfg, self._operand)
+                    else:
+                        mcast_mask = Int32(1) << cta_rank
                     _tma_gather4_cluster_x4(
                         smem_dst0,
                         smem_dst1,
@@ -1318,15 +1514,24 @@ class SmemTmaGatherResource(MemoryResource):
                             r2 = self.routed_rows[route_cache_base + 2]
                             r3 = self.routed_rows[route_cache_base + 3]
 
-                            # SMEM destination: each s128b row = 128 bytes.
+                            # SMEM destination: rows are contiguous in this K box.
                             # Clustered routes store only this CTA's row slice.
                             smem_offset = Int32(
-                                ki * tile_rows_per_cta * 128
-                            ) + gi * Int32(4 * 128)
+                                ki * tile_rows_per_cta * row_box_bytes
+                            ) + gi * Int32(4 * row_box_bytes)
                             smem_dst = stage_base.subview(smem_offset)
 
-                            if cutlass.const_expr(self.cfg.has_cluster):
-                                mcast_mask = Int32(1) << cta_rank
+                            if cutlass.const_expr(self.cfg.uses_two_cta_mma):
+                                if cutlass.const_expr(
+                                    needs_extended_tma_multicast(
+                                        self.cfg, self._operand
+                                    )
+                                ):
+                                    mcast_mask, _, _, _ = cga_tma_masks(
+                                        self.cfg, self._operand
+                                    )
+                                else:
+                                    mcast_mask = Int32(1) << cta_rank
                                 _tma_gather4_cluster(
                                     smem_dst,
                                     self.tma_desc,
@@ -1358,15 +1563,24 @@ class SmemTmaGatherResource(MemoryResource):
                                 r2 = self.routed_rows[route_cache_base + 2]
                                 r3 = self.routed_rows[route_cache_base + 3]
 
-                                # SMEM destination: each s128b row = 128 bytes.
+                                # SMEM destination: rows are contiguous in this K box.
                                 # Clustered routes store only this CTA's row slice.
                                 smem_offset = Int32(
-                                    ki * tile_rows_per_cta * 128
-                                ) + gi * Int32(4 * 128)
+                                    ki * tile_rows_per_cta * row_box_bytes
+                                ) + gi * Int32(4 * row_box_bytes)
                                 smem_dst = stage_base.subview(smem_offset)
 
-                                if cutlass.const_expr(self.cfg.has_cluster):
-                                    mcast_mask = Int32(1) << cta_rank
+                                if cutlass.const_expr(self.cfg.uses_two_cta_mma):
+                                    if cutlass.const_expr(
+                                        needs_extended_tma_multicast(
+                                            self.cfg, self._operand
+                                        )
+                                    ):
+                                        mcast_mask, _, _, _ = cga_tma_masks(
+                                            self.cfg, self._operand
+                                        )
+                                    else:
+                                        mcast_mask = Int32(1) << cta_rank
                                     _tma_gather4_cluster(
                                         smem_dst,
                                         self.tma_desc,
@@ -1404,34 +1618,49 @@ class SmemTmaGatherResource(MemoryResource):
 
     @cute.jit
     def _build_mma_desc_impl(self, stage_info: StageInfo):
-        """Build SMEM descriptor for MMA operand (s128b swizzle)."""
+        """Build the SMEM descriptor for the TMA-gathered MMA operand."""
         is_b = self._operand == "b"
         tile_rows = (self.cfg.tile_n if is_b else self.cfg.tile_m) // (
-            self.cfg.cluster_m if self.cfg.has_cluster and is_b else 1
+            self.cfg.umma_cta_count if self.cfg.uses_two_cta_mma and is_b else 1
         )
         dtype_bits = self.cfg.dtype_b_smem_bits if is_b else self.cfg.dtype_a_smem_bits
         bytes_per_stage = tile_rows * self.cfg.tile_k * dtype_bits // 8
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
-        if cutlass.const_expr(self.cfg.is_fp8_mma):
+        dtype_kind = self.cfg.dtype_b if is_b else self.cfg.dtype_a
+        if cutlass.const_expr(_uses_native_mx_fp4_operand(self.cfg, dtype_kind)):
+            leading, stride, layout = _native_mx_fp4_smem_desc_params(
+                tile_rows, self.cfg.tile_k
+            )
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
+                stage_base,
+                leading_byte_offset=leading,
+                stride_byte_offset=stride,
+                layout=layout,
+            )
+        elif cutlass.const_expr(self.cfg.is_fp8_mma):
             if cutlass.const_expr(is_b):
                 leading_byte_offset = max(1024, self.cfg.tile_n * 64)
             else:
                 leading_byte_offset = 16384
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=leading_byte_offset,
                 stride_byte_offset=1024,
                 layout=2,
             )
         elif cutlass.const_expr(self.cfg.uses_f16_mma):
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=bytes_per_stage,
                 stride_byte_offset=1024,
                 layout=2,
             )
         else:
-            desc = prims.Tcgen05SmemDesc.build(
+            desc = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=1024,

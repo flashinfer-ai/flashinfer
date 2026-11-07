@@ -37,6 +37,13 @@ class MoEEpTensors:
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
     output: Optional["torch.Tensor"] = None
+    # Largest ``num_tokens`` over the EP ranks for this step, the same on
+    # every rank. ``MoEEpSplitLayer`` passes it to
+    # :meth:`MoEEpCommunication.dispatch` as ``runtime_max_tokens_per_rank``,
+    # which sizes the receive rows and the inner kernel's batch; ``None``
+    # uses ``FleetParams.max_tokens_per_rank``. Fleet/Handle transports and
+    # ``MoEEpMegaLayer`` ignore it.
+    runtime_max_tokens_per_rank: Optional[int] = None
 
     @property
     def num_tokens(self) -> int:

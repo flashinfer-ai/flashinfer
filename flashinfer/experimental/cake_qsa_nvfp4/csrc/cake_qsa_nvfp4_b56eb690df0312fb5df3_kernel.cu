@@ -653,13 +653,12 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             float ov[32];
             float sv_next[8];
             unsigned int okn[1];
+            int pv_seen = 0;
             if (n_tiles > 0) {
                 int kk = 0;
                 int ks = kk % 2;
                 int kr = kk % 4;
-                int _stage_s_full = (int)((unsigned int)kk % 2);
-                int _parity_s_full = (int)((unsigned int)kk / 2 % 2);
-                mbarrier_wait(s_full_addr + (_stage_s_full) * 8, _parity_s_full);
+                mbarrier_wait(s_full_addr, 0);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 unsigned int s_addr = s_lane + (unsigned int)(16 * ks) + (unsigned int)(16 * ks << 16);
                 asm volatile(
@@ -667,15 +666,13 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], 8;"
                     : "=r"(*reinterpret_cast<uint32_t*>(&sv_next[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[3])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[4])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[5])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[6])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[7]))
                     : "r"(s_addr));
-                int _stage_valid_full = (int)((unsigned int)kk % 4);
-                int _parity_valid_full = (int)((unsigned int)kk / 4 % 2);
-                mbarrier_wait(valid_full_addr + (_stage_valid_full) * 8, _parity_valid_full);
+                mbarrier_wait(valid_full_addr, 0);
                 unsigned int bits = valid_s[kr * 2 + (tok >> 5)];
                 okn[0] = bits >> tok_bit & 1;
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(valid_empty_addr + (kr) * 8);
+                    mbarrier_arrive(valid_empty_addr);
                 }
             }
             #pragma unroll 1
@@ -685,7 +682,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(s_empty_addr + (ss) * 8);
+                    mbarrier_arrive(s_empty_addr + ((int)((unsigned int)n % 2)) * 8);
                 }
                 unsigned int ok = okn[0];
                 s[0] = ((ok != 0) ? sv_next[0] * score_scale : -1e+20f);
@@ -704,38 +701,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 mx[6] = s[6];
                 s[7] = ((ok != 0) ? sv_next[7] * score_scale : -1e+20f);
                 mx[7] = s[7];
-#if __CUDA_ARCH__ == 1070
-                float send8 = ((b3) ? mx[0] : mx[4]);
-                float keep8 = ((b3) ? mx[4] : mx[0]);
-                float _shfl_xor_sync_0 = __shfl_xor_sync(0xFFFFFFFF, send8, 8);
-                a4[0] = fmaxf(keep8, _shfl_xor_sync_0);
-                float send8_0 = ((b3) ? mx[1] : mx[5]);
-                float keep8_1 = ((b3) ? mx[5] : mx[1]);
-                float _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, send8_0, 8);
-                a4[1] = fmaxf(keep8_1, _shfl_xor_sync_1);
-                float send8_2 = ((b3) ? mx[2] : mx[6]);
-                float keep8_3 = ((b3) ? mx[6] : mx[2]);
-                float _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, send8_2, 8);
-                a4[2] = fmaxf(keep8_3, _shfl_xor_sync_2);
-                float send8_4 = ((b3) ? mx[3] : mx[7]);
-                float keep8_5 = ((b3) ? mx[7] : mx[3]);
-                float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, send8_4, 8);
-                a4[3] = fmaxf(keep8_5, _shfl_xor_sync_3);
-                float send4 = ((b2) ? a4[0] : a4[2]);
-                float keep4 = ((b2) ? a4[2] : a4[0]);
-                float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, send4, 4);
-                a2[0] = fmaxf(keep4, _shfl_xor_sync_4);
-                float send4_6 = ((b2) ? a4[1] : a4[3]);
-                float keep4_7 = ((b2) ? a4[3] : a4[1]);
-                float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, send4_6, 4);
-                a2[1] = fmaxf(keep4_7, _shfl_xor_sync_5);
-                float send2 = ((b1) ? a2[0] : a2[1]);
-                float keep2 = ((b1) ? a2[1] : a2[0]);
-                float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, send2, 2);
-                float red = fmaxf(keep2, _shfl_xor_sync_6);
-                float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, red, 1);
-                red = fmaxf(red, _shfl_xor_sync_7);
-#else
                 float r16[16];
                 float rv = ((half == 0) ? mx[0] : -1e+20f);
                 float _warp_redux_0;
@@ -801,21 +766,12 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 float _warp_redux_15;
                 asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_15) : "f"(rv_14));
                 r16[15] = _warp_redux_15;
-#endif
                 unsigned int xb = xchg_max + (unsigned int)(n & 1) * 768;
-#if __CUDA_ARCH__ == 1070
-                if (pub_lane) {
-                    {
-                        uint32_t _addr_8 = static_cast<uint32_t>(xb + pub_off);
-                        asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_8), "f"(red) : "memory");
-                    }
-#else
                 if (lane_1 == 0) {
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1)), "f"(r16[0]), "f"(r16[1]), "f"(r16[2]), "f"(r16[3]) : "memory");
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 16)), "f"(r16[4]), "f"(r16[5]), "f"(r16[6]), "f"(r16[7]) : "memory");
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 32)), "f"(r16[8]), "f"(r16[9]), "f"(r16[10]), "f"(r16[11]) : "memory");
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(xb + (unsigned int)(64 * warp_1 + 48)), "f"(r16[12]), "f"(r16[13]), "f"(r16[14]), "f"(r16[15]) : "memory");
-#endif
                 }
                 asm volatile("barrier.sync 2, 128;" ::: "memory");
                 unsigned int xb_half = xb + xb_half_off;
@@ -844,9 +800,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     : "=r"(*reinterpret_cast<uint32_t*>(&mw[28])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mw[(28) + 3]))
                     : "r"(xb_half + 192 + 16));
                 bool moved = 0;
-#if __CUDA_ARCH__ == 1070
-                m_new[0] = fmaxf(fmaxf(m[0], mw[0]), fmaxf(fmaxf(mw[8], mw[16]), mw[24]));
-#else
                 float _max3_17;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -858,11 +811,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_16) : "f"(_max3_17), "f"(mw[16]), "f"(mw[24]));
                 m_new[0] = _max3_16;
-#endif
                 moved = moved || m_new[0] != m[0];
-#if __CUDA_ARCH__ == 1070
-                m_new[1] = fmaxf(fmaxf(m[1], mw[1]), fmaxf(fmaxf(mw[9], mw[17]), mw[25]));
-#else
                 float _max3_19;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -874,11 +823,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_18) : "f"(_max3_19), "f"(mw[17]), "f"(mw[25]));
                 m_new[1] = _max3_18;
-#endif
                 moved = moved || m_new[1] != m[1];
-#if __CUDA_ARCH__ == 1070
-                m_new[2] = fmaxf(fmaxf(m[2], mw[2]), fmaxf(fmaxf(mw[10], mw[18]), mw[26]));
-#else
                 float _max3_21;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -890,11 +835,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_20) : "f"(_max3_21), "f"(mw[18]), "f"(mw[26]));
                 m_new[2] = _max3_20;
-#endif
                 moved = moved || m_new[2] != m[2];
-#if __CUDA_ARCH__ == 1070
-                m_new[3] = fmaxf(fmaxf(m[3], mw[3]), fmaxf(fmaxf(mw[11], mw[19]), mw[27]));
-#else
                 float _max3_23;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -906,11 +847,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_22) : "f"(_max3_23), "f"(mw[19]), "f"(mw[27]));
                 m_new[3] = _max3_22;
-#endif
                 moved = moved || m_new[3] != m[3];
-#if __CUDA_ARCH__ == 1070
-                m_new[4] = fmaxf(fmaxf(m[4], mw[4]), fmaxf(fmaxf(mw[12], mw[20]), mw[28]));
-#else
                 float _max3_25;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -922,11 +859,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_24) : "f"(_max3_25), "f"(mw[20]), "f"(mw[28]));
                 m_new[4] = _max3_24;
-#endif
                 moved = moved || m_new[4] != m[4];
-#if __CUDA_ARCH__ == 1070
-                m_new[5] = fmaxf(fmaxf(m[5], mw[5]), fmaxf(fmaxf(mw[13], mw[21]), mw[29]));
-#else
                 float _max3_27;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -938,11 +871,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(_max3_27), "f"(mw[21]), "f"(mw[29]));
                 m_new[5] = _max3_26;
-#endif
                 moved = moved || m_new[5] != m[5];
-#if __CUDA_ARCH__ == 1070
-                m_new[6] = fmaxf(fmaxf(m[6], mw[6]), fmaxf(fmaxf(mw[14], mw[22]), mw[30]));
-#else
                 float _max3_29;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -954,11 +883,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_28) : "f"(_max3_29), "f"(mw[22]), "f"(mw[30]));
                 m_new[6] = _max3_28;
-#endif
                 moved = moved || m_new[6] != m[6];
-#if __CUDA_ARCH__ == 1070
-                m_new[7] = fmaxf(fmaxf(m[7], mw[7]), fmaxf(fmaxf(mw[15], mw[23]), mw[31]));
-#else
                 float _max3_31;
                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                 #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -970,28 +895,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 #endif
                 asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_31), "f"(mw[23]), "f"(mw[31]));
                 m_new[7] = _max3_30;
-#endif
                 moved = moved || m_new[7] != m[7];
-#if __CUDA_ARCH__ == 1070
-                int _warp_vote_9 = __any_sync(0xFFFFFFFF, moved);
-                bool any_rescale = _warp_vote_9;
-                float _exp2_10 = approx_exp2(s[0] - m_new[0]);
-                p[0] = ((ok != 0) ? _exp2_10 : 0.0f);
-                float _exp2_11 = approx_exp2(s[1] - m_new[1]);
-                p[1] = ((ok != 0) ? _exp2_11 : 0.0f);
-                float _exp2_12 = approx_exp2(s[2] - m_new[2]);
-                p[2] = ((ok != 0) ? _exp2_12 : 0.0f);
-                float _exp2_13 = approx_exp2(s[3] - m_new[3]);
-                p[3] = ((ok != 0) ? _exp2_13 : 0.0f);
-                float _exp2_14 = approx_exp2(s[4] - m_new[4]);
-                p[4] = ((ok != 0) ? _exp2_14 : 0.0f);
-                float _exp2_15 = approx_exp2(s[5] - m_new[5]);
-                p[5] = ((ok != 0) ? _exp2_15 : 0.0f);
-                float _exp2_16 = approx_exp2(s[6] - m_new[6]);
-                p[6] = ((ok != 0) ? _exp2_16 : 0.0f);
-                float _exp2_17 = approx_exp2(s[7] - m_new[7]);
-                p[7] = ((ok != 0) ? _exp2_17 : 0.0f);
-#else
                 int _warp_vote_32 = __any_sync(0xFFFFFFFF, moved);
                 bool any_rescale = _warp_vote_32;
                 float _exp2_33 = approx_exp2(s[0] - m_new[0]);
@@ -1010,71 +914,30 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 p[6] = ((ok != 0) ? _exp2_39 : 0.0f);
                 float _exp2_40 = approx_exp2(s[7] - m_new[7]);
                 p[7] = ((ok != 0) ? _exp2_40 : 0.0f);
-#endif
                 if (any_rescale) {
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_18 = approx_exp2(m[0] - m_new[0]);
-                    alpha[0] = _exp2_18;
-#else
                     float _exp2_41 = approx_exp2(m[0] - m_new[0]);
                     alpha[0] = _exp2_41;
-#endif
                     l[0] = __fmaf_rn(l[0], alpha[0], p[0]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_19 = approx_exp2(m[1] - m_new[1]);
-                    alpha[1] = _exp2_19;
-#else
                     float _exp2_42 = approx_exp2(m[1] - m_new[1]);
                     alpha[1] = _exp2_42;
-#endif
                     l[1] = __fmaf_rn(l[1], alpha[1], p[1]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_20 = approx_exp2(m[2] - m_new[2]);
-                    alpha[2] = _exp2_20;
-#else
                     float _exp2_43 = approx_exp2(m[2] - m_new[2]);
                     alpha[2] = _exp2_43;
-#endif
                     l[2] = __fmaf_rn(l[2], alpha[2], p[2]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_21 = approx_exp2(m[3] - m_new[3]);
-                    alpha[3] = _exp2_21;
-#else
                     float _exp2_44 = approx_exp2(m[3] - m_new[3]);
                     alpha[3] = _exp2_44;
-#endif
                     l[3] = __fmaf_rn(l[3], alpha[3], p[3]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_22 = approx_exp2(m[4] - m_new[4]);
-                    alpha[4] = _exp2_22;
-#else
                     float _exp2_45 = approx_exp2(m[4] - m_new[4]);
                     alpha[4] = _exp2_45;
-#endif
                     l[4] = __fmaf_rn(l[4], alpha[4], p[4]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_23 = approx_exp2(m[5] - m_new[5]);
-                    alpha[5] = _exp2_23;
-#else
                     float _exp2_46 = approx_exp2(m[5] - m_new[5]);
                     alpha[5] = _exp2_46;
-#endif
                     l[5] = __fmaf_rn(l[5], alpha[5], p[5]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_24 = approx_exp2(m[6] - m_new[6]);
-                    alpha[6] = _exp2_24;
-#else
                     float _exp2_47 = approx_exp2(m[6] - m_new[6]);
                     alpha[6] = _exp2_47;
-#endif
                     l[6] = __fmaf_rn(l[6], alpha[6], p[6]);
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_25 = approx_exp2(m[7] - m_new[7]);
-                    alpha[7] = _exp2_25;
-#else
                     float _exp2_48 = approx_exp2(m[7] - m_new[7]);
                     alpha[7] = _exp2_48;
-#endif
                     l[7] = __fmaf_rn(l[7], alpha[7], p[7]);
                 } else {
                     l[0] = l[0] + p[0];
@@ -1101,24 +964,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_p_addr + (unsigned int)(ss * 2048) + (unsigned int)(tok * 32 + 16 * half ^ (tok * 32 + 16 * half >> 7 & 1) << 4))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[0], p[1])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[2], p[3])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[4], p[5])))), "r"(__as_u32(__float22bfloat162_rn(make_float2(p[6], p[7])))) : "memory");
                 if (n > 0 && any_rescale) {
-#if __CUDA_ARCH__ == 1070
-                    float _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
-                    other[0] = _shfl_xor_sync_26;
-                    float _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
-                    other[1] = _shfl_xor_sync_27;
-                    float _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, alpha[2], 16);
-                    other[2] = _shfl_xor_sync_28;
-                    float _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, alpha[3], 16);
-                    other[3] = _shfl_xor_sync_29;
-                    float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, alpha[4], 16);
-                    other[4] = _shfl_xor_sync_30;
-                    float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, alpha[5], 16);
-                    other[5] = _shfl_xor_sync_31;
-                    float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, alpha[6], 16);
-                    other[6] = _shfl_xor_sync_32;
-                    float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
-                    other[7] = _shfl_xor_sync_33;
-#else
                     float _shfl_xor_sync_49 = __shfl_xor_sync(0xFFFFFFFF, alpha[0], 16);
                     other[0] = _shfl_xor_sync_49;
                     float _shfl_xor_sync_50 = __shfl_xor_sync(0xFFFFFFFF, alpha[1], 16);
@@ -1135,7 +980,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     other[6] = _shfl_xor_sync_55;
                     float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, alpha[7], 16);
                     other[7] = _shfl_xor_sync_56;
-#endif
                     int _stage_pv_done_1 = (int)((unsigned int)(n - 1) % 2);
                     int _parity_pv_done_1 = (int)((unsigned int)(n - 1) / 2 % 2);
                     mbarrier_wait(pv_done_addr + (_stage_pv_done_1) * 8, _parity_pv_done_1);
@@ -1183,15 +1027,15 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(p_full_addr + (ss) * 8);
+                    mbarrier_arrive(p_full_addr + ((int)((unsigned int)n % 2)) * 8);
                 }
                 if (n_tiles > n + 1) {
                     int kk_1 = n + 1;
                     int ks_1 = kk_1 % 2;
                     int kr_1 = kk_1 % 4;
-                    int _stage_s_full_1 = (int)((unsigned int)kk_1 % 2);
-                    int _parity_s_full_1 = (int)((unsigned int)kk_1 / 2 % 2);
-                    mbarrier_wait(s_full_addr + (_stage_s_full_1) * 8, _parity_s_full_1);
+                    int _stage_s_full = (int)((unsigned int)(n + 1) % 2);
+                    int _parity_s_full = (int)((unsigned int)(n + 1) / 2 % 2);
+                    mbarrier_wait(s_full_addr + (_stage_s_full) * 8, _parity_s_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int s_addr_1 = s_lane + (unsigned int)(16 * ks_1) + (unsigned int)(16 * ks_1 << 16);
                     asm volatile(
@@ -1199,21 +1043,19 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], 8;"
                         : "=r"(*reinterpret_cast<uint32_t*>(&sv_next[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[3])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[4])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[5])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[6])), "=r"(*reinterpret_cast<uint32_t*>(&sv_next[7]))
                         : "r"(s_addr_1));
-                    int _stage_valid_full_1 = (int)((unsigned int)kk_1 % 4);
-                    int _parity_valid_full_1 = (int)((unsigned int)kk_1 / 4 % 2);
-                    mbarrier_wait(valid_full_addr + (_stage_valid_full_1) * 8, _parity_valid_full_1);
+                    int _stage_valid_full = (int)((unsigned int)(n + 1) % 4);
+                    int _parity_valid_full = (int)((unsigned int)(n + 1) / 4 % 2);
+                    mbarrier_wait(valid_full_addr + (_stage_valid_full) * 8, _parity_valid_full);
                     unsigned int bits_1 = valid_s[kr_1 * 2 + (tok >> 5)];
                     okn[0] = bits_1 >> tok_bit & 1;
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     __syncwarp();
                     if (elect_sync()) {
-                        mbarrier_arrive(valid_empty_addr + (kr_1) * 8);
+                        mbarrier_arrive(valid_empty_addr + ((int)((unsigned int)(n + 1) % 4)) * 8);
                     }
                 }
             }
             float o_acc[32];
-#if __CUDA_ARCH__ == 1070
-#else
             float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
             l[0] = l[0] + _shfl_xor_sync_57;
             float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
@@ -1436,10 +1278,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             inv_h[14] = output_scale * _rcp_103;
             float _rcp_104 = approx_rcp(fmaxf(l_sum[15], 1e-20f));
             inv_h[15] = output_scale * _rcp_104;
-#endif
             if (n_tiles > 0) {
-                int _stage_pv_done_2 = (int)((unsigned int)(n_tiles - 1) % 2);
-                int _parity_pv_done_2 = (int)((unsigned int)(n_tiles - 1) / 2 % 2);
+                pv_seen += n_tiles;
+                int _stage_pv_done_2 = (int)((unsigned int)(pv_seen - 1) % 2);
+                int _parity_pv_done_2 = (int)((unsigned int)(pv_seen - 1) / 2 % 2);
                 mbarrier_wait(pv_done_addr + (_stage_pv_done_2) * 8, _parity_pv_done_2);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 tmem_ld_x16(&o_acc[0], o_lane);
@@ -1484,165 +1326,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             if (elect_sync()) {
                 mbarrier_arrive(tmem_dead_addr);
             }
-#if __CUDA_ARCH__ == 1070
-            float _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, l[0], 1);
-            l[0] = l[0] + _shfl_xor_sync_34;
-            float _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, l[1], 1);
-            l[1] = l[1] + _shfl_xor_sync_35;
-            float _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, l[2], 1);
-            l[2] = l[2] + _shfl_xor_sync_36;
-            float _shfl_xor_sync_37 = __shfl_xor_sync(0xFFFFFFFF, l[3], 1);
-            l[3] = l[3] + _shfl_xor_sync_37;
-            float _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, l[4], 1);
-            l[4] = l[4] + _shfl_xor_sync_38;
-            float _shfl_xor_sync_39 = __shfl_xor_sync(0xFFFFFFFF, l[5], 1);
-            l[5] = l[5] + _shfl_xor_sync_39;
-            float _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, l[6], 1);
-            l[6] = l[6] + _shfl_xor_sync_40;
-            float _shfl_xor_sync_41 = __shfl_xor_sync(0xFFFFFFFF, l[7], 1);
-            l[7] = l[7] + _shfl_xor_sync_41;
-            float _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, l[0], 2);
-            l[0] = l[0] + _shfl_xor_sync_42;
-            float _shfl_xor_sync_43 = __shfl_xor_sync(0xFFFFFFFF, l[1], 2);
-            l[1] = l[1] + _shfl_xor_sync_43;
-            float _shfl_xor_sync_44 = __shfl_xor_sync(0xFFFFFFFF, l[2], 2);
-            l[2] = l[2] + _shfl_xor_sync_44;
-            float _shfl_xor_sync_45 = __shfl_xor_sync(0xFFFFFFFF, l[3], 2);
-            l[3] = l[3] + _shfl_xor_sync_45;
-            float _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, l[4], 2);
-            l[4] = l[4] + _shfl_xor_sync_46;
-            float _shfl_xor_sync_47 = __shfl_xor_sync(0xFFFFFFFF, l[5], 2);
-            l[5] = l[5] + _shfl_xor_sync_47;
-            float _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, l[6], 2);
-            l[6] = l[6] + _shfl_xor_sync_48;
-            float _shfl_xor_sync_49 = __shfl_xor_sync(0xFFFFFFFF, l[7], 2);
-            l[7] = l[7] + _shfl_xor_sync_49;
-            float _shfl_xor_sync_50 = __shfl_xor_sync(0xFFFFFFFF, l[0], 4);
-            l[0] = l[0] + _shfl_xor_sync_50;
-            float _shfl_xor_sync_51 = __shfl_xor_sync(0xFFFFFFFF, l[1], 4);
-            l[1] = l[1] + _shfl_xor_sync_51;
-            float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, l[2], 4);
-            l[2] = l[2] + _shfl_xor_sync_52;
-            float _shfl_xor_sync_53 = __shfl_xor_sync(0xFFFFFFFF, l[3], 4);
-            l[3] = l[3] + _shfl_xor_sync_53;
-            float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, l[4], 4);
-            l[4] = l[4] + _shfl_xor_sync_54;
-            float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, l[5], 4);
-            l[5] = l[5] + _shfl_xor_sync_55;
-            float _shfl_xor_sync_56 = __shfl_xor_sync(0xFFFFFFFF, l[6], 4);
-            l[6] = l[6] + _shfl_xor_sync_56;
-            float _shfl_xor_sync_57 = __shfl_xor_sync(0xFFFFFFFF, l[7], 4);
-            l[7] = l[7] + _shfl_xor_sync_57;
-            float _shfl_xor_sync_58 = __shfl_xor_sync(0xFFFFFFFF, l[0], 8);
-            l[0] = l[0] + _shfl_xor_sync_58;
-            float _shfl_xor_sync_59 = __shfl_xor_sync(0xFFFFFFFF, l[1], 8);
-            l[1] = l[1] + _shfl_xor_sync_59;
-            float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, l[2], 8);
-            l[2] = l[2] + _shfl_xor_sync_60;
-            float _shfl_xor_sync_61 = __shfl_xor_sync(0xFFFFFFFF, l[3], 8);
-            l[3] = l[3] + _shfl_xor_sync_61;
-            float _shfl_xor_sync_62 = __shfl_xor_sync(0xFFFFFFFF, l[4], 8);
-            l[4] = l[4] + _shfl_xor_sync_62;
-            float _shfl_xor_sync_63 = __shfl_xor_sync(0xFFFFFFFF, l[5], 8);
-            l[5] = l[5] + _shfl_xor_sync_63;
-            float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, l[6], 8);
-            l[6] = l[6] + _shfl_xor_sync_64;
-            float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, l[7], 8);
-            l[7] = l[7] + _shfl_xor_sync_65;
-            if ((lane_1 & 15) == 0) {
-                unsigned int pub_l = xchg_addr + (unsigned int)(4 * (64 + 16 * warp_1 + 8 * half));
-                asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_l), "f"(l[0]), "f"(l[1]), "f"(l[2]), "f"(l[3]) : "memory");
-                asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_l + 16), "f"(l[4]), "f"(l[5]), "f"(l[6]), "f"(l[7]) : "memory");
-            }
-            if (tid_0 == 0 || tid_0 == 16) {
-                unsigned int pub_m = xchg_addr + 512 + xb_half_off;
-                asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_m), "f"(m[0]), "f"(m[1]), "f"(m[2]), "f"(m[3]) : "memory");
-                asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(pub_m + 16), "f"(m[4]), "f"(m[5]), "f"(m[6]), "f"(m[7]) : "memory");
-            }
-#else
-#endif
             int d0 = 32 * warp_1 + lane_1;
-#if __CUDA_ARCH__ == 1070
-            o_xchg[d0] = o_acc[0];
-            o_xchg[128 + d0] = o_acc[16];
-            o_xchg[260 + d0] = o_acc[1];
-            o_xchg[388 + d0] = o_acc[17];
-            o_xchg[520 + d0] = o_acc[2];
-            o_xchg[648 + d0] = o_acc[18];
-            o_xchg[780 + d0] = o_acc[3];
-            o_xchg[908 + d0] = o_acc[19];
-            o_xchg[1040 + d0] = o_acc[4];
-            o_xchg[1168 + d0] = o_acc[20];
-            o_xchg[1300 + d0] = o_acc[5];
-            o_xchg[1428 + d0] = o_acc[21];
-            o_xchg[1560 + d0] = o_acc[6];
-            o_xchg[1688 + d0] = o_acc[22];
-            o_xchg[1820 + d0] = o_acc[7];
-            o_xchg[1948 + d0] = o_acc[23];
-            o_xchg[2080 + d0] = o_acc[8];
-            o_xchg[2208 + d0] = o_acc[24];
-            o_xchg[2340 + d0] = o_acc[9];
-            o_xchg[2468 + d0] = o_acc[25];
-            o_xchg[2600 + d0] = o_acc[10];
-            o_xchg[2728 + d0] = o_acc[26];
-            o_xchg[2860 + d0] = o_acc[11];
-            o_xchg[2988 + d0] = o_acc[27];
-            o_xchg[3120 + d0] = o_acc[12];
-            o_xchg[3248 + d0] = o_acc[28];
-            o_xchg[3380 + d0] = o_acc[13];
-            o_xchg[3508 + d0] = o_acc[29];
-            o_xchg[3640 + d0] = o_acc[14];
-            o_xchg[3768 + d0] = o_acc[30];
-            o_xchg[3900 + d0] = o_acc[15];
-            o_xchg[4028 + d0] = o_acc[31];
-            asm volatile("barrier.sync 2, 128;" ::: "memory");
-            int g = lane_1 >> 2;
-            int t = lane_1 & 3;
-            int dim0 = 64 * warp_1 + 16 * t;
-            float v[16];
-            float gated[8];
-            int head_1 = g;
-            if (head_1 < group_size) {
-                float l_r = xchg[64 + head_1];
-                l_r = l_r + xchg[80 + head_1];
-                l_r = l_r + xchg[96 + head_1];
-                l_r = l_r + xchg[112 + head_1];
-                float m_r = xchg[128 + head_1];
-                unsigned int o_src = o_xchg_addr + (unsigned int)(4 * (head_1 * 260 + dim0));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[0])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 3]))
-                    : "r"(o_src));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[4])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 3]))
-                    : "r"(o_src + 16));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[8])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 3]))
-                    : "r"(o_src + 32));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
-                    : "r"(o_src + 48));
-                bool has_values = l_r > 0.0f;
-                float _rcp_66 = approx_rcp(fmaxf(l_r, 1e-20f));
-                float inv = output_scale * _rcp_66;
-                v[0] = ((has_values) ? v[0] * inv : 0.0f);
-                v[1] = ((has_values) ? v[1] * inv : 0.0f);
-                v[2] = ((has_values) ? v[2] * inv : 0.0f);
-                v[3] = ((has_values) ? v[3] * inv : 0.0f);
-                v[4] = ((has_values) ? v[4] * inv : 0.0f);
-                v[5] = ((has_values) ? v[5] * inv : 0.0f);
-                v[6] = ((has_values) ? v[6] * inv : 0.0f);
-                v[7] = ((has_values) ? v[7] * inv : 0.0f);
-                v[8] = ((has_values) ? v[8] * inv : 0.0f);
-                v[9] = ((has_values) ? v[9] * inv : 0.0f);
-                v[10] = ((has_values) ? v[10] * inv : 0.0f);
-                v[11] = ((has_values) ? v[11] * inv : 0.0f);
-                v[12] = ((has_values) ? v[12] * inv : 0.0f);
-                v[13] = ((has_values) ? v[13] * inv : 0.0f);
-                v[14] = ((has_values) ? v[14] * inv : 0.0f);
-                v[15] = ((has_values) ? v[15] * inv : 0.0f);
-                long long qo_head = (long long)(first_head + head_1);
-                if (num_splits == 1) {
-#else
             if (num_splits == 1) {
                 o_xchg[d0] = o_acc[0];
                 o_xchg[128 + d0] = o_acc[16];
@@ -1721,110 +1405,54 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     v[14] = ((has_values) ? v[14] * inv : 0.0f);
                     v[15] = ((has_values) ? v[15] * inv : 0.0f);
                     long long qo_head = (long long)(first_head + head_1);
-#endif
                     long long gate_off = (row_i64 * (long long)num_qo_heads + qo_head) * 256 + (long long)dim0;
                     long long out_off = row_i64 * out_stride_row + qo_head * out_stride_head + (long long)dim0;
                     float _vec_load_8[8];
                     {
-#if __CUDA_ARCH__ == 1070
-                        const uint4* _vptr_67 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
-                        uint4 _vld_67[1];
-#else
                         const uint4* _vptr_106 = reinterpret_cast<const uint4*>(gate + gate_off + 0);
                         uint4 _vld_106[1];
-#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-#if __CUDA_ARCH__ == 1070
-                            _vld_67[_blk] = _vptr_67[_blk];
-                            uint32_t* _vpairs_67 = reinterpret_cast<uint32_t*>(&_vld_67[_blk]);
-#else
                             _vld_106[_blk] = _vptr_106[_blk];
                             uint32_t* _vpairs_106 = reinterpret_cast<uint32_t*>(&_vld_106[_blk]);
-#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-#if __CUDA_ARCH__ == 1070
-                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_67[_pair]) << 16);
-                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_67[_pair]) & 0xffff0000u);
-#else
                                 (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_106[_pair]) << 16);
                                 (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_106[_pair]) & 0xffff0000u);
-#endif
                             }
                         }
                     }
                     float attn = (float)(__nv_bfloat16)v[0];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_68 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
-                    float sigmoid = approx_rcp(1.0f + _exp2_68);
-#else
                     float _exp2_107 = approx_exp2((-_vec_load_8[0]) * 1.442695f);
                     float sigmoid = approx_rcp(1.0f + _exp2_107);
-#endif
                     gated[0] = attn * sigmoid;
                     float attn_0 = (float)(__nv_bfloat16)v[1];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_69 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
-                    float sigmoid_1 = approx_rcp(1.0f + _exp2_69);
-#else
                     float _exp2_108 = approx_exp2((-_vec_load_8[1]) * 1.442695f);
                     float sigmoid_1 = approx_rcp(1.0f + _exp2_108);
-#endif
                     gated[1] = attn_0 * sigmoid_1;
                     float attn_2 = (float)(__nv_bfloat16)v[2];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_70 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
-                    float sigmoid_3 = approx_rcp(1.0f + _exp2_70);
-#else
                     float _exp2_109 = approx_exp2((-_vec_load_8[2]) * 1.442695f);
                     float sigmoid_3 = approx_rcp(1.0f + _exp2_109);
-#endif
                     gated[2] = attn_2 * sigmoid_3;
                     float attn_4 = (float)(__nv_bfloat16)v[3];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_71 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
-                    float sigmoid_5 = approx_rcp(1.0f + _exp2_71);
-#else
                     float _exp2_110 = approx_exp2((-_vec_load_8[3]) * 1.442695f);
                     float sigmoid_5 = approx_rcp(1.0f + _exp2_110);
-#endif
                     gated[3] = attn_4 * sigmoid_5;
                     float attn_6 = (float)(__nv_bfloat16)v[4];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_72 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
-                    float sigmoid_7 = approx_rcp(1.0f + _exp2_72);
-#else
                     float _exp2_111 = approx_exp2((-_vec_load_8[4]) * 1.442695f);
                     float sigmoid_7 = approx_rcp(1.0f + _exp2_111);
-#endif
                     gated[4] = attn_6 * sigmoid_7;
                     float attn_8 = (float)(__nv_bfloat16)v[5];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_73 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
-                    float sigmoid_9 = approx_rcp(1.0f + _exp2_73);
-#else
                     float _exp2_112 = approx_exp2((-_vec_load_8[5]) * 1.442695f);
                     float sigmoid_9 = approx_rcp(1.0f + _exp2_112);
-#endif
                     gated[5] = attn_8 * sigmoid_9;
                     float attn_10 = (float)(__nv_bfloat16)v[6];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_74 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
-                    float sigmoid_11 = approx_rcp(1.0f + _exp2_74);
-#else
                     float _exp2_113 = approx_exp2((-_vec_load_8[6]) * 1.442695f);
                     float sigmoid_11 = approx_rcp(1.0f + _exp2_113);
-#endif
                     gated[6] = attn_10 * sigmoid_11;
                     float attn_12 = (float)(__nv_bfloat16)v[7];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_75 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
-                    float sigmoid_13 = approx_rcp(1.0f + _exp2_75);
-#else
                     float _exp2_114 = approx_exp2((-_vec_load_8[7]) * 1.442695f);
                     float sigmoid_13 = approx_rcp(1.0f + _exp2_114);
-#endif
                     gated[7] = attn_12 * sigmoid_13;
                     unsigned int _packed_0[4];
                     #pragma unroll
@@ -1850,105 +1478,50 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     reinterpret_cast<int4*>(out + out_off)[0] = reinterpret_cast<int4*>(_packed_0)[0];
                     float _vec_load_9[8];
                     {
-#if __CUDA_ARCH__ == 1070
-                        const uint4* _vptr_76 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
-                        uint4 _vld_76[1];
-#else
                         const uint4* _vptr_115 = reinterpret_cast<const uint4*>(gate + (gate_off + 8) + 0);
                         uint4 _vld_115[1];
-#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-#if __CUDA_ARCH__ == 1070
-                            _vld_76[_blk] = _vptr_76[_blk];
-                            uint32_t* _vpairs_76 = reinterpret_cast<uint32_t*>(&_vld_76[_blk]);
-#else
                             _vld_115[_blk] = _vptr_115[_blk];
                             uint32_t* _vpairs_115 = reinterpret_cast<uint32_t*>(&_vld_115[_blk]);
-#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-#if __CUDA_ARCH__ == 1070
-                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_76[_pair]) << 16);
-                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_76[_pair]) & 0xffff0000u);
-#else
                                 (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_115[_pair]) << 16);
                                 (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_115[_pair]) & 0xffff0000u);
-#endif
                             }
                         }
                     }
                     float attn_14 = (float)(__nv_bfloat16)v[8];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_77 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
-                    float sigmoid_15 = approx_rcp(1.0f + _exp2_77);
-#else
                     float _exp2_116 = approx_exp2((-_vec_load_9[0]) * 1.442695f);
                     float sigmoid_15 = approx_rcp(1.0f + _exp2_116);
-#endif
                     gated[0] = attn_14 * sigmoid_15;
                     float attn_16 = (float)(__nv_bfloat16)v[9];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_78 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
-                    float sigmoid_17 = approx_rcp(1.0f + _exp2_78);
-#else
                     float _exp2_117 = approx_exp2((-_vec_load_9[1]) * 1.442695f);
                     float sigmoid_17 = approx_rcp(1.0f + _exp2_117);
-#endif
                     gated[1] = attn_16 * sigmoid_17;
                     float attn_18 = (float)(__nv_bfloat16)v[10];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_79 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
-                    float sigmoid_19 = approx_rcp(1.0f + _exp2_79);
-#else
                     float _exp2_118 = approx_exp2((-_vec_load_9[2]) * 1.442695f);
                     float sigmoid_19 = approx_rcp(1.0f + _exp2_118);
-#endif
                     gated[2] = attn_18 * sigmoid_19;
                     float attn_20 = (float)(__nv_bfloat16)v[11];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_80 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
-                    float sigmoid_21 = approx_rcp(1.0f + _exp2_80);
-#else
                     float _exp2_119 = approx_exp2((-_vec_load_9[3]) * 1.442695f);
                     float sigmoid_21 = approx_rcp(1.0f + _exp2_119);
-#endif
                     gated[3] = attn_20 * sigmoid_21;
                     float attn_22 = (float)(__nv_bfloat16)v[12];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_81 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
-                    float sigmoid_23 = approx_rcp(1.0f + _exp2_81);
-#else
                     float _exp2_120 = approx_exp2((-_vec_load_9[4]) * 1.442695f);
                     float sigmoid_23 = approx_rcp(1.0f + _exp2_120);
-#endif
                     gated[4] = attn_22 * sigmoid_23;
                     float attn_24 = (float)(__nv_bfloat16)v[13];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_82 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
-                    float sigmoid_25 = approx_rcp(1.0f + _exp2_82);
-#else
                     float _exp2_121 = approx_exp2((-_vec_load_9[5]) * 1.442695f);
                     float sigmoid_25 = approx_rcp(1.0f + _exp2_121);
-#endif
                     gated[5] = attn_24 * sigmoid_25;
                     float attn_26 = (float)(__nv_bfloat16)v[14];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_83 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
-                    float sigmoid_27 = approx_rcp(1.0f + _exp2_83);
-#else
                     float _exp2_122 = approx_exp2((-_vec_load_9[6]) * 1.442695f);
                     float sigmoid_27 = approx_rcp(1.0f + _exp2_122);
-#endif
                     gated[6] = attn_26 * sigmoid_27;
                     float attn_28 = (float)(__nv_bfloat16)v[15];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_84 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
-                    float sigmoid_29 = approx_rcp(1.0f + _exp2_84);
-#else
                     float _exp2_123 = approx_exp2((-_vec_load_9[7]) * 1.442695f);
                     float sigmoid_29 = approx_rcp(1.0f + _exp2_123);
-#endif
                     gated[7] = attn_28 * sigmoid_29;
                     unsigned int _packed_1[4];
                     #pragma unroll
@@ -1972,78 +1545,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(out + (out_off + 8))[0] = reinterpret_cast<int4*>(_packed_1)[0];
-#if __CUDA_ARCH__ == 1070
-                } else {
-                    long long partial_row = ((long long)split * (long long)num_rows + row_i64) * (long long)num_qo_heads + qo_head;
-                    long long partial_off = partial_row * 256 + (long long)dim0;
-                    {
-                        float4 _v4 = make_float4(v[0 + 0], v[0 + 1], v[0 + 2], v[0 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + partial_off) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[4 + 0], v[4 + 1], v[4 + 2], v[4 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off + 4)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[8 + 0], v[8 + 1], v[8 + 2], v[8 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off + 8)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[12 + 0], v[12 + 1], v[12 + 2], v[12 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off + 12)) + 0) = _v4;
-                    }
-                    if (warp_1 == 0 && t == 0) {
-                        float _log2_85;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_85) : "f"(l_r));
-                        *(reinterpret_cast<float*>(partial_lse + partial_row) + (0)) = ((has_values) ? m_r + _log2_85 : -CUDART_INF_F);
-                    }
-#else
-#endif
                 }
-#if __CUDA_ARCH__ == 1070
-            }
-            int head_1_1 = g + 8;
-            if (head_1_1 < group_size) {
-                float l_r_1 = xchg[64 + head_1_1];
-                l_r_1 = l_r_1 + xchg[80 + head_1_1];
-                l_r_1 = l_r_1 + xchg[96 + head_1_1];
-                l_r_1 = l_r_1 + xchg[112 + head_1_1];
-                float m_r_1 = xchg[128 + head_1_1];
-                unsigned int o_src_1 = o_xchg_addr + (unsigned int)(4 * (head_1_1 * 260 + dim0));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[0])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(0) + 3]))
-                    : "r"(o_src_1));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[4])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(4) + 3]))
-                    : "r"(o_src_1 + 16));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[8])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(8) + 3]))
-                    : "r"(o_src_1 + 32));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&v[12])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v[(12) + 3]))
-                    : "r"(o_src_1 + 48));
-                bool has_values_1 = l_r_1 > 0.0f;
-                float _rcp_86 = approx_rcp(fmaxf(l_r_1, 1e-20f));
-                float inv_1 = output_scale * _rcp_86;
-                v[0] = ((has_values_1) ? v[0] * inv_1 : 0.0f);
-                v[1] = ((has_values_1) ? v[1] * inv_1 : 0.0f);
-                v[2] = ((has_values_1) ? v[2] * inv_1 : 0.0f);
-                v[3] = ((has_values_1) ? v[3] * inv_1 : 0.0f);
-                v[4] = ((has_values_1) ? v[4] * inv_1 : 0.0f);
-                v[5] = ((has_values_1) ? v[5] * inv_1 : 0.0f);
-                v[6] = ((has_values_1) ? v[6] * inv_1 : 0.0f);
-                v[7] = ((has_values_1) ? v[7] * inv_1 : 0.0f);
-                v[8] = ((has_values_1) ? v[8] * inv_1 : 0.0f);
-                v[9] = ((has_values_1) ? v[9] * inv_1 : 0.0f);
-                v[10] = ((has_values_1) ? v[10] * inv_1 : 0.0f);
-                v[11] = ((has_values_1) ? v[11] * inv_1 : 0.0f);
-                v[12] = ((has_values_1) ? v[12] * inv_1 : 0.0f);
-                v[13] = ((has_values_1) ? v[13] * inv_1 : 0.0f);
-                v[14] = ((has_values_1) ? v[14] * inv_1 : 0.0f);
-                v[15] = ((has_values_1) ? v[15] * inv_1 : 0.0f);
-                long long qo_head_1 = (long long)(first_head + head_1_1);
-                if (num_splits == 1) {
-#else
                 int head_0 = g + 8;
                 if (head_0 < group_size) {
                     float l_r_1 = xchg[64 + head_0];
@@ -2083,110 +1585,54 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     v[14] = ((has_values_1) ? v[14] * inv_1 : 0.0f);
                     v[15] = ((has_values_1) ? v[15] * inv_1 : 0.0f);
                     long long qo_head_1 = (long long)(first_head + head_0);
-#endif
                     long long gate_off_1 = (row_i64 * (long long)num_qo_heads + qo_head_1) * 256 + (long long)dim0;
                     long long out_off_1 = row_i64 * out_stride_row + qo_head_1 * out_stride_head + (long long)dim0;
                     float _vec_load_10[8];
                     {
-#if __CUDA_ARCH__ == 1070
-                        const uint4* _vptr_87 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
-                        uint4 _vld_87[1];
-#else
                         const uint4* _vptr_125 = reinterpret_cast<const uint4*>(gate + gate_off_1 + 0);
                         uint4 _vld_125[1];
-#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-#if __CUDA_ARCH__ == 1070
-                            _vld_87[_blk] = _vptr_87[_blk];
-                            uint32_t* _vpairs_87 = reinterpret_cast<uint32_t*>(&_vld_87[_blk]);
-#else
                             _vld_125[_blk] = _vptr_125[_blk];
                             uint32_t* _vpairs_125 = reinterpret_cast<uint32_t*>(&_vld_125[_blk]);
-#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-#if __CUDA_ARCH__ == 1070
-                                (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_87[_pair]) << 16);
-                                (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_87[_pair]) & 0xffff0000u);
-#else
                                 (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_125[_pair]) << 16);
                                 (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_125[_pair]) & 0xffff0000u);
-#endif
                             }
                         }
                     }
                     float attn_1 = (float)(__nv_bfloat16)v[0];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_88 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
-                    float sigmoid_2 = approx_rcp(1.0f + _exp2_88);
-#else
                     float _exp2_126 = approx_exp2((-_vec_load_10[0]) * 1.442695f);
                     float sigmoid_2 = approx_rcp(1.0f + _exp2_126);
-#endif
                     gated[0] = attn_1 * sigmoid_2;
                     float attn_0_1 = (float)(__nv_bfloat16)v[1];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_89 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
-                    float sigmoid_1_1 = approx_rcp(1.0f + _exp2_89);
-#else
                     float _exp2_127 = approx_exp2((-_vec_load_10[1]) * 1.442695f);
                     float sigmoid_1_1 = approx_rcp(1.0f + _exp2_127);
-#endif
                     gated[1] = attn_0_1 * sigmoid_1_1;
                     float attn_2_1 = (float)(__nv_bfloat16)v[2];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_90 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
-                    float sigmoid_3_1 = approx_rcp(1.0f + _exp2_90);
-#else
                     float _exp2_128 = approx_exp2((-_vec_load_10[2]) * 1.442695f);
                     float sigmoid_3_1 = approx_rcp(1.0f + _exp2_128);
-#endif
                     gated[2] = attn_2_1 * sigmoid_3_1;
                     float attn_4_1 = (float)(__nv_bfloat16)v[3];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_91 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
-                    float sigmoid_5_1 = approx_rcp(1.0f + _exp2_91);
-#else
                     float _exp2_129 = approx_exp2((-_vec_load_10[3]) * 1.442695f);
                     float sigmoid_5_1 = approx_rcp(1.0f + _exp2_129);
-#endif
                     gated[3] = attn_4_1 * sigmoid_5_1;
                     float attn_6_1 = (float)(__nv_bfloat16)v[4];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_92 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
-                    float sigmoid_7_1 = approx_rcp(1.0f + _exp2_92);
-#else
                     float _exp2_130 = approx_exp2((-_vec_load_10[4]) * 1.442695f);
                     float sigmoid_7_1 = approx_rcp(1.0f + _exp2_130);
-#endif
                     gated[4] = attn_6_1 * sigmoid_7_1;
                     float attn_8_1 = (float)(__nv_bfloat16)v[5];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_93 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
-                    float sigmoid_9_1 = approx_rcp(1.0f + _exp2_93);
-#else
                     float _exp2_131 = approx_exp2((-_vec_load_10[5]) * 1.442695f);
                     float sigmoid_9_1 = approx_rcp(1.0f + _exp2_131);
-#endif
                     gated[5] = attn_8_1 * sigmoid_9_1;
                     float attn_10_1 = (float)(__nv_bfloat16)v[6];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_94 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
-                    float sigmoid_11_1 = approx_rcp(1.0f + _exp2_94);
-#else
                     float _exp2_132 = approx_exp2((-_vec_load_10[6]) * 1.442695f);
                     float sigmoid_11_1 = approx_rcp(1.0f + _exp2_132);
-#endif
                     gated[6] = attn_10_1 * sigmoid_11_1;
                     float attn_12_1 = (float)(__nv_bfloat16)v[7];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_95 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
-                    float sigmoid_13_1 = approx_rcp(1.0f + _exp2_95);
-#else
                     float _exp2_133 = approx_exp2((-_vec_load_10[7]) * 1.442695f);
                     float sigmoid_13_1 = approx_rcp(1.0f + _exp2_133);
-#endif
                     gated[7] = attn_12_1 * sigmoid_13_1;
                     unsigned int _packed_2[4];
                     #pragma unroll
@@ -2212,105 +1658,50 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     reinterpret_cast<int4*>(out + out_off_1)[0] = reinterpret_cast<int4*>(_packed_2)[0];
                     float _vec_load_11[8];
                     {
-#if __CUDA_ARCH__ == 1070
-                        const uint4* _vptr_96 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
-                        uint4 _vld_96[1];
-#else
                         const uint4* _vptr_134 = reinterpret_cast<const uint4*>(gate + (gate_off_1 + 8) + 0);
                         uint4 _vld_134[1];
-#endif
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-#if __CUDA_ARCH__ == 1070
-                            _vld_96[_blk] = _vptr_96[_blk];
-                            uint32_t* _vpairs_96 = reinterpret_cast<uint32_t*>(&_vld_96[_blk]);
-#else
                             _vld_134[_blk] = _vptr_134[_blk];
                             uint32_t* _vpairs_134 = reinterpret_cast<uint32_t*>(&_vld_134[_blk]);
-#endif
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-#if __CUDA_ARCH__ == 1070
-                                (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_96[_pair]) << 16);
-                                (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_96[_pair]) & 0xffff0000u);
-#else
                                 (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_134[_pair]) << 16);
                                 (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_134[_pair]) & 0xffff0000u);
-#endif
                             }
                         }
                     }
                     float attn_14_1 = (float)(__nv_bfloat16)v[8];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_97 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
-                    float sigmoid_15_1 = approx_rcp(1.0f + _exp2_97);
-#else
                     float _exp2_135 = approx_exp2((-_vec_load_11[0]) * 1.442695f);
                     float sigmoid_15_1 = approx_rcp(1.0f + _exp2_135);
-#endif
                     gated[0] = attn_14_1 * sigmoid_15_1;
                     float attn_16_1 = (float)(__nv_bfloat16)v[9];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_98 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
-                    float sigmoid_17_1 = approx_rcp(1.0f + _exp2_98);
-#else
                     float _exp2_136 = approx_exp2((-_vec_load_11[1]) * 1.442695f);
                     float sigmoid_17_1 = approx_rcp(1.0f + _exp2_136);
-#endif
                     gated[1] = attn_16_1 * sigmoid_17_1;
                     float attn_18_1 = (float)(__nv_bfloat16)v[10];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_99 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
-                    float sigmoid_19_1 = approx_rcp(1.0f + _exp2_99);
-#else
                     float _exp2_137 = approx_exp2((-_vec_load_11[2]) * 1.442695f);
                     float sigmoid_19_1 = approx_rcp(1.0f + _exp2_137);
-#endif
                     gated[2] = attn_18_1 * sigmoid_19_1;
                     float attn_20_1 = (float)(__nv_bfloat16)v[11];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_100 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
-                    float sigmoid_21_1 = approx_rcp(1.0f + _exp2_100);
-#else
                     float _exp2_138 = approx_exp2((-_vec_load_11[3]) * 1.442695f);
                     float sigmoid_21_1 = approx_rcp(1.0f + _exp2_138);
-#endif
                     gated[3] = attn_20_1 * sigmoid_21_1;
                     float attn_22_1 = (float)(__nv_bfloat16)v[12];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_101 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
-                    float sigmoid_23_1 = approx_rcp(1.0f + _exp2_101);
-#else
                     float _exp2_139 = approx_exp2((-_vec_load_11[4]) * 1.442695f);
                     float sigmoid_23_1 = approx_rcp(1.0f + _exp2_139);
-#endif
                     gated[4] = attn_22_1 * sigmoid_23_1;
                     float attn_24_1 = (float)(__nv_bfloat16)v[13];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_102 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
-                    float sigmoid_25_1 = approx_rcp(1.0f + _exp2_102);
-#else
                     float _exp2_140 = approx_exp2((-_vec_load_11[5]) * 1.442695f);
                     float sigmoid_25_1 = approx_rcp(1.0f + _exp2_140);
-#endif
                     gated[5] = attn_24_1 * sigmoid_25_1;
                     float attn_26_1 = (float)(__nv_bfloat16)v[14];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_103 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
-                    float sigmoid_27_1 = approx_rcp(1.0f + _exp2_103);
-#else
                     float _exp2_141 = approx_exp2((-_vec_load_11[6]) * 1.442695f);
                     float sigmoid_27_1 = approx_rcp(1.0f + _exp2_141);
-#endif
                     gated[6] = attn_26_1 * sigmoid_27_1;
                     float attn_28_1 = (float)(__nv_bfloat16)v[15];
-#if __CUDA_ARCH__ == 1070
-                    float _exp2_104 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
-                    float sigmoid_29_1 = approx_rcp(1.0f + _exp2_104);
-#else
                     float _exp2_142 = approx_exp2((-_vec_load_11[7]) * 1.442695f);
                     float sigmoid_29_1 = approx_rcp(1.0f + _exp2_142);
-#endif
                     gated[7] = attn_28_1 * sigmoid_29_1;
                     unsigned int _packed_3[4];
                     #pragma unroll
@@ -2334,31 +1725,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(out + (out_off_1 + 8))[0] = reinterpret_cast<int4*>(_packed_3)[0];
-#if __CUDA_ARCH__ == 1070
-                } else {
-                    long long partial_row_1 = ((long long)split * (long long)num_rows + row_i64) * (long long)num_qo_heads + qo_head_1;
-                    long long partial_off_1 = partial_row_1 * 256 + (long long)dim0;
-                    {
-                        float4 _v4 = make_float4(v[0 + 0], v[0 + 1], v[0 + 2], v[0 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + partial_off_1) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[4 + 0], v[4 + 1], v[4 + 2], v[4 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off_1 + 4)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[8 + 0], v[8 + 1], v[8 + 2], v[8 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off_1 + 8)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(v[12 + 0], v[12 + 1], v[12 + 2], v[12 + 3]);
-                        *reinterpret_cast<float4*>((partial_out + (partial_off_1 + 12)) + 0) = _v4;
-                    }
-                    if (warp_1 == 0 && t == 0) {
-                        float _log2_105;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_105) : "f"(l_r_1));
-                        *(reinterpret_cast<float*>(partial_lse + partial_row_1) + (0)) = ((has_values_1) ? m_r_1 + _log2_105 : -CUDART_INF_F);
-#else
                 }
             } else {
                 long long p_base = ((long long)split * (long long)num_rows + row_i64) * (long long)num_qo_heads + (long long)first_head;
@@ -2453,7 +1819,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         float _log2_143;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_143) : "f"(l_t));
                         *(reinterpret_cast<float*>(partial_lse + (p_base + (long long)tid_0)) + (0)) = ((l_t > 0.0f) ? m_t + _log2_143 : -CUDART_INF_F);
-#endif
                     }
                 }
             }
@@ -2472,16 +1837,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             : "=r"(old) : "l"(&merge_counters[cidx]), "r"(static_cast<uint32_t>(nb)) : "memory");
                         unsigned int target = (old ^ flip) & flip;
                         {
-#if __CUDA_ARCH__ == 1070
-                            unsigned int _poll_v_106;
-                            unsigned long long _poll_t0_106;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_t0_106) :: "memory");
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_106) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
-                            while (((_poll_v_106 ^ static_cast<unsigned int>(target)) & static_cast<unsigned int>(2147483648)) != 0) {
-                                unsigned long long _poll_now_106;
-                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_now_106) :: "memory");
-                                if (_poll_now_106 - _poll_t0_106 > 4000000000ull) {
-#else
                             unsigned int _poll_v_144;
                             unsigned long long _poll_t0_144;
                             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_t0_144) :: "memory");
@@ -2490,14 +1845,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 unsigned long long _poll_now_144;
                                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_poll_now_144) :: "memory");
                                 if (_poll_now_144 - _poll_t0_144 > 4000000000ull) {
-#endif
                                     asm volatile("trap;" ::: "memory");
                                 }
-#if __CUDA_ARCH__ == 1070
-                                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_106) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
-#else
                                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_144) : "l"((reinterpret_cast<unsigned int*>(merge_counters) + (cidx))) : "memory");
-#endif
                             }
                         }
                     }
@@ -2530,18 +1880,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             for (int s_1 = lane_1; s_1 < num_splits; s_1 += 32) {
                                 hmax = fmaxf(hmax, lse_tab[h_1 * num_splits + s_1]);
                             }
-#if __CUDA_ARCH__ == 1070
-                            float _shfl_xor_sync_107 = __shfl_xor_sync(0xFFFFFFFF, hmax, 16);
-                            hmax = fmaxf(hmax, _shfl_xor_sync_107);
-                            float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, hmax, 8);
-                            hmax = fmaxf(hmax, _shfl_xor_sync_108);
-                            float _shfl_xor_sync_109 = __shfl_xor_sync(0xFFFFFFFF, hmax, 4);
-                            hmax = fmaxf(hmax, _shfl_xor_sync_109);
-                            float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, hmax, 2);
-                            hmax = fmaxf(hmax, _shfl_xor_sync_110);
-                            float _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, hmax, 1);
-                            hmax = fmaxf(hmax, _shfl_xor_sync_111);
-#else
                             float _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, hmax, 16);
                             hmax = fmaxf(hmax, _shfl_xor_sync_145);
                             float _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, hmax, 8);
@@ -2552,7 +1890,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             hmax = fmaxf(hmax, _shfl_xor_sync_148);
                             float _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, hmax, 1);
                             hmax = fmaxf(hmax, _shfl_xor_sync_149);
-#endif
                             if (lane_1 == 0) {
                                 max_tab[h_1] = hmax;
                             }
@@ -2582,17 +1919,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         for (int p_1 = p_first; p_1 < end; p_1 += 128) {
                             int pk = ((p_1) < (end - 1) ? (p_1) : (end - 1));
                             valid[0] = ((end > p_1) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                            int head_0 = pk >> 7;
-#else
                             int head_2 = pk >> 7;
-#endif
                             dim[0] = (long long)((pk & 127) * 2);
-#if __CUDA_ARCH__ == 1070
-                            qo_head_2[0] = (long long)(first_head + head_0);
-#else
                             qo_head_2[0] = (long long)(first_head + head_2);
-#endif
                             row_head[0] = row_i64 * nqo + qo_head_2[0];
                             acc0[0] = 0.0f;
                             acc1[0] = 0.0f;
@@ -2606,26 +1935,14 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             acc0[3] = 0.0f;
                             acc1[3] = 0.0f;
                             den[3] = 0.0f;
-#if __CUDA_ARCH__ == 1070
-                            tab[0] = (head_0 - head_first) * num_splits;
-                            lse_max[0] = max_tab[head_0 - head_first];
-#else
                             tab[0] = (head_2 - head_first) * num_splits;
                             lse_max[0] = max_tab[head_2 - head_first];
-#endif
                             float _vec_load_12[2];
                             {
-#if __CUDA_ARCH__ == 1070
-                                uint32_t _bf16x2_bits_112;
-                                _bf16x2_bits_112 = *reinterpret_cast<const uint32_t*>(gate + (row_head[0] * 256 + dim[0]) + 0);
-                                (&_vec_load_12[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_112) << 16);
-                                (&_vec_load_12[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_112) & 0xffff0000u);
-#else
                                 uint32_t _bf16x2_bits_150;
                                 _bf16x2_bits_150 = *reinterpret_cast<const uint32_t*>(gate + (row_head[0] * 256 + dim[0]) + 0);
                                 (&_vec_load_12[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_150) << 16);
                                 (&_vec_load_12[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_150) & 0xffff0000u);
-#endif
                             }
                             gate0[0] = _vec_load_12[0];
                             gate1[0] = _vec_load_12[1];
@@ -2637,15 +1954,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row = (long long)base * split_pitch + row_head[0];
                                     float _vec_load_13[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_113 = *reinterpret_cast<const float2*>(partial_out + (part_row * 256 + dim[0]) + 0);
-                                        _vec_load_13[0] = _v2_113.x;
-                                        _vec_load_13[0 + 1] = _v2_113.y;
-#else
                                         float2 _v2_151 = *reinterpret_cast<const float2*>(partial_out + (part_row * 256 + dim[0]) + 0);
                                         _vec_load_13[0] = _v2_151.x;
                                         _vec_load_13[0 + 1] = _v2_151.y;
-#endif
                                     }
                                     p0[0] = _vec_load_13[0];
                                     p1[0] = _vec_load_13[1];
@@ -2654,15 +1965,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_1 = (long long)(base + 1) * split_pitch + row_head[0];
                                     float _vec_load_14[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_114 = *reinterpret_cast<const float2*>(partial_out + (part_row_1 * 256 + dim[0]) + 0);
-                                        _vec_load_14[0] = _v2_114.x;
-                                        _vec_load_14[0 + 1] = _v2_114.y;
-#else
                                         float2 _v2_152 = *reinterpret_cast<const float2*>(partial_out + (part_row_1 * 256 + dim[0]) + 0);
                                         _vec_load_14[0] = _v2_152.x;
                                         _vec_load_14[0 + 1] = _v2_152.y;
-#endif
                                     }
                                     p0[1] = _vec_load_14[0];
                                     p1[1] = _vec_load_14[1];
@@ -2671,15 +1976,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_2 = (long long)(base + 2) * split_pitch + row_head[0];
                                     float _vec_load_15[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_115 = *reinterpret_cast<const float2*>(partial_out + (part_row_2 * 256 + dim[0]) + 0);
-                                        _vec_load_15[0] = _v2_115.x;
-                                        _vec_load_15[0 + 1] = _v2_115.y;
-#else
                                         float2 _v2_153 = *reinterpret_cast<const float2*>(partial_out + (part_row_2 * 256 + dim[0]) + 0);
                                         _vec_load_15[0] = _v2_153.x;
                                         _vec_load_15[0 + 1] = _v2_153.y;
-#endif
                                     }
                                     p0[2] = _vec_load_15[0];
                                     p1[2] = _vec_load_15[1];
@@ -2688,15 +1987,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_3 = (long long)(base + 3) * split_pitch + row_head[0];
                                     float _vec_load_16[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_116 = *reinterpret_cast<const float2*>(partial_out + (part_row_3 * 256 + dim[0]) + 0);
-                                        _vec_load_16[0] = _v2_116.x;
-                                        _vec_load_16[0 + 1] = _v2_116.y;
-#else
                                         float2 _v2_154 = *reinterpret_cast<const float2*>(partial_out + (part_row_3 * 256 + dim[0]) + 0);
                                         _vec_load_16[0] = _v2_154.x;
                                         _vec_load_16[0 + 1] = _v2_154.y;
-#endif
                                     }
                                     p0[3] = _vec_load_16[0];
                                     p1[3] = _vec_load_16[1];
@@ -2705,15 +1998,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_4 = (long long)(base + 4) * split_pitch + row_head[0];
                                     float _vec_load_17[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_117 = *reinterpret_cast<const float2*>(partial_out + (part_row_4 * 256 + dim[0]) + 0);
-                                        _vec_load_17[0] = _v2_117.x;
-                                        _vec_load_17[0 + 1] = _v2_117.y;
-#else
                                         float2 _v2_155 = *reinterpret_cast<const float2*>(partial_out + (part_row_4 * 256 + dim[0]) + 0);
                                         _vec_load_17[0] = _v2_155.x;
                                         _vec_load_17[0 + 1] = _v2_155.y;
-#endif
                                     }
                                     p0[4] = _vec_load_17[0];
                                     p1[4] = _vec_load_17[1];
@@ -2722,15 +2009,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_5 = (long long)(base + 5) * split_pitch + row_head[0];
                                     float _vec_load_18[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_118 = *reinterpret_cast<const float2*>(partial_out + (part_row_5 * 256 + dim[0]) + 0);
-                                        _vec_load_18[0] = _v2_118.x;
-                                        _vec_load_18[0 + 1] = _v2_118.y;
-#else
                                         float2 _v2_156 = *reinterpret_cast<const float2*>(partial_out + (part_row_5 * 256 + dim[0]) + 0);
                                         _vec_load_18[0] = _v2_156.x;
                                         _vec_load_18[0 + 1] = _v2_156.y;
-#endif
                                     }
                                     p0[5] = _vec_load_18[0];
                                     p1[5] = _vec_load_18[1];
@@ -2739,15 +2020,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_6 = (long long)(base + 6) * split_pitch + row_head[0];
                                     float _vec_load_19[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_119 = *reinterpret_cast<const float2*>(partial_out + (part_row_6 * 256 + dim[0]) + 0);
-                                        _vec_load_19[0] = _v2_119.x;
-                                        _vec_load_19[0 + 1] = _v2_119.y;
-#else
                                         float2 _v2_157 = *reinterpret_cast<const float2*>(partial_out + (part_row_6 * 256 + dim[0]) + 0);
                                         _vec_load_19[0] = _v2_157.x;
                                         _vec_load_19[0 + 1] = _v2_157.y;
-#endif
                                     }
                                     p0[6] = _vec_load_19[0];
                                     p1[6] = _vec_load_19[1];
@@ -2756,15 +2031,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_7 = (long long)(base + 7) * split_pitch + row_head[0];
                                     float _vec_load_20[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_120 = *reinterpret_cast<const float2*>(partial_out + (part_row_7 * 256 + dim[0]) + 0);
-                                        _vec_load_20[0] = _v2_120.x;
-                                        _vec_load_20[0 + 1] = _v2_120.y;
-#else
                                         float2 _v2_158 = *reinterpret_cast<const float2*>(partial_out + (part_row_7 * 256 + dim[0]) + 0);
                                         _vec_load_20[0] = _v2_158.x;
                                         _vec_load_20[0 + 1] = _v2_158.y;
-#endif
                                     }
                                     p0[7] = _vec_load_20[0];
                                     p1[7] = _vec_load_20[1];
@@ -2773,15 +2042,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_8 = (long long)(base + 8) * split_pitch + row_head[0];
                                     float _vec_load_21[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_121 = *reinterpret_cast<const float2*>(partial_out + (part_row_8 * 256 + dim[0]) + 0);
-                                        _vec_load_21[0] = _v2_121.x;
-                                        _vec_load_21[0 + 1] = _v2_121.y;
-#else
                                         float2 _v2_159 = *reinterpret_cast<const float2*>(partial_out + (part_row_8 * 256 + dim[0]) + 0);
                                         _vec_load_21[0] = _v2_159.x;
                                         _vec_load_21[0 + 1] = _v2_159.y;
-#endif
                                     }
                                     p0[8] = _vec_load_21[0];
                                     p1[8] = _vec_load_21[1];
@@ -2790,15 +2053,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_9 = (long long)(base + 9) * split_pitch + row_head[0];
                                     float _vec_load_22[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_122 = *reinterpret_cast<const float2*>(partial_out + (part_row_9 * 256 + dim[0]) + 0);
-                                        _vec_load_22[0] = _v2_122.x;
-                                        _vec_load_22[0 + 1] = _v2_122.y;
-#else
                                         float2 _v2_160 = *reinterpret_cast<const float2*>(partial_out + (part_row_9 * 256 + dim[0]) + 0);
                                         _vec_load_22[0] = _v2_160.x;
                                         _vec_load_22[0 + 1] = _v2_160.y;
-#endif
                                     }
                                     p0[9] = _vec_load_22[0];
                                     p1[9] = _vec_load_22[1];
@@ -2807,15 +2064,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_10 = (long long)(base + 10) * split_pitch + row_head[0];
                                     float _vec_load_23[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_123 = *reinterpret_cast<const float2*>(partial_out + (part_row_10 * 256 + dim[0]) + 0);
-                                        _vec_load_23[0] = _v2_123.x;
-                                        _vec_load_23[0 + 1] = _v2_123.y;
-#else
                                         float2 _v2_161 = *reinterpret_cast<const float2*>(partial_out + (part_row_10 * 256 + dim[0]) + 0);
                                         _vec_load_23[0] = _v2_161.x;
                                         _vec_load_23[0 + 1] = _v2_161.y;
-#endif
                                     }
                                     p0[10] = _vec_load_23[0];
                                     p1[10] = _vec_load_23[1];
@@ -2824,15 +2075,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_11 = (long long)(base + 11) * split_pitch + row_head[0];
                                     float _vec_load_24[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_124 = *reinterpret_cast<const float2*>(partial_out + (part_row_11 * 256 + dim[0]) + 0);
-                                        _vec_load_24[0] = _v2_124.x;
-                                        _vec_load_24[0 + 1] = _v2_124.y;
-#else
                                         float2 _v2_162 = *reinterpret_cast<const float2*>(partial_out + (part_row_11 * 256 + dim[0]) + 0);
                                         _vec_load_24[0] = _v2_162.x;
                                         _vec_load_24[0 + 1] = _v2_162.y;
-#endif
                                     }
                                     p0[11] = _vec_load_24[0];
                                     p1[11] = _vec_load_24[1];
@@ -2841,15 +2086,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_12 = (long long)(base + 12) * split_pitch + row_head[0];
                                     float _vec_load_25[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_125 = *reinterpret_cast<const float2*>(partial_out + (part_row_12 * 256 + dim[0]) + 0);
-                                        _vec_load_25[0] = _v2_125.x;
-                                        _vec_load_25[0 + 1] = _v2_125.y;
-#else
                                         float2 _v2_163 = *reinterpret_cast<const float2*>(partial_out + (part_row_12 * 256 + dim[0]) + 0);
                                         _vec_load_25[0] = _v2_163.x;
                                         _vec_load_25[0 + 1] = _v2_163.y;
-#endif
                                     }
                                     p0[12] = _vec_load_25[0];
                                     p1[12] = _vec_load_25[1];
@@ -2858,15 +2097,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_13 = (long long)(base + 13) * split_pitch + row_head[0];
                                     float _vec_load_26[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_126 = *reinterpret_cast<const float2*>(partial_out + (part_row_13 * 256 + dim[0]) + 0);
-                                        _vec_load_26[0] = _v2_126.x;
-                                        _vec_load_26[0 + 1] = _v2_126.y;
-#else
                                         float2 _v2_164 = *reinterpret_cast<const float2*>(partial_out + (part_row_13 * 256 + dim[0]) + 0);
                                         _vec_load_26[0] = _v2_164.x;
                                         _vec_load_26[0 + 1] = _v2_164.y;
-#endif
                                     }
                                     p0[13] = _vec_load_26[0];
                                     p1[13] = _vec_load_26[1];
@@ -2875,15 +2108,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_14 = (long long)(base + 14) * split_pitch + row_head[0];
                                     float _vec_load_27[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_127 = *reinterpret_cast<const float2*>(partial_out + (part_row_14 * 256 + dim[0]) + 0);
-                                        _vec_load_27[0] = _v2_127.x;
-                                        _vec_load_27[0 + 1] = _v2_127.y;
-#else
                                         float2 _v2_165 = *reinterpret_cast<const float2*>(partial_out + (part_row_14 * 256 + dim[0]) + 0);
                                         _vec_load_27[0] = _v2_165.x;
                                         _vec_load_27[0 + 1] = _v2_165.y;
-#endif
                                     }
                                     p0[14] = _vec_load_27[0];
                                     p1[14] = _vec_load_27[1];
@@ -2892,15 +2119,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     long long part_row_15 = (long long)(base + 15) * split_pitch + row_head[0];
                                     float _vec_load_28[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_128 = *reinterpret_cast<const float2*>(partial_out + (part_row_15 * 256 + dim[0]) + 0);
-                                        _vec_load_28[0] = _v2_128.x;
-                                        _vec_load_28[0 + 1] = _v2_128.y;
-#else
                                         float2 _v2_166 = *reinterpret_cast<const float2*>(partial_out + (part_row_15 * 256 + dim[0]) + 0);
                                         _vec_load_28[0] = _v2_166.x;
                                         _vec_load_28[0 + 1] = _v2_166.y;
-#endif
                                     }
                                     p0[15] = _vec_load_28[0];
                                     p1[15] = _vec_load_28[1];
@@ -3018,522 +2239,292 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1[0] = __fmaf_rn(weight_15, p1[15], acc1[0]);
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            int c_end_1 = ((chunk_w * 2) < (num_splits) ? (chunk_w * 2) : (num_splits));
-                            int c_begin_2 = ((chunk_w) < (c_end_1) ? (chunk_w) : (c_end_1));
-#else
                             int c_end_0 = ((chunk_w * 2) < (num_splits) ? (chunk_w * 2) : (num_splits));
                             int c_begin_1 = ((chunk_w) < (c_end_0) ? (chunk_w) : (c_end_0));
-#endif
                             #pragma unroll 1
-#if __CUDA_ARCH__ == 1070
-                            for (int base_1 = c_begin_2; base_1 < c_end_1; base_1 += 16) {
-                                if (c_end_1 > base_1) {
-#else
                             for (int base_1 = c_begin_1; base_1 < c_end_0; base_1 += 16) {
                                 if (c_end_0 > base_1) {
-#endif
                                     long long part_row_16 = (long long)base_1 * split_pitch + row_head[0];
                                     float _vec_load_29[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_129 = *reinterpret_cast<const float2*>(partial_out + (part_row_16 * 256 + dim[0]) + 0);
-                                        _vec_load_29[0] = _v2_129.x;
-                                        _vec_load_29[0 + 1] = _v2_129.y;
-#else
                                         float2 _v2_167 = *reinterpret_cast<const float2*>(partial_out + (part_row_16 * 256 + dim[0]) + 0);
                                         _vec_load_29[0] = _v2_167.x;
                                         _vec_load_29[0 + 1] = _v2_167.y;
-#endif
                                     }
                                     p0[0] = _vec_load_29[0];
                                     p1[0] = _vec_load_29[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 1) {
-#else
                                 if (c_end_0 > base_1 + 1) {
-#endif
                                     long long part_row_17 = (long long)(base_1 + 1) * split_pitch + row_head[0];
                                     float _vec_load_30[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_130 = *reinterpret_cast<const float2*>(partial_out + (part_row_17 * 256 + dim[0]) + 0);
-                                        _vec_load_30[0] = _v2_130.x;
-                                        _vec_load_30[0 + 1] = _v2_130.y;
-#else
                                         float2 _v2_168 = *reinterpret_cast<const float2*>(partial_out + (part_row_17 * 256 + dim[0]) + 0);
                                         _vec_load_30[0] = _v2_168.x;
                                         _vec_load_30[0 + 1] = _v2_168.y;
-#endif
                                     }
                                     p0[1] = _vec_load_30[0];
                                     p1[1] = _vec_load_30[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 2) {
-#else
                                 if (c_end_0 > base_1 + 2) {
-#endif
                                     long long part_row_18 = (long long)(base_1 + 2) * split_pitch + row_head[0];
                                     float _vec_load_31[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_131 = *reinterpret_cast<const float2*>(partial_out + (part_row_18 * 256 + dim[0]) + 0);
-                                        _vec_load_31[0] = _v2_131.x;
-                                        _vec_load_31[0 + 1] = _v2_131.y;
-#else
                                         float2 _v2_169 = *reinterpret_cast<const float2*>(partial_out + (part_row_18 * 256 + dim[0]) + 0);
                                         _vec_load_31[0] = _v2_169.x;
                                         _vec_load_31[0 + 1] = _v2_169.y;
-#endif
                                     }
                                     p0[2] = _vec_load_31[0];
                                     p1[2] = _vec_load_31[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 3) {
-#else
                                 if (c_end_0 > base_1 + 3) {
-#endif
                                     long long part_row_19 = (long long)(base_1 + 3) * split_pitch + row_head[0];
                                     float _vec_load_32[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_132 = *reinterpret_cast<const float2*>(partial_out + (part_row_19 * 256 + dim[0]) + 0);
-                                        _vec_load_32[0] = _v2_132.x;
-                                        _vec_load_32[0 + 1] = _v2_132.y;
-#else
                                         float2 _v2_170 = *reinterpret_cast<const float2*>(partial_out + (part_row_19 * 256 + dim[0]) + 0);
                                         _vec_load_32[0] = _v2_170.x;
                                         _vec_load_32[0 + 1] = _v2_170.y;
-#endif
                                     }
                                     p0[3] = _vec_load_32[0];
                                     p1[3] = _vec_load_32[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 4) {
-#else
                                 if (c_end_0 > base_1 + 4) {
-#endif
                                     long long part_row_20 = (long long)(base_1 + 4) * split_pitch + row_head[0];
                                     float _vec_load_33[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_133 = *reinterpret_cast<const float2*>(partial_out + (part_row_20 * 256 + dim[0]) + 0);
-                                        _vec_load_33[0] = _v2_133.x;
-                                        _vec_load_33[0 + 1] = _v2_133.y;
-#else
                                         float2 _v2_171 = *reinterpret_cast<const float2*>(partial_out + (part_row_20 * 256 + dim[0]) + 0);
                                         _vec_load_33[0] = _v2_171.x;
                                         _vec_load_33[0 + 1] = _v2_171.y;
-#endif
                                     }
                                     p0[4] = _vec_load_33[0];
                                     p1[4] = _vec_load_33[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 5) {
-#else
                                 if (c_end_0 > base_1 + 5) {
-#endif
                                     long long part_row_21 = (long long)(base_1 + 5) * split_pitch + row_head[0];
                                     float _vec_load_34[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_134 = *reinterpret_cast<const float2*>(partial_out + (part_row_21 * 256 + dim[0]) + 0);
-                                        _vec_load_34[0] = _v2_134.x;
-                                        _vec_load_34[0 + 1] = _v2_134.y;
-#else
                                         float2 _v2_172 = *reinterpret_cast<const float2*>(partial_out + (part_row_21 * 256 + dim[0]) + 0);
                                         _vec_load_34[0] = _v2_172.x;
                                         _vec_load_34[0 + 1] = _v2_172.y;
-#endif
                                     }
                                     p0[5] = _vec_load_34[0];
                                     p1[5] = _vec_load_34[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 6) {
-#else
                                 if (c_end_0 > base_1 + 6) {
-#endif
                                     long long part_row_22 = (long long)(base_1 + 6) * split_pitch + row_head[0];
                                     float _vec_load_35[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_135 = *reinterpret_cast<const float2*>(partial_out + (part_row_22 * 256 + dim[0]) + 0);
-                                        _vec_load_35[0] = _v2_135.x;
-                                        _vec_load_35[0 + 1] = _v2_135.y;
-#else
                                         float2 _v2_173 = *reinterpret_cast<const float2*>(partial_out + (part_row_22 * 256 + dim[0]) + 0);
                                         _vec_load_35[0] = _v2_173.x;
                                         _vec_load_35[0 + 1] = _v2_173.y;
-#endif
                                     }
                                     p0[6] = _vec_load_35[0];
                                     p1[6] = _vec_load_35[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 7) {
-#else
                                 if (c_end_0 > base_1 + 7) {
-#endif
                                     long long part_row_23 = (long long)(base_1 + 7) * split_pitch + row_head[0];
                                     float _vec_load_36[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_136 = *reinterpret_cast<const float2*>(partial_out + (part_row_23 * 256 + dim[0]) + 0);
-                                        _vec_load_36[0] = _v2_136.x;
-                                        _vec_load_36[0 + 1] = _v2_136.y;
-#else
                                         float2 _v2_174 = *reinterpret_cast<const float2*>(partial_out + (part_row_23 * 256 + dim[0]) + 0);
                                         _vec_load_36[0] = _v2_174.x;
                                         _vec_load_36[0 + 1] = _v2_174.y;
-#endif
                                     }
                                     p0[7] = _vec_load_36[0];
                                     p1[7] = _vec_load_36[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 8) {
-#else
                                 if (c_end_0 > base_1 + 8) {
-#endif
                                     long long part_row_24 = (long long)(base_1 + 8) * split_pitch + row_head[0];
                                     float _vec_load_37[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_137 = *reinterpret_cast<const float2*>(partial_out + (part_row_24 * 256 + dim[0]) + 0);
-                                        _vec_load_37[0] = _v2_137.x;
-                                        _vec_load_37[0 + 1] = _v2_137.y;
-#else
                                         float2 _v2_175 = *reinterpret_cast<const float2*>(partial_out + (part_row_24 * 256 + dim[0]) + 0);
                                         _vec_load_37[0] = _v2_175.x;
                                         _vec_load_37[0 + 1] = _v2_175.y;
-#endif
                                     }
                                     p0[8] = _vec_load_37[0];
                                     p1[8] = _vec_load_37[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 9) {
-#else
                                 if (c_end_0 > base_1 + 9) {
-#endif
                                     long long part_row_25 = (long long)(base_1 + 9) * split_pitch + row_head[0];
                                     float _vec_load_38[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_138 = *reinterpret_cast<const float2*>(partial_out + (part_row_25 * 256 + dim[0]) + 0);
-                                        _vec_load_38[0] = _v2_138.x;
-                                        _vec_load_38[0 + 1] = _v2_138.y;
-#else
                                         float2 _v2_176 = *reinterpret_cast<const float2*>(partial_out + (part_row_25 * 256 + dim[0]) + 0);
                                         _vec_load_38[0] = _v2_176.x;
                                         _vec_load_38[0 + 1] = _v2_176.y;
-#endif
                                     }
                                     p0[9] = _vec_load_38[0];
                                     p1[9] = _vec_load_38[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 10) {
-#else
                                 if (c_end_0 > base_1 + 10) {
-#endif
                                     long long part_row_26 = (long long)(base_1 + 10) * split_pitch + row_head[0];
                                     float _vec_load_39[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_139 = *reinterpret_cast<const float2*>(partial_out + (part_row_26 * 256 + dim[0]) + 0);
-                                        _vec_load_39[0] = _v2_139.x;
-                                        _vec_load_39[0 + 1] = _v2_139.y;
-#else
                                         float2 _v2_177 = *reinterpret_cast<const float2*>(partial_out + (part_row_26 * 256 + dim[0]) + 0);
                                         _vec_load_39[0] = _v2_177.x;
                                         _vec_load_39[0 + 1] = _v2_177.y;
-#endif
                                     }
                                     p0[10] = _vec_load_39[0];
                                     p1[10] = _vec_load_39[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 11) {
-#else
                                 if (c_end_0 > base_1 + 11) {
-#endif
                                     long long part_row_27 = (long long)(base_1 + 11) * split_pitch + row_head[0];
                                     float _vec_load_40[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_140 = *reinterpret_cast<const float2*>(partial_out + (part_row_27 * 256 + dim[0]) + 0);
-                                        _vec_load_40[0] = _v2_140.x;
-                                        _vec_load_40[0 + 1] = _v2_140.y;
-#else
                                         float2 _v2_178 = *reinterpret_cast<const float2*>(partial_out + (part_row_27 * 256 + dim[0]) + 0);
                                         _vec_load_40[0] = _v2_178.x;
                                         _vec_load_40[0 + 1] = _v2_178.y;
-#endif
                                     }
                                     p0[11] = _vec_load_40[0];
                                     p1[11] = _vec_load_40[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 12) {
-#else
                                 if (c_end_0 > base_1 + 12) {
-#endif
                                     long long part_row_28 = (long long)(base_1 + 12) * split_pitch + row_head[0];
                                     float _vec_load_41[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_141 = *reinterpret_cast<const float2*>(partial_out + (part_row_28 * 256 + dim[0]) + 0);
-                                        _vec_load_41[0] = _v2_141.x;
-                                        _vec_load_41[0 + 1] = _v2_141.y;
-#else
                                         float2 _v2_179 = *reinterpret_cast<const float2*>(partial_out + (part_row_28 * 256 + dim[0]) + 0);
                                         _vec_load_41[0] = _v2_179.x;
                                         _vec_load_41[0 + 1] = _v2_179.y;
-#endif
                                     }
                                     p0[12] = _vec_load_41[0];
                                     p1[12] = _vec_load_41[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 13) {
-#else
                                 if (c_end_0 > base_1 + 13) {
-#endif
                                     long long part_row_29 = (long long)(base_1 + 13) * split_pitch + row_head[0];
                                     float _vec_load_42[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_142 = *reinterpret_cast<const float2*>(partial_out + (part_row_29 * 256 + dim[0]) + 0);
-                                        _vec_load_42[0] = _v2_142.x;
-                                        _vec_load_42[0 + 1] = _v2_142.y;
-#else
                                         float2 _v2_180 = *reinterpret_cast<const float2*>(partial_out + (part_row_29 * 256 + dim[0]) + 0);
                                         _vec_load_42[0] = _v2_180.x;
                                         _vec_load_42[0 + 1] = _v2_180.y;
-#endif
                                     }
                                     p0[13] = _vec_load_42[0];
                                     p1[13] = _vec_load_42[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 14) {
-#else
                                 if (c_end_0 > base_1 + 14) {
-#endif
                                     long long part_row_30 = (long long)(base_1 + 14) * split_pitch + row_head[0];
                                     float _vec_load_43[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_143 = *reinterpret_cast<const float2*>(partial_out + (part_row_30 * 256 + dim[0]) + 0);
-                                        _vec_load_43[0] = _v2_143.x;
-                                        _vec_load_43[0 + 1] = _v2_143.y;
-#else
                                         float2 _v2_181 = *reinterpret_cast<const float2*>(partial_out + (part_row_30 * 256 + dim[0]) + 0);
                                         _vec_load_43[0] = _v2_181.x;
                                         _vec_load_43[0 + 1] = _v2_181.y;
-#endif
                                     }
                                     p0[14] = _vec_load_43[0];
                                     p1[14] = _vec_load_43[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_1 > base_1 + 15) {
-#else
                                 if (c_end_0 > base_1 + 15) {
-#endif
                                     long long part_row_31 = (long long)(base_1 + 15) * split_pitch + row_head[0];
                                     float _vec_load_44[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_144 = *reinterpret_cast<const float2*>(partial_out + (part_row_31 * 256 + dim[0]) + 0);
-                                        _vec_load_44[0] = _v2_144.x;
-                                        _vec_load_44[0 + 1] = _v2_144.y;
-#else
                                         float2 _v2_182 = *reinterpret_cast<const float2*>(partial_out + (part_row_31 * 256 + dim[0]) + 0);
                                         _vec_load_44[0] = _v2_182.x;
                                         _vec_load_44[0 + 1] = _v2_182.y;
-#endif
                                     }
                                     p0[15] = _vec_load_44[0];
                                     p1[15] = _vec_load_44[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_15 = c_end_1 > base_1 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_15 = c_end_0 > base_1 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_15) {
                                     float weight_16 = approx_exp2(lse_tab[tab[0] + base_1] - lse_max[0]);
                                     den[1] = den[1] + weight_16;
                                     acc0[1] = __fmaf_rn(weight_16, p0[0], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_16, p1[0], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_0_1 = c_end_1 > base_1 + 1 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_0_1 = c_end_0 > base_1 + 1 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_0_1) {
                                     float weight_17 = approx_exp2(lse_tab[tab[0] + base_1 + 1] - lse_max[0]);
                                     den[1] = den[1] + weight_17;
                                     acc0[1] = __fmaf_rn(weight_17, p0[1], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_17, p1[1], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_1_1 = c_end_1 > base_1 + 2 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_1_1 = c_end_0 > base_1 + 2 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_1_1) {
                                     float weight_18 = approx_exp2(lse_tab[tab[0] + base_1 + 2] - lse_max[0]);
                                     den[1] = den[1] + weight_18;
                                     acc0[1] = __fmaf_rn(weight_18, p0[2], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_18, p1[2], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_2_1 = c_end_1 > base_1 + 3 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_2_1 = c_end_0 > base_1 + 3 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_2_1) {
                                     float weight_19 = approx_exp2(lse_tab[tab[0] + base_1 + 3] - lse_max[0]);
                                     den[1] = den[1] + weight_19;
                                     acc0[1] = __fmaf_rn(weight_19, p0[3], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_19, p1[3], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_3_1 = c_end_1 > base_1 + 4 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_3_1 = c_end_0 > base_1 + 4 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_3_1) {
                                     float weight_20 = approx_exp2(lse_tab[tab[0] + base_1 + 4] - lse_max[0]);
                                     den[1] = den[1] + weight_20;
                                     acc0[1] = __fmaf_rn(weight_20, p0[4], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_20, p1[4], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_4_1 = c_end_1 > base_1 + 5 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_4_1 = c_end_0 > base_1 + 5 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_4_1) {
                                     float weight_21 = approx_exp2(lse_tab[tab[0] + base_1 + 5] - lse_max[0]);
                                     den[1] = den[1] + weight_21;
                                     acc0[1] = __fmaf_rn(weight_21, p0[5], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_21, p1[5], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_5_1 = c_end_1 > base_1 + 6 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_5_1 = c_end_0 > base_1 + 6 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_5_1) {
                                     float weight_22 = approx_exp2(lse_tab[tab[0] + base_1 + 6] - lse_max[0]);
                                     den[1] = den[1] + weight_22;
                                     acc0[1] = __fmaf_rn(weight_22, p0[6], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_22, p1[6], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_6_1 = c_end_1 > base_1 + 7 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_6_1 = c_end_0 > base_1 + 7 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_6_1) {
                                     float weight_23 = approx_exp2(lse_tab[tab[0] + base_1 + 7] - lse_max[0]);
                                     den[1] = den[1] + weight_23;
                                     acc0[1] = __fmaf_rn(weight_23, p0[7], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_23, p1[7], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_1 = c_end_1 > base_1 + 8 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_7_1 = c_end_0 > base_1 + 8 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_7_1) {
                                     float weight_24 = approx_exp2(lse_tab[tab[0] + base_1 + 8] - lse_max[0]);
                                     den[1] = den[1] + weight_24;
                                     acc0[1] = __fmaf_rn(weight_24, p0[8], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_24, p1[8], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_1 = c_end_1 > base_1 + 9 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_8_1 = c_end_0 > base_1 + 9 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_8_1) {
                                     float weight_25 = approx_exp2(lse_tab[tab[0] + base_1 + 9] - lse_max[0]);
                                     den[1] = den[1] + weight_25;
                                     acc0[1] = __fmaf_rn(weight_25, p0[9], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_25, p1[9], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_1 = c_end_1 > base_1 + 10 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_9_1 = c_end_0 > base_1 + 10 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_9_1) {
                                     float weight_26 = approx_exp2(lse_tab[tab[0] + base_1 + 10] - lse_max[0]);
                                     den[1] = den[1] + weight_26;
                                     acc0[1] = __fmaf_rn(weight_26, p0[10], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_26, p1[10], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_1 = c_end_1 > base_1 + 11 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_10_1 = c_end_0 > base_1 + 11 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_10_1) {
                                     float weight_27 = approx_exp2(lse_tab[tab[0] + base_1 + 11] - lse_max[0]);
                                     den[1] = den[1] + weight_27;
                                     acc0[1] = __fmaf_rn(weight_27, p0[11], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_27, p1[11], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_1 = c_end_1 > base_1 + 12 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_11_1 = c_end_0 > base_1 + 12 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_11_1) {
                                     float weight_28 = approx_exp2(lse_tab[tab[0] + base_1 + 12] - lse_max[0]);
                                     den[1] = den[1] + weight_28;
                                     acc0[1] = __fmaf_rn(weight_28, p0[12], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_28, p1[12], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_1 = c_end_1 > base_1 + 13 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_12_1 = c_end_0 > base_1 + 13 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_12_1) {
                                     float weight_29 = approx_exp2(lse_tab[tab[0] + base_1 + 13] - lse_max[0]);
                                     den[1] = den[1] + weight_29;
                                     acc0[1] = __fmaf_rn(weight_29, p0[13], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_29, p1[13], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_1 = c_end_1 > base_1 + 14 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_13_1 = c_end_0 > base_1 + 14 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_13_1) {
                                     float weight_30 = approx_exp2(lse_tab[tab[0] + base_1 + 14] - lse_max[0]);
                                     den[1] = den[1] + weight_30;
                                     acc0[1] = __fmaf_rn(weight_30, p0[14], acc0[1]);
                                     acc1[1] = __fmaf_rn(weight_30, p1[14], acc1[1]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_1 = c_end_1 > base_1 + 15 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_14_1 = c_end_0 > base_1 + 15 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_14_1) {
                                     float weight_31 = approx_exp2(lse_tab[tab[0] + base_1 + 15] - lse_max[0]);
                                     den[1] = den[1] + weight_31;
@@ -3541,522 +2532,292 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1[1] = __fmaf_rn(weight_31, p1[15], acc1[1]);
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            int c_end_3 = ((chunk_w * 3) < (num_splits) ? (chunk_w * 3) : (num_splits));
-                            int c_begin_4 = ((chunk_w * 2) < (c_end_3) ? (chunk_w * 2) : (c_end_3));
-#else
                             int c_end_2 = ((chunk_w * 3) < (num_splits) ? (chunk_w * 3) : (num_splits));
                             int c_begin_3 = ((chunk_w * 2) < (c_end_2) ? (chunk_w * 2) : (c_end_2));
-#endif
                             #pragma unroll 1
-#if __CUDA_ARCH__ == 1070
-                            for (int base_2 = c_begin_4; base_2 < c_end_3; base_2 += 16) {
-                                if (c_end_3 > base_2) {
-#else
                             for (int base_2 = c_begin_3; base_2 < c_end_2; base_2 += 16) {
                                 if (c_end_2 > base_2) {
-#endif
                                     long long part_row_32 = (long long)base_2 * split_pitch + row_head[0];
                                     float _vec_load_45[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_145 = *reinterpret_cast<const float2*>(partial_out + (part_row_32 * 256 + dim[0]) + 0);
-                                        _vec_load_45[0] = _v2_145.x;
-                                        _vec_load_45[0 + 1] = _v2_145.y;
-#else
                                         float2 _v2_183 = *reinterpret_cast<const float2*>(partial_out + (part_row_32 * 256 + dim[0]) + 0);
                                         _vec_load_45[0] = _v2_183.x;
                                         _vec_load_45[0 + 1] = _v2_183.y;
-#endif
                                     }
                                     p0[0] = _vec_load_45[0];
                                     p1[0] = _vec_load_45[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 1) {
-#else
                                 if (c_end_2 > base_2 + 1) {
-#endif
                                     long long part_row_33 = (long long)(base_2 + 1) * split_pitch + row_head[0];
                                     float _vec_load_46[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_146 = *reinterpret_cast<const float2*>(partial_out + (part_row_33 * 256 + dim[0]) + 0);
-                                        _vec_load_46[0] = _v2_146.x;
-                                        _vec_load_46[0 + 1] = _v2_146.y;
-#else
                                         float2 _v2_184 = *reinterpret_cast<const float2*>(partial_out + (part_row_33 * 256 + dim[0]) + 0);
                                         _vec_load_46[0] = _v2_184.x;
                                         _vec_load_46[0 + 1] = _v2_184.y;
-#endif
                                     }
                                     p0[1] = _vec_load_46[0];
                                     p1[1] = _vec_load_46[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 2) {
-#else
                                 if (c_end_2 > base_2 + 2) {
-#endif
                                     long long part_row_34 = (long long)(base_2 + 2) * split_pitch + row_head[0];
                                     float _vec_load_47[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_147 = *reinterpret_cast<const float2*>(partial_out + (part_row_34 * 256 + dim[0]) + 0);
-                                        _vec_load_47[0] = _v2_147.x;
-                                        _vec_load_47[0 + 1] = _v2_147.y;
-#else
                                         float2 _v2_185 = *reinterpret_cast<const float2*>(partial_out + (part_row_34 * 256 + dim[0]) + 0);
                                         _vec_load_47[0] = _v2_185.x;
                                         _vec_load_47[0 + 1] = _v2_185.y;
-#endif
                                     }
                                     p0[2] = _vec_load_47[0];
                                     p1[2] = _vec_load_47[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 3) {
-#else
                                 if (c_end_2 > base_2 + 3) {
-#endif
                                     long long part_row_35 = (long long)(base_2 + 3) * split_pitch + row_head[0];
                                     float _vec_load_48[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_148 = *reinterpret_cast<const float2*>(partial_out + (part_row_35 * 256 + dim[0]) + 0);
-                                        _vec_load_48[0] = _v2_148.x;
-                                        _vec_load_48[0 + 1] = _v2_148.y;
-#else
                                         float2 _v2_186 = *reinterpret_cast<const float2*>(partial_out + (part_row_35 * 256 + dim[0]) + 0);
                                         _vec_load_48[0] = _v2_186.x;
                                         _vec_load_48[0 + 1] = _v2_186.y;
-#endif
                                     }
                                     p0[3] = _vec_load_48[0];
                                     p1[3] = _vec_load_48[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 4) {
-#else
                                 if (c_end_2 > base_2 + 4) {
-#endif
                                     long long part_row_36 = (long long)(base_2 + 4) * split_pitch + row_head[0];
                                     float _vec_load_49[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_149 = *reinterpret_cast<const float2*>(partial_out + (part_row_36 * 256 + dim[0]) + 0);
-                                        _vec_load_49[0] = _v2_149.x;
-                                        _vec_load_49[0 + 1] = _v2_149.y;
-#else
                                         float2 _v2_187 = *reinterpret_cast<const float2*>(partial_out + (part_row_36 * 256 + dim[0]) + 0);
                                         _vec_load_49[0] = _v2_187.x;
                                         _vec_load_49[0 + 1] = _v2_187.y;
-#endif
                                     }
                                     p0[4] = _vec_load_49[0];
                                     p1[4] = _vec_load_49[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 5) {
-#else
                                 if (c_end_2 > base_2 + 5) {
-#endif
                                     long long part_row_37 = (long long)(base_2 + 5) * split_pitch + row_head[0];
                                     float _vec_load_50[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_150 = *reinterpret_cast<const float2*>(partial_out + (part_row_37 * 256 + dim[0]) + 0);
-                                        _vec_load_50[0] = _v2_150.x;
-                                        _vec_load_50[0 + 1] = _v2_150.y;
-#else
                                         float2 _v2_188 = *reinterpret_cast<const float2*>(partial_out + (part_row_37 * 256 + dim[0]) + 0);
                                         _vec_load_50[0] = _v2_188.x;
                                         _vec_load_50[0 + 1] = _v2_188.y;
-#endif
                                     }
                                     p0[5] = _vec_load_50[0];
                                     p1[5] = _vec_load_50[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 6) {
-#else
                                 if (c_end_2 > base_2 + 6) {
-#endif
                                     long long part_row_38 = (long long)(base_2 + 6) * split_pitch + row_head[0];
                                     float _vec_load_51[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_151 = *reinterpret_cast<const float2*>(partial_out + (part_row_38 * 256 + dim[0]) + 0);
-                                        _vec_load_51[0] = _v2_151.x;
-                                        _vec_load_51[0 + 1] = _v2_151.y;
-#else
                                         float2 _v2_189 = *reinterpret_cast<const float2*>(partial_out + (part_row_38 * 256 + dim[0]) + 0);
                                         _vec_load_51[0] = _v2_189.x;
                                         _vec_load_51[0 + 1] = _v2_189.y;
-#endif
                                     }
                                     p0[6] = _vec_load_51[0];
                                     p1[6] = _vec_load_51[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 7) {
-#else
                                 if (c_end_2 > base_2 + 7) {
-#endif
                                     long long part_row_39 = (long long)(base_2 + 7) * split_pitch + row_head[0];
                                     float _vec_load_52[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_152 = *reinterpret_cast<const float2*>(partial_out + (part_row_39 * 256 + dim[0]) + 0);
-                                        _vec_load_52[0] = _v2_152.x;
-                                        _vec_load_52[0 + 1] = _v2_152.y;
-#else
                                         float2 _v2_190 = *reinterpret_cast<const float2*>(partial_out + (part_row_39 * 256 + dim[0]) + 0);
                                         _vec_load_52[0] = _v2_190.x;
                                         _vec_load_52[0 + 1] = _v2_190.y;
-#endif
                                     }
                                     p0[7] = _vec_load_52[0];
                                     p1[7] = _vec_load_52[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 8) {
-#else
                                 if (c_end_2 > base_2 + 8) {
-#endif
                                     long long part_row_40 = (long long)(base_2 + 8) * split_pitch + row_head[0];
                                     float _vec_load_53[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_153 = *reinterpret_cast<const float2*>(partial_out + (part_row_40 * 256 + dim[0]) + 0);
-                                        _vec_load_53[0] = _v2_153.x;
-                                        _vec_load_53[0 + 1] = _v2_153.y;
-#else
                                         float2 _v2_191 = *reinterpret_cast<const float2*>(partial_out + (part_row_40 * 256 + dim[0]) + 0);
                                         _vec_load_53[0] = _v2_191.x;
                                         _vec_load_53[0 + 1] = _v2_191.y;
-#endif
                                     }
                                     p0[8] = _vec_load_53[0];
                                     p1[8] = _vec_load_53[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 9) {
-#else
                                 if (c_end_2 > base_2 + 9) {
-#endif
                                     long long part_row_41 = (long long)(base_2 + 9) * split_pitch + row_head[0];
                                     float _vec_load_54[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_154 = *reinterpret_cast<const float2*>(partial_out + (part_row_41 * 256 + dim[0]) + 0);
-                                        _vec_load_54[0] = _v2_154.x;
-                                        _vec_load_54[0 + 1] = _v2_154.y;
-#else
                                         float2 _v2_192 = *reinterpret_cast<const float2*>(partial_out + (part_row_41 * 256 + dim[0]) + 0);
                                         _vec_load_54[0] = _v2_192.x;
                                         _vec_load_54[0 + 1] = _v2_192.y;
-#endif
                                     }
                                     p0[9] = _vec_load_54[0];
                                     p1[9] = _vec_load_54[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 10) {
-#else
                                 if (c_end_2 > base_2 + 10) {
-#endif
                                     long long part_row_42 = (long long)(base_2 + 10) * split_pitch + row_head[0];
                                     float _vec_load_55[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_155 = *reinterpret_cast<const float2*>(partial_out + (part_row_42 * 256 + dim[0]) + 0);
-                                        _vec_load_55[0] = _v2_155.x;
-                                        _vec_load_55[0 + 1] = _v2_155.y;
-#else
                                         float2 _v2_193 = *reinterpret_cast<const float2*>(partial_out + (part_row_42 * 256 + dim[0]) + 0);
                                         _vec_load_55[0] = _v2_193.x;
                                         _vec_load_55[0 + 1] = _v2_193.y;
-#endif
                                     }
                                     p0[10] = _vec_load_55[0];
                                     p1[10] = _vec_load_55[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 11) {
-#else
                                 if (c_end_2 > base_2 + 11) {
-#endif
                                     long long part_row_43 = (long long)(base_2 + 11) * split_pitch + row_head[0];
                                     float _vec_load_56[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_156 = *reinterpret_cast<const float2*>(partial_out + (part_row_43 * 256 + dim[0]) + 0);
-                                        _vec_load_56[0] = _v2_156.x;
-                                        _vec_load_56[0 + 1] = _v2_156.y;
-#else
                                         float2 _v2_194 = *reinterpret_cast<const float2*>(partial_out + (part_row_43 * 256 + dim[0]) + 0);
                                         _vec_load_56[0] = _v2_194.x;
                                         _vec_load_56[0 + 1] = _v2_194.y;
-#endif
                                     }
                                     p0[11] = _vec_load_56[0];
                                     p1[11] = _vec_load_56[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 12) {
-#else
                                 if (c_end_2 > base_2 + 12) {
-#endif
                                     long long part_row_44 = (long long)(base_2 + 12) * split_pitch + row_head[0];
                                     float _vec_load_57[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_157 = *reinterpret_cast<const float2*>(partial_out + (part_row_44 * 256 + dim[0]) + 0);
-                                        _vec_load_57[0] = _v2_157.x;
-                                        _vec_load_57[0 + 1] = _v2_157.y;
-#else
                                         float2 _v2_195 = *reinterpret_cast<const float2*>(partial_out + (part_row_44 * 256 + dim[0]) + 0);
                                         _vec_load_57[0] = _v2_195.x;
                                         _vec_load_57[0 + 1] = _v2_195.y;
-#endif
                                     }
                                     p0[12] = _vec_load_57[0];
                                     p1[12] = _vec_load_57[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 13) {
-#else
                                 if (c_end_2 > base_2 + 13) {
-#endif
                                     long long part_row_45 = (long long)(base_2 + 13) * split_pitch + row_head[0];
                                     float _vec_load_58[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_158 = *reinterpret_cast<const float2*>(partial_out + (part_row_45 * 256 + dim[0]) + 0);
-                                        _vec_load_58[0] = _v2_158.x;
-                                        _vec_load_58[0 + 1] = _v2_158.y;
-#else
                                         float2 _v2_196 = *reinterpret_cast<const float2*>(partial_out + (part_row_45 * 256 + dim[0]) + 0);
                                         _vec_load_58[0] = _v2_196.x;
                                         _vec_load_58[0 + 1] = _v2_196.y;
-#endif
                                     }
                                     p0[13] = _vec_load_58[0];
                                     p1[13] = _vec_load_58[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 14) {
-#else
                                 if (c_end_2 > base_2 + 14) {
-#endif
                                     long long part_row_46 = (long long)(base_2 + 14) * split_pitch + row_head[0];
                                     float _vec_load_59[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_159 = *reinterpret_cast<const float2*>(partial_out + (part_row_46 * 256 + dim[0]) + 0);
-                                        _vec_load_59[0] = _v2_159.x;
-                                        _vec_load_59[0 + 1] = _v2_159.y;
-#else
                                         float2 _v2_197 = *reinterpret_cast<const float2*>(partial_out + (part_row_46 * 256 + dim[0]) + 0);
                                         _vec_load_59[0] = _v2_197.x;
                                         _vec_load_59[0 + 1] = _v2_197.y;
-#endif
                                     }
                                     p0[14] = _vec_load_59[0];
                                     p1[14] = _vec_load_59[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_3 > base_2 + 15) {
-#else
                                 if (c_end_2 > base_2 + 15) {
-#endif
                                     long long part_row_47 = (long long)(base_2 + 15) * split_pitch + row_head[0];
                                     float _vec_load_60[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_160 = *reinterpret_cast<const float2*>(partial_out + (part_row_47 * 256 + dim[0]) + 0);
-                                        _vec_load_60[0] = _v2_160.x;
-                                        _vec_load_60[0 + 1] = _v2_160.y;
-#else
                                         float2 _v2_198 = *reinterpret_cast<const float2*>(partial_out + (part_row_47 * 256 + dim[0]) + 0);
                                         _vec_load_60[0] = _v2_198.x;
                                         _vec_load_60[0 + 1] = _v2_198.y;
-#endif
                                     }
                                     p0[15] = _vec_load_60[0];
                                     p1[15] = _vec_load_60[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_16 = c_end_3 > base_2 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_16 = c_end_2 > base_2 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_16) {
                                     float weight_32 = approx_exp2(lse_tab[tab[0] + base_2] - lse_max[0]);
                                     den[2] = den[2] + weight_32;
                                     acc0[2] = __fmaf_rn(weight_32, p0[0], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_32, p1[0], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_0_2 = c_end_3 > base_2 + 1 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_0_2 = c_end_2 > base_2 + 1 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_0_2) {
                                     float weight_33 = approx_exp2(lse_tab[tab[0] + base_2 + 1] - lse_max[0]);
                                     den[2] = den[2] + weight_33;
                                     acc0[2] = __fmaf_rn(weight_33, p0[1], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_33, p1[1], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_1_2 = c_end_3 > base_2 + 2 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_1_2 = c_end_2 > base_2 + 2 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_1_2) {
                                     float weight_34 = approx_exp2(lse_tab[tab[0] + base_2 + 2] - lse_max[0]);
                                     den[2] = den[2] + weight_34;
                                     acc0[2] = __fmaf_rn(weight_34, p0[2], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_34, p1[2], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_2_2 = c_end_3 > base_2 + 3 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_2_2 = c_end_2 > base_2 + 3 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_2_2) {
                                     float weight_35 = approx_exp2(lse_tab[tab[0] + base_2 + 3] - lse_max[0]);
                                     den[2] = den[2] + weight_35;
                                     acc0[2] = __fmaf_rn(weight_35, p0[3], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_35, p1[3], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_3_2 = c_end_3 > base_2 + 4 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_3_2 = c_end_2 > base_2 + 4 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_3_2) {
                                     float weight_36 = approx_exp2(lse_tab[tab[0] + base_2 + 4] - lse_max[0]);
                                     den[2] = den[2] + weight_36;
                                     acc0[2] = __fmaf_rn(weight_36, p0[4], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_36, p1[4], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_4_2 = c_end_3 > base_2 + 5 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_4_2 = c_end_2 > base_2 + 5 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_4_2) {
                                     float weight_37 = approx_exp2(lse_tab[tab[0] + base_2 + 5] - lse_max[0]);
                                     den[2] = den[2] + weight_37;
                                     acc0[2] = __fmaf_rn(weight_37, p0[5], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_37, p1[5], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_5_2 = c_end_3 > base_2 + 6 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_5_2 = c_end_2 > base_2 + 6 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_5_2) {
                                     float weight_38 = approx_exp2(lse_tab[tab[0] + base_2 + 6] - lse_max[0]);
                                     den[2] = den[2] + weight_38;
                                     acc0[2] = __fmaf_rn(weight_38, p0[6], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_38, p1[6], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_6_2 = c_end_3 > base_2 + 7 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_6_2 = c_end_2 > base_2 + 7 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_6_2) {
                                     float weight_39 = approx_exp2(lse_tab[tab[0] + base_2 + 7] - lse_max[0]);
                                     den[2] = den[2] + weight_39;
                                     acc0[2] = __fmaf_rn(weight_39, p0[7], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_39, p1[7], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_2 = c_end_3 > base_2 + 8 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_7_2 = c_end_2 > base_2 + 8 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_7_2) {
                                     float weight_40 = approx_exp2(lse_tab[tab[0] + base_2 + 8] - lse_max[0]);
                                     den[2] = den[2] + weight_40;
                                     acc0[2] = __fmaf_rn(weight_40, p0[8], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_40, p1[8], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_2 = c_end_3 > base_2 + 9 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_8_2 = c_end_2 > base_2 + 9 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_8_2) {
                                     float weight_41 = approx_exp2(lse_tab[tab[0] + base_2 + 9] - lse_max[0]);
                                     den[2] = den[2] + weight_41;
                                     acc0[2] = __fmaf_rn(weight_41, p0[9], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_41, p1[9], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_2 = c_end_3 > base_2 + 10 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_9_2 = c_end_2 > base_2 + 10 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_9_2) {
                                     float weight_42 = approx_exp2(lse_tab[tab[0] + base_2 + 10] - lse_max[0]);
                                     den[2] = den[2] + weight_42;
                                     acc0[2] = __fmaf_rn(weight_42, p0[10], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_42, p1[10], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_2 = c_end_3 > base_2 + 11 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_10_2 = c_end_2 > base_2 + 11 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_10_2) {
                                     float weight_43 = approx_exp2(lse_tab[tab[0] + base_2 + 11] - lse_max[0]);
                                     den[2] = den[2] + weight_43;
                                     acc0[2] = __fmaf_rn(weight_43, p0[11], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_43, p1[11], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_2 = c_end_3 > base_2 + 12 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_11_2 = c_end_2 > base_2 + 12 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_11_2) {
                                     float weight_44 = approx_exp2(lse_tab[tab[0] + base_2 + 12] - lse_max[0]);
                                     den[2] = den[2] + weight_44;
                                     acc0[2] = __fmaf_rn(weight_44, p0[12], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_44, p1[12], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_2 = c_end_3 > base_2 + 13 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_12_2 = c_end_2 > base_2 + 13 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_12_2) {
                                     float weight_45 = approx_exp2(lse_tab[tab[0] + base_2 + 13] - lse_max[0]);
                                     den[2] = den[2] + weight_45;
                                     acc0[2] = __fmaf_rn(weight_45, p0[13], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_45, p1[13], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_2 = c_end_3 > base_2 + 14 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_13_2 = c_end_2 > base_2 + 14 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_13_2) {
                                     float weight_46 = approx_exp2(lse_tab[tab[0] + base_2 + 14] - lse_max[0]);
                                     den[2] = den[2] + weight_46;
                                     acc0[2] = __fmaf_rn(weight_46, p0[14], acc0[2]);
                                     acc1[2] = __fmaf_rn(weight_46, p1[14], acc1[2]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_2 = c_end_3 > base_2 + 15 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_14_2 = c_end_2 > base_2 + 15 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_14_2) {
                                     float weight_47 = approx_exp2(lse_tab[tab[0] + base_2 + 15] - lse_max[0]);
                                     den[2] = den[2] + weight_47;
@@ -4064,522 +2825,292 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1[2] = __fmaf_rn(weight_47, p1[15], acc1[2]);
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            int c_end_5 = ((chunk_w * 4) < (num_splits) ? (chunk_w * 4) : (num_splits));
-                            int c_begin_6 = ((chunk_w * 3) < (c_end_5) ? (chunk_w * 3) : (c_end_5));
-#else
                             int c_end_4 = ((chunk_w * 4) < (num_splits) ? (chunk_w * 4) : (num_splits));
                             int c_begin_5 = ((chunk_w * 3) < (c_end_4) ? (chunk_w * 3) : (c_end_4));
-#endif
                             #pragma unroll 1
-#if __CUDA_ARCH__ == 1070
-                            for (int base_3 = c_begin_6; base_3 < c_end_5; base_3 += 16) {
-                                if (c_end_5 > base_3) {
-#else
                             for (int base_3 = c_begin_5; base_3 < c_end_4; base_3 += 16) {
                                 if (c_end_4 > base_3) {
-#endif
                                     long long part_row_48 = (long long)base_3 * split_pitch + row_head[0];
                                     float _vec_load_61[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_161 = *reinterpret_cast<const float2*>(partial_out + (part_row_48 * 256 + dim[0]) + 0);
-                                        _vec_load_61[0] = _v2_161.x;
-                                        _vec_load_61[0 + 1] = _v2_161.y;
-#else
                                         float2 _v2_199 = *reinterpret_cast<const float2*>(partial_out + (part_row_48 * 256 + dim[0]) + 0);
                                         _vec_load_61[0] = _v2_199.x;
                                         _vec_load_61[0 + 1] = _v2_199.y;
-#endif
                                     }
                                     p0[0] = _vec_load_61[0];
                                     p1[0] = _vec_load_61[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 1) {
-#else
                                 if (c_end_4 > base_3 + 1) {
-#endif
                                     long long part_row_49 = (long long)(base_3 + 1) * split_pitch + row_head[0];
                                     float _vec_load_62[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_162 = *reinterpret_cast<const float2*>(partial_out + (part_row_49 * 256 + dim[0]) + 0);
-                                        _vec_load_62[0] = _v2_162.x;
-                                        _vec_load_62[0 + 1] = _v2_162.y;
-#else
                                         float2 _v2_200 = *reinterpret_cast<const float2*>(partial_out + (part_row_49 * 256 + dim[0]) + 0);
                                         _vec_load_62[0] = _v2_200.x;
                                         _vec_load_62[0 + 1] = _v2_200.y;
-#endif
                                     }
                                     p0[1] = _vec_load_62[0];
                                     p1[1] = _vec_load_62[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 2) {
-#else
                                 if (c_end_4 > base_3 + 2) {
-#endif
                                     long long part_row_50 = (long long)(base_3 + 2) * split_pitch + row_head[0];
                                     float _vec_load_63[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_163 = *reinterpret_cast<const float2*>(partial_out + (part_row_50 * 256 + dim[0]) + 0);
-                                        _vec_load_63[0] = _v2_163.x;
-                                        _vec_load_63[0 + 1] = _v2_163.y;
-#else
                                         float2 _v2_201 = *reinterpret_cast<const float2*>(partial_out + (part_row_50 * 256 + dim[0]) + 0);
                                         _vec_load_63[0] = _v2_201.x;
                                         _vec_load_63[0 + 1] = _v2_201.y;
-#endif
                                     }
                                     p0[2] = _vec_load_63[0];
                                     p1[2] = _vec_load_63[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 3) {
-#else
                                 if (c_end_4 > base_3 + 3) {
-#endif
                                     long long part_row_51 = (long long)(base_3 + 3) * split_pitch + row_head[0];
                                     float _vec_load_64[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_164 = *reinterpret_cast<const float2*>(partial_out + (part_row_51 * 256 + dim[0]) + 0);
-                                        _vec_load_64[0] = _v2_164.x;
-                                        _vec_load_64[0 + 1] = _v2_164.y;
-#else
                                         float2 _v2_202 = *reinterpret_cast<const float2*>(partial_out + (part_row_51 * 256 + dim[0]) + 0);
                                         _vec_load_64[0] = _v2_202.x;
                                         _vec_load_64[0 + 1] = _v2_202.y;
-#endif
                                     }
                                     p0[3] = _vec_load_64[0];
                                     p1[3] = _vec_load_64[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 4) {
-#else
                                 if (c_end_4 > base_3 + 4) {
-#endif
                                     long long part_row_52 = (long long)(base_3 + 4) * split_pitch + row_head[0];
                                     float _vec_load_65[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_165 = *reinterpret_cast<const float2*>(partial_out + (part_row_52 * 256 + dim[0]) + 0);
-                                        _vec_load_65[0] = _v2_165.x;
-                                        _vec_load_65[0 + 1] = _v2_165.y;
-#else
                                         float2 _v2_203 = *reinterpret_cast<const float2*>(partial_out + (part_row_52 * 256 + dim[0]) + 0);
                                         _vec_load_65[0] = _v2_203.x;
                                         _vec_load_65[0 + 1] = _v2_203.y;
-#endif
                                     }
                                     p0[4] = _vec_load_65[0];
                                     p1[4] = _vec_load_65[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 5) {
-#else
                                 if (c_end_4 > base_3 + 5) {
-#endif
                                     long long part_row_53 = (long long)(base_3 + 5) * split_pitch + row_head[0];
                                     float _vec_load_66[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_166 = *reinterpret_cast<const float2*>(partial_out + (part_row_53 * 256 + dim[0]) + 0);
-                                        _vec_load_66[0] = _v2_166.x;
-                                        _vec_load_66[0 + 1] = _v2_166.y;
-#else
                                         float2 _v2_204 = *reinterpret_cast<const float2*>(partial_out + (part_row_53 * 256 + dim[0]) + 0);
                                         _vec_load_66[0] = _v2_204.x;
                                         _vec_load_66[0 + 1] = _v2_204.y;
-#endif
                                     }
                                     p0[5] = _vec_load_66[0];
                                     p1[5] = _vec_load_66[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 6) {
-#else
                                 if (c_end_4 > base_3 + 6) {
-#endif
                                     long long part_row_54 = (long long)(base_3 + 6) * split_pitch + row_head[0];
                                     float _vec_load_67[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_167 = *reinterpret_cast<const float2*>(partial_out + (part_row_54 * 256 + dim[0]) + 0);
-                                        _vec_load_67[0] = _v2_167.x;
-                                        _vec_load_67[0 + 1] = _v2_167.y;
-#else
                                         float2 _v2_205 = *reinterpret_cast<const float2*>(partial_out + (part_row_54 * 256 + dim[0]) + 0);
                                         _vec_load_67[0] = _v2_205.x;
                                         _vec_load_67[0 + 1] = _v2_205.y;
-#endif
                                     }
                                     p0[6] = _vec_load_67[0];
                                     p1[6] = _vec_load_67[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 7) {
-#else
                                 if (c_end_4 > base_3 + 7) {
-#endif
                                     long long part_row_55 = (long long)(base_3 + 7) * split_pitch + row_head[0];
                                     float _vec_load_68[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_168 = *reinterpret_cast<const float2*>(partial_out + (part_row_55 * 256 + dim[0]) + 0);
-                                        _vec_load_68[0] = _v2_168.x;
-                                        _vec_load_68[0 + 1] = _v2_168.y;
-#else
                                         float2 _v2_206 = *reinterpret_cast<const float2*>(partial_out + (part_row_55 * 256 + dim[0]) + 0);
                                         _vec_load_68[0] = _v2_206.x;
                                         _vec_load_68[0 + 1] = _v2_206.y;
-#endif
                                     }
                                     p0[7] = _vec_load_68[0];
                                     p1[7] = _vec_load_68[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 8) {
-#else
                                 if (c_end_4 > base_3 + 8) {
-#endif
                                     long long part_row_56 = (long long)(base_3 + 8) * split_pitch + row_head[0];
                                     float _vec_load_69[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_169 = *reinterpret_cast<const float2*>(partial_out + (part_row_56 * 256 + dim[0]) + 0);
-                                        _vec_load_69[0] = _v2_169.x;
-                                        _vec_load_69[0 + 1] = _v2_169.y;
-#else
                                         float2 _v2_207 = *reinterpret_cast<const float2*>(partial_out + (part_row_56 * 256 + dim[0]) + 0);
                                         _vec_load_69[0] = _v2_207.x;
                                         _vec_load_69[0 + 1] = _v2_207.y;
-#endif
                                     }
                                     p0[8] = _vec_load_69[0];
                                     p1[8] = _vec_load_69[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 9) {
-#else
                                 if (c_end_4 > base_3 + 9) {
-#endif
                                     long long part_row_57 = (long long)(base_3 + 9) * split_pitch + row_head[0];
                                     float _vec_load_70[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_170 = *reinterpret_cast<const float2*>(partial_out + (part_row_57 * 256 + dim[0]) + 0);
-                                        _vec_load_70[0] = _v2_170.x;
-                                        _vec_load_70[0 + 1] = _v2_170.y;
-#else
                                         float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_57 * 256 + dim[0]) + 0);
                                         _vec_load_70[0] = _v2_208.x;
                                         _vec_load_70[0 + 1] = _v2_208.y;
-#endif
                                     }
                                     p0[9] = _vec_load_70[0];
                                     p1[9] = _vec_load_70[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 10) {
-#else
                                 if (c_end_4 > base_3 + 10) {
-#endif
                                     long long part_row_58 = (long long)(base_3 + 10) * split_pitch + row_head[0];
                                     float _vec_load_71[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_171 = *reinterpret_cast<const float2*>(partial_out + (part_row_58 * 256 + dim[0]) + 0);
-                                        _vec_load_71[0] = _v2_171.x;
-                                        _vec_load_71[0 + 1] = _v2_171.y;
-#else
                                         float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_58 * 256 + dim[0]) + 0);
                                         _vec_load_71[0] = _v2_209.x;
                                         _vec_load_71[0 + 1] = _v2_209.y;
-#endif
                                     }
                                     p0[10] = _vec_load_71[0];
                                     p1[10] = _vec_load_71[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 11) {
-#else
                                 if (c_end_4 > base_3 + 11) {
-#endif
                                     long long part_row_59 = (long long)(base_3 + 11) * split_pitch + row_head[0];
                                     float _vec_load_72[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_172 = *reinterpret_cast<const float2*>(partial_out + (part_row_59 * 256 + dim[0]) + 0);
-                                        _vec_load_72[0] = _v2_172.x;
-                                        _vec_load_72[0 + 1] = _v2_172.y;
-#else
                                         float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_59 * 256 + dim[0]) + 0);
                                         _vec_load_72[0] = _v2_210.x;
                                         _vec_load_72[0 + 1] = _v2_210.y;
-#endif
                                     }
                                     p0[11] = _vec_load_72[0];
                                     p1[11] = _vec_load_72[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 12) {
-#else
                                 if (c_end_4 > base_3 + 12) {
-#endif
                                     long long part_row_60 = (long long)(base_3 + 12) * split_pitch + row_head[0];
                                     float _vec_load_73[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_173 = *reinterpret_cast<const float2*>(partial_out + (part_row_60 * 256 + dim[0]) + 0);
-                                        _vec_load_73[0] = _v2_173.x;
-                                        _vec_load_73[0 + 1] = _v2_173.y;
-#else
                                         float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_60 * 256 + dim[0]) + 0);
                                         _vec_load_73[0] = _v2_211.x;
                                         _vec_load_73[0 + 1] = _v2_211.y;
-#endif
                                     }
                                     p0[12] = _vec_load_73[0];
                                     p1[12] = _vec_load_73[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 13) {
-#else
                                 if (c_end_4 > base_3 + 13) {
-#endif
                                     long long part_row_61 = (long long)(base_3 + 13) * split_pitch + row_head[0];
                                     float _vec_load_74[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_174 = *reinterpret_cast<const float2*>(partial_out + (part_row_61 * 256 + dim[0]) + 0);
-                                        _vec_load_74[0] = _v2_174.x;
-                                        _vec_load_74[0 + 1] = _v2_174.y;
-#else
                                         float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_61 * 256 + dim[0]) + 0);
                                         _vec_load_74[0] = _v2_212.x;
                                         _vec_load_74[0 + 1] = _v2_212.y;
-#endif
                                     }
                                     p0[13] = _vec_load_74[0];
                                     p1[13] = _vec_load_74[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 14) {
-#else
                                 if (c_end_4 > base_3 + 14) {
-#endif
                                     long long part_row_62 = (long long)(base_3 + 14) * split_pitch + row_head[0];
                                     float _vec_load_75[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_175 = *reinterpret_cast<const float2*>(partial_out + (part_row_62 * 256 + dim[0]) + 0);
-                                        _vec_load_75[0] = _v2_175.x;
-                                        _vec_load_75[0 + 1] = _v2_175.y;
-#else
                                         float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_62 * 256 + dim[0]) + 0);
                                         _vec_load_75[0] = _v2_213.x;
                                         _vec_load_75[0 + 1] = _v2_213.y;
-#endif
                                     }
                                     p0[14] = _vec_load_75[0];
                                     p1[14] = _vec_load_75[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                if (c_end_5 > base_3 + 15) {
-#else
                                 if (c_end_4 > base_3 + 15) {
-#endif
                                     long long part_row_63 = (long long)(base_3 + 15) * split_pitch + row_head[0];
                                     float _vec_load_76[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_176 = *reinterpret_cast<const float2*>(partial_out + (part_row_63 * 256 + dim[0]) + 0);
-                                        _vec_load_76[0] = _v2_176.x;
-                                        _vec_load_76[0 + 1] = _v2_176.y;
-#else
                                         float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_63 * 256 + dim[0]) + 0);
                                         _vec_load_76[0] = _v2_214.x;
                                         _vec_load_76[0 + 1] = _v2_214.y;
-#endif
                                     }
                                     p0[15] = _vec_load_76[0];
                                     p1[15] = _vec_load_76[1];
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_17 = c_end_5 > base_3 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_17 = c_end_4 > base_3 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_17) {
                                     float weight_48 = approx_exp2(lse_tab[tab[0] + base_3] - lse_max[0]);
                                     den[3] = den[3] + weight_48;
                                     acc0[3] = __fmaf_rn(weight_48, p0[0], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_48, p1[0], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_0_3 = c_end_5 > base_3 + 1 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_0_3 = c_end_4 > base_3 + 1 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_0_3) {
                                     float weight_49 = approx_exp2(lse_tab[tab[0] + base_3 + 1] - lse_max[0]);
                                     den[3] = den[3] + weight_49;
                                     acc0[3] = __fmaf_rn(weight_49, p0[1], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_49, p1[1], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_1_3 = c_end_5 > base_3 + 2 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_1_3 = c_end_4 > base_3 + 2 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_1_3) {
                                     float weight_50 = approx_exp2(lse_tab[tab[0] + base_3 + 2] - lse_max[0]);
                                     den[3] = den[3] + weight_50;
                                     acc0[3] = __fmaf_rn(weight_50, p0[2], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_50, p1[2], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_2_3 = c_end_5 > base_3 + 3 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_2_3 = c_end_4 > base_3 + 3 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_2_3) {
                                     float weight_51 = approx_exp2(lse_tab[tab[0] + base_3 + 3] - lse_max[0]);
                                     den[3] = den[3] + weight_51;
                                     acc0[3] = __fmaf_rn(weight_51, p0[3], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_51, p1[3], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_3_3 = c_end_5 > base_3 + 4 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_3_3 = c_end_4 > base_3 + 4 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_3_3) {
                                     float weight_52 = approx_exp2(lse_tab[tab[0] + base_3 + 4] - lse_max[0]);
                                     den[3] = den[3] + weight_52;
                                     acc0[3] = __fmaf_rn(weight_52, p0[4], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_52, p1[4], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_4_3 = c_end_5 > base_3 + 5 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_4_3 = c_end_4 > base_3 + 5 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_4_3) {
                                     float weight_53 = approx_exp2(lse_tab[tab[0] + base_3 + 5] - lse_max[0]);
                                     den[3] = den[3] + weight_53;
                                     acc0[3] = __fmaf_rn(weight_53, p0[5], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_53, p1[5], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_5_3 = c_end_5 > base_3 + 6 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_5_3 = c_end_4 > base_3 + 6 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_5_3) {
                                     float weight_54 = approx_exp2(lse_tab[tab[0] + base_3 + 6] - lse_max[0]);
                                     den[3] = den[3] + weight_54;
                                     acc0[3] = __fmaf_rn(weight_54, p0[6], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_54, p1[6], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_6_3 = c_end_5 > base_3 + 7 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_6_3 = c_end_4 > base_3 + 7 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_6_3) {
                                     float weight_55 = approx_exp2(lse_tab[tab[0] + base_3 + 7] - lse_max[0]);
                                     den[3] = den[3] + weight_55;
                                     acc0[3] = __fmaf_rn(weight_55, p0[7], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_55, p1[7], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_3 = c_end_5 > base_3 + 8 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_7_3 = c_end_4 > base_3 + 8 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_7_3) {
                                     float weight_56 = approx_exp2(lse_tab[tab[0] + base_3 + 8] - lse_max[0]);
                                     den[3] = den[3] + weight_56;
                                     acc0[3] = __fmaf_rn(weight_56, p0[8], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_56, p1[8], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_3 = c_end_5 > base_3 + 9 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_8_3 = c_end_4 > base_3 + 9 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_8_3) {
                                     float weight_57 = approx_exp2(lse_tab[tab[0] + base_3 + 9] - lse_max[0]);
                                     den[3] = den[3] + weight_57;
                                     acc0[3] = __fmaf_rn(weight_57, p0[9], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_57, p1[9], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_3 = c_end_5 > base_3 + 10 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_9_3 = c_end_4 > base_3 + 10 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_9_3) {
                                     float weight_58 = approx_exp2(lse_tab[tab[0] + base_3 + 10] - lse_max[0]);
                                     den[3] = den[3] + weight_58;
                                     acc0[3] = __fmaf_rn(weight_58, p0[10], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_58, p1[10], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_3 = c_end_5 > base_3 + 11 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_10_3 = c_end_4 > base_3 + 11 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_10_3) {
                                     float weight_59 = approx_exp2(lse_tab[tab[0] + base_3 + 11] - lse_max[0]);
                                     den[3] = den[3] + weight_59;
                                     acc0[3] = __fmaf_rn(weight_59, p0[11], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_59, p1[11], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_3 = c_end_5 > base_3 + 12 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_11_3 = c_end_4 > base_3 + 12 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_11_3) {
                                     float weight_60 = approx_exp2(lse_tab[tab[0] + base_3 + 12] - lse_max[0]);
                                     den[3] = den[3] + weight_60;
                                     acc0[3] = __fmaf_rn(weight_60, p0[12], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_60, p1[12], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_3 = c_end_5 > base_3 + 13 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_12_3 = c_end_4 > base_3 + 13 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_12_3) {
                                     float weight_61 = approx_exp2(lse_tab[tab[0] + base_3 + 13] - lse_max[0]);
                                     den[3] = den[3] + weight_61;
                                     acc0[3] = __fmaf_rn(weight_61, p0[13], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_61, p1[13], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_3 = c_end_5 > base_3 + 14 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_13_3 = c_end_4 > base_3 + 14 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_13_3) {
                                     float weight_62 = approx_exp2(lse_tab[tab[0] + base_3 + 14] - lse_max[0]);
                                     den[3] = den[3] + weight_62;
                                     acc0[3] = __fmaf_rn(weight_62, p0[14], acc0[3]);
                                     acc1[3] = __fmaf_rn(weight_62, p1[14], acc1[3]);
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_3 = c_end_5 > base_3 + 15 && lse_max[0] > -CUDART_INF_F;
-#else
                                 bool live_14_3 = c_end_4 > base_3 + 15 && lse_max[0] > -CUDART_INF_F;
-#endif
                                 if (live_14_3) {
                                     float weight_63 = approx_exp2(lse_tab[tab[0] + base_3 + 15] - lse_max[0]);
                                     den[3] = den[3] + weight_63;
@@ -4602,26 +3133,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_k = acc1_k + acc1[3];
                                 float inv_2 = 0.0f;
                                 if (den_k > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                    float _rcp_177 = approx_rcp(den_k);
-                                    inv_2 = _rcp_177;
-#else
                                     float _rcp_215 = approx_rcp(den_k);
                                     inv_2 = _rcp_215;
-#endif
                                 }
                                 float attn0 = (float)(__nv_bfloat16)(acc0_k * inv_2);
                                 float attn1 = (float)(__nv_bfloat16)(acc1_k * inv_2);
-#if __CUDA_ARCH__ == 1070
-                                float _exp2_179 = approx_exp2((-gate0[0]) * 1.442695f);
-                                float _rcp_178 = approx_rcp(1.0f + _exp2_179);
-                                float result0 = attn0 * _rcp_178;
-                                float _exp2_181 = approx_exp2((-gate1[0]) * 1.442695f);
-                                float _rcp_180 = approx_rcp(1.0f + _exp2_181);
-                                float result1 = attn1 * _rcp_180;
-                                __nv_bfloat162 _bit_cast_src_182 = __float22bfloat162_rn(make_float2(result0, result1));
-                                word[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_182)[0];
-#else
                                 float _exp2_217 = approx_exp2((-gate0[0]) * 1.442695f);
                                 float _rcp_216 = approx_rcp(1.0f + _exp2_217);
                                 float result0 = attn0 * _rcp_216;
@@ -4630,7 +3146,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 float result1 = attn1 * _rcp_218;
                                 __nv_bfloat162 _bit_cast_src_220 = __float22bfloat162_rn(make_float2(result0, result1));
                                 word[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_220)[0];
-#endif
                                 long long out_offset = row_i64 * out_stride_row + qo_head_2[0] * out_stride_head + dim[0];
                                 *(reinterpret_cast<unsigned int*>(out + out_offset) + (0)) = word[0];
                             }
@@ -4665,17 +3180,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                         for (int p_1_1 = p_first; p_1_1 < end; p_1_1 += 128) {
                             int pk_1 = ((p_1_1) < (end - 1) ? (p_1_1) : (end - 1));
                             valid_1[0] = ((end > p_1_1) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                            int head_0_1 = pk_1 >> 7;
-#else
                             int head_3 = pk_1 >> 7;
-#endif
                             dim_1[0] = (long long)((pk_1 & 127) * 2);
-#if __CUDA_ARCH__ == 1070
-                            qo_head_3[0] = (long long)(first_head + head_0_1);
-#else
                             qo_head_3[0] = (long long)(first_head + head_3);
-#endif
                             row_head_1[0] = row_i64 * nqo_1 + qo_head_3[0];
                             acc0_1[0] = 0.0f;
                             acc1_1[0] = 0.0f;
@@ -4692,17 +3199,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             lse_max_1[0] = -CUDART_INF_F;
                             float _vec_load_77[2];
                             {
-#if __CUDA_ARCH__ == 1070
-                                uint32_t _bf16x2_bits_183;
-                                _bf16x2_bits_183 = *reinterpret_cast<const uint32_t*>(gate + (row_head_1[0] * 256 + dim_1[0]) + 0);
-                                (&_vec_load_77[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_183) << 16);
-                                (&_vec_load_77[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_183) & 0xffff0000u);
-#else
                                 uint32_t _bf16x2_bits_221;
                                 _bf16x2_bits_221 = *reinterpret_cast<const uint32_t*>(gate + (row_head_1[0] * 256 + dim_1[0]) + 0);
                                 (&_vec_load_77[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_221) << 16);
                                 (&_vec_load_77[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_221) & 0xffff0000u);
-#endif
                             }
                             gate0_1[0] = _vec_load_77[0];
                             gate1_1[0] = _vec_load_77[1];
@@ -4712,15 +3212,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[0] = partial_lse[part_row_64];
                                 float _vec_load_78[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_184 = *reinterpret_cast<const float2*>(partial_out + (part_row_64 * 256 + dim_1[0]) + 0);
-                                    _vec_load_78[0] = _v2_184.x;
-                                    _vec_load_78[0 + 1] = _v2_184.y;
-#else
                                     float2 _v2_222 = *reinterpret_cast<const float2*>(partial_out + (part_row_64 * 256 + dim_1[0]) + 0);
                                     _vec_load_78[0] = _v2_222.x;
                                     _vec_load_78[0 + 1] = _v2_222.y;
-#endif
                                 }
                                 p0_1[0] = _vec_load_78[0];
                                 p1_1[0] = _vec_load_78[1];
@@ -4731,15 +3225,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[1] = partial_lse[part_row_65];
                                 float _vec_load_79[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_185 = *reinterpret_cast<const float2*>(partial_out + (part_row_65 * 256 + dim_1[0]) + 0);
-                                    _vec_load_79[0] = _v2_185.x;
-                                    _vec_load_79[0 + 1] = _v2_185.y;
-#else
                                     float2 _v2_223 = *reinterpret_cast<const float2*>(partial_out + (part_row_65 * 256 + dim_1[0]) + 0);
                                     _vec_load_79[0] = _v2_223.x;
                                     _vec_load_79[0 + 1] = _v2_223.y;
-#endif
                                 }
                                 p0_1[1] = _vec_load_79[0];
                                 p1_1[1] = _vec_load_79[1];
@@ -4750,15 +3238,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[2] = partial_lse[part_row_66];
                                 float _vec_load_80[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_186 = *reinterpret_cast<const float2*>(partial_out + (part_row_66 * 256 + dim_1[0]) + 0);
-                                    _vec_load_80[0] = _v2_186.x;
-                                    _vec_load_80[0 + 1] = _v2_186.y;
-#else
                                     float2 _v2_224 = *reinterpret_cast<const float2*>(partial_out + (part_row_66 * 256 + dim_1[0]) + 0);
                                     _vec_load_80[0] = _v2_224.x;
                                     _vec_load_80[0 + 1] = _v2_224.y;
-#endif
                                 }
                                 p0_1[2] = _vec_load_80[0];
                                 p1_1[2] = _vec_load_80[1];
@@ -4769,15 +3251,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[3] = partial_lse[part_row_67];
                                 float _vec_load_81[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_187 = *reinterpret_cast<const float2*>(partial_out + (part_row_67 * 256 + dim_1[0]) + 0);
-                                    _vec_load_81[0] = _v2_187.x;
-                                    _vec_load_81[0 + 1] = _v2_187.y;
-#else
                                     float2 _v2_225 = *reinterpret_cast<const float2*>(partial_out + (part_row_67 * 256 + dim_1[0]) + 0);
                                     _vec_load_81[0] = _v2_225.x;
                                     _vec_load_81[0 + 1] = _v2_225.y;
-#endif
                                 }
                                 p0_1[3] = _vec_load_81[0];
                                 p1_1[3] = _vec_load_81[1];
@@ -4788,15 +3264,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[4] = partial_lse[part_row_68];
                                 float _vec_load_82[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_188 = *reinterpret_cast<const float2*>(partial_out + (part_row_68 * 256 + dim_1[0]) + 0);
-                                    _vec_load_82[0] = _v2_188.x;
-                                    _vec_load_82[0 + 1] = _v2_188.y;
-#else
                                     float2 _v2_226 = *reinterpret_cast<const float2*>(partial_out + (part_row_68 * 256 + dim_1[0]) + 0);
                                     _vec_load_82[0] = _v2_226.x;
                                     _vec_load_82[0 + 1] = _v2_226.y;
-#endif
                                 }
                                 p0_1[4] = _vec_load_82[0];
                                 p1_1[4] = _vec_load_82[1];
@@ -4807,15 +3277,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[5] = partial_lse[part_row_69];
                                 float _vec_load_83[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_189 = *reinterpret_cast<const float2*>(partial_out + (part_row_69 * 256 + dim_1[0]) + 0);
-                                    _vec_load_83[0] = _v2_189.x;
-                                    _vec_load_83[0 + 1] = _v2_189.y;
-#else
                                     float2 _v2_227 = *reinterpret_cast<const float2*>(partial_out + (part_row_69 * 256 + dim_1[0]) + 0);
                                     _vec_load_83[0] = _v2_227.x;
                                     _vec_load_83[0 + 1] = _v2_227.y;
-#endif
                                 }
                                 p0_1[5] = _vec_load_83[0];
                                 p1_1[5] = _vec_load_83[1];
@@ -4826,15 +3290,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[6] = partial_lse[part_row_70];
                                 float _vec_load_84[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_190 = *reinterpret_cast<const float2*>(partial_out + (part_row_70 * 256 + dim_1[0]) + 0);
-                                    _vec_load_84[0] = _v2_190.x;
-                                    _vec_load_84[0 + 1] = _v2_190.y;
-#else
                                     float2 _v2_228 = *reinterpret_cast<const float2*>(partial_out + (part_row_70 * 256 + dim_1[0]) + 0);
                                     _vec_load_84[0] = _v2_228.x;
                                     _vec_load_84[0 + 1] = _v2_228.y;
-#endif
                                 }
                                 p0_1[6] = _vec_load_84[0];
                                 p1_1[6] = _vec_load_84[1];
@@ -4845,15 +3303,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[7] = partial_lse[part_row_71];
                                 float _vec_load_85[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_191 = *reinterpret_cast<const float2*>(partial_out + (part_row_71 * 256 + dim_1[0]) + 0);
-                                    _vec_load_85[0] = _v2_191.x;
-                                    _vec_load_85[0 + 1] = _v2_191.y;
-#else
                                     float2 _v2_229 = *reinterpret_cast<const float2*>(partial_out + (part_row_71 * 256 + dim_1[0]) + 0);
                                     _vec_load_85[0] = _v2_229.x;
                                     _vec_load_85[0 + 1] = _v2_229.y;
-#endif
                                 }
                                 p0_1[7] = _vec_load_85[0];
                                 p1_1[7] = _vec_load_85[1];
@@ -4864,15 +3316,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[8] = partial_lse[part_row_72];
                                 float _vec_load_86[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_192 = *reinterpret_cast<const float2*>(partial_out + (part_row_72 * 256 + dim_1[0]) + 0);
-                                    _vec_load_86[0] = _v2_192.x;
-                                    _vec_load_86[0 + 1] = _v2_192.y;
-#else
                                     float2 _v2_230 = *reinterpret_cast<const float2*>(partial_out + (part_row_72 * 256 + dim_1[0]) + 0);
                                     _vec_load_86[0] = _v2_230.x;
                                     _vec_load_86[0 + 1] = _v2_230.y;
-#endif
                                 }
                                 p0_1[8] = _vec_load_86[0];
                                 p1_1[8] = _vec_load_86[1];
@@ -4883,15 +3329,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[9] = partial_lse[part_row_73];
                                 float _vec_load_87[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_193 = *reinterpret_cast<const float2*>(partial_out + (part_row_73 * 256 + dim_1[0]) + 0);
-                                    _vec_load_87[0] = _v2_193.x;
-                                    _vec_load_87[0 + 1] = _v2_193.y;
-#else
                                     float2 _v2_231 = *reinterpret_cast<const float2*>(partial_out + (part_row_73 * 256 + dim_1[0]) + 0);
                                     _vec_load_87[0] = _v2_231.x;
                                     _vec_load_87[0 + 1] = _v2_231.y;
-#endif
                                 }
                                 p0_1[9] = _vec_load_87[0];
                                 p1_1[9] = _vec_load_87[1];
@@ -4902,15 +3342,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[10] = partial_lse[part_row_74];
                                 float _vec_load_88[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_194 = *reinterpret_cast<const float2*>(partial_out + (part_row_74 * 256 + dim_1[0]) + 0);
-                                    _vec_load_88[0] = _v2_194.x;
-                                    _vec_load_88[0 + 1] = _v2_194.y;
-#else
                                     float2 _v2_232 = *reinterpret_cast<const float2*>(partial_out + (part_row_74 * 256 + dim_1[0]) + 0);
                                     _vec_load_88[0] = _v2_232.x;
                                     _vec_load_88[0 + 1] = _v2_232.y;
-#endif
                                 }
                                 p0_1[10] = _vec_load_88[0];
                                 p1_1[10] = _vec_load_88[1];
@@ -4921,15 +3355,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[11] = partial_lse[part_row_75];
                                 float _vec_load_89[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_195 = *reinterpret_cast<const float2*>(partial_out + (part_row_75 * 256 + dim_1[0]) + 0);
-                                    _vec_load_89[0] = _v2_195.x;
-                                    _vec_load_89[0 + 1] = _v2_195.y;
-#else
                                     float2 _v2_233 = *reinterpret_cast<const float2*>(partial_out + (part_row_75 * 256 + dim_1[0]) + 0);
                                     _vec_load_89[0] = _v2_233.x;
                                     _vec_load_89[0 + 1] = _v2_233.y;
-#endif
                                 }
                                 p0_1[11] = _vec_load_89[0];
                                 p1_1[11] = _vec_load_89[1];
@@ -4940,15 +3368,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[12] = partial_lse[part_row_76];
                                 float _vec_load_90[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_196 = *reinterpret_cast<const float2*>(partial_out + (part_row_76 * 256 + dim_1[0]) + 0);
-                                    _vec_load_90[0] = _v2_196.x;
-                                    _vec_load_90[0 + 1] = _v2_196.y;
-#else
                                     float2 _v2_234 = *reinterpret_cast<const float2*>(partial_out + (part_row_76 * 256 + dim_1[0]) + 0);
                                     _vec_load_90[0] = _v2_234.x;
                                     _vec_load_90[0 + 1] = _v2_234.y;
-#endif
                                 }
                                 p0_1[12] = _vec_load_90[0];
                                 p1_1[12] = _vec_load_90[1];
@@ -4959,15 +3381,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[13] = partial_lse[part_row_77];
                                 float _vec_load_91[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_197 = *reinterpret_cast<const float2*>(partial_out + (part_row_77 * 256 + dim_1[0]) + 0);
-                                    _vec_load_91[0] = _v2_197.x;
-                                    _vec_load_91[0 + 1] = _v2_197.y;
-#else
                                     float2 _v2_235 = *reinterpret_cast<const float2*>(partial_out + (part_row_77 * 256 + dim_1[0]) + 0);
                                     _vec_load_91[0] = _v2_235.x;
                                     _vec_load_91[0 + 1] = _v2_235.y;
-#endif
                                 }
                                 p0_1[13] = _vec_load_91[0];
                                 p1_1[13] = _vec_load_91[1];
@@ -4978,15 +3394,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[14] = partial_lse[part_row_78];
                                 float _vec_load_92[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_198 = *reinterpret_cast<const float2*>(partial_out + (part_row_78 * 256 + dim_1[0]) + 0);
-                                    _vec_load_92[0] = _v2_198.x;
-                                    _vec_load_92[0 + 1] = _v2_198.y;
-#else
                                     float2 _v2_236 = *reinterpret_cast<const float2*>(partial_out + (part_row_78 * 256 + dim_1[0]) + 0);
                                     _vec_load_92[0] = _v2_236.x;
                                     _vec_load_92[0 + 1] = _v2_236.y;
-#endif
                                 }
                                 p0_1[14] = _vec_load_92[0];
                                 p1_1[14] = _vec_load_92[1];
@@ -4997,15 +3407,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[15] = partial_lse[part_row_79];
                                 float _vec_load_93[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_199 = *reinterpret_cast<const float2*>(partial_out + (part_row_79 * 256 + dim_1[0]) + 0);
-                                    _vec_load_93[0] = _v2_199.x;
-                                    _vec_load_93[0 + 1] = _v2_199.y;
-#else
                                     float2 _v2_237 = *reinterpret_cast<const float2*>(partial_out + (part_row_79 * 256 + dim_1[0]) + 0);
                                     _vec_load_93[0] = _v2_237.x;
                                     _vec_load_93[0 + 1] = _v2_237.y;
-#endif
                                 }
                                 p0_1[15] = _vec_load_93[0];
                                 p1_1[15] = _vec_load_93[1];
@@ -5016,15 +3420,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[16] = partial_lse[part_row_80];
                                 float _vec_load_94[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_200 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_1[0]) + 0);
-                                    _vec_load_94[0] = _v2_200.x;
-                                    _vec_load_94[0 + 1] = _v2_200.y;
-#else
                                     float2 _v2_238 = *reinterpret_cast<const float2*>(partial_out + (part_row_80 * 256 + dim_1[0]) + 0);
                                     _vec_load_94[0] = _v2_238.x;
                                     _vec_load_94[0 + 1] = _v2_238.y;
-#endif
                                 }
                                 p0_1[16] = _vec_load_94[0];
                                 p1_1[16] = _vec_load_94[1];
@@ -5035,15 +3433,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[17] = partial_lse[part_row_81];
                                 float _vec_load_95[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_201 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_1[0]) + 0);
-                                    _vec_load_95[0] = _v2_201.x;
-                                    _vec_load_95[0 + 1] = _v2_201.y;
-#else
                                     float2 _v2_239 = *reinterpret_cast<const float2*>(partial_out + (part_row_81 * 256 + dim_1[0]) + 0);
                                     _vec_load_95[0] = _v2_239.x;
                                     _vec_load_95[0 + 1] = _v2_239.y;
-#endif
                                 }
                                 p0_1[17] = _vec_load_95[0];
                                 p1_1[17] = _vec_load_95[1];
@@ -5054,15 +3446,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[18] = partial_lse[part_row_82];
                                 float _vec_load_96[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_202 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_1[0]) + 0);
-                                    _vec_load_96[0] = _v2_202.x;
-                                    _vec_load_96[0 + 1] = _v2_202.y;
-#else
                                     float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_82 * 256 + dim_1[0]) + 0);
                                     _vec_load_96[0] = _v2_240.x;
                                     _vec_load_96[0 + 1] = _v2_240.y;
-#endif
                                 }
                                 p0_1[18] = _vec_load_96[0];
                                 p1_1[18] = _vec_load_96[1];
@@ -5073,15 +3459,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[19] = partial_lse[part_row_83];
                                 float _vec_load_97[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_203 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_1[0]) + 0);
-                                    _vec_load_97[0] = _v2_203.x;
-                                    _vec_load_97[0 + 1] = _v2_203.y;
-#else
                                     float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_83 * 256 + dim_1[0]) + 0);
                                     _vec_load_97[0] = _v2_241.x;
                                     _vec_load_97[0 + 1] = _v2_241.y;
-#endif
                                 }
                                 p0_1[19] = _vec_load_97[0];
                                 p1_1[19] = _vec_load_97[1];
@@ -5092,15 +3472,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[20] = partial_lse[part_row_84];
                                 float _vec_load_98[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_204 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_1[0]) + 0);
-                                    _vec_load_98[0] = _v2_204.x;
-                                    _vec_load_98[0 + 1] = _v2_204.y;
-#else
                                     float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_84 * 256 + dim_1[0]) + 0);
                                     _vec_load_98[0] = _v2_242.x;
                                     _vec_load_98[0 + 1] = _v2_242.y;
-#endif
                                 }
                                 p0_1[20] = _vec_load_98[0];
                                 p1_1[20] = _vec_load_98[1];
@@ -5111,15 +3485,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[21] = partial_lse[part_row_85];
                                 float _vec_load_99[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_205 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_1[0]) + 0);
-                                    _vec_load_99[0] = _v2_205.x;
-                                    _vec_load_99[0 + 1] = _v2_205.y;
-#else
                                     float2 _v2_243 = *reinterpret_cast<const float2*>(partial_out + (part_row_85 * 256 + dim_1[0]) + 0);
                                     _vec_load_99[0] = _v2_243.x;
                                     _vec_load_99[0 + 1] = _v2_243.y;
-#endif
                                 }
                                 p0_1[21] = _vec_load_99[0];
                                 p1_1[21] = _vec_load_99[1];
@@ -5130,15 +3498,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[22] = partial_lse[part_row_86];
                                 float _vec_load_100[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_206 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_1[0]) + 0);
-                                    _vec_load_100[0] = _v2_206.x;
-                                    _vec_load_100[0 + 1] = _v2_206.y;
-#else
                                     float2 _v2_244 = *reinterpret_cast<const float2*>(partial_out + (part_row_86 * 256 + dim_1[0]) + 0);
                                     _vec_load_100[0] = _v2_244.x;
                                     _vec_load_100[0 + 1] = _v2_244.y;
-#endif
                                 }
                                 p0_1[22] = _vec_load_100[0];
                                 p1_1[22] = _vec_load_100[1];
@@ -5149,15 +3511,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[23] = partial_lse[part_row_87];
                                 float _vec_load_101[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_207 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_1[0]) + 0);
-                                    _vec_load_101[0] = _v2_207.x;
-                                    _vec_load_101[0 + 1] = _v2_207.y;
-#else
                                     float2 _v2_245 = *reinterpret_cast<const float2*>(partial_out + (part_row_87 * 256 + dim_1[0]) + 0);
                                     _vec_load_101[0] = _v2_245.x;
                                     _vec_load_101[0 + 1] = _v2_245.y;
-#endif
                                 }
                                 p0_1[23] = _vec_load_101[0];
                                 p1_1[23] = _vec_load_101[1];
@@ -5168,15 +3524,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[24] = partial_lse[part_row_88];
                                 float _vec_load_102[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_208 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_1[0]) + 0);
-                                    _vec_load_102[0] = _v2_208.x;
-                                    _vec_load_102[0 + 1] = _v2_208.y;
-#else
                                     float2 _v2_246 = *reinterpret_cast<const float2*>(partial_out + (part_row_88 * 256 + dim_1[0]) + 0);
                                     _vec_load_102[0] = _v2_246.x;
                                     _vec_load_102[0 + 1] = _v2_246.y;
-#endif
                                 }
                                 p0_1[24] = _vec_load_102[0];
                                 p1_1[24] = _vec_load_102[1];
@@ -5187,15 +3537,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[25] = partial_lse[part_row_89];
                                 float _vec_load_103[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_209 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_1[0]) + 0);
-                                    _vec_load_103[0] = _v2_209.x;
-                                    _vec_load_103[0 + 1] = _v2_209.y;
-#else
                                     float2 _v2_247 = *reinterpret_cast<const float2*>(partial_out + (part_row_89 * 256 + dim_1[0]) + 0);
                                     _vec_load_103[0] = _v2_247.x;
                                     _vec_load_103[0 + 1] = _v2_247.y;
-#endif
                                 }
                                 p0_1[25] = _vec_load_103[0];
                                 p1_1[25] = _vec_load_103[1];
@@ -5206,15 +3550,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[26] = partial_lse[part_row_90];
                                 float _vec_load_104[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_210 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_1[0]) + 0);
-                                    _vec_load_104[0] = _v2_210.x;
-                                    _vec_load_104[0 + 1] = _v2_210.y;
-#else
                                     float2 _v2_248 = *reinterpret_cast<const float2*>(partial_out + (part_row_90 * 256 + dim_1[0]) + 0);
                                     _vec_load_104[0] = _v2_248.x;
                                     _vec_load_104[0 + 1] = _v2_248.y;
-#endif
                                 }
                                 p0_1[26] = _vec_load_104[0];
                                 p1_1[26] = _vec_load_104[1];
@@ -5225,15 +3563,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[27] = partial_lse[part_row_91];
                                 float _vec_load_105[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_211 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_1[0]) + 0);
-                                    _vec_load_105[0] = _v2_211.x;
-                                    _vec_load_105[0 + 1] = _v2_211.y;
-#else
                                     float2 _v2_249 = *reinterpret_cast<const float2*>(partial_out + (part_row_91 * 256 + dim_1[0]) + 0);
                                     _vec_load_105[0] = _v2_249.x;
                                     _vec_load_105[0 + 1] = _v2_249.y;
-#endif
                                 }
                                 p0_1[27] = _vec_load_105[0];
                                 p1_1[27] = _vec_load_105[1];
@@ -5244,15 +3576,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[28] = partial_lse[part_row_92];
                                 float _vec_load_106[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_212 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_1[0]) + 0);
-                                    _vec_load_106[0] = _v2_212.x;
-                                    _vec_load_106[0 + 1] = _v2_212.y;
-#else
                                     float2 _v2_250 = *reinterpret_cast<const float2*>(partial_out + (part_row_92 * 256 + dim_1[0]) + 0);
                                     _vec_load_106[0] = _v2_250.x;
                                     _vec_load_106[0 + 1] = _v2_250.y;
-#endif
                                 }
                                 p0_1[28] = _vec_load_106[0];
                                 p1_1[28] = _vec_load_106[1];
@@ -5263,15 +3589,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[29] = partial_lse[part_row_93];
                                 float _vec_load_107[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_213 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_1[0]) + 0);
-                                    _vec_load_107[0] = _v2_213.x;
-                                    _vec_load_107[0 + 1] = _v2_213.y;
-#else
                                     float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_93 * 256 + dim_1[0]) + 0);
                                     _vec_load_107[0] = _v2_251.x;
                                     _vec_load_107[0 + 1] = _v2_251.y;
-#endif
                                 }
                                 p0_1[29] = _vec_load_107[0];
                                 p1_1[29] = _vec_load_107[1];
@@ -5282,15 +3602,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[30] = partial_lse[part_row_94];
                                 float _vec_load_108[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_214 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_1[0]) + 0);
-                                    _vec_load_108[0] = _v2_214.x;
-                                    _vec_load_108[0 + 1] = _v2_214.y;
-#else
                                     float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_94 * 256 + dim_1[0]) + 0);
                                     _vec_load_108[0] = _v2_252.x;
                                     _vec_load_108[0 + 1] = _v2_252.y;
-#endif
                                 }
                                 p0_1[30] = _vec_load_108[0];
                                 p1_1[30] = _vec_load_108[1];
@@ -5301,15 +3615,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[31] = partial_lse[part_row_95];
                                 float _vec_load_109[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_215 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_1[0]) + 0);
-                                    _vec_load_109[0] = _v2_215.x;
-                                    _vec_load_109[0 + 1] = _v2_215.y;
-#else
                                     float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_95 * 256 + dim_1[0]) + 0);
                                     _vec_load_109[0] = _v2_253.x;
                                     _vec_load_109[0 + 1] = _v2_253.y;
-#endif
                                 }
                                 p0_1[31] = _vec_load_109[0];
                                 p1_1[31] = _vec_load_109[1];
@@ -5320,15 +3628,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[32] = partial_lse[part_row_96];
                                 float _vec_load_110[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_216 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_1[0]) + 0);
-                                    _vec_load_110[0] = _v2_216.x;
-                                    _vec_load_110[0 + 1] = _v2_216.y;
-#else
                                     float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_96 * 256 + dim_1[0]) + 0);
                                     _vec_load_110[0] = _v2_254.x;
                                     _vec_load_110[0 + 1] = _v2_254.y;
-#endif
                                 }
                                 p0_1[32] = _vec_load_110[0];
                                 p1_1[32] = _vec_load_110[1];
@@ -5339,15 +3641,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[33] = partial_lse[part_row_97];
                                 float _vec_load_111[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_217 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_1[0]) + 0);
-                                    _vec_load_111[0] = _v2_217.x;
-                                    _vec_load_111[0 + 1] = _v2_217.y;
-#else
                                     float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_97 * 256 + dim_1[0]) + 0);
                                     _vec_load_111[0] = _v2_255.x;
                                     _vec_load_111[0 + 1] = _v2_255.y;
-#endif
                                 }
                                 p0_1[33] = _vec_load_111[0];
                                 p1_1[33] = _vec_load_111[1];
@@ -5358,15 +3654,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[34] = partial_lse[part_row_98];
                                 float _vec_load_112[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_218 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_1[0]) + 0);
-                                    _vec_load_112[0] = _v2_218.x;
-                                    _vec_load_112[0 + 1] = _v2_218.y;
-#else
                                     float2 _v2_256 = *reinterpret_cast<const float2*>(partial_out + (part_row_98 * 256 + dim_1[0]) + 0);
                                     _vec_load_112[0] = _v2_256.x;
                                     _vec_load_112[0 + 1] = _v2_256.y;
-#endif
                                 }
                                 p0_1[34] = _vec_load_112[0];
                                 p1_1[34] = _vec_load_112[1];
@@ -5377,15 +3667,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_1[35] = partial_lse[part_row_99];
                                 float _vec_load_113[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    float2 _v2_219 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_1[0]) + 0);
-                                    _vec_load_113[0] = _v2_219.x;
-                                    _vec_load_113[0 + 1] = _v2_219.y;
-#else
                                     float2 _v2_257 = *reinterpret_cast<const float2*>(partial_out + (part_row_99 * 256 + dim_1[0]) + 0);
                                     _vec_load_113[0] = _v2_257.x;
                                     _vec_load_113[0 + 1] = _v2_257.y;
-#endif
                                 }
                                 p0_1[35] = _vec_load_113[0];
                                 p1_1[35] = _vec_load_113[1];
@@ -5449,13 +3733,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_1_4 = num_splits > 1 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_1_4) {
-#else
                             bool live_0_4 = num_splits > 1 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_0_4) {
-#endif
                                 float weight_65 = approx_exp2(lse_1[1] - lse_max_1[0]);
                                 if (bound[0] > 1) {
                                     den_1[0] = den_1[0] + weight_65;
@@ -5477,13 +3756,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_2_4 = num_splits > 2 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_2_4) {
-#else
                             bool live_1_4 = num_splits > 2 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_1_4) {
-#endif
                                 float weight_66 = approx_exp2(lse_1[2] - lse_max_1[0]);
                                 if (bound[0] > 2) {
                                     den_1[0] = den_1[0] + weight_66;
@@ -5505,13 +3779,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_3_4 = num_splits > 3 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_3_4) {
-#else
                             bool live_2_4 = num_splits > 3 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_2_4) {
-#endif
                                 float weight_67 = approx_exp2(lse_1[3] - lse_max_1[0]);
                                 if (bound[0] > 3) {
                                     den_1[0] = den_1[0] + weight_67;
@@ -5533,13 +3802,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_4_4 = num_splits > 4 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_4_4) {
-#else
                             bool live_3_4 = num_splits > 4 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_3_4) {
-#endif
                                 float weight_68 = approx_exp2(lse_1[4] - lse_max_1[0]);
                                 if (bound[0] > 4) {
                                     den_1[0] = den_1[0] + weight_68;
@@ -5561,13 +3825,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_5_4 = num_splits > 5 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_5_4) {
-#else
                             bool live_4_4 = num_splits > 5 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_4_4) {
-#endif
                                 float weight_69 = approx_exp2(lse_1[5] - lse_max_1[0]);
                                 if (bound[0] > 5) {
                                     den_1[0] = den_1[0] + weight_69;
@@ -5589,13 +3848,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_6_4 = num_splits > 6 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_6_4) {
-#else
                             bool live_5_4 = num_splits > 6 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_5_4) {
-#endif
                                 float weight_70 = approx_exp2(lse_1[6] - lse_max_1[0]);
                                 if (bound[0] > 6) {
                                     den_1[0] = den_1[0] + weight_70;
@@ -5617,13 +3871,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_7_4 = num_splits > 7 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_7_4) {
-#else
                             bool live_6_4 = num_splits > 7 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_6_4) {
-#endif
                                 float weight_71 = approx_exp2(lse_1[7] - lse_max_1[0]);
                                 if (bound[0] > 7) {
                                     den_1[0] = den_1[0] + weight_71;
@@ -5645,13 +3894,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_8_4 = num_splits > 8 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_8_4) {
-#else
                             bool live_7_4 = num_splits > 8 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_7_4) {
-#endif
                                 float weight_72 = approx_exp2(lse_1[8] - lse_max_1[0]);
                                 if (bound[0] > 8) {
                                     den_1[0] = den_1[0] + weight_72;
@@ -5673,13 +3917,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_9_4 = num_splits > 9 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_9_4) {
-#else
                             bool live_8_4 = num_splits > 9 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_8_4) {
-#endif
                                 float weight_73 = approx_exp2(lse_1[9] - lse_max_1[0]);
                                 if (bound[0] > 9) {
                                     den_1[0] = den_1[0] + weight_73;
@@ -5701,13 +3940,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_10_4 = num_splits > 10 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_10_4) {
-#else
                             bool live_9_4 = num_splits > 10 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_9_4) {
-#endif
                                 float weight_74 = approx_exp2(lse_1[10] - lse_max_1[0]);
                                 if (bound[0] > 10) {
                                     den_1[0] = den_1[0] + weight_74;
@@ -5729,13 +3963,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_11_4 = num_splits > 11 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_11_4) {
-#else
                             bool live_10_4 = num_splits > 11 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_10_4) {
-#endif
                                 float weight_75 = approx_exp2(lse_1[11] - lse_max_1[0]);
                                 if (bound[0] > 11) {
                                     den_1[0] = den_1[0] + weight_75;
@@ -5757,13 +3986,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_12_4 = num_splits > 12 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_12_4) {
-#else
                             bool live_11_4 = num_splits > 12 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_11_4) {
-#endif
                                 float weight_76 = approx_exp2(lse_1[12] - lse_max_1[0]);
                                 if (bound[0] > 12) {
                                     den_1[0] = den_1[0] + weight_76;
@@ -5785,13 +4009,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_13_4 = num_splits > 13 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_13_4) {
-#else
                             bool live_12_4 = num_splits > 13 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_12_4) {
-#endif
                                 float weight_77 = approx_exp2(lse_1[13] - lse_max_1[0]);
                                 if (bound[0] > 13) {
                                     den_1[0] = den_1[0] + weight_77;
@@ -5813,13 +4032,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_14_4 = num_splits > 14 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_14_4) {
-#else
                             bool live_13_4 = num_splits > 14 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_13_4) {
-#endif
                                 float weight_78 = approx_exp2(lse_1[14] - lse_max_1[0]);
                                 if (bound[0] > 14) {
                                     den_1[0] = den_1[0] + weight_78;
@@ -5841,13 +4055,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_15_1 = num_splits > 15 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_15_1) {
-#else
                             bool live_14_4 = num_splits > 15 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_14_4) {
-#endif
                                 float weight_79 = approx_exp2(lse_1[15] - lse_max_1[0]);
                                 if (bound[0] > 15) {
                                     den_1[0] = den_1[0] + weight_79;
@@ -5869,13 +4078,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_16_1 = num_splits > 16 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_16_1) {
-#else
                             bool live_15_1 = num_splits > 16 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_15_1) {
-#endif
                                 float weight_80 = approx_exp2(lse_1[16] - lse_max_1[0]);
                                 if (bound[0] > 16) {
                                     den_1[0] = den_1[0] + weight_80;
@@ -5897,13 +4101,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_17_1 = num_splits > 17 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_17_1) {
-#else
                             bool live_16_1 = num_splits > 17 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_16_1) {
-#endif
                                 float weight_81 = approx_exp2(lse_1[17] - lse_max_1[0]);
                                 if (bound[0] > 17) {
                                     den_1[0] = den_1[0] + weight_81;
@@ -5925,13 +4124,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_18_1 = num_splits > 18 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_18_1) {
-#else
                             bool live_17_1 = num_splits > 18 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_17_1) {
-#endif
                                 float weight_82 = approx_exp2(lse_1[18] - lse_max_1[0]);
                                 if (bound[0] > 18) {
                                     den_1[0] = den_1[0] + weight_82;
@@ -5953,13 +4147,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_19 = num_splits > 19 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_19) {
-#else
                             bool live_18_1 = num_splits > 19 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_18_1) {
-#endif
                                 float weight_83 = approx_exp2(lse_1[19] - lse_max_1[0]);
                                 if (bound[0] > 19) {
                                     den_1[0] = den_1[0] + weight_83;
@@ -5981,13 +4170,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_20 = num_splits > 20 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_20) {
-#else
                             bool live_19 = num_splits > 20 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_19) {
-#endif
                                 float weight_84 = approx_exp2(lse_1[20] - lse_max_1[0]);
                                 if (bound[0] > 20) {
                                     den_1[0] = den_1[0] + weight_84;
@@ -6009,13 +4193,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_21 = num_splits > 21 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_21) {
-#else
                             bool live_20 = num_splits > 21 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_20) {
-#endif
                                 float weight_85 = approx_exp2(lse_1[21] - lse_max_1[0]);
                                 if (bound[0] > 21) {
                                     den_1[0] = den_1[0] + weight_85;
@@ -6037,13 +4216,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_22 = num_splits > 22 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_22) {
-#else
                             bool live_21 = num_splits > 22 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_21) {
-#endif
                                 float weight_86 = approx_exp2(lse_1[22] - lse_max_1[0]);
                                 if (bound[0] > 22) {
                                     den_1[0] = den_1[0] + weight_86;
@@ -6065,13 +4239,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_23 = num_splits > 23 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_23) {
-#else
                             bool live_22 = num_splits > 23 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_22) {
-#endif
                                 float weight_87 = approx_exp2(lse_1[23] - lse_max_1[0]);
                                 if (bound[0] > 23) {
                                     den_1[0] = den_1[0] + weight_87;
@@ -6093,13 +4262,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_24 = num_splits > 24 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_24) {
-#else
                             bool live_23 = num_splits > 24 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_23) {
-#endif
                                 float weight_88 = approx_exp2(lse_1[24] - lse_max_1[0]);
                                 if (bound[0] > 24) {
                                     den_1[0] = den_1[0] + weight_88;
@@ -6121,13 +4285,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_25 = num_splits > 25 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_25) {
-#else
                             bool live_24 = num_splits > 25 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_24) {
-#endif
                                 float weight_89 = approx_exp2(lse_1[25] - lse_max_1[0]);
                                 if (bound[0] > 25) {
                                     den_1[0] = den_1[0] + weight_89;
@@ -6149,13 +4308,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_26 = num_splits > 26 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_26) {
-#else
                             bool live_25 = num_splits > 26 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_25) {
-#endif
                                 float weight_90 = approx_exp2(lse_1[26] - lse_max_1[0]);
                                 if (bound[0] > 26) {
                                     den_1[0] = den_1[0] + weight_90;
@@ -6177,13 +4331,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_27 = num_splits > 27 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_27) {
-#else
                             bool live_26 = num_splits > 27 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_26) {
-#endif
                                 float weight_91 = approx_exp2(lse_1[27] - lse_max_1[0]);
                                 if (bound[0] > 27) {
                                     den_1[0] = den_1[0] + weight_91;
@@ -6205,13 +4354,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_28 = num_splits > 28 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_28) {
-#else
                             bool live_27 = num_splits > 28 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_27) {
-#endif
                                 float weight_92 = approx_exp2(lse_1[28] - lse_max_1[0]);
                                 if (bound[0] > 28) {
                                     den_1[0] = den_1[0] + weight_92;
@@ -6233,13 +4377,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_29 = num_splits > 29 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_29) {
-#else
                             bool live_28 = num_splits > 29 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_28) {
-#endif
                                 float weight_93 = approx_exp2(lse_1[29] - lse_max_1[0]);
                                 if (bound[0] > 29) {
                                     den_1[0] = den_1[0] + weight_93;
@@ -6261,13 +4400,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_30 = num_splits > 30 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_30) {
-#else
                             bool live_29 = num_splits > 30 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_29) {
-#endif
                                 float weight_94 = approx_exp2(lse_1[30] - lse_max_1[0]);
                                 if (bound[0] > 30) {
                                     den_1[0] = den_1[0] + weight_94;
@@ -6289,13 +4423,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_31 = num_splits > 31 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_31) {
-#else
                             bool live_30 = num_splits > 31 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_30) {
-#endif
                                 float weight_95 = approx_exp2(lse_1[31] - lse_max_1[0]);
                                 if (bound[0] > 31) {
                                     den_1[0] = den_1[0] + weight_95;
@@ -6317,13 +4446,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_32 = num_splits > 32 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_32) {
-#else
                             bool live_31 = num_splits > 32 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_31) {
-#endif
                                 float weight_96 = approx_exp2(lse_1[32] - lse_max_1[0]);
                                 if (bound[0] > 32) {
                                     den_1[0] = den_1[0] + weight_96;
@@ -6345,13 +4469,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_33 = num_splits > 33 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_33) {
-#else
                             bool live_32 = num_splits > 33 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_32) {
-#endif
                                 float weight_97 = approx_exp2(lse_1[33] - lse_max_1[0]);
                                 if (bound[0] > 33) {
                                     den_1[0] = den_1[0] + weight_97;
@@ -6373,13 +4492,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_34 = num_splits > 34 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_34) {
-#else
                             bool live_33 = num_splits > 34 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_33) {
-#endif
                                 float weight_98 = approx_exp2(lse_1[34] - lse_max_1[0]);
                                 if (bound[0] > 34) {
                                     den_1[0] = den_1[0] + weight_98;
@@ -6401,13 +4515,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     }
                                 }
                             }
-#if __CUDA_ARCH__ == 1070
-                            bool live_35 = num_splits > 35 && lse_max_1[0] > -CUDART_INF_F;
-                            if (live_35) {
-#else
                             bool live_34 = num_splits > 35 && lse_max_1[0] > -CUDART_INF_F;
                             if (live_34) {
-#endif
                                 float weight_99 = approx_exp2(lse_1[35] - lse_max_1[0]);
                                 if (bound[0] > 35) {
                                     den_1[0] = den_1[0] + weight_99;
@@ -6444,26 +4553,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 acc1_k_1 = acc1_k_1 + acc1_1[3];
                                 float inv_3 = 0.0f;
                                 if (den_k_1 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                    float _rcp_220 = approx_rcp(den_k_1);
-                                    inv_3 = _rcp_220;
-#else
                                     float _rcp_258 = approx_rcp(den_k_1);
                                     inv_3 = _rcp_258;
-#endif
                                 }
                                 float attn0_1 = (float)(__nv_bfloat16)(acc0_k_1 * inv_3);
                                 float attn1_1 = (float)(__nv_bfloat16)(acc1_k_1 * inv_3);
-#if __CUDA_ARCH__ == 1070
-                                float _exp2_222 = approx_exp2((-gate0_1[0]) * 1.442695f);
-                                float _rcp_221 = approx_rcp(1.0f + _exp2_222);
-                                float result0_1 = attn0_1 * _rcp_221;
-                                float _exp2_224 = approx_exp2((-gate1_1[0]) * 1.442695f);
-                                float _rcp_223 = approx_rcp(1.0f + _exp2_224);
-                                float result1_1 = attn1_1 * _rcp_223;
-                                __nv_bfloat162 _bit_cast_src_225 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
-                                word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_225)[0];
-#else
                                 float _exp2_260 = approx_exp2((-gate0_1[0]) * 1.442695f);
                                 float _rcp_259 = approx_rcp(1.0f + _exp2_260);
                                 float result0_1 = attn0_1 * _rcp_259;
@@ -6472,7 +4566,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 float result1_1 = attn1_1 * _rcp_261;
                                 __nv_bfloat162 _bit_cast_src_263 = __float22bfloat162_rn(make_float2(result0_1, result1_1));
                                 word_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_263)[0];
-#endif
                                 long long out_offset_1 = row_i64 * out_stride_row + qo_head_3[0] * out_stride_head + dim_1[0];
                                 *(reinterpret_cast<unsigned int*>(out + out_offset_1) + (0)) = word_1[0];
                             }
@@ -6508,17 +4601,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             for (int p_1_2 = p_first; p_1_2 < end; p_1_2 += 256) {
                                 int pk_2 = ((p_1_2) < (end - 1) ? (p_1_2) : (end - 1));
                                 valid_2[0] = ((end > p_1_2) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_0_2 = pk_2 >> 7;
-#else
                                 int head_4 = pk_2 >> 7;
-#endif
                                 dim_2[0] = (long long)((pk_2 & 127) * 2);
-#if __CUDA_ARCH__ == 1070
-                                qo_head_4[0] = (long long)(first_head + head_0_2);
-#else
                                 qo_head_4[0] = (long long)(first_head + head_4);
-#endif
                                 row_head_2[0] = row_i64 * nqo_2 + qo_head_4[0];
                                 acc0_2[0] = 0.0f;
                                 acc1_2[0] = 0.0f;
@@ -6535,35 +4620,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[0] = -CUDART_INF_F;
                                 float _vec_load_114[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_226;
-                                    _bf16x2_bits_226 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
-                                    (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) << 16);
-                                    (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_226) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_264;
                                     _bf16x2_bits_264 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[0] * 256 + dim_2[0]) + 0);
                                     (&_vec_load_114[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_264) << 16);
                                     (&_vec_load_114[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_264) & 0xffff0000u);
-#endif
                                 }
                                 gate0_2[0] = _vec_load_114[0];
                                 gate1_2[0] = _vec_load_114[1];
-#if __CUDA_ARCH__ == 1070
-                                int pk_1_1 = ((p_1_2 + 128) < (end - 1) ? (p_1_2 + 128) : (end - 1));
-#else
                                 int pk_0 = ((p_1_2 + 128) < (end - 1) ? (p_1_2 + 128) : (end - 1));
-#endif
                                 valid_2[1] = ((end > p_1_2 + 128) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_2 = pk_1_1 >> 7;
-                                dim_2[1] = (long long)((pk_1_1 & 127) * 2);
-                                qo_head_4[1] = (long long)(first_head + head_2);
-#else
                                 int head_1_1 = pk_0 >> 7;
                                 dim_2[1] = (long long)((pk_0 & 127) * 2);
                                 qo_head_4[1] = (long long)(first_head + head_1_1);
-#endif
                                 row_head_2[1] = row_i64 * nqo_2 + qo_head_4[1];
                                 acc0_2[4] = 0.0f;
                                 acc1_2[4] = 0.0f;
@@ -6580,17 +4648,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[1] = -CUDART_INF_F;
                                 float _vec_load_115[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_227;
-                                    _bf16x2_bits_227 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
-                                    (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) << 16);
-                                    (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_227) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_265;
                                     _bf16x2_bits_265 = *reinterpret_cast<const uint32_t*>(gate + (row_head_2[1] * 256 + dim_2[1]) + 0);
                                     (&_vec_load_115[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_265) << 16);
                                     (&_vec_load_115[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_265) & 0xffff0000u);
-#endif
                                 }
                                 gate0_2[1] = _vec_load_115[0];
                                 gate1_2[1] = _vec_load_115[1];
@@ -6600,15 +4661,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[0] = partial_lse[part_row_100];
                                     float _vec_load_116[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_228 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_2[0]) + 0);
-                                        _vec_load_116[0] = _v2_228.x;
-                                        _vec_load_116[0 + 1] = _v2_228.y;
-#else
                                         float2 _v2_266 = *reinterpret_cast<const float2*>(partial_out + (part_row_100 * 256 + dim_2[0]) + 0);
                                         _vec_load_116[0] = _v2_266.x;
                                         _vec_load_116[0 + 1] = _v2_266.y;
-#endif
                                     }
                                     p0_2[0] = _vec_load_116[0];
                                     p1_2[0] = _vec_load_116[1];
@@ -6619,15 +4674,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[1] = partial_lse[part_row_101];
                                     float _vec_load_117[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_229 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_2[0]) + 0);
-                                        _vec_load_117[0] = _v2_229.x;
-                                        _vec_load_117[0 + 1] = _v2_229.y;
-#else
                                         float2 _v2_267 = *reinterpret_cast<const float2*>(partial_out + (part_row_101 * 256 + dim_2[0]) + 0);
                                         _vec_load_117[0] = _v2_267.x;
                                         _vec_load_117[0 + 1] = _v2_267.y;
-#endif
                                     }
                                     p0_2[1] = _vec_load_117[0];
                                     p1_2[1] = _vec_load_117[1];
@@ -6638,15 +4687,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[2] = partial_lse[part_row_102];
                                     float _vec_load_118[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_230 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_2[0]) + 0);
-                                        _vec_load_118[0] = _v2_230.x;
-                                        _vec_load_118[0 + 1] = _v2_230.y;
-#else
                                         float2 _v2_268 = *reinterpret_cast<const float2*>(partial_out + (part_row_102 * 256 + dim_2[0]) + 0);
                                         _vec_load_118[0] = _v2_268.x;
                                         _vec_load_118[0 + 1] = _v2_268.y;
-#endif
                                     }
                                     p0_2[2] = _vec_load_118[0];
                                     p1_2[2] = _vec_load_118[1];
@@ -6657,15 +4700,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[3] = partial_lse[part_row_103];
                                     float _vec_load_119[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_231 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_2[0]) + 0);
-                                        _vec_load_119[0] = _v2_231.x;
-                                        _vec_load_119[0 + 1] = _v2_231.y;
-#else
                                         float2 _v2_269 = *reinterpret_cast<const float2*>(partial_out + (part_row_103 * 256 + dim_2[0]) + 0);
                                         _vec_load_119[0] = _v2_269.x;
                                         _vec_load_119[0 + 1] = _v2_269.y;
-#endif
                                     }
                                     p0_2[3] = _vec_load_119[0];
                                     p1_2[3] = _vec_load_119[1];
@@ -6676,15 +4713,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[4] = partial_lse[part_row_104];
                                     float _vec_load_120[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_232 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_2[0]) + 0);
-                                        _vec_load_120[0] = _v2_232.x;
-                                        _vec_load_120[0 + 1] = _v2_232.y;
-#else
                                         float2 _v2_270 = *reinterpret_cast<const float2*>(partial_out + (part_row_104 * 256 + dim_2[0]) + 0);
                                         _vec_load_120[0] = _v2_270.x;
                                         _vec_load_120[0 + 1] = _v2_270.y;
-#endif
                                     }
                                     p0_2[4] = _vec_load_120[0];
                                     p1_2[4] = _vec_load_120[1];
@@ -6695,15 +4726,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[5] = partial_lse[part_row_105];
                                     float _vec_load_121[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_233 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_2[0]) + 0);
-                                        _vec_load_121[0] = _v2_233.x;
-                                        _vec_load_121[0 + 1] = _v2_233.y;
-#else
                                         float2 _v2_271 = *reinterpret_cast<const float2*>(partial_out + (part_row_105 * 256 + dim_2[0]) + 0);
                                         _vec_load_121[0] = _v2_271.x;
                                         _vec_load_121[0 + 1] = _v2_271.y;
-#endif
                                     }
                                     p0_2[5] = _vec_load_121[0];
                                     p1_2[5] = _vec_load_121[1];
@@ -6714,15 +4739,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[6] = partial_lse[part_row_106];
                                     float _vec_load_122[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_234 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_2[0]) + 0);
-                                        _vec_load_122[0] = _v2_234.x;
-                                        _vec_load_122[0 + 1] = _v2_234.y;
-#else
                                         float2 _v2_272 = *reinterpret_cast<const float2*>(partial_out + (part_row_106 * 256 + dim_2[0]) + 0);
                                         _vec_load_122[0] = _v2_272.x;
                                         _vec_load_122[0 + 1] = _v2_272.y;
-#endif
                                     }
                                     p0_2[6] = _vec_load_122[0];
                                     p1_2[6] = _vec_load_122[1];
@@ -6733,15 +4752,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[7] = partial_lse[part_row_107];
                                     float _vec_load_123[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_235 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_2[0]) + 0);
-                                        _vec_load_123[0] = _v2_235.x;
-                                        _vec_load_123[0 + 1] = _v2_235.y;
-#else
                                         float2 _v2_273 = *reinterpret_cast<const float2*>(partial_out + (part_row_107 * 256 + dim_2[0]) + 0);
                                         _vec_load_123[0] = _v2_273.x;
                                         _vec_load_123[0 + 1] = _v2_273.y;
-#endif
                                     }
                                     p0_2[7] = _vec_load_123[0];
                                     p1_2[7] = _vec_load_123[1];
@@ -6752,15 +4765,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[8] = partial_lse[part_row_108];
                                     float _vec_load_124[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_236 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_2[0]) + 0);
-                                        _vec_load_124[0] = _v2_236.x;
-                                        _vec_load_124[0 + 1] = _v2_236.y;
-#else
                                         float2 _v2_274 = *reinterpret_cast<const float2*>(partial_out + (part_row_108 * 256 + dim_2[0]) + 0);
                                         _vec_load_124[0] = _v2_274.x;
                                         _vec_load_124[0 + 1] = _v2_274.y;
-#endif
                                     }
                                     p0_2[8] = _vec_load_124[0];
                                     p1_2[8] = _vec_load_124[1];
@@ -6771,15 +4778,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[9] = partial_lse[part_row_109];
                                     float _vec_load_125[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_237 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_2[0]) + 0);
-                                        _vec_load_125[0] = _v2_237.x;
-                                        _vec_load_125[0 + 1] = _v2_237.y;
-#else
                                         float2 _v2_275 = *reinterpret_cast<const float2*>(partial_out + (part_row_109 * 256 + dim_2[0]) + 0);
                                         _vec_load_125[0] = _v2_275.x;
                                         _vec_load_125[0 + 1] = _v2_275.y;
-#endif
                                     }
                                     p0_2[9] = _vec_load_125[0];
                                     p1_2[9] = _vec_load_125[1];
@@ -6790,15 +4791,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[10] = partial_lse[part_row_110];
                                     float _vec_load_126[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_238 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_2[0]) + 0);
-                                        _vec_load_126[0] = _v2_238.x;
-                                        _vec_load_126[0 + 1] = _v2_238.y;
-#else
                                         float2 _v2_276 = *reinterpret_cast<const float2*>(partial_out + (part_row_110 * 256 + dim_2[0]) + 0);
                                         _vec_load_126[0] = _v2_276.x;
                                         _vec_load_126[0 + 1] = _v2_276.y;
-#endif
                                     }
                                     p0_2[10] = _vec_load_126[0];
                                     p1_2[10] = _vec_load_126[1];
@@ -6809,15 +4804,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[11] = partial_lse[part_row_111];
                                     float _vec_load_127[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_239 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_2[0]) + 0);
-                                        _vec_load_127[0] = _v2_239.x;
-                                        _vec_load_127[0 + 1] = _v2_239.y;
-#else
                                         float2 _v2_277 = *reinterpret_cast<const float2*>(partial_out + (part_row_111 * 256 + dim_2[0]) + 0);
                                         _vec_load_127[0] = _v2_277.x;
                                         _vec_load_127[0 + 1] = _v2_277.y;
-#endif
                                     }
                                     p0_2[11] = _vec_load_127[0];
                                     p1_2[11] = _vec_load_127[1];
@@ -6828,15 +4817,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[12] = partial_lse[part_row_112];
                                     float _vec_load_128[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_240 = *reinterpret_cast<const float2*>(partial_out + (part_row_112 * 256 + dim_2[0]) + 0);
-                                        _vec_load_128[0] = _v2_240.x;
-                                        _vec_load_128[0 + 1] = _v2_240.y;
-#else
                                         float2 _v2_278 = *reinterpret_cast<const float2*>(partial_out + (part_row_112 * 256 + dim_2[0]) + 0);
                                         _vec_load_128[0] = _v2_278.x;
                                         _vec_load_128[0 + 1] = _v2_278.y;
-#endif
                                     }
                                     p0_2[12] = _vec_load_128[0];
                                     p1_2[12] = _vec_load_128[1];
@@ -6847,15 +4830,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[13] = partial_lse[part_row_113];
                                     float _vec_load_129[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_241 = *reinterpret_cast<const float2*>(partial_out + (part_row_113 * 256 + dim_2[0]) + 0);
-                                        _vec_load_129[0] = _v2_241.x;
-                                        _vec_load_129[0 + 1] = _v2_241.y;
-#else
                                         float2 _v2_279 = *reinterpret_cast<const float2*>(partial_out + (part_row_113 * 256 + dim_2[0]) + 0);
                                         _vec_load_129[0] = _v2_279.x;
                                         _vec_load_129[0 + 1] = _v2_279.y;
-#endif
                                     }
                                     p0_2[13] = _vec_load_129[0];
                                     p1_2[13] = _vec_load_129[1];
@@ -6866,15 +4843,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[14] = partial_lse[part_row_114];
                                     float _vec_load_130[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_242 = *reinterpret_cast<const float2*>(partial_out + (part_row_114 * 256 + dim_2[0]) + 0);
-                                        _vec_load_130[0] = _v2_242.x;
-                                        _vec_load_130[0 + 1] = _v2_242.y;
-#else
                                         float2 _v2_280 = *reinterpret_cast<const float2*>(partial_out + (part_row_114 * 256 + dim_2[0]) + 0);
                                         _vec_load_130[0] = _v2_280.x;
                                         _vec_load_130[0 + 1] = _v2_280.y;
-#endif
                                     }
                                     p0_2[14] = _vec_load_130[0];
                                     p1_2[14] = _vec_load_130[1];
@@ -6885,15 +4856,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[15] = partial_lse[part_row_115];
                                     float _vec_load_131[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_243 = *reinterpret_cast<const float2*>(partial_out + (part_row_115 * 256 + dim_2[0]) + 0);
-                                        _vec_load_131[0] = _v2_243.x;
-                                        _vec_load_131[0 + 1] = _v2_243.y;
-#else
                                         float2 _v2_281 = *reinterpret_cast<const float2*>(partial_out + (part_row_115 * 256 + dim_2[0]) + 0);
                                         _vec_load_131[0] = _v2_281.x;
                                         _vec_load_131[0 + 1] = _v2_281.y;
-#endif
                                     }
                                     p0_2[15] = _vec_load_131[0];
                                     p1_2[15] = _vec_load_131[1];
@@ -6904,15 +4869,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[16] = partial_lse[part_row_116];
                                     float _vec_load_132[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_244 = *reinterpret_cast<const float2*>(partial_out + (part_row_116 * 256 + dim_2[1]) + 0);
-                                        _vec_load_132[0] = _v2_244.x;
-                                        _vec_load_132[0 + 1] = _v2_244.y;
-#else
                                         float2 _v2_282 = *reinterpret_cast<const float2*>(partial_out + (part_row_116 * 256 + dim_2[1]) + 0);
                                         _vec_load_132[0] = _v2_282.x;
                                         _vec_load_132[0 + 1] = _v2_282.y;
-#endif
                                     }
                                     p0_2[16] = _vec_load_132[0];
                                     p1_2[16] = _vec_load_132[1];
@@ -6923,15 +4882,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[17] = partial_lse[part_row_117];
                                     float _vec_load_133[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_245 = *reinterpret_cast<const float2*>(partial_out + (part_row_117 * 256 + dim_2[1]) + 0);
-                                        _vec_load_133[0] = _v2_245.x;
-                                        _vec_load_133[0 + 1] = _v2_245.y;
-#else
                                         float2 _v2_283 = *reinterpret_cast<const float2*>(partial_out + (part_row_117 * 256 + dim_2[1]) + 0);
                                         _vec_load_133[0] = _v2_283.x;
                                         _vec_load_133[0 + 1] = _v2_283.y;
-#endif
                                     }
                                     p0_2[17] = _vec_load_133[0];
                                     p1_2[17] = _vec_load_133[1];
@@ -6942,15 +4895,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[18] = partial_lse[part_row_118];
                                     float _vec_load_134[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_246 = *reinterpret_cast<const float2*>(partial_out + (part_row_118 * 256 + dim_2[1]) + 0);
-                                        _vec_load_134[0] = _v2_246.x;
-                                        _vec_load_134[0 + 1] = _v2_246.y;
-#else
                                         float2 _v2_284 = *reinterpret_cast<const float2*>(partial_out + (part_row_118 * 256 + dim_2[1]) + 0);
                                         _vec_load_134[0] = _v2_284.x;
                                         _vec_load_134[0 + 1] = _v2_284.y;
-#endif
                                     }
                                     p0_2[18] = _vec_load_134[0];
                                     p1_2[18] = _vec_load_134[1];
@@ -6961,15 +4908,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[19] = partial_lse[part_row_119];
                                     float _vec_load_135[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_247 = *reinterpret_cast<const float2*>(partial_out + (part_row_119 * 256 + dim_2[1]) + 0);
-                                        _vec_load_135[0] = _v2_247.x;
-                                        _vec_load_135[0 + 1] = _v2_247.y;
-#else
                                         float2 _v2_285 = *reinterpret_cast<const float2*>(partial_out + (part_row_119 * 256 + dim_2[1]) + 0);
                                         _vec_load_135[0] = _v2_285.x;
                                         _vec_load_135[0 + 1] = _v2_285.y;
-#endif
                                     }
                                     p0_2[19] = _vec_load_135[0];
                                     p1_2[19] = _vec_load_135[1];
@@ -6980,15 +4921,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[20] = partial_lse[part_row_120];
                                     float _vec_load_136[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_248 = *reinterpret_cast<const float2*>(partial_out + (part_row_120 * 256 + dim_2[1]) + 0);
-                                        _vec_load_136[0] = _v2_248.x;
-                                        _vec_load_136[0 + 1] = _v2_248.y;
-#else
                                         float2 _v2_286 = *reinterpret_cast<const float2*>(partial_out + (part_row_120 * 256 + dim_2[1]) + 0);
                                         _vec_load_136[0] = _v2_286.x;
                                         _vec_load_136[0 + 1] = _v2_286.y;
-#endif
                                     }
                                     p0_2[20] = _vec_load_136[0];
                                     p1_2[20] = _vec_load_136[1];
@@ -6999,15 +4934,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[21] = partial_lse[part_row_121];
                                     float _vec_load_137[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_249 = *reinterpret_cast<const float2*>(partial_out + (part_row_121 * 256 + dim_2[1]) + 0);
-                                        _vec_load_137[0] = _v2_249.x;
-                                        _vec_load_137[0 + 1] = _v2_249.y;
-#else
                                         float2 _v2_287 = *reinterpret_cast<const float2*>(partial_out + (part_row_121 * 256 + dim_2[1]) + 0);
                                         _vec_load_137[0] = _v2_287.x;
                                         _vec_load_137[0 + 1] = _v2_287.y;
-#endif
                                     }
                                     p0_2[21] = _vec_load_137[0];
                                     p1_2[21] = _vec_load_137[1];
@@ -7018,15 +4947,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[22] = partial_lse[part_row_122];
                                     float _vec_load_138[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_250 = *reinterpret_cast<const float2*>(partial_out + (part_row_122 * 256 + dim_2[1]) + 0);
-                                        _vec_load_138[0] = _v2_250.x;
-                                        _vec_load_138[0 + 1] = _v2_250.y;
-#else
                                         float2 _v2_288 = *reinterpret_cast<const float2*>(partial_out + (part_row_122 * 256 + dim_2[1]) + 0);
                                         _vec_load_138[0] = _v2_288.x;
                                         _vec_load_138[0 + 1] = _v2_288.y;
-#endif
                                     }
                                     p0_2[22] = _vec_load_138[0];
                                     p1_2[22] = _vec_load_138[1];
@@ -7037,15 +4960,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[23] = partial_lse[part_row_123];
                                     float _vec_load_139[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_251 = *reinterpret_cast<const float2*>(partial_out + (part_row_123 * 256 + dim_2[1]) + 0);
-                                        _vec_load_139[0] = _v2_251.x;
-                                        _vec_load_139[0 + 1] = _v2_251.y;
-#else
                                         float2 _v2_289 = *reinterpret_cast<const float2*>(partial_out + (part_row_123 * 256 + dim_2[1]) + 0);
                                         _vec_load_139[0] = _v2_289.x;
                                         _vec_load_139[0 + 1] = _v2_289.y;
-#endif
                                     }
                                     p0_2[23] = _vec_load_139[0];
                                     p1_2[23] = _vec_load_139[1];
@@ -7056,15 +4973,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[24] = partial_lse[part_row_124];
                                     float _vec_load_140[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_252 = *reinterpret_cast<const float2*>(partial_out + (part_row_124 * 256 + dim_2[1]) + 0);
-                                        _vec_load_140[0] = _v2_252.x;
-                                        _vec_load_140[0 + 1] = _v2_252.y;
-#else
                                         float2 _v2_290 = *reinterpret_cast<const float2*>(partial_out + (part_row_124 * 256 + dim_2[1]) + 0);
                                         _vec_load_140[0] = _v2_290.x;
                                         _vec_load_140[0 + 1] = _v2_290.y;
-#endif
                                     }
                                     p0_2[24] = _vec_load_140[0];
                                     p1_2[24] = _vec_load_140[1];
@@ -7075,15 +4986,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[25] = partial_lse[part_row_125];
                                     float _vec_load_141[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_253 = *reinterpret_cast<const float2*>(partial_out + (part_row_125 * 256 + dim_2[1]) + 0);
-                                        _vec_load_141[0] = _v2_253.x;
-                                        _vec_load_141[0 + 1] = _v2_253.y;
-#else
                                         float2 _v2_291 = *reinterpret_cast<const float2*>(partial_out + (part_row_125 * 256 + dim_2[1]) + 0);
                                         _vec_load_141[0] = _v2_291.x;
                                         _vec_load_141[0 + 1] = _v2_291.y;
-#endif
                                     }
                                     p0_2[25] = _vec_load_141[0];
                                     p1_2[25] = _vec_load_141[1];
@@ -7094,15 +4999,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[26] = partial_lse[part_row_126];
                                     float _vec_load_142[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_254 = *reinterpret_cast<const float2*>(partial_out + (part_row_126 * 256 + dim_2[1]) + 0);
-                                        _vec_load_142[0] = _v2_254.x;
-                                        _vec_load_142[0 + 1] = _v2_254.y;
-#else
                                         float2 _v2_292 = *reinterpret_cast<const float2*>(partial_out + (part_row_126 * 256 + dim_2[1]) + 0);
                                         _vec_load_142[0] = _v2_292.x;
                                         _vec_load_142[0 + 1] = _v2_292.y;
-#endif
                                     }
                                     p0_2[26] = _vec_load_142[0];
                                     p1_2[26] = _vec_load_142[1];
@@ -7113,15 +5012,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[27] = partial_lse[part_row_127];
                                     float _vec_load_143[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_255 = *reinterpret_cast<const float2*>(partial_out + (part_row_127 * 256 + dim_2[1]) + 0);
-                                        _vec_load_143[0] = _v2_255.x;
-                                        _vec_load_143[0 + 1] = _v2_255.y;
-#else
                                         float2 _v2_293 = *reinterpret_cast<const float2*>(partial_out + (part_row_127 * 256 + dim_2[1]) + 0);
                                         _vec_load_143[0] = _v2_293.x;
                                         _vec_load_143[0 + 1] = _v2_293.y;
-#endif
                                     }
                                     p0_2[27] = _vec_load_143[0];
                                     p1_2[27] = _vec_load_143[1];
@@ -7132,15 +5025,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[28] = partial_lse[part_row_128];
                                     float _vec_load_144[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_256 = *reinterpret_cast<const float2*>(partial_out + (part_row_128 * 256 + dim_2[1]) + 0);
-                                        _vec_load_144[0] = _v2_256.x;
-                                        _vec_load_144[0 + 1] = _v2_256.y;
-#else
                                         float2 _v2_294 = *reinterpret_cast<const float2*>(partial_out + (part_row_128 * 256 + dim_2[1]) + 0);
                                         _vec_load_144[0] = _v2_294.x;
                                         _vec_load_144[0 + 1] = _v2_294.y;
-#endif
                                     }
                                     p0_2[28] = _vec_load_144[0];
                                     p1_2[28] = _vec_load_144[1];
@@ -7151,15 +5038,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[29] = partial_lse[part_row_129];
                                     float _vec_load_145[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_257 = *reinterpret_cast<const float2*>(partial_out + (part_row_129 * 256 + dim_2[1]) + 0);
-                                        _vec_load_145[0] = _v2_257.x;
-                                        _vec_load_145[0 + 1] = _v2_257.y;
-#else
                                         float2 _v2_295 = *reinterpret_cast<const float2*>(partial_out + (part_row_129 * 256 + dim_2[1]) + 0);
                                         _vec_load_145[0] = _v2_295.x;
                                         _vec_load_145[0 + 1] = _v2_295.y;
-#endif
                                     }
                                     p0_2[29] = _vec_load_145[0];
                                     p1_2[29] = _vec_load_145[1];
@@ -7170,15 +5051,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[30] = partial_lse[part_row_130];
                                     float _vec_load_146[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_258 = *reinterpret_cast<const float2*>(partial_out + (part_row_130 * 256 + dim_2[1]) + 0);
-                                        _vec_load_146[0] = _v2_258.x;
-                                        _vec_load_146[0 + 1] = _v2_258.y;
-#else
                                         float2 _v2_296 = *reinterpret_cast<const float2*>(partial_out + (part_row_130 * 256 + dim_2[1]) + 0);
                                         _vec_load_146[0] = _v2_296.x;
                                         _vec_load_146[0 + 1] = _v2_296.y;
-#endif
                                     }
                                     p0_2[30] = _vec_load_146[0];
                                     p1_2[30] = _vec_load_146[1];
@@ -7189,15 +5064,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_2[31] = partial_lse[part_row_131];
                                     float _vec_load_147[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_259 = *reinterpret_cast<const float2*>(partial_out + (part_row_131 * 256 + dim_2[1]) + 0);
-                                        _vec_load_147[0] = _v2_259.x;
-                                        _vec_load_147[0 + 1] = _v2_259.y;
-#else
                                         float2 _v2_297 = *reinterpret_cast<const float2*>(partial_out + (part_row_131 * 256 + dim_2[1]) + 0);
                                         _vec_load_147[0] = _v2_297.x;
                                         _vec_load_147[0 + 1] = _v2_297.y;
-#endif
                                     }
                                     p0_2[31] = _vec_load_147[0];
                                     p1_2[31] = _vec_load_147[1];
@@ -7234,13 +5103,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[29]);
                                 lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[30]);
                                 lse_max_2[1] = fmaxf(lse_max_2[1], lse_2[31]);
-#if __CUDA_ARCH__ == 1070
-                                bool live_36 = num_splits > 0 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_36) {
-#else
                                 bool live_35 = num_splits > 0 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_35) {
-#endif
                                     float weight_100 = approx_exp2(lse_2[0] - lse_max_2[0]);
                                     if (bound_1[0] > 0) {
                                         den_2[0] = den_2[0] + weight_100;
@@ -7262,13 +5126,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_3_5 = num_splits > 1 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_3_5) {
-#else
                                 bool live_2_5 = num_splits > 1 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_2_5) {
-#endif
                                     float weight_101 = approx_exp2(lse_2[1] - lse_max_2[0]);
                                     if (bound_1[0] > 1) {
                                         den_2[0] = den_2[0] + weight_101;
@@ -7290,13 +5149,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_4_5 = num_splits > 2 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_4_5) {
-#else
                                 bool live_3_5 = num_splits > 2 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_3_5) {
-#endif
                                     float weight_102 = approx_exp2(lse_2[2] - lse_max_2[0]);
                                     if (bound_1[0] > 2) {
                                         den_2[0] = den_2[0] + weight_102;
@@ -7318,13 +5172,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_5_5 = num_splits > 3 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_5_5) {
-#else
                                 bool live_4_5 = num_splits > 3 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_4_5) {
-#endif
                                     float weight_103 = approx_exp2(lse_2[3] - lse_max_2[0]);
                                     if (bound_1[0] > 3) {
                                         den_2[0] = den_2[0] + weight_103;
@@ -7346,13 +5195,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_6_5 = num_splits > 4 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_6_5) {
-#else
                                 bool live_5_5 = num_splits > 4 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_5_5) {
-#endif
                                     float weight_104 = approx_exp2(lse_2[4] - lse_max_2[0]);
                                     if (bound_1[0] > 4) {
                                         den_2[0] = den_2[0] + weight_104;
@@ -7374,13 +5218,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_5 = num_splits > 5 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_7_5) {
-#else
                                 bool live_6_5 = num_splits > 5 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_6_5) {
-#endif
                                     float weight_105 = approx_exp2(lse_2[5] - lse_max_2[0]);
                                     if (bound_1[0] > 5) {
                                         den_2[0] = den_2[0] + weight_105;
@@ -7402,13 +5241,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_5 = num_splits > 6 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_8_5) {
-#else
                                 bool live_7_5 = num_splits > 6 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_7_5) {
-#endif
                                     float weight_106 = approx_exp2(lse_2[6] - lse_max_2[0]);
                                     if (bound_1[0] > 6) {
                                         den_2[0] = den_2[0] + weight_106;
@@ -7430,13 +5264,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_5 = num_splits > 7 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_9_5) {
-#else
                                 bool live_8_5 = num_splits > 7 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_8_5) {
-#endif
                                     float weight_107 = approx_exp2(lse_2[7] - lse_max_2[0]);
                                     if (bound_1[0] > 7) {
                                         den_2[0] = den_2[0] + weight_107;
@@ -7458,13 +5287,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_5 = num_splits > 8 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_10_5) {
-#else
                                 bool live_9_5 = num_splits > 8 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_9_5) {
-#endif
                                     float weight_108 = approx_exp2(lse_2[8] - lse_max_2[0]);
                                     if (bound_1[0] > 8) {
                                         den_2[0] = den_2[0] + weight_108;
@@ -7486,13 +5310,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_5 = num_splits > 9 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_11_5) {
-#else
                                 bool live_10_5 = num_splits > 9 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_10_5) {
-#endif
                                     float weight_109 = approx_exp2(lse_2[9] - lse_max_2[0]);
                                     if (bound_1[0] > 9) {
                                         den_2[0] = den_2[0] + weight_109;
@@ -7514,13 +5333,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_5 = num_splits > 10 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_12_5) {
-#else
                                 bool live_11_5 = num_splits > 10 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_11_5) {
-#endif
                                     float weight_110 = approx_exp2(lse_2[10] - lse_max_2[0]);
                                     if (bound_1[0] > 10) {
                                         den_2[0] = den_2[0] + weight_110;
@@ -7542,13 +5356,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_5 = num_splits > 11 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_13_5) {
-#else
                                 bool live_12_5 = num_splits > 11 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_12_5) {
-#endif
                                     float weight_111 = approx_exp2(lse_2[11] - lse_max_2[0]);
                                     if (bound_1[0] > 11) {
                                         den_2[0] = den_2[0] + weight_111;
@@ -7570,13 +5379,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_5 = num_splits > 12 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_14_5) {
-#else
                                 bool live_13_5 = num_splits > 12 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_13_5) {
-#endif
                                     float weight_112 = approx_exp2(lse_2[12] - lse_max_2[0]);
                                     if (bound_1[0] > 12) {
                                         den_2[0] = den_2[0] + weight_112;
@@ -7598,13 +5402,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_15_2 = num_splits > 13 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_15_2) {
-#else
                                 bool live_14_5 = num_splits > 13 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_14_5) {
-#endif
                                     float weight_113 = approx_exp2(lse_2[13] - lse_max_2[0]);
                                     if (bound_1[0] > 13) {
                                         den_2[0] = den_2[0] + weight_113;
@@ -7626,13 +5425,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_16_2 = num_splits > 14 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_16_2) {
-#else
                                 bool live_15_2 = num_splits > 14 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_15_2) {
-#endif
                                     float weight_114 = approx_exp2(lse_2[14] - lse_max_2[0]);
                                     if (bound_1[0] > 14) {
                                         den_2[0] = den_2[0] + weight_114;
@@ -7654,13 +5448,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_17_2 = num_splits > 15 && lse_max_2[0] > -CUDART_INF_F;
-                                if (live_17_2) {
-#else
                                 bool live_16_2 = num_splits > 15 && lse_max_2[0] > -CUDART_INF_F;
                                 if (live_16_2) {
-#endif
                                     float weight_115 = approx_exp2(lse_2[15] - lse_max_2[0]);
                                     if (bound_1[0] > 15) {
                                         den_2[0] = den_2[0] + weight_115;
@@ -7682,13 +5471,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_18_2 = num_splits > 0 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_18_2) {
-#else
                                 bool live_17_2 = num_splits > 0 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_17_2) {
-#endif
                                     float weight_116 = approx_exp2(lse_2[16] - lse_max_2[1]);
                                     if (bound_1[0] > 0) {
                                         den_2[4] = den_2[4] + weight_116;
@@ -7710,13 +5494,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_19_1 = num_splits > 1 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_19_1) {
-#else
                                 bool live_18_2 = num_splits > 1 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_18_2) {
-#endif
                                     float weight_117 = approx_exp2(lse_2[17] - lse_max_2[1]);
                                     if (bound_1[0] > 1) {
                                         den_2[4] = den_2[4] + weight_117;
@@ -7738,13 +5517,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_20_1 = num_splits > 2 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_20_1) {
-#else
                                 bool live_19_1 = num_splits > 2 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_19_1) {
-#endif
                                     float weight_118 = approx_exp2(lse_2[18] - lse_max_2[1]);
                                     if (bound_1[0] > 2) {
                                         den_2[4] = den_2[4] + weight_118;
@@ -7766,13 +5540,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_21_1 = num_splits > 3 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_21_1) {
-#else
                                 bool live_20_1 = num_splits > 3 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_20_1) {
-#endif
                                     float weight_119 = approx_exp2(lse_2[19] - lse_max_2[1]);
                                     if (bound_1[0] > 3) {
                                         den_2[4] = den_2[4] + weight_119;
@@ -7794,13 +5563,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_22_1 = num_splits > 4 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_22_1) {
-#else
                                 bool live_21_1 = num_splits > 4 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_21_1) {
-#endif
                                     float weight_120 = approx_exp2(lse_2[20] - lse_max_2[1]);
                                     if (bound_1[0] > 4) {
                                         den_2[4] = den_2[4] + weight_120;
@@ -7822,13 +5586,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_23_1 = num_splits > 5 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_23_1) {
-#else
                                 bool live_22_1 = num_splits > 5 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_22_1) {
-#endif
                                     float weight_121 = approx_exp2(lse_2[21] - lse_max_2[1]);
                                     if (bound_1[0] > 5) {
                                         den_2[4] = den_2[4] + weight_121;
@@ -7850,13 +5609,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_24_1 = num_splits > 6 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_24_1) {
-#else
                                 bool live_23_1 = num_splits > 6 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_23_1) {
-#endif
                                     float weight_122 = approx_exp2(lse_2[22] - lse_max_2[1]);
                                     if (bound_1[0] > 6) {
                                         den_2[4] = den_2[4] + weight_122;
@@ -7878,13 +5632,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_25_1 = num_splits > 7 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_25_1) {
-#else
                                 bool live_24_1 = num_splits > 7 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_24_1) {
-#endif
                                     float weight_123 = approx_exp2(lse_2[23] - lse_max_2[1]);
                                     if (bound_1[0] > 7) {
                                         den_2[4] = den_2[4] + weight_123;
@@ -7906,13 +5655,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_26_1 = num_splits > 8 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_26_1) {
-#else
                                 bool live_25_1 = num_splits > 8 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_25_1) {
-#endif
                                     float weight_124 = approx_exp2(lse_2[24] - lse_max_2[1]);
                                     if (bound_1[0] > 8) {
                                         den_2[4] = den_2[4] + weight_124;
@@ -7934,13 +5678,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_27_1 = num_splits > 9 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_27_1) {
-#else
                                 bool live_26_1 = num_splits > 9 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_26_1) {
-#endif
                                     float weight_125 = approx_exp2(lse_2[25] - lse_max_2[1]);
                                     if (bound_1[0] > 9) {
                                         den_2[4] = den_2[4] + weight_125;
@@ -7962,13 +5701,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_28_1 = num_splits > 10 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_28_1) {
-#else
                                 bool live_27_1 = num_splits > 10 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_27_1) {
-#endif
                                     float weight_126 = approx_exp2(lse_2[26] - lse_max_2[1]);
                                     if (bound_1[0] > 10) {
                                         den_2[4] = den_2[4] + weight_126;
@@ -7990,13 +5724,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_29_1 = num_splits > 11 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_29_1) {
-#else
                                 bool live_28_1 = num_splits > 11 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_28_1) {
-#endif
                                     float weight_127 = approx_exp2(lse_2[27] - lse_max_2[1]);
                                     if (bound_1[0] > 11) {
                                         den_2[4] = den_2[4] + weight_127;
@@ -8018,13 +5747,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_30_1 = num_splits > 12 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_30_1) {
-#else
                                 bool live_29_1 = num_splits > 12 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_29_1) {
-#endif
                                     float weight_128 = approx_exp2(lse_2[28] - lse_max_2[1]);
                                     if (bound_1[0] > 12) {
                                         den_2[4] = den_2[4] + weight_128;
@@ -8046,13 +5770,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_31_1 = num_splits > 13 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_31_1) {
-#else
                                 bool live_30_1 = num_splits > 13 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_30_1) {
-#endif
                                     float weight_129 = approx_exp2(lse_2[29] - lse_max_2[1]);
                                     if (bound_1[0] > 13) {
                                         den_2[4] = den_2[4] + weight_129;
@@ -8074,13 +5793,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_32_1 = num_splits > 14 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_32_1) {
-#else
                                 bool live_31_1 = num_splits > 14 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_31_1) {
-#endif
                                     float weight_130 = approx_exp2(lse_2[30] - lse_max_2[1]);
                                     if (bound_1[0] > 14) {
                                         den_2[4] = den_2[4] + weight_130;
@@ -8102,13 +5816,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_33_1 = num_splits > 15 && lse_max_2[1] > -CUDART_INF_F;
-                                if (live_33_1) {
-#else
                                 bool live_32_1 = num_splits > 15 && lse_max_2[1] > -CUDART_INF_F;
                                 if (live_32_1) {
-#endif
                                     float weight_131 = approx_exp2(lse_2[31] - lse_max_2[1]);
                                     if (bound_1[0] > 15) {
                                         den_2[4] = den_2[4] + weight_131;
@@ -8145,26 +5854,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_2 = acc1_k_2 + acc1_2[3];
                                     float inv_4 = 0.0f;
                                     if (den_k_2 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_260 = approx_rcp(den_k_2);
-                                        inv_4 = _rcp_260;
-#else
                                         float _rcp_298 = approx_rcp(den_k_2);
                                         inv_4 = _rcp_298;
-#endif
                                     }
                                     float attn0_2 = (float)(__nv_bfloat16)(acc0_k_2 * inv_4);
                                     float attn1_2 = (float)(__nv_bfloat16)(acc1_k_2 * inv_4);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_262 = approx_exp2((-gate0_2[0]) * 1.442695f);
-                                    float _rcp_261 = approx_rcp(1.0f + _exp2_262);
-                                    float result0_2 = attn0_2 * _rcp_261;
-                                    float _exp2_264 = approx_exp2((-gate1_2[0]) * 1.442695f);
-                                    float _rcp_263 = approx_rcp(1.0f + _exp2_264);
-                                    float result1_2 = attn1_2 * _rcp_263;
-                                    __nv_bfloat162 _bit_cast_src_265 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
-                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_265)[0];
-#else
                                     float _exp2_300 = approx_exp2((-gate0_2[0]) * 1.442695f);
                                     float _rcp_299 = approx_rcp(1.0f + _exp2_300);
                                     float result0_2 = attn0_2 * _rcp_299;
@@ -8173,7 +5867,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_2 = attn1_2 * _rcp_301;
                                     __nv_bfloat162 _bit_cast_src_303 = __float22bfloat162_rn(make_float2(result0_2, result1_2));
                                     word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_303)[0];
-#endif
                                     long long out_offset_2 = row_i64 * out_stride_row + qo_head_4[0] * out_stride_head + dim_2[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_2) + (0)) = word_2[0];
                                 }
@@ -8192,26 +5885,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_3 = acc1_k_3 + acc1_2[7];
                                     float inv_5 = 0.0f;
                                     if (den_k_3 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_266 = approx_rcp(den_k_3);
-                                        inv_5 = _rcp_266;
-#else
                                         float _rcp_304 = approx_rcp(den_k_3);
                                         inv_5 = _rcp_304;
-#endif
                                     }
                                     float attn0_3 = (float)(__nv_bfloat16)(acc0_k_3 * inv_5);
                                     float attn1_3 = (float)(__nv_bfloat16)(acc1_k_3 * inv_5);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_268 = approx_exp2((-gate0_2[1]) * 1.442695f);
-                                    float _rcp_267 = approx_rcp(1.0f + _exp2_268);
-                                    float result0_3 = attn0_3 * _rcp_267;
-                                    float _exp2_270 = approx_exp2((-gate1_2[1]) * 1.442695f);
-                                    float _rcp_269 = approx_rcp(1.0f + _exp2_270);
-                                    float result1_3 = attn1_3 * _rcp_269;
-                                    __nv_bfloat162 _bit_cast_src_271 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
-                                    word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_271)[0];
-#else
                                     float _exp2_306 = approx_exp2((-gate0_2[1]) * 1.442695f);
                                     float _rcp_305 = approx_rcp(1.0f + _exp2_306);
                                     float result0_3 = attn0_3 * _rcp_305;
@@ -8220,7 +5898,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_3 = attn1_3 * _rcp_307;
                                     __nv_bfloat162 _bit_cast_src_309 = __float22bfloat162_rn(make_float2(result0_3, result1_3));
                                     word_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_309)[0];
-#endif
                                     long long out_offset_3 = row_i64 * out_stride_row + qo_head_4[1] * out_stride_head + dim_2[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_3) + (0)) = word_2[0];
                                 }
@@ -8255,17 +5932,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             for (int p_1_3 = p_first; p_1_3 < end; p_1_3 += 256) {
                                 int pk_3 = ((p_1_3) < (end - 1) ? (p_1_3) : (end - 1));
                                 valid_3[0] = ((end > p_1_3) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_0_3 = pk_3 >> 7;
-#else
                                 int head_5 = pk_3 >> 7;
-#endif
                                 dim_3[0] = (long long)((pk_3 & 127) * 2);
-#if __CUDA_ARCH__ == 1070
-                                qo_head_5[0] = (long long)(first_head + head_0_3);
-#else
                                 qo_head_5[0] = (long long)(first_head + head_5);
-#endif
                                 row_head_3[0] = row_i64 * nqo_3 + qo_head_5[0];
                                 acc0_3[0] = 0.0f;
                                 acc1_3[0] = 0.0f;
@@ -8282,35 +5951,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_3[0] = -CUDART_INF_F;
                                 float _vec_load_148[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_272;
-                                    _bf16x2_bits_272 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
-                                    (&_vec_load_148[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) << 16);
-                                    (&_vec_load_148[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_272) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_310;
                                     _bf16x2_bits_310 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[0] * 256 + dim_3[0]) + 0);
                                     (&_vec_load_148[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_310) << 16);
                                     (&_vec_load_148[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_310) & 0xffff0000u);
-#endif
                                 }
                                 gate0_3[0] = _vec_load_148[0];
                                 gate1_3[0] = _vec_load_148[1];
-#if __CUDA_ARCH__ == 1070
-                                int pk_1_2 = ((p_1_3 + 128) < (end - 1) ? (p_1_3 + 128) : (end - 1));
-#else
                                 int pk_0_1 = ((p_1_3 + 128) < (end - 1) ? (p_1_3 + 128) : (end - 1));
-#endif
                                 valid_3[1] = ((end > p_1_3 + 128) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_2_1 = pk_1_2 >> 7;
-                                dim_3[1] = (long long)((pk_1_2 & 127) * 2);
-                                qo_head_5[1] = (long long)(first_head + head_2_1);
-#else
                                 int head_1_2 = pk_0_1 >> 7;
                                 dim_3[1] = (long long)((pk_0_1 & 127) * 2);
                                 qo_head_5[1] = (long long)(first_head + head_1_2);
-#endif
                                 row_head_3[1] = row_i64 * nqo_3 + qo_head_5[1];
                                 acc0_3[4] = 0.0f;
                                 acc1_3[4] = 0.0f;
@@ -8327,17 +5979,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_3[1] = -CUDART_INF_F;
                                 float _vec_load_149[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_273;
-                                    _bf16x2_bits_273 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
-                                    (&_vec_load_149[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) << 16);
-                                    (&_vec_load_149[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_273) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_311;
                                     _bf16x2_bits_311 = *reinterpret_cast<const uint32_t*>(gate + (row_head_3[1] * 256 + dim_3[1]) + 0);
                                     (&_vec_load_149[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_311) << 16);
                                     (&_vec_load_149[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_311) & 0xffff0000u);
-#endif
                                 }
                                 gate0_3[1] = _vec_load_149[0];
                                 gate1_3[1] = _vec_load_149[1];
@@ -8347,15 +5992,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[0] = partial_lse[part_row_132];
                                     float _vec_load_150[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_274 = *reinterpret_cast<const float2*>(partial_out + (part_row_132 * 256 + dim_3[0]) + 0);
-                                        _vec_load_150[0] = _v2_274.x;
-                                        _vec_load_150[0 + 1] = _v2_274.y;
-#else
                                         float2 _v2_312 = *reinterpret_cast<const float2*>(partial_out + (part_row_132 * 256 + dim_3[0]) + 0);
                                         _vec_load_150[0] = _v2_312.x;
                                         _vec_load_150[0 + 1] = _v2_312.y;
-#endif
                                     }
                                     p0_3[0] = _vec_load_150[0];
                                     p1_3[0] = _vec_load_150[1];
@@ -8366,15 +6005,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[1] = partial_lse[part_row_133];
                                     float _vec_load_151[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_275 = *reinterpret_cast<const float2*>(partial_out + (part_row_133 * 256 + dim_3[0]) + 0);
-                                        _vec_load_151[0] = _v2_275.x;
-                                        _vec_load_151[0 + 1] = _v2_275.y;
-#else
                                         float2 _v2_313 = *reinterpret_cast<const float2*>(partial_out + (part_row_133 * 256 + dim_3[0]) + 0);
                                         _vec_load_151[0] = _v2_313.x;
                                         _vec_load_151[0 + 1] = _v2_313.y;
-#endif
                                     }
                                     p0_3[1] = _vec_load_151[0];
                                     p1_3[1] = _vec_load_151[1];
@@ -8385,15 +6018,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[2] = partial_lse[part_row_134];
                                     float _vec_load_152[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_276 = *reinterpret_cast<const float2*>(partial_out + (part_row_134 * 256 + dim_3[0]) + 0);
-                                        _vec_load_152[0] = _v2_276.x;
-                                        _vec_load_152[0 + 1] = _v2_276.y;
-#else
                                         float2 _v2_314 = *reinterpret_cast<const float2*>(partial_out + (part_row_134 * 256 + dim_3[0]) + 0);
                                         _vec_load_152[0] = _v2_314.x;
                                         _vec_load_152[0 + 1] = _v2_314.y;
-#endif
                                     }
                                     p0_3[2] = _vec_load_152[0];
                                     p1_3[2] = _vec_load_152[1];
@@ -8404,15 +6031,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[3] = partial_lse[part_row_135];
                                     float _vec_load_153[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_277 = *reinterpret_cast<const float2*>(partial_out + (part_row_135 * 256 + dim_3[0]) + 0);
-                                        _vec_load_153[0] = _v2_277.x;
-                                        _vec_load_153[0 + 1] = _v2_277.y;
-#else
                                         float2 _v2_315 = *reinterpret_cast<const float2*>(partial_out + (part_row_135 * 256 + dim_3[0]) + 0);
                                         _vec_load_153[0] = _v2_315.x;
                                         _vec_load_153[0 + 1] = _v2_315.y;
-#endif
                                     }
                                     p0_3[3] = _vec_load_153[0];
                                     p1_3[3] = _vec_load_153[1];
@@ -8423,15 +6044,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[4] = partial_lse[part_row_136];
                                     float _vec_load_154[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_278 = *reinterpret_cast<const float2*>(partial_out + (part_row_136 * 256 + dim_3[0]) + 0);
-                                        _vec_load_154[0] = _v2_278.x;
-                                        _vec_load_154[0 + 1] = _v2_278.y;
-#else
                                         float2 _v2_316 = *reinterpret_cast<const float2*>(partial_out + (part_row_136 * 256 + dim_3[0]) + 0);
                                         _vec_load_154[0] = _v2_316.x;
                                         _vec_load_154[0 + 1] = _v2_316.y;
-#endif
                                     }
                                     p0_3[4] = _vec_load_154[0];
                                     p1_3[4] = _vec_load_154[1];
@@ -8442,15 +6057,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[5] = partial_lse[part_row_137];
                                     float _vec_load_155[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_279 = *reinterpret_cast<const float2*>(partial_out + (part_row_137 * 256 + dim_3[0]) + 0);
-                                        _vec_load_155[0] = _v2_279.x;
-                                        _vec_load_155[0 + 1] = _v2_279.y;
-#else
                                         float2 _v2_317 = *reinterpret_cast<const float2*>(partial_out + (part_row_137 * 256 + dim_3[0]) + 0);
                                         _vec_load_155[0] = _v2_317.x;
                                         _vec_load_155[0 + 1] = _v2_317.y;
-#endif
                                     }
                                     p0_3[5] = _vec_load_155[0];
                                     p1_3[5] = _vec_load_155[1];
@@ -8461,15 +6070,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[6] = partial_lse[part_row_138];
                                     float _vec_load_156[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_280 = *reinterpret_cast<const float2*>(partial_out + (part_row_138 * 256 + dim_3[0]) + 0);
-                                        _vec_load_156[0] = _v2_280.x;
-                                        _vec_load_156[0 + 1] = _v2_280.y;
-#else
                                         float2 _v2_318 = *reinterpret_cast<const float2*>(partial_out + (part_row_138 * 256 + dim_3[0]) + 0);
                                         _vec_load_156[0] = _v2_318.x;
                                         _vec_load_156[0 + 1] = _v2_318.y;
-#endif
                                     }
                                     p0_3[6] = _vec_load_156[0];
                                     p1_3[6] = _vec_load_156[1];
@@ -8480,15 +6083,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[7] = partial_lse[part_row_139];
                                     float _vec_load_157[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_281 = *reinterpret_cast<const float2*>(partial_out + (part_row_139 * 256 + dim_3[0]) + 0);
-                                        _vec_load_157[0] = _v2_281.x;
-                                        _vec_load_157[0 + 1] = _v2_281.y;
-#else
                                         float2 _v2_319 = *reinterpret_cast<const float2*>(partial_out + (part_row_139 * 256 + dim_3[0]) + 0);
                                         _vec_load_157[0] = _v2_319.x;
                                         _vec_load_157[0 + 1] = _v2_319.y;
-#endif
                                     }
                                     p0_3[7] = _vec_load_157[0];
                                     p1_3[7] = _vec_load_157[1];
@@ -8499,15 +6096,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[8] = partial_lse[part_row_140];
                                     float _vec_load_158[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_282 = *reinterpret_cast<const float2*>(partial_out + (part_row_140 * 256 + dim_3[1]) + 0);
-                                        _vec_load_158[0] = _v2_282.x;
-                                        _vec_load_158[0 + 1] = _v2_282.y;
-#else
                                         float2 _v2_320 = *reinterpret_cast<const float2*>(partial_out + (part_row_140 * 256 + dim_3[1]) + 0);
                                         _vec_load_158[0] = _v2_320.x;
                                         _vec_load_158[0 + 1] = _v2_320.y;
-#endif
                                     }
                                     p0_3[8] = _vec_load_158[0];
                                     p1_3[8] = _vec_load_158[1];
@@ -8518,15 +6109,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[9] = partial_lse[part_row_141];
                                     float _vec_load_159[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_283 = *reinterpret_cast<const float2*>(partial_out + (part_row_141 * 256 + dim_3[1]) + 0);
-                                        _vec_load_159[0] = _v2_283.x;
-                                        _vec_load_159[0 + 1] = _v2_283.y;
-#else
                                         float2 _v2_321 = *reinterpret_cast<const float2*>(partial_out + (part_row_141 * 256 + dim_3[1]) + 0);
                                         _vec_load_159[0] = _v2_321.x;
                                         _vec_load_159[0 + 1] = _v2_321.y;
-#endif
                                     }
                                     p0_3[9] = _vec_load_159[0];
                                     p1_3[9] = _vec_load_159[1];
@@ -8537,15 +6122,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[10] = partial_lse[part_row_142];
                                     float _vec_load_160[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_284 = *reinterpret_cast<const float2*>(partial_out + (part_row_142 * 256 + dim_3[1]) + 0);
-                                        _vec_load_160[0] = _v2_284.x;
-                                        _vec_load_160[0 + 1] = _v2_284.y;
-#else
                                         float2 _v2_322 = *reinterpret_cast<const float2*>(partial_out + (part_row_142 * 256 + dim_3[1]) + 0);
                                         _vec_load_160[0] = _v2_322.x;
                                         _vec_load_160[0 + 1] = _v2_322.y;
-#endif
                                     }
                                     p0_3[10] = _vec_load_160[0];
                                     p1_3[10] = _vec_load_160[1];
@@ -8556,15 +6135,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[11] = partial_lse[part_row_143];
                                     float _vec_load_161[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_285 = *reinterpret_cast<const float2*>(partial_out + (part_row_143 * 256 + dim_3[1]) + 0);
-                                        _vec_load_161[0] = _v2_285.x;
-                                        _vec_load_161[0 + 1] = _v2_285.y;
-#else
                                         float2 _v2_323 = *reinterpret_cast<const float2*>(partial_out + (part_row_143 * 256 + dim_3[1]) + 0);
                                         _vec_load_161[0] = _v2_323.x;
                                         _vec_load_161[0 + 1] = _v2_323.y;
-#endif
                                     }
                                     p0_3[11] = _vec_load_161[0];
                                     p1_3[11] = _vec_load_161[1];
@@ -8575,15 +6148,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[12] = partial_lse[part_row_144];
                                     float _vec_load_162[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_286 = *reinterpret_cast<const float2*>(partial_out + (part_row_144 * 256 + dim_3[1]) + 0);
-                                        _vec_load_162[0] = _v2_286.x;
-                                        _vec_load_162[0 + 1] = _v2_286.y;
-#else
                                         float2 _v2_324 = *reinterpret_cast<const float2*>(partial_out + (part_row_144 * 256 + dim_3[1]) + 0);
                                         _vec_load_162[0] = _v2_324.x;
                                         _vec_load_162[0 + 1] = _v2_324.y;
-#endif
                                     }
                                     p0_3[12] = _vec_load_162[0];
                                     p1_3[12] = _vec_load_162[1];
@@ -8594,15 +6161,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[13] = partial_lse[part_row_145];
                                     float _vec_load_163[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_287 = *reinterpret_cast<const float2*>(partial_out + (part_row_145 * 256 + dim_3[1]) + 0);
-                                        _vec_load_163[0] = _v2_287.x;
-                                        _vec_load_163[0 + 1] = _v2_287.y;
-#else
                                         float2 _v2_325 = *reinterpret_cast<const float2*>(partial_out + (part_row_145 * 256 + dim_3[1]) + 0);
                                         _vec_load_163[0] = _v2_325.x;
                                         _vec_load_163[0 + 1] = _v2_325.y;
-#endif
                                     }
                                     p0_3[13] = _vec_load_163[0];
                                     p1_3[13] = _vec_load_163[1];
@@ -8613,15 +6174,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[14] = partial_lse[part_row_146];
                                     float _vec_load_164[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_288 = *reinterpret_cast<const float2*>(partial_out + (part_row_146 * 256 + dim_3[1]) + 0);
-                                        _vec_load_164[0] = _v2_288.x;
-                                        _vec_load_164[0 + 1] = _v2_288.y;
-#else
                                         float2 _v2_326 = *reinterpret_cast<const float2*>(partial_out + (part_row_146 * 256 + dim_3[1]) + 0);
                                         _vec_load_164[0] = _v2_326.x;
                                         _vec_load_164[0 + 1] = _v2_326.y;
-#endif
                                     }
                                     p0_3[14] = _vec_load_164[0];
                                     p1_3[14] = _vec_load_164[1];
@@ -8632,15 +6187,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_3[15] = partial_lse[part_row_147];
                                     float _vec_load_165[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_289 = *reinterpret_cast<const float2*>(partial_out + (part_row_147 * 256 + dim_3[1]) + 0);
-                                        _vec_load_165[0] = _v2_289.x;
-                                        _vec_load_165[0 + 1] = _v2_289.y;
-#else
                                         float2 _v2_327 = *reinterpret_cast<const float2*>(partial_out + (part_row_147 * 256 + dim_3[1]) + 0);
                                         _vec_load_165[0] = _v2_327.x;
                                         _vec_load_165[0 + 1] = _v2_327.y;
-#endif
                                     }
                                     p0_3[15] = _vec_load_165[0];
                                     p1_3[15] = _vec_load_165[1];
@@ -8661,13 +6210,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[13]);
                                 lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[14]);
                                 lse_max_3[1] = fmaxf(lse_max_3[1], lse_3[15]);
-#if __CUDA_ARCH__ == 1070
-                                bool live_37 = num_splits > 0 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_37) {
-#else
                                 bool live_36 = num_splits > 0 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_36) {
-#endif
                                     float weight_132 = approx_exp2(lse_3[0] - lse_max_3[0]);
                                     if (bound_2[0] > 0) {
                                         den_3[0] = den_3[0] + weight_132;
@@ -8689,13 +6233,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_3_6 = num_splits > 1 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_3_6) {
-#else
                                 bool live_2_6 = num_splits > 1 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_2_6) {
-#endif
                                     float weight_133 = approx_exp2(lse_3[1] - lse_max_3[0]);
                                     if (bound_2[0] > 1) {
                                         den_3[0] = den_3[0] + weight_133;
@@ -8717,13 +6256,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_4_6 = num_splits > 2 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_4_6) {
-#else
                                 bool live_3_6 = num_splits > 2 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_3_6) {
-#endif
                                     float weight_134 = approx_exp2(lse_3[2] - lse_max_3[0]);
                                     if (bound_2[0] > 2) {
                                         den_3[0] = den_3[0] + weight_134;
@@ -8745,13 +6279,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_5_6 = num_splits > 3 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_5_6) {
-#else
                                 bool live_4_6 = num_splits > 3 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_4_6) {
-#endif
                                     float weight_135 = approx_exp2(lse_3[3] - lse_max_3[0]);
                                     if (bound_2[0] > 3) {
                                         den_3[0] = den_3[0] + weight_135;
@@ -8773,13 +6302,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_6_6 = num_splits > 4 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_6_6) {
-#else
                                 bool live_5_6 = num_splits > 4 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_5_6) {
-#endif
                                     float weight_136 = approx_exp2(lse_3[4] - lse_max_3[0]);
                                     if (bound_2[0] > 4) {
                                         den_3[0] = den_3[0] + weight_136;
@@ -8801,13 +6325,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_6 = num_splits > 5 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_7_6) {
-#else
                                 bool live_6_6 = num_splits > 5 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_6_6) {
-#endif
                                     float weight_137 = approx_exp2(lse_3[5] - lse_max_3[0]);
                                     if (bound_2[0] > 5) {
                                         den_3[0] = den_3[0] + weight_137;
@@ -8829,13 +6348,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_6 = num_splits > 6 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_8_6) {
-#else
                                 bool live_7_6 = num_splits > 6 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_7_6) {
-#endif
                                     float weight_138 = approx_exp2(lse_3[6] - lse_max_3[0]);
                                     if (bound_2[0] > 6) {
                                         den_3[0] = den_3[0] + weight_138;
@@ -8857,13 +6371,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_6 = num_splits > 7 && lse_max_3[0] > -CUDART_INF_F;
-                                if (live_9_6) {
-#else
                                 bool live_8_6 = num_splits > 7 && lse_max_3[0] > -CUDART_INF_F;
                                 if (live_8_6) {
-#endif
                                     float weight_139 = approx_exp2(lse_3[7] - lse_max_3[0]);
                                     if (bound_2[0] > 7) {
                                         den_3[0] = den_3[0] + weight_139;
@@ -8885,13 +6394,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_6 = num_splits > 0 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_10_6) {
-#else
                                 bool live_9_6 = num_splits > 0 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_9_6) {
-#endif
                                     float weight_140 = approx_exp2(lse_3[8] - lse_max_3[1]);
                                     if (bound_2[0] > 0) {
                                         den_3[4] = den_3[4] + weight_140;
@@ -8913,13 +6417,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_6 = num_splits > 1 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_11_6) {
-#else
                                 bool live_10_6 = num_splits > 1 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_10_6) {
-#endif
                                     float weight_141 = approx_exp2(lse_3[9] - lse_max_3[1]);
                                     if (bound_2[0] > 1) {
                                         den_3[4] = den_3[4] + weight_141;
@@ -8941,13 +6440,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_6 = num_splits > 2 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_12_6) {
-#else
                                 bool live_11_6 = num_splits > 2 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_11_6) {
-#endif
                                     float weight_142 = approx_exp2(lse_3[10] - lse_max_3[1]);
                                     if (bound_2[0] > 2) {
                                         den_3[4] = den_3[4] + weight_142;
@@ -8969,13 +6463,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_6 = num_splits > 3 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_13_6) {
-#else
                                 bool live_12_6 = num_splits > 3 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_12_6) {
-#endif
                                     float weight_143 = approx_exp2(lse_3[11] - lse_max_3[1]);
                                     if (bound_2[0] > 3) {
                                         den_3[4] = den_3[4] + weight_143;
@@ -8997,13 +6486,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_6 = num_splits > 4 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_14_6) {
-#else
                                 bool live_13_6 = num_splits > 4 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_13_6) {
-#endif
                                     float weight_144 = approx_exp2(lse_3[12] - lse_max_3[1]);
                                     if (bound_2[0] > 4) {
                                         den_3[4] = den_3[4] + weight_144;
@@ -9025,13 +6509,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_15_3 = num_splits > 5 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_15_3) {
-#else
                                 bool live_14_6 = num_splits > 5 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_14_6) {
-#endif
                                     float weight_145 = approx_exp2(lse_3[13] - lse_max_3[1]);
                                     if (bound_2[0] > 5) {
                                         den_3[4] = den_3[4] + weight_145;
@@ -9053,13 +6532,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_16_3 = num_splits > 6 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_16_3) {
-#else
                                 bool live_15_3 = num_splits > 6 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_15_3) {
-#endif
                                     float weight_146 = approx_exp2(lse_3[14] - lse_max_3[1]);
                                     if (bound_2[0] > 6) {
                                         den_3[4] = den_3[4] + weight_146;
@@ -9081,13 +6555,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_17_3 = num_splits > 7 && lse_max_3[1] > -CUDART_INF_F;
-                                if (live_17_3) {
-#else
                                 bool live_16_3 = num_splits > 7 && lse_max_3[1] > -CUDART_INF_F;
                                 if (live_16_3) {
-#endif
                                     float weight_147 = approx_exp2(lse_3[15] - lse_max_3[1]);
                                     if (bound_2[0] > 7) {
                                         den_3[4] = den_3[4] + weight_147;
@@ -9124,26 +6593,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_4 = acc1_k_4 + acc1_3[3];
                                     float inv_6 = 0.0f;
                                     if (den_k_4 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_290 = approx_rcp(den_k_4);
-                                        inv_6 = _rcp_290;
-#else
                                         float _rcp_328 = approx_rcp(den_k_4);
                                         inv_6 = _rcp_328;
-#endif
                                     }
                                     float attn0_4 = (float)(__nv_bfloat16)(acc0_k_4 * inv_6);
                                     float attn1_4 = (float)(__nv_bfloat16)(acc1_k_4 * inv_6);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_292 = approx_exp2((-gate0_3[0]) * 1.442695f);
-                                    float _rcp_291 = approx_rcp(1.0f + _exp2_292);
-                                    float result0_4 = attn0_4 * _rcp_291;
-                                    float _exp2_294 = approx_exp2((-gate1_3[0]) * 1.442695f);
-                                    float _rcp_293 = approx_rcp(1.0f + _exp2_294);
-                                    float result1_4 = attn1_4 * _rcp_293;
-                                    __nv_bfloat162 _bit_cast_src_295 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_295)[0];
-#else
                                     float _exp2_330 = approx_exp2((-gate0_3[0]) * 1.442695f);
                                     float _rcp_329 = approx_rcp(1.0f + _exp2_330);
                                     float result0_4 = attn0_4 * _rcp_329;
@@ -9152,7 +6606,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_4 = attn1_4 * _rcp_331;
                                     __nv_bfloat162 _bit_cast_src_333 = __float22bfloat162_rn(make_float2(result0_4, result1_4));
                                     word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_333)[0];
-#endif
                                     long long out_offset_4 = row_i64 * out_stride_row + qo_head_5[0] * out_stride_head + dim_3[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_4) + (0)) = word_3[0];
                                 }
@@ -9171,26 +6624,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_5 = acc1_k_5 + acc1_3[7];
                                     float inv_7 = 0.0f;
                                     if (den_k_5 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_296 = approx_rcp(den_k_5);
-                                        inv_7 = _rcp_296;
-#else
                                         float _rcp_334 = approx_rcp(den_k_5);
                                         inv_7 = _rcp_334;
-#endif
                                     }
                                     float attn0_5 = (float)(__nv_bfloat16)(acc0_k_5 * inv_7);
                                     float attn1_5 = (float)(__nv_bfloat16)(acc1_k_5 * inv_7);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_298 = approx_exp2((-gate0_3[1]) * 1.442695f);
-                                    float _rcp_297 = approx_rcp(1.0f + _exp2_298);
-                                    float result0_5 = attn0_5 * _rcp_297;
-                                    float _exp2_300 = approx_exp2((-gate1_3[1]) * 1.442695f);
-                                    float _rcp_299 = approx_rcp(1.0f + _exp2_300);
-                                    float result1_5 = attn1_5 * _rcp_299;
-                                    __nv_bfloat162 _bit_cast_src_301 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
-                                    word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_301)[0];
-#else
                                     float _exp2_336 = approx_exp2((-gate0_3[1]) * 1.442695f);
                                     float _rcp_335 = approx_rcp(1.0f + _exp2_336);
                                     float result0_5 = attn0_5 * _rcp_335;
@@ -9199,7 +6637,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_5 = attn1_5 * _rcp_337;
                                     __nv_bfloat162 _bit_cast_src_339 = __float22bfloat162_rn(make_float2(result0_5, result1_5));
                                     word_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_339)[0];
-#endif
                                     long long out_offset_5 = row_i64 * out_stride_row + qo_head_5[1] * out_stride_head + dim_3[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_5) + (0)) = word_3[0];
                                 }
@@ -9234,17 +6671,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                             for (int p_1_4 = p_first; p_1_4 < end; p_1_4 += 512) {
                                 int pk_4 = ((p_1_4) < (end - 1) ? (p_1_4) : (end - 1));
                                 valid_4[0] = ((end > p_1_4) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_0_4 = pk_4 >> 7;
-#else
                                 int head_6 = pk_4 >> 7;
-#endif
                                 dim_4[0] = (long long)((pk_4 & 127) * 2);
-#if __CUDA_ARCH__ == 1070
-                                qo_head_6[0] = (long long)(first_head + head_0_4);
-#else
                                 qo_head_6[0] = (long long)(first_head + head_6);
-#endif
                                 row_head_4[0] = row_i64 * nqo_4 + qo_head_6[0];
                                 acc0_4[0] = 0.0f;
                                 acc1_4[0] = 0.0f;
@@ -9261,35 +6690,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[0] = -CUDART_INF_F;
                                 float _vec_load_166[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_302;
-                                    _bf16x2_bits_302 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[0] * 256 + dim_4[0]) + 0);
-                                    (&_vec_load_166[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) << 16);
-                                    (&_vec_load_166[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_302) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_340;
                                     _bf16x2_bits_340 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[0] * 256 + dim_4[0]) + 0);
                                     (&_vec_load_166[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_340) << 16);
                                     (&_vec_load_166[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_340) & 0xffff0000u);
-#endif
                                 }
                                 gate0_4[0] = _vec_load_166[0];
                                 gate1_4[0] = _vec_load_166[1];
-#if __CUDA_ARCH__ == 1070
-                                int pk_1_3 = ((p_1_4 + 128) < (end - 1) ? (p_1_4 + 128) : (end - 1));
-#else
                                 int pk_0_2 = ((p_1_4 + 128) < (end - 1) ? (p_1_4 + 128) : (end - 1));
-#endif
                                 valid_4[1] = ((end > p_1_4 + 128) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_2_2 = pk_1_3 >> 7;
-                                dim_4[1] = (long long)((pk_1_3 & 127) * 2);
-                                qo_head_6[1] = (long long)(first_head + head_2_2);
-#else
                                 int head_1_3 = pk_0_2 >> 7;
                                 dim_4[1] = (long long)((pk_0_2 & 127) * 2);
                                 qo_head_6[1] = (long long)(first_head + head_1_3);
-#endif
                                 row_head_4[1] = row_i64 * nqo_4 + qo_head_6[1];
                                 acc0_4[4] = 0.0f;
                                 acc1_4[4] = 0.0f;
@@ -9306,35 +6718,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[1] = -CUDART_INF_F;
                                 float _vec_load_167[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_303;
-                                    _bf16x2_bits_303 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[1] * 256 + dim_4[1]) + 0);
-                                    (&_vec_load_167[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) << 16);
-                                    (&_vec_load_167[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_303) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_341;
                                     _bf16x2_bits_341 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[1] * 256 + dim_4[1]) + 0);
                                     (&_vec_load_167[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_341) << 16);
                                     (&_vec_load_167[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_341) & 0xffff0000u);
-#endif
                                 }
                                 gate0_4[1] = _vec_load_167[0];
                                 gate1_4[1] = _vec_load_167[1];
-#if __CUDA_ARCH__ == 1070
-                                int pk_3_1 = ((p_1_4 + 256) < (end - 1) ? (p_1_4 + 256) : (end - 1));
-#else
                                 int pk_2_1 = ((p_1_4 + 256) < (end - 1) ? (p_1_4 + 256) : (end - 1));
-#endif
                                 valid_4[2] = ((end > p_1_4 + 256) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_4 = pk_3_1 >> 7;
-                                dim_4[2] = (long long)((pk_3_1 & 127) * 2);
-                                qo_head_6[2] = (long long)(first_head + head_4);
-#else
                                 int head_3_1 = pk_2_1 >> 7;
                                 dim_4[2] = (long long)((pk_2_1 & 127) * 2);
                                 qo_head_6[2] = (long long)(first_head + head_3_1);
-#endif
                                 row_head_4[2] = row_i64 * nqo_4 + qo_head_6[2];
                                 acc0_4[8] = 0.0f;
                                 acc1_4[8] = 0.0f;
@@ -9351,35 +6746,18 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[2] = -CUDART_INF_F;
                                 float _vec_load_168[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_304;
-                                    _bf16x2_bits_304 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[2] * 256 + dim_4[2]) + 0);
-                                    (&_vec_load_168[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) << 16);
-                                    (&_vec_load_168[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_304) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_342;
                                     _bf16x2_bits_342 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[2] * 256 + dim_4[2]) + 0);
                                     (&_vec_load_168[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_342) << 16);
                                     (&_vec_load_168[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_342) & 0xffff0000u);
-#endif
                                 }
                                 gate0_4[2] = _vec_load_168[0];
                                 gate1_4[2] = _vec_load_168[1];
-#if __CUDA_ARCH__ == 1070
-                                int pk_5 = ((p_1_4 + 384) < (end - 1) ? (p_1_4 + 384) : (end - 1));
-#else
                                 int pk_4_1 = ((p_1_4 + 384) < (end - 1) ? (p_1_4 + 384) : (end - 1));
-#endif
                                 valid_4[3] = ((end > p_1_4 + 384) ? 1 : 0);
-#if __CUDA_ARCH__ == 1070
-                                int head_6 = pk_5 >> 7;
-                                dim_4[3] = (long long)((pk_5 & 127) * 2);
-                                qo_head_6[3] = (long long)(first_head + head_6);
-#else
                                 int head_5_1 = pk_4_1 >> 7;
                                 dim_4[3] = (long long)((pk_4_1 & 127) * 2);
                                 qo_head_6[3] = (long long)(first_head + head_5_1);
-#endif
                                 row_head_4[3] = row_i64 * nqo_4 + qo_head_6[3];
                                 acc0_4[12] = 0.0f;
                                 acc1_4[12] = 0.0f;
@@ -9396,17 +6774,10 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[3] = -CUDART_INF_F;
                                 float _vec_load_169[2];
                                 {
-#if __CUDA_ARCH__ == 1070
-                                    uint32_t _bf16x2_bits_305;
-                                    _bf16x2_bits_305 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[3] * 256 + dim_4[3]) + 0);
-                                    (&_vec_load_169[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) << 16);
-                                    (&_vec_load_169[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_305) & 0xffff0000u);
-#else
                                     uint32_t _bf16x2_bits_343;
                                     _bf16x2_bits_343 = *reinterpret_cast<const uint32_t*>(gate + (row_head_4[3] * 256 + dim_4[3]) + 0);
                                     (&_vec_load_169[0])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_343) << 16);
                                     (&_vec_load_169[0])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_343) & 0xffff0000u);
-#endif
                                 }
                                 gate0_4[3] = _vec_load_169[0];
                                 gate1_4[3] = _vec_load_169[1];
@@ -9416,15 +6787,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[0] = partial_lse[part_row_148];
                                     float _vec_load_170[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_306 = *reinterpret_cast<const float2*>(partial_out + (part_row_148 * 256 + dim_4[0]) + 0);
-                                        _vec_load_170[0] = _v2_306.x;
-                                        _vec_load_170[0 + 1] = _v2_306.y;
-#else
                                         float2 _v2_344 = *reinterpret_cast<const float2*>(partial_out + (part_row_148 * 256 + dim_4[0]) + 0);
                                         _vec_load_170[0] = _v2_344.x;
                                         _vec_load_170[0 + 1] = _v2_344.y;
-#endif
                                     }
                                     p0_4[0] = _vec_load_170[0];
                                     p1_4[0] = _vec_load_170[1];
@@ -9435,15 +6800,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[1] = partial_lse[part_row_149];
                                     float _vec_load_171[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_307 = *reinterpret_cast<const float2*>(partial_out + (part_row_149 * 256 + dim_4[0]) + 0);
-                                        _vec_load_171[0] = _v2_307.x;
-                                        _vec_load_171[0 + 1] = _v2_307.y;
-#else
                                         float2 _v2_345 = *reinterpret_cast<const float2*>(partial_out + (part_row_149 * 256 + dim_4[0]) + 0);
                                         _vec_load_171[0] = _v2_345.x;
                                         _vec_load_171[0 + 1] = _v2_345.y;
-#endif
                                     }
                                     p0_4[1] = _vec_load_171[0];
                                     p1_4[1] = _vec_load_171[1];
@@ -9454,15 +6813,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[2] = partial_lse[part_row_150];
                                     float _vec_load_172[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_308 = *reinterpret_cast<const float2*>(partial_out + (part_row_150 * 256 + dim_4[0]) + 0);
-                                        _vec_load_172[0] = _v2_308.x;
-                                        _vec_load_172[0 + 1] = _v2_308.y;
-#else
                                         float2 _v2_346 = *reinterpret_cast<const float2*>(partial_out + (part_row_150 * 256 + dim_4[0]) + 0);
                                         _vec_load_172[0] = _v2_346.x;
                                         _vec_load_172[0 + 1] = _v2_346.y;
-#endif
                                     }
                                     p0_4[2] = _vec_load_172[0];
                                     p1_4[2] = _vec_load_172[1];
@@ -9473,15 +6826,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[3] = partial_lse[part_row_151];
                                     float _vec_load_173[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_309 = *reinterpret_cast<const float2*>(partial_out + (part_row_151 * 256 + dim_4[0]) + 0);
-                                        _vec_load_173[0] = _v2_309.x;
-                                        _vec_load_173[0 + 1] = _v2_309.y;
-#else
                                         float2 _v2_347 = *reinterpret_cast<const float2*>(partial_out + (part_row_151 * 256 + dim_4[0]) + 0);
                                         _vec_load_173[0] = _v2_347.x;
                                         _vec_load_173[0 + 1] = _v2_347.y;
-#endif
                                     }
                                     p0_4[3] = _vec_load_173[0];
                                     p1_4[3] = _vec_load_173[1];
@@ -9492,15 +6839,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[4] = partial_lse[part_row_152];
                                     float _vec_load_174[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_310 = *reinterpret_cast<const float2*>(partial_out + (part_row_152 * 256 + dim_4[1]) + 0);
-                                        _vec_load_174[0] = _v2_310.x;
-                                        _vec_load_174[0 + 1] = _v2_310.y;
-#else
                                         float2 _v2_348 = *reinterpret_cast<const float2*>(partial_out + (part_row_152 * 256 + dim_4[1]) + 0);
                                         _vec_load_174[0] = _v2_348.x;
                                         _vec_load_174[0 + 1] = _v2_348.y;
-#endif
                                     }
                                     p0_4[4] = _vec_load_174[0];
                                     p1_4[4] = _vec_load_174[1];
@@ -9511,15 +6852,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[5] = partial_lse[part_row_153];
                                     float _vec_load_175[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_311 = *reinterpret_cast<const float2*>(partial_out + (part_row_153 * 256 + dim_4[1]) + 0);
-                                        _vec_load_175[0] = _v2_311.x;
-                                        _vec_load_175[0 + 1] = _v2_311.y;
-#else
                                         float2 _v2_349 = *reinterpret_cast<const float2*>(partial_out + (part_row_153 * 256 + dim_4[1]) + 0);
                                         _vec_load_175[0] = _v2_349.x;
                                         _vec_load_175[0 + 1] = _v2_349.y;
-#endif
                                     }
                                     p0_4[5] = _vec_load_175[0];
                                     p1_4[5] = _vec_load_175[1];
@@ -9530,15 +6865,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[6] = partial_lse[part_row_154];
                                     float _vec_load_176[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_312 = *reinterpret_cast<const float2*>(partial_out + (part_row_154 * 256 + dim_4[1]) + 0);
-                                        _vec_load_176[0] = _v2_312.x;
-                                        _vec_load_176[0 + 1] = _v2_312.y;
-#else
                                         float2 _v2_350 = *reinterpret_cast<const float2*>(partial_out + (part_row_154 * 256 + dim_4[1]) + 0);
                                         _vec_load_176[0] = _v2_350.x;
                                         _vec_load_176[0 + 1] = _v2_350.y;
-#endif
                                     }
                                     p0_4[6] = _vec_load_176[0];
                                     p1_4[6] = _vec_load_176[1];
@@ -9549,15 +6878,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[7] = partial_lse[part_row_155];
                                     float _vec_load_177[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_313 = *reinterpret_cast<const float2*>(partial_out + (part_row_155 * 256 + dim_4[1]) + 0);
-                                        _vec_load_177[0] = _v2_313.x;
-                                        _vec_load_177[0 + 1] = _v2_313.y;
-#else
                                         float2 _v2_351 = *reinterpret_cast<const float2*>(partial_out + (part_row_155 * 256 + dim_4[1]) + 0);
                                         _vec_load_177[0] = _v2_351.x;
                                         _vec_load_177[0 + 1] = _v2_351.y;
-#endif
                                     }
                                     p0_4[7] = _vec_load_177[0];
                                     p1_4[7] = _vec_load_177[1];
@@ -9568,15 +6891,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[8] = partial_lse[part_row_156];
                                     float _vec_load_178[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_314 = *reinterpret_cast<const float2*>(partial_out + (part_row_156 * 256 + dim_4[2]) + 0);
-                                        _vec_load_178[0] = _v2_314.x;
-                                        _vec_load_178[0 + 1] = _v2_314.y;
-#else
                                         float2 _v2_352 = *reinterpret_cast<const float2*>(partial_out + (part_row_156 * 256 + dim_4[2]) + 0);
                                         _vec_load_178[0] = _v2_352.x;
                                         _vec_load_178[0 + 1] = _v2_352.y;
-#endif
                                     }
                                     p0_4[8] = _vec_load_178[0];
                                     p1_4[8] = _vec_load_178[1];
@@ -9587,15 +6904,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[9] = partial_lse[part_row_157];
                                     float _vec_load_179[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_315 = *reinterpret_cast<const float2*>(partial_out + (part_row_157 * 256 + dim_4[2]) + 0);
-                                        _vec_load_179[0] = _v2_315.x;
-                                        _vec_load_179[0 + 1] = _v2_315.y;
-#else
                                         float2 _v2_353 = *reinterpret_cast<const float2*>(partial_out + (part_row_157 * 256 + dim_4[2]) + 0);
                                         _vec_load_179[0] = _v2_353.x;
                                         _vec_load_179[0 + 1] = _v2_353.y;
-#endif
                                     }
                                     p0_4[9] = _vec_load_179[0];
                                     p1_4[9] = _vec_load_179[1];
@@ -9606,15 +6917,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[10] = partial_lse[part_row_158];
                                     float _vec_load_180[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_316 = *reinterpret_cast<const float2*>(partial_out + (part_row_158 * 256 + dim_4[2]) + 0);
-                                        _vec_load_180[0] = _v2_316.x;
-                                        _vec_load_180[0 + 1] = _v2_316.y;
-#else
                                         float2 _v2_354 = *reinterpret_cast<const float2*>(partial_out + (part_row_158 * 256 + dim_4[2]) + 0);
                                         _vec_load_180[0] = _v2_354.x;
                                         _vec_load_180[0 + 1] = _v2_354.y;
-#endif
                                     }
                                     p0_4[10] = _vec_load_180[0];
                                     p1_4[10] = _vec_load_180[1];
@@ -9625,15 +6930,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[11] = partial_lse[part_row_159];
                                     float _vec_load_181[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_317 = *reinterpret_cast<const float2*>(partial_out + (part_row_159 * 256 + dim_4[2]) + 0);
-                                        _vec_load_181[0] = _v2_317.x;
-                                        _vec_load_181[0 + 1] = _v2_317.y;
-#else
                                         float2 _v2_355 = *reinterpret_cast<const float2*>(partial_out + (part_row_159 * 256 + dim_4[2]) + 0);
                                         _vec_load_181[0] = _v2_355.x;
                                         _vec_load_181[0 + 1] = _v2_355.y;
-#endif
                                     }
                                     p0_4[11] = _vec_load_181[0];
                                     p1_4[11] = _vec_load_181[1];
@@ -9644,15 +6943,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[12] = partial_lse[part_row_160];
                                     float _vec_load_182[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_318 = *reinterpret_cast<const float2*>(partial_out + (part_row_160 * 256 + dim_4[3]) + 0);
-                                        _vec_load_182[0] = _v2_318.x;
-                                        _vec_load_182[0 + 1] = _v2_318.y;
-#else
                                         float2 _v2_356 = *reinterpret_cast<const float2*>(partial_out + (part_row_160 * 256 + dim_4[3]) + 0);
                                         _vec_load_182[0] = _v2_356.x;
                                         _vec_load_182[0 + 1] = _v2_356.y;
-#endif
                                     }
                                     p0_4[12] = _vec_load_182[0];
                                     p1_4[12] = _vec_load_182[1];
@@ -9663,15 +6956,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[13] = partial_lse[part_row_161];
                                     float _vec_load_183[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_319 = *reinterpret_cast<const float2*>(partial_out + (part_row_161 * 256 + dim_4[3]) + 0);
-                                        _vec_load_183[0] = _v2_319.x;
-                                        _vec_load_183[0 + 1] = _v2_319.y;
-#else
                                         float2 _v2_357 = *reinterpret_cast<const float2*>(partial_out + (part_row_161 * 256 + dim_4[3]) + 0);
                                         _vec_load_183[0] = _v2_357.x;
                                         _vec_load_183[0 + 1] = _v2_357.y;
-#endif
                                     }
                                     p0_4[13] = _vec_load_183[0];
                                     p1_4[13] = _vec_load_183[1];
@@ -9682,15 +6969,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[14] = partial_lse[part_row_162];
                                     float _vec_load_184[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_320 = *reinterpret_cast<const float2*>(partial_out + (part_row_162 * 256 + dim_4[3]) + 0);
-                                        _vec_load_184[0] = _v2_320.x;
-                                        _vec_load_184[0 + 1] = _v2_320.y;
-#else
                                         float2 _v2_358 = *reinterpret_cast<const float2*>(partial_out + (part_row_162 * 256 + dim_4[3]) + 0);
                                         _vec_load_184[0] = _v2_358.x;
                                         _vec_load_184[0 + 1] = _v2_358.y;
-#endif
                                     }
                                     p0_4[14] = _vec_load_184[0];
                                     p1_4[14] = _vec_load_184[1];
@@ -9701,15 +6982,9 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     lse_4[15] = partial_lse[part_row_163];
                                     float _vec_load_185[2];
                                     {
-#if __CUDA_ARCH__ == 1070
-                                        float2 _v2_321 = *reinterpret_cast<const float2*>(partial_out + (part_row_163 * 256 + dim_4[3]) + 0);
-                                        _vec_load_185[0] = _v2_321.x;
-                                        _vec_load_185[0 + 1] = _v2_321.y;
-#else
                                         float2 _v2_359 = *reinterpret_cast<const float2*>(partial_out + (part_row_163 * 256 + dim_4[3]) + 0);
                                         _vec_load_185[0] = _v2_359.x;
                                         _vec_load_185[0 + 1] = _v2_359.y;
-#endif
                                     }
                                     p0_4[15] = _vec_load_185[0];
                                     p1_4[15] = _vec_load_185[1];
@@ -9730,13 +7005,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                 lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[13]);
                                 lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[14]);
                                 lse_max_4[3] = fmaxf(lse_max_4[3], lse_4[15]);
-#if __CUDA_ARCH__ == 1070
-                                bool live_38 = num_splits > 0 && lse_max_4[0] > -CUDART_INF_F;
-                                if (live_38) {
-#else
                                 bool live_37 = num_splits > 0 && lse_max_4[0] > -CUDART_INF_F;
                                 if (live_37) {
-#endif
                                     float weight_148 = approx_exp2(lse_4[0] - lse_max_4[0]);
                                     if (bound_3[0] > 0) {
                                         den_4[0] = den_4[0] + weight_148;
@@ -9758,13 +7028,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_7_7 = num_splits > 1 && lse_max_4[0] > -CUDART_INF_F;
-                                if (live_7_7) {
-#else
                                 bool live_6_7 = num_splits > 1 && lse_max_4[0] > -CUDART_INF_F;
                                 if (live_6_7) {
-#endif
                                     float weight_149 = approx_exp2(lse_4[1] - lse_max_4[0]);
                                     if (bound_3[0] > 1) {
                                         den_4[0] = den_4[0] + weight_149;
@@ -9786,13 +7051,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_8_7 = num_splits > 2 && lse_max_4[0] > -CUDART_INF_F;
-                                if (live_8_7) {
-#else
                                 bool live_7_7 = num_splits > 2 && lse_max_4[0] > -CUDART_INF_F;
                                 if (live_7_7) {
-#endif
                                     float weight_150 = approx_exp2(lse_4[2] - lse_max_4[0]);
                                     if (bound_3[0] > 2) {
                                         den_4[0] = den_4[0] + weight_150;
@@ -9814,13 +7074,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_9_7 = num_splits > 3 && lse_max_4[0] > -CUDART_INF_F;
-                                if (live_9_7) {
-#else
                                 bool live_8_7 = num_splits > 3 && lse_max_4[0] > -CUDART_INF_F;
                                 if (live_8_7) {
-#endif
                                     float weight_151 = approx_exp2(lse_4[3] - lse_max_4[0]);
                                     if (bound_3[0] > 3) {
                                         den_4[0] = den_4[0] + weight_151;
@@ -9842,13 +7097,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_10_7 = num_splits > 0 && lse_max_4[1] > -CUDART_INF_F;
-                                if (live_10_7) {
-#else
                                 bool live_9_7 = num_splits > 0 && lse_max_4[1] > -CUDART_INF_F;
                                 if (live_9_7) {
-#endif
                                     float weight_152 = approx_exp2(lse_4[4] - lse_max_4[1]);
                                     if (bound_3[0] > 0) {
                                         den_4[4] = den_4[4] + weight_152;
@@ -9870,13 +7120,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_11_7 = num_splits > 1 && lse_max_4[1] > -CUDART_INF_F;
-                                if (live_11_7) {
-#else
                                 bool live_10_7 = num_splits > 1 && lse_max_4[1] > -CUDART_INF_F;
                                 if (live_10_7) {
-#endif
                                     float weight_153 = approx_exp2(lse_4[5] - lse_max_4[1]);
                                     if (bound_3[0] > 1) {
                                         den_4[4] = den_4[4] + weight_153;
@@ -9898,13 +7143,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_12_7 = num_splits > 2 && lse_max_4[1] > -CUDART_INF_F;
-                                if (live_12_7) {
-#else
                                 bool live_11_7 = num_splits > 2 && lse_max_4[1] > -CUDART_INF_F;
                                 if (live_11_7) {
-#endif
                                     float weight_154 = approx_exp2(lse_4[6] - lse_max_4[1]);
                                     if (bound_3[0] > 2) {
                                         den_4[4] = den_4[4] + weight_154;
@@ -9926,13 +7166,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_13_7 = num_splits > 3 && lse_max_4[1] > -CUDART_INF_F;
-                                if (live_13_7) {
-#else
                                 bool live_12_7 = num_splits > 3 && lse_max_4[1] > -CUDART_INF_F;
                                 if (live_12_7) {
-#endif
                                     float weight_155 = approx_exp2(lse_4[7] - lse_max_4[1]);
                                     if (bound_3[0] > 3) {
                                         den_4[4] = den_4[4] + weight_155;
@@ -9954,13 +7189,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_14_7 = num_splits > 0 && lse_max_4[2] > -CUDART_INF_F;
-                                if (live_14_7) {
-#else
                                 bool live_13_7 = num_splits > 0 && lse_max_4[2] > -CUDART_INF_F;
                                 if (live_13_7) {
-#endif
                                     float weight_156 = approx_exp2(lse_4[8] - lse_max_4[2]);
                                     if (bound_3[0] > 0) {
                                         den_4[8] = den_4[8] + weight_156;
@@ -9982,13 +7212,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_15_4 = num_splits > 1 && lse_max_4[2] > -CUDART_INF_F;
-                                if (live_15_4) {
-#else
                                 bool live_14_7 = num_splits > 1 && lse_max_4[2] > -CUDART_INF_F;
                                 if (live_14_7) {
-#endif
                                     float weight_157 = approx_exp2(lse_4[9] - lse_max_4[2]);
                                     if (bound_3[0] > 1) {
                                         den_4[8] = den_4[8] + weight_157;
@@ -10010,13 +7235,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_16_4 = num_splits > 2 && lse_max_4[2] > -CUDART_INF_F;
-                                if (live_16_4) {
-#else
                                 bool live_15_4 = num_splits > 2 && lse_max_4[2] > -CUDART_INF_F;
                                 if (live_15_4) {
-#endif
                                     float weight_158 = approx_exp2(lse_4[10] - lse_max_4[2]);
                                     if (bound_3[0] > 2) {
                                         den_4[8] = den_4[8] + weight_158;
@@ -10038,13 +7258,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_17_4 = num_splits > 3 && lse_max_4[2] > -CUDART_INF_F;
-                                if (live_17_4) {
-#else
                                 bool live_16_4 = num_splits > 3 && lse_max_4[2] > -CUDART_INF_F;
                                 if (live_16_4) {
-#endif
                                     float weight_159 = approx_exp2(lse_4[11] - lse_max_4[2]);
                                     if (bound_3[0] > 3) {
                                         den_4[8] = den_4[8] + weight_159;
@@ -10066,13 +7281,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_18_3 = num_splits > 0 && lse_max_4[3] > -CUDART_INF_F;
-                                if (live_18_3) {
-#else
                                 bool live_17_3 = num_splits > 0 && lse_max_4[3] > -CUDART_INF_F;
                                 if (live_17_3) {
-#endif
                                     float weight_160 = approx_exp2(lse_4[12] - lse_max_4[3]);
                                     if (bound_3[0] > 0) {
                                         den_4[12] = den_4[12] + weight_160;
@@ -10094,13 +7304,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_19_2 = num_splits > 1 && lse_max_4[3] > -CUDART_INF_F;
-                                if (live_19_2) {
-#else
                                 bool live_18_3 = num_splits > 1 && lse_max_4[3] > -CUDART_INF_F;
                                 if (live_18_3) {
-#endif
                                     float weight_161 = approx_exp2(lse_4[13] - lse_max_4[3]);
                                     if (bound_3[0] > 1) {
                                         den_4[12] = den_4[12] + weight_161;
@@ -10122,13 +7327,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_20_2 = num_splits > 2 && lse_max_4[3] > -CUDART_INF_F;
-                                if (live_20_2) {
-#else
                                 bool live_19_2 = num_splits > 2 && lse_max_4[3] > -CUDART_INF_F;
                                 if (live_19_2) {
-#endif
                                     float weight_162 = approx_exp2(lse_4[14] - lse_max_4[3]);
                                     if (bound_3[0] > 2) {
                                         den_4[12] = den_4[12] + weight_162;
@@ -10150,13 +7350,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                         }
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                                bool live_21_2 = num_splits > 3 && lse_max_4[3] > -CUDART_INF_F;
-                                if (live_21_2) {
-#else
                                 bool live_20_2 = num_splits > 3 && lse_max_4[3] > -CUDART_INF_F;
                                 if (live_20_2) {
-#endif
                                     float weight_163 = approx_exp2(lse_4[15] - lse_max_4[3]);
                                     if (bound_3[0] > 3) {
                                         den_4[12] = den_4[12] + weight_163;
@@ -10193,26 +7388,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_6 = acc1_k_6 + acc1_4[3];
                                     float inv_8 = 0.0f;
                                     if (den_k_6 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_322 = approx_rcp(den_k_6);
-                                        inv_8 = _rcp_322;
-#else
                                         float _rcp_360 = approx_rcp(den_k_6);
                                         inv_8 = _rcp_360;
-#endif
                                     }
                                     float attn0_6 = (float)(__nv_bfloat16)(acc0_k_6 * inv_8);
                                     float attn1_6 = (float)(__nv_bfloat16)(acc1_k_6 * inv_8);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_324 = approx_exp2((-gate0_4[0]) * 1.442695f);
-                                    float _rcp_323 = approx_rcp(1.0f + _exp2_324);
-                                    float result0_6 = attn0_6 * _rcp_323;
-                                    float _exp2_326 = approx_exp2((-gate1_4[0]) * 1.442695f);
-                                    float _rcp_325 = approx_rcp(1.0f + _exp2_326);
-                                    float result1_6 = attn1_6 * _rcp_325;
-                                    __nv_bfloat162 _bit_cast_src_327 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
-                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_327)[0];
-#else
                                     float _exp2_362 = approx_exp2((-gate0_4[0]) * 1.442695f);
                                     float _rcp_361 = approx_rcp(1.0f + _exp2_362);
                                     float result0_6 = attn0_6 * _rcp_361;
@@ -10221,7 +7401,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_6 = attn1_6 * _rcp_363;
                                     __nv_bfloat162 _bit_cast_src_365 = __float22bfloat162_rn(make_float2(result0_6, result1_6));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_365)[0];
-#endif
                                     long long out_offset_6 = row_i64 * out_stride_row + qo_head_6[0] * out_stride_head + dim_4[0];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_6) + (0)) = word_4[0];
                                 }
@@ -10240,26 +7419,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_7 = acc1_k_7 + acc1_4[7];
                                     float inv_9 = 0.0f;
                                     if (den_k_7 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_328 = approx_rcp(den_k_7);
-                                        inv_9 = _rcp_328;
-#else
                                         float _rcp_366 = approx_rcp(den_k_7);
                                         inv_9 = _rcp_366;
-#endif
                                     }
                                     float attn0_7 = (float)(__nv_bfloat16)(acc0_k_7 * inv_9);
                                     float attn1_7 = (float)(__nv_bfloat16)(acc1_k_7 * inv_9);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_330 = approx_exp2((-gate0_4[1]) * 1.442695f);
-                                    float _rcp_329 = approx_rcp(1.0f + _exp2_330);
-                                    float result0_7 = attn0_7 * _rcp_329;
-                                    float _exp2_332 = approx_exp2((-gate1_4[1]) * 1.442695f);
-                                    float _rcp_331 = approx_rcp(1.0f + _exp2_332);
-                                    float result1_7 = attn1_7 * _rcp_331;
-                                    __nv_bfloat162 _bit_cast_src_333 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
-                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_333)[0];
-#else
                                     float _exp2_368 = approx_exp2((-gate0_4[1]) * 1.442695f);
                                     float _rcp_367 = approx_rcp(1.0f + _exp2_368);
                                     float result0_7 = attn0_7 * _rcp_367;
@@ -10268,7 +7432,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_7 = attn1_7 * _rcp_369;
                                     __nv_bfloat162 _bit_cast_src_371 = __float22bfloat162_rn(make_float2(result0_7, result1_7));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_371)[0];
-#endif
                                     long long out_offset_7 = row_i64 * out_stride_row + qo_head_6[1] * out_stride_head + dim_4[1];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_7) + (0)) = word_4[0];
                                 }
@@ -10287,26 +7450,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_8 = acc1_k_8 + acc1_4[11];
                                     float inv_10 = 0.0f;
                                     if (den_k_8 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_334 = approx_rcp(den_k_8);
-                                        inv_10 = _rcp_334;
-#else
                                         float _rcp_372 = approx_rcp(den_k_8);
                                         inv_10 = _rcp_372;
-#endif
                                     }
                                     float attn0_8 = (float)(__nv_bfloat16)(acc0_k_8 * inv_10);
                                     float attn1_8 = (float)(__nv_bfloat16)(acc1_k_8 * inv_10);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_336 = approx_exp2((-gate0_4[2]) * 1.442695f);
-                                    float _rcp_335 = approx_rcp(1.0f + _exp2_336);
-                                    float result0_8 = attn0_8 * _rcp_335;
-                                    float _exp2_338 = approx_exp2((-gate1_4[2]) * 1.442695f);
-                                    float _rcp_337 = approx_rcp(1.0f + _exp2_338);
-                                    float result1_8 = attn1_8 * _rcp_337;
-                                    __nv_bfloat162 _bit_cast_src_339 = __float22bfloat162_rn(make_float2(result0_8, result1_8));
-                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_339)[0];
-#else
                                     float _exp2_374 = approx_exp2((-gate0_4[2]) * 1.442695f);
                                     float _rcp_373 = approx_rcp(1.0f + _exp2_374);
                                     float result0_8 = attn0_8 * _rcp_373;
@@ -10315,7 +7463,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_8 = attn1_8 * _rcp_375;
                                     __nv_bfloat162 _bit_cast_src_377 = __float22bfloat162_rn(make_float2(result0_8, result1_8));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_377)[0];
-#endif
                                     long long out_offset_8 = row_i64 * out_stride_row + qo_head_6[2] * out_stride_head + dim_4[2];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_8) + (0)) = word_4[0];
                                 }
@@ -10334,26 +7481,11 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     acc1_k_9 = acc1_k_9 + acc1_4[15];
                                     float inv_11 = 0.0f;
                                     if (den_k_9 > 0.0f) {
-#if __CUDA_ARCH__ == 1070
-                                        float _rcp_340 = approx_rcp(den_k_9);
-                                        inv_11 = _rcp_340;
-#else
                                         float _rcp_378 = approx_rcp(den_k_9);
                                         inv_11 = _rcp_378;
-#endif
                                     }
                                     float attn0_9 = (float)(__nv_bfloat16)(acc0_k_9 * inv_11);
                                     float attn1_9 = (float)(__nv_bfloat16)(acc1_k_9 * inv_11);
-#if __CUDA_ARCH__ == 1070
-                                    float _exp2_342 = approx_exp2((-gate0_4[3]) * 1.442695f);
-                                    float _rcp_341 = approx_rcp(1.0f + _exp2_342);
-                                    float result0_9 = attn0_9 * _rcp_341;
-                                    float _exp2_344 = approx_exp2((-gate1_4[3]) * 1.442695f);
-                                    float _rcp_343 = approx_rcp(1.0f + _exp2_344);
-                                    float result1_9 = attn1_9 * _rcp_343;
-                                    __nv_bfloat162 _bit_cast_src_345 = __float22bfloat162_rn(make_float2(result0_9, result1_9));
-                                    word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_345)[0];
-#else
                                     float _exp2_380 = approx_exp2((-gate0_4[3]) * 1.442695f);
                                     float _rcp_379 = approx_rcp(1.0f + _exp2_380);
                                     float result0_9 = attn0_9 * _rcp_379;
@@ -10362,7 +7494,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                                     float result1_9 = attn1_9 * _rcp_381;
                                     __nv_bfloat162 _bit_cast_src_383 = __float22bfloat162_rn(make_float2(result0_9, result1_9));
                                     word_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_383)[0];
-#endif
                                     long long out_offset_9 = row_i64 * out_stride_row + qo_head_6[3] * out_stride_head + dim_4[3];
                                     *(reinterpret_cast<unsigned int*>(out + out_offset_9) + (0)) = word_4[0];
                                 }
@@ -11522,8 +8653,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(k_full_addr + (par) * 8);
-                    mbarrier_arrive(raw_empty_addr + (st) * 8);
+                    mbarrier_arrive(k_full_addr + ((int)((unsigned int)n_1 % 2)) * 8);
+                    mbarrier_arrive(raw_empty_addr + ((int)((unsigned int)n_1 % 4)) * 8);
                 }
             }
         }
@@ -12691,8 +9822,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(v_full_addr + (vs) * 8);
-                    mbarrier_arrive(raw_empty_addr + (st_1) * 8);
+                    mbarrier_arrive(v_full_addr + ((int)((unsigned int)n_2 % 2)) * 8);
+                    mbarrier_arrive(raw_empty_addr + ((int)((unsigned int)n_2 % 4)) * 8);
                 }
             }
         }
@@ -12704,84 +9835,12 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             int g_1 = gtid >> 5;
             int lane_4 = gtid & 31;
             int token = gtid;
-#if __CUDA_ARCH__ == 1070
-            int e_1 = gtid;
-            int head_3 = e_1 >> 5;
-            int c_1 = e_1 & 31;
-            int panel = c_1 >> 3;
-            int cc = c_1 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel * 2048) + (unsigned int)(head_3 * 128 + 16 * cc ^ (head_3 * 128 + 16 * cc >> 7 & 7) << 4))), "r"(qw_regs[0]), "r"(qw_regs[1]), "r"(qw_regs[2]), "r"(qw_regs[3]) : "memory");
-            int e_0 = gtid + 64;
-            int head_1_2 = e_0 >> 5;
-            int c_2 = e_0 & 31;
-            int panel_3 = c_2 >> 3;
-            int cc_4 = c_2 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_3 * 2048) + (unsigned int)(head_1_2 * 128 + 16 * cc_4 ^ (head_1_2 * 128 + 16 * cc_4 >> 7 & 7) << 4))), "r"(qw_regs[4]), "r"(qw_regs[5]), "r"(qw_regs[6]), "r"(qw_regs[7]) : "memory");
-            int e_5 = gtid + 128;
-            int head_6_1 = e_5 >> 5;
-            int c_7 = e_5 & 31;
-            int panel_8 = c_7 >> 3;
-            int cc_9 = c_7 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_8 * 2048) + (unsigned int)(head_6_1 * 128 + 16 * cc_9 ^ (head_6_1 * 128 + 16 * cc_9 >> 7 & 7) << 4))), "r"(qw_regs[8]), "r"(qw_regs[9]), "r"(qw_regs[10]), "r"(qw_regs[11]) : "memory");
-            int e_10 = gtid + 192;
-            int head_11 = e_10 >> 5;
-            int c_12 = e_10 & 31;
-            int panel_13 = c_12 >> 3;
-            int cc_14 = c_12 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_13 * 2048) + (unsigned int)(head_11 * 128 + 16 * cc_14 ^ (head_11 * 128 + 16 * cc_14 >> 7 & 7) << 4))), "r"(qw_regs[12]), "r"(qw_regs[13]), "r"(qw_regs[14]), "r"(qw_regs[15]) : "memory");
-            int e_15_1 = gtid + 256;
-            int head_16_1 = e_15_1 >> 5;
-            int c_17_1 = e_15_1 & 31;
-            int panel_18 = c_17_1 >> 3;
-            int cc_19 = c_17_1 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_18 * 2048) + (unsigned int)(head_16_1 * 128 + 16 * cc_19 ^ (head_16_1 * 128 + 16 * cc_19 >> 7 & 7) << 4))), "r"(qw_regs[16]), "r"(qw_regs[17]), "r"(qw_regs[18]), "r"(qw_regs[19]) : "memory");
-            int e_20 = gtid + 320;
-            int head_21 = e_20 >> 5;
-            int c_22 = e_20 & 31;
-            int panel_23 = c_22 >> 3;
-            int cc_24 = c_22 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_23 * 2048) + (unsigned int)(head_21 * 128 + 16 * cc_24 ^ (head_21 * 128 + 16 * cc_24 >> 7 & 7) << 4))), "r"(qw_regs[20]), "r"(qw_regs[21]), "r"(qw_regs[22]), "r"(qw_regs[23]) : "memory");
-            int e_25 = gtid + 384;
-            int head_26 = e_25 >> 5;
-            int c_27 = e_25 & 31;
-            int panel_28 = c_27 >> 3;
-            int cc_29 = c_27 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_28 * 2048) + (unsigned int)(head_26 * 128 + 16 * cc_29 ^ (head_26 * 128 + 16 * cc_29 >> 7 & 7) << 4))), "r"(qw_regs[24]), "r"(qw_regs[25]), "r"(qw_regs[26]), "r"(qw_regs[27]) : "memory");
-            int e_30 = gtid + 448;
-            int head_31 = e_30 >> 5;
-            int c_32 = e_30 & 31;
-            int panel_33 = c_32 >> 3;
-            int cc_34 = c_32 & 7;
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_q_addr + (unsigned int)(panel_33 * 2048) + (unsigned int)(head_31 * 128 + 16 * cc_34 ^ (head_31 * 128 + 16 * cc_34 >> 7 & 7) << 4))), "r"(qw_regs[28]), "r"(qw_regs[29]), "r"(qw_regs[30]), "r"(qw_regs[31]) : "memory");
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            __syncwarp();
-            if (elect_sync()) {
-                mbarrier_arrive(q_full_addr);
-            }
-#else
             int phys[3];
             int local[3];
-#endif
             int column_1 = split * 64 + token;
             bool in_range = column_1 < topk && tile_end > split;
             int logical = ((in_range) ? idx[0] : -1);
             idx[0] = logical;
-#if __CUDA_ARCH__ == 1070
-            int column_35 = (split + num_splits) * 64 + token;
-            bool in_range_36 = column_35 < topk && tile_end > split + num_splits;
-            int logical_37 = ((in_range_36) ? idx[1] : -1);
-            idx[1] = logical_37;
-            int column_38 = (split + 2 * num_splits) * 64 + token;
-            bool in_range_39 = column_38 < topk && tile_end > split + 2 * num_splits;
-            int logical_40 = ((in_range_39) ? idx[2] : -1);
-            idx[2] = logical_40;
-            int column_41 = (split + 3 * num_splits) * 64 + token;
-            bool in_range_42 = column_41 < topk && tile_end > split + 3 * num_splits;
-            int logical_43 = ((in_range_42) ? idx[3] : -1);
-            idx[3] = logical_43;
-            int phys[3];
-            int local[3];
-#else
             int column_0_1 = (split + num_splits) * 64 + token;
             bool in_range_1 = column_0_1 < topk && tile_end > split + num_splits;
             int logical_2 = ((in_range_1) ? idx[1] : -1);
@@ -12794,7 +9853,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             bool in_range_7 = column_6_1 < topk && tile_end > split + 3 * num_splits;
             int logical_8 = ((in_range_7) ? idx[3] : -1);
             idx[3] = logical_8;
-#endif
             int safe_token = ((idx[0]) > (0) ? (idx[0]) : (0));
             uint32_t _fast_div_q_0 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token);
             uint32_t _fast_div_r_0 = (uint32_t)((unsigned int)safe_token) - _fast_div_q_0 * (uint32_t)(page_div.divisor);
@@ -12804,16 +9862,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             int entry = ((valid_5) ? block_table[safe_request_row + (long long)table_column] : -1);
             phys[0] = entry;
             local[0] = (int)_fast_div_r_0;
-#if __CUDA_ARCH__ == 1070
-            int safe_token_44 = ((idx[1]) > (0) ? (idx[1]) : (0));
-            uint32_t _fast_div_q_1 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token_44), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token_44);
-            uint32_t _fast_div_r_1 = (uint32_t)((unsigned int)safe_token_44) - _fast_div_q_1 * (uint32_t)(page_div.divisor);
-            int page_45 = (int)_fast_div_q_1;
-            bool valid_46 = request_ok && idx[1] >= 0 && page_45 < table_width;
-            int table_column_47 = ((page_45) < (table_width - 1) ? (page_45) : (table_width - 1));
-            int entry_48 = ((valid_46) ? block_table[safe_request_row + (long long)table_column_47] : -1);
-            phys[1] = entry_48;
-#else
             int safe_token_9 = ((idx[1]) > (0) ? (idx[1]) : (0));
             uint32_t _fast_div_q_1 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token_9), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token_9);
             uint32_t _fast_div_r_1 = (uint32_t)((unsigned int)safe_token_9) - _fast_div_q_1 * (uint32_t)(page_div.divisor);
@@ -12822,10 +9870,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             int table_column_12 = ((page_10) < (table_width - 1) ? (page_10) : (table_width - 1));
             int entry_13 = ((valid_11) ? block_table[safe_request_row + (long long)table_column_12] : -1);
             phys[1] = entry_13;
-#endif
             local[1] = (int)_fast_div_r_1;
-#if __CUDA_ARCH__ == 1070
-#else
             int e_1 = gtid;
             int head_7 = e_1 >> 5;
             int c_1 = e_1 & 31;
@@ -12879,7 +9924,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             if (elect_sync()) {
                 mbarrier_arrive(q_full_addr);
             }
-#endif
             unsigned long long kv_head_u64 = (unsigned long long)kv_head;
             unsigned long long data_stride_block_u64 = (unsigned long long)data_stride_block;
             unsigned long long data_stride_token_u64 = (unsigned long long)data_stride_token;
@@ -12900,20 +9944,6 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
             for (int n_3 = 0; n_3 < n_tiles; n_3++) {
                 int st_2 = n_3 % 4;
                 int slot = n_3 & 1;
-#if __CUDA_ARCH__ == 1070
-                int column_0_1 = (split + (n_3 + 4) * num_splits) * 64 + token;
-                bool in_range_1 = column_0_1 < topk && tile_end > split + (n_3 + 4) * num_splits;
-                int safe_column_2 = ((column_0_1) < (topk - 1) ? (column_0_1) : (topk - 1));
-                int logical_2 = ((in_range_1) ? indices[indices_row + (long long)safe_column_2] : -1);
-                int safe_token_3 = ((idx[2]) > (0) ? (idx[2]) : (0));
-                uint32_t _fast_div_q_2 = (page_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)safe_token_3), page_div.multiplier) >> page_div.shift_right) : (uint32_t)((unsigned int)safe_token_3);
-                uint32_t _fast_div_r_2 = (uint32_t)((unsigned int)safe_token_3) - _fast_div_q_2 * (uint32_t)(page_div.divisor);
-                int page_4 = (int)_fast_div_q_2;
-                bool valid_5_1 = request_ok && idx[2] >= 0 && page_4 < table_width;
-                int table_column_6 = ((page_4) < (table_width - 1) ? (page_4) : (table_width - 1));
-                int entry_7 = ((valid_5_1) ? block_table[safe_request_row + (long long)table_column_6] : -1);
-                phys[2] = entry_7;
-#else
                 int column_1_1 = (split + (n_3 + 4) * num_splits) * 64 + token;
                 bool in_range_2 = column_1_1 < topk && tile_end > split + (n_3 + 4) * num_splits;
                 int safe_column_2 = ((column_1_1) < (topk - 1) ? (column_1_1) : (topk - 1));
@@ -12926,13 +9956,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 int table_column_7 = ((page_5) < (table_width - 1) ? (page_5) : (table_width - 1));
                 int entry_8 = ((valid_6) ? block_table[safe_request_row + (long long)table_column_7] : -1);
                 phys[2] = entry_8;
-#endif
                 local[2] = (int)_fast_div_r_2;
-#if __CUDA_ARCH__ == 1070
-                bool valid_8 = phys[0] >= 0 && phys[0] < num_blocks;
-#else
                 bool valid_9 = phys[0] >= 0 && phys[0] < num_blocks;
-#endif
                 int _max_0_1 = ((phys[0]) > (0) ? (phys[0]) : (0));
                 unsigned long long block = (unsigned long long)_max_0_1;
                 unsigned long long local_u64 = (unsigned long long)local[0];
@@ -12943,11 +9968,7 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 unsigned int w2 = (unsigned int)sf_off;
                 unsigned int w3 = (unsigned int)(sf_off >> 32);
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(addr_ring_addr + (unsigned int)(slot * 1024 + token * 16)), "r"(w0), "r"(w1), "r"(w2), "r"(w3) : "memory");
-#if __CUDA_ARCH__ == 1070
-                unsigned int bits_2 = __ballot_sync(0xFFFFFFFF, valid_8);
-#else
                 unsigned int bits_2 = __ballot_sync(0xFFFFFFFF, valid_9);
-#endif
                 if (lane_4 == 0) {
                     slot_valid[slot * 2 + g_1] = bits_2;
                 }
@@ -12960,22 +9981,14 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 mbarrier_wait(valid_empty_addr + (_stage_valid_empty) * 8, _parity_valid_empty);
                 if (gtid < 2) {
                     valid_s[st_2 * 2 + gtid] = slot_valid[slot * 2 + gtid];
-                    mbarrier_arrive(valid_full_addr + (st_2) * 8);
+                    mbarrier_arrive(valid_full_addr + ((int)((unsigned int)n_3 % 4)) * 8);
                 }
-#if __CUDA_ARCH__ == 1070
-                unsigned int bits_9 = slot_valid[slot * 2 + (g_1 >> 1)] >> (unsigned int)(16 * (g_1 & 1));
-#else
                 unsigned int bits_10 = slot_valid[slot * 2 + (g_1 >> 1)] >> (unsigned int)(16 * (g_1 & 1));
-#endif
                 int col = lane_4 & 7;
                 int sub = lane_4 >> 3;
                 int token0 = 16 * g_1 + sub;
                 unsigned int entry_addr = addr_ring_addr + (unsigned int)(slot * 1024 + token0 * 16);
-#if __CUDA_ARCH__ == 1070
-                unsigned int bits_sub = bits_9 >> (unsigned int)sub;
-#else
                 unsigned int bits_sub = bits_10 >> (unsigned int)sub;
-#endif
                 unsigned long long col_off = (unsigned long long)(col * 16);
                 unsigned int stage_base = kv_addr + (unsigned int)(st_2 * 18432);
                 unsigned int dst_k0 = ((stage_base + (unsigned int)(token0 * 144 + col * 16)) < (kv_addr + 73712) ? (stage_base + (unsigned int)(token0 * 144 + col * 16)) : (kv_addr + 73712));
@@ -13020,90 +10033,32 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 unsigned long long k_src_base = k_base + col_off;
                 unsigned long long v_src_base = v_base + col_off;
                 v_bits_a[0] = bits_sub;
-#if __CUDA_ARCH__ == 1070
-                unsigned long long data_off_10 = (unsigned long long)entries_0[0] | (unsigned long long)entries_0[1] << 32;
-#else
                 unsigned long long data_off_11 = (unsigned long long)entries_0[0] | (unsigned long long)entries_0[1] << 32;
-#endif
                 unsigned int src_size = (bits_sub & 1) << 4;
-#if __CUDA_ARCH__ == 1070
-                v_src_a[0] = v_src_base + data_off_10;
-#else
                 v_src_a[0] = v_src_base + data_off_11;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0), "l"(k_src_base + data_off_10), "r"(src_size), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_11 = (unsigned long long)entries_1[0] | (unsigned long long)entries_1[1] << 32;
-                unsigned int src_size_12 = (bits_sub >> 4 & 1) << 4;
-                v_src_a[1] = v_src_base + data_off_11;
-#else
                     :: "r"(dst_k0), "l"(k_src_base + data_off_11), "r"(src_size), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_12 = (unsigned long long)entries_1[0] | (unsigned long long)entries_1[1] << 32;
                 unsigned int src_size_13 = (bits_sub >> 4 & 1) << 4;
                 v_src_a[1] = v_src_base + data_off_12;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0 + 576), "l"(k_src_base + data_off_11), "r"(src_size_12), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_13 = (unsigned long long)entries_2[0] | (unsigned long long)entries_2[1] << 32;
-                unsigned int src_size_14 = (bits_sub >> 8 & 1) << 4;
-                v_src_a[2] = v_src_base + data_off_13;
-#else
                     :: "r"(dst_k0 + 576), "l"(k_src_base + data_off_12), "r"(src_size_13), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_14 = (unsigned long long)entries_2[0] | (unsigned long long)entries_2[1] << 32;
                 unsigned int src_size_15 = (bits_sub >> 8 & 1) << 4;
                 v_src_a[2] = v_src_base + data_off_14;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0 + 1152), "l"(k_src_base + data_off_13), "r"(src_size_14), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_15 = (unsigned long long)entries_3[0] | (unsigned long long)entries_3[1] << 32;
-                unsigned int src_size_16 = (bits_sub >> 12 & 1) << 4;
-                v_src_a[3] = v_src_base + data_off_15;
-#else
                     :: "r"(dst_k0 + 1152), "l"(k_src_base + data_off_14), "r"(src_size_15), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_16 = (unsigned long long)entries_3[0] | (unsigned long long)entries_3[1] << 32;
                 unsigned int src_size_17 = (bits_sub >> 12 & 1) << 4;
                 v_src_a[3] = v_src_base + data_off_16;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0 + 1728), "l"(k_src_base + data_off_15), "r"(src_size_16), "l"(0x12F0000000000000ULL));
-                unsigned long long sf_off_17 = (unsigned long long)sf_entry[2] | (unsigned long long)sf_entry[3] << 32;
-#else
                     :: "r"(dst_k0 + 1728), "l"(k_src_base + data_off_16), "r"(src_size_17), "l"(0x12F0000000000000ULL));
                 unsigned long long sf_off_18 = (unsigned long long)sf_entry[2] | (unsigned long long)sf_entry[3] << 32;
-#endif
                 unsigned long long sf_base = ((sf_is_v) ? v_sf_base : k_sf_base);
                 int sf_side = ((sf_is_v) ? 9216 : 0);
-#if __CUDA_ARCH__ == 1070
-                unsigned int sf_size = (bits_9 >> (unsigned int)sf_lane & 1) << 4;
-#else
                 unsigned int sf_size = (bits_10 >> (unsigned int)sf_lane & 1) << 4;
-#endif
                 unsigned int sf_dst = ((stage_base + (unsigned int)(sf_side + sf_token * 144 + 128)) < (kv_addr + 73712) ? (stage_base + (unsigned int)(sf_side + sf_token * 144 + 128)) : (kv_addr + 73712));
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(sf_dst), "l"(sf_base + sf_off_17), "r"(sf_size), "l"(0x12F0000000000000ULL));
-                unsigned int bits_18 = slot_valid[slot * 2 + (g_1 + 2 >> 1)] >> (unsigned int)(16 * (g_1 + 2 & 1));
-                int col_19 = lane_4 & 7;
-                int sub_20 = lane_4 >> 3;
-                int token0_21 = 16 * (g_1 + 2) + sub_20;
-                unsigned int entry_addr_22 = addr_ring_addr + (unsigned int)(slot * 1024 + token0_21 * 16);
-                unsigned int bits_sub_23 = bits_18 >> (unsigned int)sub_20;
-                unsigned long long col_off_24 = (unsigned long long)(col_19 * 16);
-                unsigned int stage_base_25 = kv_addr + (unsigned int)(st_2 * 18432);
-                unsigned int dst_k0_26 = ((stage_base_25 + (unsigned int)(token0_21 * 144 + col_19 * 16)) < (kv_addr + 73712) ? (stage_base_25 + (unsigned int)(token0_21 * 144 + col_19 * 16)) : (kv_addr + 73712));
-                int sf_lane_27 = lane_4 & 15;
-                bool sf_is_v_28 = lane_4 >= 16;
-                int sf_token_29 = 16 * (g_1 + 2) + sf_lane_27;
-                unsigned int entries_0_30[4];
-                unsigned int entries_1_31[4];
-                unsigned int entries_2_32[4];
-                unsigned int entries_3_33[4];
-                unsigned int sf_entry_34[4];
-#else
                     :: "r"(sf_dst), "l"(sf_base + sf_off_18), "r"(sf_size), "l"(0x12F0000000000000ULL));
                 unsigned int bits_19 = slot_valid[slot * 2 + (g_1 + 2 >> 1)] >> (unsigned int)(16 * (g_1 + 2 & 1));
                 int col_20 = lane_4 & 7;
@@ -13122,77 +10077,31 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 unsigned int entries_2_33[4];
                 unsigned int entries_3_34[4];
                 unsigned int sf_entry_35[4];
-#endif
                 __int128_t _smem_raw_6;
-#if __CUDA_ARCH__ == 1070
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(entry_addr_22));
-                entries_0_30[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
-                entries_0_30[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
-                entries_0_30[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
-                entries_0_30[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
-#else
                 asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(entry_addr_23));
                 entries_0_31[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
                 entries_0_31[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
                 entries_0_31[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
                 entries_0_31[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
-#endif
                 __int128_t _smem_raw_7;
-#if __CUDA_ARCH__ == 1070
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(entry_addr_22 + 64));
-                entries_1_31[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
-                entries_1_31[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
-                entries_1_31[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
-                entries_1_31[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
-#else
                 asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(entry_addr_23 + 64));
                 entries_1_32[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
                 entries_1_32[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
                 entries_1_32[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
                 entries_1_32[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
-#endif
                 __int128_t _smem_raw_8;
-#if __CUDA_ARCH__ == 1070
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_8) : "r"(entry_addr_22 + 128));
-                entries_2_32[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[0];
-                entries_2_32[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[1];
-                entries_2_32[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[2];
-                entries_2_32[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[3];
-#else
                 asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_8) : "r"(entry_addr_23 + 128));
                 entries_2_33[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[0];
                 entries_2_33[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[1];
                 entries_2_33[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[2];
                 entries_2_33[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[3];
-#endif
                 __int128_t _smem_raw_9;
-#if __CUDA_ARCH__ == 1070
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_9) : "r"(entry_addr_22 + 192));
-                entries_3_33[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[0];
-                entries_3_33[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[1];
-                entries_3_33[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[2];
-                entries_3_33[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[3];
-#else
                 asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_9) : "r"(entry_addr_23 + 192));
                 entries_3_34[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[0];
                 entries_3_34[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[1];
                 entries_3_34[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[2];
                 entries_3_34[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_9)[3];
-#endif
                 __int128_t _smem_raw_10;
-#if __CUDA_ARCH__ == 1070
-                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_10) : "r"(addr_ring_addr + (unsigned int)(slot * 1024 + sf_token_29 * 16)));
-                sf_entry_34[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[0];
-                sf_entry_34[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[1];
-                sf_entry_34[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[2];
-                sf_entry_34[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[3];
-                unsigned long long k_src_base_35 = k_base + col_off_24;
-                unsigned long long v_src_base_36 = v_base + col_off_24;
-                v_bits_b[0] = bits_sub_23;
-                unsigned long long data_off_37 = (unsigned long long)entries_0_30[0] | (unsigned long long)entries_0_30[1] << 32;
-                unsigned int src_size_38 = (bits_sub_23 & 1) << 4;
-                v_src_b[0] = v_src_base_36 + data_off_37;
-#else
                 asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_10) : "r"(addr_ring_addr + (unsigned int)(slot * 1024 + sf_token_30 * 16)));
                 sf_entry_35[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[0];
                 sf_entry_35[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[1];
@@ -13204,166 +10113,76 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                 unsigned long long data_off_38 = (unsigned long long)entries_0_31[0] | (unsigned long long)entries_0_31[1] << 32;
                 unsigned int src_size_39 = (bits_sub_24 & 1) << 4;
                 v_src_b[0] = v_src_base_37 + data_off_38;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0_26), "l"(k_src_base_35 + data_off_37), "r"(src_size_38), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_39 = (unsigned long long)entries_1_31[0] | (unsigned long long)entries_1_31[1] << 32;
-                unsigned int src_size_40 = (bits_sub_23 >> 4 & 1) << 4;
-                v_src_b[1] = v_src_base_36 + data_off_39;
-#else
                     :: "r"(dst_k0_27), "l"(k_src_base_36 + data_off_38), "r"(src_size_39), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_40 = (unsigned long long)entries_1_32[0] | (unsigned long long)entries_1_32[1] << 32;
                 unsigned int src_size_41 = (bits_sub_24 >> 4 & 1) << 4;
                 v_src_b[1] = v_src_base_37 + data_off_40;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0_26 + 576), "l"(k_src_base_35 + data_off_39), "r"(src_size_40), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_41 = (unsigned long long)entries_2_32[0] | (unsigned long long)entries_2_32[1] << 32;
-                unsigned int src_size_42 = (bits_sub_23 >> 8 & 1) << 4;
-                v_src_b[2] = v_src_base_36 + data_off_41;
-#else
                     :: "r"(dst_k0_27 + 576), "l"(k_src_base_36 + data_off_40), "r"(src_size_41), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_42 = (unsigned long long)entries_2_33[0] | (unsigned long long)entries_2_33[1] << 32;
                 unsigned int src_size_43 = (bits_sub_24 >> 8 & 1) << 4;
                 v_src_b[2] = v_src_base_37 + data_off_42;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0_26 + 1152), "l"(k_src_base_35 + data_off_41), "r"(src_size_42), "l"(0x12F0000000000000ULL));
-                unsigned long long data_off_43 = (unsigned long long)entries_3_33[0] | (unsigned long long)entries_3_33[1] << 32;
-                unsigned int src_size_44 = (bits_sub_23 >> 12 & 1) << 4;
-                v_src_b[3] = v_src_base_36 + data_off_43;
-#else
                     :: "r"(dst_k0_27 + 1152), "l"(k_src_base_36 + data_off_42), "r"(src_size_43), "l"(0x12F0000000000000ULL));
                 unsigned long long data_off_44 = (unsigned long long)entries_3_34[0] | (unsigned long long)entries_3_34[1] << 32;
                 unsigned int src_size_45 = (bits_sub_24 >> 12 & 1) << 4;
                 v_src_b[3] = v_src_base_37 + data_off_44;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_k0_26 + 1728), "l"(k_src_base_35 + data_off_43), "r"(src_size_44), "l"(0x12F0000000000000ULL));
-                unsigned long long sf_off_45 = (unsigned long long)sf_entry_34[2] | (unsigned long long)sf_entry_34[3] << 32;
-                unsigned long long sf_base_46 = ((sf_is_v_28) ? v_sf_base : k_sf_base);
-                int sf_side_47 = ((sf_is_v_28) ? 9216 : 0);
-                unsigned int sf_size_48 = (bits_18 >> (unsigned int)sf_lane_27 & 1) << 4;
-                unsigned int sf_dst_49 = ((stage_base_25 + (unsigned int)(sf_side_47 + sf_token_29 * 144 + 128)) < (kv_addr + 73712) ? (stage_base_25 + (unsigned int)(sf_side_47 + sf_token_29 * 144 + 128)) : (kv_addr + 73712));
-#else
                     :: "r"(dst_k0_27 + 1728), "l"(k_src_base_36 + data_off_44), "r"(src_size_45), "l"(0x12F0000000000000ULL));
                 unsigned long long sf_off_46 = (unsigned long long)sf_entry_35[2] | (unsigned long long)sf_entry_35[3] << 32;
                 unsigned long long sf_base_47 = ((sf_is_v_29) ? v_sf_base : k_sf_base);
                 int sf_side_48 = ((sf_is_v_29) ? 9216 : 0);
                 unsigned int sf_size_49 = (bits_19 >> (unsigned int)sf_lane_28 & 1) << 4;
                 unsigned int sf_dst_50 = ((stage_base_26 + (unsigned int)(sf_side_48 + sf_token_30 * 144 + 128)) < (kv_addr + 73712) ? (stage_base_26 + (unsigned int)(sf_side_48 + sf_token_30 * 144 + 128)) : (kv_addr + 73712));
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(sf_dst_49), "l"(sf_base_46 + sf_off_45), "r"(sf_size_48), "l"(0x12F0000000000000ULL));
-#else
                     :: "r"(sf_dst_50), "l"(sf_base_47 + sf_off_46), "r"(sf_size_49), "l"(0x12F0000000000000ULL));
-#endif
                 asm volatile(
                     "{\n\t"
                     "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
                     "}"
-                    :: "r"(raw_full_k_addr + (st_2) * 8) : "memory");
-#if __CUDA_ARCH__ == 1070
-                int col_50 = lane_4 & 7;
-                int sub_51 = lane_4 >> 3;
-                int token0_52 = 16 * g_1 + sub_51;
-                unsigned int dst_v0 = ((kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_52 * 144 + col_50 * 16)) < (kv_addr + 73712) ? (kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_52 * 144 + col_50 * 16)) : (kv_addr + 73712));
-                unsigned int src_size_53 = (v_bits_a[0] & 1) << 4;
-#else
+                    :: "r"(raw_full_k_addr + ((int)((unsigned int)n_3 % 4)) * 8) : "memory");
                 int col_51 = lane_4 & 7;
                 int sub_52 = lane_4 >> 3;
                 int token0_53 = 16 * g_1 + sub_52;
                 unsigned int dst_v0 = ((kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_53 * 144 + col_51 * 16)) < (kv_addr + 73712) ? (kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_53 * 144 + col_51 * 16)) : (kv_addr + 73712));
                 unsigned int src_size_54 = (v_bits_a[0] & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0), "l"(v_src_a[0]), "r"(src_size_53), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_54 = (v_bits_a[0] >> 4 & 1) << 4;
-#else
                     :: "r"(dst_v0), "l"(v_src_a[0]), "r"(src_size_54), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_55 = (v_bits_a[0] >> 4 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0 + 576), "l"(v_src_a[1]), "r"(src_size_54), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_55 = (v_bits_a[0] >> 8 & 1) << 4;
-#else
                     :: "r"(dst_v0 + 576), "l"(v_src_a[1]), "r"(src_size_55), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_56 = (v_bits_a[0] >> 8 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0 + 1152), "l"(v_src_a[2]), "r"(src_size_55), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_56 = (v_bits_a[0] >> 12 & 1) << 4;
-#else
                     :: "r"(dst_v0 + 1152), "l"(v_src_a[2]), "r"(src_size_56), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_57 = (v_bits_a[0] >> 12 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0 + 1728), "l"(v_src_a[3]), "r"(src_size_56), "l"(0x12F0000000000000ULL));
-                int col_57 = lane_4 & 7;
-                int sub_58 = lane_4 >> 3;
-                int token0_59 = 16 * (g_1 + 2) + sub_58;
-                unsigned int dst_v0_60 = ((kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_59 * 144 + col_57 * 16)) < (kv_addr + 73712) ? (kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_59 * 144 + col_57 * 16)) : (kv_addr + 73712));
-                unsigned int src_size_61 = (v_bits_b[0] & 1) << 4;
-#else
                     :: "r"(dst_v0 + 1728), "l"(v_src_a[3]), "r"(src_size_57), "l"(0x12F0000000000000ULL));
                 int col_58 = lane_4 & 7;
                 int sub_59 = lane_4 >> 3;
                 int token0_60 = 16 * (g_1 + 2) + sub_59;
                 unsigned int dst_v0_61 = ((kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_60 * 144 + col_58 * 16)) < (kv_addr + 73712) ? (kv_addr + (unsigned int)(st_2 * 18432 + 9216 + token0_60 * 144 + col_58 * 16)) : (kv_addr + 73712));
                 unsigned int src_size_62 = (v_bits_b[0] & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0_60), "l"(v_src_b[0]), "r"(src_size_61), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_62 = (v_bits_b[0] >> 4 & 1) << 4;
-#else
                     :: "r"(dst_v0_61), "l"(v_src_b[0]), "r"(src_size_62), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_63 = (v_bits_b[0] >> 4 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0_60 + 576), "l"(v_src_b[1]), "r"(src_size_62), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_63 = (v_bits_b[0] >> 8 & 1) << 4;
-#else
                     :: "r"(dst_v0_61 + 576), "l"(v_src_b[1]), "r"(src_size_63), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_64 = (v_bits_b[0] >> 8 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0_60 + 1152), "l"(v_src_b[2]), "r"(src_size_63), "l"(0x12F0000000000000ULL));
-                unsigned int src_size_64 = (v_bits_b[0] >> 12 & 1) << 4;
-#else
                     :: "r"(dst_v0_61 + 1152), "l"(v_src_b[2]), "r"(src_size_64), "l"(0x12F0000000000000ULL));
                 unsigned int src_size_65 = (v_bits_b[0] >> 12 & 1) << 4;
-#endif
                 asm volatile("cp.async.cg.shared::cta.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
-#if __CUDA_ARCH__ == 1070
-                    :: "r"(dst_v0_60 + 1728), "l"(v_src_b[3]), "r"(src_size_64), "l"(0x12F0000000000000ULL));
-#else
                     :: "r"(dst_v0_61 + 1728), "l"(v_src_b[3]), "r"(src_size_65), "l"(0x12F0000000000000ULL));
-#endif
                 asm volatile(
                     "{\n\t"
                     "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
                     "}"
-                    :: "r"(raw_full_v_addr + (st_2) * 8) : "memory");
+                    :: "r"(raw_full_v_addr + ((int)((unsigned int)n_3 % 4)) * 8) : "memory");
                 idx[0] = idx[1];
                 idx[1] = idx[2];
                 idx[2] = idx[3];
-#if __CUDA_ARCH__ == 1070
-                idx[3] = logical_2;
-#else
                 idx[3] = logical_3;
-#endif
                 phys[0] = phys[1];
                 phys[1] = phys[2];
                 local[0] = local[1];
@@ -13524,8 +10343,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_s), "r"(_smem_desc_lo_4), "r"(tmem_tmem_k + 96), "r"(1), "r"(_elected_0) : "memory");
-                    tcgen05_commit_leader(k_empty_addr, _elected_0);
-                    tcgen05_commit_leader(s_full_addr, _elected_0);
+                    tcgen05_commit_leader(k_empty_addr + ((int)((unsigned int)n_4 % 2)) * 8, _elected_0);
+                    tcgen05_commit_leader(s_full_addr + ((int)((unsigned int)n_4 % 2)) * 8, _elected_0);
                 } else {
                     uint32_t _elected_5 = elect_sync();
 #if __CUDA_ARCH__ == 1070
@@ -13664,8 +10483,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"((tmem_tmem_s + (1048592))), "r"(_smem_desc_lo_9), "r"(tmem_tmem_k + 1048672), "r"(1), "r"(_elected_5) : "memory");
-                    tcgen05_commit_leader(k_empty_addr + 8, _elected_5);
-                    tcgen05_commit_leader(s_full_addr + 8, _elected_5);
+                    tcgen05_commit_leader(k_empty_addr + ((int)((unsigned int)n_4 % 2)) * 8, _elected_5);
+                    tcgen05_commit_leader(s_full_addr + ((int)((unsigned int)n_4 % 2)) * 8, _elected_5);
                 }
             }
         }
@@ -13768,8 +10587,8 @@ kernel_cake_qsa_nvfp4_b56eb690df0312fb5df3(__nv_bfloat16* __restrict__ q, uint8_
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_3_1), "r"(_smem_desc_lo_4_1), "r"((tmem_tmem_o + (16))), "r"(((first_pv) ? 0 : 1)), "r"(_elected_0) : "memory");
-                tcgen05_commit_leader(v_empty_addr + (vs_1) * 8, _elected_0);
-                tcgen05_commit_leader(pv_done_addr + (ps) * 8, _elected_0);
+                tcgen05_commit_leader(v_empty_addr + ((int)((unsigned int)n_5 % 2)) * 8, _elected_0);
+                tcgen05_commit_leader(pv_done_addr + ((int)((unsigned int)n_5 % 2)) * 8, _elected_0);
             }
             mbarrier_wait(tmem_dead_addr, 0);
             asm volatile("tcgen05.fence::after_thread_sync;");
