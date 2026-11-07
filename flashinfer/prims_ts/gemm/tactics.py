@@ -383,9 +383,14 @@ def config_from_tactic(
     head_dim: Optional[int],
     is_neox: Optional[bool],
     has_qkv_scale: bool,
+    enable_pdl: bool,
     tactic: Tactic,
 ) -> PrimsTsGemmConfig:
-    """Build a config. Default warp and stage counts stay ``None``."""
+    """Build a config. Default warp and stage counts stay ``None``.
+
+    ``enable_pdl`` is not a tactic axis: every tactic is tuned and launched in
+    the mode the caller resolved.
+    """
     (
         cluster_m,
         cluster_n,
@@ -418,6 +423,7 @@ def config_from_tactic(
         tmem_overlap=overlap,
         ab_stages=None if stages == derived_stages else stages,
         use_tma_store=use_tma_store,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -431,6 +437,7 @@ def fallback_config(
     head_dim: Optional[int],
     is_neox: Optional[bool],
     has_qkv_scale: bool,
+    enable_pdl: bool,
 ) -> PrimsTsGemmConfig:
     """Today's default: tile N 256, CLC on, overlap off, ``mma_k`` 64."""
     return config_from_tactic(
@@ -442,5 +449,6 @@ def fallback_config(
         head_dim=head_dim,
         is_neox=is_neox,
         has_qkv_scale=has_qkv_scale,
+        enable_pdl=enable_pdl,
         tactic=default_tactic(arch, operand_format, output_format, epilogue),
     )
