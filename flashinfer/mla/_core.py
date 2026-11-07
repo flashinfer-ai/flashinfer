@@ -2053,7 +2053,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         query-token order. On SM120/SM121 (``sparse`` backend) the query is
         processed per token and per-token sparse indices fully determine
         visibility, so ``cum_seq_lens_q`` and ``max_q_len`` are accepted for
-        call-site compatibility but do not affect the result.
+        call-site compatibility and do not change what each row attends to.
+        The output is still not invariant to batch composition on either
+        SM120 backend: the split plan is chosen per call from the total row
+        count, so the same row decoded in a batch of a different size (for
+        example ``q_len > 1`` versus ``q_len == 1``) can differ in the last
+        bits from the reduction order (1 to 2 BF16 ULP observed).
     max_q_len : Optional[int]
         Maximum query length in the varlen batch. Required with
         ``cum_seq_lens_q``.
