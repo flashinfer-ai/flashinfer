@@ -3482,11 +3482,9 @@ def test_router_units_policy(monkeypatch):
     )
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
         (1, 224, "simt_n128m64s2"),
-        (16172, 16384, "det_s16"),
     )
     assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] == (
         (1, 288, "simt_n64m64s2"),
-        (16172, 16384, "det_s16"),
     )
     for arch in ("sm_100a", "sm_103a"):
         for hidden in (4096, 5120, 6144):
@@ -3625,10 +3623,10 @@ def test_router_units_policy(monkeypatch):
 # hold, the token count takes the next window that holds it
 # fmt: off
 ROUTER_WGRAD_WINDOWS = {
-    ("sm_100a", 4096): ((1, 224, "simt_n128m64s2"), (16172, 16384, "det_s16")),
+    ("sm_100a", 4096): ((1, 224, "simt_n128m64s2"),),
     ("sm_100a", 5120): ((1, 256, "simt_n64m64s2"), (1, 128, "waves")),
     ("sm_100a", 6144): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
-    ("sm_103a", 4096): ((1, 288, "simt_n64m64s2"), (16172, 16384, "det_s16")),
+    ("sm_103a", 4096): ((1, 288, "simt_n64m64s2"),),
     ("sm_103a", 5120): ((1, 192, "simt_n64m64s2"), (1, 192, "waves")),
     ("sm_103a", 6144): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
 }
@@ -13155,8 +13153,8 @@ def test_k1_no_order_varying_plan_on_bench_rows():
 
 #: The ``"det_s<n>"`` windows of the router tables: ``(arch, sm_count) -> {hidden: (min_tokens, max_tokens, splits)}``.
 ROUTER_DET_WINDOWS = {
-    ("sm_100a", 152): {4096: (16172, 16384, 16), 6144: (16129, 16384, 6)},
-    ("sm_103a", 152): {4096: (16172, 16384, 16), 6144: (16129, 16384, 6)},
+    ("sm_100a", 152): {6144: (16129, 16384, 6)},
+    ("sm_103a", 152): {6144: (16129, 16384, 6)},
     ("sm_100a", 148): {4096: (16384, 16384, 16), 6144: (16129, 16384, 6)},
     ("sm_103a", 148): {6144: (16129, 16384, 6)},
     ("sm_107a", 212): {5120: (16172, 16384, 12)},
@@ -13209,7 +13207,7 @@ def test_router_det_split_windows():
 @pytest.mark.parametrize(
     "arch, sms, H, T",
     [
-        ("sm_103a", 152, 4096, 16231),
+        ("sm_103a", 152, 6144, 16231),
         ("sm_100a", 152, 6144, 16384),
         ("sm_100a", 148, 4096, 16384),
         ("sm_107a", 212, 5120, 16172),

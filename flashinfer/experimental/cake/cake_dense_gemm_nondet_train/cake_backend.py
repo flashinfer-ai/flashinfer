@@ -1932,10 +1932,11 @@ class _VerdictTable(dict):
 #: (:func:`router_det_splits`): the partials added in a fixed order, so the result repeats bit for bit.  Its accuracy
 #: was checked against the reference implementation (FlashInfer commit ``2e989556``) on six input kinds (random
 #: normal, long sums, mirrored and permuted cancellation, concentrated values, values near the largest magnitude):
-#: within 1.1 times the reference's median error on every kind.  Hidden 4096 takes 16 splits at 16172 to 16384 tokens
-#: (1.5 to 4 % faster than six on GB200 and GB300 parts), hidden 6144 six splits from 16129 to 16384 tokens, where the
-#: deterministic package's three splits missed that check on every kind (up to 2.0 times) and six, the reference's
-#: count, met it at 1 to 3 % more time.  Hidden 5120 keeps the deterministic package's nine splits there.  The
+#: within 1.1 times the reference's median error on every kind.  Hidden 6144 takes six splits from 16129 to 16384
+#: tokens, where the deterministic package's three splits missed that check on every kind (up to 2.0 times) and six,
+#: the reference's count, met it at 1 to 3 % more time.  Hidden 5120 keeps the deterministic package's nine splits
+#: there, and hidden 4096 its six: 16 splits also met the check but took 1.00 to 1.02 times the time of six through
+#: this package's entry on GB200 and GB300 parts (CUDA graph replays, 16172 to 16384 tokens).  The
 #: head/tail partitions these rows ran before (hidden 5120 ``"H0.5x3"`` on both architectures, ``sm_103a`` hidden 4096
 #: ``"H1x4p44"`` and 6144 ``"H1x5p44"``, ``sm_107a`` hidden 5120 ``"H0.5x4"``) were 3 to 23 % faster than the
 #: deterministic program but varied run to run and missed the check (up to 1.94 times the reference's error), so the
@@ -2052,10 +2053,10 @@ ROUTER_RULES: dict[
     #   than the deterministic plan through it, in every run on one part (no slower in the backward pass and the
     #   checkpointed step, 1.4 to 2.0 % faster alone in CUDA graphs); at 16385 and 20480 tokens (six splits) it was
     #   no slower than that plan: the window is 16385 to 20480 tokens.
-    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (16172, 16384, "det_s16")),
+    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
     ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
-    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (16172, 16384, "det_s16")),
+    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves")),
     ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
     ("sm_107a", "nn_t", 4096, 256): None,
