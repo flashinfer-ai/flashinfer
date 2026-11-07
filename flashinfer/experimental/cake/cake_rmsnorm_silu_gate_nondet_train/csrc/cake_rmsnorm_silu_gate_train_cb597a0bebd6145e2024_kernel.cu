@@ -50,18 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_FOLD32_OFF 1024
-#define SMEM_FOLD32_STAGE_BYTES 4096
-#define SMEM_FOLD32_STRIDE 4096
-#define SMEM_PART_OFF 5120
-#define SMEM_PART_STAGE_BYTES 512
-#define SMEM_PART_STRIDE 512
-#define SMEM_RECV_OFF 5632
-#define SMEM_RECV_STAGE_BYTES 512
-#define SMEM_RECV_STRIDE 512
-#define SMEM_TOTAL 6144
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -204,7 +192,7 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* fold32 = reinterpret_cast<float*>(smem_raw + 1024);
     const int fold32_addr = smem + 1024;
     float* part = reinterpret_cast<float*>(smem_raw + 5120);
@@ -212,8 +200,7 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
     float* recv = reinterpret_cast<float*>(smem_raw + 5632);
     const int recv_addr = smem + 5632;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
-    // Mbarriers at smem_raw[0..8)
+    // Mbarrier init (1 barriers at smem_raw[0..8))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -375,9 +362,9 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("neg.f32 %0, %1;" : "=f"(_neg_11) : "f"(zs_0[2]));
         float mz_0;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(mz_0) : "f"(_neg_9), "f"(_neg_10), "f"(_neg_11));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(mz_0) : "f"(_neg_9), "f"(_neg_10), "f"(_neg_11));
         float _abs_13;
         asm("abs.f32 %0, %1;" : "=f"(_abs_13) : "f"(zs_0[0]));
         float _neg_12;
@@ -392,18 +379,18 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("neg.f32 %0, %1;" : "=f"(_neg_16) : "f"(_abs_17));
         float ma_0;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(ma_0) : "f"(_neg_12), "f"(_neg_14), "f"(_neg_16));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(ma_0) : "f"(_neg_12), "f"(_neg_14), "f"(_neg_16));
         float _neg_19;
         asm("neg.f32 %0, %1;" : "=f"(_neg_19) : "f"(zs_0[3]));
         float _neg_20;
         asm("neg.f32 %0, %1;" : "=f"(_neg_20) : "f"(zs_0[4]));
         float _max3_18;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_18) : "f"(mz_0), "f"(_neg_19), "f"(_neg_20));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_18) : "f"(mz_0), "f"(_neg_19), "f"(_neg_20));
         mz_0 = _max3_18;
         float _abs_23;
         asm("abs.f32 %0, %1;" : "=f"(_abs_23) : "f"(zs_0[3]));
@@ -415,9 +402,9 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("neg.f32 %0, %1;" : "=f"(_neg_24) : "f"(_abs_25));
         float _max3_21;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_21) : "f"(ma_0), "f"(_neg_22), "f"(_neg_24));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_21) : "f"(ma_0), "f"(_neg_22), "f"(_neg_24));
         ma_0 = _max3_21;
         float _neg_27;
         asm("neg.f32 %0, %1;" : "=f"(_neg_27) : "f"(zs_0[5]));
@@ -425,9 +412,9 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("neg.f32 %0, %1;" : "=f"(_neg_28) : "f"(zs_0[6]));
         float _max3_26;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(mz_0), "f"(_neg_27), "f"(_neg_28));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(mz_0), "f"(_neg_27), "f"(_neg_28));
         mz_0 = _max3_26;
         float _abs_31;
         asm("abs.f32 %0, %1;" : "=f"(_abs_31) : "f"(zs_0[5]));
@@ -439,9 +426,9 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("neg.f32 %0, %1;" : "=f"(_neg_32) : "f"(_abs_33));
         float _max3_29;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(ma_0), "f"(_neg_30), "f"(_neg_32));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(ma_0), "f"(_neg_30), "f"(_neg_32));
         ma_0 = _max3_29;
         float _neg_35;
         asm("neg.f32 %0, %1;" : "=f"(_neg_35) : "f"(zs_0[7]));
@@ -463,18 +450,18 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("abs.f32 %0, %1;" : "=f"(_abs_41) : "f"(zs_0[2]));
         float mp_0;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(mp_0) : "f"(_abs_39), "f"(_abs_40), "f"(_abs_41));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(mp_0) : "f"(_abs_39), "f"(_abs_40), "f"(_abs_41));
         float _abs_43;
         asm("abs.f32 %0, %1;" : "=f"(_abs_43) : "f"(zs_0[3]));
         float _abs_44;
         asm("abs.f32 %0, %1;" : "=f"(_abs_44) : "f"(zs_0[4]));
         float _max3_42;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_42) : "f"(mp_0), "f"(_abs_43), "f"(_abs_44));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_42) : "f"(mp_0), "f"(_abs_43), "f"(_abs_44));
         mp_0 = _max3_42;
         float _abs_46;
         asm("abs.f32 %0, %1;" : "=f"(_abs_46) : "f"(zs_0[5]));
@@ -482,9 +469,9 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
         asm("abs.f32 %0, %1;" : "=f"(_abs_47) : "f"(zs_0[6]));
         float _max3_45;
         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-        #error "Max3Nan requires PTX three-input max.f32 support on sm_100+"
+        #error "Max3 requires PTX three-input max.f32 support on sm_100+"
         #endif
-        asm("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_45) : "f"(mp_0), "f"(_abs_46), "f"(_abs_47));
+        asm volatile("max.NaN.f32 %0, %1, %2, %3;" : "=f"(_max3_45) : "f"(mp_0), "f"(_abs_46), "f"(_abs_47));
         mp_0 = _max3_45;
         float _abs_49;
         asm("abs.f32 %0, %1;" : "=f"(_abs_49) : "f"(zs_0[7]));
@@ -861,7 +848,7 @@ kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024(__nv_bfloat16* __restri
             packed_dz_0[_lp + 3] = *(uint32_t*)&_bf2;
         }
         if (row_0 < rows) {
-            long long orow_0 = (long long)row_0 * 128 + (long long)col;
+            long long orow_0 = (long long)row_0 * 128ll + (long long)col;
             reinterpret_cast<int4*>(dx + orow_0)[0] = reinterpret_cast<int4*>(packed_dx_0)[0];
             reinterpret_cast<int4*>(dz + orow_0)[0] = reinterpret_cast<int4*>(packed_dz_0)[0];
         }
