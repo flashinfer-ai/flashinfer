@@ -3345,8 +3345,9 @@ def test_router_units_policy(monkeypatch):
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
     # hidden 5120 "H0.5x4" on sm_107a (108 head + 432 tail units on 216 SMs; 106 + 424 on 212 and 104 + 416 on 208,
-    # ROUTER_RULES_BY_SM); hidden 6144 "H0.5x4" on 212-SM sm_107a parts; sm_100a / sm_103a hidden 5120 (their "H0.5x3"
-    # windows end at 12288 tokens and start at 16232), sm_100a hidden 4096 and 6144 (their SIMT windows end at 224 and
+    # ROUTER_RULES_BY_SM); hidden 6144 "H0.5x4" on 212-SM sm_107a parts; sm_100a hidden 5120 "H0.5x3" (76 head + 228
+    # tail units, its window from 10240 to 16384 tokens); sm_103a hidden 5120 (its "H0.5x3" window starts at 16232),
+    # sm_100a hidden 4096 and 6144 (their SIMT windows end at 224 and
     # 256 tokens), sm_103a hidden 6144 (no head/tail window), hidden 6144 on the other sm_107a parts, sm_103a hidden
     # 4096 (its window starts at 20480 tokens) and sm_107a hidden 4096: the deterministic plan
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 6144, 256)] == (
@@ -3390,34 +3391,36 @@ def test_router_units_policy(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_103a", sm_count=152, M=4096, N=256, K=20480
     ) == (44 + 4 * 76, 22, round(16 * 640 * 44 / 76))
-    # hidden 5120 "H0.5x3" (76 head + 228 tail units): sm_100a at 12288 tokens (384 K blocks), the last token count of
-    # its window, and sm_103a at 16232 (508 K blocks), the first of its window; at 16231 both rows run the deterministic
-    # program (nine splits), and sm_100a one token after its window
+    # hidden 5120 "H0.5x3" (76 head + 228 tail units): sm_100a at 16231 tokens (508 K blocks) and 16384 (512), the last
+    # token count of its first window, and sm_103a at 16232 (508 K blocks), the first of its window; at 16231 sm_103a
+    # runs the deterministic program (nine splits)
     assert cake_backend.router_partition(
-        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=12288
-    ) == (304, 38, 20 * 384 // 2)
+        "nn_t", arch="sm_100a", sm_count=152, **wgrad5120
+    ) == (304, 38, 20 * 508 // 2)
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=16384
+    ) == (304, 38, 20 * 512 // 2)
     assert cake_backend.router_partition(
         "nn_t", arch="sm_103a", sm_count=152, M=5120, N=256, K=16232
     ) == (304, 38, 20 * 508 // 2)
-    # sm_100a hidden 5120 again from 16385 tokens (513 K blocks) to 28672 (896 K blocks)
+    # sm_100a hidden 5120 again from 16400 tokens (513 K blocks) to 28672 (896 K blocks)
     assert cake_backend.router_partition(
-        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=16385
+        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=16400
     ) == (304, 38, 20 * 513 // 2)
     assert cake_backend.router_partition(
         "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=28672
     ) == (304, 38, 20 * 896 // 2)
-    for T in (12289, 16384, 28673):
+    for T in (10239, 16385, 16399, 28673):
         assert (
             cake_backend.router_partition(
                 "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=T
             )
             is None
         ), T
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            cake_backend.router_partition("nn_t", arch=arch, sm_count=152, **wgrad5120)
-            is None
-        ), arch
+    assert (
+        cake_backend.router_partition("nn_t", arch="sm_103a", sm_count=152, **wgrad5120)
+        is None
+    )
     assert cake_backend.router_partition(
         "nn_t", arch="sm_107a", sm_count=216, **wgrad5120
     ) == (540, 54, 20 * 508 // 2)
@@ -3562,8 +3565,8 @@ ROUTER_WGRAD_WINDOWS = {
     ("sm_100a", 5120): (
         (1, 256, "simt_n64m64s2"),
         (1, 128, "waves"),
-        (10240, 12288, "H0.5x3"),
-        (16385, 28672, "H0.5x3"),
+        (10240, 16384, "H0.5x3"),
+        (16400, 28672, "H0.5x3"),
     ),
     ("sm_100a", 6144): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", 4096): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
@@ -4544,11 +4547,13 @@ ROUTER_SPLIT_RULE_WINDOW_EDGES = {
     ("sm_100a", 10239): False,
     ("sm_100a", 10240): True,
     ("sm_100a", 12288): True,
-    ("sm_100a", 12289): False,
-    ("sm_100a", 16128): False,
-    ("sm_100a", 16129): False,
-    ("sm_100a", 16384): False,
-    ("sm_100a", 16385): True,
+    ("sm_100a", 12289): True,
+    ("sm_100a", 16128): True,
+    ("sm_100a", 16129): True,
+    ("sm_100a", 16384): True,
+    ("sm_100a", 16385): False,
+    ("sm_100a", 16399): False,
+    ("sm_100a", 16400): True,
     ("sm_100a", 28672): True,
     ("sm_100a", 28673): False,
     ("sm_103a", 16171): False,
@@ -4565,10 +4570,10 @@ ROUTER_SPLIT_RULE_WINDOW_EDGES = {
 def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
     """On 152-SM sm_100a / sm_103a parts the weight gradient (256 experts) at the token counts of the deterministic
     package's ``ROUTER_SPLIT_RULES`` rows (16129 to 16384 tokens: nine splits at hidden 5120, three at hidden 6144)
-    runs this package's head/tail program only where a window was measured against that count and kept: sm_103a
-    hidden 5120 "H0.5x3" from 16232 tokens.  Every other rule-row token count -- sm_100a hidden 5120 (its windows end
-    at 12288 and start again at 16385), sm_103a hidden 5120 below 16232, hidden 6144 on both (no head/tail window) --
-    runs the deterministic program at the deterministic package's count of the row."""
+    runs this package's head/tail program only where a window was measured against that count and kept: sm_100a
+    hidden 5120 "H0.5x3" at every one of them (its window 10240 to 16384 tokens) and sm_103a hidden 5120 from 16232
+    tokens.  Every other rule-row token count -- sm_103a hidden 5120 below 16232, hidden 6144 on both (no head/tail
+    window) -- runs the deterministic program at the deterministic package's count of the row."""
 
     def part(arch, hidden, T):
         return cake_backend.router_partition(
@@ -4583,7 +4588,7 @@ def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
     def det_splits(arch, hidden, T):
         return det_backend.router_splits("nn_t", hidden, 256, T, arch, 152)
 
-    seen, own = set(), set()
+    seen, own = set(), {"sm_100a": set(), "sm_103a": set()}
     for arch in ("sm_100a", "sm_103a"):
         for hidden in (5120, 6144):
             rule = det_backend.ROUTER_SPLIT_RULES.get((arch, 152, "nn_t", hidden))
@@ -4593,7 +4598,7 @@ def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
                     case = (arch, hidden, T)
                     assert det_splits(arch, hidden, T) == splits, case
                     seen.add((arch, hidden, splits))
-                    if (arch, hidden) == ("sm_103a", 5120) and T >= 16232:
+                    if hidden == 5120 and (arch == "sm_100a" or T >= 16232):
                         k_iters = -(-T // 32)
                         assert spec(arch, hidden, T) == "H0.5x3", case
                         assert part(arch, hidden, T) == (
@@ -4601,7 +4606,7 @@ def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
                                 "H0.5x3", 20, 2, k_iters, 152
                             )
                         ), case
-                        own.add(T)
+                        own[arch].add(T)
                         continue
                     assert spec(arch, hidden, T) is None, case
                     assert part(arch, hidden, T) is None, case
@@ -4611,7 +4616,10 @@ def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
         ("sm_103a", 5120, 9),
         ("sm_103a", 6144, 3),
     }
-    assert own == set(range(16232, 16385))
+    assert own == {
+        "sm_100a": set(range(16129, 16385)),
+        "sm_103a": set(range(16232, 16385)),
+    }
     # the hidden-5120 window edges next to those rows
     for (arch, T), holds in ROUTER_SPLIT_RULE_WINDOW_EDGES.items():
         k_iters = -(-T // 32)
@@ -4770,7 +4778,7 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
     plan, _ = cake_backend.plan_atomic_router(G.t(), X5, torch.zeros(N, 5120), **kw)
     assert plan.template == "router_fp32_gemm_atomic_nn_t_ht_c3_nreg"
     # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs; sm_100a at 12288
-    # tokens, the last token count of its first window, sm_103a at 16232, the first of its window); sm_103a runs the
+    # tokens, inside its first window, sm_103a at 16232, the first token count of its window); sm_103a runs the
     # head/tail program with the A parts in tensor memory, and the deterministic program while this checkout does not
     # register it
     templates = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES

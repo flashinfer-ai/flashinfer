@@ -1693,7 +1693,7 @@ ROUTER_RULES: dict[
     # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
     # 10240 was not added).  On sm_100a the window ended at 16384 tokens: measured again against six splits, it was
     # up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to 6.9 % at 32768 (16385 to
-    # 24575 tokens not measured); its windows are 10240 to 12288 and 16385 to 28672 tokens now (below).
+    # 24575 tokens not measured); its windows are 10240 to 16384 and 16400 to 28672 tokens now (below).
     # Hidden 4096 on sm_100a keeps the deterministic plan above its SIMT window: the head/tail partition with 44 head
     # units and five tail units per CTA pair ("H1x5p44"), measured again against the current deterministic plan at
     # 10240 to 16384 tokens, left the checkpointed step (two forwards and the backward pass) up to 2.7 % slower in
@@ -1720,11 +1720,19 @@ ROUTER_RULES: dict[
     # paired sign test, p < 0.05, with a median time ratio below 0.99) and the backward pass and the checkpointed step
     # were no slower (pooled median ratio at most 1.013, no run slower than the slowest run of that plan against
     # itself); next to a resident kernel it was up to 4.5 % slower at some kept token counts (data, not a condition
-    # here).  A window ends at kept token counts and holds no token count that missed:
-    # - sm_100a hidden 5120 "H0.5x3": kept at 12288 tokens, missed at 16128 (alone, one eager run, against six
-    #   splits) and at 16384 (against nine: alone in eager launches, and the checkpointed step in CUDA graphs), kept at
-    #   16385, 16400, 18432, 20480, 24576 and 28672 (against six), missed at 32768 (the checkpointed step in CUDA graphs
-    #   on one part): the windows are 10240 to 12288 and 16385 to 28672 tokens.
+    # here).  A window ends at kept token counts and holds no token count that missed.  The comparison is what a caller
+    # gets: the window through this package's entry against the deterministic plan through it; alone in eager launches
+    # the entry adds about 14 us to the head/tail program and about 6 us to the deterministic plan, while a direct call
+    # of the deterministic program's binding adds under 1 us, so a miss alone in eager launches against that binding
+    # alone does not remove a window:
+    # - sm_100a hidden 5120 "H0.5x3": main's window (10240 to 16384 tokens) measured again with these tables on two
+    #   parts: faster than the deterministic plan through this package's entry at 12289, 16128 and 16384 tokens on
+    #   both parts, alone, in the backward pass and in the checkpointed step, eager and in CUDA graphs (at 16129 on one
+    #   part; on the other one eager checkpointed-step run was 3.3 % slower), and at 10240, 11264 and 12288 faster than
+    #   the deterministic program in CUDA graphs, in the backward pass and in the checkpointed step (alone in eager
+    #   launches it missed against that program's binding only); kept at 16400, 18432, 20480, 24576 and 28672 (against
+    #   six), missed at 16385 (one eager checkpointed-step run on one part) and at 32768 (the checkpointed step in CUDA
+    #   graphs on one part): the windows are 10240 to 16384 and 16400 to 28672 tokens.
     # - sm_103a hidden 5120 "H0.5x3": missed at 16172 and 16231 tokens (alone, one eager run each, against nine
     #   splits), kept at 16232 and 16384 (against nine) and at 16385, 24576 and 32768 (against six): the window is
     #   16232 to 32768 tokens.
@@ -1732,7 +1740,7 @@ ROUTER_RULES: dict[
     #   (against six), kept at 20480 only: no window.
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
     ("sm_100a", "nn_t", 5120, 256): (
-        (1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 12288, "H0.5x3"), (16385, 28672, "H0.5x3"),
+        (1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3"), (16400, 28672, "H0.5x3"),
     ),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
