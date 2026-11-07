@@ -3096,8 +3096,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
     # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
     # rule names the architecture with its own thresholds (distinct thresholds but for one shared by a
-    # program with a token floor and one without, at most four routed programs without a token floor and at
-    # most two with one), one program selected per channel count and token count -- the highest threshold at
+    # program with a token floor and one without, at most five routed programs without a token floor -- the
+    # sm_107a backward has five since its 520 channel band's copy -- and at most two with one), one program
+    # selected per channel count and token count -- the highest threshold at
     # most C whose token floor (if any) S meets, the floored program first at a shared one, the fallback
     # below the lowest.
     for arch in loader.ARCHES:
@@ -3125,7 +3126,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
                     )
                     owners.setdefault(threshold, {})[floored] = name
             unfloored = {name for name in rules if rules[name] and name not in floors}
-            assert len(unfloored) <= 4, (arch, kind, unfloored)
+            assert len(unfloored) <= 5, (arch, kind, unfloored)
             assert len(floors) <= 2, (arch, kind, floors)
             for S in sorted({1, *(floor for _, floor in floors.values())}):
                 previous = fallbacks[0]
