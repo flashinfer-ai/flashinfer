@@ -708,9 +708,16 @@ def _eight_warp_program(cake_template, plan, arch):
     )
     if not form_rule.get("form"):
         return cake_template
+    # the batched rows' head-interleaved raster where it divides the batch count, with the rule's store hint
+    group = form_rule.get("batch_group") or 0
+    raster = (
+        dict(batch_group=group, store_hint=form_rule.get("store_hint", "none"))
+        if group > 1 and plan.L % group == 0
+        else {}
+    )
     return cake_backend.instance_symbol(
         cake_backend.instance_key(
-            a_mn=False, b_mn=True, epi="tma", slots=1, form=form_rule["form"]
+            a_mn=False, b_mn=True, epi="tma", slots=1, form=form_rule["form"], **raster
         )
     )
 
@@ -1606,6 +1613,34 @@ def test_round15_store_hint_knob():
         _fallback=False,
     )
     assert b200.store_hint == "none" and "_so" not in _nopro(b200.template)
+    # the sm_100a / sm_103a rules of the batched MLA rows (64 heads): the eight-warp programs with the head interleave,
+    # over all 64 heads for the absorbed-query forward and over 8 heads with the evict_last stores for the
+    # value-projection input gradient (raster group 4 on sm_100a, 2 on sm_103a); served by registered programs
+    for arch, sm_count in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)):
+        for row, op, template, group, group_m in (
+            ("qabs", "fwd", "dense_proj_det_gemm_kn_n256_tma1_bg64_w8rs", 64, 2),
+            (
+                "vproj",
+                "dgrad",
+                "dense_proj_det_gemm_kn_n256_tma1_bg8_sol_w8rs",
+                8,
+                4 if arch == "sm_100a" else 2,
+            ),
+        ):
+            v = _views("mla", row, op, "bf16", 1001)
+            gb, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=sm_count,
+                l2_bytes=L2_BYTES,
+                arch=arch,
+                _fallback=False,
+            )
+            where = (arch, sm_count, row, op)
+            assert gb.template == template and gb.batch_group == group, where
+            assert gb.group_m == group_m and gb.form == "w8rs", where
+            assert template in cake_jit.KERNELS[arch], where
 
 
 def test_round15_pd_sh_knobs():
@@ -8816,7 +8851,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         dict(**kn, cta1=True, form="w8r"),
         dict(**kn, out_f32=True, form="w8r"),
         dict(a_mn=False, b_mn=True, block_n=128, epi="tma", slots=1, form="w8r"),
-        dict(**kn, batch_group=4, form="w8r"),
+        dict(**kn, batch_group=1, form="w8r"),
+        dict(**kn, batch_group=1, store_hint="evict_last", form="w8rs"),
+        dict(**kn, batch_group=8, store_hint="evict_first", form="w8rs"),
         dict(**kn, pd=2, form="w8rs"),
         dict(**kn, pro=15, form="w8rs"),
         dict(**kn, lw=True, pro=15, form="w8rs"),
@@ -8829,6 +8866,30 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     ):
         with pytest.raises(ValueError, match=r"form"):
             cake_backend.instance_key(**bad)
+    # the head-interleaved batch raster (G > 1) and, with it, the evict_last store hint are the eight-warp kernel's
+    # own knobs (the batched MLA programs): ``_bg<G>`` / ``_sol`` before the form token, decoded back
+    for knobs_bg, symbol in (
+        (dict(batch_group=8, form="w8r"), "dense_proj_det_gemm_kn_n256_tma1_bg8_w8r"),
+        (
+            dict(batch_group=64, form="w8rs"),
+            "dense_proj_det_gemm_kn_n256_tma1_bg64_w8rs",
+        ),
+        (
+            dict(batch_group=8, store_hint="evict_last", form="w8rs"),
+            "dense_proj_det_gemm_kn_n256_tma1_bg8_sol_w8rs",
+        ),
+    ):
+        assert (
+            cake_backend.instance_symbol(cake_backend.instance_key(**kn, **knobs_bg))
+            == symbol
+        )
+        decoded = cake_backend._template_knobs(symbol)
+        assert decoded is not None, symbol
+        assert (decoded["form"], decoded["batch_group"], decoded["store_hint"]) == (
+            knobs_bg["form"],
+            knobs_bg["batch_group"],
+            knobs_bg.get("store_hint", "none"),
+        ), symbol
     # the symbol decoder reads the form back and names the program again; a token the form refuses (``_pro15`` with
     # it) decodes to a key ``instance_key`` refuses
     knobs = cake_backend._template_knobs("dense_proj_det_gemm_kn_n256_tma1_w8r")
