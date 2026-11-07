@@ -108,9 +108,20 @@ repeats bit for bit for the same inputs on the same device.
 | `fwd_mid` | persistent forward, at most 6 CTAs per SM, each at most 2 blocks of 16 rows | from 976 rows per SM (800 on `sm_107a`) |
 | `fwd_long` | persistent forward, at most 3 CTAs per SM, each at most 6 blocks of 32 rows | from 2400 rows per SM on `sm_100a` and `sm_103a` |
 | `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | from 3000 rows per SM on `sm_103a`, 1740 on `sm_107a` |
-| `bwd_bf16_short` | one cluster of 16 CTAs, the weight gradient summed on chip, no workspace | up to 256 rows, a BF16 weight gradient or `compute_grad_weight=False` |
-| `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
+| `bwd_bf16_t512`, `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its bands (at most 512) |
+| `bwd_bf16_t1024`, `bwd_f32_t1024` | exact tiny backward of 8 teams | the rows of its bands (at most 1024) |
+| `bwd_bf16_short` | tiny backward: one cluster of 16 CTAs of 256 threads, the weight gradient summed on chip, no workspace; BF16 weight gradient only | the rows of its bands |
+| `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | past the bands, while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
 | `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time | past 8 chunks per SM |
+
+The small-row backward bands (`BACKWARD_BANDS`, rows per call; a call with
+`compute_grad_weight=False` takes the BF16 bands):
+
+| architecture | BF16 weight gradient | FP32 weight gradient |
+| --- | --- | --- |
+| `sm_100a` | 1-192 `t512`, 193-256 `short`, 257-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-1024 `t1024` |
+| `sm_103a` | 1-512 `short`, 513-620 `t1024` | 1-512 `t512`, 513-720 `t1024` |
+| `sm_107a` | 1-120 `t512`, 121-256 `short`, 257-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-900 `t1024` |
 
 The backward cuts the rows into 8-row blocks and the blocks into the
 deterministic backward's chunks: `blocks_per_chunk = max(1, ceil(blocks /
@@ -122,9 +133,8 @@ fewer chunks; the bits do not depend on which CTA runs a chunk.
 ## Workspace
 
 The static and the claimed backward need a workspace, also with
-`compute_grad_weight=False`; the short backward reads none, so a call of up to
-256 rows with a BF16 weight gradient or with `compute_grad_weight=False` uses
-no workspace.  A workspace is a zero-filled, contiguous `torch.uint8` CUDA tensor of
+`compute_grad_weight=False`; the small-row backwards read none, so a call in a
+small-row band uses no workspace.  A workspace is a zero-filled, contiguous `torch.uint8` CUDA tensor of
 29192 bytes whatever `T * H`, starting at a 16-byte aligned address:
 
 | buffer | dtype | elements | byte offset |

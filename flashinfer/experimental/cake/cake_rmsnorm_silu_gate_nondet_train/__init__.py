@@ -43,12 +43,17 @@ integers does not depend on its order), and rounds the exact sum once into
 package's bits except where the exact sum lies within its FP64 sum's error of
 a rounding boundary.  An infinite or ``NaN`` partial makes its column's
 ``dw`` infinite or ``NaN`` with the class the FP64 sum gives it (a ``NaN``'s
-sign and payload need not be its).  Up to 256 rows the backward of a BF16
-weight gradient, and of a call with ``compute_grad_weight=False``, is one
-thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same arithmetic,
-that sums the weight gradient on chip in a fixed order (CTA ``r`` adds every CTA's FP32
-partial of its eight columns in rank order in FP64 and rounds once), the same
-bits on every call.
+sign and payload need not be its).  A call of few rows runs a small-row
+backward instead (``cake_jit.BACKWARD_BANDS``: up to 1024 rows on sm_100a
+and sm_107a and 620 on sm_103a with a BF16 weight gradient or with
+``compute_grad_weight=False``, up to 1024, 720 and 900 rows on sm_100a,
+sm_103a and sm_107a with an FP32 one): one thread-block cluster of 16 CTAs,
+its ``dx`` and ``dz`` the same arithmetic, that sums the weight gradient on
+chip in a fixed order and rounds it once, the same bits on every call.  The
+exact tiny backward (4 or 8 teams of the deterministic backward's 128-thread
+CTA a CTA) adds the deterministic backward's chunk partials in its reduction
+order in FP64; the tiny backward (BF16 weight gradient only, 256-thread
+CTAs) adds every CTA's FP32 partial of a column in rank order in FP64.
 
 Mode: the mode is part of the name (``nondet``).  No entry point takes a
 ``deterministic`` keyword (passing one is a ``TypeError``), and no call of this
@@ -70,11 +75,9 @@ Host design (the input layout rules are the deterministic package's):
   arrival ticket and the claim counter.  Every launch of the static and the
   claimed backward takes a ticket (and the claimed one claims its chunks from
   the counter), also one with ``compute_grad_weight=False``, so it uses a
-  workspace.  The short backward takes none (up to 256 rows with a BF16
-  weight gradient or with ``compute_grad_weight=False``): it reads no
-  workspace, and a
-  caller workspace passed to it is checked as for any backward and left as it
-  is.  The kernel leaves all of it zero, so a workspace zeroed once serves
+  workspace.  The small-row backwards take none: they read no workspace,
+  and a caller workspace passed to one is checked as for any backward and
+  left as it is.  The kernel leaves all of it zero, so a workspace zeroed once serves
   every later call on its stream, of any shape and either weight-gradient
   dtype, and every CUDA Graph replay, with no host write.  A caller workspace
   must come from :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`
@@ -85,9 +88,9 @@ Host design (the input layout rules are the deterministic package's):
 - Retained state (FlashInfer issue #7039): the autograd function saves only
   ``x``, ``z`` and ``weight`` through ``save_for_backward``, so a non-reentrant
   checkpointed forward keeps nothing but its output.  A backward without a
-  caller workspace that runs a module taking one (every module but the short
-  backward; ``compute_grad_weight=False`` included: it runs the BF16
-  weight gradient's modules, the short backward up to 256 rows) uses the
+  caller workspace that runs a module taking one (every module but the
+  small-row backwards; ``compute_grad_weight=False`` included: it runs the
+  BF16 weight gradient's modules) uses the
   zero-filled workspace of its (device,
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 29192 bytes each, at most one per
@@ -121,9 +124,11 @@ Host design (the input layout rules are the deterministic package's):
   ``b + G``, ..., while every chunk has a CTA, and the claimed backward past
   that, thread 0 of every CTA claiming runs of chunks with a relaxed atomic
   increment on the workspace's claim counter, so a CTA that starts late takes
-  fewer chunks; the BF16 short backward one cluster of 16 256-thread CTAs
-  (``cake_jit.backward_ctas`` 16), CTA ``r`` taking row block ``r``, its CTAs
-  scheduled together on the SMs of one GPC.  No kernel is cooperative; no
+  fewer chunks; a small-row backward one cluster of 16 CTAs
+  (``cake_jit.backward_ctas`` 16) scheduled together on the SMs of one GPC:
+  the tiny backward's 256-thread CTA ``r`` running the 16-row blocks ``r``,
+  ``r + 16``, ..., and team ``q`` of the exact tiny backward's CTA ``r`` the
+  8-row block ``r + 16 q``.  No kernel is cooperative; no
   call synchronizes the host or the device, and every kernel runs on the
   current torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548): a kernel
@@ -483,7 +488,7 @@ def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
 
 # The workspaces of calls without a caller workspace (every launch of the
 # static and the claimed backward needs one: it takes the arrival ticket, and
-# the claimed one claims its chunks; the short backward needs none): one per
+# the claimed one claims its chunks; the small-row backwards need none): one per
 # (device, stream, backward module), zero-filled once and kept for the process
 # (29192 bytes each, one per backward module a stream ran).  Every backward
 # leaves its workspace zero and the calls of one stream run in order, so they
@@ -749,7 +754,7 @@ def _backward(
     }
     blocks_per_chunk = 0
     if not workspace_bytes(name):
-        # The short backward sums the weight gradient on chip: no workspace (a
+        # A small-row backward sums the weight gradient on chip: no workspace (a
         # caller's is checked and left as it is).
         if workspace is not None:
             _check_workspace(workspace, device, _workspace_bytes(arch))
@@ -823,10 +828,10 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     (adding ``grad_weight``'s value first when accumulating; FP32, then BF16
     for a BF16 ``dw``) and zeroes the workspace.  Every output repeats bit for
     bit.  Every call with rows uses a workspace, also with
-    ``compute_grad_weight=False``, but one of up to 256 rows with a BF16
-    weight gradient or with ``compute_grad_weight=False``: there one cluster
-    of 16 CTAs runs (summing a weight gradient on chip in a fixed order) and
-    uses none.  The arguments are those of
+    ``compute_grad_weight=False``, but one of few rows
+    (``cake_jit.BACKWARD_BANDS``, by architecture and weight-gradient dtype):
+    there one cluster of 16 CTAs runs (summing a weight gradient on chip in a
+    fixed order) and uses none.  The arguments are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_backward`;
     ``workspace`` is this package's uint8 buffer
     (:func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`) or ``None`` (the

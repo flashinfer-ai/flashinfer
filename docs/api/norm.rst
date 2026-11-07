@@ -365,9 +365,10 @@ inputs, and within the deterministic package's absolute bounds.
   so it does not depend on the grid or on the order in which CTAs finish.  Up
   to 64 rows per SM every chunk has its own CTA; past that the CTAs claim runs
   of chunks at run time, so a CTA slowed by a kernel on another stream takes
-  fewer.  Up to 256 rows with a BF16 weight gradient, or with
-  ``compute_grad_weight=False``, the backward is one thread-block cluster of
-  16 CTAs that sums on chip and takes no workspace.
+  fewer.  Up to 1024 rows on SM100 and SM107 and 620 on SM103 with a BF16
+  weight gradient or with ``compute_grad_weight=False`` (up to 1024, 720 and
+  900 rows with an FP32 one), the backward is one thread-block cluster of 16
+  CTAs that sums on chip and takes no workspace.
 * The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
   is a zero-filled ``torch.uint8`` tensor of 29192 bytes whatever the token
   count, zero after every call: zero it once and reuse it, one per

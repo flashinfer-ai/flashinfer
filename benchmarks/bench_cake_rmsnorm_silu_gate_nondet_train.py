@@ -37,8 +37,10 @@ Each package picks its kernels from the rows and the SM count.  The
 non-deterministic forward runs its short forward up to 12 rows per SM on
 SM100 and SM103 (59 on SM107), its plain forward above that, and from 976 rows
 per SM on SM100 and SM103 (800 on SM107) a persistent forward (the mid, long
-or extra-long one).  Its backward runs one cluster of 16 CTAs up to 256 rows
-(with a BF16 weight gradient or ``compute_grad_weight=False``), else one kernel of at most 8 CTAs per SM over
+or extra-long one).  Its backward runs one cluster of 16 CTAs up to 1024 rows
+on SM100 and SM107 and 620 on SM103 (with a BF16 weight gradient or
+``compute_grad_weight=False``; 1024, 720 and 900 rows with an FP32 one),
+else one kernel of at most 8 CTAs per SM over
 chunks of rows: the static backward while every chunk has a CTA, the claimed
 backward past that.  At ``--heads 48`` the default token counts reach every
 one of these kernels that a 148-SM B200 routes (all but the extra-long
@@ -104,8 +106,9 @@ API = {
 }
 MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
-# The issue's token counts and a spread around them, then small and irregular ones.
-TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 7, 129, 1031, 4097)
+# The issue's token counts and a spread around them, then small and irregular ones
+# (at 48 heads 1, 5, 7 and 16 tokens reach each of B200's small-row backwards).
+TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 4097)
 
 
 def _stats(fn: Callable[[], object]) -> dict:
