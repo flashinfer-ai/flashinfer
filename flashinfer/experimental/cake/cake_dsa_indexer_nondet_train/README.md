@@ -10,11 +10,13 @@ top-k 2048.  Tracking issue: flashinfer-ai/flashinfer#5676.
 This package runs the deterministic package's BF16 scan programs and its plain
 split merge unchanged.  It leaves out the ordering pass, which is the
 deterministic package's finalize / rank finalize that sorts every row into
-ascending id order.  Nothing else changes.  The scores are the same, and each
-row holds the same selected set in a different slot order.  The package
-implements the set-equality semantics of flashinfer-ai/flashinfer#8946
-(point 4): per row, the set of selected `(id, score bits)` pairs repeats bit
-for bit, but the slot order does not.
+ascending id order.  One more change is on `sm_107a`: the l6 and CTA-pair l6
+scan programs draw every work unit from a ticket word instead of keeping the
+deterministic programs' static unit enumeration (see "Ticket tail").  The
+scores are the same, and each row holds the same selected set in a different
+slot order.  The package implements the set-equality semantics of
+flashinfer-ai/flashinfer#8946 (point 4): per row, the set of selected
+`(id, score bits)` pairs repeats bit for bit, but the slot order does not.
 
 The entry points of `flashinfer.cake_dsa_indexer_nondet_train` are stable
 APIs.  This backend package under `flashinfer/experimental/cake/` is
@@ -265,8 +267,11 @@ The choice goes through the registry's per-architecture `POLICY` record
 deterministic package's rules without its finalize, rank and FP8 rules.  A
 call therefore gets the same scan program, candidate capacity, check period,
 split count, CTA pair and ticket plan that the deterministic package picks for
-it.  Most rules use one estimate, the mean key tiles per work unit:
-`(Tkv - T / (2 ratio)) / S / 128`.
+it.  Two exceptions are on `sm_107a`.  The l6 and CTA-pair l6 keys run the
+ticket twins of the deterministic programs.  The sampled tile count and rank
+shift follow this package's own `sample_class_rule` and `sample_long_rule`
+(whether a call samples does not change).  Most rules use one estimate, the
+mean key tiles per work unit: `(Tkv - T / (2 ratio)) / S / 128`.
 
 | decision | rule (record fields) |
 |---|---|
@@ -280,7 +285,7 @@ it.  Most rules use one estimate, the mean key tiles per work unit:
 | descending walk | the descending-walk twin of the decided program (key kind `<kind>_desc`: the same unit, split, pair, tile unroll and fit form) where `desc_walk_kinds` names the physical kind for the call's sampling mode and the twin is registered (sm_103a: the `wide` unit with the sampled first threshold off); the plan, the knobs and the workspace stay |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
-| sampled tiles and rank shift | tiles: `sample_tiles_tiny_units` up to `sample_dispatch_tiny_tiles_max` mean unit tiles, `sample_tiles_short_units` up to `sample_dispatch_mean_tiles_max`, else `sample_tiles_max`.  Shift: `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`.  Where the record sets `sample_class_rule` (sm_100a, sm_103a), the wide-unit programs take its shift on packed calls, and the tiny dispatch class (packed calls of at most 4096 queries per segment and at most `sample_dispatch_tiny_tiles_max` mean unit tiles) takes its tile count and shift.  Explicit knobs override all of these.  Whether sampling is on enters the rules above.  The tile count and the shift are launch scalars only: they set how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or the selected set.  Unsampled calls do not read the shift |
+| sampled tiles and rank shift | tiles: `sample_tiles_tiny_units` up to `sample_dispatch_tiny_tiles_max` mean unit tiles, `sample_tiles_short_units` up to `sample_dispatch_mean_tiles_max`, else `sample_tiles_max`.  Shift: `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`.  Where the record sets `sample_class_rule` (sm_100a, sm_103a: `[8, 500]`; sm_107a: `[32, 500]`), the wide-unit programs take its shift on packed calls, and the tiny dispatch class (packed calls of at most 4096 queries per segment and at most `sample_dispatch_tiny_tiles_max` mean unit tiles) takes its tile count and shift.  Where the record sets `sample_long_rule` (sm_107a: `[["l6"], 500]`), a call of more than `sample_dispatch_mean_tiles_max` mean unit tiles whose physical kind the rule names takes its shift.  On sm_107a these two rules keep every rank input of flashinfer-ai/flashinfer#7549 at or below its time with sampling off.  Explicit knobs override all of these.  Whether sampling is on enters the rules above.  The tile count and the shift are launch scalars only: they set how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or the selected set.  Unsampled calls do not read the shift |
 | candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), rounded up to whole tiles.  It is raised to `cand_cap_floor` slots, or to `cand_cap_floor_rule[1]` slots from `top_k >= cand_cap_floor_rule[0]` on where the record sets that rule.  On `sm_100a` the 16384-slot floor applies from `top_k = 1024` on and smaller `top_k` keep 8192; `sm_103a` keeps its 16384-slot floor on every `top_k`.  It is lowered to `cand_cap_ceiling` slots where the record sets one: the multiplier becomes `ceiling // top_k`, so the buffer stops growing with `top_k` once it holds the ceiling.  With the sampled first threshold off (`sample_tiles_max=0`), the `candidate_multiplier_unsampled` / `cand_mult_rule_unsampled` / `cand_cap_floor_unsampled` / `cand_cap_ceiling_unsampled` values apply instead.  An explicit `candidate_multiplier` knob replaces the multiplier |
 | check period | default `min(check_period_max, (cand_cap - top_k) // 128, cand_cap // check_period_cap_divisor)`, at least 1, or the kind's `check_period_kind_overrides` value clamped to the exactness bound; an explicit `check_period` must lie in `[1, limit]` (the kernel's headroom rule) |
 
@@ -328,11 +333,16 @@ before the record is frozen.
   caching allocator.  A call without keys fills its outputs with padding (two
   fills) instead of launching.
 * **Ticket tail**.  On all three architectures (`TICKET_TAIL_ARCHES`), the
-  scan programs draw every work unit from a ticket word.  The exception is
-  the programs of the record's `static_scan_kinds` (on `sm_107a`, the l6 and
-  CTA-pair l6 programs), which keep the static unit enumeration and get no
-  tail.  Every completed scan launch leaves the word at 0.  How the word is
-  reset depends on the workspace:
+  scan programs draw every work unit from a ticket word.  A record's
+  `static_scan_kinds` would name the kinds whose programs keep the static
+  unit enumeration and get no tail; no record names one.  The deterministic
+  package keeps the static enumeration in its `sm_107a` l6 and CTA-pair l6
+  programs.  Here those keys run ticket twins: the same scans, built to draw
+  every unit from their ticket block.  So a call that shares the GPU with
+  another stream slows with the SMs that stream holds, not by a whole extra
+  wave of work units (flashinfer-ai/flashinfer#7548).  Every completed scan
+  launch leaves the word at 0.  How the word is reset depends on the
+  workspace:
   * Backend-owned workspace: the tail is zeroed once, when the runner is
     prepared.  The eager entry prepares a one-shot runner, so this happens
     once per eager call.
@@ -369,6 +379,9 @@ registry `cake_jit.py` and `build.json`.  Every program is one of the
 deterministic package's BF16 scan programs or its plain split merge.  It is
 exported under this package's prefix as `cake_dsa_indexer_nondet_topk_<20 hex>`
 and keeps the twenty-hex identity of the deterministic program it comes from.
+The exceptions are the six `sm_107a` ticket twins of the deterministic l6 and
+CTA-pair l6 programs.  Each is a program of its own, with its own twenty-hex
+identity.
 Programs that differ only in a few constants share one kernel translation
 unit.  Programs whose launchers differ only in the kernel symbol, the
 host-shim namespace and the launch constants share one binding.  Each

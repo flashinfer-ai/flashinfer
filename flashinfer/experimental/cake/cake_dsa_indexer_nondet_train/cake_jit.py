@@ -24,7 +24,10 @@ from . import cake_build
 # Registry of the generated Cake DSA indexer programs of the non-deterministic
 # package: the BF16 scan programs and the plain split merge of the deterministic
 # package, each under this package's prefix ``cake_dsa_indexer_nondet_topk``
-# with the same twenty-hex identity.  No program orders a row: the scan writes
+# with the same twenty-hex identity -- but the sm_107a l6 and CTA-pair l6 keys,
+# whose deterministic programs keep the static unit enumeration, name their
+# ticket twins (the same builds drawing every work unit from their
+# ``TicketWord`` block, each a program of its own).  No program orders a row: the scan writes
 # the selected entries of an unsplit row and its tail padding straight into the
 # outputs, the plain merge those of a split row, so the registry carries no
 # finalize (ascending-id sort) and no rank-fused merge program.  The kernel and
@@ -590,6 +593,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_permille": 250,
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
+        "sample_long_rule": None,
         "lsf_programs": True,
         "static_scan_kinds": [],
         "far_sample": 0,
@@ -648,6 +652,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_permille": 250,
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
+        "sample_long_rule": None,
         "lsf_programs": True,
         "static_scan_kinds": [],
         "far_sample": 0,
@@ -721,7 +726,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
         "sample_shift_rule": None,
-        "sample_class_rule": None,
+        "sample_class_rule": [32, 500],
+        "sample_long_rule": [["l6"], 500],
         "lsf_programs": False,
         "static_scan_kinds": [],
         "far_sample": 0,

@@ -1077,13 +1077,14 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
 
 def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
     """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
-    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
-    architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
+    programs keep the static enumeration there, each a kind the architecture registers, and a kind with an ``:lsf``
+    copy is never static (the copy reorders ticket draws).  No record names one: every scan program draws its work
+    units, the sm_107a l6 and CTA-pair l6 programs from their ``TicketWord`` block (flashinfer-ai/flashinfer#7548)."""
     assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
     assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "pair_l6"],
+        "sm_107a": [],
     }
     # prepare decides a call's tail from this per-architecture set (made once per process)
     for arch in cake_jit.POLICY:
@@ -1097,6 +1098,44 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
         for kind in policy_for(arch).static_scan_kinds:
             assert kind in kinds and kind not in lsf_kinds, (arch, kind)
+
+
+def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
+    """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift, and the long-unit l6 calls (the two-segment 262144-key
+    document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
+    of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
+    architectures set no long-unit rule."""
+    assert policy_for("sm_100a").sample_long_rule is None
+    assert policy_for("sm_103a").sample_long_rule is None
+    arch, grid = "sm_107a", _FROZEN_GRIDS["sm_107a"][0]
+    policy = policy_for(arch)
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
+    assert class_rule is not None and long_rule is not None
+
+    def plan(T, Tkv, S, top_k=2048, **knobs):
+        return plan_dsa_indexer_nondet_topk(
+            T, Tkv, S, top_k=top_k, arch=arch, num_sms=grid, **knobs
+        )
+
+    def sampling(choice):
+        return choice.sample_tiles_max, choice.sample_shift_permille
+
+    assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    for top_k in (256, 2048, 4096):
+        doc = plan(16384, 270336, 2, top_k=top_k)
+        assert doc.physical_kind in long_rule[0], top_k
+        assert sampling(doc) == (policy.sample_tiles_max, long_rule[1]), top_k
+    wide = plan(4096, 131072, 1)
+    assert wide.physical_kind not in long_rule[0]
+    assert sampling(wide) == (policy.sample_tiles_max, policy.sample_shift_for(2048))
+    assert sampling(plan(16384, 270336, 2, sample_tiles_max=16)) == (16, long_rule[1])
+    assert sampling(plan(16384, 270336, 2, sample_shift_permille=100)) == (
+        policy.sample_tiles_max,
+        100,
+    )
+    assert plan(16384, 270336, 2, sample_tiles_max=0).sample_tiles_max == 0
+    assert plan(17536, 289344, 22, sample_tiles_max=0).sample_tiles_max == 0
 
 
 def test_far_sample_knob_is_validated_on_the_host():
@@ -2501,10 +2540,10 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
 
 
 def test_static_scan_kind_runner_has_no_ticket_tail_and_keeps_its_sets_on_a_poisoned_workspace():
-    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
-    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
-    at prepare or run) and its rows keep their sets on a caller-owned buffer poisoned everywhere.  A drawing program on
-    the same architecture keeps its tail."""
+    """A program of the record's ``static_scan_kinds`` keeps the static enumeration on every call, also where the
+    call's units exceed the grid: its runner gets no ticket tail (no memset at prepare or run) and its rows keep their
+    sets on a caller-owned buffer poisoned everywhere.  A drawing program on the same architecture keeps its tail.  No
+    record names a static kind now (every scan program draws), so this runs only on a record that does."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
