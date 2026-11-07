@@ -29,14 +29,15 @@ limitations under the License.
 # activation gradient and the 256-wide k tile's weight gradient run copies of the
 # deterministic programs, but for the sm_100a activation gradient's L2
 # evict-first twin, this package's own build of the deterministic wide tile (all
-# of them the same bits); the 512-wide k tile's weight gradient adds its split
-# tail in place with unordered fp32 reductions, so its ``dW`` is not bitwise
-# reproducible run to run (``cake_backend``, numerical mode).  Under
-# ``torch.use_deterministic_algorithms(True)`` a launch of such a split tail
-# raises the non-determinism alert immediately before it launches (a
-# ``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``, after which it
-# runs); the fixed-order launches (forward, activation gradient, the 256-wide k
-# tile and an unsplit tail) never alert.
+# of them the same bits); the 512-wide k tile's weight gradient finishes its
+# split tail in the same launch: each unit stores its fp32 partial to a slot and
+# the tile's last unit sums the slots in slot order (``cake_backend``, numerical
+# mode).  Every output repeats bit for bit for the same inputs, shapes, device
+# SM count and configuration, and no launch alerts under
+# ``torch.use_deterministic_algorithms(True)``.  The alert stays for an
+# order-varying launch, which only an architecture listed in the host plan's
+# ``unordered_tail_archs`` (empty) plans: a ``RuntimeError``, or a
+# ``UserWarning`` under ``warn_only=True``, after which it runs.
 #
 # The public entry points are the functions of the top-level module
 # ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (stable APIs), which take the
@@ -171,11 +172,10 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, one rounding at the
     store, exact zeros for empty groups.  With the 512-wide k tile a split tail
-    is added with unordered fp32 reductions, so ``dW`` is not bitwise
-    reproducible run to run, and under
-    ``torch.use_deterministic_algorithms(True)`` such a launch raises the
-    non-determinism alert immediately before it runs (a fixed-order launch does
-    not).  ``N % 256 == 0`` and ``K`` a
+    is summed in slot order in the same launch, so ``dW`` repeats bit for bit
+    for the same inputs, shapes, device SM count and configuration, and no
+    launch alerts under ``torch.use_deterministic_algorithms(True)``.
+    ``N % 256 == 0`` and ``K`` a
     multiple of the selected k tile (256, or 512 when chosen) are required.
     See ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
 

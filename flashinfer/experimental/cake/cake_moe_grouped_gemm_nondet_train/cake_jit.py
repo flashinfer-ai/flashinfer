@@ -66,28 +66,33 @@ from . import cake_build
 # ``main_halves`` (with the planned tile walk and the slack tail placement),
 # ``main_wave_halves`` (waves synchronised every eight) and, on sm_107a,
 # ``main_halves_k256t`` (with the slack tail placement) -- whose split tail is
-# added in place: every unit of a split tail tile adds its fp32 accumulator
-# into the tile's fp32 sum in ``tail_sums`` with unordered reductions and
-# counts its arrival on the tile's tickets in ``tail_tickets``; the last unit
-# rounds the sum once, stores it and clears the sum and the tickets.  Those
-# routes have no ``tail_reduce`` stage and launch one kernel.  Every whole tile
-# is reduced in a fixed order by one CTA pair, as in the deterministic package;
-# only a split tail tile's units are added in an order the launch does not fix.
-# With the slack tail placement the kernel plans each launch's tail on the
-# device: when every tail tile fits in the room the full waves leave on the
-# least-loaded clusters, each runs whole on one of them (no sum or ticket is
-# touched), else the tail splits as above.
+# finished in the same launch in a fixed order (the ordered one-launch tail):
+# every unit of a split tail tile stores its fp32 partial to its slot
+# ``j * tail_splits + s`` of ``tail_sums`` and counts its arrival on the tile's
+# tickets in ``tail_tickets``; the tile's last unit to arrive reads the tile's
+# slots back, adds them from 0.0 in slot order (the sum of the deterministic
+# tail reduce), rounds once and stores (an accumulate build adds the sum to C
+# once).  Each launch overwrites the slots it reads, so ``tail_sums`` needs no
+# value between launches; only the tickets rest at zero (the last unit wraps
+# them).  Those routes have no ``tail_reduce`` stage and launch one kernel.
+# Every whole tile is reduced in a fixed order by one CTA pair, as in the
+# deterministic package, so the output repeats bit for bit for the same
+# inputs, shapes, device SM count and ``tail_splits``.  With the slack tail
+# placement the kernel plans each launch's tail on the device: when every tail
+# tile fits in the room the full waves leave on the least-loaded clusters,
+# each runs whole on one of them (no slot or ticket is touched), else the tail
+# splits as above.
 #
 # The host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``,
 # with the deterministic package's rules and constants (``cake_backend``,
 # program choice), but for ``dgrad_evict_first_archs``, which also lists
 # sm_100a, where the data gradient's ``main_wide_ef`` stage is this package's
-# own build; ``unordered_tail_archs`` lists the architectures whose
-# 512-wide k tile routes bind the unordered-tail builds -- every architecture of
-# those routes, since the registry holds no ordered k512 build (leaving one out
-# needs the deterministic k512 builds and a ``tail_reduce`` stage on those routes,
-# a new render) -- and ``atomic_tail_plan`` holds the cost-model constants of the
-# unordered split tail (``tail_plan`` stays the ordered tail's).
+# own build; ``ordered_tail_archs`` lists the architectures whose 512-wide k
+# tile routes bind the ordered one-launch tail builds -- every architecture of
+# those routes; ``unordered_tail_archs`` is empty (the registry holds no build
+# that adds its split tail with unordered reductions); and
+# ``atomic_tail_plan`` holds the cost-model constants of the one-launch split
+# tail (``tail_plan`` stays the two-launch tail reduce's).
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_037c741e69a0ccc696e0": {
         "library": "cake_moe_grouped_gemm_037c741e69a0ccc696e0",
@@ -925,10 +930,17 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
         "launch_us": 5.0,
         "cycles_per_step": {256: 512, 512: 1024},
     },
-    # The architectures whose 512-wide k tile routes bind the unordered-tail
-    # builds (``cake_backend.wgrad_unordered_tail``).
-    "unordered_tail_archs": ["sm_100a", "sm_103a", "sm_107a"],
-    # The split-tail cost model of the 512-wide k tile's unordered tail
+    # The architectures whose 512-wide k tile routes bind builds that add their
+    # split tail in place with unordered reductions
+    # (``cake_backend.wgrad_unordered_tail``): none, the registry holds no such
+    # build.  An architecture listed here launches an order-varying weight
+    # gradient, which alerts under torch's deterministic mode.
+    "unordered_tail_archs": [],
+    # The architectures whose 512-wide k tile routes bind the ordered one-launch
+    # split-tail builds (``cake_backend.wgrad_ordered_tail``): every architecture
+    # of the k512 routes.  No architecture may be listed in both lists.
+    "ordered_tail_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    # The cost model of the one-launch split tail, ordered or unordered
     # (``cake_backend.wgrad_atomic_tail_plan``): the keys of ``tail_plan``.
     "atomic_tail_plan": {
         "max_splits": 16,

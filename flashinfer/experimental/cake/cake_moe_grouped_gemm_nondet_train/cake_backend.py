@@ -43,42 +43,49 @@ ship; the eviction priority moves lines in L2 and nothing else, so it gives the
 bits of that program (``main_wide``).  The
 weight gradient with the 512-wide k tile runs the builds of the deterministic
 package's k512 forms whose split tail (the tiles of the last partial wave, cut
-into ``tail_splits`` k-step units over the clusters) is added in place: each
-unit adds its fp32 accumulator into the tile's fp32 sum with unordered
-reductions and the last unit to arrive rounds the sum once and stores it, in
-the same launch.  Every whole tile is still reduced by one CTA pair in a fixed
-order (the deterministic bits); only the order in which a split tail tile's
-units are added varies, so only the run-to-run bitwise reproducibility of such
-a ``dW`` is relaxed.  The operands (bf16), the accumulation (fp32), the one
-round-to-nearest rounding to bf16 (or the fp32 store), the layouts, the
-``offs`` contract and the exact zeros of empty groups are the deterministic
-package's.  With ``torch.use_deterministic_algorithms(True)``, a launch whose
-result can vary run to run (``CakeMoEGroupedGemmNondetLaunch.order_varying``: the 512-wide k
-tile's weight gradient with a split tail, ``plan["unordered_tail"]`` and
-``plan["tail_splits"] > 1``, in overwrite or accumulate mode) raises PyTorch's
-non-determinism alert immediately before it launches (``_alert_not_deterministic``:
-a ``RuntimeError``, and nothing launches; or under ``warn_only=True`` a
-``UserWarning``, and the launch runs), at every ``launch()`` and in
-``cake_moe_grouped_gemm_nondet_train_wgrad`` and the backward of ``CakeMoEGroupedGemmNondetFunction``; it never falls back
-to the deterministic package.  Every other launch has a fixed order and never
-alerts: ``fwd``, ``dgrad``, the 256-wide k tile's weight gradient (ordered tail
-reduce) and a 512-wide k tile whose tail is not split.  Preparation never
-alerts.  The stable
+into ``tail_splits`` k-step units over the clusters) is finished in the same
+launch by an ordered one-launch tail: unit ``s`` of split tail tile ``j``
+stores its fp32 accumulator into slot ``j * tail_splits + s`` of the fp32
+slots (``tail_sums``), and the last unit to arrive at the tile sums the tile's
+slots from 0.0 in slot order, rounds the sum once and stores it (an accumulate
+build adds it into C once).  Every whole tile is still reduced by one CTA pair
+in a fixed order, and the slot order does not depend on the order in which the
+units arrive, so every output of this package repeats bit for bit for the same
+inputs, shapes, device SM count and configuration.  The k512 weight gradient's
+bits depend on the SM count and the tail split; a split tail tile can differ
+from the deterministic package's, whose tail plan and group order differ,
+within that package's error budget.  The operands (bf16), the accumulation
+(fp32), the one round-to-nearest rounding to bf16 (or the fp32 store), the
+layouts, the ``offs`` contract and the exact zeros of empty groups are the
+deterministic package's.  No launch of the shipped registry and constants
+alerts under ``torch.use_deterministic_algorithms(True)``.  The alert stays as
+an extension point for an order-varying launch
+(``CakeMoEGroupedGemmNondetLaunch.order_varying``: a weight gradient with a
+split tail planned with ``plan["unordered_tail"]``, which only an architecture
+listed in ``unordered_tail_archs`` -- empty in the shipped constants -- can
+produce): it raises PyTorch's non-determinism alert immediately before such a
+launch (``_alert_not_deterministic``: a ``RuntimeError``, and nothing
+launches; or under ``warn_only=True`` a ``UserWarning``, and the launch runs),
+at every ``launch()`` and in ``cake_moe_grouped_gemm_nondet_train_wgrad`` and
+the backward of ``CakeMoEGroupedGemmNondetFunction``; it never falls back to
+the deterministic package.  Preparation never alerts.  The stable
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` stays on the
 deterministic package: this package has no handoff for it.
 
 Every launch is one persistent cluster kernel (one CTA pair per SM pair); the
 256-wide k tile's weight gradient adds one ordered fp32 tail-reduce kernel when
 the tiles of its last partial wave are split over the clusters, and the
-512-wide k tile's adds its split tail in place (one kernel).  Nothing in the
-plan depends on the group sizes: the grid, the k tile, the tail split and the
-raster follow from host-known scalars (tensor shapes, the SM count, the
-architecture) so a prepared launch is CUDA-graph capturable and stays valid for
-any ``offs`` written later.  The host planner below makes the deterministic
-package's decisions from ``HOST_PLAN_CONSTANTS`` with its rules; the constants
-are the deterministic package's but for ``dgrad_evict_first_archs``, which also
-lists sm_100a (this package's own ``main_wide_ef`` program), and the split of the
-unordered tail follows ``atomic_tail_plan`` (``wgrad_atomic_tail_plan``).
+512-wide k tile's finishes its split tail in the same launch (one kernel).
+Nothing in the plan depends on the group sizes: the grid, the k tile, the tail
+split and the raster follow from host-known scalars (tensor shapes, the SM
+count, the architecture) so a prepared launch is CUDA-graph capturable and
+stays valid for any ``offs`` written later.  The host planner below makes the
+deterministic package's decisions from ``HOST_PLAN_CONSTANTS`` with its rules;
+the constants are the deterministic package's but for
+``dgrad_evict_first_archs``, which also lists sm_100a (this package's own
+``main_wide_ef`` program), and the keys of the one-launch tail
+(``unordered_tail_archs``, empty; ``ordered_tail_archs``; and
+``atomic_tail_plan``, which its split follows: ``wgrad_atomic_tail_plan``).
 
 Program choice.  ``fwd`` and ``dgrad`` launch the 512-column output tile (the
 route's ``main_wide`` stage) when the output columns are a multiple of
@@ -121,13 +128,17 @@ columns of ``dW[e]`` and of x) is at most ``k256_tail_max_k`` and the groups
 average at least ``k256_tail_min_rows`` rows (``sum_m // E``), the down
 projection of an MoE layer over few groups.  Every choice falls back to the
 plain stage where the route serves no such stage on the architecture.  The
-512-wide k tile binds the unordered-tail builds on the architectures of
-``unordered_tail_archs`` (``wgrad_unordered_tail``), which lists every
-architecture of the k512 routes: the registry holds no ordered k512 build.  The
-list is an extension point only: leaving an architecture out needs the
-deterministic k512 builds and a ``tail_reduce`` stage on those routes in the
-registry (a new render), which the host's ordered path (``partials`` and the
-tail reduce, as for the 256-wide k tile) then binds.
+512-wide k tile binds the ordered one-launch tail builds on the architectures
+of ``ordered_tail_archs`` (``wgrad_ordered_tail``), which lists every
+architecture of the k512 routes; ``unordered_tail_archs``
+(``wgrad_unordered_tail``) is empty, since the registry holds no unordered k512
+build.  Both lists are extension points: an architecture listed in both is an
+error, and an architecture listed in neither needs the deterministic k512
+builds and a ``tail_reduce`` stage on those routes in the registry (a new
+render), which the host's two-launch path (``partials`` and the tail reduce,
+as for the 256-wide k tile) then binds.  The preparation raises ``ValueError``
+for an architecture in both lists, and for one in neither whose route serves
+no ``tail_reduce`` stage there.
 
 Stream workspaces.  The forward and data-gradient programs take a scheduler
 workspace (``sched``: ``sched_words`` u32 words whose first three rest at
@@ -154,32 +165,42 @@ split only divides the tiles between the queues; every tile is still computed
 once with its k steps in order, so the output bits do not depend on it.  The
 weight-gradient wave
 programs take two wave counters (``wave_sync``, resting at zero) and their wave
-mode.  Every launch leaves a workspace at its rest state (the kernels re-arm it
-at the end), so one buffer serves every launch of one CUDA stream: the buffers
-are kept per (device, stream), allocated and set to their rest state by the
-first launch on a stream and reused by every later one, never shared by two
-streams (launches on one stream are ordered, so a buffer is never live in two
-launches at once).  A launch captured into a CUDA graph, or issued for a
-device other than the current one, takes buffers of its own at their rest
-state, set at the launch (a capture records that set with the launch and
-allocates the buffers from the graph's pool) and the even split.  The static
+mode.  Every launch leaves a workspace that has a rest state at that state
+(the kernels re-arm it at the end; the split tail's slots, ``tail_sums``, have
+no rest state: below), so one buffer serves every launch of one CUDA stream:
+the buffers are kept per (device, stream), allocated and set to their rest
+state by the first launch on a stream and reused by every later one, never
+shared by two streams (launches on one stream are ordered, so a buffer is
+never live in two launches at once).  A launch captured into a CUDA graph, or
+issued for a device other than the current one, takes buffers of its own at
+their rest state, set at the launch (a capture records that set with the
+launch and allocates the buffers from the graph's pool; ``tail_sums`` is
+allocated without a set, so no fill of it is recorded) and the even split.  The static
 sm_107a forward and data-gradient programs take ``sched``, ``c0`` and ``c1`` and
 ignore them.
 
-The 512-wide k tile's weight-gradient programs take the fp32 sums of the split
-tail tiles (``tail_sums``: ``num_tail * cluster_m * tail_tile_k`` floats) and
-their arrival tickets (``tail_tickets``: ``num_tail * cta_group *
-TAIL_TICKETS_PER_CTA`` u32 words, one per epilogue warp of a CTA), both resting
-at zero: a launch needs them zero at its start and leaves them zero (the last
-unit of a tile clears its sum, the tickets wrap).  They are stream workspaces
-too: kept per (device, stream), allocated zeroed by the first launch on a
-stream that splits its tail and replaced by a larger zeroed buffer when a later
-launch needs more (launches on one stream are ordered, so the replaced buffer
-is idle); a captured launch, or one for another device, takes zeroed buffers of
-its own of the size it needs.  A launch whose tail is not split
-(``tail_splits == 1``) passes one-element placeholders that the kernel does not
-touch.  The weight gradient keeps no per-preparation partials on the 512-wide k
-tile.
+The 512-wide k tile's weight-gradient programs take the fp32 slots of the
+split tail tiles (``tail_sums``: ``num_tail * tail_splits * cluster_m *
+tail_tile_k`` floats, one ``cluster_m x tail_tile_k`` slot per unit) and their
+arrival tickets (``tail_tickets``: ``num_tail * cta_group *
+TAIL_TICKETS_PER_CTA`` u32 words, one per epilogue warp of a CTA).  Only the
+tickets rest at zero: a launch needs them zero at its start and leaves them
+zero (the tickets wrap).  The slots need no value between launches: every unit
+of a tile stores its slot before the tile's last unit reads them, so they are
+allocated with ``torch.empty`` and never cleared.  Both are stream workspaces
+too: kept per (device, stream), allocated by the first launch on a stream that
+splits its tail (the tickets zeroed) and replaced by a larger buffer when a
+later launch needs more (launches on one stream are ordered, so the replaced
+buffer is idle); a captured launch, or one for another device, takes buffers
+of its own of the size it needs.  The slot buffer holds ``tail_splits`` slots
+per tail tile, so it is ``tail_splits`` times the size of one sum per tile; its
+size is ``plan["tail_sum_elems"]`` and is at most ``(clusters - 1) *
+max_splits * 256 * 512`` floats (the tail tiles of one partial wave, at most
+``atomic_tail_plan["max_splits"]`` = 16 units each): about 600 MiB per stream
+at 76 clusters and about 840 MiB at 106.  A launch whose tail is not split
+(``tail_splits == 1``) passes one-element placeholders that the kernel does
+not touch.  The weight gradient keeps no per-preparation partials on the
+512-wide k tile.
 
 Accumulate mode.  ``cake_moe_grouped_gemm_nondet_train_prepare_wgrad(..., out=out, accumulate=True)``
 (also ``cake_moe_grouped_gemm_nondet_train_wgrad`` and the autograd wrapper's
@@ -187,8 +208,9 @@ Accumulate mode.  ``cake_moe_grouped_gemm_nondet_train_prepare_wgrad(..., out=ou
 ``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion.  The
 host selects the route, the k tile, the stage and the plan exactly as for the
 overwrite of ``out.dtype`` (the twin); ``plan["accumulate"]`` records how the
-launch adds.  ``"fused"``: the 512-wide k tile with its unordered split tail
-(no overwriting tail-reduce stage), where the route serves the twin's
+launch adds.  ``"fused"``: the 512-wide k tile with its one-launch split tail
+(ordered, or unordered under ``unordered_tail_archs``; no overwriting
+tail-reduce stage), where the route serves the twin's
 accumulate build (the stage of the twin's name with ``ACC_SUFFIX``: the same
 argument plan, launch shape and host plan, an epilogue that adds into C) on the
 device's architecture, that build's library can load by the loader's static
@@ -197,7 +219,8 @@ rule (its prebuilt file under ``aot/``, else a FlashInfer JIT toolkit at its
 probed), and C is 32-byte aligned (its base, row pitch and expert pitch); one
 launch, which leaves an empty group's ``out[e]`` and the padding untouched.
 ``"composed"`` (``plan["accumulate_reason"]``, checked in this order:
-``"tile_k"`` the 256-wide k tile, ``"tail"`` an ordered tail, ``"stage"`` a
+``"tile_k"`` the 256-wide k tile, ``"tail"`` a two-launch tail (a
+``tail_reduce`` stage after the main launch), ``"stage"`` a
 stage without an accumulate build, ``"min_cuda"`` a build that cannot load,
 ``"alignment"``; the last two with one ``UserWarning`` per process each): the
 twin writes into a contiguous scratch of ``out.dtype`` that the preparation
@@ -330,7 +353,9 @@ def _caller_stacklevel() -> int:
 
 
 # The deterministic counterpart of each entry that can launch an order-varying weight gradient (the
-# ``entry`` of ``CakeMoEGroupedGemmNondetLaunch._run``): named by the alert.
+# ``entry`` of ``CakeMoEGroupedGemmNondetLaunch._run``): named by the alert.  The shipped constants plan
+# no order-varying launch (``unordered_tail_archs`` is empty), so the alert is dormant: it serves an
+# architecture a constants override lists there.
 _ALERT_DET_ENTRIES: dict[str, str] = {
     "CakeMoEGroupedGemmNondetFunction.backward": "CakeMoEGroupedGemmDetFunction",
     "CakeMoEGroupedGemmNondetLaunch.launch": "CakeMoEGroupedGemmDetLaunch.launch",
@@ -345,8 +370,9 @@ def _alert_not_deterministic(entry: str) -> None:
     deterministic entry (``_ALERT_DET_ENTRIES``).  The warning names the nearest frame outside flashinfer:
     the caller's line for a direct call (``cake_moe_grouped_gemm_nondet_train_wgrad``, ``launch()``), a frame of PyTorch's autograd
     for a backward (the engine calls it).  Called by :meth:`CakeMoEGroupedGemmNondetLaunch._run` immediately before an
-    order-varying launch (``order_varying``); there is no fallback.  The alert is raised here because PyTorch
-    exposes no public Python entry for it."""
+    order-varying launch (``order_varying``); there is no fallback.  No launch of the shipped constants is
+    order-varying, so only an architecture listed in ``unordered_tail_archs`` reaches it.  The alert is raised
+    here because PyTorch exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
     det = "flashinfer.cake_moe_grouped_gemm_det_train"
@@ -563,14 +589,15 @@ def wgrad_atomic_tail_plan(
     launch_us: float,
     cycles_per_step: dict,
 ) -> int:
-    """Units per tail tile of the unordered split tail (``atomic_tail_plan`` constants).
+    """Units per tail tile of the one-launch split tail (``atomic_tail_plan`` constants).
 
     The cost model of :func:`wgrad_tail_plan`: rounds(S) * steps(S), plus the
-    fp32 traffic of the units' reductions into ``tail_sums`` and the finishing
+    fp32 traffic of the units' partials in ``tail_sums`` and the finisher's
     read (``dram_tbps``), plus a fixed cost of splitting at all (``launch_us``:
     for this form the ticket count and the finishing pass; there is no second
-    launch).  The constants are this package's, so the split can follow the
-    unordered tail's measurements without moving the ordered tail's."""
+    launch).  The constants are this package's, so the split of the one-launch
+    tail can follow its own measurements without moving the two-launch tail
+    reduce's (``tail_plan``); today both hold the same values."""
     return wgrad_tail_plan(
         num_tail,
         num_clusters,
@@ -691,6 +718,7 @@ def plan_wgrad(
     reduce_threads: int,
     k256_tail: bool = False,
     unordered_tail: bool = False,
+    ordered_tail: bool = False,
     constants: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Launch plan of ``wgrad`` for the selected ``tile_k``.
@@ -703,15 +731,28 @@ def plan_wgrad(
     half tiles of the 256-wide tiling, and the last partial wave of that tiling
     is the tail (``tail_tile_k``), split as the 256-wide k tile's.
 
-    ``unordered_tail`` plans a program that adds its split tail in place (the
-    512-wide k tile's): the split comes from ``atomic_tail_plan``
-    (:func:`wgrad_atomic_tail_plan`), there is no reduce launch
-    (``tail_reduce_grid`` None, one launch) and, when the tail is split,
-    ``tail_sum_elems`` / ``tail_ticket_words`` size its ``tail_sums`` /
-    ``tail_tickets`` stream workspaces (0 otherwise).  Otherwise the split
-    comes from ``tail_plan`` and a split tail is summed by the ordered
-    tail-reduce launch, as in the deterministic package.
+    ``ordered_tail`` (the 512-wide k tile's builds, :func:`wgrad_ordered_tail`)
+    and ``unordered_tail`` (:func:`wgrad_unordered_tail`; no such build ships)
+    plan a program that finishes its split tail in the same launch (a
+    one-launch tail; at most one of the two, ``ValueError`` otherwise): the
+    split comes from ``atomic_tail_plan`` (:func:`wgrad_atomic_tail_plan`),
+    there is no reduce launch (``tail_reduce_grid`` None, one launch) and, when
+    the tail is split, ``tail_sum_elems`` / ``tail_ticket_words`` size its
+    ``tail_sums`` / ``tail_tickets`` stream workspaces (0 otherwise).
+    ``tail_sums`` holds ``num_tail * tail_splits`` slots of ``cluster_m x
+    tail_tile_k`` floats: an ordered unit stores its partial to slot
+    ``j * tail_splits + s``.  Otherwise the split comes from ``tail_plan`` and a
+    split tail is summed by the two-launch tail reduce, as in the deterministic
+    package.  ``plan["ordered_tail"]`` and ``plan["unordered_tail"]`` record
+    the form.
     """
+    if unordered_tail and ordered_tail:
+        raise ValueError(
+            "plan_wgrad: a weight gradient takes the ordered or the unordered one-launch tail, "
+            "not both (an architecture is listed in both ordered_tail_archs and "
+            "unordered_tail_archs)"
+        )
+    one_launch = bool(unordered_tail or ordered_tail)
     c = constants or host_plan_constants()
     block_n, block_k = int(c["block_n"]), int(c["block_k"])
     cluster_m, cta_group = int(c["cluster_m"]), int(c["cta_group"])
@@ -726,8 +767,8 @@ def plan_wgrad(
         )
     splits = 1
     if num_tail:
-        tail = c["atomic_tail_plan" if unordered_tail else "tail_plan"]
-        tail_plan = wgrad_atomic_tail_plan if unordered_tail else wgrad_tail_plan
+        tail = c["atomic_tail_plan" if one_launch else "tail_plan"]
+        tail_plan = wgrad_atomic_tail_plan if one_launch else wgrad_tail_plan
         splits = tail_plan(
             num_tail,
             clusters,
@@ -755,7 +796,7 @@ def plan_wgrad(
         )
     )
     reduce_grid = None
-    if splits > 1 and not unordered_tail:
+    if splits > 1 and not one_launch:
         reduce_grid = [
             wgrad_reduce_grid(
                 num_tail,
@@ -767,7 +808,7 @@ def plan_wgrad(
             1,
             1,
         ]
-    split = splits > 1 and unordered_tail
+    split = splits > 1 and one_launch
     return dict(
         grid=[grid_x, 1, 1],
         clusters=clusters,
@@ -778,7 +819,10 @@ def plan_wgrad(
         raster_rows=raster_rows,
         tail_reduce_grid=reduce_grid,
         unordered_tail=bool(unordered_tail),
-        tail_sum_elems=num_tail * cluster_m * tail_tile_k if split else 0,
+        ordered_tail=bool(ordered_tail),
+        # One slot per (tail tile, split) for any one-launch form: the registry binds only
+        # ordered k512 builds, which store slot ``j * tail_splits + s``.
+        tail_sum_elems=num_tail * splits * cluster_m * tail_tile_k if split else 0,
         tail_ticket_words=num_tail * cta_group * TAIL_TICKETS_PER_CTA if split else 0,
         launches=1 + int(reduce_grid is not None),
     )
@@ -938,13 +982,28 @@ def wgrad_unordered_tail(
     arch: str,
     constants: Optional[dict[str, Any]] = None,
 ) -> bool:
-    """Whether the weight gradient binds the builds that add their split tail in place with
+    """Whether the host plans the weight gradient as a one-launch split tail added in place with
     unordered reductions: the 512-wide k tile on the architectures of ``unordered_tail_archs``.
-    Otherwise it binds the deterministic programs, whose split tail the ordered ``tail_reduce``
-    stage sums; the registry has those for the 256-wide k tile only, so the list must name every
-    architecture of the k512 routes (module docstring)."""
+    The list is empty: the registry holds no such build (module docstring).  An architecture listed
+    there makes its split-tail launches order-varying (they alert under torch's deterministic mode);
+    it must not also be listed in ``ordered_tail_archs``."""
     c = constants or host_plan_constants()
     return tile_k == 512 and arch in c["unordered_tail_archs"]
+
+
+def wgrad_ordered_tail(
+    tile_k: int,
+    arch: str,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the weight gradient binds the builds that finish their split tail in the same launch in
+    a fixed order (the ordered one-launch tail): the 512-wide k tile on the architectures of
+    ``ordered_tail_archs``, which lists every architecture of the k512 routes.  A weight gradient
+    that takes neither this nor :func:`wgrad_unordered_tail` binds the deterministic programs, whose
+    split tail the two-launch ``tail_reduce`` stage sums; the registry has those for the 256-wide k
+    tile only (module docstring)."""
+    c = constants or host_plan_constants()
+    return tile_k == 512 and arch in c.get("ordered_tail_archs", ())
 
 
 def select_wgrad_stage(
@@ -995,14 +1054,17 @@ def wgrad_accumulate_mode(
     selects on ``arch`` (module docstring, accumulate mode).
 
     ``("fused", None)`` when every condition holds; else ``("composed", reason)`` with the first that fails:
-    ``"tile_k"`` (not the 512-wide k tile), ``"tail"`` (the tile's split tail is not the unordered one added
-    in place, :func:`wgrad_unordered_tail`: an ordered tail-reduce stage would overwrite the split tiles of
-    C), ``"stage"`` (the route serves no ``stage + ACC_SUFFIX`` on ``arch``), ``"min_cuda"`` (that build's
-    library cannot load, :func:`acc_library_loadable`) or ``"alignment"`` (``out`` is not ``ACC_ALIGN``-byte
-    aligned, ``aligned``)."""
+    ``"tile_k"`` (not the 512-wide k tile), ``"tail"`` (the tile's split tail is not finished in the same
+    launch, neither :func:`wgrad_ordered_tail` nor :func:`wgrad_unordered_tail`: a two-launch tail-reduce
+    stage would overwrite the split tiles of C), ``"stage"`` (the route serves no ``stage + ACC_SUFFIX`` on
+    ``arch``), ``"min_cuda"`` (that build's library cannot load, :func:`acc_library_loadable`) or
+    ``"alignment"`` (``out`` is not ``ACC_ALIGN``-byte aligned, ``aligned``)."""
     if tile_k != 512:
         return "composed", "tile_k"
-    if not wgrad_unordered_tail(tile_k, arch, constants):
+    if not (
+        wgrad_ordered_tail(tile_k, arch, constants)
+        or wgrad_unordered_tail(tile_k, arch, constants)
+    ):
         return "composed", "tail"
     acc_stage = stage + ACC_SUFFIX
     if not stage_served(name, acc_stage, arch):
@@ -1046,8 +1108,10 @@ except AttributeError:  # pragma: no cover - older torch
 
 # The workspace kinds a program's argument plan may name, by argument name.
 STREAM_WORKSPACES = ("sched", "wave_sync", "tail_sums", "tail_tickets")
-# The kinds whose size is the launch's (the split tail's sums and tickets); the others have a fixed size.
+# The kinds whose size is the launch's (the split tail's slots and tickets); the others have a fixed size.
 SIZED_STREAM_WORKSPACES = ("tail_sums", "tail_tickets")
+# The kinds with no rest state (each launch overwrites what it reads); the others rest at fixed values.
+UNRESTED_STREAM_WORKSPACES = ("tail_sums",)
 # The arguments each host binding passes to ``_bind`` (besides ``grid``): the forward pass and the data
 # gradient (``_prepare_row_op``), the weight gradient's main stage and its ordered tail reduce
 # (``_prepare_wgrad``).  ``_bind`` refuses any other.  A generated program's argument plan may name these,
@@ -1153,10 +1217,13 @@ _STREAM_WORKSPACES_LOCK = threading.Lock()
 
 def _rest_workspace(kind: str, device: torch.device, size: int = 0) -> torch.Tensor:
     """A new ``kind`` workspace on ``device`` at its rest state (contiguous; u32 words, or fp32 for
-    ``tail_sums``), set on the current stream.  ``size`` is the element count of a sized kind."""
+    ``tail_sums``), set on the current stream.  ``size`` is the element count of a sized kind.
+    ``tail_sums`` has no rest state: the ordered builds overwrite every slot before they read it, so
+    it is allocated uninitialized (no fill, also none recorded into a CUDA graph that captures the
+    launch); the registry binds no build that needs it zeroed (module docstring)."""
     c = host_plan_constants()
     if kind == "tail_sums":
-        return torch.zeros(int(size), dtype=torch.float32, device=device)
+        return torch.empty(int(size), dtype=torch.float32, device=device)
     if kind == "tail_tickets":
         return torch.zeros(int(size), dtype=torch.int32, device=device).view(
             torch.uint32
@@ -1419,21 +1486,23 @@ class CakeMoEGroupedGemmNondetLaunch:
     new group boundaries into ``offs`` or new values into the operands.
     Prepare a new launch when a shape, dtype or tensor binding changes.
     ``plan`` records the host decisions (grid, queue split, k tile, tail
-    split, whether the split tail is unordered and the sizes of its sums and
-    tickets, raster, wave mode, launch count); ``stages`` names the bound stages
-    of the route in launch order.  The scheduler, wave, tail-sum and tail-ticket
-    workspaces are the current stream's (module docstring), resolved at every
-    launch, as is the probed queue split where ``plan["queue_split"]`` is
-    ``"probed"``.
+    split, the form of a one-launch split tail -- ``ordered_tail`` /
+    ``unordered_tail`` -- and the sizes of its slots and tickets, raster,
+    wave mode, launch count); ``stages`` names the bound stages of the route in
+    launch order.  The scheduler, wave, tail-slot and tail-ticket workspaces
+    are the current stream's (module docstring), resolved at every launch, as
+    is the probed queue split where ``plan["queue_split"]`` is ``"probed"``.
 
-    An order-varying launch (``order_varying``: a weight gradient whose
-    512-wide k tile adds a split tail with unordered fp32 reductions) checks
-    torch's deterministic mode at every ``launch()`` (a host flag read, no
-    synchronisation) and raises the non-determinism alert immediately before
-    it launches when the mode is on, also when it was switched on after the
-    preparation: a ``RuntimeError`` (nothing launches), or under
-    ``warn_only=True`` a ``UserWarning``, after which it launches.  Every other
-    launch has a fixed order and never alerts.  Under CUDA graph capture the
+    Every launch of the shipped registry and constants has a fixed order, so
+    its output repeats bit for bit for the same inputs, shapes, device SM
+    count and configuration, and none alerts under torch's deterministic mode.
+    The alert remains for an order-varying launch (``order_varying``: a weight
+    gradient planned with ``unordered_tail`` and a split tail, reachable only
+    through ``unordered_tail_archs``): it checks torch's deterministic mode at
+    every ``launch()`` (a host flag read, no synchronisation) and raises the
+    non-determinism alert immediately before it launches when the mode is on: a
+    ``RuntimeError`` (nothing launches), or under ``warn_only=True`` a
+    ``UserWarning``, after which it launches.  Under CUDA graph capture the
     check runs when the launch is captured; a replay of the graph does not
     check again.
 
@@ -1478,7 +1547,10 @@ class CakeMoEGroupedGemmNondetLaunch:
         """Whether the launch adds a split tail with unordered fp32 reductions, so its result can vary run
         to run: a weight gradient with a program to launch whose plan has ``unordered_tail`` and
         ``tail_splits > 1`` (overwrite or accumulate).  Only such a launch alerts under torch's
-        deterministic mode."""
+        deterministic mode.  No plan of the shipped constants has ``unordered_tail`` (the 512-wide k
+        tile takes the ordered one-launch tail, ``plan["ordered_tail"]``), so every launch of this
+        package is False here and repeats bit for bit; the property and the alert stay for an
+        architecture listed in ``unordered_tail_archs``."""
         return (
             self.op == "wgrad"
             and bool(self.launches)
@@ -1982,14 +2054,24 @@ def _prepare_wgrad(
         name, k, tile_k, arch, c, sum_m=sum_m, num_groups=num_groups
     )
     k256_tail = main_stage == "main_halves_k256t"
-    # The unordered-tail programs add their split tail in place (they take
-    # ``tail_sums``); the deterministic programs' split tail is summed in order by
-    # the tail-reduce stage.
+    # The 512-wide k tile's programs finish their split tail in the same launch (they
+    # take ``tail_sums`` and ``tail_tickets``): in slot order (``ordered_tail_archs``,
+    # the shipped builds) or with unordered reductions (``unordered_tail_archs``, an
+    # empty list).  The deterministic programs' split tail is summed in order by the
+    # tail-reduce stage, a second launch.
     unordered = wgrad_unordered_tail(tile_k, arch, c)
+    ordered = wgrad_ordered_tail(tile_k, arch, c)
+    if unordered and ordered:
+        raise ValueError(
+            f"cake_moe_grouped_gemm_nondet_train_prepare_wgrad: {arch} is listed in both "
+            "ordered_tail_archs and unordered_tail_archs of the host plan constants; a weight "
+            "gradient takes one tail form"
+        )
+    one_launch = unordered or ordered
     reduce_name = None
     reduce_threads = 0
-    if not unordered:
-        # An ordered k256-tail stage's split tail is the 256-wide k tile's: the
+    if not one_launch:
+        # A k256-tail stage's two-launch split tail is the 256-wide k tile's: the
         # tail-reduce stage of that tile's route sums its partials.
         reduce_name = (
             select_module(
@@ -2001,11 +2083,18 @@ def _prepare_wgrad(
             if k256_tail
             else name
         )
-        if stage_served(reduce_name, "tail_reduce", arch):
-            reduce_program = PROGRAMS[
-                stage_binding(reduce_name, "tail_reduce", arch)["program"]
-            ]
-            reduce_threads = int(reduce_program["launch"]["block"][0])
+        if not stage_served(reduce_name, "tail_reduce", arch):
+            raise ValueError(
+                f"cake_moe_grouped_gemm_nondet_train_prepare_wgrad: the {tile_k}-wide k tile on "
+                f"{arch} takes the two-launch split tail (the architecture is in neither "
+                "ordered_tail_archs nor unordered_tail_archs), but route "
+                f"{reduce_name!r} serves no tail_reduce stage there; list {arch} in "
+                "ordered_tail_archs"
+            )
+        reduce_program = PROGRAMS[
+            stage_binding(reduce_name, "tail_reduce", arch)["program"]
+        ]
+        reduce_threads = int(reduce_program["launch"]["block"][0])
     plan = plan_wgrad(
         sum_m=sum_m,
         num_groups=num_groups,
@@ -2016,6 +2105,7 @@ def _prepare_wgrad(
         reduce_threads=reduce_threads,
         k256_tail=k256_tail,
         unordered_tail=unordered,
+        ordered_tail=ordered,
         constants=c,
     )
     plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
@@ -2089,13 +2179,13 @@ def _prepare_wgrad(
     )
     sizes: dict[str, int] = {}
     partials: Optional[torch.Tensor] = None
-    if unordered and splits > 1:
-        # The split tail's sums and tickets: the current stream's, resolved per launch.
+    if one_launch and splits > 1:
+        # The split tail's slots and tickets: the current stream's, resolved per launch.
         sizes = {
             "tail_sums": plan["tail_sum_elems"],
             "tail_tickets": plan["tail_ticket_words"],
         }
-    elif unordered:
+    elif one_launch:
         # No split tail: one-element placeholders the kernel never touches.
         tail_sums = torch.zeros(1, dtype=torch.float32, device=device)
         tail_tickets = torch.zeros(1, dtype=torch.int32, device=device).view(
@@ -2155,7 +2245,7 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     *,
     accumulate: bool = False,
 ) -> CakeMoEGroupedGemmNondetLaunch:
-    """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), non-deterministic.
+    """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out) with this package's programs.
 
     ``g``: ``[sum_m, N]`` bf16; ``x``: ``[sum_m, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets (``E = offs.numel()`` unless ``num_groups`` is
@@ -2164,14 +2254,15 @@ def cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
     when it is chosen).  Empty groups produce exact zeros.  ``out_dtype``
     defaults to the dtype of ``out`` (bf16 when neither is given).
 
-    With the 512-wide k tile a split tail is added in place with unordered fp32
-    reductions
-    (``plan["unordered_tail"]`` and ``plan["tail_splits"] > 1``, the launch's
-    ``order_varying``), so ``dW`` is not bitwise reproducible run to run; with
+    With the 512-wide k tile a split tail is finished in the same launch by the
+    ordered one-launch tail (``plan["ordered_tail"]`` and
+    ``plan["tail_splits"] > 1``: each unit stores its fp32 partial to a slot of
+    ``tail_sums`` and the tile's last unit sums the slots in slot order); with
     the 256-wide k tile the deterministic program and its ordered tail reduce
-    run.  The preparation never alerts; under
-    ``torch.use_deterministic_algorithms(True)`` an order-varying launch raises
-    the non-determinism alert at each ``launch()`` (module docstring).
+    run.  Either way ``dW`` repeats bit for bit for the same inputs, shapes,
+    device SM count and configuration, and no launch alerts under
+    ``torch.use_deterministic_algorithms(True)`` (the alert serves only an
+    architecture listed in ``unordered_tail_archs``: module docstring).
 
     ``accumulate=True`` adds instead: every launch computes
     ``out[e] <- out[e] + G[e].T @ X[e]`` into the caller's ``out`` (required, bf16
