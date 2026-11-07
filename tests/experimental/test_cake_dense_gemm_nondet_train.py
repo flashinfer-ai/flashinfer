@@ -476,11 +476,16 @@ def test_k2_routes_pass_enable_pdl(monkeypatch, pdl):
 
 
 def _without_forward_verdicts(monkeypatch) -> None:
-    """Clear the forward's shipped verdicts (the cluster SIMT windows of :data:`ROUTER_RULES`): no router table then
-    gives the forward a verdict, so the forward without a split count takes the deterministic program's binding."""
-    for key, rule in list(cake_backend.ROUTER_RULES.items()):
-        if key[1] == "kk" and rule is not None:
-            monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    """Clear the forward's shipped verdicts (the cluster SIMT windows of :data:`ROUTER_RULES` and of the tables of
+    :data:`ROUTER_RULES_BY_SM`): no router table then gives the forward a verdict, so the forward without a split
+    count takes the deterministic program's binding."""
+    for table in (
+        cake_backend.ROUTER_RULES,
+        *cake_backend.ROUTER_RULES_BY_SM.values(),
+    ):
+        for key, rule in list(table.items()):
+            if key[1] == "kk" and rule is not None:
+                monkeypatch.setitem(table, key, None)
 
 
 def _register(monkeypatch, arch: str, *templates: str) -> None:
@@ -3439,7 +3444,8 @@ def test_router_units_policy(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_107a", sm_count=212, M=6144, N=256, K=16231
     ) == (5 * 106, 53, 24 * 508 // 2)
-    # the forward of the parts with a table of their own: the deterministic plan
+    # the forward of the parts with a table of their own at 16231 tokens: the deterministic plan (the 212-SM forward
+    # windows end at 192 tokens)
     for sms in (208, 212):
         for hidden in (4096, 5120, 6144):
             assert (
@@ -3616,8 +3622,9 @@ ROUTER_DGRAD_WINDOWS = {
         for arch in ("sm_100a", "sm_103a")
     },
 }
-# the forward's cluster SIMT windows (256 experts) of 152-SM parts, (arch, hidden) -> ((first, last, spec), ...); every
-# other part, row and token count runs the deterministic program
+# the forward's cluster SIMT windows (256 experts) of 152-SM parts, (arch, hidden) -> ((first, last, spec), ...), and of
+# the parts with a router table of their own (212-SM sm_107a), (arch, sm_count, hidden) -> ((first, last, spec), ...);
+# every other part, row and token count runs the deterministic program
 # fmt: off
 _FWD_SM_100A = (
     (1, 8, "simt_c8_kg4_l32_e8t4"), (9, 16, "simt_c8_kg4_l32_e8t16"), (17, 96, "simt_c8_ffma_l16_e16t32"),
@@ -3635,38 +3642,58 @@ ROUTER_FWD_WINDOWS = {
     ("sm_103a", 5120): _FWD_SM_103A,
     ("sm_103a", 6144): _FWD_SM_103A,
 }
+ROUTER_FWD_WINDOWS_BY_SM = {
+    ("sm_107a", 212, hidden): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32"))
+    for hidden in (4096, 5120, 6144)
+}
 # fmt: on
+# the part each architecture's forward SIMT windows are planned on in the CPU planner tests
+ROUTER_FWD_PARTS = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 212}
+
+
+def _fwd_windows(arch, sm_count, hidden):
+    """The forward's SIMT windows of the row ``(arch, "kk", hidden, 256)`` on a part of ``sm_count`` SMs: the part's
+    own (:data:`ROUTER_FWD_WINDOWS_BY_SM`) on a part with a router table of its own, :data:`ROUTER_FWD_WINDOWS` on the
+    SM count of :data:`ROUTER_RULES` (:data:`ROUTER_SM_COUNT`), none on any other SM count."""
+    if (arch, sm_count) in ROUTER_BY_SM_PARTS:
+        return ROUTER_FWD_WINDOWS_BY_SM.get((arch, sm_count, hidden), ())
+    if sm_count == cake_backend.ROUTER_SM_COUNT[arch]:
+        return ROUTER_FWD_WINDOWS.get((arch, hidden), ())
+    return ()
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_router_forward_simt_windows(arch):
-    """The forward runs its cluster SIMT program only inside its token windows of the 152-SM table (:data:`ROUTER_RULES`
-    on :data:`ROUTER_SM_COUNT` SMs; not one SM more or fewer, not on the parts with a table of their own), at the
-    first and last token count of each window and not one token past the last; no partition there
-    (:func:`router_partition`); a caller's split count, another experts count or hidden size, or ``K`` off a multiple
-    of the cluster's chunk runs no SIMT program."""
+    """The forward runs its cluster SIMT program only inside its token windows of the table of the part's SM count
+    (:data:`ROUTER_RULES` on :data:`ROUTER_SM_COUNT` SMs, the part's own table of :data:`ROUTER_RULES_BY_SM` on 212-SM
+    sm_107a parts; not one SM more or fewer, not on the other parts with a table of their own), at the first and last
+    token count of each window and not one token past the last; no partition there (:func:`router_partition`); a
+    caller's split count, another experts count or hidden size, or ``K`` off a multiple of the cluster's chunk runs no
+    SIMT program."""
     measured = cake_backend.ROUTER_SM_COUNT[arch]
     own = {sms for a, sms in ROUTER_BY_SM_PARTS if a == arch}
     for hidden in (4096, 5120, 6144):
         windows = ROUTER_FWD_WINDOWS.get((arch, hidden), ())
         assert cake_backend.ROUTER_RULES[(arch, "kk", hidden, 256)] == (windows or None)
-        for sms in own:
-            assert (
-                cake_backend.ROUTER_RULES_BY_SM[(arch, sms)][(arch, "kk", hidden, 256)]
-                is None
-            )
         tokens = {1, 2, 64, 129, 192, 193, 224, 256, 1024, 16231}
         for first, last, _ in windows:
             tokens |= {first, last, last + 1}
+        for sms in own:
+            by_sm = ROUTER_FWD_WINDOWS_BY_SM.get((arch, sms, hidden), ())
+            assert cake_backend.ROUTER_RULES_BY_SM[(arch, sms)][
+                (arch, "kk", hidden, 256)
+            ] == (by_sm or None)
+            for first, last, _ in by_sm:
+                tokens |= {first, last, last + 1}
         for sms in sorted(
-            {148, 151, 152, 153, 208, 212, 216, measured - 1, measured, measured + 1}
+            {148, 151, 152, 153, 208, 211, 212, 213, 216}
+            | {measured - 1, measured, measured + 1}
         ):
             for T in sorted(tokens):
                 kw = dict(arch=arch, M=T, N=256, K=hidden, sm_count=sms)
-                spec = (
-                    next((s for a, b, s in windows if a <= T <= b), None)
-                    if sms == measured
-                    else None
+                spec = next(
+                    (s for a, b, s in _fwd_windows(arch, sms, hidden) if a <= T <= b),
+                    None,
                 )
                 tile = cake_backend.router_forward_simt(**kw)
                 assert tile == cake_backend.router_forward_simt_tile(spec), (
@@ -3727,7 +3754,10 @@ def test_router_forward_simt_specs_and_templates():
     with pytest.raises(ValueError, match="unknown router partition spec"):
         cake_backend.router_units_of("simt_c8_kg4_l32_e8t4", 2, 2, 192, 152)
     served = {}
-    for (arch, _hidden), windows in ROUTER_FWD_WINDOWS.items():
+    for (arch, *_), windows in (
+        *ROUTER_FWD_WINDOWS.items(),
+        *ROUTER_FWD_WINDOWS_BY_SM.items(),
+    ):
         for _, _, spec in windows:
             template = cake_backend.router_forward_simt_template(
                 cake_backend.router_forward_simt_tile(spec)
@@ -3758,26 +3788,26 @@ def test_router_forward_simt_specs_and_templates():
                 ], template
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_router_forward_simt_plans_its_program(monkeypatch, arch):
-    """``plan_atomic_router`` of a forward launch ``X @ W.T`` in a window on 152 SMs: the program of the window's
-    tile over the activations' and the router weight's rows in place (``lda`` / ``ldb`` their row strides; strided
-    rows a multiple of 4 elements) on ``8 N / experts x ceil(T / tokens)`` CTAs, every element stored once (no part
-    tiles); rows that are not a multiple of 4 elements, or a template the checkout does not register, run the
-    deterministic program; the argument values of the launch name the program's parameters and keep the call's PDL
-    flag."""
-    hidden, N = 5120, 256
+    """``plan_atomic_router`` of a forward launch ``X @ W.T`` in a window of the architecture's part
+    (:data:`ROUTER_FWD_PARTS`: 152 SMs, 212 SMs on sm_107a): the program of the window's tile over the activations'
+    and the router weight's rows in place (``lda`` / ``ldb`` their row strides; strided rows a multiple of 4 elements)
+    on ``8 N / experts x ceil(T / tokens)`` CTAs, every element stored once (no part tiles); rows that are not a
+    multiple of 4 elements, or a template the checkout does not register, run the deterministic program; the argument
+    values of the launch name the program's parameters and keep the call's PDL flag."""
+    hidden, N, sms = 5120, 256, ROUTER_FWD_PARTS[arch]
     monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
     X, W, out = torch.zeros(1, hidden), torch.zeros(N, hidden), torch.zeros(1, N)
     plan, reason = cake_backend.plan_atomic_router(
-        X, W.t(), out, arch=arch, sm_count=152
+        X, W.t(), out, arch=arch, sm_count=sms
     )
-    first_spec = ROUTER_FWD_WINDOWS[(arch, hidden)][0][2]
+    first_spec = _fwd_windows(arch, sms, hidden)[0][2]
     first_template = cake_backend.router_forward_simt_template(
         cake_backend.router_forward_simt_tile(first_spec)
     )
     assert plan is None and f"{first_template} is not registered" in reason
-    for first, last, spec in ROUTER_FWD_WINDOWS[(arch, hidden)]:
+    for first, last, spec in _fwd_windows(arch, sms, hidden):
         kind, lanes, experts, tokens = cake_backend.router_forward_simt_tile(spec)
         _register(
             monkeypatch,
@@ -3789,7 +3819,7 @@ def test_router_forward_simt_plans_its_program(monkeypatch, arch):
             W = torch.zeros(N, hidden + 4)[:, :hidden]
             out = torch.zeros(T, N)
             plan, reason = cake_backend.plan_atomic_router(
-                X, W.t(), out, arch=arch, sm_count=152
+                X, W.t(), out, arch=arch, sm_count=sms
             )
             assert plan is not None, (T, reason)
             assert (
@@ -3838,14 +3868,14 @@ def test_router_forward_simt_plans_its_program(monkeypatch, arch):
             # rows of the router weight off a multiple of 4 elements: the deterministic program
             W2 = torch.zeros(N, hidden + 2)[:, :hidden]
             plan2, reason2 = cake_backend.plan_atomic_router(
-                X, W2.t(), out, arch=arch, sm_count=152
+                X, W2.t(), out, arch=arch, sm_count=sms
             )
             assert plan2 is None, (T, reason2)
             # one SM more: the deterministic program
             assert (
-                cake_backend.plan_atomic_router(X, W.t(), out, arch=arch, sm_count=153)[
-                    0
-                ]
+                cake_backend.plan_atomic_router(
+                    X, W.t(), out, arch=arch, sm_count=sms + 1
+                )[0]
                 is None
             )
 
@@ -4014,8 +4044,8 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
     """A part whose SM count has a table in :data:`ROUTER_RULES_BY_SM` takes that table only (every row of
     :data:`ROUTER_RULES` of its architecture has an entry there, and rows measured on that SM count only may too; no
     ``"waves"`` window, closed head/tail or SIMT windows of the weight gradient, closed SIMT windows of the input
-    gradient); one SM more or fewer runs the deterministic program, and the measured SM count of
-    :data:`ROUTER_RULES` decides as before."""
+    gradient and closed cluster SIMT windows of the forward); one SM more or fewer runs the deterministic program, and
+    the measured SM count of :data:`ROUTER_RULES` decides as before."""
     for (arch, sms), table in cake_backend.ROUTER_RULES_BY_SM.items():
         assert sms != cake_backend.ROUTER_SM_COUNT[arch]
         assert set(table) >= {k for k in cake_backend.ROUTER_RULES if k[0] == arch}
@@ -4023,9 +4053,12 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
             assert key_arch == arch
             if rule is None:
                 continue
-            assert layout in ("nn_t", "kn") and isinstance(rule, tuple)
+            assert layout in ("kk", "nn_t", "kn") and isinstance(rule, tuple)
             for first, last, spec in rule:
                 assert 1 <= first <= last <= 32768
+                if layout == "kk":
+                    assert cake_backend.router_forward_simt_tile(spec) is not None
+                    continue
                 if layout == "kn":
                     assert cake_backend.router_simt_tile(spec) is not None
                     continue
@@ -6460,27 +6493,32 @@ def test_router_tables_count_their_changes():
 
 def test_router_memo_follows_the_router_tables(monkeypatch):
     """The memo of the router tables (``_router_memo``) is kept while no table changes and derived again after any
-    change: the forward verdicts of the 152-SM table ship, and with them cleared none is seen; a forward verdict set in any table, and its removal, are seen at the next call;
+    change: the forward verdicts of the 152-SM table and of the 212-SM sm_107a table ship, and with them cleared none is seen; a forward verdict set in any table, and its removal, are seen at the next call;
     a table rebound in place of one is seen, and one that does not count its changes (a plain ``dict``) is read on
     every call; ``cake_dense_gemm_nondet_train_convenience_cache_clear`` drops the memo."""
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     memo = cake_backend._router_memo()
     assert memo.tracked and memo.forward_verdicts and not memo.without_verdict
     assert cake_backend._router_memo() is memo
-    # the shipped forward verdicts: the cluster SIMT windows of the 152-SM table; without them no table gives one
+    # the shipped forward verdicts: the cluster SIMT windows of the 152-SM table and of the 212-SM sm_107a table;
+    # without them no table gives one
     shipped = [
         k
         for k, rule in cake_backend.ROUTER_RULES.items()
         if k[1] == "kk" and rule is not None
     ]
     assert {k[0] for k in shipped} == {"sm_100a", "sm_103a"}
-    assert not any(
-        key[1] == "kk" and rule is not None
-        for table in cake_backend.ROUTER_RULES_BY_SM.values()
+    shipped_by_sm = [
+        (part, key)
+        for part, table in cake_backend.ROUTER_RULES_BY_SM.items()
         for key, rule in table.items()
-    )
+        if key[1] == "kk" and rule is not None
+    ]
+    assert {part for part, _ in shipped_by_sm} == {("sm_107a", 212)}
     for key in shipped:
         monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    for part, key in shipped_by_sm:
+        monkeypatch.setitem(cake_backend.ROUTER_RULES_BY_SM[part], key, None)
     memo = cake_backend._router_memo()
     assert memo.tracked and not memo.forward_verdicts
     own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
@@ -6985,19 +7023,25 @@ def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
     assert len(fill.calls) == int(atomic and launch.k2.fill is not None)
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-@pytest.mark.parametrize("T", [1, 16, 17, 128, 129, 192, 193])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("T", [1, 8, 9, 16, 17, 128, 129, 192, 193])
 def test_router_forward_entry_binds_the_simt_program(monkeypatch, arch, T):
-    """Without a split count the forward's call in a SIMT window of a 152-SM part binds the
-    cluster program's launch in ``_K2_ENTRY_CACHE`` (planned once into ``_K2_ATOMIC_CACHE``): one launch per call of
-    the program with the entry point's tensors -- ``X``, ``W`` and ``out`` read in place --, the launch's dimensions
-    and row strides, the device's PDL flag and the grid of the cluster tiles; no split, no fill.  Past the windows the
-    call binds the deterministic program (four splits) through this package's binding."""
+    """Without a split count the forward's call in a SIMT window of the architecture's part (:data:`ROUTER_FWD_PARTS`:
+    152 SMs, 212 SMs on sm_107a) binds the cluster program's launch in ``_K2_ENTRY_CACHE`` (planned once into
+    ``_K2_ATOMIC_CACHE``): one launch per call of the program with the entry point's tensors -- ``X``, ``W`` and
+    ``out`` read in place --, the launch's dimensions and row strides, the device's PDL flag and the grid of the
+    cluster tiles; no split, no fill.  Past the windows the call binds the deterministic program (four splits) through
+    this package's binding."""
     entry_fn, fill = _cpu_k2_launches(monkeypatch, arch)
+    sms = ROUTER_FWD_PARTS[arch]
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sms, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
     split = Recorder()
     monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
     H, E = 5120, 256
-    spec = next((s for a, b, s in ROUTER_FWD_WINDOWS[(arch, H)] if a <= T <= b), None)
+    spec = next((s for a, b, s in _fwd_windows(arch, sms, H) if a <= T <= b), None)
     # in a window the activations' rows are strided (read in place)
     X = torch.empty(T, H) if spec is None else torch.empty(T, H + 8)[:, :H]
     W, out = torch.empty(E, H), torch.empty(T, E)
@@ -9546,25 +9590,39 @@ def _device_simt_windows(arch, sm_count, layout) -> list:
 
 def test_gpu_router_forward_simt_windows_keep_the_fp64_rule(monkeypatch):
     """Unforced (``cake_dense_gemm_nondet_train_router_forward(...)``, no split count), at the first and the last token count of
-    each forward SIMT window of the device's architecture (:data:`ROUTER_FWD_WINDOWS`; on a part whose SM count is not
-    :data:`ROUTER_SM_COUNT` the measured count is set to the device's, so the program runs there too) and two seeds:
-    the planner gives the window's cluster program, which the call launches (no program of the deterministic
-    package); three calls into a NaN-poisoned ``out`` give finite values and the same bits (every element stored once,
-    the ranks' partials added in rank order); the relative Frobenius error against FP64 of the exact operands is
-    within ``ROUTER_REL_FRO_MAX``, every element within the error bound of a sum of ``K`` FP32 products in any order,
-    and the top-8 experts of every row are FP64's except near ties; a CUDA graph captured after the eager call replays
-    the same bits.  The ratio to the error of the deterministic program is printed, not checked.  A part with a router
-    table of its own runs the deterministic program at these token counts."""
+    each forward SIMT window of the device's part (on a part with a router table of its own its windows,
+    :data:`ROUTER_FWD_WINDOWS_BY_SM`; else those of the architecture, :data:`ROUTER_FWD_WINDOWS`, and on a part whose
+    SM count is not :data:`ROUTER_SM_COUNT` the measured count is set to the device's, so the program runs there too)
+    and two seeds: the planner gives the window's cluster program, which the call launches (no program of the
+    deterministic package); three calls into a NaN-poisoned ``out`` give finite values and the same bits (every element
+    stored once, the ranks' partials added in rank order); the relative Frobenius error against FP64 of the exact
+    operands is within ``ROUTER_REL_FRO_MAX``, every element within the error bound of a sum of ``K`` FP32 products in
+    any order, and the top-8 experts of every row are FP64's except near ties; a CUDA graph captured after the eager
+    call replays the same bits.  The ratio to the error of the deterministic program is printed, not checked.  A part
+    with a router table of its own and no forward window in it runs the deterministic program at the token counts of
+    the architecture's windows."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
-    windows = [
+    arch_windows = [
         (h, a, b, s)
         for (ar, h), w in ROUTER_FWD_WINDOWS.items()
         if ar == arch
         for a, b, s in w
     ]
-    if (arch, sm_count) in cake_backend.ROUTER_RULES_BY_SM or not windows:
-        for hidden, first, last, _ in windows:
+    own = (arch, sm_count) in cake_backend.ROUTER_RULES_BY_SM
+    assert own == ((arch, sm_count) in ROUTER_BY_SM_PARTS)
+    windows = (
+        [
+            (h, a, b, s)
+            for (ar, sms, h), w in ROUTER_FWD_WINDOWS_BY_SM.items()
+            if (ar, sms) == (arch, sm_count)
+            for a, b, s in w
+        ]
+        if own
+        else arch_windows
+    )
+    if not windows:
+        for hidden, first, last, _ in arch_windows:
             for T in (first, last):
                 kw = dict(arch=arch, M=T, N=256, K=hidden, sm_count=sm_count)
                 assert cake_backend.router_forward_simt(**kw) is None, (hidden, T)
@@ -9572,7 +9630,7 @@ def test_gpu_router_forward_simt_windows_keep_the_fp64_rule(monkeypatch):
             f"ROUTER_FWD_SIMT_FP64 {arch} sm_count={sm_count}: no forward window on this part"
         )
         return
-    if sm_count != cake_backend.ROUTER_SM_COUNT[arch]:
+    if not own and sm_count != cake_backend.ROUTER_SM_COUNT[arch]:
         monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
     ran = 0
     for hidden, first, last, spec in windows:
