@@ -311,6 +311,7 @@ def fused_moe_fp8(
     config1: Optional[Knobs] = None,
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
+    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """The W8A8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 (the caller's static quantization, ``x = q / m_x``),
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r`` with the class's
@@ -369,7 +370,9 @@ def fused_moe_fp8(
             T, k, H, I, E, sm_count, family, gated=w.gated, chain1=w.chain1
         )
         config1, config2 = config1 or c1, config2 or c2
-    counts, dest, src = permute_plan(experts, E)
+    counts, dest, src = (
+        plan if plan is not None else permute_plan(experts, E)
+    )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
     x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
     if Tk:
