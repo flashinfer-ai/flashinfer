@@ -187,6 +187,55 @@ def _moe_bf16_fingerprint(
     )
 
 
+def _moe_fp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+) -> str:
+    """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantMoeFp8Config``: the dimensions of
+    :func:`_moe_bf16_fingerprint` (the routing method, the activation with its scalars and gating); the scales' values are
+    inputs, not dimensions."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
@@ -217,6 +266,14 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
+    ),
+    # the unified MoE layer with `BatchInvariantMoeFp8Config`: the same dimensions as `fused_moe`; the static per-tensor
+    # scales are inputs of the class (their values never enter the identifier)
+    "fused_moe_fp8": ClassInfo(
+        "moe.e4m3",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8_fingerprint,
+        ("method", "act", "params", "gated"),
     ),
 }
 
@@ -259,6 +316,13 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
+    'moe-...'
+
+    ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
+    ``BatchInvariantMoeFp8Config``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
+    activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
+    scales, like the operands, are inputs.
     """
     info = CLASSES.get(op)
     if info is None:

@@ -59,6 +59,9 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "fused_moe/batch_invariant/permute.py",
         "fused_moe/batch_invariant/combine.py",
     ),
+    # the fp8 per-tensor MoE grouped GEMM: its own module (the fp8 body and epilogue compose the bf16 blocks, which are in
+    # its closure; the bf16 module's key does not move with an fp8 edit)
+    "batch_invariant_moe_fp8": ("fused_moe/batch_invariant/blocks/fp8_compile.py",),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
@@ -86,6 +89,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
     ),
     # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
     "batch_invariant_moe": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_moe_fp8": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

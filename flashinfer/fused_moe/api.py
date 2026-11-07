@@ -3346,6 +3346,79 @@ class BatchInvariantMoeConfig:
         return "BatchInvariantMoeConfig()"
 
 
+@dataclass(frozen=True)
+class BatchInvariantMoeFp8Config:
+    """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
+    SM100 / SM103 / SM107.
+
+    The surface is :class:`TrtllmFp8PerTensorConfig`'s: ``QuantConfig(weight=QuantFormat.FP8PerTensor,
+    activation=QuantFormat.FP8PerTensor)``, ``prepare_weights`` from the bf16 experts with the two calibrated E4M3
+    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``: ``q = x * s``), ``prepare_activations``
+    quantizing the bf16 activations with the input multiplier (an e4m3 ``[num_tokens, H]`` and no scale tensor), all three
+    routing input modes. The class declares every rounding: the experts quantized with one multiplier per expert and GEMM
+    (``448 / amax``), the dequantization scales the correctly rounded reciprocals of the multipliers, GEMM1's activation on
+    the alpha-scaled fp32 accumulators followed by the ``mul.rn`` by the intermediate multiplier and one saturating RNE
+    conversion to e4m3, GEMM2's ``cvt_bf16(mul(acc, alpha2))``, the slot-order fp32 combine. Every output bit is a function of
+    the token's own e4m3 row, its ``top_k`` experts and routing weights, the expert bytes and the scales; ``do_finalize=True``
+    only; unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default
+    candidate (name it in ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16: torch.Tensor,
+        w2_bf16: torch.Tensor,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized to e4m3 per expert, the gate / up rows interleaved for a gated
+        activation, the dequantization scales of the two multipliers and of the experts, the activation's chain
+        (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_fp8 import MoEWeightsE4M3
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
+        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        return MoEWeightsE4M3.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            hidden_states_scale_global,
+            intermediate_scale_global,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16: torch.Tensor, *, hidden_states_scale_global
+    ) -> Tuple[torch.Tensor, None]:
+        """The static input quantization ``cvt.rn.satfinite.e4m3(mul(x, hidden_states_scale_global))`` (the class's declared
+        chain as torch ops; graph-capturable with a device scale)."""
+        from .batch_invariant.reference_fp8 import quantize_e4m3_static
+
+        x = hidden_states_bf16.to(torch.bfloat16).contiguous()
+        m = torch.as_tensor(
+            hidden_states_scale_global, dtype=torch.float32, device=x.device
+        )
+        return quantize_e4m3_static(x, m), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantMoeFp8Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantMoeConfig,
@@ -3391,6 +3464,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeFp8Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3437,6 +3511,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantMoeFp8Config,
 )
 
 
