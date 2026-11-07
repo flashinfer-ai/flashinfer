@@ -97,16 +97,17 @@ WIDE_MIN_KV = 8192
 WIDE_TILE_Q = 128  # packed rows per two-CTA cluster
 WIDE_CLUSTER = 2  # CTAs per cluster: one SM pair per work item
 WIDE_MIN_TILES_PER_SPLIT = 2
-# Longest work item (KV tokens) that takes the persistent wide route, per SM count.  B200 (148
-# SMs): 16384.  None (GB300, 152 SMs: pending its own measurement) or a missing SM count keeps
-# the shipped kernels.
-PERSISTENT_MAX_ITEM_KV = {148: 16384, 152: None}
+# Longest work item (KV tokens) that takes the persistent wide route, per device: (compute
+# capability, SM count).  B200 ((10, 0), 148 SMs): 16384.  Every other device keeps the shipped
+# kernels until its own measurement, among them GB300 ((10, 3), 152 SMs) and B300 ((10, 3), 148
+# SMs): the SM count alone does not identify the measured device.
+PERSISTENT_MAX_ITEM_KV = {((10, 0), 148): 16384}
 # Merge reducer classes (``reduce_warps_per_row`` of the plan's merge rows) that keep the shipped
-# kernels instead of the persistent wide route, per SM count.  B200 (148 SMs): single-warp reducer
+# kernels instead of the persistent wide route, per device (as above).  B200: single-warp reducer
 # plans (more than 1024 merge rows) keep the shipped kernels.  On one such shape the measurement
 # did not show the persistent route faster than the shipped kernels, so the class keeps them
 # until a separate measurement confirms a gain.
-PERSISTENT_SHIPPED_REDUCE_WARPS = {148: (1,)}
+PERSISTENT_SHIPPED_REDUCE_WARPS = {((10, 0), 148): (1,)}
 # Per-wave fixed cost (prologue + drain of a work item) in 128-token tile periods.  Calibrated
 # on B200 (148 SMs: one wave of 305 tiles beat three waves of 99) and GB300 (152 SMs: one wave
 # of 9 splits over 298 tiles beat two full waves of 19 splits by 3 % on the 8-request H96 decode
@@ -384,7 +385,9 @@ def wide_work_clusters(plan: AttentionPlan) -> int:
     return plan.grid_main[0] // WIDE_CLUSTER
 
 
-def use_persistent_route(plan: AttentionPlan, sm_count: int, max_seq_len: int) -> bool:
+def use_persistent_route(
+    plan: AttentionPlan, capability: tuple[int, int], sm_count: int, max_seq_len: int
+) -> bool:
     """Whether a plan runs the persistent wide kernel with the flag-waiting reducer.
 
     With ``s`` splits, ``nf`` unsplit items, ``W`` work clusters, ``P = sm_count // 2`` SM pairs
@@ -398,16 +401,18 @@ def use_persistent_route(plan: AttentionPlan, sm_count: int, max_seq_len: int) -
     The gains (an item's epilogue hidden under the next item, the tail merge hidden under later
     work) are fixed per item boundary, so the route also needs a tail plan (``nf > 0``: unsplit
     items whose boundaries overlap) and items no longer than ``PERSISTENT_MAX_ITEM_KV`` for the
-    device's SM count (``max_seq_len``, the keys one unsplit item streams).  An SM count without a
-    value keeps the shipped kernels, as does a plan whose merge reducer class is listed in
-    ``PERSISTENT_SHIPPED_REDUCE_WARPS`` for the SM count (``reduce_warps``).
+    device (``max_seq_len``, the keys one unsplit item streams).  Both tables are keyed by the
+    device's compute capability and SM count (``(capability, sm_count)``): a device without a value
+    keeps the shipped kernels, as does a plan whose merge reducer class is listed in
+    ``PERSISTENT_SHIPPED_REDUCE_WARPS`` for the device (``reduce_warps``).
     """
     if not plan.wide or not 2 <= plan.num_split <= REDUCE_WARP_MAX_SPLITS:
         return False
-    max_item_kv = PERSISTENT_MAX_ITEM_KV.get(int(sm_count))
+    device = ((int(capability[0]), int(capability[1])), int(sm_count))
+    max_item_kv = PERSISTENT_MAX_ITEM_KV.get(device)
     if plan.n_full_items == 0 or max_item_kv is None or int(max_seq_len) > max_item_kv:
         return False
-    if plan.reduce_warps in PERSISTENT_SHIPPED_REDUCE_WARPS.get(int(sm_count), ()):
+    if plan.reduce_warps in PERSISTENT_SHIPPED_REDUCE_WARPS.get(device, ()):
         return False
     work = wide_work_clusters(plan)
     pairs = max(1, sm_count // WIDE_CLUSTER)
@@ -466,10 +471,14 @@ def _device_index(device: torch.device) -> int:
 
 
 @functools.cache
-def _device_facts(device_index: int) -> tuple[str, int]:
-    """``(arch, sm_count)`` of a device, read once."""
+def _device_facts(device_index: int) -> tuple[str, tuple[int, int], int]:
+    """``(arch, capability, sm_count)`` of a device, read once."""
     props = torch.cuda.get_device_properties(device_index)
-    return f"sm_{props.major}{props.minor}a", int(props.multi_processor_count)
+    return (
+        f"sm_{props.major}{props.minor}a",
+        (int(props.major), int(props.minor)),
+        int(props.multi_processor_count),
+    )
 
 
 # A minimal kernel the driver JIT-compiles for the pair capacity probe: the capacity depends on the
@@ -860,7 +869,7 @@ class KimiK3MlaFp8PagedAttention:
             seq_lens=seq_lens,
             device=device,
         )
-        self.arch, sm_count = _device_facts(_device_index(device))
+        self.arch, capability, sm_count = _device_facts(_device_index(device))
         self.batch = int(batch)
         self.num_heads = int(num_heads)
         self.max_q_len = int(max_q_len)
@@ -892,7 +901,7 @@ class KimiK3MlaFp8PagedAttention:
         main_kind, reduce_kind = plan.main_kind, plan.reduce_kind
         self.tile_flags = None
         pairs = 0
-        if use_persistent_route(plan, sm_count, int(max_seq_len)):
+        if use_persistent_route(plan, capability, sm_count, int(max_seq_len)):
             pairs = min(
                 wide_work_clusters(plan), _wide_pair_capacity(_device_index(device))
             )
