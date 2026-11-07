@@ -8,6 +8,18 @@
 
 SCCACHE_VERSION="0.18.0"
 
+# rapidsai/sccache fork used for nvcc when FLASHINFER_SCCACHE_NVCC_IMPL=rapids
+# (see setup_sccache). Pinned by release tag and the sha256 digests GitHub
+# publishes for the release assets; the checksums are pinned here rather than
+# fetched from the same origin as the tarball.
+SCCACHE_RAPIDS_VERSION="0.18.0-rapids.8"
+SCCACHE_RAPIDS_SHA256_x86_64="6b479c4d4903c8f738f031d4a18f2937a1090827ed553b6bfd7beed0e9aeebeb"
+SCCACHE_RAPIDS_SHA256_aarch64="2994d493d18566af0d55dc4ebc678be6b6f91b6856d1c6837325c121da755b6d"
+# Installed in a directory of its own under the name "sccache": invoked under any
+# other name (e.g. sccache-rapids), sccache treats that name as a compiler to
+# wrap, and even `--version` hangs.
+SCCACHE_RAPIDS_BIN="${SCCACHE_RAPIDS_BIN:-/usr/local/libexec/sccache-rapids/sccache}"
+
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
 # memory to avoid OOMs on multi-arch builds.
@@ -358,6 +370,39 @@ install_sccache() {
   export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
 }
 
+# Install the pinned rapidsai/sccache fork as SCCACHE_RAPIDS_BIN, next to (not
+# replacing) an upstream /usr/local/bin/sccache.
+install_rapids_sccache() {
+  local sccache_arch=$1
+  local version="${SCCACHE_RAPIDS_VERSION}"
+  local sha_var="SCCACHE_RAPIDS_SHA256_${sccache_arch}"
+  local sccache_sha256="${!sha_var:-}"
+  local sccache_package="sccache-v${version}-${sccache_arch}-unknown-linux-musl"
+  local sccache_archive="${sccache_package}.tar.gz"
+  local sccache_url="https://github.com/rapidsai/sccache/releases/download/v${version}/${sccache_archive}"
+  local sccache_tmpdir
+
+  if [ -z "${sccache_sha256}" ]; then
+    echo "ERROR: No pinned rapids sccache checksum for ${sccache_arch}"
+    exit 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "ERROR: sha256sum is required to verify sccache downloads"
+    exit 1
+  fi
+
+  echo "::group::Install rapids sccache v${version} (${sccache_arch})"
+  sccache_tmpdir=$(mktemp -d)
+  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
+  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
+  mkdir -p "$(dirname "${SCCACHE_RAPIDS_BIN}")"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" "${SCCACHE_RAPIDS_BIN}"
+  rm -rf "${sccache_tmpdir}"
+  chmod +x "${SCCACHE_RAPIDS_BIN}"
+  echo "::endgroup::"
+}
+
 # Install sccache (if missing), configure environment, and start the server.
 # Caller must have exported SCCACHE_BUCKET before calling.
 #
@@ -366,7 +411,17 @@ install_sccache() {
 #   $2 - Source root directory for SCCACHE_BASEDIRS.
 #
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
-# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, FLASHINFER_SCCACHE_NVCC_IMPL.
+#
+# FLASHINFER_SCCACHE_NVCC_IMPL=rapids sends nvcc compiles to a second server
+# running the rapidsai/sccache fork (SCCACHE_RAPIDS_VERSION), on port
+# FLASHINFER_SCCACHE_RAPIDS_PORT (default 4227) and key prefix "<tag>-rapids";
+# host C++ stays on the upstream server and prefix. The fork's nvcc hashing
+# lists dependencies (-M) and caches that list, so a hit skips nvcc's
+# preprocessing: on the sm80 provider, about 0.3 instead of 7.4 host CPU-s per
+# hit. Its keys differ from upstream's, hence the separate prefix. Host C++
+# cannot use the fork: it fails fatally (no fallback) on `g++ -MMD` of files
+# that include <vector> ("Error computing digest: while reading '/'").
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
 # Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
 # Each setup starts a new stats session, discarding inherited runtime state.
@@ -378,6 +433,20 @@ setup_sccache() {
   unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
   unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
+  local nvcc_impl="${FLASHINFER_SCCACHE_NVCC_IMPL:-upstream}"
+  case "${nvcc_impl}" in
+    upstream|rapids) ;;
+    *)
+      echo "ERROR: Unsupported FLASHINFER_SCCACHE_NVCC_IMPL=${nvcc_impl} (upstream|rapids)"
+      return 1
+      ;;
+  esac
+  export FLASHINFER_SCCACHE_NVCC_IMPL_ACTIVE="${nvcc_impl}"
+  export FLASHINFER_SCCACHE_RAPIDS_PORT="${FLASHINFER_SCCACHE_RAPIDS_PORT:-4227}"
+  if [ "${nvcc_impl}" = "rapids" ] && \
+     [ "$("${SCCACHE_RAPIDS_BIN}" --version 2>/dev/null)" != "sccache ${SCCACHE_RAPIDS_VERSION}" ]; then
+    install_rapids_sccache "${sccache_arch}"
+  fi
   if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
     export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
@@ -423,10 +492,33 @@ setup_sccache() {
     stop_sccache_after_setup_failure
     return "${setup_status}"
   }
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    # The server reads its configuration at startup, so only the prefix differs.
+    SCCACHE_S3_KEY_PREFIX="${key_prefix}-rapids" \
+      run_rapids_sccache_command --start-server || {
+      setup_status=$?
+      stop_sccache_after_setup_failure
+      return "${setup_status}"
+    }
+    run_rapids_sccache_command --zero-stats || {
+      setup_status=$?
+      stop_sccache_after_setup_failure
+      return "${setup_status}"
+    }
+  fi
   export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    # The launcher is pasted into the ninja command line, which a shell runs.
+    export FLASHINFER_NVCC_LAUNCHER="env SCCACHE_SERVER_PORT=${FLASHINFER_SCCACHE_RAPIDS_PORT} ${SCCACHE_RAPIDS_BIN}"
+  else
+    export FLASHINFER_NVCC_LAUNCHER="sccache"
+  fi
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    echo "sccache nvcc version: $("${SCCACHE_RAPIDS_BIN}" --version)"
+    echo "sccache nvcc prefix: ${key_prefix}-rapids"
+  fi
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
   echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
@@ -443,6 +535,11 @@ setup_sccache() {
     {
       printf 'git_commit=%s\n' "${git_commit:-unknown}"
       printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_nvcc_impl=%s\n' "${nvcc_impl}"
+      if [ "${nvcc_impl}" = "rapids" ]; then
+        printf 'sccache_nvcc_version=%s\n' "$("${SCCACHE_RAPIDS_BIN}" --version)"
+        printf 'sccache_nvcc_key_prefix=%s\n' "${key_prefix}-rapids"
+      fi
       printf 'sccache_install_source=%s\n' "${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
       printf 'sccache_revision=%s\n' "${FLASHINFER_SCCACHE_REVISION}"
       printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
@@ -463,6 +560,10 @@ stop_sccache_after_setup_failure() {
   if ! run_sccache_control_command --stop-server >/dev/null 2>&1; then
     echo "WARNING: Failed to stop sccache after setup failure; daemon may remain running" >&2
   fi
+  if [ "${FLASHINFER_SCCACHE_NVCC_IMPL_ACTIVE:-upstream}" = "rapids" ] && \
+     ! run_rapids_sccache_command --stop-server >/dev/null 2>&1; then
+    echo "WARNING: Failed to stop the rapids sccache after setup failure" >&2
+  fi
 }
 
 run_sccache_control_command() {
@@ -470,6 +571,16 @@ run_sccache_control_command() {
     timeout --signal=TERM --kill-after=5s 30s sccache "$@"
   else
     sccache "$@"
+  fi
+}
+
+# Control commands for the nvcc server of FLASHINFER_SCCACHE_NVCC_IMPL=rapids.
+run_rapids_sccache_command() {
+  if command -v timeout >/dev/null 2>&1; then
+    SCCACHE_SERVER_PORT="${FLASHINFER_SCCACHE_RAPIDS_PORT:-4227}" \
+      timeout --signal=TERM --kill-after=5s 30s "${SCCACHE_RAPIDS_BIN}" "$@"
+  else
+    SCCACHE_SERVER_PORT="${FLASHINFER_SCCACHE_RAPIDS_PORT:-4227}" "${SCCACHE_RAPIDS_BIN}" "$@"
   fi
 }
 
@@ -505,5 +616,30 @@ collect_sccache_stats() {
     echo "::endgroup::"
   fi
   run_sccache_control_command --stop-server >/dev/null 2>&1 || true
+
+  if [ "${FLASHINFER_SCCACHE_NVCC_IMPL_ACTIVE:-upstream}" = "rapids" ]; then
+    if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
+      # Separate files for the nvcc server, and a section appended to the text
+      # stats that the workflow prints.
+      if run_rapids_sccache_command --show-stats \
+          > "${SCCACHE_STATS_DIR}/sccache-nvcc-stats.txt"; then
+        {
+          printf '\n=== nvcc server (%s) ===\n' "$("${SCCACHE_RAPIDS_BIN}" --version)"
+          cat "${SCCACHE_STATS_DIR}/sccache-nvcc-stats.txt"
+        } >> "${SCCACHE_STATS_DIR}/sccache-stats.txt"
+      else
+        echo "WARNING: Failed to collect text nvcc sccache stats" >&2
+      fi
+      if ! run_rapids_sccache_command --show-stats --stats-format=json \
+          > "${SCCACHE_STATS_DIR}/sccache-nvcc-stats.json"; then
+        echo "WARNING: Failed to collect JSON nvcc sccache stats" >&2
+      fi
+    else
+      echo "::group::sccache nvcc stats"
+      run_rapids_sccache_command --show-stats || true
+      echo "::endgroup::"
+    fi
+    run_rapids_sccache_command --stop-server >/dev/null 2>&1 || true
+  fi
   export FLASHINFER_SCCACHE_ACTIVE=false
 }
