@@ -534,7 +534,7 @@ def test_the_device_tile_numbering_counts_the_exact_tiles() -> None:
                 max(-(-(64 * min(2 * i + 2, -(-q // 64)) + k - q) // 128), 0),
                 -(-k // 128),
             )
-            for q, k in zip(q_lens, k_lens)
+            for q, k in zip(q_lens, k_lens, strict=True)
             for i in range(-(-q // 128))
         ]
         assert pair_order.dtype == torch.int32

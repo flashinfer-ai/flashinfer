@@ -90,7 +90,11 @@ HEAD_DIM: int = cake_jit.HEAD_DIM
 LOG2_E = math.log2(math.e)
 
 # The main kernel and the dK GEMM of each dK / dV output (the row-map form runs the FP32 window, then the fold).
-_MAIN_STAGE = {"bf16": "bwd_main_bf16", "fp32": "bwd_main_fp32", "rowmap": "bwd_main_fp32"}
+_MAIN_STAGE = {
+    "bf16": "bwd_main_bf16",
+    "fp32": "bwd_main_fp32",
+    "rowmap": "bwd_main_fp32",
+}
 _DK_STAGE = {"bf16": "bwd_dk_bf16", "fp32": "bwd_dk_fp32", "rowmap": "bwd_dk_fp32"}
 
 
@@ -361,14 +365,20 @@ class CakeGQADetWorkspace:
         ds[lines - cake_jit.DS_TILE_LINES :].zero_()
         return ds
 
-    def window(self, total_k: int, num_heads_kv: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def window(
+        self, total_k: int, num_heads_kv: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """The FP32 window gradients ``(dk_win, dv_win)``, each ``[T_k, H_kv, 256]``, of a row-map call."""
         count = total_k * num_heads_kv * HEAD_DIM
         if self._window is None or self._window.numel() < 2 * count:
             self._window = None
-            self._window = torch.empty(2 * count, dtype=torch.float32, device=self.device)
+            self._window = torch.empty(
+                2 * count, dtype=torch.float32, device=self.device
+            )
         shape = (total_k, num_heads_kv, HEAD_DIM)
-        return self._window[:count].view(shape), self._window[count : 2 * count].view(shape)
+        return self._window[:count].view(shape), self._window[count : 2 * count].view(
+            shape
+        )
 
     def release(self) -> None:
         """Drop the backward scratch, the dS^T workspace and the window gradients (the tile counter stays)."""
@@ -673,7 +683,9 @@ def cake_gqa_det_train_backward(
         dims,
         device_index,
     )
-    tile_base, pair_base, pair_order = _tile_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q)
+    tile_base, pair_base, pair_order = _tile_plan(
+        cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
+    )
     ds = ws.ds_tiles(plan["ws_tiles"])
     if mode == "rowmap":
         win_k, win_v = ws.window(total_k, heads_kv)
@@ -707,7 +719,14 @@ def cake_gqa_det_train_backward(
         for index, n0 in enumerate(range(0, blocks, n_chunk)):
             n1 = min(n0 + n_chunk, blocks)
             chunk = {"chunk_blocks": n1 - n0, "chunk_heads": hc}
-            at = {**values, "n0": n0, "n1": n1, "h0": h0, "hc": hc, "accumulate": 1 if index else 0}
+            at = {
+                **values,
+                "n0": n0,
+                "n1": n1,
+                "h0": h0,
+                "hc": hc,
+                "accumulate": 1 if index else 0,
+            }
             _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
             _launch(_DK_STAGE[mode], at, dims, device_index, **chunk)
             _launch("bwd_dq", at, dims, device_index, **chunk)
@@ -736,7 +755,10 @@ def cake_gqa_det_train_backward(
 
 
 def _tile_plan(
-    cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, key_blocks: int, total_q: int
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The workspace tile numbering on the device, from the segment boundaries (no host read):
 
@@ -754,21 +776,33 @@ def _tile_plan(
     q_len = cq[1:] - cq[:-1]
     k_len = ck[1:] - ck[:-1]
     n = torch.arange(key_blocks + 1, device=cq.device, dtype=torch.int64)[:, None]
-    m_min = torch.clamp(
-        n * cake_jit.BWD_TILE_KEYS - (k_len - q_len)[None, :], min=0
-    ) // cake_jit.BWD_TILE_ROWS
+    m_min = (
+        torch.clamp(n * cake_jit.BWD_TILE_KEYS - (k_len - q_len)[None, :], min=0)
+        // cake_jit.BWD_TILE_ROWS
+    )
     tiles = (q_len + cake_jit.BWD_TILE_ROWS - 1) // cake_jit.BWD_TILE_ROWS
     blocks = (k_len + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
-    cnt = torch.where(n < blocks[None, :], torch.clamp(tiles[None, :] - m_min, min=0), 0).reshape(-1)
+    cnt = torch.where(
+        n < blocks[None, :], torch.clamp(tiles[None, :] - m_min, min=0), 0
+    ).reshape(-1)
     tile_base = (torch.cumsum(cnt, 0) - cnt).to(torch.int32)
     pair_base = torch.zeros(q_len.numel() + 1, dtype=torch.int64, device=cq.device)
     torch.cumsum((tiles + 1) // 2, 0, out=pair_base[1:])
     pair = torch.arange(
-        (total_q + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS + q_len.numel(), device=cq.device
+        (total_q + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
+        + q_len.numel(),
+        device=cq.device,
     )
-    seg = torch.searchsorted(pair_base[1:].contiguous(), pair, right=True).clamp(max=q_len.numel() - 1)
+    seg = torch.searchsorted(pair_base[1:].contiguous(), pair, right=True).clamp(
+        max=q_len.numel() - 1
+    )
     last = torch.minimum(2 * (pair - pair_base[seg]) + 2, tiles[seg])
-    seen = (cake_jit.BWD_TILE_ROWS * last + (k_len - q_len)[seg] + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
+    seen = (
+        cake_jit.BWD_TILE_ROWS * last
+        + (k_len - q_len)[seg]
+        + cake_jit.BWD_TILE_KEYS
+        - 1
+    ) // cake_jit.BWD_TILE_KEYS
     seen = torch.minimum(seen.clamp(min=0), blocks[seg])
     seen = torch.where(pair < pair_base[-1], seen, -1)
     pair_order = torch.sort(-seen, stable=True).indices.to(torch.int32)
