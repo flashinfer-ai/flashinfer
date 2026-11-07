@@ -3314,8 +3314,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally. Must be zero-init for cute-dsl backend.
+            Must be contiguous for the FA2 CUDA-core path (``use_tensor_cores=False``).
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
+            Must be contiguous for the FA2 CUDA-core path, including when ``return_lse=False``.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
         enable_pdl : bool
