@@ -1848,9 +1848,16 @@ def split_r_form(
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
 # grid needs a second, short wave, slots < CTAs <= window x slots, prep_tma elsewhere.  Both give the same bits.  The
-# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.
+# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.  The tensor maps read q and k
+# through their strides, so prep_tma reads the head views of a packed row (token stride (2 H + HV) x 128) in place;
+# the plain prep reads contiguous rows, so a view it runs on is copied first (:func:`_prep_inputs`).
 PREP_TMA_CONSTANTS = ("ctas_per_sm", "window")
 TMA_ALIGN_BYTES = 16
+# q / k views that prep_tma reads in place run prep_tma inside the rule's plain band too (no copy of q / k); a
+# ``prep`` pin still decides
+VIEWS_TAKE_PREP_TMA = True
+# a strided q / k / v is copied into contiguous rows as 8-byte words where its strides allow (:func:`_dense`)
+_COPY_WORD = torch.int64
 
 
 @cache
@@ -1878,17 +1885,90 @@ def use_prep_tma(num_chunks: int, num_heads: int, device_index: int) -> bool:
 
 
 def _prep_stage(
-    q, k, num_chunks: int, num_heads: int, arch: str, options: ChainOptions
+    q,
+    k,
+    num_chunks: int,
+    num_heads: int,
+    arch: str,
+    options: ChainOptions,
+    *,
+    views: bool = False,
 ) -> str:
-    """``prep_tma`` or ``prep`` for one call: the ``prep`` pin, else the rule; the plain prep when q or k is not
-    16-byte aligned or the architecture has no ``prep_tma`` record."""
+    """``prep_tma`` or ``prep`` for one call: the ``prep`` pin, else the rule (``views``: ``prep_tma`` without the
+    rule); the plain prep when q or k is not 16-byte aligned or the architecture has no ``prep_tma`` record."""
     if options.prep == "plain" or not _available("prep_tma", arch):
         return "prep"
     if any(t.data_ptr() % TMA_ALIGN_BYTES for t in (q, k)):
         return "prep"
-    if options.prep == "tma" or use_prep_tma(num_chunks, num_heads, _tensor_index(q)):
+    if (
+        options.prep == "tma"
+        or views
+        or use_prep_tma(num_chunks, num_heads, _tensor_index(q))
+    ):
         return "prep_tma"
     return "prep"
+
+
+def _tma_rows(t: torch.Tensor) -> bool:
+    """Whether the ``prep_tma`` tensor map of ``t`` (``[..., T, H, 128]``) reads it in place: a unit channel stride,
+    row-major non-overlapping head and token strides that are 16-byte multiples, a 16-byte aligned address, and
+    leading axes that fold into the token axis (the binding's ``check_dense_leading_dims``)."""
+    if t.dim() < 3 or t.stride(-1) != 1:
+        return False
+    head, token = t.stride(-2), t.stride(-3)
+    if head < t.size(-1) or token < t.size(-2) * head:
+        return False
+    size = t.element_size()
+    if (
+        (head * size) % TMA_ALIGN_BYTES
+        or (token * size) % TMA_ALIGN_BYTES
+        or t.data_ptr() % TMA_ALIGN_BYTES
+    ):
+        return False
+    expected = token
+    for axis in range(t.dim() - 4, -1, -1):
+        expected *= t.size(axis + 1)
+        if t.size(axis) > 1 and t.stride(axis) != expected:
+            return False
+    return True
+
+
+def _dense(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as contiguous rows with the same bits: ``t`` itself when contiguous, else one copy.  A view with a unit
+    innermost stride whose row length, element offset and other strides are multiples of the 8-byte word (a head view
+    of a packed row) is copied as 8-byte words: the same bytes in a quarter of the elements of a BF16 copy."""
+    if t.is_contiguous():
+        return t
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    ratio = _COPY_WORD.itemsize // t.element_size()
+    if (
+        ratio > 1
+        and t.dim() > 0
+        and t.stride(-1) == 1
+        and t.size(-1) % ratio == 0
+        and t.storage_offset() % ratio == 0
+        and all(stride % ratio == 0 for stride in t.stride()[:-1])
+    ):
+        out.view(_COPY_WORD).copy_(t.view(_COPY_WORD))
+    else:
+        out.copy_(t)
+    return out
+
+
+def _prep_inputs(
+    q, k, num_chunks: int, num_heads: int, arch: str, options: ChainOptions
+):
+    """``(q, k, prep)``: the q / k the prep reads and its stage.  Strided views that ``prep_tma`` reads in place stay
+    views when it runs (:data:`VIEWS_TAKE_PREP_TMA`: without the rule; a ``prep`` pin still decides); otherwise q / k
+    become contiguous rows (:func:`_dense`) and :func:`_prep_stage` picks the stage, as for contiguous inputs."""
+    if not (q.is_contiguous() and k.is_contiguous()) and _tma_rows(q) and _tma_rows(k):
+        prep = _prep_stage(
+            q, k, num_chunks, num_heads, arch, options, views=VIEWS_TAKE_PREP_TMA
+        )
+        if prep == "prep_tma":
+            return q, k, prep
+    q, k = _dense(q), _dense(k)
+    return q, k, _prep_stage(q, k, num_chunks, num_heads, arch, options)
 
 
 # --------------------------------------------------------------------------- #
@@ -2272,7 +2352,10 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    # q / k stay views where prep_tma reads them in place (the head views of a packed row); v is read as contiguous
+    # rows (wy_tc, the backward tail), copied once byte for byte when it is a view
+    q, k, prep = _prep_inputs(q, k, meta.num_chunks, num_heads, arch, options)
+    v = _dense(v)
     g32 = g.contiguous()
     if g32.dtype != torch.float32:
         g32 = g32.float()
@@ -2289,7 +2372,6 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     rstd_q = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     rstd_k = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     g_cs = torch.empty((total_tokens, num_v_heads), dtype=torch.float32, device=device)
-    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
     _launch(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks, num_heads if prep == "prep_tma" else num_v_heads,
             1, q, k, g32, beta, beta32, qn, kn, rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads,
             num_v_heads, 1 if normalize_qk else 0)  # fmt: skip

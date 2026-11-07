@@ -3194,6 +3194,104 @@ def test_strided_packed_qkv_views(device) -> None:
     _assert_close_to_reference(got, _reference(inputs, seq_lens), OUTPUT_NAMES)
 
 
+def _run_packed(inputs, seq_lens, heads, **pins):
+    """:func:`_run` (host route) with q / k / v as head views of one packed ``[1, T, (2 H + HV) * 128]`` leaf; ``dq``
+    / ``dk`` / ``dv`` are the views of the leaf's gradient."""
+    h, hv = heads
+    total = inputs["q"].shape[1]
+    widths = (h * HEAD_DIM, h * HEAD_DIM, hv * HEAD_DIM)
+    flat = [inputs[n].reshape(1, total, -1) for n in ("q", "k", "v")]
+    packed = torch.cat(flat, -1).detach().clone().requires_grad_(True)
+    q, k, v = (part.unflatten(-1, (-1, HEAD_DIM)) for part in packed.split(widths, -1))
+    assert (
+        not q.is_contiguous()
+        and not v.is_contiguous()
+        and q.stride(1) == (2 * h + hv) * HEAD_DIM
+    )
+    g, beta = (inputs[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
+    cu = _cu(seq_lens)
+    o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM),
+                           cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=inputs["q"].device),
+                           cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
+                           **pins)  # fmt: skip
+    (o.float() * inputs["do"].float()).sum().backward()
+    torch.cuda.synchronize()
+    dq, dk, dv = (
+        part.unflatten(-1, (-1, HEAD_DIM)) for part in packed.grad.split(widths, -1)
+    )
+    return {
+        "o": o.detach(),
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+    }
+
+
+@pytest.mark.parametrize("band", ["rule", "plain-band", "plain-pin"])
+@pytest.mark.parametrize("heads", [(2, 6), (1, 3), (2, 4)], ids=["g3", "g3-h1", "g2"])
+def test_packed_views_give_the_contiguous_bits(
+    band, heads, device, monkeypatch
+) -> None:
+    # q / k / v as head views of one packed row give the bits of contiguous copies, every output and gradient:
+    # prep_tma reads q / k in place (also where the rule's band would run the plain prep on contiguous rows: the two
+    # preps give the same bits), v is copied byte for byte; a plain pin copies q / k as well
+    seq_lens = (300, 77, 640, 1)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=233)
+    pins = {"prep": "plain"} if band == "plain-pin" else {}
+    if band == "plain-band":
+        monkeypatch.setattr(cake_chain, "use_prep_tma", lambda *_args: False)
+    stages = _record_launches(monkeypatch)
+    want = _run(inputs, seq_lens, **pins)
+    want_preps = _preps(stages)
+    stages.clear()
+    got = _run_packed(inputs, seq_lens, heads, **pins)
+    got_preps = _preps(stages)
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+    expected = {"rule": ({"prep_tma"}, {"prep_tma"}), "plain-band": ({"prep"}, {"prep_tma"}),
+                "plain-pin": ({"prep"}, {"prep"})}[band]  # fmt: skip
+    assert (want_preps, got_preps) == expected, (want_preps, got_preps)
+
+
+def test_dense_copies_the_bytes(device) -> None:
+    # the 8-byte-word copy of a strided view keeps every BF16 bit pattern (NaN payloads included); a view the word
+    # view cannot express (an odd element offset) takes the element copy
+    words = torch.randint(
+        -(2**15), 2**15, (37, 1280), dtype=torch.int32, device=device
+    ).to(torch.int16)
+    row = words.view(torch.bfloat16)
+    for start, width in ((0, 256), (512, 768), (3, 256)):
+        view = row[:, start : start + width].unflatten(
+            -1, (-1, 1 if start == 3 else HEAD_DIM)
+        )
+        dense = cake_chain._dense(view)
+        assert dense.is_contiguous() and dense.shape == view.shape
+        assert torch.equal(dense.view(torch.int16), view.contiguous().view(torch.int16))
+    contiguous = row[:5]
+    assert cake_chain._dense(contiguous) is contiguous
+
+
+def test_tma_rows_takes_row_major_head_views() -> None:
+    # prep_tma's in-place reading: head views of a packed row; not a transposed, unaligned or overlapping view
+    row = torch.empty(64, (2 * 2 + 6) * HEAD_DIM, dtype=torch.bfloat16)
+    q = row[:, : 2 * HEAD_DIM].view(64, 2, HEAD_DIM)
+    assert cake_chain._tma_rows(q) and cake_chain._tma_rows(q[None])
+    assert not cake_chain._tma_rows(q.transpose(0, 1))
+    assert not cake_chain._tma_rows(row[:, 4 : 4 + 2 * HEAD_DIM].view(64, 2, HEAD_DIM))
+    assert not cake_chain._tma_rows(
+        torch.empty(64, HEAD_DIM, dtype=torch.bfloat16)[:, None].expand(64, 2, HEAD_DIM)
+    )
+    odd = torch.empty(64, 2 * HEAD_DIM + 4, dtype=torch.bfloat16)[
+        :, : 2 * HEAD_DIM
+    ].view(64, 2, HEAD_DIM)
+    assert not cake_chain._tma_rows(
+        odd
+    )  # token stride of 520 bytes: not a 16-byte multiple
+    batched = torch.empty(3, 64, 2, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._tma_rows(batched) and not cake_chain._tma_rows(batched[::2])
+
+
 def _storage_bytes(t: torch.Tensor) -> int:
     """The caching allocator's figure for one tensor's storage (512-byte rounding)."""
     return (t.untyped_storage().nbytes() + 511) // 512 * 512
