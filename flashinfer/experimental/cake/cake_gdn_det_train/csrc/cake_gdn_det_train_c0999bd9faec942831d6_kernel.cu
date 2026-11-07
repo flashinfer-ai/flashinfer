@@ -116,8 +116,8 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
     float res[8];
     float blk[8];
     float bp[2];
-    long long init_base = ((long long)seq * nvh + hv64) * 16384;
-    long long first_base = ((long long)seg_first * nvh + hv64) * 16384;
+    long long init_base = ((long long)seq * nvh + hv64) * 16384ll;
+    long long first_base = ((long long)seg_first * nvh + hv64) * 16384ll;
     float vals[4];
     unsigned int hi[2];
     unsigned int lo[2];
@@ -132,7 +132,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
         vals[3] = 0.0f;
     } else {
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_0 * 128 + (long long)col_1_0);
+            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_0 * 128ll + (long long)col_1_0);
             vals[0 + 0] = _v4.x;
             vals[0 + 1] = _v4.y;
             vals[0 + 2] = _v4.z;
@@ -165,7 +165,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
         vals[3] = 0.0f;
     } else {
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_1 * 128 + (long long)col_1_1);
+            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_1 * 128ll + (long long)col_1_1);
             vals[0 + 0] = _v4.x;
             vals[0 + 1] = _v4.y;
             vals[0 + 2] = _v4.z;
@@ -198,7 +198,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
         vals[3] = 0.0f;
     } else {
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_2 * 128 + (long long)col_1_2);
+            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_2 * 128ll + (long long)col_1_2);
             vals[0 + 0] = _v4.x;
             vals[0 + 1] = _v4.y;
             vals[0 + 2] = _v4.z;
@@ -231,7 +231,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
         vals[3] = 0.0f;
     } else {
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_3 * 128 + (long long)col_1_3);
+            float4 _v4 = *reinterpret_cast<const float4*>(init_state + init_base + (long long)row_1_3 * 128ll + (long long)col_1_3);
             vals[0 + 0] = _v4.x;
             vals[0 + 1] = _v4.y;
             vals[0 + 2] = _v4.z;
@@ -258,7 +258,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         int idx_0 = (i * 256 + tid_2) * 4;
-        long long cp_off = (long long)(idx_0 / 32) * 128 + (long long)(vb0 + idx_0 % 32);
+        long long cp_off = (long long)(idx_0 / 32) * 128ll + (long long)(vb0 + idx_0 % 32);
         if (no_init != 0) {
             cp[0] = 0.0f;
             cp[1] = 0.0f;
@@ -283,7 +283,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
     for (int sidx = 1; sidx < num_segs; sidx++) {
         int prev = seg_first + (sidx - 1) * step;
         int cur = prev + step;
-        long long pre_base = ((long long)prev * nvh + hv64) * 32768;
+        long long pre_base = ((long long)prev * nvh + hv64) * 32768ll;
         acc[0] = 0.0f;
         acc[1] = 0.0f;
         acc[2] = 0.0f;
@@ -315,7 +315,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_0 = idx_2 / 128;
             int col_2 = idx_2 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_0 * 256 + (long long)col_2);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_0 * 256ll + (long long)col_2);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -341,7 +341,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_2 = idx_3 / 128;
             int col_3 = idx_3 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_2 * 256 + (long long)col_3);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_2 * 256ll + (long long)col_3);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -367,7 +367,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_3 = idx_4 / 128;
             int col_4 = idx_4 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_3 * 256 + (long long)col_4);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_3 * 256ll + (long long)col_4);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -393,7 +393,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_4 = idx_5 / 128;
             int col_5 = idx_5 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_4 * 256 + (long long)col_5);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_4 * 256ll + (long long)col_5);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -419,7 +419,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_5 = idx_6 / 128;
             int col_6 = idx_6 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_5 * 256 + (long long)col_6);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_5 * 256ll + (long long)col_6);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -445,7 +445,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_6 = idx_7 / 128;
             int col_7 = idx_7 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_6 * 256 + (long long)col_7);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_6 * 256ll + (long long)col_7);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -471,7 +471,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_7 = idx_8 / 128;
             int col_8 = idx_8 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_7 * 256 + (long long)col_8);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_7 * 256ll + (long long)col_8);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -497,7 +497,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_8 = idx_9 / 128;
             int col_9 = idx_9 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_8 * 256 + (long long)col_9);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_8 * 256ll + (long long)col_9);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -523,7 +523,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_9 = idx_10 / 128;
             int col_10 = idx_10 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_9 * 256 + (long long)col_10);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_9 * 256ll + (long long)col_10);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -549,7 +549,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_10 = idx_11 / 128;
             int col_11 = idx_11 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_10 * 256 + (long long)col_11);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_10 * 256ll + (long long)col_11);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -575,7 +575,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_11 = idx_12 / 128;
             int col_12 = idx_12 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_11 * 256 + (long long)col_12);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_11 * 256ll + (long long)col_12);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -601,7 +601,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_12 = idx_13 / 128;
             int col_13 = idx_13 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_12 * 256 + (long long)col_13);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_12 * 256ll + (long long)col_13);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -627,7 +627,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_13 = idx_14 / 128;
             int col_14 = idx_14 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_13 * 256 + (long long)col_14);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_13 * 256ll + (long long)col_14);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -653,7 +653,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_14 = idx_15 / 128;
             int col_15 = idx_15 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_14 * 256 + (long long)col_15);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_14 * 256ll + (long long)col_15);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -679,7 +679,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_15 = idx_16 / 128;
             int col_16 = idx_16 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_15 * 256 + (long long)col_16);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_15 * 256ll + (long long)col_16);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -705,7 +705,7 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
             int row_16 = idx_17 / 128;
             int col_17 = idx_17 % 128;
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128 + (long long)row_16 * 256 + (long long)col_17);
+                float4 _v4 = *reinterpret_cast<const float4*>(seg_state + pre_base + 128ll + (long long)row_16 * 256ll + (long long)col_17);
                 vals_0[0 + 0] = _v4.x;
                 vals_0[0 + 1] = _v4.y;
                 vals_0[0 + 2] = _v4.z;
@@ -771,21 +771,21 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
                 }
             }
         }
-        long long cur_base = ((long long)cur * nvh + hv64) * 16384;
+        long long cur_base = ((long long)cur * nvh + hv64) * 16384ll;
         #pragma unroll
         for (int nb2 = 0; nb2 < 2; nb2++) {
             #pragma unroll
             for (int half = 0; half < 2; half++) {
                 int col_0 = vb0 + nb2 * 16 + half * 8 + quad * 2;
                 {
-                    float2 _v2_21 = *reinterpret_cast<const float2*>(seg_state + pre_base + (long long)row_a * 256 + (long long)col_0);
+                    float2 _v2_21 = *reinterpret_cast<const float2*>(seg_state + pre_base + (long long)row_a * 256ll + (long long)col_0);
                     bp[0] = _v2_21.x;
                     bp[0 + 1] = _v2_21.y;
                 }
                 acc[nb2 * 8 + half * 4] = acc[nb2 * 8 + half * 4] + bp[0];
                 acc[nb2 * 8 + half * 4 + 1] = acc[nb2 * 8 + half * 4 + 1] + bp[1];
                 {
-                    float2 _v2_22 = *reinterpret_cast<const float2*>(seg_state + pre_base + (long long)(row_a + 8) * 256 + (long long)col_0);
+                    float2 _v2_22 = *reinterpret_cast<const float2*>(seg_state + pre_base + (long long)(row_a + 8) * 256ll + (long long)col_0);
                     bp[0] = _v2_22.x;
                     bp[0 + 1] = _v2_22.y;
                 }
@@ -793,11 +793,11 @@ kernel_cake_gdn_det_train_c0999bd9faec942831d6(float* __restrict__ seg_state, fl
                 acc[nb2 * 8 + half * 4 + 3] = acc[nb2 * 8 + half * 4 + 3] + bp[1];
                 {
                     float2 _v2 = make_float2(acc[nb2 * 8 + half * 4 + 0], acc[nb2 * 8 + half * 4 + 1]);
-                    *reinterpret_cast<float2*>(state_out + cur_base + (long long)row_a * 128 + (long long)col_0) = _v2;
+                    *reinterpret_cast<float2*>(state_out + cur_base + (long long)row_a * 128ll + (long long)col_0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(acc[nb2 * 8 + half * 4 + 2 + 0], acc[nb2 * 8 + half * 4 + 2 + 1]);
-                    *reinterpret_cast<float2*>(state_out + cur_base + (long long)(row_a + 8) * 128 + (long long)col_0) = _v2;
+                    *reinterpret_cast<float2*>(state_out + cur_base + (long long)(row_a + 8) * 128ll + (long long)col_0) = _v2;
                 }
             }
         }
