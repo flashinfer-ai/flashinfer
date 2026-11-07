@@ -503,8 +503,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert record["kernel_symbol"] == f"kernel_{name}"
         assert record["role"] in loader.ROLES, name
         assert record["grid_rule"]["kind"] in loader.GRID_KINDS, name
-        # 32 rows, or 64 or 128 for a program whose threads own two or four rows
-        assert record["grid_rule"]["tile_rows"] in (32, 64, 128), name
+        # 32 rows, 64 or 128 for a program whose threads own two or four rows,
+        # or 8 for a 32-column program with 16 threads per row
+        assert record["grid_rule"]["tile_rows"] in (8, 32, 64, 128), name
         # 128 forward or 64 backward columns, or a narrower tile
         tile_cols = record["grid_rule"]["tile_cols"]
         widths = (128, 64, 32) if record["role"] == "fwd" else (64, 32)

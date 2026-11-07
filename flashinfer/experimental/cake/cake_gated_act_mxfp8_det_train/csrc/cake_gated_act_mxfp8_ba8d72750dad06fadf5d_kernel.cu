@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_TILE_OFF 0
-#define SMEM_TILE_STAGE_BYTES 32768
-#define SMEM_TILE_STRIDE 32768
-#define SMEM_TOTAL 32768
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
@@ -248,7 +241,7 @@ kernel_cake_gated_act_mxfp8_ba8d72750dad06fadf5d(__nv_bfloat16* __restrict__ gat
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* tile = reinterpret_cast<uint8_t*>(smem_raw + 0);
     const int tile_addr = smem + 0;
 
