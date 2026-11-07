@@ -150,7 +150,8 @@ BF16_WORK_BIN_TURN_E128_LEN = 128
 # state, every sequence between these two lengths in tokens, and more tasks
 # than SMs.  That build loads the next
 # task's entering state into tensor memory on the prep warps while the current
-# task runs (every preloading task spans at least two 32-token chunks); its
+# task runs (every preloading task spans at least two 32-token or four 16-token
+# chunks); its
 # bits are those of the work-bin build.  Every other work-bin launch keeps the
 # work-bin build (its loader and layout cost more than the load it hides on
 # shorter tasks, and on the bins of a bounded launch that the strict test
@@ -4732,8 +4733,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             # BF16_WORK_BIN_PRELOAD_MIN_LEN to BF16_WORK_BIN_PRELOAD_MAX_LEN
             # tokens and that has more tasks than SMs takes the module's
             # TMEM-preload build where the loader names one: the same bins,
-            # table and bits (swapped in below).
-            if uses_default_fused_m128 and not use_direct_m128_n16:
+            # table and bits (swapped in below), on the N32 and N16 bodies alike.
+            if uses_default_fused_m128:
                 preload_program = _work_bin_preload_program(
                     getattr(self.module, "name", None),
                     gpu_arch,
