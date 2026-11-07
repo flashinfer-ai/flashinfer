@@ -4091,7 +4091,11 @@ def _jit_route_of(monkeypatch, case, *, return_lse=False):
         m.setattr(cake_api, "get_cake_fmha_context_module", probe)
         with pytest.raises(_RouteProbe) as caught:
             _run_jit_route_batch(case, return_lse=return_lse)
-    return caught.value.args[0]
+    route = caught.value.args[0]
+    # The traceback pins the caller's frame (and a CUDA graph in it) until a
+    # GC pass, which can land in a later capture and invalidate it.
+    del caught
+    return route
 
 
 def _jit_route_tiles_without_keys(case, route):
