@@ -122,6 +122,24 @@ def _cp_async_16_with_policy(dst, src, policy, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _cp_async_wait_all(*, loc=None, ip=None):
+    """``cp.async.wait_all``: wait until every cp.async this thread issued completes.
+
+    Loader threads call it before exiting so that no thread exits with copies in
+    flight; the PTX ISA does not define that case.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "cp.async.wait_all;",
+        "~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _issue_weight_tile(
     smem,
     weight,
@@ -663,7 +681,10 @@ class CpAsyncWarpSplitKKernel:
             if lane_idx < self.stages:
                 cute.arch.mbarrier_init(bar_full + lane_idx, self.load_threads)
                 if const_expr(reuse_stages):
-                    cute.arch.mbarrier_init(bar_empty + lane_idx, _COMPUTE_WARPS)
+                    # Every compute lane releases the stage it read (see the K loop).
+                    cute.arch.mbarrier_init(
+                        bar_empty + lane_idx, _COMPUTE_WARPS * cute.arch.WARP_SIZE
+                    )
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
 
@@ -692,6 +713,7 @@ class CpAsyncWarpSplitKKernel:
                 prims.cp_async_mbarrier_arrive((bar_full + stage).llvm_ptr, noinc=True)
                 if stage == self.stages - 1:
                     empty_phase = empty_phase ^ 1
+            _cp_async_wait_all()
         elif warp_idx < self.compute_warp_base:
             if const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_wait()
@@ -729,6 +751,7 @@ class CpAsyncWarpSplitKKernel:
             if const_expr(self.use_pdl):
                 # This grid-level hint is idempotent across B-loader warps.
                 cute.arch.griddepcontrol_launch_dependents()
+            _cp_async_wait_all()
         else:
             if const_expr(self.has_bias):
                 # Each reduce lane owns one output feature (32 % output_tile == 0).
@@ -834,8 +857,10 @@ class CpAsyncWarpSplitKKernel:
                                     )
                                 )
                 if const_expr(reuse_stages):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(bar_empty + stage)
+                    # Every lane arrives (count 4 x 32): each lane's ldmatrix reads
+                    # of this stage then precede its own release, so the loaders'
+                    # next cp.async into the stage is ordered after all of them.
+                    cute.arch.mbarrier_arrive(bar_empty + stage)
                 if stage == self.stages - 1:
                     full_phase = full_phase ^ 1
             for value in cutlass.range_constexpr(values_per_lane):
@@ -872,6 +897,13 @@ class CpAsyncWarpSplitKKernel:
                     total = total + bias_value
                 final_acc[value] = total
 
+            if const_expr(self.use_pdl):
+                # Order this warp's output stores after the prerequisite grids
+                # directly: only the B-loaders waited, and their wait reaches this
+                # warp through asynchronous mbarrier arrives alone. The
+                # prerequisites completed before any tile arrived, so this
+                # returns at once.
+                cute.arch.griddepcontrol_wait()
             output_base = output_tile_idx * self.output_tile
             token_base = token_tile_idx * self.token_tile
             for value in cutlass.range_constexpr(values_per_lane):
