@@ -20,7 +20,21 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from packaging.version import Version
+
+from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.jit.cpp_ext import get_cuda_version
+from flashinfer.gemm.gemm_base import (
+    CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    _b12x_gemm_fp4_requirement,
+    _cudnn_gemm_fp4_requirement,
+    _cute_dsl_gemm_fp4_requirement,
+    _cutedsl_low_latency_gemm_fp4_requirement,
+    _cutlass_gemm_fp4_requirement,
+    _fp4_scale_byte_order_problem,
+    _fp4_short_scale_problem,
+    _trtllm_gemm_fp4_requirement,
+)
 
 
 def _test_mm_fp4(
@@ -710,6 +724,594 @@ def _check_per_token_alpha_untuned(m, n, k, res_dtype):
 def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
     _skip_unless_per_token_alpha_gpu()
     _check_per_token_alpha_untuned(m, n, k, res_dtype)
+
+
+def _quantized_fp4_operands(m, n, k, use_nvfp4):
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("cudnn", major * 10 + minor):
+        pytest.skip(f"cudnn fp4 backend unsupported on SM{major}{minor}")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    if use_nvfp4:
+        one = torch.tensor(1.0, device="cuda")
+        a_fp4, a_sf = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_128x4)
+        b_fp4, b_sf = nvfp4_quantize(b, one, sfLayout=SfLayout.layout_128x4)
+    else:
+        a_fp4, a_sf = mxfp4_quantize(a)
+        b_fp4, b_sf = mxfp4_quantize(b)
+    return a_fp4, a_sf, b_fp4, b_sf
+
+
+def _expect_cudnn_scale_error(
+    m, n, k, use_nvfp4, make_b_scale, match, make_a_scale=lambda a_sf: a_sf
+):
+    a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    try:
+        with pytest.raises(ValueError, match=match):
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                make_a_scale(a_sf),
+                make_b_scale(b_sf),
+                None,
+                torch.bfloat16,
+                out,
+                block_size=16 if use_nvfp4 else 32,
+                backend="cudnn",
+                use_nvfp4=use_nvfp4,
+            )
+    except (BackendSupportedError, LibraryError) as e:
+        pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+    except RuntimeError as e:
+        # _check_cudnn_fp4_availability raises RuntimeError when cuDNN or its FP4
+        # support is missing; any other RuntimeError is a real failure.
+        if "FP4 requires" in str(e) or "cuDNN is not available" in str(e):
+            pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+        raise
+
+
+# Regression anchors: the cuDNN path derives its block-scale descriptors from the
+# scale tensors' shapes and reads their bytes in the order fp4 quantization writes.
+# A B scale tensor in the quantizer's (n, k // block_size) orientation (not
+# transposed) used to reach cuDNN unchecked: silently wrong results for n != m (as at
+# the first test's shape), and an illegal-instruction fault for MXFP4 at
+# m = n = 128, k = 64. A contiguous copy of the transpose has the right shape but
+# the wrong byte order and gave wrong results (NaN at 128 x 256 x 512 for MXFP4).
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_untransposed_b_descale(use_nvfp4):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128, 256, 64, use_nvfp4, lambda b_sf: b_sf, "pass its transpose"
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_contiguous_copy_of_b_descale_transpose(use_nvfp4):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        use_nvfp4,
+        lambda b_sf: b_sf.T.contiguous(),
+        "transposed view of those scales",
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_untransposed_b_descale_square(use_nvfp4):
+    # k // block_size and n both pad to 128, so the shapes of the two orientations
+    # agree and only the stride tells them apart.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    block_size = 16 if use_nvfp4 else 32
+    _expect_cudnn_scale_error(
+        128,
+        128,
+        128 * block_size,
+        use_nvfp4,
+        lambda b_sf: b_sf,
+        "transposed view of those scales",
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_relaid_out_a_descale(use_nvfp4):
+    # Right shape, storage re-ordered: a copy of the transpose viewed back.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        use_nvfp4,
+        lambda b_sf: b_sf.T,
+        "not a re-laid-out copy",
+        make_a_scale=lambda a_sf: a_sf.T.contiguous().T,
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_auto_declines_untransposed_b_descale(use_nvfp4):
+    # With backend="auto" the cuDNN requirement returns False for a scale tensor
+    # the check rejects, so auto dispatch moves on to another backend instead of
+    # raising. backend="cudnn" first tells cuDNN FP4 unavailability (a library
+    # error, skipped) apart from a rejected layout, so the documented scales must
+    # then be accepted.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    m, n, k = 128, 256, 64
+    a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    def accepted(b_scale, backend="auto"):
+        return _cudnn_gemm_fp4_requirement(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_scale,
+            None,
+            torch.bfloat16,
+            out,
+            block_size=16 if use_nvfp4 else 32,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+        )
+
+    try:
+        accepted(b_sf.T, backend="cudnn")
+    except (BackendSupportedError, LibraryError) as e:
+        pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+    except RuntimeError as e:
+        if "FP4 requires" in str(e) or "cuDNN is not available" in str(e):
+            pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+        raise
+    assert accepted(b_sf.T) is True
+    assert accepted(b_sf) is False
+
+
+# The CUTLASS, b12x and TRT-LLM backends, and CuTe DSL on SM100, read the block-scale
+# bytes as given (the SM12x CuTe DSL path checks shape and stride itself). A
+# transposed copy of the A or B scales holds the same values in a different byte order
+# and used to give wrong results silently on some architecture; it now raises
+# ValueError. Views over the quantizer's bytes, and reshapes to shapes a copy cannot
+# have, keep their behaviour.
+_BYTE_ORDER_BACKENDS = [
+    ("cutlass", "nvfp4"),
+    ("b12x", "nvfp4"),
+    ("b12x", "mxfp4"),
+    ("trtllm", "nvfp4"),
+    ("cute-dsl", "nvfp4"),
+    ("cute-dsl", "mxfp4"),
+    ("cutedsl_low_latency", "nvfp4"),
+    ("cutedsl_low_latency", "mxfp4"),
+]
+
+# (a_descale, b_descale) built from the quantizer outputs a_sf and b_sf
+_BLOCK_SCALE_VIEWS = {
+    "untransposed_b": lambda a_sf, b_sf: (a_sf, b_sf),
+    "a_transposed_view": lambda a_sf, b_sf: (a_sf.T, b_sf.T),
+    "a_reshaped_to_one_row": lambda a_sf, b_sf: (a_sf.reshape(1, -1), b_sf.T),
+    "b_reshaped_to_one_row": lambda a_sf, b_sf: (a_sf, b_sf.reshape(1, -1)),
+}
+_BLOCK_SCALE_TRANSPOSED_COPIES = {
+    "b_contiguous_transpose": lambda a_sf, b_sf: (a_sf, b_sf.T.contiguous()),
+    "b_contiguous_transpose_transposed_back": lambda a_sf, b_sf: (
+        a_sf,
+        b_sf.T.contiguous().T,
+    ),
+    "a_contiguous_transpose_transposed_back": lambda a_sf, b_sf: (
+        a_sf.T.contiguous().T,
+        b_sf.T,
+    ),
+    "a_contiguous_transpose": lambda a_sf, b_sf: (a_sf.T.contiguous(), b_sf.T),
+    # B is checked even when A's scales are passed flattened
+    "b_contiguous_transpose_with_flat_a": lambda a_sf, b_sf: (
+        a_sf.reshape(-1),
+        b_sf.T.contiguous(),
+    ),
+}
+
+
+def _byte_order_case(backend, fp4_type):
+    """Skip where the backend cannot run; else quantize A and B and return the inputs."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    cc = get_compute_capability(torch.device("cuda"))
+    sm12x = cc[0] == 12
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} FP4 GEMM is not supported on this GPU.")
+    if backend == "cute-dsl" and sm12x and fp4_type == "mxfp4":
+        pytest.skip("The SM12x CuTe DSL path takes NVFP4 only.")
+    if (
+        backend == "cute-dsl"
+        and sm12x
+        and not version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("The SM12x CuTe DSL path requires CUDA 13+.")
+    # b12x runs on CuTe DSL too
+    if (
+        backend in ("cute-dsl", "cutedsl_low_latency", "b12x")
+        and not is_cute_dsl_available()
+    ):
+        pytest.skip("Please `pip install nvidia-cutlass-dsl`")
+    min_cuda = "12.9" if fp4_type == "nvfp4" else "13.0"
+    if backend == "b12x" and get_cuda_version() < Version(min_cuda):
+        pytest.skip(f"b12x {fp4_type} FP4 GEMM requires CUDA {min_cuda}+.")
+    m, n, k = (8 if backend == "cutedsl_low_latency" else 128), 256, 512
+    use_nvfp4 = fp4_type == "nvfp4"
+    torch.manual_seed(0)
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    if use_nvfp4:
+        ga = (448 * 6) / a.float().abs().nan_to_num().max()
+        gb = (448 * 6) / b.float().abs().nan_to_num().max()
+        a_fp4, a_sf = nvfp4_quantize(a, ga)
+        # the TRT-LLM backend takes B shuffled, as in _test_mm_fp4
+        b_fp4, b_sf = nvfp4_quantize(b, gb, do_shuffle=backend == "trtllm")
+        alpha = 1.0 / (ga * gb)
+    else:
+        (a_fp4, a_sf), (b_fp4, b_sf), alpha = mxfp4_quantize(a), mxfp4_quantize(b), None
+    return dict(
+        a_fp4=a_fp4,
+        b_fp4=b_fp4,
+        a_sf=a_sf,
+        b_sf=b_sf,
+        alpha=alpha,
+        m=m,
+        n=n,
+        block_size=16 if use_nvfp4 else 32,
+        use_nvfp4=use_nvfp4,
+        sm12x=sm12x,
+    )
+
+
+def _run_byte_order_case(case, backend, a_descale, b_descale):
+    out = torch.empty([case["m"], case["n"]], device="cuda", dtype=torch.bfloat16)
+    mm_fp4(
+        case["a_fp4"],
+        case["b_fp4"].T,
+        a_descale,
+        b_descale,
+        case["alpha"],
+        torch.bfloat16,
+        out,
+        block_size=case["block_size"],
+        backend=backend,
+        use_nvfp4=case["use_nvfp4"],
+        skip_check=False,
+    )
+    return out
+
+
+@pytest.mark.parametrize("form", list(_BLOCK_SCALE_VIEWS))
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_keeps_block_scale_views(backend, fp4_type, form):
+    """A view over the quantizer's bytes gives the documented result, or the
+    backend's own error where it already refused it (the C++ contiguity checks on
+    SM100, the SM12x CuTe DSL check), never the transposed-copy or storage error."""
+    case = _byte_order_case(backend, fp4_type)
+    reference = _run_byte_order_case(case, backend, case["a_sf"], case["b_sf"].T)
+    a_descale, b_descale = _BLOCK_SCALE_VIEWS[form](case["a_sf"], case["b_sf"])
+    try:
+        out = _run_byte_order_case(case, backend, a_descale, b_descale)
+    except (RuntimeError, ValueError) as err:
+        assert "the layout a transposed copy of the scales has" not in str(err)
+        # a view of the full quantizer storage must never trip the storage check
+        assert "would read past the tensor's end" not in str(err)
+    else:
+        assert torch.equal(out, reference)
+
+
+@pytest.mark.parametrize("form", list(_BLOCK_SCALE_TRANSPOSED_COPIES))
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_rejects_transposed_block_scale_copy(backend, fp4_type, form):
+    case = _byte_order_case(backend, fp4_type)
+    a_descale, b_descale = _BLOCK_SCALE_TRANSPOSED_COPIES[form](
+        case["a_sf"], case["b_sf"]
+    )
+    # the SM12x CuTe DSL path refuses them with its own check first
+    own_check = backend == "cute-dsl" and case["sm12x"]
+    with pytest.raises(
+        ValueError,
+        match=None if own_check else "the layout a transposed copy of the scales has",
+    ):
+        _run_byte_order_case(case, backend, a_descale, b_descale)
+
+
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_auto_declines_transposed_block_scale_copy(backend, fp4_type):
+    """With backend="auto" the requirement check returns False instead of raising,
+    so a transposed copy takes the backend out of the candidates."""
+    case = _byte_order_case(backend, fp4_type)
+    if backend == "cute-dsl" and case["sm12x"]:
+        pytest.skip("The SM12x CuTe DSL path is never selected by auto.")
+    requirement = {
+        "cutlass": _cutlass_gemm_fp4_requirement,
+        "b12x": _b12x_gemm_fp4_requirement,
+        "trtllm": _trtllm_gemm_fp4_requirement,
+        "cute-dsl": _cute_dsl_gemm_fp4_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_gemm_fp4_requirement,
+    }[backend]
+    assert not requirement(
+        case["a_fp4"],
+        case["b_fp4"].T,
+        case["a_sf"],
+        case["b_sf"].T.contiguous(),
+        case["alpha"],
+        block_size=case["block_size"],
+        backend="auto",
+        use_nvfp4=case["use_nvfp4"],
+    )
+
+
+_SHORT_BLOCK_SCALES = {
+    # a copy of the quantizer output without its last row. It is one row short of
+    # what the layout reads. clone() is needed because a view of the full output
+    # would pass the storage check.
+    "a_one_row_short": lambda a_sf, b_sf: (a_sf[:-1].clone(), b_sf.T),
+    "b_one_row_short": lambda a_sf, b_sf: (a_sf, b_sf[:-1].clone().T),
+}
+
+
+def test_mm_fp4_helper_rejects_scales_shorter_than_the_layout():
+    """The test covers short A scales at m = 8 and k = 512. A linear A scale tensor
+    is a plain row-major (8, 32) array of 8 x 32 = 256 bytes. An 8x4-layout A
+    tensor is also 256 bytes. The 128x4 layout reads 128 x 32 = 4096 bytes, so a
+    128x4 backend would read past the end of either 256-byte tensor. TRT-LLM's
+    8x4 A layout reads 8 x 32 = 256 bytes, so the same bytes are enough there.
+    The test also covers short B scales, the 8x4 row padding at m = 9, and a
+    short 3-D tensor."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    m, n, k = 8, 256, 512
+    a = torch.empty([m, k // 2], dtype=torch.uint8, device="cuda")
+    b = torch.empty([k // 2, n], dtype=torch.uint8, device="cuda")
+    linear_a = torch.empty([m, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    full_b = torch.empty([n, k // 16], dtype=torch.float8_e4m3fn, device="cuda").T
+    problem = _fp4_scale_byte_order_problem(a, b, linear_a, full_b, 16)
+    assert problem is not None and "a_descale has 256 bytes" in problem
+    assert "reads 4096 (128 padded rows of 32 scales" in problem
+    assert (
+        _fp4_scale_byte_order_problem(a, b, linear_a, full_b, 16, a_is_128x4=False)
+        is None
+    )
+    full_a = torch.empty([128, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    assert _fp4_scale_byte_order_problem(a, b, full_a, full_b, 16) is None
+    # B: linear scales at n = 256 already have the padded 128x4 size and pass the
+    # storage check.
+    # At n = 8 they hold 8 x 32 = 256 bytes. The layout reads 4096 bytes.
+    linear_b = torch.empty([n, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    assert _fp4_scale_byte_order_problem(a, b, full_a, linear_b.T, 16) is None
+    b_short = torch.empty([k // 2, 8], dtype=torch.uint8, device="cuda")
+    linear_b_short = torch.empty([8, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    problem = _fp4_scale_byte_order_problem(a, b_short, full_a, linear_b_short.T, 16)
+    assert problem is not None and "b_descale has 256 bytes" in problem
+    assert (
+        "reads 4096 (128 padded rows of 32 scales" in problem
+        and "linear (8, 32) array" in problem
+    )
+    # 8x4 pads rows to a multiple of 8. At m = 9 a (9, 32) tensor is 9 x 32 = 288
+    # bytes. The layout reads 16 x 32 = 512 bytes. A (16, 32) tensor is enough.
+    a9 = torch.empty([9, k // 2], dtype=torch.uint8, device="cuda")
+    scales_9 = torch.empty([9, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    problem = _fp4_scale_byte_order_problem(
+        a9, b, scales_9, full_b, 16, a_is_128x4=False
+    )
+    assert problem is not None and "a_descale has 288 bytes" in problem
+    assert "8x4 block-scale layout for this call reads 512 (16 padded rows" in problem
+    assert "is_sf_8x4_layout=True" in problem
+    scales_16 = torch.empty([16, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    assert (
+        _fp4_scale_byte_order_problem(a9, b, scales_16, full_b, 16, a_is_128x4=False)
+        is None
+    )
+    # the storage check does not look at the rank: a short 3-D tensor is rejected too
+    a128 = torch.empty([128, k // 2], dtype=torch.uint8, device="cuda")
+    short_3d = torch.empty([1, 8, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    problem = _fp4_scale_byte_order_problem(a128, b, short_3d, full_b, 16)
+    assert problem is not None and "a_descale has 256 bytes" in problem
+    # A slice that drops the first row moves the pointer 32 bytes on, leaving
+    # 4096 - 32 = 4064 bytes, and fails the byte count.
+    problem = _fp4_short_scale_problem(a, b, full_a[1:], full_b, 16)
+    assert problem is not None and "a_descale has 4064 bytes" in problem
+    b_rows = torch.empty([n, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
+    problem = _fp4_short_scale_problem(a, b, full_a, b_rows[1:].T, 16)
+    assert problem is not None and "b_descale has 8160 bytes" in problem
+    # A slice that drops the last row keeps all 4096 bytes but has 127 rows of the
+    # 128 the layout pads to, so the row check rejects it.
+    problem = _fp4_short_scale_problem(a, b, full_a[:-1], full_b, 16)
+    assert problem is not None and "127 rows of 32 scales" in problem
+    problem = _fp4_short_scale_problem(a, b, full_a, b_rows[:-1].T, 16)
+    assert (
+        problem is not None and "b_descale is a row-major tensor of 255 rows" in problem
+    )
+    # nvfp4_quantize's linear output at m = 120 is a (120, 32) array on 4096
+    # bytes, because its rows are padded to a multiple of 16 in storage. The
+    # byte count passes; the row check rejects it.
+    a120 = torch.empty([120, k // 2], dtype=torch.uint8, device="cuda")
+    linear_120 = torch.empty([128, k // 16], dtype=torch.float8_e4m3fn, device="cuda")[
+        :120
+    ]
+    problem = _fp4_short_scale_problem(a120, b, linear_120, full_b, 16)
+    assert problem is not None and "120 rows of 32 scales" in problem
+    assert "128 padded rows" in problem
+
+
+@pytest.mark.parametrize("form", list(_SHORT_BLOCK_SCALES))
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_rejects_short_block_scales(backend, fp4_type, form):
+    case = _byte_order_case(backend, fp4_type)
+    a_descale, b_descale = _SHORT_BLOCK_SCALES[form](case["a_sf"], case["b_sf"])
+    own_check = backend == "cute-dsl" and case["sm12x"]
+    with pytest.raises(
+        ValueError, match=None if own_check else "would read past the tensor's end"
+    ):
+        _run_byte_order_case(case, backend, a_descale, b_descale)
+    requirement = {
+        "cutlass": _cutlass_gemm_fp4_requirement,
+        "b12x": _b12x_gemm_fp4_requirement,
+        "trtllm": _trtllm_gemm_fp4_requirement,
+        "cute-dsl": _cute_dsl_gemm_fp4_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_gemm_fp4_requirement,
+    }[backend]
+    if not own_check:
+        assert not requirement(
+            case["a_fp4"],
+            case["b_fp4"].T,
+            a_descale,
+            b_descale,
+            case["alpha"],
+            block_size=case["block_size"],
+            backend="auto",
+            use_nvfp4=case["use_nvfp4"],
+        )
+
+
+def test_mm_fp4_cudnn_rejects_short_3d_block_scales():
+    """cuDNN's shape check only looks at 2-D tensors and would let a short 3-D scale
+    tensor through. cuDNN would then read past its end and return wrong values
+    with no error. _fp4_short_scale_problem, the storage check, rejects the tensor
+    first."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        True,
+        make_b_scale=lambda b_sf: b_sf.T,
+        match="would read past the tensor's end",
+        make_a_scale=lambda a_sf: a_sf[:8].clone().reshape(1, 8, a_sf.shape[1]),
+    )
+
+
+def test_mm_fp4_cudnn_rejects_short_2d_block_scales():
+    """The cuDNN path end to end with a 2-D A scale tensor one row short of the
+    128x4 layout: the storage check rejects it before the shape check."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        True,
+        make_b_scale=lambda b_sf: b_sf.T,
+        match="would read past the tensor's end",
+        make_a_scale=lambda a_sf: a_sf[:-1].clone(),
+    )
+
+
+def test_mm_fp4_auto_declines_short_3d_block_scales():
+    """In auto mode every requirement check declines the short 3-D tensor, cuDNN's
+    included. The call raises instead of running a backend past the tensor's end."""
+    case = _byte_order_case("cutlass", "nvfp4")
+    a_short_3d = case["a_sf"][:8].clone().reshape(1, 8, case["a_sf"].shape[1])
+    with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
+        _run_byte_order_case(case, "auto", a_short_3d, case["b_sf"].T)
+
+
+def test_mm_fp4_auto_raises_on_short_block_scales():
+    """The 2-D tensor one row short, in auto mode, end to end: no backend accepts
+    it and the call raises."""
+    case = _byte_order_case("cutlass", "nvfp4")
+    a_short = case["a_sf"][:-1].clone()
+    with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
+        _run_byte_order_case(case, "auto", a_short, case["b_sf"].T)
+
+
+def test_mm_fp4_auto_raises_on_linear_scales_with_padded_storage():
+    """nvfp4_quantize's linear A scales at m = 120 sit on 4096 bytes, as many as
+    the 128x4 layout reads, so only the row check catches them. Auto mode must
+    raise instead of returning a wrong result."""
+    # The same skips as the other auto-mode tests: CUDA, and a GPU and library
+    # where the quantizer and an FP4 backend run.
+    _byte_order_case("cutlass", "nvfp4")
+    m, n, k = 120, 256, 512
+    one = torch.tensor(1.0, device="cuda")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_fp4, _ = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_128x4)
+    b_fp4, b_sf = nvfp4_quantize(b, one, sfLayout=SfLayout.layout_128x4)
+    _, a_linear = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_linear)
+    assert tuple(a_linear.shape) == (120, 32)
+    assert a_linear.untyped_storage().nbytes() == 4096
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_linear,
+            b_sf.T,
+            one,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend="auto",
+            use_nvfp4=True,
+        )
+
+
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_keeps_block_scales_at_a_storage_offset(backend, fp4_type):
+    """The storage check _fp4_short_scale_problem counts bytes from the data
+    pointer to the end of the storage. The quantizer's bytes placed after a
+    256-element (256-byte) prefix in a larger buffer therefore pass the check.
+    The result matches the unmodified scales."""
+    case = _byte_order_case(backend, fp4_type)
+    reference = _run_byte_order_case(case, backend, case["a_sf"], case["b_sf"].T)
+    a_sf = case["a_sf"]
+    buffer = torch.empty(a_sf.numel() + 256, dtype=a_sf.dtype, device=a_sf.device)
+    buffer[256:].copy_(a_sf.reshape(-1))
+    a_descale = buffer[256:].view(a_sf.shape)
+    assert a_descale.storage_offset() == 256
+    out = _run_byte_order_case(case, backend, a_descale, case["b_sf"].T)
+    assert torch.equal(out, reference)
+
+
+def test_mm_fp4_trtllm_8x4_rejects_transposed_b_scale_copy():
+    """With A's scales in the 8x4 layout, B's are still 128x4 and read raw, so a
+    transposed copy of them raises ValueError too."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("trtllm", cc[0] * 10 + cc[1]):
+        pytest.skip("trtllm FP4 GEMM is not supported on this GPU.")
+    m, n, k = 128, 256, 512
+    torch.manual_seed(0)
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    ga = (448 * 6) / a.float().abs().nan_to_num().max()
+    gb = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_sf = nvfp4_quantize(a, ga, sfLayout=SfLayout.layout_8x4, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b, gb, sfLayout=SfLayout.layout_128x4, do_shuffle=True)
+
+    def run(b_descale):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_descale,
+            1.0 / (ga * gb),
+            torch.bfloat16,
+            out,
+            block_size=16,
+            use_8x4_sf_layout=True,
+            backend="trtllm",
+            skip_check=False,
+        )
+        return out
+
+    run(b_sf.T)
+    for b_descale in (b_sf.T.contiguous(), b_sf.T.contiguous().T):
+        with pytest.raises(
+            ValueError, match="the layout a transposed copy of the scales has"
+        ):
+            run(b_descale)
 
 
 if __name__ == "__main__":
