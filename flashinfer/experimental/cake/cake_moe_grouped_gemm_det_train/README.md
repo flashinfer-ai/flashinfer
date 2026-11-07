@@ -67,7 +67,7 @@ fp32 relative L2 at most `1e-4`. The table gives the range over those rows.
 | `dW` bf16 | `1e-2 + 1e-2 \|ref\|` | 1.639e-3 to 1.665e-3; 6.233e-2 | 1.653e-3 to 1.666e-3; 6.330e-2 | 1.649e-3 to 1.670e-3; 6.322e-2 |
 | `dW` fp32 | rel L2 `1e-4` | 4.406e-6 to 7.548e-5; 1.898e-3 | 4.396e-6 to 7.553e-5; 1.829e-3 | 4.404e-6 to 7.568e-5; 1.801e-3 |
 | `out += dW` fp32, composed | rel L2 `1e-4` | 2.782e-6 to 6.716e-5; 2.191e-3 | 2.783e-6 to 6.720e-5; 2.254e-3 | 2.790e-6 to 6.712e-5; 1.883e-3 |
-| `out += dW` fp32, fused | rel L2 `1e-4` | PENDING (not yet measured) | PENDING (not yet measured) | PENDING (not yet measured) |
+| `out += dW` fp32, fused | rel L2 `1e-4` | 2.782e-6 to 6.716e-5; 2.191e-3 | PENDING (not yet measured) | PENDING (not yet measured) |
 
 ## Mode rules
 
