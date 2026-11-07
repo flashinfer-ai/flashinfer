@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
+    apply_weight_l2_policy,
+    PrimsTsConfigSpec,
     SUPPORTED_MXFP4_BF16_TILE_N,
     SUPPORTED_MXFP4_MXFP8_TILE_N,
     _expanded_prims_ts_json_configs,
@@ -47,6 +50,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     make_config,
     validate_config,
 )
+from flashinfer.prims_ts.batched_gemm.cache_policy import _is_single_expert_tile
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -1138,3 +1142,94 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "tile_n"),
+    [
+        # DeepSeek-V4.1-Flash experts at EP8: 384 experts, top-6, rows of 8 ranks.
+        (512, 8),
+        (16384, 256),
+    ],
+)
+def test_weight_policy_enables_runtime_selection_on_both_gemms(num_tokens, tile_n):
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48
+    )
+    pair = apply_weight_l2_policy(pair)
+    assert pair.fc1.cfg.build().weight_l2_evict_first == 1
+    assert pair.fc2.cfg.build().weight_l2_evict_first == 1
+
+
+def test_weight_policy_checks_each_experts_entire_token_tile_run():
+    tile_n = 128
+    expert_rows = [0, 128, 0, 129, 1, 0]
+    tile_experts = [
+        expert
+        for expert, rows in enumerate(expert_rows)
+        for _ in range((rows + tile_n - 1) // tile_n)
+    ]
+    for tile, expert in enumerate(tile_experts):
+        previous_expert = tile_experts[tile - 1] if tile > 0 else -1
+        next_expert = tile_experts[tile + 1] if tile + 1 < len(tile_experts) else -1
+        assert _is_single_expert_tile(expert, previous_expert, next_expert) == (
+            expert_rows[expert] <= tile_n
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"batch_mode": int(BatchMode.BATCH_M)}, {"cluster_dim_y": 2}],
+)
+def test_weight_policy_preserves_ineligible_gemm_configs(overrides):
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [16, 0], num_tokens=256, top_k=6, num_local_experts=48
+    )
+    original = replace(
+        pair.fc1, cfg=PrimsTsConfigSpec(kwargs={**pair.fc1.cfg.kwargs, **overrides})
+    )
+    pair = replace(pair, fc1=original)
+    selected = apply_weight_l2_policy(pair)
+    assert selected.fc1 is original
+    assert selected.fc2.cfg.build().weight_l2_evict_first == 1
+    assert "weight_l2_evict_first" not in pair.fc2.cfg.kwargs
+
+
+def test_weight_policy_rejects_invalid_options():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [16, 0], num_tokens=256, top_k=6, num_local_experts=48
+    )
+    cfg = replace(
+        pair.fc2.cfg.build(),
+        weight_l2_evict_first=1,
+        cluster_dim_y=2,
+        umma_cta_count=2,
+        mma_m=256,
+    )
+    validate_config(replace(cfg, weight_l2_evict_first=0))
+    with pytest.raises(
+        ValueError, match="weight_l2_evict_first requires token-cluster width one"
+    ):
+        validate_config(cfg)
+
+
+def test_weight_policy_rejects_batch_m():
+    row = next(
+        row
+        for row in _expanded_prims_ts_json_configs(100)
+        if row.comment.endswith("_HighThroughput_BatchM") and "_FC2_" in row.comment
+    )
+    kwargs = _json_config_kwargs(
+        row,
+        sm_arch=100,
+        fc="fc2",
+        activation_type=int(ActivationType.Swiglu),
+        has_bias=False,
+        default_dtype_a=int(DType.BF16),
+        default_dtype_b=int(DType.BF16),
+        default_dtype_c=int(DType.BF16),
+    )
+    cfg = make_config(**kwargs)
+    validate_config(cfg)
+    with pytest.raises(ValueError, match="weight_l2_evict_first requires swap-AB"):
+        validate_config(replace(cfg, weight_l2_evict_first=1))

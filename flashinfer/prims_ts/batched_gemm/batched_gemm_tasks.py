@@ -212,6 +212,8 @@ def create_load_a_task(
         with _work_tile_schedule_loop(cfg, wq):
             # The DSL captures these named outputs even though Python does not.
             coords = gmem.compute_a_coords_head()  # noqa: F841
+            if cfg.weight_l2_evict_first:
+                smem.prepare_weight_tile()
             _call_named_aux_if_present(
                 smem, "prepare_gather_tile", has_prepare_gather_tile
             )
@@ -499,6 +501,8 @@ def create_fused_load_a_sfa_task(
         smem_sfa_res.init_load_state()
         with _work_tile_schedule_loop(cfg, wq):
             _ = gmem_a_res.compute_a_coords_head()
+            if cfg.weight_l2_evict_first:
+                smem_a_res.prepare_weight_tile()
             _call_named_aux_if_present(
                 smem_a_res, "prepare_gather_tile", has_prepare_a_tile
             )
