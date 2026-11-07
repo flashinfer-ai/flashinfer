@@ -67,16 +67,19 @@ needs_device = pytest.mark.skipif(
 )
 
 _SWIGLU = SwiGLU()
-#: The activations the GPU composition covers: the default gated chain, a parameterised gated chain whose clamps bite in
-#: dequantized units, the erf GELU, the tanh GELU, PowLU, and the ungated ReLU^2 and GELU.
+#: The activations the suites cover (the bf16 backend's list): every ``ActivationConfig`` class of the layer with its defaults,
+#: and the parameterised ones once more with scalars that move every branch; the clamps bite in dequantized units.
 ACTIVATIONS = [
     SwiGLU(),
     SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    SwiGLUStep(),
     SwiGLUStep(limit=3.0),
     GeGLU(),
     GeGLUTanh(),
     SiTU(),
+    SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=5.0),
     PowLU(),
+    PowLU(m=1.5, limit=4.0),
     ReLU2(),
     Identity(),
     GELU(),
@@ -86,11 +89,14 @@ ACTIVATIONS = [
 ACTIVATION_IDS = [
     "swiglu",
     "swiglu_oai",
+    "swiglu_step",
     "swiglu_step_limit3",
     "geglu",
     "geglu_tanh",
     "situ",
+    "situ_clamped",
     "powlu",
+    "powlu_limit4",
     "relu2",
     "identity",
     "gelu",
