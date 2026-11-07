@@ -63,6 +63,7 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm121_module,
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+from .jit.nvfp4_4over6_sm120 import gen_nvfp4_4over6_quantize_sm120_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.blackwell_msa import (
     BLACKWELL_MSA_VARIANTS_BY_TARGET,
@@ -1081,6 +1082,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
+            jit_specs.append(gen_nvfp4_4over6_quantize_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 

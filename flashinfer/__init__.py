@@ -111,6 +111,10 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
+from .quantization.nvfp4_4over6_sm120 import (
+    nvfp4_4over6_dynamic_quantize_sm120 as nvfp4_4over6_dynamic_quantize_sm120,
+    nvfp4_4over6_quantize_sm120 as nvfp4_4over6_quantize_sm120,
+)
 from .quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
     NVFP44Over6ErrMode,
