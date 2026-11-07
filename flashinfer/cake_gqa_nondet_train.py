@@ -25,14 +25,10 @@ the ``dkv_acc`` callable type ``CakeGQANondetDkvAccSource`` resolve to the
 backend's objects on first access.
 
 The mode is part of the name: no entry takes a ``deterministic`` keyword
-(passing one is a ``TypeError``).  The forward is fixed-order.  The backward
-adds the dQ partials (and the row-map dK / dV adds) with atomic FP32
-reductions, so its gradients are not bitwise reproducible run to run.  Under
-``torch.use_deterministic_algorithms(True)`` the backward raises PyTorch's
-alert after its checks and before it allocates or launches anything
-(``warn_only=True``: it warns and runs this backward); it never falls back
-to a deterministic implementation.  The
-deterministic counterpart ``flashinfer.cake_gqa_det_train`` is planned.
+(passing one is a ``TypeError``).  Every sum of the forward and the backward
+has one fixed order: ``out``, ``lse``, dQ and every dK / dV form repeat bit
+for bit run to run for one shape, one ``max_seqlen_k`` and one workspace
+budget, and nothing raises PyTorch's determinism alert.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
 wrappers: the checks, the launch plan, the workspace, the autograd Function
@@ -157,12 +153,13 @@ def cake_gqa_nondet(
         for the backward.
     max_seqlen_k : int, optional
         A host int at least every segment's key count (the caller's contract, as FlashAttention's
-        ``max_seqlen_k``; a smaller value leaves key blocks out); it sizes the backward grid.  ``None`` bounds it by
-        ``T_k`` (always correct; more CTAs that retire at once).  Never read from the device.
+        ``max_seqlen_k``; a smaller value leaves key blocks out); it sizes the backward grids and the dS^T workspace
+        chunks.  ``None`` bounds it by ``T_k`` (always correct; more, mostly empty, chunks).  Never read from the
+        device.
     workspace : optional
         A workspace of :func:`cake_gqa_nondet_train_workspace`, reused across calls and shapes (grown, never
-        shrunk; one stream at a time); autograd holds it by weak reference.  ``None``: the device's per-stream
-        default workspace.
+        shrunk; one stream at a time); autograd holds it by weak reference.  Its ``budget_bytes`` bounds the
+        backward's dS^T workspace.  ``None``: the device's per-stream default workspace (16 GiB budget).
     return_lse : bool
         Also return the FP32 natural-log LSE ``[H_q, T_q]`` (no gradient flows through it).
 
@@ -172,9 +169,8 @@ def cake_gqa_nondet(
 
     Notes
     -----
-    The forward is fixed-order.  The backward is not bitwise reproducible run to run (atomic FP32 dQ reductions);
-    under ``torch.use_deterministic_algorithms(True)`` it raises PyTorch's alert (``warn_only=True``: a warning, and
-    the backward runs).
+    The forward and the backward are bitwise reproducible run to run (one fixed summation order; the bits depend on
+    the shapes, ``max_seqlen_k`` and the workspace budget) and raise no PyTorch determinism alert.
     """
     return _pkg().cake_gqa_nondet(
         q,
@@ -227,7 +223,7 @@ def cake_gqa_nondet_train_forward(
 
     Notes
     -----
-    Fixed-order: it never raises the deterministic-algorithms alert.
+    Fixed-order and bitwise reproducible run to run; it never raises the deterministic-algorithms alert.
     """
     return _pkg().cake_gqa_nondet_train_forward(
         q,
@@ -292,7 +288,8 @@ def cake_gqa_nondet_train_backward(
         FP32 ``[N_dst, H_kv, 256]`` destinations that the window gradients are added into; they need ``row_map``.
     row_map : torch.Tensor, optional
         int32 ``[T_k]``: window row ``j`` adds into destination row ``row_map[j]`` (rows may repeat;
-        out-of-range rows are not checked).
+        out-of-range rows are not checked); a destination row becomes ``((dst + w_j1) + w_j2) + ...`` over its
+        window rows in ascending ``j``.
     max_seqlen_k : int, optional
         As in :func:`cake_gqa_nondet`.
     workspace : optional
@@ -304,10 +301,11 @@ def cake_gqa_nondet_train_backward(
 
     Notes
     -----
-    Not bitwise reproducible run to run: the dQ partials (and the row-map adds) are atomic FP32 reductions.
-    Under ``torch.use_deterministic_algorithms(True)`` a call with a (query, key) pair raises PyTorch's alert
-    after its checks and before anything is allocated or launched (``warn_only=True``: a warning, and the
-    backward runs).
+    Bitwise reproducible run to run: dS^T goes to a workspace chunk (allocated per call, at most the workspace's
+    ``budget_bytes`` above the minimum chunk), dK / dV are summed by the CTA pair that owns their key block, dQ is
+    a GEMM over the workspace, and the row-map destinations are folded in window order; nothing adds with
+    atomics.  The bits depend on the shapes, ``max_seqlen_k`` and the budget only (another budget may move the
+    last bits of dQ).  No PyTorch determinism alert is raised.
     """
     return _pkg().cake_gqa_nondet_train_backward(
         q,
@@ -334,29 +332,45 @@ def cake_gqa_nondet_train_backward(
 @flashinfer_api
 def cake_gqa_nondet_train_workspace(
     device: Union[torch.device, str, int, None] = None,
+    *,
+    budget_bytes: Optional[int] = None,
 ) -> Any:
     r"""A workspace (``CakeGQANondetWorkspace``) for :func:`cake_gqa_nondet` and its two halves.
 
     It holds the forward's tile counter and the backward scratch, grown to the largest shape seen and never
-    shrunk (``.nbytes``; ``.release()`` drops the scratch).  One workspace serves one stream at a time.
+    shrunk (``.nbytes``; ``.release()`` drops the scratch).  The backward's dS^T workspace and row-map window
+    gradients are allocated per call from PyTorch's caching allocator and freed when the call returns.  One
+    workspace serves one stream at a time.
 
     Parameters
     ----------
     device : torch.device, str or int, optional
         The CUDA device; ``None`` is the current device.
+    budget_bytes : int, optional
+        The bound of one backward call's dS^T workspace; ``None`` is 16 GiB.  A call whose dS^T exceeds it runs in
+        chunks (at least one KV head and two key blocks per chunk, even past the budget).  The chunks set the dQ
+        rounding: one budget gives the same bits on every run.
 
     Returns
     -------
     A ``CakeGQANondetWorkspace``.
     """
-    return _pkg().CakeGQANondetWorkspace(device)
+    return _pkg().CakeGQANondetWorkspace(device, budget_bytes=budget_bytes)
 
 
 @flashinfer_api
 def cake_gqa_nondet_train_workspace_bytes(
-    total_q: int, num_heads_q: int, num_segments: int
+    total_q: int,
+    num_heads_q: int,
+    num_segments: int,
+    *,
+    total_k: int = 0,
+    num_heads_kv: int = 0,
+    max_seqlen_k: Optional[int] = None,
+    row_map: bool = False,
+    budget_bytes: Optional[int] = None,
 ) -> int:
-    r"""Bytes of backward scratch one call needs.
+    r"""Bytes of device memory one backward call needs beside its operands and outputs.
 
     Parameters
     ----------
@@ -366,12 +380,28 @@ def cake_gqa_nondet_train_workspace_bytes(
         ``H_q``, the query heads.
     num_segments : int
         ``B``, the segments (``len(cu_seqlens_q) - 1``).
+    total_k, num_heads_kv : int, optional
+        ``T_k`` and ``H_kv``; with both given the per-call dS^T workspace is included.
+    max_seqlen_k : int, optional
+        As in :func:`cake_gqa_nondet`.
+    row_map : bool
+        Include the two per-call FP32 ``[T_k, H_kv, 256]`` window gradients of a row-map call.
+    budget_bytes : int, optional
+        As in :func:`cake_gqa_nondet_train_workspace`.
 
     Returns
     -------
-    The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]``, with
-    ``rows_pad = round_up(2 T_q + 128 B, 128)``.
+    The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]`` (the scratch a workspace
+    keeps), with ``rows_pad = round_up(2 T_q + 128 B, 128)``, plus the dS^T chunk and the window gradients when
+    asked.
     """
     return _pkg().cake_gqa_nondet_train_workspace_bytes(
-        total_q, num_heads_q, num_segments
+        total_q,
+        num_heads_q,
+        num_segments,
+        total_k=total_k,
+        num_heads_kv=num_heads_kv,
+        max_seqlen_k=max_seqlen_k,
+        row_map=row_map,
+        budget_bytes=budget_bytes,
     )
