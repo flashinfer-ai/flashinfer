@@ -2506,7 +2506,9 @@ def cake_kda_det_train_kcp_saved_bytes(
     per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
-    recomputes the internal rows in both modes.
+    recomputes the internal rows in both modes.  The rows a checkpoint recompute keeps for its backward
+    (``cake_kcp.INTRA_ROWS``) are not part of any set: they lie in that backward's ``dq`` / ``dk`` or go before it
+    allocates its outputs.
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
