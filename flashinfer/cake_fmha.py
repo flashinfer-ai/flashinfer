@@ -2150,6 +2150,20 @@ _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
         },
     },
 }
+# Per target and mask, per JIT pack: further calls of the other flag forms the
+# runtime-size BF16 programs serve past :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`,
+# as boxes ``(batch, keys, work)``: a call of at most ``batch`` requests, at
+# most ``keys`` cache keys and at most ``work`` of ``batch_size * num_q_heads *
+# max_q_len * max_kv_len`` takes its form's program (``None``: no bound).  B200,
+# causal pack 8: one request over at most 8192 keys ran faster than the JIT
+# module beyond the A/A band in every one of 10 layouts (1 x 1024 .. 8192 x
+# 8192 keys at 32 query and 4 KV heads, 1 x 8192 x 8192 at 64 and 8, sinks and
+# LSE).
+_CONTEXT_BF16_RUNTIME_FLAG_BOXES: dict[
+    str, dict[bool, dict[int, tuple[tuple[int | None, int | None, int | None], ...]]]
+] = {
+    "sm100a": {True: {8: ((1, 8192, 1 << 32),)}},
+}
 # Short sm103a launches keep each stage's P tile in its own S columns: the
 # program an exact, runtime-size or (every page size) one-stage route names
 # maps to the same schedule and arguments with the default P placement, for
@@ -8922,7 +8936,8 @@ def select_cake_fmha_context_route(
     # JIT pack and page size in that form's table (the same tile work as the
     # JIT module of the form): the causal form without LSE or sink except the
     # power-of-two query lengths of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`, the
-    # other forms within the bounds of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`.
+    # other forms within the bounds of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`
+    # or a box of :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOXES`.
     flag_form = (is_causal, lse is not None, sinks is not None)
     runtime_form = (
         _CONTEXT_RUNTIME_FLAG_ROUTES.get(component, {}).get(flag_form, {}).get(target)
@@ -8946,15 +8961,30 @@ def select_cake_fmha_context_route(
         if component == "context_bf16" and not plain
         else (None, None, None)
     )
+    work = batch_size * num_q_heads * max_q_len * max_kv_len
+    boxes = (
+        _CONTEXT_BF16_RUNTIME_FLAG_BOXES.get(target, {})
+        .get(is_causal, {})
+        .get(pack_g, ())
+        if component == "context_bf16" and not plain
+        else ()
+    )
     if (
         program is None
         and runtime_form
         and not jit_pow2
-        and (bound_keys is None or max_kv_len <= bound_keys)
-        and (bound_area is None or max_q_len * max_kv_len <= bound_area)
         and (
-            bound_work is None
-            or batch_size * num_q_heads * max_q_len * max_kv_len <= bound_work
+            (
+                (bound_keys is None or max_kv_len <= bound_keys)
+                and (bound_area is None or max_q_len * max_kv_len <= bound_area)
+                and (bound_work is None or work <= bound_work)
+            )
+            or any(
+                (box_batch is None or batch_size <= box_batch)
+                and (box_keys is None or max_kv_len <= box_keys)
+                and (box_work is None or work <= box_work)
+                for box_batch, box_keys, box_work in boxes
+            )
         )
     ):
         program = runtime_form.get((pack_g, page_size)) or runtime_form.get(
