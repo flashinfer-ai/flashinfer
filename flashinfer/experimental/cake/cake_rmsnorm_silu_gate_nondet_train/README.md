@@ -33,12 +33,37 @@ within the deterministic FP64 sum's error of a rounding boundary.
 the tests compute on the same inputs: the relative L2 error and the largest
 absolute error relative to the largest reference value.
 
-Measured errors (relative L2 / largest relative), this package and the
-deterministic package on the same inputs:
+Measured errors against an FP64 reference computed from the BF16 inputs, on
+normal inputs at three training shapes `[T, H, 128]`: `x`, `z` and `dy`
+standard normal, the weight 1 + 0.5 times standard normal, all rounded to
+BF16, `eps` = 1e-6, seed 0.  Each cell gives this package / the deterministic
+package at FlashInfer commit 2e989556.  This package's value is the largest
+over 10 runs, which gave the same bits every time; the deterministic package's
+value is the median over 5 runs with equal bits.  `y`, `dx` and `dz` come from
+the calls with a BF16 weight gradient; the calls with an FP32 weight gradient
+give the same values.  These tables do not cover R200 (`sm_107a`).
 
-| GPU | shape | `y` | `dx` | `dz` | `dw` |
-| --- | --- | --- | --- | --- | --- |
-| (pending measurement) | | | | | |
+Relative L2 error (this package / the deterministic package):
+
+| GPU | T x H | `y` | `dx` | `dz` | `dw` BF16 | `dw` FP32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| B200 (`sm_100a`) | 30193 x 48 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.699e-03 / 1.699e-03 | 1.305e-07 / 1.305e-07 |
+| B200 (`sm_100a`) | 32388 x 48 | 1.658e-03 / 1.658e-03 | 1.659e-03 / 1.659e-03 | 1.658e-03 / 1.658e-03 | 1.650e-03 / 1.650e-03 | 1.008e-07 / 1.008e-07 |
+| B200 (`sm_100a`) | 32737 x 48 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.718e-03 / 1.718e-03 | 1.259e-07 / 1.259e-07 |
+| GB300 (`sm_103a`) | 30193 x 48 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.658e-03 / 1.658e-03 | 1.741e-03 / 1.741e-03 | 1.171e-07 / 1.171e-07 |
+| GB300 (`sm_103a`) | 32388 x 48 | 1.658e-03 / 1.658e-03 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.545e-03 / 1.545e-03 | 1.152e-07 / 1.152e-07 |
+| GB300 (`sm_103a`) | 32737 x 48 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.659e-03 / 1.659e-03 | 1.677e-03 / 1.677e-03 | 1.410e-07 / 1.410e-07 |
+
+Largest error relative to the largest reference value (this package / the deterministic package):
+
+| GPU | T x H | `y` | `dx` | `dz` | `dw` BF16 | `dw` FP32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| B200 (`sm_100a`) | 30193 x 48 | 2.019e-03 / 2.019e-03 | 2.232e-03 / 2.232e-03 | 2.168e-03 / 2.168e-03 | 2.432e-03 / 2.432e-03 | 1.327e-07 / 1.327e-07 |
+| B200 (`sm_100a`) | 32388 x 48 | 2.457e-03 / 2.457e-03 | 2.245e-03 / 2.245e-03 | 2.129e-03 / 2.129e-03 | 2.505e-03 / 2.505e-03 | 1.218e-07 / 1.218e-07 |
+| B200 (`sm_100a`) | 32737 x 48 | 2.307e-03 / 2.307e-03 | 2.097e-03 / 2.097e-03 | 2.183e-03 / 2.183e-03 | 2.026e-03 / 2.026e-03 | 1.590e-07 / 1.590e-07 |
+| GB300 (`sm_103a`) | 30193 x 48 | 2.222e-03 / 2.222e-03 | 2.317e-03 / 2.317e-03 | 2.386e-03 / 2.386e-03 | 1.922e-03 / 1.922e-03 | 9.621e-08 / 9.621e-08 |
+| GB300 (`sm_103a`) | 32388 x 48 | 2.335e-03 / 2.335e-03 | 2.054e-03 / 2.054e-03 | 1.965e-03 / 1.965e-03 | 1.961e-03 / 1.961e-03 | 1.331e-07 / 1.331e-07 |
+| GB300 (`sm_103a`) | 32737 x 48 | 2.106e-03 / 2.106e-03 | 1.836e-03 / 1.836e-03 | 2.465e-03 / 2.465e-03 | 1.915e-03 / 1.915e-03 | 1.354e-07 / 1.354e-07 |
 
 Under `torch.use_deterministic_algorithms(True)` (strict or `warn_only`) no
 entry point alerts or warns, also during CUDA Graph capture.
