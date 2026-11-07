@@ -609,12 +609,46 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
             torch.cuda.current_stream()
             return max_active_clusters(cluster_size)
 
+    def _gather_workspace_proposals(self, error, proposal=None):
+        """Share preparation errors before returning the ranks' proposals."""
+        import torch.distributed as dist
+
+        reports = [None] * self.ep_world_size
+        dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, (error, _) in enumerate(reports)
+            if error is not None
+        ]
+        if failures:
+            raise MoEEpConfigError(
+                "MXFP4 workspace preparation failed on EP ranks: " + "; ".join(failures)
+            )
+        return [proposal for _, proposal in reports]
+
+    def validate_init(self, bootstrap, fleet_params):
+        """Coordinate validation failures when the EP group is available."""
+        self._ensure_ep_bootstrap(bootstrap)
+        # Initial construction validates before runtime bootstrap. Explicit
+        # workspace creation has an EP group and must fail collectively.
+        if (
+            self._config.kernel_variant != "inference"
+            or self.ep_world_size == 1
+            or self._ep_comm_group is None
+        ):
+            return super().validate_init(bootstrap, fleet_params)
+        error = None
+        try:
+            super().validate_init(bootstrap, fleet_params)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gather_workspace_proposals(error)
+
     def prepare_workspace(self, bootstrap, fleet_params):
         """Agree on workspace proposals or local failures before pool lookup."""
         self._ensure_ep_bootstrap(bootstrap)
         if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
             import dataclasses
-            import torch.distributed as dist
 
             error, proposal = None, None
             try:
@@ -628,19 +662,8 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
                 error = f"{type(exc).__name__}: {exc}"
             # Agree before pool lookup so every rank participates even when
             # a peer's probe failed or another layer owns a matching workspace.
-            reports = [None] * self.ep_world_size
-            dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
-            failures = [
-                f"rank {rank}: {error}"
-                for rank, (error, _) in enumerate(reports)
-                if error is not None
-            ]
-            if failures:
-                raise MoEEpConfigError(
-                    "MXFP4 workspace preparation failed on EP ranks: "
-                    + "; ".join(failures)
-                )
-            if any(p != proposal for _, p in reports):
+            proposals = self._gather_workspace_proposals(error, proposal)
+            if any(p != proposal for p in proposals):
                 raise MoEEpConfigError(
                     "MXFP4 configuration or active cluster count differs across EP ranks"
                 )

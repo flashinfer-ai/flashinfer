@@ -1,6 +1,7 @@
 """Run each MXFP4 default band and a partial override through the public API."""
 
 import os
+from unittest import mock
 
 import pytest
 import torch
@@ -176,3 +177,64 @@ def test_mxfp4_rank_agreement_before_pool_reuse(failure, monkeypatch):
     finally:
         for layer in reversed(layers):
             layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_4
+@pytest.mark.parametrize("failure", ["config", "occupancy"])
+def test_mxfp4_create_workspace_validation_failure(failure, monkeypatch):
+    """Fail collectively during public handle validation, before preparation."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires Blackwell")
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world < 2:
+        pytest.skip("requires multiple EP ranks")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103")
+    layer = moe_ep.MoEEpLayer(
+        moe_ep.BootstrapConfig(world_size=world, rank=rank),
+        moe_ep.FleetParams(
+            num_experts=2 * world, max_tokens_per_rank=32, token_hidden_size=256
+        ),
+        moe_ep.MoEWeightPack(
+            torch.zeros(2, 512, 256, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(2, 256, 256, device="cuda", dtype=torch.bfloat16),
+        ),
+        backend=moe_ep.MegaConfig(
+            megakernel=moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=256, top_k=2
+            )
+        ),
+    )
+    try:
+        with (
+            monkeypatch.context() as patch,
+            mock.patch.object(type(layer._kernel), "prepare_workspace") as prepare,
+        ):
+            knobs = None
+            if failure == "config":
+                # Explicit knobs create a new backend before validation.
+                knobs = {"schedule_mode": "invalid" if rank == 0 else "grouped"}
+                message = "rank 0: MoEEpConfigError: Unsupported schedule_mode"
+            else:
+                if rank == 0:
+                    probe = mock.Mock(
+                        side_effect=RuntimeError("occupancy probe failed")
+                    )
+                    patch.setattr(layer._kernel, "_active_clusters", probe)
+                message = "rank 0: RuntimeError: occupancy probe failed"
+            # This capacity triggers the occupancy probe in validate_init().
+            with pytest.raises(moe_ep.MoEEpConfigError, match=message):
+                layer.create_workspace(256, knobs=knobs)
+            prepare.assert_not_called()
+            if failure == "occupancy" and rank == 0:
+                probe.assert_called_once()
+        dist.barrier()
+        # Failure must not register a handle or prevent a later valid request.
+        handle = layer.create_workspace(256)
+        assert handle.max_tokens_per_rank == 256
+        handle.destroy()
+    finally:
+        layer.destroy()
