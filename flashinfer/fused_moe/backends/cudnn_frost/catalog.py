@@ -38,8 +38,12 @@ def generic_contract(raw: dict[str, Any]) -> dict[str, Any]:
     """Conservative common bounds for the frozen symbolic grouped-MoE recipes.
 
     128-element N/K alignment covers BF16 vector/TMA stores and every supported
-    block-scale layout. Offsets remain unaligned, int32 and one per routed group;
-    aligned-offset and split-K recipes require a separate launch contract.
+    block-scale layout of the SM107 recipes. The SM120 warp-MMA recipes zero-fill
+    K tails through TMA and bound-check N at their STG stores, so they need only
+    whole 32-element blocks: 16-byte E2M1 TMA rows, one MX scale block and one
+    fused-quantization block (e.g. gpt-oss's 2880 = 90 x 32). Offsets remain
+    unaligned, int32 and one per routed group; aligned-offset and split-K recipes
+    require a separate launch contract.
     """
     parameters = raw.get("source", {}).get("parameters", {})
     if parameters.get("version") != 1:
@@ -53,10 +57,11 @@ def generic_contract(raw: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("unsupported generic Frost grouped-MoE recipe")
     contract = deepcopy(raw["contract"])
+    multiple = 32 if raw.get("arch") == "sm_120a" else 128
     contract.update(
         s={"min": 1},
-        n={"min": 128, "max": 1 << 20, "multiple_of": 128},
-        k={"min": 128, "max": 1 << 20, "multiple_of": 128},
+        n={"min": multiple, "max": 1 << 20, "multiple_of": multiple},
+        k={"min": multiple, "max": 1 << 20, "multiple_of": multiple},
         experts={"min": 1, "max": 1024},
         groups={"min": 1, "max": 1024},
     )
