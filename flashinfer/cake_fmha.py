@@ -1440,6 +1440,233 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # The sm103a builds of the same programs with the 4-stage K/V ring and
+    # each stage's P tile in the other stage's S columns.
+    ("context_fp8", "RUNTIME_PACK1_NC_PX"): (
+        "cake_fmha_context_fp8_3f05abdd0dfb416998fd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_PX"): (
+        "cake_fmha_context_fp8_43829028305fe1296e79",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_PX"): (
+        "cake_fmha_context_fp8_03f683a3fe844acad53a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_PX"): (
+        "cake_fmha_context_fp8_0c8c4520324b57450d68",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_PX"): (
+        "cake_fmha_context_fp8_949b803cd8ef3e4ee015",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_PX"): (
+        "cake_fmha_context_fp8_11a387bdb94e731b4a81",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_PX"): (
+        "cake_fmha_context_fp8_a6eaaef29b42f9602206",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_PX"): (
+        "cake_fmha_context_fp8_05047f777e8265009b0d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_PX"): (
+        "cake_fmha_context_fp8_e386241abbbca476ce27",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_LSE_PX"): (
+        "cake_fmha_context_fp8_f907e36ece76575a53d1",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_LSE_PX"): (
+        "cake_fmha_context_fp8_1aba28a73173872fd3fb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_LSE_PX"): (
+        "cake_fmha_context_fp8_31badec3271fcbce787d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_LSE_PX"): (
+        "cake_fmha_context_fp8_6b73d5dc4ae4c91c8a91",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_LSE_PX"): (
+        "cake_fmha_context_fp8_4fc03e35f070593d5604",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_LSE_PX"): (
+        "cake_fmha_context_fp8_93267992d47af41601f2",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_LSE_PX"): (
+        "cake_fmha_context_fp8_85a868e1aeda0e3ad931",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_LSE_PX"): (
+        "cake_fmha_context_fp8_f60026397cd113a89c4a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_LSE_PX"): (
+        "cake_fmha_context_fp8_153db10be76831301707",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_SINK_PX"): (
+        "cake_fmha_context_fp8_06551cbf9595d0fec9b2",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_SINK_PX"): (
+        "cake_fmha_context_fp8_2eb08cfd64f065c2923d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_SINK_PX"): (
+        "cake_fmha_context_fp8_d9f12a7798a4ef48f3fc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_SINK_PX"): (
+        "cake_fmha_context_fp8_4218bd247b760dcb8ebd",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_SINK_PX"): (
+        "cake_fmha_context_fp8_5135dab25ffdbce365c9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_SINK_PX"): (
+        "cake_fmha_context_fp8_3b4d3e7797632fd340d8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_SINK_PX"): (
+        "cake_fmha_context_fp8_c828c717314b2c30ecdb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_SINK_PX"): (
+        "cake_fmha_context_fp8_2448bba5c99b727f7bba",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_SINK_PX"): (
+        "cake_fmha_context_fp8_64f3ba3f829afe2a9c81",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_87118ffc6e2fd677b465",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_ae7ec9d64660cc3b1e3c",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_4615c4178898a152657b",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_f579d90a5bdd681b22f9",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_8629ad04ca06ccd1ecd6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_f3a595de408fa3d2ad51",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_960bf6763c0cfbeae654",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_46865ca87d422fdec925",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_LSE_PX"): (
+        "cake_fmha_context_fp8_79a7946155bc3993b289",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_f5fa3bfd3b00fd44fabc",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_ebf8d7837e7123a08abe",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_f35f2ffe6db82fbabebf",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_adb2255214f458a9ec66",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK7_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_909439ede445c07be428",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK5_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_ffd4f84506eb37625918",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK6_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_1c6b259c9c16a55a3ace",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK12_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_0a4c6a377884f71460b7",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK16_NC_SINK_PX"): (
+        "cake_fmha_context_fp8_48b599fe731a4ce66d7b",
+        None,
+        False,
+    ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
         "cake_fmha_context_fp8_2b603161717df80f5fad",
@@ -1879,11 +2106,15 @@ _CONTEXT_FP8_FORMS: dict[tuple[bool, bool, bool], str] = {
 # Per target, ``(form, pack_g, page_size)`` -> the runtime-size program of an
 # FP8 call of that form (``None``: every page size): the program of its pack
 # (:func:`_context_fp8_runtime_form_pack`), the 3-stage K/V ring with each
-# stage's P tile in its own S columns on both targets.  It writes the LSE (log2
-# units, one float per query row and head) or reads the sinks of the call.
+# stage's P tile in its own S columns on sm100a, and on sm103a the 4-stage
+# ring with each stage's P tile in the other stage's S columns, as for the
+# causal call without LSE or sink (the same arithmetic; its launches of at
+# most 128 keys take the program with P in its own S columns,
+# ``_CONTEXT_FP8_SHORT_KV_ROUTES``).  It writes the LSE (log2 units, one
+# float per query row and head) or reads the sinks of the call.
 _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], str]] = {
     target: {
-        (form, pack, None): f"RUNTIME_PACK{pack}_{form}"
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}{suffix}"
         for form in _CONTEXT_FP8_FORMS.values()
         for pack in (
             1,
@@ -1891,7 +2122,11 @@ _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], st
             *_CONTEXT_FP8_RUNTIME_OWN_PACKS,
         )
     }
-    for target in ("sm100a", "sm103a")
+    for target, suffix in (("sm100a", ""), ("sm103a", "_PX"))
+}
+_CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
+    program: (program.removesuffix("_PX"), 128)
+    for program in _CONTEXT_FP8_RUNTIME_FORM_ROUTES["sm103a"].values()
 }
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
@@ -8536,6 +8771,11 @@ def select_cake_fmha_context_route(
             program = forms.get((form, pack, page_size)) or forms.get(
                 (form, pack, None)
             )
+            # A call of at most the keys of the program's short-KV entry: the
+            # entry's program (the same schedule, pack, m-blocks and arguments).
+            short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+            if short and max_kv_len <= short[1]:
+                program = short[0]
             if program is not None:
                 pack_g = pack
                 tok_per_stage = 128 // pack
