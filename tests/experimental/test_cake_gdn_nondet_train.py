@@ -336,7 +336,7 @@ FUSED_TAIL_STAGES = {
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 42 and len(set(cake_jit.STAGES)) == 42
+    assert len(cake_jit.STAGES) == 45 and len(set(cake_jit.STAGES)) == 45
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -1378,16 +1378,30 @@ G3_R_FORM_ROWS = {
 }
 
 
+@pytest.mark.parametrize("plan", ["planner", "stage1"])
 @pytest.mark.parametrize("row", sorted(G3_R_FORM_ROWS))
-def test_group_of_three_r_form_keeps_its_bits(row, device, monkeypatch) -> None:
+def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) -> None:
     # the R form beside tail_g3_f32x gives the bits of one dhu_tc2 launch (one stream); at the same tables the package
     # tail's bits (the planner's split table that SPLIT_R_FORM keeps serves a group of three's cluster tail only, so
     # that comparison runs without it); without the FP32 dv_local adjoint and with tail_g3 pinned, the deterministic
     # package's bits
-    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty); plan "stage1": the shipped plan, where a row the
+    # one-wave split prices runs the split beside the group's cluster tail instead of the R form
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
+    if plan == "planner":
+        monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+    elif (
+        cake_chain._adjoint_split_length(
+            seq_lens, heads[1], index, cake_chain.make_options()
+        )
+        is not None
+    ):
+        _check_group_of_three_split(seq_lens, heads, device, monkeypatch)
+        return
     if not SERIAL_G3_R_FORM.get(arch, False):
         pytest.skip(f"{arch} runs one dhu_tc2 launch on these rows")
-    seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
     main = torch.cuda.current_stream(device).cuda_stream
     launches = _record_streams(monkeypatch)
@@ -1414,6 +1428,30 @@ def test_group_of_three_r_form_keeps_its_bits(row, device, monkeypatch) -> None:
         _run(inputs, seq_lens, det=True),
         OUTPUT_NAMES,
     )
+
+
+def _check_group_of_three_split(seq_lens, heads, device, monkeypatch) -> None:
+    """A group of three on a row the one-wave split prices: the split's forms and its composition beside tail_g3_f32x,
+    no R form and no other adjoint scan; the bits repeat, on one stream too, and the package tail gives the cluster
+    tail's bits at the same tables."""
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
+    launches = _record_streams(monkeypatch)
+    got = _run(inputs, seq_lens)
+    stages = [stage for stage, _ in launches]
+    composer = cake_chain._adjoint_chain_stage(arch)
+    assert stages.count("dhu_tc2_dvl32_modes") >= 1 and composer in stages, stages
+    assert "tail_g3_f32x" in stages, stages
+    assert not [
+        s
+        for s in stages
+        if s in ("dhu_tc2", "dhu_tc2_dvl32", "dv_local")
+        or s.startswith(("dhu_pre", "dhu_r"))
+    ], stages
+    _assert_same_bits(_run(inputs, seq_lens), got, OUTPUT_NAMES)
+    _assert_same_bits(_run(inputs, seq_lens, streams=1), got, OUTPUT_NAMES)
+    _assert_same_bits(_run(inputs, seq_lens, tail="tail", host_cache=False), _run(inputs, seq_lens, host_cache=False),
+                      OUTPUT_NAMES)  # fmt: skip
 
 
 def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
@@ -2694,13 +2732,28 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
             assert rec["select"] is (arch in replaced_on), (row, rec)
 
 
+@pytest.mark.parametrize("plan", ["planner", "stage1"])
 @pytest.mark.parametrize("heads", [(8, 16), (8, 24)], ids=["g2", "g3"])
-def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> None:
+def test_tc_plan_changes_only_the_adjoint_table(
+    heads, plan, device, monkeypatch
+) -> None:
     # one 16384-token sequence (the r07 form; gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor; no
     # CHAIN_PLAN tables): the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats bitwise
     # (fixed-order cluster tails) and stays within the budgets of the planner's table; a plan pin keeps the planner
+    # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty); plan "stage1": the shipped plan, where the
+    # one-wave split takes the adjoint table on the architectures of ADJOINT_SPLIT_ARCHS (_check_tc_plan_split)
     seq_lens = (16384,)
     index = cake_chain._device_index(device)
+    if plan == "planner":
+        monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+    elif (
+        cake_chain._adjoint_split_length(
+            seq_lens, heads[1], index, cake_chain.make_options()
+        )
+        is not None
+    ):
+        _check_tc_plan_split(seq_lens, heads, device, monkeypatch)
+        return
     monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
@@ -2732,6 +2785,43 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
     on = _run(inputs, seq_lens, **pins)
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     _assert_same_bits(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
+
+
+def _check_tc_plan_split(seq_lens, heads, device, monkeypatch) -> None:
+    """The one-wave split in place of the tc plan: the forward's bits as on the planner's tables, the split's forms and
+    composition (no dv_local, no other adjoint scan), bits that repeat and do not depend on TC_PLAN, within the budgets
+    of the planner's table; a plan pin keeps the planner's tables."""
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    _fwd, bwd = cake_chain.scan_plans(
+        sum(seq_lens), len(seq_lens), heads[1], index, seq_lens
+    )
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=307)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+        m.setattr(cake_chain, "TC_PLAN", False)
+        base = _run(inputs, seq_lens)
+    launches = _record_streams(monkeypatch)
+    runs = [_run(inputs, seq_lens) for _ in range(2)]
+    stages = [stage for stage, _stream in launches]
+    assert torch.equal(runs[0]["o"], base["o"])
+    _assert_same_bits(runs[1], runs[0], OUTPUT_NAMES)
+    _assert_within_budget(runs[0], base, OUTPUT_NAMES)
+    composer = cake_chain._adjoint_chain_stage(arch)
+    assert "dhu_tc2_dvl32_modes" in stages and composer in stages, stages
+    assert not [
+        s
+        for s in stages
+        if s in ("dv_local", "dhu_tc2", "dhu_tc2_dvl32")
+        or s.startswith(("dhu_pre", "dhu_r"))
+    ], stages
+    monkeypatch.setattr(cake_chain, "TC_PLAN", not cake_chain.TC_PLAN)
+    _assert_same_bits(_run(inputs, seq_lens, host_cache=False), runs[0], OUTPUT_NAMES)
+    pins = {"scan_config": tuple(bwd.config), "segment_chunks": bwd.segment_len}
+    on = _run(inputs, seq_lens, **pins)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+        _assert_same_bits(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
 
 
 # --------------------------------------------------------------------------- deeper split tables (CHAIN_PLAN)
@@ -2928,7 +3018,14 @@ SPLIT_R_ROWS = {
     ],
     ids=["B200", "B300", "GB300", "R200-212", "R200-216"],
 )
-def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
+@pytest.mark.parametrize("plan", ["planner", "stage1"])
+def test_split_r_form_rule(arch, sm_count, plan, monkeypatch) -> None:
+    # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty), SPLIT_R_ROWS; plan "stage1": the shipped plan,
+    # where on the architectures of ADJOINT_SPLIT_ARCHS every adjoint table is the one-wave split or a serial table and
+    # the R form keeps none
+    split_arch = plan == "stage1" and arch in cake_chain.ADJOINT_SPLIT_ARCHS
+    if plan == "planner":
+        monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
     monkeypatch.setattr(
         cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
     )
@@ -2937,6 +3034,18 @@ def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
     kept = {}
     for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
         want = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        if split_arch:
+            length = cake_chain._adjoint_split_length(seq_lens, num_v_heads, 0, options)
+            chunks = tuple(-(-n // 64) for n in seq_lens)
+            if length is not None:
+                assert (
+                    want[0][1] == cake_chain.ScanPlan(cake_chain.SDT_CONFIG, length)
+                    and not want[1]
+                ), row
+            else:
+                assert (
+                    want[0][1].segment_len <= 0 or max(chunks) <= want[0][1].segment_len
+                ), (row, want)
         for group in (1, 2, 3):
             if num_v_heads % group:
                 continue
@@ -2971,7 +3080,7 @@ def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
             # the groups only beside the split R form's tail (a pin to another tail keeps the tables of host_plans)
             assert not cake_chain._host_plans(seq_lens, num_v_heads, 0, cake_chain.make_options(tail="tail"),
                                               group=3)[2]  # fmt: skip
-    assert kept == SPLIT_R_ROWS[(arch, sm_count)]
+    assert kept == ({} if split_arch else SPLIT_R_ROWS[(arch, sm_count)])
     # plan pins (and a dhu_scan pin) keep the planner's tables
     for pins in ({"scan_config": (64, 1), "segment_chunks": 94}, {"dhu_scan": "tc"}):
         assert not cake_chain._host_plans(
@@ -3847,3 +3956,256 @@ def test_row_stride_of_head_views() -> None:
         cake_chain._row_stride(v.transpose(-1, -2))
     with pytest.raises(ValueError):
         cake_chain._row_stride(v[::2])
+
+
+# --------------------------------------------------------------------------- the one-wave split of the adjoint walk
+
+# The one-wave piece tables of the bench rows on a 148-SM device: (tokens per sequence, HV) -> (L, pieces per sequence)
+PIECE_ROWS = {
+    "issue": (((131071, 87531, 43385), 6), (158, (13, 9, 5))),
+    "P3": (((128147, 131027), 6), (158, (13, 13))),
+    "P1": (
+        ((126565, 32714, 33696, 15081, 22979, 10782), 6),
+        (132, (15, 4, 4, 2, 3, 2)),
+    ),
+    "h8": (((11000, 12000, 9768), 24), (63, (3, 3, 3))),
+    "h4": (((11000, 12000, 9768), 12), (38, (5, 5, 5))),
+    "h2": (((11000, 12000, 9768), 6), (20, (9, 10, 8))),
+    "h1": (((11000, 12000, 9768), 3), (11, (16, 18, 14))),
+    "A16": (((11000, 12000, 9768), 48), (94, (2, 2, 2))),
+}
+
+
+def _pieces(chunks, length) -> tuple[int, ...]:
+    return tuple(len(cake_chain.segment_bounds(n, length)) - 1 for n in chunks)
+
+
+@pytest.mark.parametrize("row", sorted(PIECE_ROWS))
+def test_bwd_piece_table_on_the_bench_rows(row) -> None:
+    (seq_lens, num_v_heads), (length, pieces) = PIECE_ROWS[row]
+    chunks = tuple(-(-n // 64) for n in seq_lens)
+    assert cake_chain.bwd_piece_table(chunks, num_v_heads, 148) == length
+    assert _pieces(chunks, length) == pieces
+    # one wave each: the first wave (last and middle pieces, one-piece sequences), the second (all but the last)
+    assert sum(max(p - 1, 1) for p in pieces) * num_v_heads <= 148
+    assert sum(p - 1 for p in pieces) * num_v_heads <= 148
+    # the smallest such length
+    assert sum(max(p - 1, 1) for p in _pieces(chunks, length - 1)) * num_v_heads > 148
+
+
+def test_bwd_piece_table_rule() -> None:
+    gen = torch.Generator().manual_seed(7007)
+    for _ in range(200):
+        num = int(torch.randint(1, 9, (), generator=gen))
+        chunks = tuple(int(x) for x in torch.randint(0, 400, (num,), generator=gen))
+        num_v_heads = int(torch.randint(1, 13, (), generator=gen))
+        sm_count = int(torch.randint(8, 200, (), generator=gen))
+        length = cake_chain.bwd_piece_table(chunks, num_v_heads, sm_count)
+
+        def ctas(n_len: int, chunks=chunks, num_v_heads=num_v_heads) -> int:
+            return sum(max(-(-n // n_len) - 1, 1) for n in chunks) * num_v_heads
+
+        if len(chunks) * num_v_heads > sm_count or max(chunks) < 2:
+            assert length is None
+            continue
+        smallest = next(n for n in range(1, max(chunks) + 1) if ctas(n) <= sm_count)
+        assert length == (smallest if max(chunks) > smallest else None), (
+            chunks,
+            num_v_heads,
+            sm_count,
+        )
+    # the rule reads the shapes, HV and the SM count only
+    assert cake_chain.bwd_piece_table((), 4, 148) is None
+    assert cake_chain.bwd_piece_table((2048,), 200, 148) is None
+    assert cake_chain.bwd_piece_table((1, 1, 1), 4, 148) is None
+
+
+def test_adjoint_split_entry_lists() -> None:
+    # three sequences: one piece, three pieces, two pieces (segments [0, 1), [1, 4), [4, 6))
+    seed, seq, tape, out = (cake_chain.SPLIT_SEED, cake_chain.SPLIT_SEED_SEQ, cake_chain.SPLIT_TAPE,
+                            cake_chain.SPLIT_OUT)  # fmt: skip
+    walk_i, walk_m, summary_i, summary_m, front_i, front_m = (
+        cake_chain.adjoint_split_lists([0, 1, 4, 6])
+    )
+    assert walk_i == [0, 3, 5]
+    assert walk_m == [
+        seed | seq | tape,
+        seed | seq | tape | out,
+        seed | seq | tape | out,
+    ]
+    assert summary_i == [2] and summary_m == [0]
+    assert front_i == [1, 2, 4] and front_m == [seed | tape] * 3
+    # every segment's tapes are written once: by a first-wave walk or a second-wave walk
+    assert sorted(walk_i[:1] + [3, 5] + front_i) == list(range(6))
+
+
+@pytest.mark.parametrize("row", sorted(PIECE_ROWS))
+def test_adjoint_split_pricing_on_the_bench_rows(row) -> None:
+    (seq_lens, num_v_heads), (length, _) = PIECE_ROWS[row]
+    chunks = tuple(-(-n // 64) for n in seq_lens)
+    for arch in cake_chain.ADJOINT_SPLIT_COSTS:
+        rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 148, arch)
+        assert (
+            rec["segment_len"] == length
+            and rec["serial_us"] > 0
+            and rec["split_us"] > 0
+        ), (row, rec)
+        assert rec["select"] is (rec["split_us"] < rec["serial_us"]), (row, rec)
+    # no table, no split: 64 sequences x 6 value heads exceed 148 SMs; an architecture without costs never splits
+    rec = cake_chain.adjoint_split_pricing((64,) * 64, 6, 148, "sm_100a")
+    assert rec["select"] is False and rec["segment_len"] == 0
+    assert (
+        cake_chain.adjoint_split_pricing(chunks, num_v_heads, 148, "sm_90a")["select"]
+        is False
+    )
+
+
+def test_host_plans_take_the_split_or_the_serial_table(monkeypatch) -> None:
+    # on an architecture of ADJOINT_SPLIT_ARCHS a host layout's adjoint table is the one-wave split or a serial table,
+    # never a pre-scan's split table; plan pins keep the planner's tables
+    arch = sorted(cake_chain.ADJOINT_SPLIT_ARCHS)[0]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: (148, 232448, 10))
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    options = cake_chain.make_options()
+    for row, ((seq_lens, num_v_heads), (length, _)) in PIECE_ROWS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        (_fwd, bwd), bwd_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 148, arch)
+        if rec["select"]:
+            assert (
+                bwd == cake_chain.ScanPlan(cake_chain.SDT_CONFIG, length) and not bwd_tc
+            ), row
+        else:
+            assert bwd.segment_len <= 0 or max(chunks) <= bwd.segment_len, (row, bwd)
+    pinned = cake_chain.make_options(segment_chunks=64)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+        want = cake_chain.host_plans((131071, 87531, 43385), 6, 0, pinned)
+    assert cake_chain.host_plans((131071, 87531, 43385), 6, 0, pinned) == want
+
+
+# A layout the split cuts on a device of SPLIT_SMS SMs with HV 4: sequences of 11, 24 and 4 chunks take pieces of 4
+# chunks (3, 6 and 1 pieces: wave 1 walks 3 pieces beside 5 summaries, wave 2 walks 7 pieces); partial last chunks.
+SPLIT_LAYOUT = (700, 1500, 230)
+SPLIT_HEADS = (2, 4)
+SPLIT_SMS = 40
+_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
+
+
+def _split_device(monkeypatch, device, *, split: bool, chain: str | None = None) -> str:
+    """The small device of :func:`_small_device` with SPLIT_SMS SMs, the device's architecture in
+    ADJOINT_SPLIT_ARCHS and costs that select the split (``split``) or the serial table; ``chain`` pins the stage that
+    composes the end adjoints (``ADJOINT_CHAIN_STAGES``' preference otherwise)."""
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if not all(cake_chain._available(stage, arch) for stage in _SPLIT_STAGES):
+        pytest.skip(f"the split's stages are not delivered for {arch}")
+    if chain is not None:
+        if not cake_chain._available(chain, arch):
+            pytest.skip(f"{chain} is not delivered for {arch}")
+        monkeypatch.setattr(cake_chain, "ADJOINT_CHAIN_STAGES", (chain,))
+    if cake_chain._adjoint_chain_stage(arch) is None:
+        pytest.skip(f"no chain stage is delivered for {arch}")
+    _small_device(monkeypatch, device, SPLIT_SMS)
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset({arch}))
+    costs = {"walk": 1.0, "summary": 1.0, "serial_low": 1.0, "serial_full": 1.0, "stitch": 0.0, "stitch_piece": 0.0,
+             "fixed": 0.0 if split else 1e9}  # fmt: skip
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_COSTS", {arch: costs})
+    return arch
+
+
+@pytest.mark.parametrize(
+    "lpt, states, chain",
+    [
+        (True, True, None),
+        (True, False, None),
+        (False, True, None),
+        (False, False, None),
+        (True, True, "piece_chain"),
+    ],
+    ids=[
+        "lpt-h0-dht",
+        "lpt-no-states",
+        "caller-order-h0-dht",
+        "caller-order-no-states",
+        "lpt-h0-dht-piece-chain",
+    ],
+)
+def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
+    lpt, states, chain, device, monkeypatch
+) -> None:
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    index = cake_chain._device_index(device)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7007)
+    gen = torch.Generator().manual_seed(7008)
+    h0 = dht = None
+    if states:
+        h0 = (
+            0.1
+            * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+        ).to(device)
+        dht = torch.randn(
+            len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen
+        ).to(device)
+    names = OUTPUT_NAMES + (("final_state", "dh0") if states else ())
+    runs = {}
+    for split in (True, False):
+        with monkeypatch.context() as m:
+            arch = _split_device(m, device, split=split, chain=chain)
+            composer = cake_chain._adjoint_chain_stage(arch)
+            options = cake_chain.make_options(lpt=lpt)
+            cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+            meta = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1], options,
+                                          heads[1] // heads[0])  # fmt: skip
+            if split:
+                assert meta.bwd_split is not None and meta.bwd_segments.segment_len == 4
+                assert meta.bwd_segments.num_segments == 10 and meta.bwd_groups is None
+                assert (
+                    meta.bwd_split.num_walk,
+                    meta.bwd_split.num_summary,
+                    meta.bwd_split.num_front,
+                ) == (3, 5, 7)
+            else:
+                assert meta.bwd_split is None and meta.bwd_segments.num_segments == len(
+                    seq_lens
+                )
+            launches = _record_streams(m)
+            got = [_run(inputs, seq_lens, initial_state=h0, output_final_state=states, dht=dht, lpt=lpt)
+                   for _ in range(3)]  # fmt: skip
+            stages = [stage for stage, _ in launches]
+            if split:
+                main = torch.cuda.current_stream(device).cuda_stream
+                assert (
+                    stages.count("dhu_tc2_dvl32_modes") == 6
+                    and stages.count("dhu_tc2_dvl32_gm") == 3
+                ), stages
+                # the backward's composition, once per run (the forward's plan may stitch too)
+                assert stages.count(composer) >= 3, (composer, stages)
+                if composer == "piece_chain":
+                    assert stages.count("piece_chain") == 3, stages
+                assert not [
+                    s for s in stages if s.startswith(("dhu_pre", "dv_local", "dhu_r"))
+                ], stages
+                assert {
+                    stream for stage, stream in launches if stage == "dhu_tc2_dvl32_gm"
+                } != {main}
+            else:
+                assert not set(stages) & {"dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm"}, (
+                    stages
+                )
+            for run in got[1:]:
+                _assert_same_bits(run, got[0], names)  # the same launches, run to run
+            runs[split] = got[0]
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    _assert_close_to_reference(runs[True], ref, names)
+    _assert_within_budget(runs[True], runs[False], names)
+
+
+def test_adjoint_split_packed_views_give_the_contiguous_bits(
+    device, monkeypatch
+) -> None:
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    _split_device(monkeypatch, device, split=True)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7009)
+    want = _run(inputs, seq_lens)
+    got = _run_packed(inputs, seq_lens, heads)
+    _assert_same_bits(got, want, OUTPUT_NAMES)

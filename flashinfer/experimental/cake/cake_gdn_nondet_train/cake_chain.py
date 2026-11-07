@@ -72,7 +72,13 @@ beside a value-head group of two's tail, and beside a group of three's cluster
 tail on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  On an
 architecture of ``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan
 beside a group of three's cluster tail runs the same way over its segments
-(:func:`split_r_form`).
+(:func:`split_r_form`).  On an architecture of ``ADJOINT_SPLIT_ARCHS`` the
+adjoint walk of a host-built table is either the serial table or the exact
+one-wave split (:func:`bwd_piece_table`, :func:`adjoint_split_pricing`, both
+priced at their full cost): the last piece of every sequence walks beside the
+affine maps of its middle pieces (``dhu_tc2_dvl32_modes`` / ``dhu_tc2_dvl32_gm``),
+the stitch composes the other pieces' end adjoints and a second wave walks
+them, so neither the plan nor its cost depends on the gates.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -125,6 +131,15 @@ __all__ = [
     "TAIL_MIN_CTAS",
     "TAIL_TILE_FLOATS",
     "TAIL_WORKSPACE_TILES",
+    "ADJOINT_SPLIT_ARCHS",
+    "ADJOINT_SPLIT_COSTS",
+    "ADJOINT_CHAIN_STAGES",
+    "CHAIN_VSPLIT",
+    "AdjointSplit",
+    "adjoint_split_lists",
+    "adjoint_split_pricing",
+    "adjoint_split_tables",
+    "bwd_piece_table",
     "CHAIN_PLAN",
     "FWD_HO_VH2_ARCHS",
     "FWD_HO_VH2_STEP",
@@ -189,6 +204,7 @@ REG_SCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (32, 1), (64, 1))
 PRESCAN_CONFIGS: tuple[tuple[int, int], ...] = ((32, 2), (64, 1))
 SCAN_KINDS = ("fwd_h", "dhu")
 STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
+CHAIN_VSPLIT = 8  # CTAs per (sequence, value head) of the piece chain launch
 
 # The tag of this package's forward tape: the backward reads only a tape that carries it (the deterministic package's
 # tape has no ``"mode"`` key, so it is refused).
@@ -209,6 +225,8 @@ _FWD_H_SPLIT_ARGS = _FWD_H_ARGS + ("seg_flag",)
 _FWD_H_PRE_ARGS = _FWD_H_SPLIT_ARGS + ("warmup_thresh_log2",)
 _STITCH_ARGS = ("seg_state", "init_state", "state_out", "seq_seg_start", "seg_flag", "num_v_heads", "use_init",
                 "reverse")  # fmt: skip
+# the piece chain: the stitch's arguments without ``reverse`` (the chain walks backward)
+_CHAIN_ARGS = _STITCH_ARGS[:-1]
 _FWD_HO_ARGS = ("qn_tma", "kn_tma", "w_tma", "u_tma", "g_cs", "h0", "seg_start", "h_tma", "v_new_tma", "v_new",
                 "o_tma", "o_out", "final_state", "chunk_start", "chunk_len", "seg_chunk_start", "seg_seq",
                 "seq_chunk_start", "walk", "num_heads", "num_v_heads", "use_initial_state", "store_final_state",
@@ -224,6 +242,9 @@ _DHU_PRE_DVL_ARGS = tuple(a for a in _DHU_PRE_ARGS if a != "dv_local")
 _DHU_TC2_ARGS = ("qn_tma", "kn_tma", "w_tma", "do_tma") + tuple(
     a for a in _DHU_ARGS[4:] if a != "dv_local"
 )
+# the dhu_tc2_dvl32 forms of the one-wave adjoint split: the scan's arguments, then the entry table (segment index and
+# mode bits per CTA row)
+_DHU_TC2_FORM_ARGS = (*_DHU_TC2_ARGS, "seg_index", "seg_mode")
 _DQKWG_ARGS = ("qn", "kn", "v_new", "do", "dv2", "h", "dh", "g_cs", "dq_out", "dk_out", "dw_out", "dg_out",
                "chunk_start", "chunk_len", "num_heads", "num_v_heads", "scale")  # fmt: skip
 _WY_BWD_ARGS = ("kn", "v", "A", "dw", "du", "g_cs", "beta", "dk2_out", "dv_out", "dbeta_out", "dg2_out",
@@ -259,9 +280,12 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "fwd_ho": _FWD_HO_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
+    "piece_chain": _CHAIN_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
     "dhu_tc2_dvl32": _DHU_TC2_ARGS,
+    "dhu_tc2_dvl32_modes": _DHU_TC2_FORM_ARGS,
+    "dhu_tc2_dvl32_gm": _DHU_TC2_FORM_ARGS,
     "dqkwg": _DQKWG_ARGS,
     "wy_bwd": _WY_BWD_ARGS,
     "wy_bwd_bf16": _WY_BWD_ARGS,
@@ -577,7 +601,9 @@ class ChunkMeta:
     sequence ``order[vs]``, its chunks at their original token offsets (``None``: the caller's order);
     ``order_index`` holds it on the device as ``[order, inverse]`` for the state rows.  ``fwd_groups`` /
     ``bwd_groups``: the two-stream sequence groups of the forward / adjoint scan (``None``: one stream);
-    ``bwd_tc``: the adjoint table is priced for ``dhu_tc2`` (:func:`tc_plan_pricing`), which runs it."""
+    ``bwd_tc``: the adjoint table is priced for ``dhu_tc2`` (:func:`tc_plan_pricing`), which runs it; ``bwd_split``:
+    the entry tables of the one-wave split of the adjoint walk over ``bwd_segments`` (:class:`AdjointSplit`), which
+    the backward runs instead of a pre-scan (``None``: the other plans)."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -593,6 +619,8 @@ class ChunkMeta:
     bwd_groups: StreamGroups | None = None
     # the adjoint table was priced for dhu_tc2 (:func:`tc_plan_pricing`): the backward runs it on dhu_tc2
     bwd_tc: bool = False
+    # the one-wave split of the adjoint walk over bwd_segments (:func:`adjoint_split_pricing`)
+    bwd_split: AdjointSplit | None = None
 
 
 @dataclass(frozen=True)
@@ -1949,6 +1977,246 @@ def split_r_form(
 
 
 # --------------------------------------------------------------------------- #
+# the one-wave split of the adjoint walk (exact, independent of the gates)
+# --------------------------------------------------------------------------- #
+# On the architectures of ADJOINT_SPLIT_ARCHS a host-built table splits each long sequence's adjoint walk into pieces
+# of at most ``L`` chunks (:func:`bwd_piece_table`, the bounds of :func:`segment_bounds`) and runs it in two waves of
+# the ``dhu_tc2_dvl32`` forms.  Wave 1: ``dhu_tc2_dvl32_modes`` walks each sequence's last piece from ``dht`` with its
+# tapes and stores the adjoint it reaches at the piece's start, while ``dhu_tc2_dvl32_gm`` (on a side stream) walks
+# each middle piece's affine map ``[B | M]`` (``B`` from zero, ``M`` from the identity); the stitch composes the end
+# adjoint of every other piece; wave 2: ``dhu_tc2_dvl32_modes`` walks those pieces from their end adjoints with their
+# tapes, the first piece storing ``dh0``.  A sequence of one piece is walked whole in wave 1.  The end adjoints come
+# from the stitch (3xBF16 products, about 16 mantissa bits per step); ``piece_chain`` (FP32 FFMA, one dot product per
+# element and step, slower) is the FP32 composition a caller selects through ADJOINT_CHAIN_STAGES.  Every chunk's walk is the serial walk's from the same end
+# adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
+# cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
+# full cost.
+ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a"})
+ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
+# the stages that compose the end adjoints, in preference order
+ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
+# the mode bits of an entry of the forms (``seg_mode``): seed the walk from ``dht`` (row of the segment, or of its
+# sequence with SPLIT_SEED_SEQ), write the dh / dv2 tapes, store the adjoint at the segment's start into the B half of
+# ``seg_state`` (the stitch's layout)
+SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
+# Per architecture, microseconds: the step of the walk with its tapes in a full wave (``walk``) and of wave 1, the
+# summaries beside the last pieces' walks (``summary``); the step of the serial walk at an empty and at a full wave
+# (``serial_low`` / ``serial_full``, interpolated by the fill); the composition's fixed cost and its cost per
+# composed piece (``stitch`` / ``stitch_piece``); the split's fixed cost (its extra launches and the stream fork and
+# join).
+ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
+    "sm_100a": {
+        "walk": 2.69,
+        "summary": 2.77,
+        "serial_low": 2.29,
+        "serial_full": 2.72,
+        "stitch": 10.5,
+        "stitch_piece": 3.0,
+        "fixed": 15.0,
+    },
+}
+
+
+def bwd_piece_table(chunks, num_v_heads: int, sm_count: int) -> int | None:
+    """The piece length ``L`` (chunks) of the one-wave split of the adjoint walk over sequences of ``chunks`` chunks:
+    the smallest ``L`` whose first wave fits one CTA per SM, ``sum_d max(ceil(n_d / L) - 1, 1) * HV <= sm_count`` (a
+    sequence of ``P`` pieces puts its last piece and its ``P - 2`` middle pieces in the first wave, a sequence of one
+    piece its whole walk); the second wave, ``sum_d (P_d - 1) * HV`` CTAs, fits too.  ``None`` where no ``L`` splits a
+    sequence (more sequences x value heads than SMs, or every sequence one piece at the smallest fitting ``L``).
+    Depends on the shapes, ``HV`` and the SM count alone."""
+    chunks = [int(n) for n in chunks]
+    hv, sms = int(num_v_heads), int(sm_count)
+    if not chunks or hv <= 0 or len(chunks) * hv > sms or max(chunks) < 2:
+        return None
+
+    def ctas(length: int) -> int:
+        return sum(max(-(-n // length) - 1, 1) for n in chunks) * hv
+
+    lo, hi = 1, max(chunks)  # ctas(max(chunks)) = N x HV fits
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ctas(mid) <= sms:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo if max(chunks) > lo else None
+
+
+def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) -> dict:
+    """The one-wave split (:func:`bwd_piece_table`) against the serial table of ``chunks``, both at their full cost
+    (``ADJOINT_SPLIT_COSTS``, microseconds): the split pays wave 1 (its longest last piece or one-piece sequence at the
+    walk's step, its longest middle piece at the summary's), the stitch over the most pieces of a sequence, wave 2 (its
+    longest other piece) and its fixed cost; the serial table pays its longest sequence at the step of its fill.
+    ``select`` where the split is cheaper; ``segment_len`` is ``L`` (0 without a split)."""
+    chunks = tuple(int(n) for n in chunks)
+    hv, sms = int(num_v_heads), int(sm_count)
+    out: dict[str, Any] = {
+        "select": False,
+        "segment_len": 0,
+        "split_us": None,
+        "serial_us": None,
+    }
+    costs = ADJOINT_SPLIT_COSTS.get(arch)
+    if costs is None or not chunks:
+        return out
+    fill = min(1.0, len(chunks) * hv / sms)
+    rounds = -(-len(chunks) * hv // sms)
+    step = costs["serial_low"] + (costs["serial_full"] - costs["serial_low"]) * fill
+    out["serial_us"] = rounds * max(chunks) * step
+    length = bwd_piece_table(chunks, hv, sms)
+    if length is None:
+        return out
+    last = middle = front = 0
+    pieces = 1
+    for n in chunks:
+        bounds = segment_bounds(n, length)
+        lens = [b - a for a, b in zip(bounds[:-1], bounds[1:], strict=True)]
+        pieces = max(pieces, len(lens))
+        last = max(last, lens[-1])
+        if len(lens) > 2:
+            middle = max(middle, max(lens[1:-1]))
+        if len(lens) > 1:
+            front = max(front, max(lens[:-1]))
+    split = (
+        max(last * costs["walk"], middle * costs["summary"])
+        + costs["stitch"]
+        + costs["stitch_piece"] * (pieces - 1)
+        + front * costs["walk"]
+        + costs["fixed"]
+    )
+    out.update(select=split < out["serial_us"], segment_len=length, split_us=split)
+    return out
+
+
+def _adjoint_chain_stage(arch: str) -> str | None:
+    """The stage that composes the split's end adjoints on ``arch``: the first of
+    ``ADJOINT_CHAIN_STAGES`` delivered."""
+    delivered = [stage for stage in ADJOINT_CHAIN_STAGES if _available(stage, arch)]
+    return delivered[0] if delivered else None
+
+
+def _adjoint_split_length(
+    seq_lens, num_v_heads: int, device_index: int, options: ChainOptions
+) -> int | None:
+    """``L`` of the one-wave split a host layout takes on device ``device_index``, ``None`` for the other plans: the
+    device's architecture in ``ADJOINT_SPLIT_ARCHS`` with the forms and a chain stage delivered, no plan or ``dhu_scan``
+    pin, and :func:`adjoint_split_pricing` selecting it."""
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    if (
+        arch not in ADJOINT_SPLIT_ARCHS
+        or options.pins != (None, None)
+        or options.dhu_scan is not None
+    ):
+        return None
+    if not all(_available(stage, arch) for stage in ADJOINT_SPLIT_STAGES):
+        return None
+    if _adjoint_chain_stage(arch) is None:
+        return None
+    chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
+    priced = adjoint_split_pricing(
+        chunks, int(num_v_heads), _device_props(index)[0], arch
+    )
+    return int(priced["segment_len"]) if priced["select"] else None
+
+
+@dataclass(frozen=True)
+class AdjointSplit:
+    """The entry tables of the one-wave split of the adjoint walk over a table's adjoint segments (the pieces): rows
+    ``[segment index, mode bits]`` of each launch of the ``dhu_tc2_dvl32`` forms (:func:`adjoint_split_tables`), and the
+    stitch's ``seg_flag`` (``[segments, HV]``: 0 at each sequence's last piece, whose B half the stitch copies)."""
+
+    walk: torch.Tensor
+    summary: torch.Tensor
+    front: torch.Tensor
+    seg_flag: torch.Tensor
+    num_walk: int
+    num_summary: int
+    num_front: int
+
+
+def adjoint_split_lists(
+    seq_seg_start,
+) -> tuple[list[int], list[int], list[int], list[int], list[int], list[int]]:
+    """The host entry lists of the split over a segment table whose sequence ``vs`` owns the segments
+    ``seq_seg_start[vs] .. seq_seg_start[vs + 1]``: wave 1's walks (each sequence's last piece, seeded from its
+    sequence's ``dht`` row, tapes, start adjoint out; a one-piece sequence the same without the store), wave 1's
+    summaries (the middle pieces, mode 0), wave 2's walks (every other piece, seeded from its own end adjoint, tapes),
+    each as segment indices and modes, in table order."""
+    walk_i: list[int] = []
+    walk_m: list[int] = []
+    summary_i: list[int] = []
+    front_i: list[int] = []
+    front_m: list[int] = []
+    for s0, s1 in zip(seq_seg_start[:-1], seq_seg_start[1:], strict=True):
+        if s1 - s0 == 1:
+            walk_i.append(s0)
+            walk_m.append(SPLIT_SEED | SPLIT_SEED_SEQ | SPLIT_TAPE)
+            continue
+        walk_i.append(s1 - 1)
+        walk_m.append(SPLIT_SEED | SPLIT_SEED_SEQ | SPLIT_TAPE | SPLIT_OUT)
+        summary_i.extend(range(s0 + 1, s1 - 1))
+        front_i.extend(range(s0, s1 - 1))
+        front_m.extend([SPLIT_SEED | SPLIT_TAPE] * (s1 - 1 - s0))
+    return walk_i, walk_m, summary_i, [0] * len(summary_i), front_i, front_m
+
+
+def adjoint_split_tables(seq_seg_start, num_v_heads: int, device) -> AdjointSplit:
+    """:class:`AdjointSplit` of a segment table (:func:`adjoint_split_lists`), copied to ``device`` in one transfer."""
+    seq_seg_start = [int(x) for x in seq_seg_start]
+    walk_i, walk_m, summary_i, summary_m, front_i, front_m = adjoint_split_lists(
+        seq_seg_start
+    )
+    flags: list[int] = []
+    for s0, s1 in zip(seq_seg_start[:-1], seq_seg_start[1:], strict=True):
+        flags.extend([1] * ((s1 - s0 - 1) * int(num_v_heads)) + [0] * int(num_v_heads))
+    parts = [walk_i + walk_m, summary_i + summary_m, front_i + front_m, flags]
+    table = torch.tensor([x for part in parts for x in part], dtype=torch.int32)
+    device = torch.device(device)
+    table = (
+        table.pin_memory().to(device, non_blocking=True)
+        if device.type == "cuda"
+        else table.to(device)
+    )
+    views = []
+    offset = 0
+    for part in parts:
+        views.append(table[offset : offset + len(part)])
+        offset += len(part)
+    return AdjointSplit(
+        walk=views[0].view(2, -1),
+        summary=views[1].view(2, -1),
+        front=views[2].view(2, -1),
+        seg_flag=views[3].view(-1, int(num_v_heads)),
+        num_walk=len(walk_i),
+        num_summary=len(summary_i),
+        num_front=len(front_i),
+    )
+
+
+@lru_cache(maxsize=256)
+def _host_adjoint_split(
+    seq_lens: tuple[int, ...],
+    segment_len: int,
+    num_v_heads: int,
+    device_index: int,
+    lpt: bool,
+) -> AdjointSplit:
+    """:func:`adjoint_split_tables` of the adjoint segments :func:`build_chunk_meta` builds for ``seq_lens`` (the
+    sequences in :func:`lpt_sequence_order` with ``lpt``) at ``segment_len``."""
+    order = lpt_sequence_order(seq_lens) if lpt else None
+    seq_seg_start = [0]
+    for seq in order if order is not None else range(len(seq_lens)):
+        n = -(-int(seq_lens[seq]) // CHUNK)
+        seq_seg_start.append(
+            seq_seg_start[-1] + len(segment_bounds(n, int(segment_len))) - 1
+        )
+    return adjoint_split_tables(
+        seq_seg_start, num_v_heads, torch.device("cuda", device_index)
+    )
+
+
+# --------------------------------------------------------------------------- #
 # prep selection: prep_tma (TMA-staged q / k, one CTA per (chunk, key head)) or the plain prep
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
@@ -2621,6 +2889,70 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
 # --------------------------------------------------------------------------- #
 # backward
 # --------------------------------------------------------------------------- #
+def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMeta, qn, kn, w, do, g_cs, dht32,
+                        use_dht: int, dh, dv2, dh0, has_initial_state: bool, num_heads: int, num_v_heads: int,
+                        scale: float, table, workspaces: Workspaces, index: int, device) -> None:  # fmt: skip
+    """The adjoint walk of a table's segments as the one-wave split (:class:`AdjointSplit`): wave 1, the last and
+    one-piece walks (``dhu_tc2_dvl32_modes``, caller's stream) beside the middle pieces' summaries
+    (``dhu_tc2_dvl32_gm``, side stream, joined back); the composition of the pieces' end adjoints (the stitch with
+    ``reverse``, or ``piece_chain``: each sequence's last piece ends at ``dht``, the piece before it at the B half its walk
+    stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other pieces' walks from those end
+    adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's start adjoint (with
+    ``has_initial_state``)."""
+    hv = num_v_heads
+    seg_state = workspaces.take(table, "b_seg_state", (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), torch.float32,
+                                device)  # fmt: skip
+    store0 = 1 if has_initial_state else 0
+    common = (meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
+              hv)  # fmt: skip
+
+    def walk(stage, entries, count, dht, use_final, store_initial):
+        _launch(stage, count, hv, 1, qn, kn, w, do, g_cs, dht, dh, dv2, dh0, seg_state, *common, use_final,
+                store_initial, scale, entries[0], entries[1])  # fmt: skip
+
+    if split1.num_summary:
+        main = torch.cuda.current_stream(index)
+        side = _side_stream(index, main)
+        fork = torch.cuda.Event()
+        fork.record(main)
+        try:
+            with torch.cuda.stream(side):
+                side.wait_event(fork)
+                walk(
+                    "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
+                )
+            walk(
+                "dhu_tc2_dvl32_modes",
+                split1.walk,
+                split1.num_walk,
+                dht32,
+                use_dht,
+                store0,
+            )
+        finally:
+            main.wait_stream(side)  # the join
+    else:
+        walk(
+            "dhu_tc2_dvl32_modes", split1.walk, split1.num_walk, dht32, use_dht, store0
+        )
+    if not split1.num_front:
+        return
+    dh_end = workspaces.take(
+        table,
+        "b_dh_end",
+        (segs.num_segments, hv, HEAD_DIM, HEAD_DIM),
+        torch.float32,
+        device,
+    )
+    if _adjoint_chain_stage(cake_backend.device_arch(index)) == "piece_chain":
+        _launch("piece_chain", meta.num_seqs, hv, CHAIN_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
+                split1.seg_flag, hv, use_dht)  # fmt: skip
+    else:
+        _launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
+                split1.seg_flag, hv, use_dht, 1)  # fmt: skip
+    walk("dhu_tc2_dvl32_modes", split1.front, split1.num_front, dh_end, 1, store0)
+
+
 def cake_gdn_nondet_train_backward(
     forward, do, dht=None, *, initial_state=None, dbeta_dtype=None, grad_qkv=None
 ) -> dict[str, Any]:
@@ -2682,13 +3014,21 @@ def cake_gdn_nondet_train_backward(
         h, v_new = forward["h"], forward["v_new"]
     token_hv = (total_tokens, num_v_heads, HEAD_DIM)
     segs = meta.bwd_segments
-    serial = not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs)
+    # the one-wave split of the adjoint walk (:class:`AdjointSplit`): its own launches, then the tail as one launch
+    split1 = meta.bwd_split
+    serial = split1 is None and not (
+        segs.segment_len > 0 and segs.num_segments > meta.num_seqs
+    )
     use_tc = serial and (
         meta.bwd_tc or _dhu_tc_selected(meta, num_v_heads, index, options)
     )
     # a split plan's pass 2 on dhu_tc2: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
-    split_tc = not serial and (
-        meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
+    split_tc = (
+        split1 is None
+        and not serial
+        and (
+            meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
+        )
     )
     # two groups (R form, :func:`adjoint_r_form`): the tcgen05 serial scan feeding a fused tail (a group of
     # R_FORM_GROUPS; a group of three's cluster tail on TWO_STREAM_SERIAL_G3_ARCHS), and the dhu_tc2 pass 2 of a split
@@ -2696,8 +3036,8 @@ def cake_gdn_nondet_train_backward(
     two_groups = adjoint_r_form(
         arch, num_v_heads // num_heads, form, serial_tc=use_tc, split_tc=split_tc
     )
-    groups = meta.bwd_groups if two_groups else None
-    if not (use_tc or split_tc):
+    groups = meta.bwd_groups if two_groups and split1 is None else None
+    if not (use_tc or split_tc or split1 is not None):
         dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
         _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,
                 meta.chunk_len, num_heads, num_v_heads, scale)  # fmt: skip
@@ -2726,7 +3066,10 @@ def cake_gdn_nondet_train_backward(
         dht32, use_dht = dh0, 0
     scan_stage, vb, pre, pre_threads = _scan_stages("dhu", segs.scan_config, arch)
     tc_stage = dhu_tc2_stage(arch)
-    if use_tc and groups is None:
+    if split1 is not None:
+        _adjoint_split_walk(split1, segs, meta, qn, kn, w, do, g_cs, dht32, use_dht, dh, dv2, dh0, has_initial_state,
+                            num_heads, num_v_heads, scale, table, workspaces, index, device)  # fmt: skip
+    elif use_tc and groups is None:
         # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
         _launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
@@ -2766,7 +3109,7 @@ def cake_gdn_nondet_train_backward(
         _launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
-    elif not (use_tc or split_tc):
+    elif not (use_tc or split_tc or split1 is not None):
         _launch(scan_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32, dh,
                 dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
@@ -3118,6 +3461,27 @@ def _host_plans(
                     plans = (table, plans[1])
                 else:
                     plans, bwd_tc = (plans[0], table), True
+    if (
+        cake_backend.device_arch(index) in ADJOINT_SPLIT_ARCHS
+        and options.pins == (None, None)
+        and (options.dhu_scan is None)
+    ):
+        # the one-wave split of the adjoint walk or the serial table, priced at their full cost: never a pre-scan's
+        # split table, whose cost follows the gates
+        length = _adjoint_split_length(seq_lens, int(num_v_heads), index, options)
+        bwd = plans[1]
+        if length is not None:
+            plans, bwd_tc, kept = (plans[0], ScanPlan(SDT_CONFIG, length)), False, False
+        elif (
+            bwd.segment_len > 0
+            and max(-(-n // CHUNK) for n in seq_lens) > bwd.segment_len
+        ):
+            serial = (
+                bwd.config
+                if tuple(bwd.config) in REG_SCAN_CONFIGS
+                else REG_SCAN_CONFIGS[0]
+            )
+            plans, bwd_tc, kept = (plans[0], ScanPlan(serial, 0)), False, False
     return plans, bwd_tc, kept
 
 
@@ -3164,6 +3528,7 @@ def _chunk_meta(
         group,
         options.tail,
         SPLIT_R_FORM,
+        tuple(sorted(ADJOINT_SPLIT_ARCHS)),
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -3180,6 +3545,14 @@ def _chunk_meta(
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if bwd_tc:
         meta = replace(meta, bwd_tc=True)
+    split_len = _adjoint_split_length(seq_lens, int(num_v_heads), int(index), options)
+    if split_len is not None and int(plans[1].segment_len) == split_len:
+        meta = replace(
+            meta,
+            bwd_split=_host_adjoint_split(
+                seq_lens, split_len, int(num_v_heads), int(index), options.lpt
+            ),
+        )
     if options.streams == 2:
         split_adjoint = _split_r_groups(
             cake_backend.device_arch(int(index)), group, options
@@ -3190,6 +3563,8 @@ def _chunk_meta(
             _device_props(int(index))[0],
             split_adjoint=split_adjoint,
         )
+        if meta.bwd_split is not None:
+            bwd_groups = None  # the split's two waves fill the device; the tail runs as one launch after them
         if fwd_groups is not None or bwd_groups is not None:
             meta = replace(meta, fwd_groups=fwd_groups, bwd_groups=bwd_groups)
     if options.host_cache:
