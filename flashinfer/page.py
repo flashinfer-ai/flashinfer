@@ -442,7 +442,10 @@ def append_paged_mla_kv_cache(
     positions : torch.Tensor
         The positions of the each entry in the appended key-value pairs, shape: ``[append_indptr[-1]]``.
     ckv_cache : cache for compressed kv, torch.Tensor, shape: [page_num, page_size, ckv_dim]
+        Must have the same dtype as ``append_ckv``. For an FP8 cache, quantize
+        ``append_ckv`` and ``append_kpe`` to the cache dtype first.
     kpe_cache : cache for key position embedding, torch.Tensor, shape: [page_num, page_size, kpe_dim]
+        Must have the same dtype as ``append_kpe``.
     kv_indices : torch.Tensor
         The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
     kv_indptr : torch.Tensor
@@ -622,6 +625,9 @@ def append_paged_kv_cache(
           ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
           :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
           ``paged_kv_cache[:, 1]`` is the value-cache.
+
+        The cache must have the same dtype as ``append_key`` and ``append_value``.
+        For an FP8 cache, quantize the keys and values to the cache dtype first.
 
     kv_indices : torch.Tensor
         The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
