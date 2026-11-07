@@ -149,7 +149,23 @@ class CompilationContext:
         self,
         supported_major_versions: list[int] = None,
         map_sm107_to_100f: bool = False,
+        *,
+        supported_archs: list[int | tuple[int, str]] | None = None,
     ) -> list[str]:
+        """Return nvcc flags for the supported target architectures.
+
+        ``supported_major_versions`` filters by major version; ``None`` and
+        an empty list preserve the existing unrestricted behavior.
+        ``supported_archs`` accepts major versions, exact ``(major, minor)``
+        pairs, or both. Exact pairs include the architecture suffix, such as
+        ``(10, "3a")`` or ``(12, "0f")``. ``None`` leaves targets unrestricted,
+        while an empty list matches no targets. When both filters are supplied,
+        only targets matching both are retained.
+
+        Filtering applies to the normalized targets before any SM107-to-SM100f
+        mapping, which still follows ``map_sm107_to_100f`` and toolchain support.
+        Raises ``RuntimeError`` if no target matches the filters.
+        """
         if supported_major_versions:
             supported_cuda_archs = [
                 major_minor_tuple
@@ -158,10 +174,17 @@ class CompilationContext:
             ]
         else:
             supported_cuda_archs = self.TARGET_CUDA_ARCHS
+        if supported_archs is not None:
+            supported_cuda_archs = [
+                (major, minor)
+                for major, minor in supported_cuda_archs
+                if major in supported_archs or (major, minor) in supported_archs
+            ]
         if len(supported_cuda_archs) == 0:
-            raise RuntimeError(
-                f"No supported CUDA architectures found for major versions {supported_major_versions}."
-            )
+            message = f"No supported CUDA architectures found for major versions {supported_major_versions}"
+            if supported_archs is not None:
+                message += f" and supported_archs {supported_archs}"
+            raise RuntimeError(message + ".")
 
         # SM107 (Rubin) falls back to the sm100f family target only while the
         # bundled CUTLASS lacks native compute_107a support; once CUTLASS adds
