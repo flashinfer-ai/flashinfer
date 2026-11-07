@@ -2810,3 +2810,43 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("m", [1, 7, 64, 129, 512])
+@pytest.mark.parametrize("k", [64, 3072, 6144])
+@pytest.mark.parametrize("seed", [0, 1])
+@torch.inference_mode()
+def test_nvfp4_per_token_linear_scales_need_no_zero_fill(dtype, m, k, seed):
+    """The per-token NVFP4 quant writes every scale byte of the linear layout,
+    so its output does not depend on the scale buffer's previous contents."""
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    from flashinfer.quantization.fp4_quantization import get_fp4_quantization_module
+
+    major, minor = torch.cuda.get_device_capability(device)
+    module = get_fp4_quantization_module(f"{major * 10 + minor}")
+    torch.manual_seed(seed)
+    x = torch.randn((m, k), dtype=dtype, device=device) * 3
+    x[0, :16] = 0  # an all-zero block: scale byte 0
+    if m > 1:
+        x[1] = 0  # an all-zero row: its scale bytes must still be written
+    linear = SfLayout.layout_linear.value
+
+    def run(fill):
+        out = torch.empty((m, k // 2), dtype=torch.uint8, device=device)
+        scale = torch.full((m, k // 16), fill, dtype=torch.uint8, device=device)
+        per_token = torch.empty((m,), dtype=torch.float32, device=device)
+        module.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, 1.0, out, scale, per_token, None, linear
+        )
+        return out, scale, per_token
+
+    ref = run(0)
+    for fill in (0xAB, 0xFF):
+        for a, b in zip(run(fill), ref, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    got = module.nvfp4_quant_and_per_token_scale_sm100(x, 1.0, None, linear)
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
