@@ -15,6 +15,8 @@
  */
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
+
 void rmsnorm(TensorView out, TensorView input, TensorView weight, double eps, bool enable_pdl);
 
 void rmsnorm_quant(TensorView out, TensorView input, TensorView weight, TensorView scale,
@@ -27,8 +29,9 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
                              TensorView weight, TensorView scale, double eps, bool enable_pdl);
 
 void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale,
-                                       TensorView normed_out, TensorView input, TensorView residual,
-                                       TensorView weight, double eps, bool enable_pdl);
+                                       Optional<TensorView> normed_out, TensorView input,
+                                       TensorView residual, TensorView weight, double eps,
+                                       bool enable_pdl);
 
 void gemma_rmsnorm(TensorView out, TensorView input, TensorView weight, double eps,
                    bool enable_pdl);

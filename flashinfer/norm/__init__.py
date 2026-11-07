@@ -1493,7 +1493,7 @@ def _fused_add_rmsnorm_quant_fake(
 def fused_add_rmsnorm_fp8_block_quant(
     out: torch.Tensor,
     block_scale: torch.Tensor,
-    normed_out: torch.Tensor,
+    normed_out: Optional[torch.Tensor],
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -1504,11 +1504,11 @@ def fused_add_rmsnorm_fp8_block_quant(
 
     Replaces the two-kernel producer (:func:`fused_add_rmsnorm` then a per-token-group 1x128 fp8
     quant) used before fp8 block-scaled GEMMs. Unlike :func:`fused_add_rmsnorm_quant` (scalar
-    per-tensor scale) this emits a **dynamic per-1x128-block** fp32 scale in the column-major
+    per-tensor scale) this emits a **dynamic per-1x128-block** scale in the column-major
     TMA-aligned layout that :mod:`flashinfer.deep_gemm` consumes.
 
     Step 1: ``residual = input + residual`` (pre-norm, written in place).
-    Step 2: ``normed = RMSNorm(residual) * weight`` (bf16, written to ``normed_out``).
+    Step 2: ``normed = RMSNorm(residual) * weight`` (bf16, written to ``normed_out`` if given).
     Step 3: ``out, block_scale = quant_1x128_fp8(normed)`` (fp8 from the bf16-rounded normed, so
     ``out`` matches re-quantizing ``normed_out``).
 
@@ -1518,12 +1518,24 @@ def fused_add_rmsnorm_fp8_block_quant(
         fp8 output, shape ``(batch_size, hidden_size)``, dtype float8_e4m3fn (the activation
         dtype the fp8 block-scaled GEMMs consume).
     block_scale : torch.Tensor
-        fp32 block scales, shape ``(hidden_size // 128, round_up(batch_size, 4))``, contiguous.
-        This is the column-major (MN-major, TMA-aligned) buffer deep_gemm expects: the logical
-        ``(batch_size, hidden_size // 128)`` scale is ``block_scale.transpose(0, 1)[:batch_size]``.
-    normed_out : torch.Tensor
+        Block scales in a column-major (MN-major, TMA-aligned) layout. The dtype selects the
+        format and the consumer it is for. Below, ``amax = max(block_amax, 1e-4)``, where
+        ``block_amax`` is the largest magnitude of the rounded normed values in a 1x128 block.
+
+        - ``torch.float32``: ``amax / 448``, shape
+          ``(hidden_size // 128, round_up(batch_size, 4))``. The logical
+          ``(batch_size, hidden_size // 128)`` scale is ``block_scale.transpose(0, 1)[:batch_size]``.
+          For consumers that accept arbitrary fp32 block scales, such as DeepGEMM's SM90 FP8 GEMM.
+          Not for :mod:`flashinfer.deep_gemm`: on SM100 it packs fp32 (1, 128) scales by keeping
+          only their exponent, which gives wrong results for these scales.
+        - ``torch.int32``: packed UE8M0 for :mod:`flashinfer.deep_gemm` on SM100/SM103/SM107, which
+          reads it without a layout transform. Shape ``(ceil(hidden_size / 512),
+          round_up(batch_size, 4))``. Each scale is ``ceil_to_ue8m0(amax / 448)``, stored as
+          its exponent byte, four consecutive blocks per int32 (little-endian); the unused bytes of
+          a row's last int32 are zero.
+    normed_out : Optional[torch.Tensor]
         bf16/fp16 normed output, shape ``(batch_size, hidden_size)`` (for consumers that need the
-        pre-quant activation, e.g. an MoE router).
+        pre-quant activation, e.g. an MoE router). ``None`` skips this write.
     input, residual : torch.Tensor
         Shape ``(batch_size, hidden_size)``. ``residual`` is updated in place with ``input+residual``.
     weight : torch.Tensor
@@ -1545,7 +1557,7 @@ def fused_add_rmsnorm_fp8_block_quant(
 def _fused_add_rmsnorm_fp8_block_quant_fake(
     out: torch.Tensor,
     block_scale: torch.Tensor,
-    normed_out: torch.Tensor,
+    normed_out: Optional[torch.Tensor],
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
