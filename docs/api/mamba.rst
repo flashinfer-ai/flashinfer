@@ -318,7 +318,7 @@ were removed without aliases: importing an old module raises
 the module selects the mode.  The old names ran the deterministic package by
 default: a call that relied on that default moves to the deterministic
 package's names (``flashinfer.cake_causal_conv1d_det_train[_kcp]``), not to
-the names below.  The backend's ``plan_cache_clear`` keeps its name.
+the names below.
 
 .. list-table:: Old and new non-deterministic names
    :header-rows: 1
@@ -375,6 +375,8 @@ the names below.  The backend's ``plan_cache_clear`` keeps its name.
      - ``cake_causal_conv1d_nondet_train_kcp_graph_cache_clear``
    * - ``host_cache_clear`` (of the backend's ``kcp`` module)
      - ``cake_causal_conv1d_nondet_train_kcp_host_cache_clear``
+   * - ``plan_cache_clear`` (of the backend)
+     - ``cake_causal_conv1d_nondet_train_plan_cache_clear``
 
 The deterministic package's names before its ``det`` rename (the modules
 ``flashinfer.cake_causal_conv1d_train`` and

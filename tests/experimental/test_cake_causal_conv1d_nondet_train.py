@@ -1117,7 +1117,7 @@ def test_narrow_tile_row_gives_up_one_sm_at_three_tiles(monkeypatch) -> None:
         label = f"{arch} {kind} S={S} C={C} full={full} k={k}"
         x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=43)
         refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
-        pkg.plan_cache_clear()
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
         launched.clear()
         dx, dw, db = _backward(x, w, cu, dy, b, policy)
         torch.cuda.synchronize(device)
@@ -1128,11 +1128,11 @@ def test_narrow_tile_row_gives_up_one_sm_at_three_tiles(monkeypatch) -> None:
         if cut:
             with monkeypatch.context() as m:
                 m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
-                pkg.plan_cache_clear()
+                pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
                 launched.clear()
                 dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
                 torch.cuda.synchronize(device)
-            pkg.plan_cache_clear()
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
             assert launched == [(tiles, tuple(untrimmed))], f"{label}: {launched}"
             assert torch.equal(dx, dx_full), label
             _check_grads(
@@ -1839,11 +1839,11 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
         if cut:
             with monkeypatch.context() as m:
                 m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
-                pkg.plan_cache_clear()
+                pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
                 launched.clear()
                 dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
                 torch.cuda.synchronize(device)
-            pkg.plan_cache_clear()
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
             assert launched == [(full, 1, 1)], (kind, C, launched)
             assert torch.equal(dx, dx_full), (kind, C)
             _check_grads(

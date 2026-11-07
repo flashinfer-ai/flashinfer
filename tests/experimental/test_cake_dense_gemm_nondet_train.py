@@ -527,7 +527,7 @@ def no_k1_chains(monkeypatch):
     (:func:`k1_chain_plan`), so a test of those tables holds them without it (``test_k1_chain_ranges`` holds the
     chain ranges).  The one-split ranges of :data:`K1_ONE_SPLIT_RANGES_BY_SM`, which come next, go too
     (``test_k1_152_sm_one_split_ranges`` holds them), and so do the cluster ranges of :data:`K1_DSM_RANGES_BY_SM`,
-    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_152_sm_dsm_ranges`` holds them)."""
+    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_dsm_ranges`` holds them)."""
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -1649,7 +1649,17 @@ def test_k1_152_sm_one_split_ranges_bind_the_one_split_program(monkeypatch):
 #: The ranges of :data:`K1_DSM_RANGES_BY_SM`, ``(arch, sm_count) -> {(d_in, d_out): ((min_tokens, max_tokens, (block_n,
 #: splits)), ...)}`` (FP32 out): the cluster program of that tile width and cluster size at every token count of a range.
 # fmt: off
-K1_152_DSM_RANGES = {
+K1_DSM_RANGES = {
+    ("sm_100a", 148): {
+        (4096, 32): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        (4096, 48): ((1024, 4095, (32, 2)), (4096, 16384, (64, 3)), (32768, 32768, (64, 3))),
+        (4096, 64): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        (4096, 128): ((1024, 12288, (64, 2)),),
+        (5120, 32): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        (5120, 48): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 32768, (64, 2))),
+        (5120, 64): ((1024, 2047, (64, 3)), (2048, 32768, (64, 2))),
+        (5120, 128): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
     ("sm_100a", 152): {
         (4096, 32): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
         (4096, 48): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
@@ -1660,28 +1670,32 @@ K1_152_DSM_RANGES = {
         (5120, 64): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         (5120, 128): ((1024, 6144, (128, 2)),),
     },
+    ("sm_103a", 152): {
+        (4096, 32): ((1024, 2047, (32, 3)), (2048, 4095, (32, 2)), (4096, 8191, (32, 3)), (8192, 12287, (32, 2)), (12288, 16383, (32, 3)), (16384, 24575, (32, 2)), (24576, 32768, (32, 3))),
+        (4096, 48): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        (4096, 64): ((1024, 2047, (32, 2)), (2048, 8191, (64, 3)), (8192, 12287, (32, 2)), (12288, 32768, (64, 3))),
+        (4096, 128): ((1024, 12288, (64, 2)),),
+        (5120, 32): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (8192, 12287, (32, 3)), (12288, 32768, (32, 2))),
+        (5120, 48): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 8192, (64, 3))),
+        (5120, 64): ((1024, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 12287, (64, 2)), (12288, 24576, (64, 3))),
+        (5120, 128): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
+}
+#: The token counts at which the rows of each part were measured (two 148-SM B200 parts, two 152-SM GB200 parts, two
+#: 152-SM GB300 parts).
+K1_DSM_MEASURED_TOKENS = {
+    ("sm_100a", 148): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_100a", 152): (1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_103a", 152): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
 }
 # fmt: on
-#: The token counts at which these rows were measured (two 152-SM GB200 parts).
-K1_152_DSM_MEASURED_TOKENS = (
-    1024,
-    2048,
-    3072,
-    4096,
-    6144,
-    8192,
-    12288,
-    16384,
-    24576,
-    32768,
-)
 
 
-def _k1_dsm_ranges_edges(ranges):
+def _k1_dsm_ranges_edges(ranges, part):
     """Token counts of a row's cluster ranges to plan at: every range's first and last token count and the token counts
-    next to them, and the measured token counts."""
+    next to them, and the token counts at which the rows of ``part`` were measured."""
     Ts = {t for lo, hi, _ in ranges for t in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1)}
-    return sorted(Ts | set(K1_152_DSM_MEASURED_TOKENS))
+    return sorted(Ts | set(K1_DSM_MEASURED_TOKENS[part]))
 
 
 def _k1_wgrad_plans(M, N, T, parts):
@@ -1707,22 +1721,24 @@ def _k1_wgrad_plans(M, N, T, parts):
     return plans
 
 
-def test_k1_152_sm_dsm_ranges(monkeypatch):
-    """On 152-SM sm_100a parts the FP32 rows ``4096 -> 32, 48, 64, 128`` and ``5120 -> 32, 48, 64, 128`` run the
-    cluster program of their ranges in :data:`K1_DSM_RANGES_BY_SM` (:func:`k1_dsm_plan`; :func:`plan_atomic_gemm`
-    plans it with ``dsm``, before every other K1 table) at every token count of a range.  A row's ranges are ordered
-    and disjoint, its first range starts and its last range ends at a measured token count, every range holds a
-    measured token count and ends at one or next to one (where the next range starts), and every range names a
-    program this checkout registers for sm_100a, with its cluster size baked into the module.  One token below or
-    above a row's ranges, BF16 out, every other row, every other SM count (148, 150, 151, 153, 160) and the other
-    architectures keep the plan they take without the table; every row's plan changes inside each of its ranges."""
+def test_k1_dsm_ranges(monkeypatch):
+    """On 148-SM and 152-SM sm_100a parts and on 152-SM sm_103a parts the FP32 rows ``4096 -> 32, 48, 64, 128`` and
+    ``5120 -> 32, 48, 64, 128`` run the cluster program of their ranges in :data:`K1_DSM_RANGES_BY_SM`
+    (:func:`k1_dsm_plan`; :func:`plan_atomic_gemm` plans it with ``dsm``, before every other K1 table) at every token
+    count of a range.  A row's ranges are ordered and disjoint, its first range starts and its last range ends at a
+    token count at which the part was measured, every range holds such a token count and ends at one or next to one
+    (where the next range starts), and every range names a program this checkout registers for the part's
+    architecture, with its cluster size baked into the module.  One token below or above a row's ranges, BF16 out,
+    every other row and every other part (SM count or architecture) keep the plan they take without the part's table
+    (another part's table where it has one); every row's plan changes inside each of its ranges."""
     table = cake_backend.K1_DSM_RANGES_BY_SM
     assert table == {
         part: {(part[0], 1, M, N, "f32"): want for (M, N), want in rows.items()}
-        for part, rows in K1_152_DSM_RANGES.items()
+        for part, rows in K1_DSM_RANGES.items()
     }
-    measured = set(K1_152_DSM_MEASURED_TOKENS)
-    for (arch, _), rows in table.items():
+    for part, rows in table.items():
+        arch = part[0]
+        measured = set(K1_DSM_MEASURED_TOKENS[part])
         for key, ranges in rows.items():
             assert ranges[0][0] in measured and ranges[-1][1] in measured, key
             for i, (lo, hi, (block_n, splits)) in enumerate(ranges):
@@ -1744,24 +1760,36 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
             arch=arch, L=1, M=M, N=N, K=T, out_f32=out_f32, sm_count=sm_count
         )
 
-    for (arch, sms), rows in K1_152_DSM_RANGES.items():
+    def held_by(part, M, N, T):
+        own = K1_DSM_RANGES.get(part, {}).get((M, N), ())
+        held = [v for lo, hi, v in own if lo <= T <= hi]
+        return held[0] if held else None
+
+    others = [
+        (a, s)
+        for a in ("sm_100a", "sm_103a")
+        for s in (147, 148, 150, 151, 152, 153, 160)
+    ]
+    others += [("sm_107a", 152), ("sm_107a", 212), ("sm_107a", 216)]
+    for part, rows in K1_DSM_RANGES.items():
+        arch, sms = part
         for (M, N), ranges in rows.items():
-            for T in _k1_dsm_ranges_edges(ranges):
-                held = [v for lo, hi, v in ranges if lo <= T <= hi]
-                assert p(arch, sms, M, N, T) == (held[0] if held else None), (M, N, T)
-                assert p(arch, sms, M, N, T, out_f32=False) is None, (M, N, T)
-                for other in (148, 150, 151, 153, 160):
-                    assert p(arch, other, M, N, T) is None, (M, N, T, other)
-                for other_arch in ("sm_103a", "sm_107a"):
-                    assert p(other_arch, sms, M, N, T) is None, (M, N, T)
-    shapes = sorted({mn for rows in K1_152_DSM_RANGES.values() for mn in rows})
+            for T in _k1_dsm_ranges_edges(ranges, part):
+                assert p(arch, sms, M, N, T) == held_by(part, M, N, T), (part, M, N, T)
+                assert p(arch, sms, M, N, T, out_f32=False) is None, (part, M, N, T)
+                for other in others:
+                    if other != part:
+                        want = held_by(other, M, N, T)
+                        assert p(*other, M, N, T) == want, (part, other, M, N, T)
+    shapes = sorted({mn for rows in K1_DSM_RANGES.values() for mn in rows})
     shapes += [(4096, 512), (6144, 32), (6144, 128), (5120, 1024)]
-    Ts = set(K1_152_DSM_MEASURED_TOKENS) | {255, 256, 512, 960, 1023, 16231, 40960}
-    for rows in K1_152_DSM_RANGES.values():
+    Ts = {255, 256, 512, 960, 1023, 16231, 40960}
+    for part, rows in K1_DSM_RANGES.items():
+        Ts |= set(K1_DSM_MEASURED_TOKENS[part])
         for ranges in rows.values():
-            Ts |= set(_k1_dsm_ranges_edges(ranges))
+            Ts |= set(_k1_dsm_ranges_edges(ranges, part))
     parts = [("sm_100a", s) for s in (148, 150, 151, 152, 153, 160)]
-    parts += [("sm_103a", 152), ("sm_107a", 212), ("sm_107a", 216)]
+    parts += [("sm_103a", 148), ("sm_103a", 152), ("sm_107a", 212), ("sm_107a", 216)]
 
     def plans():
         return {
@@ -1776,7 +1804,7 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
     without = plans()
     changed = {}
     for (arch, sms, M, N, T, f32), plan in with_table.items():
-        own = K1_152_DSM_RANGES.get((arch, sms), {}).get((M, N), ())
+        own = K1_DSM_RANGES.get((arch, sms), {}).get((M, N), ())
         held = [(i, v) for i, (lo, hi, v) in enumerate(own) if lo <= T <= hi]
         if f32 and held:
             i, (block_n, splits) = held[0]
@@ -1789,13 +1817,13 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
             )
             assert plan == want, (arch, sms, M, N, T)
             assert plan != without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T)
-            changed[(M, N, i)] = changed.get((M, N, i), 0) + 1
+            changed[(arch, sms, M, N, i)] = changed.get((arch, sms, M, N, i), 0) + 1
         else:
             assert plan == without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T, f32)
             assert plan is None or not plan[4], (arch, sms, M, N, T, f32)
     assert sorted(changed) == sorted(
-        (M, N, i)
-        for rows in K1_152_DSM_RANGES.values()
+        (*part, M, N, i)
+        for part, rows in K1_DSM_RANGES.items()
         for (M, N), ranges in rows.items()
         for i in range(len(ranges))
     )
@@ -1818,21 +1846,55 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
     ],
 )
 def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, T):
-    """The planner's launch at a token count of a cluster range is the range's cluster program: template
+    """The planner's launch at a token count of a cluster range of a 152-SM sm_100a part is the range's cluster
+    program (:func:`_assert_dsm_cluster_launch`)."""
+    _assert_dsm_cluster_launch(monkeypatch, ("sm_100a", 152), d_in, d_out, T)
+
+
+@pytest.mark.parametrize(
+    "part, d_in, d_out, T",
+    [
+        (("sm_103a", 152), 4096, 32, 1024),
+        (("sm_103a", 152), 4096, 32, 2048),
+        (("sm_103a", 152), 4096, 64, 8192),
+        (("sm_103a", 152), 4096, 128, 12288),
+        (("sm_103a", 152), 5120, 32, 6144),
+        (("sm_103a", 152), 5120, 48, 8192),
+        (("sm_103a", 152), 5120, 64, 24576),
+        (("sm_103a", 152), 5120, 128, 32768),
+        (("sm_100a", 148), 4096, 32, 4096),
+        (("sm_100a", 148), 4096, 48, 32768),
+        (("sm_100a", 148), 4096, 64, 12288),
+        (("sm_100a", 148), 4096, 128, 1024),
+        (("sm_100a", 148), 5120, 48, 2048),
+        (("sm_100a", 148), 5120, 64, 1024),
+        (("sm_100a", 148), 5120, 128, 4096),
+    ],
+)
+def test_k1_dsm_ranges_plan_the_cluster_launch_on_more_parts(
+    monkeypatch, part, d_in, d_out, T
+):
+    """The planner's launch at a token count of a cluster range of a 152-SM sm_103a or a 148-SM sm_100a part is the
+    range's cluster program (:func:`_assert_dsm_cluster_launch`)."""
+    _assert_dsm_cluster_launch(monkeypatch, part, d_in, d_out, T)
+
+
+def _assert_dsm_cluster_launch(monkeypatch, part, d_in, d_out, T):
+    """The planner's launch on ``part`` at a token count of a cluster range is the range's cluster program: template
     ``dense_proj_gemm_dsm_nn_n<block_n>_f32_t_s<splits>``, one chain, the transposed store, tiles of 128 ``d_in``
     columns by ``block_n`` ``d_out`` rows, ``splits`` CTAs per tile (a grid that is a multiple of the module's
-    cluster), no workspace and no tickets.  An explicit split count or tile width plans the CTA-pair program, and on
-    148 SMs or another architecture the row does not run the cluster program."""
-    _register_k1(monkeypatch, "sm_100a")
+    cluster), no workspace and no tickets; the program is registered for sm_100a and sm_103a.  An explicit split count
+    or tile width plans the CTA-pair program.  On another part the row runs the cluster program of that part's own
+    range at ``T`` and no cluster program where that part has none."""
+    arch, sms = part
+    _register_k1(monkeypatch, arch)
     G = torch.zeros(T, d_out, dtype=torch.bfloat16)
     X = torch.zeros(T, d_in, dtype=torch.bfloat16)
     out = torch.zeros(d_out, d_in, dtype=torch.float32)
-    kw = dict(transposed_out=True, arch="sm_100a", sm_count=152)
+    kw = dict(transposed_out=True, arch=arch, sm_count=sms)
     plan, a, b, out3, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
     ((block_n, splits),) = [
-        v
-        for lo, hi, v in K1_152_DSM_RANGES[("sm_100a", 152)][(d_in, d_out)]
-        if lo <= T <= hi
+        v for lo, hi, v in K1_DSM_RANGES[part][(d_in, d_out)] if lo <= T <= hi
     ]
     assert (
         isinstance(plan, cake_backend.CakeDenseGemmNondetProjectionPlan)
@@ -1857,9 +1919,9 @@ def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, 
         plan.grid == (plan.tiles * splits, 1, 1) and plan.items == plan.tiles * splits
     )
     assert plan.ws_f32_elems == 0 and plan.counters_u32 == 0
-    record = cake_jit.MODULES[cake_jit.KERNELS["sm_100a"][plan.template]]
+    record = cake_jit.MODULES[cake_jit.KERNELS[arch][plan.template]]
     assert plan.grid[0] % record["launch"]["cluster"][0] == 0
-    assert record["arches"] == ["sm_100a"]
+    assert record["arches"] == ["sm_100a", "sm_103a"]
     assert tuple(a.shape) == (1, T, d_in) and tuple(b.shape) == (1, T, d_out)
     assert tuple(out3.shape) == (1, d_out, d_in)
     explicit = cake_backend.plan_atomic_gemm(X.t(), G, out, splits=2, **kw)[0]
@@ -1867,16 +1929,25 @@ def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, 
     assert explicit.template.startswith(cake_jit.TEMPLATE_PREFIXES[0])
     explicit = cake_backend.plan_atomic_gemm(X.t(), G, out, block_n=64, **kw)[0]
     assert explicit is not None and not explicit.dsm
-    for arch, sms in (("sm_100a", 148), ("sm_103a", 152)):
-        _register_k1(monkeypatch, arch)
+    others = [(a_, s_) for a_ in ("sm_100a", "sm_103a") for s_ in (148, 150, 152)]
+    for other_arch, other_sms in others:
+        if (other_arch, other_sms) == part:
+            continue
+        _register_k1(monkeypatch, other_arch)
         other = cake_backend.plan_atomic_gemm(
-            X.t(), G, out, transposed_out=True, arch=arch, sm_count=sms
+            X.t(), G, out, transposed_out=True, arch=other_arch, sm_count=other_sms
         )[0]
-        assert other is None or not other.dsm
+        own = K1_DSM_RANGES.get((other_arch, other_sms), {}).get((d_in, d_out), ())
+        held = [v for lo, hi, v in own if lo <= T <= hi]
+        if held:
+            assert other is not None and other.dsm, (other_arch, other_sms)
+            assert (other.block_n, other.splits) == held[0], (other_arch, other_sms)
+        else:
+            assert other is None or not other.dsm, (other_arch, other_sms)
     # a checkout that does not register the program: the deterministic program, with the reason
-    table = dict(cake_jit.KERNELS["sm_100a"])
+    table = dict(cake_jit.KERNELS[arch])
     table.pop(plan.template)
-    monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", table)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, table)
     missing = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
     assert missing[0] is None and plan.template in missing[4]
 
@@ -7959,7 +8030,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
         }
         for arch in cake_jit.KERNELS
     }
-    assert dsm["sm_100a"]
+    assert dsm["sm_100a"] and dsm["sm_103a"]
     for arch, table in cake_jit.KERNELS.items():
         assert dsm[arch] <= set(table), (arch, sorted(dsm[arch] - set(table)))
         assert {t for t in table if t.startswith(cake_jit.TEMPLATE_PREFIXES[7])} == dsm[
@@ -8317,7 +8388,7 @@ def _force_k1_rule(monkeypatch, G, X, out, splits, block_n=None):
 @pytest.fixture
 def no_k1_dsm(monkeypatch):
     """Take the cluster ranges of :data:`K1_DSM_RANGES_BY_SM` out of the planner for a test of the K1 tables it comes
-    before (:func:`plan_atomic_gemm` reads it first; ``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds it),
+    before (:func:`plan_atomic_gemm` reads it first; ``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds it),
     with the convenience caches cleared before and after: no entry planned without the table outlives the test."""
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -8662,24 +8733,32 @@ def test_gpu_torch_deterministic_mode_alerts_before_an_order_varying_launch(
     assert _arena_tickets_zero()
 
 
+#: The cluster program of the shipped row ``4096 -> 64`` FP32 at 2048 tokens on each part of
+#: :data:`K1_DSM_RANGES_BY_SM`: ``(block_n, splits)``.
+K1_DSM_ALERT_ROWS = {
+    ("sm_100a", 148): (32, 2),
+    ("sm_100a", 152): (64, 3),
+    ("sm_103a", 152): (64, 3),
+}
+
+
 def test_gpu_the_cluster_program_does_not_alert(torch_determinism):
-    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens of :data:`K1_DSM_RANGES_BY_SM` (152-SM ``sm_100a``
-    parts: the cluster program at three splits, added in cluster-rank order) launches without an alert or a warning
-    under ``torch.use_deterministic_algorithms(True)``, and with ``warn_only=True``: the planning call, the call from
-    the cached key and the prepared launch run the cluster program (by kernel name), and every output meets the
-    deterministic package's FP32 budget against FP64 (:func:`_k1_check`).  ``test_the_cluster_program_does_not_alert``
-    checks the same calls on the CPU binding.  A part of any other SM count or architecture skips."""
+    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens of :data:`K1_DSM_RANGES_BY_SM` (the cluster program
+    of :data:`K1_DSM_ALERT_ROWS` on the part: two or three splits, added in cluster-rank order) launches without an
+    alert or a warning under ``torch.use_deterministic_algorithms(True)``, and with ``warn_only=True``: the planning
+    call, the call from the cached key and the prepared launch run the cluster program (by kernel name), every output
+    meets the deterministic package's FP32 budget against FP64 (:func:`_k1_check`), and all of them have the same
+    bits.  ``test_the_cluster_program_does_not_alert`` checks the same calls on the CPU binding.  A part of any other SM
+    count or architecture skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
-    if (arch, sm_count) != ("sm_100a", 152):
-        pytest.skip(
-            f"the cluster row is shipped for 152-SM sm_100a parts, not {arch} on {sm_count} SMs"
-        )
+    if (arch, sm_count) not in K1_DSM_ALERT_ROWS:
+        pytest.skip(f"no K1 cluster row is shipped for {arch} on {sm_count} SMs")
     T, N, M = 2048, 64, 4096
     dsm = cake_backend.k1_dsm_plan(
         arch=arch, L=1, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
     )
-    assert dsm == (64, 3)
+    assert dsm == K1_DSM_ALERT_ROWS[(arch, sm_count)]
     _require_template(arch, cake_backend.dsm_k1_template(*dsm))
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     g = torch.Generator(device=device).manual_seed(SEED + 99)
@@ -8728,6 +8807,7 @@ def test_gpu_the_cluster_program_does_not_alert(torch_determinism):
     torch.use_deterministic_algorithms(False)
     for i, result in enumerate(got):
         _k1_check(result, ref, f"cluster program call {i}")
+        assert torch.equal(result, got[0]), f"cluster program call {i}: other bits"
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
 
 
@@ -10330,7 +10410,7 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm):
     ``K1_P1_EDGES`` the deterministic program itself misses the BF16 budget for some seed: the edge asserts the route
     only, and the FP64 rule runs at the entry's token count of the same range instead (none: no check).  The cluster
     ranges of :data:`K1_DSM_RANGES_BY_SM`, which come before these tables, are taken out
-    (``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds them).  A part of any other SM count skips."""
+    (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them).  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -10461,7 +10541,7 @@ def test_gpu_k1_152_sm_one_split_ranges_run_at_their_edges(no_k1_dsm):
     output meets that budget too.  One token below and one above a range the row takes the route the planner gives it
     without the range (another program or the deterministic program), within the same budget.  The cluster ranges of
     :data:`K1_DSM_RANGES_BY_SM`, which come before the one-split ranges and hold some of these token counts on
-    ``sm_100a``, are taken out (``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds them).  A part of any other
+    ``sm_100a``, are taken out (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them).  A part of any other
     SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
@@ -10537,13 +10617,14 @@ def test_gpu_k1_152_sm_one_split_ranges_run_at_their_edges(no_k1_dsm):
     assert ran
 
 
-def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
+def test_gpu_k1_dsm_ranges_run_at_their_edges():
     """Unforced (no split count), on a part of exactly the SM count of a table of
-    :data:`K1_DSM_RANGES_BY_SM` (152-SM ``sm_100a`` parts): at the first and the last token count of every range of a
-    row the prepared launch runs the range's cluster program (by kernel name) and its output meets the deterministic
-    package's FP32 budget against FP64 (:func:`_k1_check`: relative Frobenius error at most 5e-5, max error at most
-    1e-3 times the largest reference element) in each of ``RERUNS`` launches into a NaN-poisoned ``out``; the
-    convenience path binds the same program, with no arena, and its output meets that budget too.  One token below a
+    :data:`K1_DSM_RANGES_BY_SM` (148-SM and 152-SM ``sm_100a``, 152-SM ``sm_103a`` parts): at the first and the last
+    token count of every range of a row the prepared launch runs the range's cluster program (by kernel name) and its
+    output meets the deterministic package's FP32 budget against FP64 (:func:`_k1_check`: relative Frobenius error at
+    most 5e-5, max error at most 1e-3 times the largest reference element) with the same bits in each of ``RERUNS``
+    launches into a NaN-poisoned ``out``; the convenience path binds the same program, with no arena, and its output
+    has those bits too.  One token below a
     row's first range, one above its last and next to a gap between two of its ranges the row takes the route the
     planner gives it without the table (another program or the deterministic program), within the same budget.  A
     part of any other SM count or architecture skips."""
@@ -10594,11 +10675,13 @@ def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
             _assert_ran(prepared.launch, prepared.module_name)
             torch.cuda.synchronize()
             _k1_check(out, ref, what)
+            first = out.clone()
             for i in range(RERUNS):
                 out.fill_(float("nan"))
                 prepared.launch()
                 torch.cuda.synchronize()
                 _k1_check(out, ref, f"{what} run {i}")
+                assert torch.equal(out, first), f"{what} run {i}: other bits"
             cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
             conv = torch.full_like(out, float("nan"))
             assert (
@@ -10611,6 +10694,7 @@ def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
             assert entry.plan.dsm and entry.arena is None, what
             assert (entry.plan.block_n, entry.plan.splits) == dsm, what
             _k1_check(conv, ref, f"{what} convenience")
+            assert torch.equal(conv, first), f"{what} convenience: other bits"
             ran += 1
     print(
         f"K1_DSM_RANGES {arch} sm_count={sm_count}: {ran} token counts ran the cluster program"

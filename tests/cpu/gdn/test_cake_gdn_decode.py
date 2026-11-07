@@ -1887,9 +1887,16 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
             monkeypatch, arch="sm_103a", **{**key, **change}
         )
         assert attr == expected, (change, attr)
+    # The f16-I/O body asks for its twin as well (shipped on sm_107a only; elsewhere the real catalog has no twin
+    # record and the key runs its base, see test_f16io_keys_without_a_shipped_gate_stream_twin_keep_their_base).
+    attr, _, _ = _requested_prefill_source(
+        monkeypatch, arch="sm_100a", **{**key, "io_dtype": "float16"}
+    )
+    assert attr == f"{base}_f16io_gatestream_full", attr
     # Off: 8 x 1024 (256 tiles, two per CTA, but a 1024-token mean), 16 x 513 (mean above 512), 16 x 512 Hq4/Hv8
     # (128 tiles, one CTA per tile), 4 x 256 Hq4/Hv8 (DV-split: one CTA per tile; sm_100a takes the L2 twin), f16
-    # I/O and the stateless body (no gate-stream twin), indexed state (the ``_indexed`` body, no twin).
+    # I/O with long sequences, the stateless body (no gate-stream twin), indexed state (the ``_indexed`` body, no
+    # twin).
     for change, expected in (
         (dict(num_seqs=8, total_seq_len=8 * 1024, max_seq_len=1024), base),
         (dict(num_seqs=16, total_seq_len=16 * 513, max_seq_len=513), base),
@@ -1914,7 +1921,15 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
             ),
             "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late",
         ),
-        (dict(io_dtype="float16"), f"{base}_f16io"),
+        (
+            dict(
+                io_dtype="float16",
+                num_seqs=8,
+                total_seq_len=8 * 1024,
+                max_seq_len=1024,
+            ),
+            f"{base}_f16io",
+        ),
         (
             dict(use_initial_state=False, store_final_state=False),
             "flashinfer_blackwell_gdn_prefill",

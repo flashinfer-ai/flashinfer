@@ -37,11 +37,12 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish;
-* the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 152-SM ``sm_100a`` parts,
-  in that table's token ranges), before every other K1 table: a cluster program (:func:`k1_dsm_plan`) whose ``S``
-  CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's distributed shared memory -- each CTA sends
-  the column quads another rank owns to that rank, adds the ``S`` partials of its own quads in cluster-rank order and
-  stores them once (no workspace, no ticket; the same bits on every run);
+* the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
+  ``sm_100a`` and 152-SM ``sm_103a`` parts, in that table's token ranges), before every other K1 table: a cluster
+  program (:func:`k1_dsm_plan`) whose ``S`` CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's
+  distributed shared memory -- each CTA sends the column quads another rank owns to that rank, adds the ``S``
+  partials of its own quads in cluster-rank order and stores them once (no workspace, no ticket; the same bits on
+  every run);
 * the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K block)
   steps into ``units`` spans, alike or a head/tail partition of long head spans and short tail spans
   (:func:`router_partition` reads the measured verdicts and token windows of :data:`ROUTER_RULES`; every other row and
@@ -970,14 +971,34 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16383 tokens,
 #: ``4096 -> 128`` below 4096 and above 8192 tokens, ``5120 -> 64`` from 2049 to 4095 and above 24576 tokens,
 #: ``5120 -> 48`` above 24576 tokens, ``5120 -> 128`` above 6144 tokens, every row below 1024 and above 32768 tokens).
-#: The output met the deterministic package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max
-#: error at most 1e-3 times the largest reference element) in every one of 20 runs of 10 seeds at every measured
-#: token count.  The protocol, the measured token counts and the times are in the 152-SM cluster table of the README.
+#: On 152-SM ``sm_103a`` parts (two GB300 parts) and 148-SM ``sm_100a`` parts (two B200 parts) the same rows run it in
+#: the ranges of their tables.  There a measured token count's program is the fastest of the six programs on a first
+#: screen of both parts at 1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576 and 32768 tokens, and the ranges were
+#: measured with the table at those token counts with the protocol above, except that the time next to a kernel holding
+#: SMs was recorded, not required.  Where two consecutive measured token counts of a range take different programs, the
+#: lower one's runs up to the token count before the upper one.  Not in a range (the routing of the other tables
+#: holds): on ``sm_103a`` ``4096 -> 48`` from 6145 to 12287 tokens, ``4096 -> 128`` above 12288 tokens, ``5120 -> 32``
+#: from 2049 to 6143 tokens, ``5120 -> 48`` above 8192 tokens and ``5120 -> 64`` above 24576 tokens; on 148-SM
+#: ``sm_100a`` ``4096 -> 48`` from 16385 to 32767 tokens, ``4096 -> 64`` from 6145 to 12287 tokens and ``4096 -> 128``
+#: above 12288 tokens; every row below 1024 and above 32768 tokens.  On every part the output met the deterministic
+#: package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest
+#: reference element) in every one of 20 runs of 10 seeds at every measured token count.  The protocol, the measured
+#: token counts and the times are in the cluster tables of the README.
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
 ] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 16384, (64, 3)), (32768, 32768, (64, 3))),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        ("sm_100a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
+        ("sm_100a", 1, 5120, 32, "f32"): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 5120, 48, "f32"): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 32768, (64, 2))),
+        ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2047, (64, 3)), (2048, 32768, (64, 2))),
+        ("sm_100a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
     ("sm_100a", 152): {
         ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
         ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
@@ -987,6 +1008,16 @@ K1_DSM_RANGES_BY_SM: dict[
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
         ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         ("sm_100a", 1, 5120, 128, "f32"): ((1024, 6144, (128, 2)),),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 32, "f32"): ((1024, 2047, (32, 3)), (2048, 4095, (32, 2)), (4096, 8191, (32, 3)), (8192, 12287, (32, 2)), (12288, 16383, (32, 3)), (16384, 24575, (32, 2)), (24576, 32768, (32, 3))),
+        ("sm_103a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        ("sm_103a", 1, 4096, 64, "f32"): ((1024, 2047, (32, 2)), (2048, 8191, (64, 3)), (8192, 12287, (32, 2)), (12288, 32768, (64, 3))),
+        ("sm_103a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
+        ("sm_103a", 1, 5120, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (8192, 12287, (32, 3)), (12288, 32768, (32, 2))),
+        ("sm_103a", 1, 5120, 48, "f32"): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 8192, (64, 3))),
+        ("sm_103a", 1, 5120, 64, "f32"): ((1024, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 12287, (64, 2)), (12288, 24576, (64, 3))),
+        ("sm_103a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
     },
 }
 # fmt: on
