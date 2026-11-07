@@ -750,14 +750,18 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[True]),
         # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], or that with
         # [top_k (an int >= 1), exponent, packed minimum (>= the one-segment one), rise per wave, waves (an int >= 1),
-        # low wave ratio (>= the second element), its tile coefficient, its packed coefficient], each >= 0, or None
+        # low wave ratio (>= element 1), its tile coefficient, its packed coefficient, the one-document cap
+        # coefficient, the cap's lower bound from two wide waves, the wide waves (an int >= 1) from which the next
+        # element is that lower bound, that lower bound], each >= 0, or None
         dict(wide_wave_rule=1.6),
         dict(wide_wave_rule=[]),
         dict(wide_wave_rule=[1.6, 1.3]),
         dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048]),
         dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1]),
         dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14]),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0]),
+        dict(
+            wide_wave_rule=[1.7, 1.15, 64.0, 2048, 1.1, 112.0, 3.5, 14, 1.26, 40.0, 9.0]
+        ),
         dict(
             wide_wave_rule=[
                 1.6,
@@ -771,41 +775,481 @@ def test_policy_record_round_trip_and_validation():
                 1.3,
                 40.0,
                 9.0,
+                8.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
                 1.0,
             ]
         ),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]),
         dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048.0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                0,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
         ),
         dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, True, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048.0,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
         ),
         dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, -1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
-        ),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 64.0, 3.5, 14, 1.3, 40.0, 9.0]),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, -3.5, 14, 1.3, 40.0, 9.0]
-        ),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 0, 1.3, 40.0, 9.0]),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14.0, 1.3, 40.0, 9.0]
-        ),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.2, 40.0, 9.0]
-        ),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, -40.0, 9.0]
-        ),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, True, 9.0]
-        ),
-        dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, -9.0]
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                True,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
         ),
         dict(
-            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, True]
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                -1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                64.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                -3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                0,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14.0,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.2,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                -40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                True,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                -9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                True,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                -8.0,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                True,
+                55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                -55.0,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                True,
+                8,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8.0,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                0,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                True,
+                60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                -60.0,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                True,
+            ]
+        ),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+                1.0,
+            ]
         ),
         dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
         dict(wide_wave_rule=[1.6, 1.3, True]),
@@ -953,7 +1397,23 @@ def test_policy_record_round_trip_and_validation():
     scaled = DispatchPolicy.from_record(
         dict(
             record,
-            wide_wave_rule=(1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0),
+            wide_wave_rule=(
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ),
         )
     )
     assert scaled.record()["wide_wave_rule"] == [
@@ -968,6 +1428,10 @@ def test_policy_record_round_trip_and_validation():
         1.3,
         40.0,
         9.0,
+        8.0,
+        55.0,
+        8,
+        60.0,
     ]
     assert DispatchPolicy.from_record(scaled.record()) == scaled
     scoped = DispatchPolicy.from_record(
@@ -1646,13 +2110,30 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert unit(712, 4096, K=256) == 8
     # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
     assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
-    # an eleven-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9] (no low wave-ratio minimum: its ratio is the
-    # second element's): the same decisions on one document of at least 14 wide waves at top_k <= 2048 (16384
-    # queries: 14 wide waves, 19 l6 waves)
+    # a fifteen-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9, 1e6, 1e6, 8, 1e6] (no low wave-ratio
+    # minimum: its ratio is the second element's; no one-document cap: 1e6 is above every minimum): the same
+    # decisions on one document of at least 14 wide waves at top_k <= 2048 (16384 queries: 14 wide waves, 19 l6
+    # waves)
     scaled = DispatchPolicy.from_record(
         dict(
             NARROW_PAIR_POLICY.record(),
-            wide_wave_rule=[1.7, 1.3, 84.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0],
+            wide_wave_rule=[
+                1.7,
+                1.3,
+                84.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                1e6,
+                1e6,
+                8,
+                1e6,
+            ],
         )
     )
 
@@ -1676,12 +2157,17 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert unit(16384, 20480, K=4096) == 8
     assert scaled_unit(16384, 20480, K=4096) == 6
     assert scaled_unit(16384, 32768, K=4096) == 8
-    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9]: below a wave ratio W = 1.26 the minimum is at least
-    # 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5 l6
-    # waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
+    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9, 8, 55, 8, 60]: below a wave ratio W = 1.26 the minimum is at
+    # least 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5
+    # l6 waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
     # the 99-tile minimum of 4 wide waves; 8520 queries take 8 wide waves against 10 l6 waves (W = 1.25) and need 160
-    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324; 8192
-    # queries (7 wide waves, 10 l6 waves) keep the 88.5-tile minimum
+    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324.  From
+    # W = 1.26 on, one document of fewer than 14 wide waves needs at most 8 / (W - 1) ** 2, from two wide waves on at
+    # most the larger of that and 55, from 8 wide waves on of that and 60: 8192 queries (7 wide waves, 10 l6 waves,
+    # W = 10 / 7: 43.6) need 55 instead of 88.5, 2048 queries (2 wide waves, 3 l6 waves: 32) 55 instead of 106 but
+    # 112 on two documents, 11776 queries (10 wide waves, 14 l6 waves, W = 1.4: 50) 60 instead of 78, 9216 queries
+    # (8 wide waves, 11 l6 waves, W = 1.375: 56.9) 60 instead of 85, and 1024 queries (1 wide wave, 2 l6 waves) 8
+    # instead of 109.5; 16384 queries (14 wide waves, 19 l6 waves) keep the 64-tile minimum
     low = DispatchPolicy.from_record(
         dict(
             NARROW_PAIR_POLICY.record(),
@@ -1698,6 +2184,10 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
                 1.26,
                 40.0,
                 9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
             ],
         )
     )
@@ -1716,7 +2206,24 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert low_unit(6144, 3072 + 240 * 128) == 8
     assert low_unit(6144, 3072 + 323 * 256, S=2) == 6
     assert low_unit(6144, 3072 + 324 * 256, S=2) == 8
-    assert low_unit(8192, 4096 + 89 * 128) == 8
+    assert low_unit(8192, 4096 + 54 * 128) == 6
+    assert low_unit(8192, 4096 + 55 * 128) == 8
+    assert low_unit(2048, 1024 + 54 * 128) == 6
+    assert low_unit(2048, 1024 + 55 * 128) == 8
+    assert low_unit(11776, 5888 + 55 * 128) == 6
+    assert low_unit(11776, 5888 + 59 * 128) == 6
+    assert low_unit(11776, 5888 + 60 * 128) == 8
+    # the top_k factor applies after the cap: 60 x 2 ** 1.1 = 128.6 at top_k 4096 (78 x 2 ** 1.1 = 167.2 without it)
+    assert low_unit(11776, 5888 + 128 * 128, K=4096) == 6
+    assert low_unit(11776, 5888 + 129 * 128, K=4096) == 8
+    assert low_unit(9216, 4608 + 59 * 128) == 6
+    assert low_unit(9216, 4608 + 60 * 128) == 8
+    assert low_unit(2048, 1024 + 111 * 256, S=2) == 6
+    assert low_unit(2048, 1024 + 112 * 256, S=2) == 8
+    assert low_unit(1024, 512 + 7 * 128) == 6
+    assert low_unit(1024, 512 + 8 * 128) == 8
+    assert low_unit(16384, 8192 + 63 * 128) == 6
+    assert low_unit(16384, 8192 + 64 * 128) == 8
 
 
 def test_sample_shift_rule_precedence():
