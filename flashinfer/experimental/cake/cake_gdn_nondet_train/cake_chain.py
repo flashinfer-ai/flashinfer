@@ -38,17 +38,25 @@ at most ``DHU_TC_GAIN`` of the register path; a split plan at ``SDT_CONFIG``
 on a host-built table runs its pass 2 on ``dhu_tc2`` from the stitched segment
 states when its rule (:func:`sdt_pricing`) prices that pass 2 below the
 register one, and then launches no ``dv_local``: its pre-scan
-(``dhu_pre_dvl_r64k1``) computes the ``dv_local`` tiles of the chunks it scans
-(the same bits); then the tail :func:`tail_form` dispatches: the package's
-tail, one tcgen05 kernel per (chunk, value head) whose value heads write their
-FP32 ``dq`` / ``dk`` partials to a workspace slot each, the last arriving CTA
-of a (chunk, key head) summing the slots in value-head order, running the
-finalize and rounding ``dq`` / ``dk`` to BF16 once (:func:`tail_segments`
-bounds the workspace), or one of the deterministic package's fixed-order tails
-where it measures faster (``tail_g2`` for a value-head group of two,
-``tail_g3`` for three; ``dqkwg``, the WY pullback and the finalize,
-"unfused", for other groups below the architecture's ``TAIL_MIN_CTAS``
-(chunk, value head) CTAs).
+(``dhu_pre_dvl_r64k1``) computes the ``dv_local`` tiles of the chunks it scans.
+On the architectures of ``DVL32_ARCHS`` the tcgen05 adjoint scan adds the
+FP32 ``dv_local`` values to ``dv2`` (``dhu_tc2_dvl32``: one rounding of ``dv2``
+instead of two, :func:`dhu_tc2_stage`); on those of ``PRE_DVL32_ARCHS`` the
+split pre-scan does too (``dhu_pre_dvl32_r64k1``, :func:`sdt_prescan`).  Then the tail :func:`tail_form`
+dispatches: for a value-head group of two or three the cluster tail of
+``CLUSTER_TAILS``, whose CTAs exchange the group's FP32 ``dq`` / ``dk``
+partials over distributed shared memory and round ``dq`` / ``dk`` to BF16 once
+(``tail_g2_f32x`` / ``tail_g3_f32x``: the deterministic package's cluster
+kernels ``tail_g2`` / ``tail_g3`` with FP32 partials; they write ``dq``,
+``dk`` and ``dv`` through token-row strides, so a call on the head views of one
+packed row writes one packed gradient row, :class:`CakeGDNNondetPackedFunction`);
+for other groups the package's tail, one tcgen05 kernel per (chunk, value head)
+whose value heads write their FP32 ``dq`` / ``dk`` partials to a workspace slot
+each, the last arriving CTA of a (chunk, key head) summing the slots in
+value-head order, running the finalize and rounding ``dq`` / ``dk`` to BF16
+once (:func:`tail_segments` bounds the workspace), and below the architecture's
+``TAIL_MIN_CTAS`` (chunk, value head) CTAs the deterministic package's
+``dqkwg``, WY pullback and finalize ("unfused").
 Every launch is fixed-order.  A host-built table lists the sequences longest first
 (:func:`lpt_sequence_order`; every chunk keeps its token offset, the state rows
 are gathered into that order and the final state and its gradient scattered
@@ -60,10 +68,11 @@ high-priority side stream forked from the caller's stream and joined back
 before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
 partial group overlaps the fused tail of the other (:func:`adjoint_r_form`:
-beside a value-head group of two's tail, and beside ``tail_g3`` on the
-architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  On an architecture of
-``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan beside
-``tail_g3`` runs the same way over its segments (:func:`split_r_form`).
+beside a value-head group of two's tail, and beside a group of three's cluster
+tail on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  On an
+architecture of ``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan
+beside a group of three's cluster tail runs the same way over its segments
+(:func:`split_r_form`).
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -78,8 +87,9 @@ Every launch is fixed-order today, so two runs of one call on one device give
 the same bits; the non-deterministic contract does not promise run-to-run bits.
 The results agree with the deterministic package
 (``flashinfer.experimental.cake.cake_gdn_det_train``) to its accuracy budgets, not
-bitwise: the package tail of a value-head group of two or more sums the group's
-FP32 ``dq`` / ``dk`` partials before one BF16 rounding, and the adjoint table
+bitwise: the tails of a value-head group of two or more sum the group's FP32
+``dq`` / ``dk`` partials before one BF16 rounding, the tcgen05 adjoint adds the
+FP32 ``dv_local`` to ``dv2`` before its one rounding, and the adjoint table
 priced for ``dhu_tc2`` splits the sequences at other segment boundaries.
 The plan pins that tests and tuning use are explicit keyword arguments of
 :func:`cake_gdn_nondet` (``scan_config``, ``segment_chunks``,
@@ -125,6 +135,12 @@ __all__ = [
     "TC_PLAN_SELECT",
     "TC_PLAN_STEP",
     "CakeGDNNondetFunction",
+    "CakeGDNNondetPackedFunction",
+    "DVL32_ARCHS",
+    "F32X_TAILS",
+    "GROUP_TAILS",
+    "PACKED_ROW",
+    "PRE_DVL32_ARCHS",
     "ChainOptions",
     "ChunkMeta",
     "ScanPlan",
@@ -139,6 +155,7 @@ __all__ = [
     "cake_gdn_nondet_train_forward",
     "choose_scan_plan",
     "chain_plan_pricing",
+    "dhu_tc2_stage",
     "dhu_tc_pricing",
     "finalize_stage",
     "fwd_ho_vh2_engaged",
@@ -148,6 +165,7 @@ __all__ = [
     "lpt_walk",
     "make_options",
     "scan_plans",
+    "sdt_prescan",
     "sdt_pricing",
     "split_r_form",
     "tc_plan_pricing",
@@ -217,6 +235,15 @@ _TAIL_ARGS = ("qn", "kn", "rstd_q", "rstd_k", "v_new", "do", "dv2", "h", "dh", "
               "normalize_qk")  # fmt: skip
 # the tail of any value-head group: the operands of tail_g2, then the workspace, its arrival counters and its tiles
 _TAIL_WS_ARGS = (*_TAIL_ARGS[:18], "ws", "ws_count", *_TAIL_ARGS[18:], "ws_tiles")
+# the cluster tails with FP32 partials: the operands of tail_g2 / tail_g3, then the token-row strides (elements) of v,
+# dq, dk and dv
+_TAIL_F32X_ARGS = (
+    *_TAIL_ARGS,
+    "v_row_stride",
+    "dq_row_stride",
+    "dk_row_stride",
+    "dv_row_stride",
+)
 _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_seg_chunk_start", "fwd_seg_seq",
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
@@ -234,6 +261,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
+    "dhu_tc2_dvl32": _DHU_TC2_ARGS,
     "dqkwg": _DQKWG_ARGS,
     "wy_bwd": _WY_BWD_ARGS,
     "wy_bwd_bf16": _WY_BWD_ARGS,
@@ -243,7 +271,12 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "tail_g2_bf16": _TAIL_ARGS,
     "tail_g3": _TAIL_ARGS,
     "tail_g3_bf16": _TAIL_ARGS,
+    "tail_g2_f32x": _TAIL_F32X_ARGS,
+    "tail_g2_f32x_bf16": _TAIL_F32X_ARGS,
+    "tail_g3_f32x": _TAIL_F32X_ARGS,
+    "tail_g3_f32x_bf16": _TAIL_F32X_ARGS,
     "dhu_pre_dvl_r64k1": _DHU_PRE_DVL_ARGS,
+    "dhu_pre_dvl32_r64k1": _DHU_PRE_DVL_ARGS,
     "tail": _TAIL_WS_ARGS,
     "tail_bf16": _TAIL_WS_ARGS,
     **{f"fwd_h_r{vb}k{ks}": _FWD_H_ARGS for vb, ks in REG_SCAN_CONFIGS},
@@ -312,7 +345,16 @@ FINALIZE_STAGES = ("finalize", "finalize_mlp")
 DHU_SCANS = ("reg", "tc")
 PREP_FORMS = ("plain", "tma")
 STREAM_COUNTS = (1, 2)
-TAIL_FORMS = ("tail", "tail_g2", "tail_g3", "unfused")
+TAIL_FORMS = ("tail", "tail_g2", "tail_g3", "tail_g2_f32x", "tail_g3_f32x", "unfused")
+# the cluster tails per value-head group (one launch per chunk table, clusters of the group's CTAs), and the ones that
+# sum FP32 partials and take token-row strides
+GROUP_TAILS: dict[str, int] = {
+    "tail_g2": 2,
+    "tail_g2_f32x": 2,
+    "tail_g3": 3,
+    "tail_g3_f32x": 3,
+}
+F32X_TAILS: tuple[str, ...] = ("tail_g2_f32x", "tail_g3_f32x")
 
 
 @dataclass(frozen=True)
@@ -334,10 +376,11 @@ class ChainOptions:
     ``2`` to let a host-built table's serial scans run as two sequence groups on the caller's stream and a side stream
     where their rule (:func:`two_stream_split`) fills the last round (the same bits), ``1`` to keep every launch on
     the caller's stream; ``tail`` forces the backward tail (``None``: the rule of :func:`tail_form`): the package's
-    tail ``"tail"``, which sums the FP32 ``dq`` / ``dk`` partials in value-head order, or the deterministic
-    package's fixed-order tails ``"tail_g2"`` / ``"tail_g3"`` (a value-head group of two / three) and ``"unfused"``
-    (``dqkwg``, the WY pullback and the finalize), which round each value head's ``dq`` / ``dk`` partials to BF16
-    before their sum (``dv``, ``dg`` and ``dbeta`` are the same bits in every form).
+    tail ``"tail"`` and the cluster tails ``"tail_g2_f32x"`` / ``"tail_g3_f32x"`` (a value-head group of two /
+    three), which sum the FP32 ``dq`` / ``dk`` partials in value-head order (the same bits), or the deterministic
+    package's fixed-order tails ``"tail_g2"`` / ``"tail_g3"`` and ``"unfused"`` (``dqkwg``, the WY pullback and the
+    finalize), which round each value head's ``dq`` / ``dk`` partials to BF16 before their sum (``dv``, ``dg`` and
+    ``dbeta`` are the same bits in every form).
     """
 
     scan_config: tuple[int, int] | None = None
@@ -761,20 +804,26 @@ TAIL_MIN_CTAS: dict[str, dict[int, int]] = {
     "sm_103a": {1: 2048, 4: 1024},
     "sm_107a": {1: 1024, 4: 1024},
 }
-# The fixed-order cluster tail the rule takes per architecture and value-head group, and the package tail it takes
-# elsewhere from its TAIL_MIN_CTAS on: tail_g2 measured 16-19 % faster than the package tail at G = 2 (the tail
-# kernels alone, B200 and GB300), tail_g3 1-6 % (B200) and 1-14 % (GB300) faster at G = 3 (this package's backward;
-# sm_107a: as sm_103a until it is measured there).
+# The cluster tail the rule takes per architecture and value-head group, and the package tail it takes elsewhere from
+# its TAIL_MIN_CTAS on.  The cluster tails exchange the group's FP32 dq / dk partials over distributed shared memory,
+# so dq / dk round once, as the package tail's (the same bits).  B200 kernel times (CUPTI, cold L2, four processes,
+# both gate regimes): tail_g3_f32x is 1.024-1.034 x tail_g3 (which rounds each value head's partials to BF16) on the
+# (2, 6) head pair at 241,817-262,144 tokens and the (16, 48) pair at 32,768 tokens, 1.034-1.051 x on the pairs
+# (8, 24) .. (1, 3), where the package tail is 1.073-1.081 x tail_g3 at 3,782 or more (chunk, value head) CTAs, 1.05 x
+# at the (4, 12) pair and 0.99-1.006 x at the (2, 6) and (1, 3) pairs (1,539 and 3,078 CTAs); tail_g2_f32x is
+# 1.014-1.036 x tail_g2, which measured 16-19 % faster than the package tail at G = 2 (B200 and GB300).  sm_103a and
+# sm_107a take the same forms until they are measured there.
 CLUSTER_TAILS: dict[str, dict[int, str]] = {
-    "sm_100a": {2: "tail_g2", 3: "tail_g3"},
-    "sm_103a": {2: "tail_g2", 3: "tail_g3"},
-    "sm_107a": {2: "tail_g2", 3: "tail_g3"},
+    "sm_100a": {2: "tail_g2_f32x", 3: "tail_g3_f32x"},
+    "sm_103a": {2: "tail_g2_f32x", 3: "tail_g3_f32x"},
+    "sm_107a": {2: "tail_g2_f32x", 3: "tail_g3_f32x"},
 }
 TAIL_DEFAULT = "tail"
 # The value-head groups whose adjoint dhu_tc2 scan runs as two sequence groups (two streams) feeding the fused tail
 # (the R form) where :func:`sequence_groups` splits it.
 R_FORM_GROUPS: tuple[int, ...] = (2,)
-# The architectures where a serial dhu_tc2 adjoint scan feeding ``tail_g3`` (a value-head group of three) also runs as
+# The architectures where a serial dhu_tc2 adjoint scan feeding a cluster tail of a value-head group of three
+# (``tail_g3_f32x`` or the pinned ``tail_g3``) also runs as
 # the R form: group B (the partial round) on the side stream beside the tail of group A; elsewhere one launch (the
 # deterministic package's rule).  Measured on the (2, 6) head pair over 64 x 4096 tokens (FP32 beta, one process per
 # GPU, both arm orders), fwd+bwd against one launch: 3.3489 -> 3.3169 ms on B200 (49 + 15 sequences, sustained
@@ -787,15 +836,16 @@ def adjoint_r_form(
 ) -> bool:
     """Whether a call's adjoint scan runs as its two groups (the R form) where :func:`sequence_groups` splits it:
     the serial ``dhu_tc2`` scan (``serial_tc``) feeding a fused tail for a value-head group ``group`` of
-    ``R_FORM_GROUPS``, or feeding ``tail_g3`` on an architecture of ``TWO_STREAM_SERIAL_G3_ARCHS``; the ``dhu_tc2``
-    pass 2 of a split plan (``split_tc``) feeding ``tail_g3`` (its segments are grouped on an architecture of
-    ``SPLIT_R_FORM`` only).  ``form`` is the call's backward tail (:func:`tail_form`)."""
+    ``R_FORM_GROUPS``, or feeding a group of three's cluster tail on an architecture of
+    ``TWO_STREAM_SERIAL_G3_ARCHS``; the ``dhu_tc2`` pass 2 of a split plan (``split_tc``) feeding a group of three's
+    cluster tail (its segments are grouped on an architecture of ``SPLIT_R_FORM`` only).  ``form`` is the call's
+    backward tail (:func:`tail_form`)."""
+    g3 = GROUP_TAILS.get(form) == 3
     if serial_tc:
         return form != "unfused" and (
-            group in R_FORM_GROUPS
-            or (form == "tail_g3" and arch in TWO_STREAM_SERIAL_G3_ARCHS)
+            group in R_FORM_GROUPS or (g3 and arch in TWO_STREAM_SERIAL_G3_ARCHS)
         )
-    return split_tc and form == "tail_g3"
+    return split_tc and g3
 
 
 def tail_min_ctas(arch: str, group: int) -> int:
@@ -813,12 +863,12 @@ def tail_form(
     num_chunks: int | None = None,
 ) -> str:
     """The backward tail of one call on ``arch`` over ``num_chunks`` chunks (``None``: a large call): ``forced`` when
-    given (``"tail_g2"`` / ``"tail_g3"`` serve a value-head group of two / three), else the fastest tail measured for
-    the call's architecture, value-head group ``G = num_v_heads / num_heads`` and size
-    (``benchmarks/bench_cake_gdn_nondet_train.py`` on B200 and GB300): the fixed-order cluster tail of
-    ``CLUSTER_TAILS[arch]`` for its group; otherwise the package tail ``TAIL_DEFAULT`` from
-    :func:`tail_min_ctas` (chunk, value head) CTAs on, and below them the fixed-order ``"tail_g3"`` for a group of
-    three, ``"unfused"`` for the others."""
+    given (``"tail_g2"`` / ``"tail_g2_f32x"`` serve a value-head group of two, ``"tail_g3"`` / ``"tail_g3_f32x"`` a
+    group of three), else the cluster tail of ``CLUSTER_TAILS[arch]`` for the call's value-head group
+    ``G = num_v_heads / num_heads``; otherwise the package tail ``TAIL_DEFAULT`` from :func:`tail_min_ctas` (chunk,
+    value head) CTAs on, and below them the fixed-order ``"tail_g3"`` for a group of three, ``"unfused"`` for the
+    others (the fastest forms measured for the architecture, value-head group and size,
+    ``benchmarks/bench_cake_gdn_nondet_train.py`` on B200 and GB300)."""
     if num_heads <= 0 or num_v_heads % num_heads != 0:
         raise ValueError(
             f"num_v_heads={num_v_heads} must be a positive multiple of num_heads={num_heads}"
@@ -834,10 +884,11 @@ def tail_form(
         return TAIL_DEFAULT
     if forced not in TAIL_FORMS:
         raise ValueError(f"tail={forced!r}")
-    if forced == "tail_g2" and group != 2:
-        raise ValueError("the tail_g2 form serves a value-head group of two")
-    if forced == "tail_g3" and group != 3:
-        raise ValueError("the tail_g3 form serves a value-head group of three")
+    serves = GROUP_TAILS.get(forced)
+    if serves is not None and group != serves:
+        raise ValueError(
+            f"the {forced} form serves a value-head group of {'two' if serves == 2 else 'three'}"
+        )
     return forced
 
 
@@ -1412,6 +1463,30 @@ SDT_PRESCAN = "dhu_pre_dvl_r64k1"
 SDT_CONSTANTS = ("sdt_gain", "sdt_min_saving")
 _SDT_AUTO: dict = {}
 _SDT_AUTO_LIMIT = 256
+# The architectures whose tcgen05 adjoint scan adds the FP32 ``dv_local`` values to ``dv2``, so ``dv2`` rounds once
+# (``dhu_tc2_dvl32`` for ``dhu_tc2``: the same arguments, tables and selection constants; :func:`dhu_tc2_stage`), and
+# those whose split pre-scan does (``dhu_pre_dvl32_r64k1`` for ``SDT_PRESCAN``, :func:`sdt_prescan`).  B200 (CUPTI,
+# cold L2, fresh processes): ``dhu_tc2_dvl32`` 0.990-0.995 x ``dhu_tc2``, -0.3 to -0.4 % of the backward;
+# ``dhu_pre_dvl32_r64k1`` costs up to +1.2 % of the backward on the split plans of the long-sequence regime (its FP32
+# tile adds 16 KiB of shared memory, still one CTA per SM), so no architecture routes it.
+DVL32_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
+PRE_DVL32_ARCHS: tuple[str, ...] = ()
+
+
+def dhu_tc2_stage(arch: str) -> str:
+    """The tcgen05 adjoint scan's stage on ``arch``: ``dhu_tc2_dvl32`` on an architecture of ``DVL32_ARCHS`` whose
+    registry delivers it, else ``dhu_tc2``."""
+    if arch in DVL32_ARCHS and _available("dhu_tc2_dvl32", arch):
+        return "dhu_tc2_dvl32"
+    return "dhu_tc2"
+
+
+def sdt_prescan(arch: str) -> str:
+    """The pre-scan of a split plan whose pass 2 runs on the tcgen05 scan, on ``arch``: ``dhu_pre_dvl32_r64k1`` on an
+    architecture of ``PRE_DVL32_ARCHS`` whose registry delivers it, else ``SDT_PRESCAN``."""
+    if arch in PRE_DVL32_ARCHS and _available("dhu_pre_dvl32_r64k1", arch):
+        return "dhu_pre_dvl32_r64k1"
+    return SDT_PRESCAN
 
 
 @cache
@@ -1783,9 +1858,11 @@ def chain_plan_pricing(
 
 
 # --------------------------------------------------------------------------- #
-# the split adjoint plan beside tail_g3 on two streams (the R form over segments), per architecture
+# the split adjoint plan beside a group of three's cluster tail on two streams (the R form over segments), per
+# architecture
 # --------------------------------------------------------------------------- #
-# On an architecture of ``SPLIT_R_FORM``, a call of a value-head group of three whose backward tail is ``tail_g3`` runs
+# On an architecture of ``SPLIT_R_FORM``, a call of a value-head group of three whose backward tail is a cluster tail
+# (``tail_g3_f32x``, or the pinned ``tail_g3``) runs
 # the ``dhu_tc2`` pass 2 of a split adjoint plan as two groups of segments where :func:`two_stream_split` groups them
 # (:func:`sequence_groups` with ``split_adjoint``): the caller's stream runs group A (the full rounds), then the fused
 # tail of its chunks while a side stream runs group B (the partial round), then the tail of the rest.  The
@@ -1805,11 +1882,11 @@ SPLIT_R_FORM: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 
 def _split_r_groups(arch: str, group: int | None, options: ChainOptions) -> bool:
     """Whether a call on ``arch`` of value-head group ``group`` groups the segments of a split adjoint table (the R
-    form beside ``tail_g3``; :func:`sequence_groups` with ``split_adjoint``)."""
+    form beside a group of three's cluster tail; :func:`sequence_groups` with ``split_adjoint``)."""
     return (
         arch in SPLIT_R_FORM
         and group == 3
-        and tail_form(1, 3, options.tail, arch=arch) == "tail_g3"
+        and GROUP_TAILS.get(tail_form(1, 3, options.tail, arch=arch)) == 3
     )
 
 
@@ -1822,10 +1899,11 @@ def split_r_form(
     options: ChainOptions,
 ) -> bool:
     """Whether a host layout of ``chunks`` (chunks per sequence) keeps the planner's adjoint table ``plan`` for the R
-    form of a split plan beside ``tail_g3`` (see above): the device's architecture in ``SPLIT_R_FORM``, a value-head
-    group ``group`` of three with ``tail_g3`` as its tail, no plan or ``dhu_scan`` pin, a split ``SDT_CONFIG`` table
-    whose pass 2 the ``sdt_pricing`` rule runs on ``dhu_tc2`` and whose segments :func:`two_stream_split` groups.
-    Both stream counts keep the same table (``streams=1`` runs it on one stream: the same bits)."""
+    form of a split plan beside a group of three's cluster tail (see above): the device's architecture in
+    ``SPLIT_R_FORM``, a value-head group ``group`` of three with a cluster tail, no plan or ``dhu_scan`` pin, a split
+    ``SDT_CONFIG`` table whose pass 2 the ``sdt_pricing`` rule runs on ``dhu_tc2`` and whose segments
+    :func:`two_stream_split` groups.  Both stream counts keep the same table (``streams=1`` runs it on one stream: the
+    same bits)."""
     index = int(device_index)
     arch = cake_backend.device_arch(index)
     if not _split_r_groups(arch, group, options):
@@ -1959,6 +2037,30 @@ def _dense(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _row_stride(t: torch.Tensor) -> int:
+    """The token-row stride in elements of a ``[..., T, heads, 128]`` tensor that a kernel addresses through that
+    stride (its pointer declared strided, its binding checks no layout): a unit channel stride, head stride 128, rows
+    at least ``heads x 128`` apart, and leading axes that fold into the token axis (``ValueError`` otherwise)."""
+    heads, dim = t.size(-2), t.size(-1)
+    if t.is_contiguous():
+        return heads * dim
+    token = t.stride(-3)
+    expected = token
+    for axis in range(t.dim() - 4, -1, -1):
+        expected *= t.size(axis + 1)
+        if t.size(axis) > 1 and t.stride(axis) != expected:
+            raise ValueError(
+                f"the leading axes of a {tuple(t.shape)} tensor of strides {t.stride()} do not fold into its "
+                "token axis"
+            )
+    if t.stride(-1) != 1 or t.stride(-2) != dim or token < heads * dim:
+        raise ValueError(
+            f"a {tuple(t.shape)} tensor of strides {t.stride()} is not token rows of {heads} heads x {dim} "
+            "contiguous elements"
+        )
+    return token
+
+
 def _prep_inputs(
     q, k, num_chunks: int, num_heads: int, arch: str, options: ChainOptions
 ):
@@ -1982,7 +2084,8 @@ def _prep_inputs(
 # idle.  Split into two contiguous groups of segments, the group that fills whole rounds runs on one stream while the
 # other group's scan overlaps the neighbouring stage (forward: wy_tc of the other group; adjoint: the tail of the
 # first group) on a second stream.  On an architecture of ``SPLIT_R_FORM`` the adjoint ``dhu_tc2`` pass 2 of a split
-# plan beside ``tail_g3`` (one CTA per (segment, value head), every segment starting from its stitched state) is grouped
+# plan beside a group of three's cluster tail (one CTA per (segment, value head), every segment starting from its
+# stitched state) is grouped
 # the same way over its segments: a sequence's segments are contiguous in the table, so group A covers the chunks
 # before the first segment of group B.  A group launch is the full launch restricted to its segments (fwd_ho through a
 # slice of its walk, dhu_tc2 through views of the segment table and of dht) or chunks (wy_tc and the fused tails
@@ -2419,12 +2522,16 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
 # backward
 # --------------------------------------------------------------------------- #
 def cake_gdn_nondet_train_backward(
-    forward, do, dht=None, *, initial_state=None, dbeta_dtype=None
+    forward, do, dht=None, *, initial_state=None, dbeta_dtype=None, grad_qkv=None
 ) -> dict[str, Any]:
     """The backward chain over one forward tape of :func:`cake_gdn_nondet_train_forward`; returns ``dq``, ``dk``,
     ``dv``, ``dg``, ``dbeta`` and ``dinitial_state``.  The tape must carry this package's tag (``"mode": "nondet"``):
-    any other tape, such as one of the deterministic package, is refused (``ValueError``).  With PyTorch's
-    deterministic algorithms enabled it runs as usual: every launch is fixed-order today."""
+    any other tape, such as one of the deterministic package, is refused (``ValueError``).  ``grad_qkv``, three
+    tensors of the shapes of ``dq``, ``dk`` and ``dv`` with a unit channel stride, head stride 128 and any token-row
+    stride (the head views of one packed gradient row), receives ``dq`` / ``dk`` / ``dv`` in place when the call's
+    tail is a cluster tail of ``F32X_TAILS``; the returned ``dq`` / ``dk`` / ``dv`` are then those tensors (other
+    tails return tensors of their own).  With PyTorch's deterministic algorithms enabled it runs as usual: every
+    launch is fixed-order today."""
     if forward.get("mode") != _TAPE_MODE:
         raise ValueError("cake_gdn_nondet_train_backward reads the tape of a non-deterministic forward "
                          "(cake_gdn_nondet_train_forward, tag 'mode': 'nondet'); this tape does not carry that tag "
@@ -2516,9 +2623,10 @@ def cake_gdn_nondet_train_backward(
     else:
         dht32, use_dht = dh0, 0
     scan_stage, vb, pre, pre_threads = _scan_stages("dhu", segs.scan_config, arch)
+    tc_stage = dhu_tc2_stage(arch)
     if use_tc and groups is None:
         # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
-        _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
+        _launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
     elif segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
@@ -2536,7 +2644,7 @@ def cake_gdn_nondet_train_backward(
         )
         if split_tc:
             # the pre-scan with the dv_local tiles of its chunks computed in the CTA (the same seg_state / seg_flag)
-            _launch(SDT_PRESCAN, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, g_cs, dht32, dh,
+            _launch(sdt_prescan(arch), segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, g_cs, dht32, dh,
                     dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                     meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
                     warmup_thresh_log2(options))  # fmt: skip
@@ -2553,7 +2661,7 @@ def cake_gdn_nondet_train_backward(
     if split_tc and groups is None:
         # pass 2 on the tcgen05 scan: segment ``seg`` starts from dht[seg], the stitched dh_end[seg]; the first segment
         # of a sequence stores its dh0 (the register pass 2's contract)
-        _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
+        _launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
     elif not (use_tc or split_tc):
@@ -2564,12 +2672,16 @@ def cake_gdn_nondet_train_backward(
     if form != "unfused":
         # one kernel per (chunk, value head) for dqkwg, the WY pullback and the finalize: a package tail for every
         # value-head group (its workspace bounded by segmented launches), or the cluster kernel of a group of two or
-        # three ("tail_g2" / "tail_g3")
-        dv = torch.empty(v.shape, dtype=v.dtype, device=device)
+        # three (GROUP_TAILS); the FP32-partial cluster tails write dq / dk / dv through their token-row strides, into
+        # the caller's views (``grad_qkv``) when given
+        if grad_qkv is not None and form in F32X_TAILS:
+            dq, dk, dv = grad_qkv
+        else:
+            dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
+            dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
+            dv = torch.empty(v.shape, dtype=v.dtype, device=device)
         dbeta = torch.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
                             dtype=torch.bfloat16 if dbeta_bf16 else torch.float32, device=device)  # fmt: skip
-        dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
-        dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
         dg = torch.empty(
             forward.get("g_shape") or (total_tokens, num_v_heads),
             dtype=torch.float32,
@@ -2578,11 +2690,15 @@ def cake_gdn_nondet_train_backward(
         normalize = 1 if forward.get("normalize_qk", True) else 0
         rstd_q, rstd_k = forward["rstd_q"], forward["rstd_k"]
         num_chunks = meta.num_chunks
-        if form in ("tail_g2", "tail_g3") and groups is None:
+        # the token-row strides of v, dq, dk and dv, which these tails take after their operands
+        strides = (
+            tuple(_row_stride(t) for t in (v, dq, dk, dv)) if form in F32X_TAILS else ()
+        )
+        if form in GROUP_TAILS and groups is None:
             # one launch over the whole table, issued directly: the host path of the deterministic package's tail
             _launch(form + ("_bf16" if dbeta_bf16 else ""), num_chunks * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k,
                     v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start,
-                    meta.chunk_len, num_heads, num_v_heads, scale, normalize)  # fmt: skip
+                    meta.chunk_len, num_heads, num_v_heads, scale, normalize, *strides)  # fmt: skip
             return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
                     "dinitial_state": _caller_rows(dh0, meta) if has_initial_state else None}  # fmt: skip
 
@@ -2593,14 +2709,14 @@ def cake_gdn_nondet_train_backward(
                 return h, dh, meta.chunk_start, meta.chunk_len
             return h[a:b], dh[a:b], meta.chunk_start[a:b], meta.chunk_len[a:b]
 
-        if form in ("tail_g2", "tail_g3"):
+        if form in GROUP_TAILS:
             stage = form + ("_bf16" if dbeta_bf16 else "")
 
             def tail(c0, c1):
                 h_r, dh_r, cs_r, cl_r = rows(c0, c1)
                 _launch(stage, (c1 - c0) * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k, v_new, do, dv2, h_r, dh_r, g_cs,
                         v, A, beta32, dq, dk, dg, dv, dbeta, cs_r, cl_r, num_heads, num_v_heads, scale,
-                        normalize)  # fmt: skip
+                        normalize, *strides)  # fmt: skip
 
         else:
             stage = form + ("_bf16" if dbeta_bf16 else "")
@@ -2637,7 +2753,7 @@ def cake_gdn_nondet_train_backward(
             na, ca = groups.split, groups.split_chunk
 
             def dhu_tc2(s0, s1):
-                _launch("dhu_tc2", s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
+                _launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
                         dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
                         segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
                         1 if has_initial_state else 0, scale)  # fmt: skip
@@ -2970,78 +3086,174 @@ def _chunk_meta(
     return meta
 
 
+def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
+                      use_qk_l2norm_in_kernel, options):  # fmt: skip
+    """The forward of :class:`CakeGDNNondetFunction` and :class:`CakeGDNNondetPackedFunction` over q / k / v (the
+    inputs, or the head views of the packed row): the chain, the saved tape and ``ctx``'s fields."""
+    batch, seq_len, num_heads, key_dim = q.shape
+    num_v_heads = v.shape[2]
+    index = _tensor_index(q)
+    arch = cake_backend.device_arch(index)
+    meta = _chunk_meta(cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options,
+                       num_v_heads // num_heads)  # fmt: skip
+    fwd = cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
+                                        initial_state=initial_state, output_final_state=output_final_state,
+                                        normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
+    state_tensors = (
+        (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
+    )
+    ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
+                          fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
+    ctx.saved_state_tensors = bool(state_tensors)
+    ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
+    ctx.grad_shapes = (g.shape, beta.shape)
+    ctx.normalize_qk = bool(use_qk_l2norm_in_kernel)
+    ctx.has_initial_state_input = initial_state is not None
+    ctx.dtypes = (g.dtype, beta.dtype)
+    ctx.options = options
+    # the forward tape's tag; the backward reads only a tape of its own
+    ctx.mode = fwd["mode"]
+    output = fwd["output"]
+    if output.dtype != q.dtype:
+        output = output.to(q.dtype)
+    return output, (fwd["final_state"] if output_final_state else None)
+
+
+def _function_backward(ctx, do, dht, grad_qkv=None):
+    """The backward of both autograd functions: the gradients of q, k, v, g, beta and the initial state (``grad_qkv``:
+    see :func:`cake_gdn_nondet_train_backward`)."""
+    qn, kn, rstd_q, rstd_k, v_flat, g_cs, beta32, A, saved_state, *state_tensors = (
+        ctx.saved_tensors
+    )
+    g_shape, beta_shape = ctx.grad_shapes
+    g_dtype, beta_dtype = ctx.dtypes
+    tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
+            "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
+            "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
+    if ctx.saved_state_tensors:
+        tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
+    grads = cake_gdn_nondet_train_backward(
+        tape,
+        do.contiguous(),
+        dht,
+        initial_state=saved_state,
+        dbeta_dtype=beta_dtype,
+        grad_qkv=grad_qkv,
+    )
+    dg = grads["dg"]
+    if dg.dtype != g_dtype:
+        dg = dg.to(g_dtype)
+    dbeta = grads["dbeta"]
+    if dbeta.dtype != beta_dtype:
+        dbeta = dbeta.to(beta_dtype)
+    dh0 = grads["dinitial_state"] if ctx.has_initial_state_input else None
+    return grads["dq"], grads["dk"], grads["dv"], dg, dbeta, dh0
+
+
 class CakeGDNNondetFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
                 use_qk_l2norm_in_kernel, options):  # fmt: skip
-        batch, seq_len, num_heads, key_dim = q.shape
-        num_v_heads = v.shape[2]
-        index = _tensor_index(q)
-        arch = cake_backend.device_arch(index)
-        meta = _chunk_meta(cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options,
-                           num_v_heads // num_heads)  # fmt: skip
-        fwd = cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
-                                            initial_state=initial_state, output_final_state=output_final_state,
-                                            normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
-        state_tensors = (
-            (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
-        )
-        ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
-                              fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
-        ctx.saved_state_tensors = bool(state_tensors)
-        ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
-        ctx.grad_shapes = (g.shape, beta.shape)
-        ctx.normalize_qk = bool(use_qk_l2norm_in_kernel)
-        ctx.has_initial_state_input = initial_state is not None
-        ctx.dtypes = (g.dtype, beta.dtype)
-        ctx.options = options
-        # the forward tape's tag; the backward reads only a tape of its own
-        ctx.mode = fwd["mode"]
-        output = fwd["output"]
-        if output.dtype != q.dtype:
-            output = output.to(q.dtype)
-        return output, (fwd["final_state"] if output_final_state else None)
+        return _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
+                                 cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
 
     @staticmethod
     def backward(ctx, do, dht):
-        qn, kn, rstd_q, rstd_k, v_flat, g_cs, beta32, A, saved_state, *state_tensors = (
-            ctx.saved_tensors
-        )
-        g_shape, beta_shape = ctx.grad_shapes
-        g_dtype, beta_dtype = ctx.dtypes
-        tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
-                "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
-                "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
-        if ctx.saved_state_tensors:
-            tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
-        grads = cake_gdn_nondet_train_backward(
-            tape,
-            do.contiguous(),
-            dht,
-            initial_state=saved_state,
-            dbeta_dtype=beta_dtype,
-        )
-        dg = grads["dg"]
-        if dg.dtype != g_dtype:
-            dg = dg.to(g_dtype)
-        dbeta = grads["dbeta"]
-        if dbeta.dtype != beta_dtype:
-            dbeta = dbeta.to(beta_dtype)
-        dh0 = grads["dinitial_state"] if ctx.has_initial_state_input else None
-        return (
-            grads["dq"],
-            grads["dk"],
-            grads["dv"],
-            dg,
-            dbeta,
-            None,
-            dh0,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht)
+        return dq, dk, dv, dg, dbeta, None, dh0, None, None, None, None, None
+
+
+# --------------------------------------------------------------------------- #
+# q / k / v as the head views of one packed row: one autograd input, one packed gradient row
+# --------------------------------------------------------------------------- #
+# The customer layout (FlashInfer #7074): one BF16 row [..., T, (2 H + HV) x 128] per token, q / k / v its head views
+# (``row.split((H * 128, H * 128, HV * 128), -1)``, each viewed as [B, T, heads, 128]).  Run on the views, autograd
+# would return dq / dk / dv as three tensors and the split's backward would copy them into a new row gradient.  With
+# the packed row as the one input instead, the backward allocates the row gradient and the cluster tails write dq /
+# dk / dv straight into its head views through their token-row strides: no concatenation.  The views are recognized
+# from their metadata alone (:func:`_packed_row`); any other layout takes :class:`CakeGDNNondetFunction`, as does a
+# call whose tail is not a cluster tail of ``F32X_TAILS`` or that records no gradient for the row.
+PACKED_ROW = True
+
+
+def _packed_row(q, k, v) -> torch.Tensor | None:
+    """The packed row whose head views ``q``, ``k`` and ``v`` are, or ``None``: their common base, a contiguous BF16
+    tensor of ``B x T`` rows of ``(2 H + HV) x 128`` elements that requires grad, q / k / v at its row offsets 0,
+    ``H x 128`` and ``2 H x 128`` with its row stride, head stride 128 and unit channel stride, each requiring grad
+    through a view of it."""
+    base = q._base
+    if base is None or k._base is not base or v._base is not base:
+        return None
+    if not (
+        base.requires_grad and q.requires_grad and k.requires_grad and v.requires_grad
+    ):
+        return None
+    if base.dtype != torch.bfloat16 or not base.is_contiguous():
+        return None
+    batch, seq_len, num_heads, dim = q.shape
+    num_v_heads = v.shape[2]
+    width = (2 * num_heads + num_v_heads) * dim
+    if (
+        base.dim() < 1
+        or base.size(-1) != width
+        or base.numel() != batch * seq_len * width
+    ):
+        return None
+    offset = base.storage_offset()
+    for t, at, heads in (
+        (q, 0, num_heads),
+        (k, num_heads * dim, num_heads),
+        (v, 2 * num_heads * dim, num_v_heads),
+    ):
+        if t.storage_offset() != offset + at:
+            return None
+        strides = (seq_len * width, width, dim, 1)
+        if any(
+            size > 1 and t.stride(i) != strides[i] for i, size in enumerate(t.shape)
+        ):
+            return None
+        if t.shape[:2] != (batch, seq_len) or t.shape[2:] != (heads, dim):
+            return None
+    return base
+
+
+def _row_views(row, batch: int, seq_len: int, num_heads: int, num_v_heads: int):
+    """The q / k / v head views ``[B, T, heads, 128]`` of a packed row tensor (contiguous)."""
+    flat = row.view(batch * seq_len, -1)
+    q_end, k_end = num_heads * HEAD_DIM, 2 * num_heads * HEAD_DIM
+    return (
+        flat[:, :q_end].view(batch, seq_len, num_heads, HEAD_DIM),
+        flat[:, q_end:k_end].view(batch, seq_len, num_heads, HEAD_DIM),
+        flat[:, k_end:].view(batch, seq_len, num_v_heads, HEAD_DIM),
+    )
+
+
+class CakeGDNNondetPackedFunction(torch.autograd.Function):
+    """:class:`CakeGDNNondetFunction` with the packed row as its one q / k / v input (see :func:`_packed_row`): the
+    same forward on the row's head views, and a backward that returns the row's gradient, written by the tail."""
+
+    @staticmethod
+    def forward(ctx, row, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
+                use_qk_l2norm_in_kernel, options, heads):  # fmt: skip
+        batch, seq_len, num_heads, num_v_heads = heads
+        q, k, v = _row_views(row, batch, seq_len, num_heads, num_v_heads)
+        ctx.heads = heads
+        ctx.row_shape = row.shape
+        return _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
+                                 cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
+
+    @staticmethod
+    def backward(ctx, do, dht):
+        batch, seq_len, num_heads, num_v_heads = ctx.heads
+        d_row = torch.empty(ctx.row_shape, dtype=torch.bfloat16, device=do.device)
+        views = _row_views(d_row, batch, seq_len, num_heads, num_v_heads)
+        dq, dk, dv, dg, dbeta, dh0 = _function_backward(ctx, do, dht, views)
+        for view, grad in zip(views, (dq, dk, dv), strict=True):
+            if (
+                grad is not view
+            ):  # a tail that does not write the row's views (not one of F32X_TAILS)
+                view.copy_(grad)
+        return d_row, dg, dbeta, None, dh0, None, None, None, None, None, None
 
 
 def cake_gdn_nondet(
@@ -3089,6 +3301,11 @@ def cake_gdn_nondet(
     fixed-order today, so PyTorch's deterministic algorithms (``torch.use_deterministic_algorithms(True)``, with or
     without ``warn_only``) change nothing: no alert, no warning, no fallback.  The contract does not promise run-to-run
     bits.  ``tail`` pins the backward tail (:class:`ChainOptions`).
+
+    When q, k and v are the head views of one packed BF16 row that requires grad (``row.split((H * 128, H * 128,
+    HV * 128), -1)``, each viewed as ``[B, T, heads, 128]``; :func:`_packed_row`) and the backward tail is a cluster
+    tail of ``F32X_TAILS``, the row is the autograd input (:class:`CakeGDNNondetPackedFunction`): the backward writes
+    dq / dk / dv into one packed gradient row, the same bits as on the views.
     """
     if (
         q.dtype != torch.bfloat16
@@ -3111,5 +3328,14 @@ def cake_gdn_nondet(
         g = g.float()
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+    if PACKED_ROW and torch.is_grad_enabled():
+        row = _packed_row(q, k, v)
+        if row is not None:
+            arch = cake_backend.device_arch(_tensor_index(q))
+            if tail_form(q.shape[2], v.shape[2], options.tail, arch=arch) in F32X_TAILS:
+                heads = (q.shape[0], q.shape[1], q.shape[2], v.shape[2])
+                return CakeGDNNondetPackedFunction.apply(row, g, beta, float(scale), initial_state, output_final_state,
+                                                         cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options,
+                                                         heads)  # fmt: skip
     return CakeGDNNondetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state, cu_seqlens,
                                        cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
