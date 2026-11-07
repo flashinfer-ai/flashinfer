@@ -249,6 +249,8 @@ _ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
 }
+# rm8: sm_100a runs the same overridden stages (CAB4 route codes + L2 push unpermute)
+_ARCH_STAGE_OVERRIDES["sm_100a"] = _ARCH_STAGE_OVERRIDES["sm_107a"]
 _STAGE_LAUNCH_CONTRACTS = {
     "stage_inputs": (
         (128, 1, 1),
@@ -1007,7 +1009,7 @@ class BlackwellBf16RankMajorSession:
         # input_arrive sends into every owner's route codes; the routed owner
         # masks stay unused there (dispatch reads the route codes instead).
         self._route_codes_out: torch.Tensor | None = None
-        if self._arch == "sm_107a":
+        if self._arch in ("sm_100a", "sm_107a"):
             self._route_codes_out = torch.zeros(
                 (_WORLD_SIZE * _TOKENS_PER_RANK * 2,),
                 dtype=torch.int32,
@@ -1686,7 +1688,7 @@ class BlackwellBf16RankMajorSession:
                 _INTERMEDIATE_SIZE,
             )
             return values, (*self._pointer_types(6), ctypes.c_int32)
-        if name == "local_unpermute" and self._arch == "sm_107a":
+        if name == "local_unpermute" and self._arch in ("sm_100a", "sm_107a"):
             values = (
                 p(self._gemm2_output),
                 p(self._recv_weights),

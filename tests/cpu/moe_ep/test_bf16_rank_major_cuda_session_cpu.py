@@ -670,8 +670,9 @@ def test_sm100a_stages_are_the_manifest_stages():
     module = _session_module()
     manifest, _ = module._load_manifest()
 
-    assert module._stages_for_arch(manifest, "sm_100a") == manifest["stages"]
-    assert "sm_100a" not in manifest["arch_stage_overrides"]
+    # rm8 candidates: sm_100a runs the sm_107a stage overrides
+    assert manifest["arch_stage_overrides"]["sm_100a"] == manifest["arch_stage_overrides"]["sm_107a"]
+    assert module._stages_for_arch(manifest, "sm_100a") == module._stages_for_arch(manifest, "sm_107a")
 
 
 @pytest.mark.cpu_only
