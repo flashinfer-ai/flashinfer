@@ -399,8 +399,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_with_kcp,
     ),
     Package(
-        "flashinfer.cake_gated_act_mxfp8_backend",
-        "flashinfer/cake_gated_act_mxfp8_backend",
+        "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
+        "flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train",
         "cake_jit.py",
         refs_generic,
     ),

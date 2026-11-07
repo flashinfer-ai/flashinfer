@@ -100,10 +100,10 @@ def _fused(
     colwise: bool,
 ):
     if direction == "forward":
-        return flashinfer.silu_and_mul_mxfp8_quantize(
+        return flashinfer.cake_gated_act_mxfp8_det_train_forward(
             gated_input, rowwise=rowwise, colwise=colwise
         )
-    return flashinfer.silu_and_mul_mxfp8_quantize_backward(
+    return flashinfer.cake_gated_act_mxfp8_det_train_backward(
         gated_input, grad_output, rowwise=rowwise, colwise=colwise
     )
 

@@ -32,7 +32,9 @@ scales are laid out in swizzled 128 x 4 tiles of 512 bytes.
 normals with each 32-column block of a row scaled by a power of two (2^-8 to
 2^8), so the scale bytes span a range; ``"special"``, the scaled normals with
 NaN, Inf, -0, zero, subnormal and overflowing blocks and gates at and below
--87; ``"bits"``, every BF16 bit pattern as a gate.
+-87; ``"boundary"``, the scaled normals with blocks whose values sit on the
+E4M3 and E8M0 boundaries (:data:`BOUNDARY_BLOCKS`), along rows and along
+columns; ``"bits"``, every BF16 bit pattern as a gate.
 """
 
 from __future__ import annotations
@@ -45,7 +47,20 @@ TILE = 128
 SF_TILE_BYTES = 512
 NAN_CODE = 0x7F
 NAN_SCALE = 255
-VALUES = ("normal", "scaled", "special", "bits")
+VALUES = ("normal", "scaled", "special", "boundary", "bits")
+# Value patterns of one 32-element block, repeated to fill it: the quantized
+# value (the forward product, and the backward gate gradient) of each element
+# of a ``"boundary"`` block.  A block maximum with a mantissa of at most 1.75
+# keeps the scale of its exponent; above 1.75 the RCEIL scale goes up by one.
+BOUNDARY_BLOCKS = (
+    (448.0, 449.0, -464.0, 480.0),  # E4M3 maximum, rounding ties, scale bump
+    (448.0, -446.0, 1.0, 3.0),  # maximum mantissa exactly 1.75: no bump
+    (450.0, -449.0, 2.0, -0.5),  # maximum mantissa just above 1.75: bump
+    (256.0, -255.0, 0.75, 1.0),  # maximum exactly a power of two
+    (255.0, -254.0, 1.5, 3.0),  # maximum just below a power of two: bump
+    (2.0**-119, -(2.0**-120), 1.75 * 2.0**-119, 2.0**-121),  # scale 0 boundary
+    (1.75 * 2.0**127, -(2.0**126), 3.0e38, 1.0),  # largest scales
+)
 
 
 def make_inputs(
@@ -62,6 +77,8 @@ def make_inputs(
     grad = draw(M, K, generator, device)
     if values == "special":
         _inject_specials(gate, up, grad)
+    elif values == "boundary":
+        _inject_boundaries(gate, up, grad)
     elif values == "bits":
         bits = (torch.arange(M * K, device=device, dtype=torch.int32) % 65536).to(
             torch.int16
@@ -110,6 +127,25 @@ def _inject_specials(gate: torch.Tensor, up: torch.Tensor, grad: torch.Tensor) -
     grad[15, 64:96] = 0.0
     grad[16, 96:128] = -0.0
     grad[17, 0:32] = 3.0e38  # dact * grad and act * grad overflow for some gates
+
+
+def _inject_boundaries(
+    gate: torch.Tensor, up: torch.Tensor, grad: torch.Tensor
+) -> None:
+    """:data:`BOUNDARY_BLOCKS` along rows 0-6 (columns 0-31) and along columns
+    0-6 (rows 32-63) (``M >= 64``, ``K >= 32``).  There the gate is 32, whose
+    sigmoid rounds to 1 in FP32, so the SiLU is 32 exactly and its derivative 1;
+    ``up`` is the target over 32 and ``grad`` is 32, so the forward product
+    ``32 * up`` and the backward gate gradient ``(1 * 32) * up`` are the target
+    exactly, and the up gradient ``32 * 32`` is 1024."""
+
+    for index, pattern in enumerate(BOUNDARY_BLOCKS):
+        block = torch.tensor(pattern, dtype=torch.float32).repeat(8) / 32.0
+        block = block.to(torch.bfloat16).float().to(up.device)
+        for rows, cols in ((index, slice(0, 32)), (slice(32, 64), index)):
+            gate[rows, cols] = 32.0
+            up[rows, cols] = block
+            grad[rows, cols] = 32.0
 
 
 def _sigmoid(x: torch.Tensor) -> torch.Tensor:
@@ -181,7 +217,7 @@ def _quantize(values: torch.Tensor, *, rowwise: bool, colwise: bool) -> dict:
 
 
 def forward(gated_input: torch.Tensor, *, rowwise: bool, colwise: bool) -> dict:
-    """The expected bytes of ``silu_and_mul_mxfp8_quantize``."""
+    """The expected bytes of ``cake_gated_act_mxfp8_det_train_forward``."""
 
     K = gated_input.shape[1] // 2
     gate, up = gated_input.float().split(K, dim=1)
@@ -196,7 +232,7 @@ def backward(
     rowwise: bool,
     colwise: bool,
 ) -> dict:
-    """The expected bytes of ``silu_and_mul_mxfp8_quantize_backward``."""
+    """The expected bytes of ``cake_gated_act_mxfp8_det_train_backward``."""
 
     K = gated_input.shape[1] // 2
     x, up = gated_input.float().split(K, dim=1)

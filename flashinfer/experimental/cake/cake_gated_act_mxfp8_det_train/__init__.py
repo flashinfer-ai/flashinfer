@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend of :mod:`flashinfer.gated_act_mxfp8`: the Cake fused SwiGLU + MXFP8
-quantization training forward / backward (SM100 / SM103 / SM107) as one
-self-contained package (host API bodies, the ``cake_jit`` registry, the pinned
-``cake_build`` loader and the generated CUDA sources under ``csrc/``).  The
-``@flashinfer_api``-decorated entry points and the user-facing documentation
-live in :mod:`flashinfer.gated_act_mxfp8`; import that module.
+Backend of :mod:`flashinfer.cake_gated_act_mxfp8_det_train`: the Cake fused
+SwiGLU + MXFP8 quantization training forward / backward (SM100 / SM103 /
+SM107), deterministic, as one self-contained package (host API bodies, the
+``cake_jit`` registry, the pinned ``cake_build`` loader and the generated CUDA
+sources under ``csrc/``).  The ``@flashinfer_api``-decorated entry points and
+the user-facing documentation live in
+:mod:`flashinfer.cake_gated_act_mxfp8_det_train`; import that module.
 
 Host design (the knobs are keywords; no environment variable):
 
@@ -35,6 +36,10 @@ Host design (the knobs are keywords; no environment variable):
 - A call runs one program of its route (``cake_jit.route_name``), chosen by
   ``M * K`` alone (``cake_jit.selected_module``); every program of a route
   writes the same bytes.
+- Every output (the E4M3 values and the E8M0 scales of both orientations,
+  forward and backward) repeats bit for bit for identical inputs: the op is
+  elementwise plus a maximum over each 32-element block, which is exact in any
+  order, and nothing is summed across threads, CTAs or calls (``README.md``).
 """
 
 from __future__ import annotations
@@ -62,7 +67,9 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 # The kernels load ``gated_input`` and ``grad_output`` in 32-byte rows.
 ALIGNMENT_BYTES = 32
 
-GatedActMxfp8Outputs = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+CakeGatedActMXFP8DetOutputs = Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
 
 
 def _device_index(device: torch.device) -> int:
@@ -76,7 +83,7 @@ def _arch_of_index(device_index: int) -> Optional[str]:
     return arch_for_capability(tuple(torch.cuda.get_device_capability(device_index)))
 
 
-def is_cake_gated_act_mxfp8_supported(device: torch.device) -> bool:
+def is_cake_gated_act_mxfp8_det_train_supported(device: torch.device) -> bool:
     """Whether ``device`` is a CUDA device of an exported architecture."""
 
     device = torch.device(device)
@@ -85,7 +92,7 @@ def is_cake_gated_act_mxfp8_supported(device: torch.device) -> bool:
     return _arch_of_index(_device_index(device)) is not None
 
 
-def check_inputs(
+def cake_gated_act_mxfp8_det_train_check_inputs(
     gated_input: torch.Tensor,
     grad_output: Optional[torch.Tensor],
     *,
@@ -138,13 +145,13 @@ def check_inputs(
     return m, k
 
 
-def empty_outputs(
+def cake_gated_act_mxfp8_det_train_empty_outputs(
     gated_input: torch.Tensor,
     *,
     backward: bool,
     rowwise: bool,
     colwise: bool,
-) -> GatedActMxfp8Outputs:
+) -> CakeGatedActMXFP8DetOutputs:
     """The four output tensors of one call, unwritten: ``(row_output, col_output,
     row_scales, col_scales)``, ``[M, N]`` E4M3 row-major and column-major values
     and their swizzled scale bytes (``N`` = ``K`` forward, ``2K`` backward), a
@@ -177,7 +184,9 @@ def empty_outputs(
     return row_output, col_output, row_scales, col_scales
 
 
-def logical_outputs(outputs: GatedActMxfp8Outputs) -> GatedActMxfp8Outputs:
+def cake_gated_act_mxfp8_det_train_logical_outputs(
+    outputs: CakeGatedActMXFP8DetOutputs,
+) -> CakeGatedActMXFP8DetOutputs:
     """``outputs`` as the public API returns them: the scale bytes as E8M0."""
 
     row_output, col_output, row_scales, col_scales = outputs
@@ -192,7 +201,7 @@ def logical_outputs(outputs: GatedActMxfp8Outputs) -> GatedActMxfp8Outputs:
 def _run(
     gated_input: torch.Tensor,
     grad_output: Optional[torch.Tensor],
-    outputs: GatedActMxfp8Outputs,
+    outputs: CakeGatedActMXFP8DetOutputs,
     *,
     M: int,
     K: int,
@@ -221,31 +230,33 @@ def _run(
     run_module(name, values, device_index=device_index)
 
 
-def silu_and_mul_mxfp8_quantize(
+def cake_gated_act_mxfp8_det_train_forward(
     gated_input: torch.Tensor,
     *,
     rowwise: bool = True,
     colwise: bool = False,
-) -> GatedActMxfp8Outputs:
+) -> CakeGatedActMXFP8DetOutputs:
     """SwiGLU of ``gated_input`` ``[M, 2K]`` quantized to MXFP8 (RCEIL scales):
     ``(row_output, col_output, row_scales, col_scales)``, a disabled
     orientation's pair zero-size."""
 
-    m, k = check_inputs(gated_input, None, rowwise=rowwise, colwise=colwise)
-    outputs = empty_outputs(
+    m, k = cake_gated_act_mxfp8_det_train_check_inputs(
+        gated_input, None, rowwise=rowwise, colwise=colwise
+    )
+    outputs = cake_gated_act_mxfp8_det_train_empty_outputs(
         gated_input, backward=False, rowwise=rowwise, colwise=colwise
     )
     _run(gated_input, None, outputs, M=m, K=k, rowwise=rowwise, colwise=colwise)
-    return logical_outputs(outputs)
+    return cake_gated_act_mxfp8_det_train_logical_outputs(outputs)
 
 
-def silu_and_mul_mxfp8_quantize_backward(
+def cake_gated_act_mxfp8_det_train_backward(
     gated_input: torch.Tensor,
     grad_output: torch.Tensor,
     *,
     rowwise: bool = True,
     colwise: bool = False,
-) -> GatedActMxfp8Outputs:
+) -> CakeGatedActMXFP8DetOutputs:
     """The SwiGLU backward of ``gated_input`` ``[M, 2K]`` and ``grad_output``
     ``[M, K]``, its gate and up gradients ``[M, 2K]`` quantized to MXFP8:
     ``(row_output, col_output, row_scales, col_scales)``, a disabled
@@ -253,23 +264,25 @@ def silu_and_mul_mxfp8_quantize_backward(
 
     if grad_output is None:
         raise ValueError("grad_output must be a CUDA tensor")
-    m, k = check_inputs(gated_input, grad_output, rowwise=rowwise, colwise=colwise)
-    outputs = empty_outputs(
+    m, k = cake_gated_act_mxfp8_det_train_check_inputs(
+        gated_input, grad_output, rowwise=rowwise, colwise=colwise
+    )
+    outputs = cake_gated_act_mxfp8_det_train_empty_outputs(
         gated_input, backward=True, rowwise=rowwise, colwise=colwise
     )
     _run(gated_input, grad_output, outputs, M=m, K=k, rowwise=rowwise, colwise=colwise)
-    return logical_outputs(outputs)
+    return cake_gated_act_mxfp8_det_train_logical_outputs(outputs)
 
 
 __all__ = [
     "ALIGNMENT_BYTES",
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "GatedActMxfp8Outputs",
-    "check_inputs",
-    "empty_outputs",
-    "is_cake_gated_act_mxfp8_supported",
-    "logical_outputs",
-    "silu_and_mul_mxfp8_quantize",
-    "silu_and_mul_mxfp8_quantize_backward",
+    "CakeGatedActMXFP8DetOutputs",
+    "cake_gated_act_mxfp8_det_train_check_inputs",
+    "cake_gated_act_mxfp8_det_train_empty_outputs",
+    "is_cake_gated_act_mxfp8_det_train_supported",
+    "cake_gated_act_mxfp8_det_train_logical_outputs",
+    "cake_gated_act_mxfp8_det_train_forward",
+    "cake_gated_act_mxfp8_det_train_backward",
 ]

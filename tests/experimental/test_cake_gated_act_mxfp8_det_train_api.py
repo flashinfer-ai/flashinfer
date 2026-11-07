@@ -15,12 +15,13 @@ limitations under the License.
 
 Tests of the flashinfer public surface of the Cake fused SwiGLU + MXFP8
 quantization training kernels (SM100 / SM103 / SM107): the
-``flashinfer.gated_act_mxfp8`` entry points, their re-export from the
+``flashinfer.cake_gated_act_mxfp8_det_train`` entry points, their re-export from the
 ``flashinfer`` top-level package and the ``torch.ops.flashinfer`` custom ops.
-The entry points are pass-throughs to ``flashinfer.cake_gated_act_mxfp8_backend``;
+The entry points are pass-throughs to
+``flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train``;
 this module checks that identity (same objects at the top level, the backend's
 exact signatures, same bytes as the backend) and leaves the numerical contract
-to ``test_cake_gated_act_mxfp8.py``, which imports only the backend package.
+to ``test_cake_gated_act_mxfp8_det_train.py``, which imports only the backend package.
 """
 
 from __future__ import annotations
@@ -31,11 +32,11 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_gated_act_mxfp8_backend as backend
-from flashinfer.gated_act_mxfp8 import (
-    get_gated_act_mxfp8_module,
-    silu_and_mul_mxfp8_quantize,
-    silu_and_mul_mxfp8_quantize_backward,
+import flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train as backend
+from flashinfer.cake_gated_act_mxfp8_det_train import (
+    cake_gated_act_mxfp8_det_train_register_custom_ops,
+    cake_gated_act_mxfp8_det_train_forward,
+    cake_gated_act_mxfp8_det_train_backward,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -52,7 +53,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gated_act_mxfp8 needs an SM100 / SM103 / SM107 device",
+    reason="cake_gated_act_mxfp8_det_train needs an SM100 / SM103 / SM107 device",
 )
 
 
@@ -75,21 +76,24 @@ def _same(a, b) -> None:
 
 
 def test_entry_points_are_exported() -> None:
-    assert flashinfer.silu_and_mul_mxfp8_quantize is silu_and_mul_mxfp8_quantize
     assert (
-        flashinfer.silu_and_mul_mxfp8_quantize_backward
-        is silu_and_mul_mxfp8_quantize_backward
+        flashinfer.cake_gated_act_mxfp8_det_train_forward
+        is cake_gated_act_mxfp8_det_train_forward
+    )
+    assert (
+        flashinfer.cake_gated_act_mxfp8_det_train_backward
+        is cake_gated_act_mxfp8_det_train_backward
     )
 
 
 def test_entry_point_signatures_mirror_the_backend() -> None:
     for name in (
-        "silu_and_mul_mxfp8_quantize",
-        "silu_and_mul_mxfp8_quantize_backward",
+        "cake_gated_act_mxfp8_det_train_forward",
+        "cake_gated_act_mxfp8_det_train_backward",
     ):
         # The backend postpones its annotations; compare the evaluated forms.
         facade = inspect.signature(
-            getattr(flashinfer.gated_act_mxfp8, name), eval_str=True
+            getattr(flashinfer.cake_gated_act_mxfp8_det_train, name), eval_str=True
         )
         backend_signature = inspect.signature(getattr(backend, name), eval_str=True)
         assert facade == backend_signature, (name, facade, backend_signature)
@@ -103,16 +107,18 @@ def test_entry_point_signatures_mirror_the_backend() -> None:
 def test_entry_points_match_the_backend(rowwise, colwise) -> None:
     gated_input, grad_output = _inputs(256, 384)
     _same(
-        silu_and_mul_mxfp8_quantize(gated_input, rowwise=rowwise, colwise=colwise),
-        backend.silu_and_mul_mxfp8_quantize(
+        cake_gated_act_mxfp8_det_train_forward(
+            gated_input, rowwise=rowwise, colwise=colwise
+        ),
+        backend.cake_gated_act_mxfp8_det_train_forward(
             gated_input, rowwise=rowwise, colwise=colwise
         ),
     )
     _same(
-        silu_and_mul_mxfp8_quantize_backward(
+        cake_gated_act_mxfp8_det_train_backward(
             gated_input, grad_output, rowwise=rowwise, colwise=colwise
         ),
-        backend.silu_and_mul_mxfp8_quantize_backward(
+        backend.cake_gated_act_mxfp8_det_train_backward(
             gated_input, grad_output, rowwise=rowwise, colwise=colwise
         ),
     )
@@ -121,14 +127,16 @@ def test_entry_points_match_the_backend(rowwise, colwise) -> None:
 @pytest.mark.parametrize("rowwise,colwise", MODES)
 def test_custom_ops_match_the_entry_points(rowwise, colwise) -> None:
     gated_input, grad_output = _inputs(128, 256)
-    module = get_gated_act_mxfp8_module()
+    module = cake_gated_act_mxfp8_det_train_register_custom_ops()
     _same(
         module.forward(gated_input, rowwise, colwise),
-        silu_and_mul_mxfp8_quantize(gated_input, rowwise=rowwise, colwise=colwise),
+        cake_gated_act_mxfp8_det_train_forward(
+            gated_input, rowwise=rowwise, colwise=colwise
+        ),
     )
     _same(
         module.backward(gated_input, grad_output, rowwise, colwise),
-        silu_and_mul_mxfp8_quantize_backward(
+        cake_gated_act_mxfp8_det_train_backward(
             gated_input, grad_output, rowwise=rowwise, colwise=colwise
         ),
     )
