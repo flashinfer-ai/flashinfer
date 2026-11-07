@@ -17,7 +17,7 @@ PACKAGES: dict[str, str] = {
     "cake_rmsnorm_det_train": "flashinfer.experimental.cake.cake_rmsnorm_det_train",
     "cake_rmsnorm_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
     "cake_causal_conv1d_det_train": "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
-    "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
+    "cake_gated_act_mxfp8_det_train": "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
     "cake_rmsnorm_silu_gate_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",

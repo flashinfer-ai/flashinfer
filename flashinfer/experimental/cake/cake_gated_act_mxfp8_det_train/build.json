@@ -1786,6 +1786,6 @@
       ]
     }
   ],
-  "package": "flashinfer.cake_gated_act_mxfp8_backend",
+  "package": "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
   "schema": "cake-build/1"
 }
