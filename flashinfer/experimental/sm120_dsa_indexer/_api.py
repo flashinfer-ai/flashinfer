@@ -383,6 +383,8 @@ def dsa_indexer_det_topk_paged(
     scores: Optional[torch.Tensor] = None,
     return_scores: bool = True,
     enable_pdl: Optional[bool] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """The paged form (see flashinfer.dsa_indexer.dsa_indexer_det_topk).
 
@@ -434,6 +436,24 @@ def dsa_indexer_det_topk_paged(
         kv_cache.view(torch.uint8), (kv_cache.shape[0], page_bytes), (page_stride, 1)
     )
     row_len = context_lens.reshape(num_rows).contiguous()
+    cand = None
+    scan_len = int(max_context_len)
+    if candidate_blocks is not None:
+        bs = int(candidate_block_size)
+        if bs < 8 or bs & (bs - 1) or bs > min(page_rows, 128):
+            raise ValueError(
+                "candidate_block_size must be a power of two from 8 to min(page_rows, 128)"
+            )
+        if candidate_blocks.dtype != torch.int32:
+            raise ValueError("candidate_blocks must be int32")
+        cand = candidate_blocks.reshape(num_rows, -1)
+        if cand.stride(1) != 1:
+            cand = cand.contiguous()
+        if cand.shape[1] * bs > _row_sel_keys():
+            raise ValueError(
+                f"candidate blocks * candidate_block_size must be at most {_row_sel_keys()}"
+            )
+        scan_len = min(scan_len, cand.shape[1] * bs)
     indices, scores = _outputs(indices, scores, return_scores, num_rows, top_k, dev)
     if num_rows == 0:
         return indices, scores
@@ -444,7 +464,11 @@ def dsa_indexer_det_topk_paged(
     # rows keep one-row units, whose scan builds the long rows' histograms
     # more cheaply.
     unit = (
-        2 if next_n % 2 == 0 and (next_n >= 4 or num_rows > (8 if fp4 else 16)) else 1
+        2
+        if cand is None
+        and next_n % 2 == 0
+        and (next_n >= 4 or num_rows > (8 if fp4 else 16))
+        else 1
     )
     _module().run_decode(
         q,
@@ -460,8 +484,14 @@ def dsa_indexer_det_topk_paged(
         q_scale,
         indices,
         scores,
-        _decode_logits(dev, num_rows, int(max_context_len)),
-        _decode_long_ws(dev, num_rows) if max_context_len > _row_sel_keys() else None,
+        _decode_logits(dev, num_rows, scan_len),
+        _decode_long_ws(dev, num_rows) if scan_len > _row_sel_keys() else None,
         device_support_pdl(dev) if enable_pdl is None else bool(enable_pdl),
+        cand,
+        int(candidate_block_size).bit_length() - 1,
+        None
+        if cand is None
+        else torch.empty_like(cand, memory_format=torch.contiguous_format),
+        None if cand is None else torch.empty(num_rows, dtype=torch.int32, device=dev),
     )
     return indices, scores

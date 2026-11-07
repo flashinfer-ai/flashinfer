@@ -19,6 +19,7 @@
 // launching a fixed sequence of kernels on the caller's stream.
 #include <algorithm>
 
+#include "decode_candidates.cuh"
 #include "decode_scan.cuh"
 #include "decode_select_long.cuh"
 #include "sm120_dsa_indexer.cuh"
@@ -527,8 +528,8 @@ namespace {
 
 template <int kNumHeads, bool kFp4, int kNextN, typename Kernel>
 void launch_scan(Kernel kernel, const ScanParams& p, const void* q, const void* w, const void* kv,
-                 const void* q_sf, int num_pages, int64_t page_stride, int grid, bool pdl,
-                 cudaStream_t stream, int bytes) {
+                 const void* q_sf, int num_pages, int64_t page_stride, int box_rows, int grid,
+                 bool pdl, cudaStream_t stream, int bytes) {
   constexpr uint64_t kRow = Fmt<kFp4>::kRow;
   const CUtensorMapSwizzle swizzle = kFp4 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
   const uint64_t q_dims[2] = {kRow, static_cast<uint64_t>(p.num_rows) * kNumHeads};
@@ -545,7 +546,7 @@ void launch_scan(Kernel kernel, const ScanParams& p, const void* q, const void* 
                                            w_strides, w_box, CU_TENSOR_MAP_SWIZZLE_NONE)
                                : tw;
   // A page: page_rows key rows of kRow bytes, then their page_rows scale words.
-  const uint32_t rows = static_cast<uint32_t>(p.page_rows < kBlockKV ? p.page_rows : kBlockKV);
+  const uint32_t rows = static_cast<uint32_t>(box_rows);
   const uint64_t pk_dims[3] = {kRow, static_cast<uint64_t>(p.page_rows),
                                static_cast<uint64_t>(num_pages)};
   const uint64_t pk_strides[2] = {kRow, static_cast<uint64_t>(page_stride)};
@@ -575,11 +576,20 @@ void launch_scan(Kernel kernel, const ScanParams& p, const void* q, const void* 
 // fp32 is the scan's output; long_ws [num_rows * kLongWords] (when
 // max_context_len > kRowSelKeys) the long rows' selection state, zero at
 // first use. Every row_len is at most max_context_len.
+//
+// Candidate mode (cand_blocks [num_rows, C] int32, unit_rows 1): row r ranks
+// only the keys of the blocks of 1 << cand_shift keys that cand_blocks[r]
+// lists (any order, duplicates, -1 padding and blocks past the row allowed).
+// cand_sorted [num_rows, C] and cand_vlen [num_rows] int32 are scratch; the
+// rows are at most C << cand_shift <= kRowSelKeys keys, so logits need only
+// that many columns and no long_ws.
 void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
                TensorView block_table, int64_t page_rows, int64_t unit_rows, int64_t units_per_req,
                int64_t top_k, int64_t max_context_len, Optional<TensorView> q_sf,
                TensorView indices, Optional<TensorView> scores, TensorView logits,
-               Optional<TensorView> long_ws, bool enable_pdl) {
+               Optional<TensorView> long_ws, bool enable_pdl, Optional<TensorView> cand_blocks,
+               int64_t cand_shift, Optional<TensorView> cand_sorted,
+               Optional<TensorView> cand_vlen) {
   const bool fp4 = q_sf.has_value();
   const int64_t row_bytes = fp4 ? kHeadDim / 2 : kHeadDim;
   if (fp4) {
@@ -627,10 +637,32 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
   TVM_FFI_ICHECK(units_per_req >= 1 && num_units % units_per_req == 0 &&
                  block_table.size(0) >= num_units / units_per_req)
       << "block_table must have a row per request";
+  const bool cand = cand_blocks.has_value();
+  int num_cands = 0;
+  // The scan's rows: the keys, or in candidate mode the virtual rows.
+  int64_t scan_len = max_context_len;
+  if (cand) {
+    num_cands = static_cast<int>(cand_blocks.value().size(1));
+    TVM_FFI_ICHECK_EQ(unit_rows, 1) << "candidate rows are one-row units";
+    TVM_FFI_ICHECK(cand_shift >= 3 &&
+                   (int64_t{1} << cand_shift) <= std::min<int64_t>(page_rows, kBlockKV))
+        << "the candidate block size must be a power of two from 8 to min(page_rows, 128)";
+    TVM_FFI_ICHECK(num_cands >= 1 && (int64_t{num_cands} << cand_shift) <= kRowSelKeys)
+        << "candidate blocks * block size must be at most " << kRowSelKeys;
+    CHECK_INPUT_TYPE(cand_blocks.value(), dl_int32);
+    TVM_FFI_ICHECK(cand_blocks.value().ndim() == 2 && cand_blocks.value().size(0) == num_rows &&
+                   cand_blocks.value().stride(1) == 1)
+        << "candidate_blocks must be [rows, C] int32 with unit stride";
+    TVM_FFI_ICHECK(cand_sorted.has_value() && cand_vlen.has_value() &&
+                   cand_sorted.value().numel() >= int64_t{num_rows} * num_cands &&
+                   cand_vlen.value().numel() >= num_rows)
+        << "candidate scratch too small";
+    scan_len = std::min<int64_t>(max_context_len, int64_t{num_cands} << cand_shift);
+  }
   TVM_FFI_ICHECK(logits.ndim() == 2 && logits.size(0) >= num_rows && logits.stride(1) == 1 &&
-                 logits.stride(0) % 4 == 0 && logits.size(1) >= max_context_len)
-      << "logits must be [>= rows, >= max_context_len] float32, row stride a multiple of 4";
-  const bool may_long = max_context_len > kRowSelKeys;
+                 logits.stride(0) % 4 == 0 && logits.size(1) >= scan_len)
+      << "logits must be [>= rows, >= the rows' keys] float32, row stride a multiple of 4";
+  const bool may_long = scan_len > kRowSelKeys;
   if (may_long) {
     TVM_FFI_ICHECK(long_ws.has_value() && long_ws.value().dtype().bits == 32 &&
                    long_ws.value().numel() >= int64_t{num_rows} * kLongWords)
@@ -638,8 +670,7 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
   }
   cudaStream_t stream = get_stream(q.device());
   const int S = stream_sm_count(stream);  // one wave
-  const int max_tiles =
-      std::max<int>(1, static_cast<int>((max_context_len + kBlockKV - 1) / kBlockKV));
+  const int max_tiles = std::max<int>(1, static_cast<int>((scan_len + kBlockKV - 1) / kBlockKV));
   // The scan's split runs in 32 bits: units * max_tiles virtual tiles times
   // the CTAs, and max_tiles times a row's tiles.
   TVM_FFI_ICHECK(static_cast<uint64_t>(num_units) * max_tiles * S < (1ull << 32) &&
@@ -657,13 +688,39 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
   p.logits = ptr<float>(logits);
   p.logits_stride = logits.stride(0);
   p.long_ws = may_long ? ptr<uint32_t>(long_ws.value()) : nullptr;
+  if (cand) {
+    CandParams cp{};
+    cp.row_len = p.row_len;
+    cp.blocks = ptr<const int32_t>(cand_blocks.value());
+    cp.blocks_stride = cand_blocks.value().stride(0);
+    cp.num_cands = num_cands;
+    cp.shift = static_cast<int>(cand_shift);
+    cp.max_blocks =
+        static_cast<int>((max_context_len + (int64_t{1} << cand_shift) - 1) >> cand_shift);
+    cp.sorted = ptr<int32_t>(cand_sorted.value());
+    cp.vlen = ptr<int32_t>(cand_vlen.value());
+    const int bitmap = ((cp.max_blocks + 31) / 32) * 4;
+    TVM_FFI_ICHECK(bitmap <= kSmemLimit - 1024) << "max_context_len too large for candidate rows";
+    TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(candidates_kernel,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, bitmap),
+                      cudaSuccess);
+    launch_ex(candidates_kernel, num_rows, kCandThreads, bitmap, get_stream(q.device()), enable_pdl,
+              false, cp);
+    check_launch("decode candidates");
+    p.row_len = cp.vlen;
+    p.cand = cp.sorted;
+    p.cand_stride = num_cands;
+    p.cand_shift = cp.shift;
+    p.kv_scales = static_cast<const uint8_t*>(kv.data_ptr()) + page_rows * row_bytes;
+    p.page_stride = page_stride;
+  }
   // Logits of 4 MB up to a quarter of L2 stay there for the selection: their
   // write-back would take the DRAM-bound scan's bandwidth. Smaller calls keep
   // the plain kernels.
   int l2 = 0;
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, q.device().device_id),
                     cudaSuccess);
-  const int64_t logits_bytes = int64_t{num_rows} * max_context_len * 4;
+  const int64_t logits_bytes = int64_t{num_rows} * scan_len * 4;
   const bool keep =
       may_long && logits_bytes >= (int64_t{4} << 20) && logits_bytes <= int64_t{l2} / 4;
 
@@ -680,9 +737,11 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
       int st = kScanMaxStages;
       while (st > 2 && LS::bytes(st) > kSmemLimit) --st;
       p.k_stages = st;
+      const int box_rows =
+          cand ? 1 << cand_shift : static_cast<int>(std::min<int64_t>(page_rows, kBlockKV));
       launch_scan<H, kF, NN>(logits_scan_kernel<H, kF, NN, kL, kK>, p, q.data_ptr(), w.data_ptr(),
-                             kv.data_ptr(), qsf, num_pages, page_stride, S, enable_pdl, stream,
-                             LS::bytes(st));
+                             kv.data_ptr(), qsf, num_pages, page_stride, box_rows, S, enable_pdl,
+                             stream, LS::bytes(st));
     };
     if (!may_long)
       go(std::false_type{}, std::false_type{});
@@ -715,6 +774,9 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
   sp.indices = ptr<int32_t>(indices);
   sp.scores = scores_p;
   sp.long_ws = p.long_ws;
+  sp.cand = p.cand;
+  sp.cand_stride = p.cand_stride;
+  sp.cand_shift = p.cand_shift;
   // A CTA a row, then (where a row may be long) one wave for the long rows.
   launch_ex(keep ? select_kernel<true> : select_kernel<false>, num_rows + (may_long ? S : 0),
             kSelThreads, 0, stream, enable_pdl, false, sp);

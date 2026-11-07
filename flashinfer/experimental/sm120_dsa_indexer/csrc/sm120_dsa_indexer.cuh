@@ -314,6 +314,16 @@ __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, u
       "l"(map), "r"(smem_addr(bar)), "r"(c0), "r"(c1)
       : "memory");
 }
+// A plain bulk copy (no tensor map): bytes a multiple of 16, both addresses
+// 16-byte aligned (a tensor copy needs a 128-byte aligned destination).
+__device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t bytes,
+                                          uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
+          smem_addr(dst)),
+      "l"(src), "r"(bytes), "r"(smem_addr(bar))
+      : "memory");
+}
 __device__ __forceinline__ void tma_load_3d(void* dst, const CUtensorMap* map, uint64_t* bar,
                                             int c0, int c1, int c2) {
   asm volatile(

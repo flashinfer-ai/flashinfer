@@ -45,6 +45,11 @@ struct SelParams {
   int32_t* indices;   // [num_rows, top_k]
   float* scores;      // [num_rows, top_k] or null
   uint32_t* long_ws;  // [num_rows][kLongWords]; null when no row may be long
+  // Candidate mode (see ScanParams): the rows are virtual, and a selected
+  // position v is key cand[row][v >> cand_shift] << cand_shift plus the rest.
+  const int32_t* cand;
+  int cand_stride;
+  int cand_shift;
 };
 
 struct RowSelShared {
@@ -467,6 +472,18 @@ __device__ __forceinline__ void rowsel_body(const SelParams& p, RowSelShared& sh
     rowsel_row<2>(sh, src, len, top_k, out_i, out_s);
   } else {
     rowsel_row<4>(sh, src, len, top_k, out_i, out_s);
+  }
+  if (p.cand != nullptr) {
+    // The selection's writes, made by any thread, are visible after the
+    // barrier. The blocks ascend, so the order of positions is the order of
+    // keys and ties still go to the larger key.
+    __syncthreads();
+    const int32_t* blocks = p.cand + static_cast<int64_t>(row) * p.cand_stride;
+    const int shift = p.cand_shift, mask = (1 << shift) - 1;
+    for (int i = tid; i < top_k; i += kSelThreads) {
+      const int v = out_i[i];
+      if (v >= 0) out_i[i] = (__ldg(blocks + (v >> shift)) << shift) | (v & mask);
+    }
   }
   if constexpr (kDrop) {
     __syncthreads();

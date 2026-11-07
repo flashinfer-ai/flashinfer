@@ -41,6 +41,15 @@ struct ScanParams {
   float* logits;
   int64_t logits_stride;
   uint32_t* long_ws;  // kLong: [num_rows][kLongWords]
+  // Candidate mode (one-row units): row u scores only the blocks of
+  // 1 << cand_shift keys listed in cand[u * cand_stride ...], ascending and
+  // distinct (decode_candidates.cuh), as one virtual row of row_len[u] keys.
+  // Null: every row scores its keys [0, row_len) in order.
+  const int32_t* cand;
+  int cand_stride;
+  int cand_shift;
+  const uint8_t* kv_scales;  // page 0's scales; page p's at + p * page_stride
+  int64_t page_stride;
 };
 
 template <int kNumHeads, bool kFp4, int kNextN, bool kLong = false>
@@ -70,6 +79,91 @@ struct ScanSmem {
     return hist_off(stages) + (kLong ? kNextN * 2048 * 4 + 16 : 0);
   }
 };
+
+// The producer in candidate mode. A virtual tile of kBlockKV keys is
+// kBlockKV >> cand_shift candidate blocks, each one TMA box inside one page;
+// lane j issues box j's key and scale loads, so a tile's loads go out
+// together rather than one after another from one lane.
+template <int kNumHeads, bool kFp4, int kNextN, bool kLong, typename Piece>
+__device__ __forceinline__ void produce_candidates(
+    const ScanParams& p, uint8_t* smem, const CUtensorMap& tmap_q, const CUtensorMap& tmap_w,
+    const CUtensorMap& tmap_k, const CUtensorMap& tmap_qsf, uint64_t* full_q, uint64_t* empty_q,
+    uint64_t* full_k, uint64_t* empty_k, int rq_lo, int rq_hi, int upr, int uk, int stages,
+    int lane, Piece&& piece) {
+  static_assert(kNextN == 1, "candidate rows are one-row units");
+  using L = ScanSmem<kNumHeads, kFp4, kNextN, kLong>;
+  using F = Fmt<kFp4>;
+  const int shift = p.cand_shift, boxes_per_tile = kBlockKV >> shift;
+  const int page_shift = __ffs(p.page_rows) - 1, page_mask = p.page_rows - 1;
+  int st = 0, n = 0;
+  uint32_t parity = 0u;
+  for (int rq = rq_lo; rq < rq_hi; ++rq, ++n) {
+    const int u = rq * upr + uk;
+    int t0, t1, len[2];
+    const int kend = piece(rq, t0, t1, len);
+    const int qb = n & 1;
+    if (lane == 0) {
+      if (n >= 2) mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+      mbar_expect_tx(full_q + qb, L::kQBytes + L::kWBytes + (kFp4 ? L::kWBytes : 0));
+      tma_load_2d(smem + L::q_off(qb), &tmap_q, full_q + qb, 0, u * kNumHeads);
+      tma_load_2d(smem + L::w_off(stages, qb), &tmap_w, full_q + qb, 0, u);
+      if constexpr (kFp4) tma_load_2d(smem + L::qsf_off(stages, qb), &tmap_qsf, full_q + qb, 0, u);
+    }
+    // A request's rows are consecutive units, whatever the split (upr is 1 on
+    // fewer CTAs than units_per_req).
+    const int bt_req = u / p.units_per_req;
+    const int64_t bt_row = static_cast<int64_t>(bt_req) * p.bt_stride;
+    const int32_t* blocks = p.cand + static_cast<int64_t>(u) * p.cand_stride;
+    const int box0 = t0 * boxes_per_tile, box1 = t1 * boxes_per_tile;
+    // Box b's page and in-page row. Boxes past the row load page 0, which the
+    // math warps mask by the row's length.
+    auto box_at = [&](int b, int& row) -> int {
+      if (b >= box1 || (b << shift) >= kend) {
+        row = 0;
+        return 0;
+      }
+      const int key = __ldg(blocks + b) << shift;
+      row = key & page_mask;
+      return __ldg(p.block_table + bt_row + (key >> page_shift));
+    };
+    // The lanes hold the next 64 boxes (two windows of 32).
+    int win = box0, cur_row, nxt_row;
+    int cur = box_at(win + lane, cur_row), nxt = box_at(win + 32 + lane, nxt_row);
+    for (int i = 0; i < t1 - t0; ++i) {
+      const int b0 = box0 + i * boxes_per_tile;
+      if (b0 - win >= 32) {
+        win += 32;
+        cur = nxt;
+        cur_row = nxt_row;
+        nxt = box_at(win + 32 + lane, nxt_row);
+      }
+      const int s = b0 - win + lane;
+      const int page_a = __shfl_sync(0xffffffffu, cur, s & 31);
+      const int page_b = __shfl_sync(0xffffffffu, nxt, s & 31);
+      const int row_a = __shfl_sync(0xffffffffu, cur_row, s & 31);
+      const int row_b = __shfl_sync(0xffffffffu, nxt_row, s & 31);
+      const int page = s < 32 ? page_a : page_b, row = s < 32 ? row_a : row_b;
+      if (lane == 0) {
+        mbar_wait(empty_k + st, parity ^ 1u);
+        mbar_expect_tx(full_k + st, L::kKBytes + kBlockKV * 4);
+      }
+      __syncwarp();
+      if (lane < boxes_per_tile) {
+        const int r = lane << shift;
+        tma_load_3d(smem + L::k_off(st) + r * F::kRow, &tmap_k, full_k + st, 0, row, page);
+        // A box's scales are 4 << shift bytes, too few for a tensor copy's
+        // 128-byte destination alignment.
+        bulk_load(smem + L::scale_off(stages, st) + r * 4,
+                  p.kv_scales + page * p.page_stride + row * 4, 4u << shift, full_k + st);
+      }
+      __syncwarp();
+      if (++st == stages) {
+        st = 0;
+        parity ^= 1u;
+      }
+    }
+  }
+}
 
 // One producer warp (TMA) and 256 math threads. setmaxnreg moves the
 // producer warpgroup's registers to the math warps (40 / 232 around the
@@ -164,6 +258,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     const int boxes_per_tile = kBlockKV >> box_shift;
     int st = 0, n = 0;
     uint32_t parity = 0u;
+    if constexpr (kNextN == 1 && !kLong) {
+      if (p.cand != nullptr) {
+        produce_candidates<kNumHeads, kFp4, kNextN, kLong>(
+            p, smem, tmap_q, tmap_w, tmap_k, tmap_qsf, full_q, empty_q, full_k, empty_k, rq_lo,
+            rq_hi, upr, uk, stages, lane, piece);
+        return;
+      }
+    }
     for (int rq = rq_lo; rq < rq_hi; ++rq, ++n) {
       const int u = rq * upr + uk;
       int t0, t1, len[2];

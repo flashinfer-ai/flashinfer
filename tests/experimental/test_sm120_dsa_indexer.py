@@ -856,3 +856,205 @@ def test_paged_top_k(top_k):
     q, w, ctx = _decode_inputs(False, 2, 2, 32, lens, gen, dev)
     idx, sc = _run_decode(q, w, ctx, paged, top_k)
     _check_decode(idx, sc, q, w, ctx, paged, top_k)
+
+
+# ---------------------------------------------------------------------------
+# Paged form with candidate blocks (DeepSeek-V4.1 consumer layers)
+# ---------------------------------------------------------------------------
+
+
+def _candidate_lists(ctx, C, bs, gen, dev):
+    """Per row, C entries as a source layer may publish them: shuffled, with
+    duplicates, -1 padding, blocks past the row, and the newest block."""
+    rows = ctx.numel()
+    out = torch.full((rows, C), -1, dtype=torch.int32, device=dev)
+    for r, n in enumerate(ctx.reshape(-1).tolist()):
+        nb = (n + bs - 1) // bs
+        if nb == 0:
+            out[r, : C // 4] = torch.randint(
+                0, 50, (C // 4,), generator=gen, device=dev
+            )
+            continue
+        if nb <= C:
+            picks = torch.randperm(nb, generator=gen, device=dev)
+        else:
+            picks = torch.randperm(nb, generator=gen, device=dev)[: C - C // 8]
+            picks[0] = nb - 1
+        k = picks.numel()
+        out[r, :k] = picks.int()
+        extra = C - k
+        if extra > 0:
+            dup = picks[torch.randint(0, k, (extra,), generator=gen, device=dev)]
+            past = torch.randint(nb, nb + 100, (extra,), generator=gen, device=dev)
+            kind = torch.randint(0, 3, (extra,), generator=gen, device=dev)
+            out[r, k:] = torch.where(
+                kind == 0, dup, torch.where(kind == 1, past, -1)
+            ).int()
+        out[r] = out[r, torch.randperm(C, generator=gen, device=dev)]
+    return out
+
+
+def _check_candidates(idx, sc, q, w, ctx, paged, cand, bs, top_k):
+    B, next_n = ctx.shape
+    for b in range(B):
+        n_max = int(ctx[b].max())
+        keys = paged.request_keys(b, n_max)
+        rows = slice(b * next_n, (b + 1) * next_n)
+        full = _scores(q.value[b], w[rows], keys)
+        for j in range(next_n):
+            r = b * next_n + j
+            n = int(ctx[b, j])
+            listed = cand[r][(cand[r] >= 0)].long()
+            keep = torch.zeros(n, dtype=torch.bool, device=idx.device)
+            blocks_of = torch.arange(n, device=idx.device) // bs
+            if n:
+                keep = torch.isin(blocks_of, listed)
+            ids = keep.nonzero().squeeze(1)
+            # The listed keys as one row; positions map back through ids.
+            pos = idx[r].clone()
+            hit = pos >= 0
+            lookup = torch.full((max(n, 1),), -1, dtype=torch.long, device=idx.device)
+            lookup[ids] = torch.arange(ids.numel(), device=idx.device)
+            assert bool((pos[hit] < n).all()), f"request {b} row {j}: past the row"
+            mapped = lookup[pos[hit].long()]
+            assert bool((mapped >= 0).all()), f"request {b} row {j}: unlisted key"
+            pos[hit] = mapped.int()
+            _check_row(pos, sc[r], full[j, ids], top_k, False, f"request {b} row {j}")
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+@pytest.mark.parametrize("heads,top_k", _HK)
+@pytest.mark.parametrize(
+    "next_n,lens,P,bs,C",
+    [
+        # DeepSeek-V4.1: 2048 blocks of 8 keys; rows below, at and past 16K.
+        (1, [60000, 16384, 3000, 0, 16385, 100000], 64, 8, 2048),
+        (2, [60000, 900, 30000, 16383], 64, 8, 2048),
+        (1, [5000, 40000], 32, 16, 512),
+        (2, [70000, 12000], 128, 64, 256),
+    ],
+)
+def test_paged_candidates(fp4, heads, top_k, next_n, lens, P, bs, C):
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(len(lens) * 17 + next_n + bs + heads)
+    B = len(lens)
+    paged = _Paged(fp4, B, max(lens), P, gen, dev)
+    q, w, ctx = _decode_inputs(fp4, B, next_n, heads, lens, gen, dev)
+    cand = _candidate_lists(ctx, C, bs, gen, dev)
+    idx, sc = _run_decode(
+        q, w, ctx, paged, top_k, candidate_blocks=cand, candidate_block_size=bs
+    )
+    _check_candidates(idx, sc, q, w, ctx, paged, cand, bs, top_k)
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+def test_paged_candidates_all_blocks(fp4):
+    """A row that lists every block of its keys ranks like the plain form."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(5)
+    lens = [16384, 9000, 2049, 100]
+    paged = _Paged(fp4, len(lens), max(lens), 64, gen, dev)
+    q, w, ctx = _decode_inputs(fp4, len(lens), 1, 32, lens, gen, dev)
+    cand = _candidate_lists(ctx, 2048, 8, gen, dev)
+    got, got_s = _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand)
+    ref, ref_s = _run_decode(q, w, ctx, paged, 512)
+    for r in range(len(lens)):
+        assert torch.equal(torch.sort(got[r]).values, torch.sort(ref[r]).values)
+        assert torch.equal(torch.sort(got_s[r]).values, torch.sort(ref_s[r]).values)
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+def test_paged_candidates_cuda_graph(fp4):
+    """One capture replays over new lists, lengths and queries."""
+    dev = torch.device("cuda")
+    B, next_n, max_len, C, bs, top_k = 8, 2, 70000, 2048, 8, 512
+    gen = torch.Generator(device=dev).manual_seed(23)
+    paged = _Paged(fp4, B, max_len, 64, gen, dev)
+    q, w, ctx = _decode_inputs(fp4, B, next_n, 32, [max_len] * B, gen, dev)
+    cand = _candidate_lists(ctx, C, bs, gen, dev)
+    idx = torch.empty(B * next_n, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(B * next_n, top_k, dtype=torch.float32, device=dev)
+
+    def run():
+        _run_decode(
+            q, w, ctx, paged, top_k, indices=idx, scores=sc, candidate_blocks=cand
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lo, hi in ((1, max_len), (1, 2000), (60000, max_len), (0, 1)):
+        q2 = _queries(fp4, (B, next_n, 32), gen, dev)
+        q.data.copy_(q2.data)
+        if fp4:
+            q.scale.copy_(q2.scale)
+        q.value = q2.value
+        Lb = torch.randint(
+            lo, hi + 1, (B, 1), generator=gen, device=dev, dtype=torch.int32
+        )
+        ctx.copy_((Lb - next_n + 1 + torch.arange(next_n, device=dev)).clamp_min(0))
+        cand.copy_(_candidate_lists(ctx, C, bs, gen, dev))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_candidates(idx, sc, q, w, ctx, paged, cand, bs, top_k)
+
+
+def test_paged_candidates_validation():
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(3)
+    paged = _Paged(False, 1, 1000, 64, gen, dev)
+    q, w, ctx = _decode_inputs(False, 1, 1, 32, [1000], gen, dev)
+    cand = torch.zeros(1, 2048, dtype=torch.int32, device=dev)
+    for bs in (4, 12, 128):
+        with pytest.raises(ValueError, match="candidate_block_size"):
+            _run_decode(
+                q, w, ctx, paged, 512, candidate_blocks=cand, candidate_block_size=bs
+            )
+    with pytest.raises(ValueError, match="at most"):
+        _run_decode(
+            q, w, ctx, paged, 512, candidate_blocks=cand, candidate_block_size=16
+        )
+    with pytest.raises(ValueError, match="int32"):
+        _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand.long())
+    with pytest.raises(ValueError, match="paged form"):
+        dsa_indexer_det_topk(
+            q.data.view(1, 32, _D),
+            paged.keys.data,
+            w,
+            torch.tensor([0, 1], dtype=torch.int32, device=dev),
+            torch.tensor([0, 1000], dtype=torch.int32, device=dev),
+            backend="sm120",
+            k_scale=paged.keys.scale,
+            top_k=512,
+            candidate_blocks=cand,
+        )
+
+
+def test_paged_candidates_small_partition():
+    """On fewer SMs than next_n, a request's rows no longer get a CTA each; each
+    row must still read its own request's block table row."""
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+    dev = torch.device("cuda")
+    streams, resources = split_device_green_ctx_by_sm_count(
+        torch.device("cuda", torch.cuda.current_device()), [8]
+    )
+    if int(resources[0].sm.smCount) >= 16:
+        pytest.skip("no partition below 16 SMs")
+    gen = torch.Generator(device=dev).manual_seed(29)
+    lens, next_n = [30000, 5000, 20000], 16
+    paged = _Paged(False, len(lens), max(lens), 64, gen, dev)
+    q, w, ctx = _decode_inputs(False, len(lens), next_n, 32, lens, gen, dev)
+    cand = _candidate_lists(ctx, 2048, 8, gen, dev)
+    stream = streams[0]
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        idx, sc = _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    _check_candidates(idx, sc, q, w, ctx, paged, cand, 8, 512)

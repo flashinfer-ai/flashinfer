@@ -59,6 +59,8 @@ def dsa_indexer_det_topk(
     block_table: Optional[torch.Tensor] = None,
     context_lens: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Fused DSA indexer scoring and exact top-k selection (DeepSeek Sparse
     Attention indexer), the experimental FP8 / MXFP4 serving form on SM120:
@@ -166,6 +168,17 @@ def dsa_indexer_det_topk(
         Programmatic dependent launch: each kernel's
         launch and setup overlap the previous kernel's end; ``None``: on where
         the device supports it.
+    candidate_blocks : Optional[torch.Tensor]
+        The paged form only: int32 ``[B * next_n, C]`` request-local block ids
+        (blocks of ``candidate_block_size`` keys), in any order, with
+        duplicates and ``-1`` padding allowed (DeepSeek-V4.1's consumer
+        layers).  Row ``r`` then ranks only its visible keys whose block it
+        lists: its ids and scores are the plain form's over those keys.  Needs
+        ``C * candidate_block_size <= 16384``; ``C`` and the block size fix the
+        launches, so a captured graph replays for any lists.
+    candidate_block_size : int
+        Keys a candidate block: a power of two from 8 to
+        ``min(k.shape[1], 128)``.
 
     Returns
     -------
@@ -225,7 +238,11 @@ def dsa_indexer_det_topk(
             scores=scores,
             return_scores=return_scores,
             enable_pdl=enable_pdl,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
         )
+    if candidate_blocks is not None:
+        raise ValueError("candidate_blocks needs the paged form of backend='sm120'")
     if k_scale is None:
         raise ValueError("backend='sm120' requires k_scale")
     if cu_seqlens_q is None or cu_seqlens_k is None:
