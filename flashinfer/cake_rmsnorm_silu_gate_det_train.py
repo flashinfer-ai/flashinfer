@@ -26,7 +26,7 @@ This is ``RMSNorm(x) * weight * SiLU(z)``, not :func:`flashinfer.norm.fused_rmsn
 (``SiLU(RMSNorm(x))``).  The backward recomputes the statistics and the gate
 from ``x`` and ``z`` and returns BF16 ``dx`` and ``dz`` and the weight
 gradient summed over every token and head (FP32 runs of at most 16 rows, added
-exactly in fixed point, one rounding), so repeated calls with the same row
+exactly in fixed point, rounded once to FP32), so repeated calls with the same row
 count on a device with the same SM count return the same bits.  The autograd
 function saves only its inputs, which keeps
 ``torch.utils.checkpoint(..., use_reentrant=False)`` free of FP32 temporaries.
@@ -65,7 +65,8 @@ Mode and dispatch rules (the same in
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
-   alerts: every deterministic launch sums in a fixed order.  The
+   alerts: every deterministic launch gives the same bits for the same
+   inputs on the same device (a sum across CTAs is exact).  The
    non-deterministic forward never alerts.  A non-deterministic backward that
    computes the weight gradient raises PyTorch's alert immediately before its
    order-varying launch (``RuntimeError``; with ``warn_only=True`` a
@@ -295,8 +296,9 @@ def cake_rmsnorm_silu_gate_det_train_backward(
 
     in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
     is summed in FP32 runs of at most 16 rows, added exactly in fixed point
-    whatever the order of the CTAs, and rounded once: the same row count on a
-    device with the same SM count gives the same bits.
+    whatever the order of the CTAs, and rounded once to FP32 (then to BF16 for
+    a BF16 gradient): the same row count on a device with the same SM count
+    gives the same bits.
 
     Parameters
     ----------
@@ -310,10 +312,11 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         Preallocated BF16 outputs of ``x``'s shape.
     grad_weight : torch.Tensor, optional
         A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
-        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+        (the exact sum rounded once to FP32, then to BF16 for a BF16 tensor).
+        Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
-        Add the gradient to ``grad_weight``'s current value before the one
-        rounding (needs ``grad_weight``).
+        Add the gradient to ``grad_weight``'s current value exactly, before
+        the rounding (needs ``grad_weight``).
     compute_grad_weight : bool
         ``False`` skips the weight-gradient result and returns ``None`` for it.
     workspace : torch.Tensor, optional

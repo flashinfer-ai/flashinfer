@@ -30,7 +30,8 @@ first build.
 
 A role is one kernel of a call: ``fwd`` (the forward) and ``bwd_bf16`` /
 ``bwd_f32`` (the backward: ``dx``, ``dz`` and the weight gradient in one
-kernel, rounded once into a BF16 or FP32 weight gradient).
+kernel, the weight gradient rounded once to FP32, then to BF16 for a BF16
+weight gradient).
 ``ROUTES[arch][role]`` names the one module a role runs on an architecture,
 whatever the row count (:func:`module_for_rows`).
 

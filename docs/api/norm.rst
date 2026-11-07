@@ -252,7 +252,8 @@ by every call, so one workspace serves every later call on its stream.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
-   alerts: every deterministic launch sums in a fixed order.  The
+   alerts: every deterministic launch gives the same bits for the same
+   inputs on the same device (a sum across CTAs is exact).  The
    non-deterministic forward never alerts.  A non-deterministic backward that
    computes the weight gradient raises PyTorch's alert immediately before its
    order-varying launch (``RuntimeError``; with ``warn_only=True`` a

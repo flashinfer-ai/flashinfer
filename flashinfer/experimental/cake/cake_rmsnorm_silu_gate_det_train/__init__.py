@@ -56,14 +56,15 @@ Host design (every control is a keyword; no environment variable):
   FP32 runs of at most 16 rows and folds each run into an FP32 two-sum pair (a
   sum and its exact error term); each CTA adds its pairs exactly into 64-bit
   fixed-point digit counters and adds those to the workspace with integer
-  atomics, which are exact in any order.  The CTA that arrives last converts
-  each column's digits to FP64, adds ``grad_weight``'s value when
-  accumulating, rounds once into ``grad_weight`` and zeroes the workspace.  A
-  chunk's runs follow from the row count and ``G`` alone, whichever CTA takes
-  it, so the weight gradient is the same bits at every call with the same row
-  count on a device with the same SM count; each run errs by at most about
-  ``2^-20`` of its terms' magnitude, the digits sum exactly, and the FP64
-  conversion errs by at most about ``9 * 2^-53`` of the runs' magnitude.
+  atomics, which are exact in any order.  The CTA that arrives last adds
+  ``grad_weight``'s value exactly as digits when accumulating, rounds each
+  column's exact sum once to FP32 (round to nearest even, in integer
+  arithmetic), stores it (a BF16 ``grad_weight`` takes that FP32 value rounded
+  to BF16, as an FP32 sum cast to BF16) and zeroes the workspace.  A chunk's
+  runs follow from the row count and ``G`` alone, whichever CTA takes it, so
+  the weight gradient is the same bits at every call with the same row count
+  on a device with the same SM count; each run errs by at most about
+  ``2^-20`` of its terms' magnitude and the digits sum exactly.
 - Workspace: ``cake_jit.workspace_elements`` FP32 elements (18952 bytes): the
   digit counters (``2 * 9 * 128`` 64-bit words, read as ``uint64``), one
   32-bit flag word a column (infinite and ``NaN`` sums), and two 32-bit words,
@@ -81,12 +82,13 @@ Host design (every control is a keyword; no environment variable):
   nothing but its output.  A backward without a caller workspace uses the
   zero-filled workspace of its (device, stream), allocated on first use and
   kept in ``_STREAM_WORKSPACES`` for later calls (18952 bytes for every stream
-  that ran a backward).  Such eager calls also keep a reserve of 64
-  zero-filled workspaces per device (one allocation of about 1.2 MiB, filled
-  outside any capture), from which a call during CUDA Graph capture takes the
-  workspace of its capture and capture stream for good, so a replay launches
-  no fill kernel (see ``_RESERVES``; with none ready, the graph zero-fills one
-  of its own).
+  that ran a backward).  Such eager calls also keep a reserve of zero-filled
+  workspaces per device, filled outside any capture in allocations of 64
+  (about 1.2 MiB each) whenever fewer than 32 are ready, up to 1024 per
+  process (about 18.75 MiB), from which a call during CUDA Graph capture takes
+  the workspace of its capture and capture stream for good, so a replay
+  launches no fill kernel (see ``_RESERVES``; with none ready, the graph
+  zero-fills one of its own).
 - No call synchronizes the host or the device, and every kernel runs on the
   current torch stream.  No launch is cooperative or uses programmatic
   dependent launch, and no CTA waits for another CTA: beside a kernel resident
@@ -94,8 +96,10 @@ Host design (every control is a keyword; no environment variable):
   the backward's CTAs exits and claims only the blocks left.
 - Mode: the mode is part of the name (``det``).  Every entry point is
   deterministic and takes no ``deterministic`` keyword (passing one is a
-  ``TypeError``); every launch sums in a fixed order, so
-  ``torch.use_deterministic_algorithms`` does not affect any call.  The
+  ``TypeError``); every launch gives the same bits for the same inputs on
+  the same device (the backward's sum across CTAs is exact integer addition,
+  whose order does not change it), so ``torch.use_deterministic_algorithms``
+  does not affect any call.  The
   backward refuses a workspace of the non-deterministic package
   (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``; an FP64 or ``uint8``
   tensor) with a ``ValueError``, also in a call with no rows.
@@ -668,8 +672,9 @@ def cake_rmsnorm_silu_gate_det_train_backward(
 
     in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
     is summed in FP32 runs of at most 16 rows, added exactly in fixed point in
-    an order-independent way, and rounded once (see the module): the same row
-    count on a device with the same SM count gives the same bits.
+    an order-independent way, and rounded once to FP32 (then to BF16 for a
+    BF16 gradient; see the module): the same row count on a device with the
+    same SM count gives the same bits.
 
     Parameters
     ----------
@@ -683,10 +688,11 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         Preallocated BF16 outputs of ``x``'s shape.
     grad_weight : torch.Tensor, optional
         A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
-        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+        (the exact sum rounded once to FP32, then to BF16 for a BF16 tensor).
+        Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
-        Add the gradient to ``grad_weight``'s current value before the one
-        rounding (needs ``grad_weight``).
+        Add the gradient to ``grad_weight``'s current value exactly, before
+        the rounding (needs ``grad_weight``).
     compute_grad_weight : bool
         ``False`` skips the weight-gradient result and returns ``None`` for it.
     workspace : torch.Tensor, optional

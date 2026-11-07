@@ -131,6 +131,29 @@ def assert_bf16_close(got, want, *, what, scale=None):
     )
 
 
+def assert_y_elementwise(y, x, z, w, eps, *, what):
+    """``y`` within one BF16 ulp of the FP64 reference plus a floor of 1/64 ulp
+    of its row's largest finite ungated magnitude ``|x * rstd * w|``, times the
+    gate's magnitude where that exceeds one: each element's own bound, which
+    large gates elsewhere in the row or the tensor do not widen.  Elements whose
+    reference is not finite are left to the callers."""
+    xd, zd, wd = x.double(), z.double(), w.double()
+    rstd = 1.0 / torch.sqrt(xd.square().mean(dim=-1, keepdim=True) + eps)
+    ungated = xd * rstd * wd
+    scale = torch.where(ungated.isfinite(), ungated.abs(), 0.0).amax(
+        dim=-1, keepdim=True
+    )
+    silu = zd * torch.sigmoid(zd)
+    want = ungated * silu
+    floor = scale * silu.abs().clamp_min(1.0) * BF16_RTOL / 64
+    err = (y.double() - want).abs()
+    bad = want.isfinite() & ~(err <= want.abs() * BF16_RTOL + floor)
+    assert not bad.any(), (
+        f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond their own "
+        f"bound; worst err {err[bad].max().item():.3e}"
+    )
+
+
 def make(T, H, *, layout="contiguous", data="normal", seed=0, device="cuda"):
     g = torch.Generator(device=device).manual_seed(seed)
 
@@ -342,6 +365,7 @@ def test_layouts_give_the_contiguous_bits(layout):
 def test_edge_values(data):
     x, z, w, dy = make(37, 48, data=data, seed=2)
     check_all(x, z, w, dy, EPS)
+    assert_y_elementwise(forward(x, z, w, EPS), x, z, w, EPS, what=f"{data} y")
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
@@ -407,12 +431,14 @@ def _gate_edges(z, seed):
 )
 def test_gate_edge_values(T, H):
     """Gate inputs at the edges of the forward's gate (``GATE_EDGE_VALUES``)
-    within ``check_all``'s bounds; where ``z <= -87.5`` the forward's gate is
+    within ``check_all``'s bounds and ``y`` within each element's own bound
+    (``assert_y_elementwise``); where ``z <= -87.5`` the forward's gate is
     ``-0``, so ``y`` is zero there."""
     x, z, w, dy = make(T, H, seed=23)
     _gate_edges(z, 24)
     check_all(x, z, w, dy, EPS)
     y = forward(x, z, w, EPS)
+    assert_y_elementwise(y, x, z, w, EPS, what="y at the gate edges")
     flushed = z.float() <= GATE_FLUSHED
     assert bool(flushed.any())
     assert not bool(y[flushed].float().ne(0).any()), "y where z <= -87.5"
@@ -478,6 +504,34 @@ def test_infinite_and_nan_gates():
     for a, b, name in zip(got, want, ("dx", "dz", "dw"), strict=True):
         assert_same_bits(a, b, f"{name} on the workspace after the non-finite call")
     assert_zero(ws)
+
+
+@pytest.mark.parametrize("T,H", [(1, 1), (257, 47)], ids=["1x1", "257x47"])
+def test_infinite_terms_in_the_last_row_of_a_partial_block(T, H):
+    """A row count that is not a multiple of the 16-row block, with infinite
+    weight-gradient terms in the last row (a gate of ``+inf`` in column 0, an
+    upstream gradient of ``+inf`` in column 1): the rows of the last block past
+    the last row read that row and add nothing, so both columns are ``+inf`` in
+    the BF16 and the FP32 weight gradient, as in the FP64 reference, and the
+    other columns lie within budget; the workspace is zero after each call."""
+    x, z, w, dy = make(T, H, seed=27)
+    assert (T * H) % 16
+    t, h = T - 1, H - 1
+    z[t, h, 0], dy[t, h, 0], x[t, h, 0] = float("inf"), 1.0, 1.0
+    z[t, h, 1], dy[t, h, 1], x[t, h, 1] = 1.0, float("inf"), 1.0
+    dw64, mag = dw_reference(dy, x, z, EPS)
+    assert dw64[0].item() == dw64[1].item() == float("inf")
+    assert bool(dw64[2:].isfinite().all())
+    ws = workspace_for(T * H, x.device)
+    f32 = torch.empty(D, dtype=torch.float32, device=x.device)
+    dw = backward(dy, x, z, w, EPS, workspace=ws)[2]
+    assert_zero(ws, "the workspace after the BF16 weight gradient")
+    backward(dy, x, z, w, EPS, grad_weight=f32, workspace=ws)
+    assert_zero(ws, "the workspace after the FP32 weight gradient")
+    for got, what in ((dw, "BF16 dw"), (f32, "FP32 dw")):
+        assert got[0].item() == got[1].item() == float("inf"), what
+        assert bool(got[2:].isfinite().all()), what
+        assert_dw_within(got[2:], dw64[2:], mag[2:], what=f"{what}, finite columns")
 
 
 def test_weight_gradient_is_deterministic():
