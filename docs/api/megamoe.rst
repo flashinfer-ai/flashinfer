@@ -21,6 +21,18 @@ Buffer and execution
     nvfp4_mega_moe
     mxfp4_mega_moe
 
+Replica plan (MXFP4)
+--------------------
+
+Redundant expert slots per rank, the plan tables that route each logical
+expert's token blocks onto its copies, and the weight copy of the slots whose
+expert changed, either as a separate kernel or inside the MXFP4 fused kernel.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MegaMoEExpertSlots
+
 Weight preparation
 ------------------
 

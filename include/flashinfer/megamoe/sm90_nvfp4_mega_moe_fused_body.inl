@@ -1543,6 +1543,9 @@ if (warp_idx < kNumDispatchWarps) {
       return;
     }
 
+    const float task_global_scale = (kBlockIsL2 or l1_global_scales == nullptr)
+                                        ? 1.0f
+                                        : __ldg(l1_global_scales + local_expert_idx);
 #include <flashinfer/megamoe/detail/fused_epilogue.inl>
   };
   const auto run_math_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,

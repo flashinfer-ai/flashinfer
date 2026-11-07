@@ -1,7 +1,7 @@
-// Shared NVFP4/MXFP4 fused SwiGLU, FP8 quantization and BF16 scatter.
+// Shared NVFP4/MXFP4 fused SwiGLU, FP8 quantization and BF16 scatter. The
+// including body provides `task_global_scale`, the L1 global scale of the task.
 if constexpr (!kBlockIsL2) {
-  const float l1_global_scale =
-      l1_global_scales == nullptr ? 1.0f : __ldg(l1_global_scales + local_expert_idx);
+  const float l1_global_scale = task_global_scale;
   if constexpr (kSwapABRequested) {
     auto silu = [](float x) -> float {
       const float e = kFastMath ? __expf(-x) : expf(-x);

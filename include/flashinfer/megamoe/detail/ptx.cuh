@@ -246,6 +246,14 @@ CUTLASS_DEVICE uint64_t ld_acq_sys(const uint64_t* ptr) {
   return ret;
 }
 
+CUTLASS_DEVICE void st_release_gpu(const uint32_t* ptr, const uint32_t& value) {
+  asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(ptr), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void st_release_sys(const uint32_t* ptr, const uint32_t& value) {
+  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(ptr), "r"(value) : "memory");
+}
+
 /// Atomics
 CUTLASS_DEVICE uint32_t atomic_add(const uint32_t* ptr, const uint32_t& value) {
   uint32_t ret;

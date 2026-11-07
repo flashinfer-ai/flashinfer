@@ -18,6 +18,7 @@
 #include <flashinfer/megamoe/detail/ptx.cuh>
 #include <flashinfer/megamoe/detail/tma_copy.cuh>
 #include <flashinfer/megamoe/layout.cuh>
+#include <flashinfer/megamoe/mega_moe_eplb.cuh>
 #include <flashinfer/megamoe/mxfp4_dequant.cuh>
 #include <flashinfer/megamoe/scheduler.cuh>
 #include <flashinfer/megamoe/sym_buffer.cuh>
@@ -176,7 +177,13 @@ template <uint32_t kNumSMs,
           // on the NVFP4 side when they were runtime-gated -- so the shipped kernel
           // must not contain them at all. Defaulted, so every existing instantiation
           // (and every compile-gate row) keeps its current meaning.
-          bool kPhaseStamps = false>
+          bool kPhaseStamps = false,
+          // In-kernel weight copy of a replica plan: the dispatch warps copy the
+          // changed redundant expert slots from their resident ranks after the token
+          // pull, and the weight loader gates each redundant slot's tasks on its
+          // readiness counters. Off by default, so every existing instantiation is
+          // unchanged.
+          bool kInKernelWeightCopy = false>
 CUTLASS_GLOBAL __launch_bounds__(
     sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
     1) void sm90_mxfp4_mega_moe_fused_impl(void* y, int* cumulative_local_expert_recv_stats,
@@ -202,7 +209,10 @@ CUTLASS_GLOBAL __launch_bounds__(
                                            const float* __restrict__ l2_global_scales,
                                            // Only written when kPhaseStamps; see the slot map in
                                            // the body.
-                                           unsigned long long* __restrict__ phase_stamps) {
+                                           unsigned long long* __restrict__ phase_stamps,
+                                           // Only read when kInKernelWeightCopy.
+                                           const __grid_constant__ eplb::InKernelCopy<kNumRanks>
+                                               in_kernel_copy) {
   constexpr uint32_t BLOCK_K = 128;
   constexpr uint32_t kNumDispatchThreads = 64;
   constexpr uint32_t kNumNonEpilogueThreads = 64;
