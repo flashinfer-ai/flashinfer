@@ -1421,7 +1421,6 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "f32_v8": True, "stages": 9, "store_ef": True, "pro": 15},
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_107a', False, True, False, False, False, 2048, 16384, None): {"cgrp": True, "group_m": 8},
     ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "slots": 1, "group_m": 2, "cta1": True},
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128, "cta1": True, "group_m": 2, "pd": 2},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b', "pro": 15},
@@ -1506,7 +1505,6 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 5120, 64, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', False, True, True, False, False, 5120, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', False, False, False, False, False, 128, 5120, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
-    ('sm_107a', True, True, True, False, False, 5120, None, 5120): {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ('none', 'none'), "epi": 'reg', "b_swz": 128, "pd": 0, "pf": 0},
     ('sm_107a', False, True, True, False, False, 8192, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', True, True, True, True, False, 32, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 48, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
@@ -1532,6 +1530,38 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, False, False, 4096, None, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
     ('sm_107a', True, True, True, False, False, 4096, None, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
     ('sm_107a', True, True, False, False, False, 5120, None, 1024): {"block_n": 224, "cta_rows": 128, "hints": ('none', 'evict_first'), "cgrp": True, "pro": 15},
+    # ---- sm_107a: the 212-SM tranche - ragged rules measured on R200 (212 SMs) at T 16172 - 16384 against the plan the
+    #      row had without them, both in the cold-L2 frame and under sustained back-to-back load; the half-tail and
+    #      column-grouped forward / input-gradient rows keep every output bitwise equal to that plan's ----
+    # the 12288 -> 4096 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 12288 input gradient: the half-tail program with the column-grouped raster (at least as fast)
+    ('sm_107a', False, True, False, False, False, 4096, 12288, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 4096 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 4096, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 5120 -> 5120 input gradient: the column-grouped raster in 12-column-tile groups (at least as fast)
+    ('sm_107a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
+    # the q_b 2048 x 16384 input gradient: the half-tail program with the column-grouped raster in the default groups,
+    # in place of 8-column-tile groups (faster)
+    ('sm_107a', False, True, False, False, False, 2048, 16384, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the shared_down 2048 -> 6144 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 2048, 6144, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 12288 forward: the half-tail program with the column-grouped raster (at least as fast)
+    ('sm_107a', False, False, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 5120 -> 5120 forward: the column-grouped raster in 12-column-tile groups (at least as fast)
+    ('sm_107a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
+    # the 12288 -> 4096 weight gradient (direct orientation): the tail tiles split into 3 K parts (faster)
+    ('sm_107a', True, True, False, False, False, 12288, None, 4096): {"sk_parts": 3, "pro": 15},
+    # the 4096 -> 12288 weight gradient (direct orientation): the tail tiles split into 3 K parts, 16-row raster
+    # groups (faster)
+    ('sm_107a', True, True, False, False, False, 4096, None, 12288): {"group_m": 16, "sk_parts": 3, "pro": 15},
+    # the 5120 -> 5120 weight gradient (direct orientation): the synchronised stream-K program with the slab path and
+    # a 26-step collector margin (faster)
+    ('sm_107a', True, True, False, False, False, 5120, None, 5120): {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2},
+    # the 5120 -> 5120 fp32 weight gradient (direct orientation): the synchronised stream-K program with the slab path,
+    # a 38-step collector margin and the evict-first fp32 v8 register stores, in place of the whole-tile fp32 v8
+    # program (faster)
+    ('sm_107a', True, True, True, False, False, 5120, None, 5120): {"epi": 'reg', "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_sync_m": 38, "sk_slab": 2},
     # ---- sm_100a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB200 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
