@@ -34,8 +34,8 @@
 namespace flashinfer {
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, uint32_t head_dim,
+          typename AttentionVariant, typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
@@ -157,7 +157,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t bdx = decode_num_lanes(HEAD_DIM, vec_size);
     static_assert(bdx <= 32);
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
@@ -166,12 +166,12 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
     const uint32_t smem_size =
-        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
+        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * bdx * vec_size * sizeof(DTypeKV) +
         std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
 
-    auto kernel =
-        BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+    auto kernel = BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                                    HEAD_DIM, AttentionVariant, Params>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
