@@ -315,19 +315,28 @@ def test_packed_serving_expected_m_one_with_multi_block_groups(nk, groups):
     )
 
 
+_N512_CELL_BN32 = "seed_masked_bn__n512_k128_cell_bn32_k128"
+
+
 @pytest.mark.parametrize(
-    "groups,m,full,route",
+    "groups,m,full,route,route_sm107",
     [
-        (1, 1024, (0,), "seed_n512_k128__b1_bn32"),
-        (1, 2048, (0,), "seed_n512_k128__b1_mbn32"),
-        (4, 1024, (0, 3), "seed_n512_k128__b2_8_bn32"),
-        (4, 2048, (0, 3), "seed_n512_k128__b2_8_mbn32"),
-        (16, 1024, (2, 15), "seed_n512_k128__b9_bn128"),
-        (16, 2048, (2, 15), "seed_n512_k128__b9_mbn128"),
-        (40, 2048, (2, 39), "seed_n512_k128__b9_mbn192"),
+        (1, 1024, (0,), "seed_n512_k128__b1_bn32", _N512_CELL_BN32),
+        (1, 2048, (0,), "seed_n512_k128__b1_mbn32", _N512_CELL_BN32),
+        (4, 1024, (0, 3), "seed_n512_k128__b2_8_bn32", _N512_CELL_BN32),
+        (4, 2048, (0, 3), "seed_n512_k128__b2_8_mbn32", _N512_CELL_BN32),
+        (16, 1024, (2, 15), "seed_n512_k128__b9_bn128", _N512_CELL_BN32),
+        (16, 2048, (2, 15), "seed_n512_k128__b9_mbn128", _N512_CELL_BN32),
+        (
+            40,
+            2048,
+            (2, 39),
+            "seed_n512_k128__b9_mbn192",
+            "seed_masked_bn__n512_k128_cell_bn192_once",
+        ),
     ],
 )
-def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
+def test_n512_k128_groups_far_above_expected_m(groups, m, full, route, route_sm107):
     """``expected_m`` is only a hint: groups that fill all M rows at ``expected_m=1``
     on the N=512, K=128 routes still have every valid row written."""
     device = torch.device("cuda")
@@ -342,6 +351,9 @@ def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
     )
     if _arch() in ("sm_100a", "sm_103a"):  # the N=512, K=128 routes' architectures
         assert prepared.route == route
+    elif _arch() == "sm_107a":  # the masked BLOCK_N cells of the same geometry
+        assert prepared.parent == "seed_masked_bn"
+        assert prepared.route == route_sm107
     else:
         assert prepared.parent == "seed_masked_bn"
     out = prepared.launch()
