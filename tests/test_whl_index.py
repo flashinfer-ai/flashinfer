@@ -3,12 +3,12 @@
 `scripts/update_whl_index.py` is shared by `release.yml` (stable) and
 `nightly-release.yml` (nightly). The nightly workflow publishes artifacts even
 when the test suite fails and passes `--untested` in that case, so these tests
-pin both the untested marker and the unchanged default output the stable
-release path depends on.
+cover upload times alongside the untested marker and the stable release path.
 """
 
 import hashlib
 import importlib.util
+import json
 import pathlib
 import re
 import sys
@@ -35,6 +35,7 @@ WHEEL = "flashinfer_python-0.6.18.dev20260915-cp39-abi3-manylinux_2_28_x86_64.wh
 JIT_WHEEL = (
     "flashinfer_jit_cache-0.6.18.dev20260915+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
 )
+UPLOAD_TIME = "2026-10-28T01:02:03Z"
 
 
 def _make_dist(tmp_path, names=(WHEEL,)):
@@ -54,8 +55,22 @@ def _index_for(out_dir, package="flashinfer-python", cuda=None, nightly=True):
     return base / package / "index.html"
 
 
+def _release_assets(dist):
+    assets = dist.parent / "release-assets.json"
+    assets.write_text(
+        json.dumps(
+            [
+                {"name": wheel.name, "created_at": UPLOAD_TIME}
+                for wheel in dist.glob("*.whl")
+            ]
+        )
+    )
+    return assets
+
+
 def _run(whl_index, dist, out_dir, untested=False):
     whl_index.update_index(
+        release_assets=str(_release_assets(dist)),
         dist_dir=str(dist),
         output_dir=str(out_dir),
         base_url="https://github.com/flashinfer-ai/whl/releases/download",
@@ -71,6 +86,8 @@ def _run_cli(whl_index, monkeypatch, dist, out_dir, *args):
         "argv",
         [
             "update_whl_index.py",
+            "--release-assets",
+            str(_release_assets(dist)),
             "--dist-dir",
             str(dist),
             "--output-dir",
@@ -97,6 +114,7 @@ def test_default_row_has_no_marker(whl_index, tmp_path, monkeypatch):
         f"v0.6.18/{WHEEL}#sha256="
     ) in content
     assert f">{WHEEL}</a><br>" in content
+    assert f'data-upload-time="{UPLOAD_TIME}"' in content
     assert "data-untested" not in content
     assert "(untested)" not in content
 
@@ -120,6 +138,7 @@ def test_untested_row_is_marked(whl_index, tmp_path, monkeypatch):
 
     content = _index_for(out).read_text()
     assert 'data-untested="true"' in content
+    assert f'data-upload-time="{UPLOAD_TIME}"' in content
     assert "</a> (untested)<br>" in content
     # The href itself must be untouched so installers resolve it normally.
     assert re.search(
@@ -153,6 +172,7 @@ def test_rerun_replaces_row_instead_of_duplicating(whl_index, tmp_path):
     assert content.count("<a href=") == 1
     assert "data-untested" not in content
     assert "(untested)" not in content
+    assert f'data-upload-time="{UPLOAD_TIME}"' in content
 
 
 def test_rebuilt_wheel_replaces_row_with_new_hash(whl_index, tmp_path):

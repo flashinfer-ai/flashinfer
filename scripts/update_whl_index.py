@@ -11,10 +11,12 @@ The index is organized by CUDA version for jit-cache, and flat for others.
 """
 
 import hashlib
+import json
 import pathlib
 import re
 import argparse
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -112,7 +114,9 @@ def row_key(href: str) -> str:
     return href.split("#", 1)[0]
 
 
-def build_row(download_url: str, wheel_name: str, untested: bool) -> str:
+def build_row(
+    download_url: str, wheel_name: str, untested: bool, upload_time: str
+) -> str:
     """Build one PEP 503 anchor row for ``wheel_name``.
 
     ``data-untested`` is a custom attribute. PEP 503 only assigns meaning to the
@@ -121,12 +125,14 @@ def build_row(download_url: str, wheel_name: str, untested: bool) -> str:
     would hide it from ordinary resolution. The trailing text after the anchor
     makes the same state visible to anyone browsing the index in a browser.
     """
+    # uv reads this HTML extension for --exclude-newer (PEP 700 specifies JSON only).
+    upload_attr = f' data-upload-time="{upload_time}"'
     if untested:
         return (
-            f'<a href="{download_url}" data-untested="true">{wheel_name}</a>'
+            f'<a href="{download_url}"{upload_attr} data-untested="true">{wheel_name}</a>'
             " (untested)<br>\n"
         )
-    return f'<a href="{download_url}">{wheel_name}</a><br>\n'
+    return f'<a href="{download_url}"{upload_attr}>{wheel_name}</a><br>\n'
 
 
 def compute_sha256(file_path: pathlib.Path) -> str:
@@ -170,6 +176,7 @@ def update_parent_indices(leaf_dir: pathlib.Path, root_dir: pathlib.Path):
 
 
 def update_index(
+    release_assets: str,
     dist_dir: str = "dist",
     output_dir: str = "whl",
     base_url: str = "https://github.com/flashinfer-ai/flashinfer/releases/download",
@@ -181,6 +188,7 @@ def update_index(
     Update wheel index from dist directory.
 
     Args:
+        release_assets: JSON file with GitHub release assets (name and created_at)
         dist_dir: Directory containing wheel files
         output_dir: Output directory for index files
         base_url: Base URL for wheel downloads
@@ -197,6 +205,19 @@ def update_index(
     if not wheels:
         print(f"No wheel files found in '{dist_dir}'")
         sys.exit(1)
+
+    upload_times = {}
+    for asset in json.loads(pathlib.Path(release_assets).read_text()):
+        uploaded_at = datetime.fromisoformat(asset["created_at"].replace("Z", "+00:00"))
+        if uploaded_at.tzinfo is None:
+            raise ValueError(f"Upload time for {asset['name']} must include a timezone")
+        upload_times[asset["name"]] = (
+            uploaded_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+
+    for wheel_path in wheels:
+        if get_package_info(wheel_path) and wheel_path.name not in upload_times:
+            raise ValueError(f"Missing release asset upload time for {wheel_path.name}")
 
     print(f"Found {len(wheels)} wheel file(s)")
 
@@ -253,7 +274,9 @@ def update_index(
                 rows[row_key(match.group("href"))] = match.group(0)
 
         # Create and add new row
-        new_row = build_row(download_url, wheel_path.name, untested)
+        new_row = build_row(
+            download_url, wheel_path.name, untested, upload_times[wheel_path.name]
+        )
         key = row_key(download_url)
         is_new = rows.get(key) != new_row
         rows[key] = new_row
@@ -292,6 +315,11 @@ def main():
         description="Update wheel index for flashinfer packages"
     )
     parser.add_argument(
+        "--release-assets",
+        required=True,
+        help="JSON array of GitHub release assets with name and created_at fields",
+    )
+    parser.add_argument(
         "--dist-dir",
         default="dist",
         help="Directory containing wheel files (default: dist)",
@@ -327,6 +355,7 @@ def main():
     args = parser.parse_args()
 
     update_index(
+        release_assets=args.release_assets,
         dist_dir=args.dist_dir,
         output_dir=args.output_dir,
         base_url=args.base_url,
