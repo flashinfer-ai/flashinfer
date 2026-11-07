@@ -1867,9 +1867,8 @@ def _backward_finish(
     rows_mode = plan["group_rows"] and int(sinkhorn_iters) == SINKHORN_ITERS
     # The atomic fn split writes the transposed operand layout and, without
     # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks, its slab-fastest _os copy where bwd_slab_order names
-    # "slab", or the lpt record where a calibration of the host rule picks
-    # two-size chunks; the tables of record pick none)
+    # one-size chunks, or its slab-fastest _os copy where bwd_slab_order names
+    # "slab"; no two-size lpt record ships)
     # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
     # ``T`` rows of the padded ``dz'`` record, draws its work units from the
     # workspace's self-resetting ticket word, stores each unit's dfn Kahan

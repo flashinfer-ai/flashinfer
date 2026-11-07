@@ -32,14 +32,12 @@ and record scalars of every hidden size on its boards of record
   included), plus the programs of this package: at hidden 4096
   ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
   ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
-  ``cake_mhc_train_bwd_slab_fold__dynr`` and
-  ``cake_mhc_train_bwd_slab_fold__lpt`` on all three and the slab-fastest
-  copy ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three too; at 5120
+  ``cake_mhc_train_bwd_slab_fold__dynr`` and its slab-fastest copy
+  ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
   ``cake_mhc_train_bwd_slab_fold__dynr__h<H>`` and
-  ``cake_mhc_train_bwd_slab_fold__dynr_os__h<H>`` on sm_100a / sm_103a and
-  ``cake_mhc_train_bwd_slab_fold__lpt__h<H>`` on sm_100a (no ``lpt_os``
-  record: no two-size calibration of record).  Their
+  ``cake_mhc_train_bwd_slab_fold__dynr_os__h<H>`` on sm_100a / sm_103a (no
+  two-size record, ``lpt`` / ``lpt_os``: no two-size calibration of record).  Their
   records keep the launch, grid and roles of the deterministic records they
   replace (the fn splits with the static PDL attribute: they follow the
   token-owner pass; the column slab with its fold arguments ``dfn_slot``,
@@ -53,9 +51,9 @@ and record scalars of every hidden size on its boards of record
   except ``bwd_finish``: the deterministic token-owner records (the group-row
   forms inside ``BWD_ROW_BANDS``, the run-time-count record at another Sinkhorn
   count), the atomic fn split of the architecture and size, the column slab's
-  forms (one per call by ``bwd_slab_atomic_program``: ``dynr``, ``lpt`` and
+  forms (one per call by ``bwd_slab_atomic_program``: ``dynr`` and
   ``dynr_os`` at hidden 4096 on every architecture and at 5120 and 7168 on
-  sm_100a; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no
+  sm_100a and sm_103a), no
   reduction; every program the column slab's tables and board cells can name
   has a record on the route, and every ``_os`` record a band of them that names
   it; the route plans bind the column slab's parameter rows (``prow`` and
@@ -156,34 +154,29 @@ HIDDEN = 4096
 HIDDEN_SIZES = (4096, 5120, 7168)
 NEW_HIDDEN_SIZES = HIDDEN_SIZES[1:]
 NEW_HIDDEN_ARCHES = ("sm_100a", "sm_103a")
-# The architectures of the two-size column slab's records at 5120 and 7168 (the sizes' lpt calibrations).
-NEW_HIDDEN_LPT_ARCHES = ("sm_100a",)
 ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 OWN = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
     "cake_mhc_train_bwd_slab_fold__dynr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab_fold__lpt": ("sm_100a", "sm_103a", "sm_107a"),
     **{
         f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
         for hidden in NEW_HIDDEN_SIZES
         for program in ("fn_split_atomic__tv128_dep", "bwd_slab_fold__dynr")
     },
-    **{
-        f"cake_mhc_train_bwd_slab_fold__lpt__h{hidden}": NEW_HIDDEN_LPT_ARCHES
-        for hidden in NEW_HIDDEN_SIZES
-    },
     # The slab-fastest copies of dynr, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
-    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band. No lpt_os record ships:
-    # no two-size calibration of record is other than None (LPT_OF_RECORD), so no table can name one.
+    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band. No two-size record
+    # (lpt, lpt_os) ships: no two-size calibration of record is other than None (LPT_OF_RECORD), so no table can name
+    # one.
     "cake_mhc_train_bwd_slab_fold__dynr_os": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h5120": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h7168": ("sm_100a", "sm_103a"),
 }
 SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
 LPT = "cake_mhc_train_bwd_slab_fold__lpt"
-# The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``).
+# The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``); the
+# two-size names (LPT, LPT_OS) name no record of record.
 SLAB_OS = "cake_mhc_train_bwd_slab_fold__dynr_os"
 LPT_OS = "cake_mhc_train_bwd_slab_fold__lpt_os"
 DET_DYNR = "cake_mhc_det_train_bwd_slab__dynr"
@@ -801,14 +794,18 @@ def test_own_records_keep_the_deterministic_launch() -> None:
         assert slab["arg_plan"][-8] == ["buffer", "ticket"], hidden
         assert slab["arg_plan"][-7:-4] == FOLD_TAIL, hidden
     for hidden in HIDDEN_SIZES:
+        table = _lpt_table(hidden)
+        assert set(table) == set(det.ARCHES), hidden
+        calibrated = {
+            arch for arch, calibration in table.items() if calibration is not None
+        }
+        if _lpt(hidden) not in nd.MODULES:
+            assert not calibrated and _lpt(hidden) not in OWN, hidden
+            continue
         slab, lpt = nd.MODULES[_slab(hidden)], nd.MODULES[_lpt(hidden)]
         assert lpt["role"] == "bwd_slab" and lpt["hidden"] == hidden, hidden
         assert set(lpt["arches"]) <= set(slab["arches"]), hidden
-        table = _lpt_table(hidden)
-        assert set(table) == set(det.ARCHES), hidden
-        assert set(lpt["arches"]) == {
-            arch for arch, calibration in table.items() if calibration is not None
-        }, hidden
+        assert set(lpt["arches"]) == calibrated, hidden
         assert lpt["launch"] == slab["launch"], hidden
         assert lpt["grid_rule"] == {**slab["grid_rule"], "chunks_rule": "lpt_chunks"}
         assert lpt["arg_plan"] == [
@@ -2093,7 +2090,7 @@ _TWO_SIZE_CASES = [
     for arch, sm in det.RULES_BOARDS
     for hidden in det.supported_hidden_sizes(arch)
     for calibration in (
-        ("record", "screen") if arch in OWN[_lpt(hidden)] else ("record",)
+        ("record", "screen") if arch in OWN.get(_lpt(hidden), ()) else ("record",)
     )
 ]
 
@@ -2261,7 +2258,7 @@ def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
     screened = [
         f for a, s, h, f in LPT_SCREEN_FIRES_HIDDEN if (a, s, h) == (arch, sm, hidden)
     ]
-    assert bool(screened) == (arch in OWN[_lpt(hidden)] and sm == 148), (arch, sm)
+    assert bool(screened) == ((arch, sm) == ("sm_100a", 148)), (arch, sm)
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(_lpt_table(hidden), arch, LPT_SCREEN)
         _clear_plans()
@@ -2337,24 +2334,20 @@ def test_two_size_makespan_runs_are_the_unit_by_unit_schedule() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("order", ("chunk",))
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
-def test_forced_geometry_is_read_at_call_time(
-    monkeypatch, hidden: int, order: str
-) -> None:
-    """``lpt_chunks`` and ``BWD_SLAB_ORDER`` are module globals read at call time, at every hidden size (on B200, whose
-    routes hold the ``lpt`` record of each size; the size's order set to ``order``, the chunk order, for every token
-    count: no two-size record of the slab order ships): a replacement that forces a geometry at one token count moves ``slab_plan``,
-    ``bwd_slab_atomic_program``, the selection and the size's ``lpt`` (``lpt_os``) record's launch grid (``min(SMs, H
-    / 64 x P)``) there, never the ``dynr`` (``dynr_os``) record's; a forced geometry that does not cover the tokens is
-    a ``ValueError``; without the replacement the size's table decides (``None``: ``dynr`` / ``dynr_os`` and the
-    one-size chunks).  Each of these asks the rule at the size (the replacement records the hidden size it is asked
-    at): at 80 / 112 slabs both forced grids are the SM count, so only that record shows that ``launch_grid`` reads
-    the record's hidden size."""
+def test_forced_geometry_is_read_at_call_time(monkeypatch, hidden: int) -> None:
+    """``lpt_chunks`` is a module global read at call time, at every hidden size (on B200, the size's order set to
+    ``"chunk"`` for every token count): a replacement that forces a geometry at one token count moves ``slab_plan``
+    and ``bwd_slab_atomic_program`` (``lpt``) there, and since no two-size record ships, the ``bwd_finish`` selection
+    refuses the call (a ``ValueError``, never a backward without the column slab); the ``dynr`` record's launch grid
+    (``min(SMs, H / 64 x P)`` over the one-size chunks) never moves.  A forced geometry that does not cover the tokens
+    is a ``ValueError``; without the replacement the size's table decides (``None``: ``dynr`` and the one-size chunks,
+    the selection's one column slab).  Each of these asks the rule at the size (the replacement records the hidden
+    size it is asked at)."""
     arch, sm, T = "sm_100a", 148, 2049
     monkeypatch.setattr(nd, "sm_count", lambda _index: sm)
     monkeypatch.setattr(nd, "device_arch", lambda _index: arch)
-    monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, order),))
+    monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, "chunk"),))
     rule, forced, seen = nd.lpt_chunks, {}, []
 
     def forcing(t, s, a, hidden=HIDDEN):
@@ -2362,8 +2355,8 @@ def test_forced_geometry_is_read_at_call_time(
         return forced[t] if t in forced else rule(t, s, a, hidden=hidden)
 
     monkeypatch.setattr(nd, "lpt_chunks", forcing)
-    suffix = "_os" if order == "slab" else ""
-    slab, lpt = _record_of("dynr" + suffix, hidden), _record_of("lpt" + suffix, hidden)
+    slab = _record_of("dynr", hidden)
+    assert _lpt(hidden) not in nd.MODULES, hidden
     slabs = hidden // det.SLAB_D
     plan = nd.host_plan(T, sm, arch, hidden)
     one = (plan["parts"], plan["rows_per_chunk"], plan["parts"], plan["rows_per_chunk"])
@@ -2375,17 +2368,10 @@ def test_forced_geometry_is_read_at_call_time(
         assert nd.slab_plan(T, sm, arch, hidden) == dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
         )
-        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "lpt" + suffix
-        names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
-        assert names[-1] == lpt and slab not in names, names
+        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "lpt"
+        with pytest.raises(ValueError, match="selects 0 column-slab records"):
+            nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
         assert seen and set(seen) == {hidden}, seen
-        seen.clear()
-        assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == (
-            min(sm, slabs * geometry[0]),
-            1,
-            1,
-        )
-        assert seen == [hidden], seen
         assert nd.launch_grid(nd.MODULES[slab], T, device_index=0) == dynr_grid
         assert nd.slab_plan(T + 64, sm, arch, hidden) != dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
@@ -2393,21 +2379,15 @@ def test_forced_geometry_is_read_at_call_time(
     forced[T] = (2, 512, 1, 64)  # 576 tokens: not a partition of 2049
     with pytest.raises(ValueError, match="not a two-size geometry"):
         nd.slab_plan(T, sm, arch, hidden)
-    with pytest.raises(ValueError, match="not a two-size geometry"):
-        nd.launch_grid(nd.MODULES[lpt], T, device_index=0)
     del forced[T]
-    assert (
-        nd.bwd_slab_atomic_program(T, sm, arch, hidden)
-        == ("lpt" if rule(T, sm, arch, hidden=hidden) else "dynr") + suffix
-    )
-    monkeypatch.setitem(_lpt_table(hidden), arch, None)
-    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr" + suffix
+    assert _lpt_table(hidden)[arch] is None, hidden
+    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr"
     names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
-    assert names[-1] == slab and lpt not in names, names
+    assert names[-1] == slab, names
     assert nd.slab_plan(T, sm, arch, hidden) == dict(
         zip(LPT_HOST_KEYS, one, strict=True)
     )
-    assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == dynr_grid
+    assert nd.launch_grid(nd.MODULES[slab], T, device_index=0) == dynr_grid
 
 
 @pytest.mark.cpu_only
@@ -2451,7 +2431,7 @@ _ONE_SIZE_CASES = [
     pytest.param(arch, sm, hidden, id=f"{arch}-{sm}-H{hidden}")
     for arch, sm in det.RULES_BOARDS
     for hidden in NEW_HIDDEN_SIZES
-    if arch not in OWN[_lpt(hidden)]
+    if arch not in OWN.get(_lpt(hidden), ())
 ]
 
 
