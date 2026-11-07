@@ -33,6 +33,8 @@ import torch
 
 import flashinfer
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
 CKV_DIM = 512
 KPE_DIM = 64
 SM_SCALE = 1.0 / math.sqrt(CKV_DIM + KPE_DIM)
@@ -52,6 +54,7 @@ def _reference(q_nope, q_pe, ckv, kpe):
 
 
 def _run_fa2_mla(q_nope, q_pe, ckv, kpe):
+    """Run one FA2 MLA decode request over contiguous pages and return its output."""
     seq_len = ckv.shape[0] * ckv.shape[1]
     num_pages = ckv.shape[0]
     device = q_nope.device
@@ -82,6 +85,12 @@ def _run_fa2_mla(q_nope, q_pe, ckv, kpe):
 
 
 def _make_inputs(seq_len, magnitude, constant):
+    """Build one request worth of q and kv tensors on cuda, scaled by magnitude.
+
+    Constant inputs fill every element with the same value, so each KV position
+    scores identically; otherwise the values come from a fixed-seed normal
+    distribution clamped to the fp16 range.
+    """
     num_pages = seq_len // PAGE_SIZE
     if constant:
         # Every KV position gets the same score, so the exact output is V itself
@@ -113,6 +122,7 @@ def _make_inputs(seq_len, magnitude, constant):
 
 @pytest.mark.parametrize("magnitude", [6000.0, 12000.0, 30000.0])
 def test_constant_scores_large_logits_are_exact(magnitude):
+    """A uniform-score row must return V itself, not NaN, for large scaled maxima."""
     # 512 * magnitude * magnitude * SM_SCALE is ~7.7e8 for magnitude 6000: the
     # fp32 ulp of the scaled maximum is already 64, so exp2(rounding error)
     # overflowed the fp16 P and the whole row came back as NaN.
@@ -125,6 +135,7 @@ def test_constant_scores_large_logits_are_exact(magnitude):
 
 
 def test_random_large_logits_match_fp64_reference():
+    """Random large-magnitude inputs must stay finite and match the fp64 reference."""
     # 32 KV tiles of online-softmax history rescale on top of the per-tile
     # exponent; this reproduces the NaN end to end.
     q_nope, q_pe, ckv, kpe = _make_inputs(2048, 20000.0, constant=False)
@@ -138,8 +149,7 @@ def test_random_large_logits_match_fp64_reference():
 
 
 def test_normal_logits_still_match_fp64_reference():
-    # Control: ordinary logits keep the fp16-level accuracy they had before the
-    # exponent was rewritten.
+    """Control: ordinary logits keep the fp16-level accuracy of the old exponent path."""
     q_nope, q_pe, ckv, kpe = _make_inputs(1024, 1.0, constant=False)
     out = _run_fa2_mla(q_nope, q_pe, ckv, kpe)
     reference = _reference(q_nope, q_pe, ckv, kpe)
