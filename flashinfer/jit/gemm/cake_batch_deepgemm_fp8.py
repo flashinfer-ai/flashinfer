@@ -8,9 +8,9 @@ on), the exact compile flags of the source build, the tvm-ffi entry, the kernel
 symbol and the id of its positional argument plan in ``ARG_PLANS``.  ``MODULES``
 names one JIT module per (program, architecture).  ``SERVING_PROGRAMS`` maps a
 packed-scale serving configuration to its program (a key qualified by an
-architecture, ``"sm_103a:<configuration>"``, takes precedence on that
-architecture).  ``DISPATCH_TABLES`` holds, per architecture and SM count, the
-ordered first-match route chain of the Cake
+architecture, ``"sm_103a:<configuration>"`` or ``"sm_107a:<configuration>"``,
+takes precedence on that architecture).  ``DISPATCH_TABLES`` holds, per
+architecture and SM count, the ordered first-match route chain of the Cake
 dispatcher, driven by the route table at the end of this module (``_ROUTES`` read
 by ``select``): every predicate, launch grid, argument binding and workspace shape
 is a function of the five scalars ``(B, M, N, K, expected_m)``; a string argument
@@ -1452,14 +1452,20 @@ MODULES: dict[str, dict[str, str]] = {
 
 SERVING_PROGRAMS: dict[str, str] = {
     "n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
+    "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_d6e942459cd927602da9",
     "n4096_k7168_g32_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_46272696cde7145a5da4",
     "n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
+    "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_d4947478442a83de8873",
     "n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
     "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
+    "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ba8f5c7a6e58631c0626",
     "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
     "sm_103a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0",
+    "sm_107a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0",
     "n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
+    "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_eeb77812570514381d69",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    "sm_107a:n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_afcc5247e82d569b4b01",
 }
 
 ARCH_NVCC_FLAGS = {

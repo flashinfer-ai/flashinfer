@@ -387,7 +387,7 @@ def test_out_of_band_problems_raise():
         2, 128, 7168, 2048, seed=932, device=device
     )
     assert 2 not in PACKED_GROUPS and (7168, 2048) in PACKED_NK
-    assert "sm_107a" not in PACKED_ARCHS
+    assert PACKED_ARCHS == {"sm_100a", "sm_103a", "sm_107a"}
     with pytest.raises(ValueError, match="packed UE8M0"):
         prepare_batch_deepgemm_fp8_nt_groupwise(
             a,
