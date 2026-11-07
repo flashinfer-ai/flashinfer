@@ -39,7 +39,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # The SM120 Cake MegaMoE device source parts, instance wrappers and geometry table are generated
 # and sealed by cake_sm120_megamoe_manifest.json; keep their bytes.
 # The csrc/ trees of the Cake-exported packages (flashinfer-ai/flashinfer#6553: the rmsnorm
-# training and mHC training backends, the causal conv1d, ulysses and fused QK RoPE append (BF16 / FP8) backends, cake_dsa_sparse_attention_nondet_train, cake_kda_train / cake_kda_det_train / cake_kda_det_train_kcp, cake/cake_dsa_indexer_det_train, cake_mok_bf16, cake_moe_grouped_det_gemm,
+# training and mHC training backends, the causal conv1d, ulysses and fused QK RoPE append (BF16 / FP8) backends, cake_dsa_sparse_attention_nondet_train / cake_dsa_sparse_attention_det_train, cake_kda_train / cake_kda_det_train / cake_kda_det_train_kcp, cake/cake_dsa_indexer_det_train, cake_mok_bf16, cake_moe_grouped_det_gemm,
 # cake_lm_head_loss / cake_lm_head_det_loss, dense_projection_det_gemm, dense_projection_gemm, cake_stepfun_moe, nvfp4_attention, cake_nvfp4_ptilemax_attention, deepgemm_fp8_gemm, deepgemm_batched_gemm, deepgemm_mega_gate, nvfp4_sparse_mla_decode) are rendered by the Cake exporters and
 # digest-checked by their build.json manifests; keep their bytes.  The package-root loaders,
 # cake_build.py and build.json next to them stay checked.

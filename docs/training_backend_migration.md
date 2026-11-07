@@ -556,5 +556,4 @@ On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the name
 ## Reserved names
 
 - `flashinfer.cake_dsa_indexer_nondet_train`: DSA indexer `nondet`, not implemented.
-- `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.
 - `flashinfer.cake_gqa_det_train` (`cake_gqa_det`, `CakeGQADetFunction`): GQA HD256 `det`, not implemented.

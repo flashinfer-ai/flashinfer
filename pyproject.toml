@@ -108,6 +108,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
