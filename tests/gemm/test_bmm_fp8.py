@@ -182,11 +182,13 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
     assert cos_sim > 0.99
 
 
-def _bias_case(res_dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+def _bias_case(
+    res_dtype: torch.dtype, b: int = 2, m: int = 48
+) -> tuple[torch.Tensor, ...]:
     major, minor = get_compute_capability(torch.device("cuda"))
     if not bmm_fp8.is_backend_supported("cublas", major * 10 + minor):
         pytest.skip("bmm_fp8 takes a bias only with the cublas backend (SM89+).")
-    b, m, n, k = 2, 48, 80, 256
+    n, k = 80, 256
     input_fp8, input_inv_s = to_float8(
         torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
     )
@@ -198,11 +200,15 @@ def _bias_case(res_dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
 
 
 # The fuzzer has no bias axis, so the cuBLASLt bias epilogue is anchored here.
+# Batch 1 has no batch stride, and M=1 is a decode step.
+@pytest.mark.parametrize(("b", "m"), [(2, 48), (1, 1)])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cublas", "auto"])
-def test_bmm_fp8_bias(backend: str, res_dtype: torch.dtype, auto_tuning: bool) -> None:
-    input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(res_dtype)
+def test_bmm_fp8_bias(
+    backend: str, res_dtype: torch.dtype, auto_tuning: bool, b: int, m: int
+) -> None:
+    input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(res_dtype, b, m)
     with autotune(auto_tuning):
         res = bmm_fp8(
             input_fp8,
@@ -226,9 +232,24 @@ def test_bmm_fp8_bias_rejected() -> None:
     # A backend without the bias epilogue refuses the bias instead of dropping it.
     with pytest.raises(ValueError, match="cublas"):
         bmm_fp8(*args, backend="cudnn", bias=bias)
-    # The batch-invariant class replaces the backends and takes no bias.
-    with pytest.raises(ValueError, match="batch_invariant"):
-        bmm_fp8(*args, backend="auto", batch_invariant=True, bias=bias)
+    # The batch-invariant class replaces the backends and takes no bias,
+    # also when skip_check=True skips the problem-size check.
+    for skip_check in (False, True):
+        with pytest.raises(ValueError, match="batch_invariant"):
+            bmm_fp8(
+                *args,
+                backend="auto",
+                batch_invariant=True,
+                bias=bias,
+                skip_check=skip_check,
+            )
+    # One value per output column, in the output dtype.
+    for wrong in (
+        torch.randn(bias.numel() + 8, device="cuda").to(bias.dtype),
+        bias.float(),
+    ):
+        with pytest.raises(ValueError, match="bias must have shape"):
+            bmm_fp8(*args, bias=wrong)
     # A bias 2 bytes past an allocation has no cuBLASLt algo, so it is refused upfront.
     misaligned = torch.empty(bias.numel() + 1, device="cuda", dtype=bias.dtype)[1:]
     with pytest.raises(ValueError, match="aligned"):

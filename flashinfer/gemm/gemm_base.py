@@ -241,9 +241,14 @@ def get_gemm_module():
                 # Must be synthesis-invariant: including a.shape (dynamic M)
                 # makes the runtime key miss the bucketed profile key, so the
                 # tuned tactic is dropped for tactic=-1. Shapes are already in
-                # the autotuner's input_shapes; add only dtypes.
+                # the autotuner's input_shapes; add only dtypes and the bias
+                # alignment, which the algo list a tactic indexes depends on
+                # (profiling reuses the bias tensor, so it is invariant too).
                 a, b, out = inputs[0], inputs[1], inputs[4]
-                return (a.dtype, b.dtype, out.dtype)
+                bias = self._bias(inputs)
+                if bias is None:
+                    return (a.dtype, b.dtype, out.dtype)
+                return (a.dtype, b.dtype, out.dtype, self._pointer_alignment(bias))
 
             @staticmethod
             def _bias(inputs: List[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -10394,11 +10399,6 @@ def _check_bmm_fp8_problem_size(
 ):
     _validate_fp8_output_dtype(dtype)
     if bias is not None:
-        if batch_invariant:
-            raise ValueError(
-                "bmm_fp8 supports a bias only with the cublas backend, "
-                "not with batch_invariant=True."
-            )
         if bias.shape != (B.shape[2],) or bias.dtype != dtype:
             raise ValueError(
                 f"bias must have shape {(B.shape[2],)} and dtype {dtype}, "
@@ -10591,6 +10591,12 @@ def bmm_fp8(
     """
 
     if batch_invariant:
+        # Here rather than in the problem-size check, which skip_check=True skips.
+        if bias is not None:
+            raise ValueError(
+                "bmm_fp8 supports a bias only with the cublas backend, "
+                "not with batch_invariant=True."
+            )
         from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
 
         return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
