@@ -9,6 +9,8 @@ import torch.distributed as dist
 from flashinfer import moe_ep
 from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
 
+pytestmark = pytest.mark.node_exclusive
+
 
 @pytest.mark.arch_blackwell
 @pytest.mark.gpu_4
@@ -19,6 +21,7 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
         (768, None, 128, "grouped"),
         (1536, None, 128, "phase_interleave"),
         (1536, {"load_balance_mode": "static"}, 128, "grouped"),
+        (1536, {"schedule_mode": "phase_interleave"}, 128, "phase_interleave"),
         (
             1536,
             {"schedule_policy": ("phase_interleave", None)},
@@ -28,6 +31,7 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
     ],
 )
 def test_mxfp4_default_bands(capacity, knobs, tile_n, schedule, monkeypatch):
+    """Check selected tactics, reference accuracy, and fresh graph outputs."""
     if not torch.cuda.is_available():
         pytest.skip("requires Blackwell")
     rank = int(os.environ.get("RANK", "0"))
@@ -97,9 +101,10 @@ def test_mxfp4_default_bands(capacity, knobs, tile_n, schedule, monkeypatch):
         with torch.cuda.graph(graph):
             captured = layer.forward(tensors, return_workspace_view=True)
         for _ in range(3):
+            captured.fill_(float("nan"))
             graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, eager, atol=0, rtol=0)
     finally:
         if graph is not None:
             graph.reset()
@@ -108,7 +113,9 @@ def test_mxfp4_default_bands(capacity, knobs, tile_n, schedule, monkeypatch):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.gpu_4
-def test_mxfp4_rank_agreement_before_pool_reuse():
+@pytest.mark.parametrize("failure", ["mismatch", "config", "occupancy"])
+def test_mxfp4_rank_agreement_before_pool_reuse(failure, monkeypatch):
+    """Reject divergent settings and rank-local failures before pooled reuse."""
     if not torch.cuda.is_available():
         pytest.skip("requires Blackwell")
     rank = int(os.environ.get("RANK", "0"))
@@ -141,10 +148,25 @@ def test_mxfp4_rank_agreement_before_pool_reuse():
             )
             layers.append(layer)
             if len(layers) == 3:
+                # Inject failures after construction to test workspace preparation.
+                if rank == 0 and failure == "config":
+                    monkeypatch.setattr(
+                        layer._kernel._config, "knobs", {"schedule_mode": "invalid"}
+                    )
+                if rank == 0 and failure == "occupancy":
+
+                    def failed_probe(cluster_size):
+                        """Model a recoverable driver occupancy-query failure."""
+                        raise RuntimeError("occupancy probe failed")
+
+                    monkeypatch.setattr(layer._kernel, "_active_clusters", failed_probe)
                 # Only rank 0 would miss the pool without the agreement check.
-                with pytest.raises(
-                    moe_ep.MoEEpConfigError, match="differs across EP ranks"
-                ):
+                message = {
+                    "mismatch": "differs across EP ranks",
+                    "config": "rank 0: MoEEpConfigError: Unsupported schedule_mode",
+                    "occupancy": "rank 0: RuntimeError: occupancy probe failed",
+                }[failure]
+                with pytest.raises(moe_ep.MoEEpConfigError, match=message):
                     layer._ensure_workspace()
             elif len(layers) == 2:
                 assert layer._ensure_workspace() is layers[0]._ensure_workspace()
