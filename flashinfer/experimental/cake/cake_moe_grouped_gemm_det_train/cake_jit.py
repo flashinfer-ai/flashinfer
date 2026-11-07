@@ -73,13 +73,13 @@ from . import cake_build
 # head and two tail k steps of an item around the release of the
 # accumulator's halves instead of four and three; the data-gradient
 # ``main_wide_ts33`` stage is the twin of ``main_wide`` that splits three head
-# and three tail k steps around that release, launched in its place on the architectures of
-# ``dgrad_wide_ts33_archs`` when the groups average at least the architecture's
-# ``dgrad_wide_ts33_min_rows`` rows and the output has at least
-# ``dgrad_wide_ts33_min_k`` columns, and the forward ``main_wide_ts33`` stage on
-# the architectures of ``fwd_wide_ts33_archs`` when the reduction K is at most
-# ``fwd_wide_ts33_max_k`` with at most ``fwd_wide_ts33_max_rows`` rows per
-# group; the weight gradient
+# and three tail k steps around that release, launched in its place on the
+# architectures of ``dgrad_wide_ts33_archs`` when the groups average at least
+# the architecture's ``dgrad_wide_ts33_min_rows`` rows and the output has at
+# least ``dgrad_wide_ts33_min_k`` columns, and the forward ``main_wide_ts33``
+# stage on the architectures of ``fwd_wide_ts33_archs`` when the reduction K is
+# at most ``fwd_wide_ts33_max_k`` with at most ``fwd_wide_ts33_max_rows`` rows
+# per group; the weight gradient
 # takes the 512-wide k tile on the architectures of ``k512_archs`` when the
 # groups average at least the architecture's ``k512_min_rows_per_group`` rows;
 # the weight-gradient ``main_wave`` stage is the main program with wave
