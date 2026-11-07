@@ -23,10 +23,11 @@ residual quantization error no longer carries the value DC component. P is
 E4M3 through the ExpCast path in both recipes of the Q/K side:
 
 * VC-Attention-QK16 keeps Q and K in bf16 (plan ``q_dtype`` bf16);
-* VC-Attention-QK8 (plan ``q_dtype`` E4M3) centres K by its per-head channel
-  mean, rotates Q and K by the normalised 128-point Hadamard matrix and
-  quantizes them to E4M3 with one scale per 128-token Q block and per
-  128-token K tile, as the paper does.
+* VC-Attention-QK8 (plan ``q_dtype`` E4M3 or INT8) centres K by its per-head
+  channel mean, rotates Q and K by the normalised 128-point Hadamard matrix and
+  quantizes them with one scale per 128-token Q block and per 128-token K tile.
+  INT8 Q/K is the paper's B200 configuration and needs the INT8 tensor core
+  of SM100; E4M3 Q/K is its B300 configuration.
 
 This module holds what the kernel and the plan need: the tile constants, the
 mean operand shapes, ``VCAttentionConfig`` and ``VCAttentionParams`` with
@@ -64,6 +65,18 @@ VC_MEAN_MMA_K = 16
 VC_MEAN_OPERANDS = 2
 VC_MEAN_GROUP_TILES = VC_MEAN_OPERANDS * VC_MEAN_MMA_K // 2
 E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+# Largest magnitude of the symmetric INT8 Q/K code of VC-Attention-QK8 on B200.
+INT8_QK_MAX = float(torch.iinfo(torch.int8).max)
+
+
+def vc_qk8_dtype(device: torch.device | int | str) -> torch.dtype:
+    """The Q/K code type of VC-Attention-QK8 on ``device``: INT8 on SM100 (B200),
+    whose tensor core multiplies INT8 codes, and E4M3 on every other Blackwell,
+    as the paper configures B200 and B300. VC plans reject SM107, so the E4M3
+    answer there only names the preparation's code type."""
+    if torch.cuda.get_device_capability(device) == (10, 0):
+        return torch.int8
+    return torch.float8_e4m3fn
 
 
 def vc_mean_group_shape(head_dim: int) -> tuple[int, int]:
@@ -155,19 +168,19 @@ def vc_scale_shapes(
     head_dim: int,
     seq_len_q: int | None = None,
     num_qo_heads: int | None = None,
-    qk_fp8: bool = False,
+    qk_quant: bool = False,
 ) -> dict[str, tuple[int, ...]]:
     """Return the shape of every ``VCAttentionParams`` tensor a plan consumes, by
-    field name. ``qk_fp8`` adds the Q/K scales of VC-Attention-QK8, which need
-    ``seq_len_q`` and ``num_qo_heads``."""
+    field name. ``qk_quant`` adds the Q/K scales of VC-Attention-QK8 (E4M3 or
+    INT8 Q/K), which need ``seq_len_q`` and ``num_qo_heads``."""
     num_kv_tiles = _blocks(seq_len_kv, VC_K_BLOCK_SIZE)
     if config.repair_tiles:
         # The repair tiles follow the whole tiles.
         seq_len_kv = vc_repair_kv_len(seq_len_kv, config.repair_tiles)
     shapes: dict[str, tuple[int, ...]] = {}
-    if qk_fp8:
+    if qk_quant:
         if seq_len_q is None or num_qo_heads is None:
-            raise ValueError("qk_fp8 scale shapes need seq_len_q and num_qo_heads")
+            raise ValueError("qk_quant scale shapes need seq_len_q and num_qo_heads")
         shapes["q_scale"] = (
             num_qo_heads,
             batch_size,
@@ -294,6 +307,8 @@ def vc_reference(
 
 __all__ = [
     "E4M3_MAX",
+    "INT8_QK_MAX",
+    "vc_qk8_dtype",
     "VC_HEAD_DIM",
     "VC_K_BLOCK_SIZE",
     "VC_MEAN_MMA_K",
