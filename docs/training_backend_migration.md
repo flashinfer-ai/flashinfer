@@ -62,7 +62,7 @@ Every shipped training module after the renames. Each module has a backend packa
 | LM head + loss | `flashinfer.cake_lm_head_det_train` | det | single rank | #8925 |
 |  | `flashinfer.cake_lm_head_nondet_train` | nondet | single rank | #8952 |
 | DSA indexer | `flashinfer.cake_dsa_indexer_det_train` | det | single rank | #8936 |
-|  | `flashinfer.cake_dsa_indexer_nondet_train` | nondet | single rank | #NNNN |
+|  | `flashinfer.cake_dsa_indexer_nondet_train` | nondet | single rank | #9113 |
 | DSA sparse attention | `flashinfer.cake_dsa_sparse_attention_nondet_train` | nondet | single rank | #8942 |
 | GQA HD256 | `flashinfer.cake_gqa_nondet_train` | nondet | single rank | #8939 |
 
