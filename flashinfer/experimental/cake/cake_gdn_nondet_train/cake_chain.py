@@ -515,12 +515,26 @@ def _tensor_index(t) -> int:
     return index if index >= 0 else torch.cuda.current_device()
 
 
+# (stage, device index) -> (the architecture lookup it was resolved with, the record's parameter order of
+# :func:`_order`), filled by the stage's first launch on the device, so a launch reads one entry instead of the
+# device's architecture and the order cache (host time per launch counts on a Grace host); a replaced
+# ``cake_backend.device_arch`` resolves it again
+_LAUNCH_ORDERS: dict = {}
+
+
 def _launch(stage, gx, gy, gz, *values):
     """Launch ``stage`` on ``(gx, gy, gz)``; ``values`` in call-site order, the first a tensor on the device."""
-    device_index = _tensor_index(values[0])
-    order = _order(stage, cake_backend.device_arch(device_index))
+    device_index = values[0].get_device()
+    if device_index < 0:
+        device_index = torch.cuda.current_device()
+    key = (stage, device_index)
+    found = _LAUNCH_ORDERS.get(key)
+    arch_of = cake_backend.device_arch
+    if found is None or found[0] is not arch_of:
+        found = _LAUNCH_ORDERS[key] = (arch_of, _order(stage, arch_of(device_index)))
+    order = found[1]
     if order is not None:
-        values = tuple(values[i] for i in order)
+        values = tuple([values[i] for i in order])
     cake_backend.launch_stage(stage, (gx, gy, gz), values, device_index=device_index)
 
 
