@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from b12x.attention.paged.planner import create_paged_plan
@@ -11,6 +12,57 @@ from b12x.attention.paged.traits import (
 )
 
 from .test_attention_paged_planner import _make_inputs
+
+
+@pytest.mark.parametrize("head_dim_qk", [64, 128, 192, 256])
+def test_head64_decode_admits_one_kv_mma_for_bf16(head_dim_qk) -> None:
+    # The 16-row decode sweep has a single KV MMA candidate, so this layout
+    # does not depend on the device's shared-memory capacity.
+    traits = select_paged_forward_traits(
+        cta_tile_q=16,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    assert traits.num_warps_q == 1
+    assert traits.num_mma_kv == 1
+    assert traits.num_mma_d_vo == 4
+    assert traits.cta_tile_kv == traits.num_warps_kv * 16
+    assert traits.launch_smem_bytes <= traits.max_smem_per_threadblock
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {"q_dtype": torch.float16, "o_dtype": torch.bfloat16}, id="fp16-query"
+        ),
+        pytest.param({"kv_dtype": torch.float16}, id="fp16-kv"),
+        pytest.param({"o_dtype": torch.float16}, id="fp16-output"),
+        pytest.param({"kv_dtype": torch.float8_e4m3fn}, id="fp8-kv"),
+        pytest.param({"cta_tile_q": 8}, id="non-decode-tile"),
+        pytest.param({"cta_tile_q": 64}, id="multiple-query-warps"),
+        pytest.param({"exact_num_mma_kv": 3}, id="three-kv-mmas"),
+        pytest.param({"head_dim_qk": 80}, id="qk-not-multiple-of-64"),
+        pytest.param({"head_dim_qk": 320}, id="qk-above-256"),
+    ],
+)
+def test_head64_decode_rejects_unsupported_exact_layouts(overrides) -> None:
+    arguments = dict(
+        cta_tile_q=16,
+        head_dim_qk=64,
+        head_dim_vo=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        exact_num_mma_kv=1,
+        device="cuda",
+    )
+    arguments.update(overrides)
+    with pytest.raises(ValueError, match="no valid NUM_MMA_KV"):
+        select_paged_forward_traits(**arguments)
 
 
 def test_paged_decode_fp8_traits_match_flashinfer_shape_rules() -> None:
@@ -39,7 +91,9 @@ def test_paged_decode_fp8_traits_match_flashinfer_shape_rules() -> None:
     assert traits.shared_storage_bytes == 66048
 
 
-def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -> None:
+def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache(
+    monkeypatch,
+) -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5, 7, 4],
         cache_seqlens=[97, 81, 113, 68],
@@ -52,6 +106,17 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
         cache_seqlens,
         cu_seqlens_q,
     )
+    # The KV tile grows with shared memory; pin the SM12x limits so the
+    # expectation does not follow the CI GPU (228 KiB on SM90/SM100).
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     traits = select_paged_forward_traits_from_plan(plan)
 
     assert traits.cta_tile_q == 64
@@ -63,7 +128,16 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
     assert traits.shared_storage_bytes == 49152
 
 
-def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
+def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits(monkeypatch) -> None:
+    # Pin the SM12x shared-memory limits, as above.
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
     fp8_traits = select_paged_forward_traits(
         cta_tile_q=32,
         head_dim_qk=256,
