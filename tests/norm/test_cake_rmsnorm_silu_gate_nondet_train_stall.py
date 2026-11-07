@@ -17,30 +17,34 @@ Stall regression of the Cake SiLU-gated RMSNorm training forward and the
 non-deterministic (``nondet``) backward beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
-The forward launches a plain grid of independent CTAs; up to 12 rows per SM
-on SM100 and SM103 (59 on SM107) the short forward launches one 256-thread CTA
-per row
-block (fewer CTAs than SMs on SM100 and SM103; on SM107 with 205 SMs or more,
-as with 212 or 216, at most one wave of 4 CTAs per SM on all SMs but 16, a
-bound fewer SMs do not keep at 59 rows per SM), from 976 rows per SM on SM100
-and SM103 (800 on
-SM107) the mid forward whole waves of 6 CTAs per SM that each walk at most 2
-row blocks, and from 2400 rows per SM (1740 on SM107) the long forward whole
-waves of 3 CTAs per SM that each walk at most 6.  The backward launches
-at most one wave of CTAs (on SM100 and SM103 from 1280 rows per SM the long
-backward 5 CTAs per SM, a quarter more than an SM holds at once, its fifth on
-an SM starting as one of the first four leaves): when the grid has a CTA for
-every row block, each
-CTA takes its own block; past one wave the CTAs claim every block in chunks of
-consecutive blocks from the workspace's claim counter, chunks that shrink to
-single blocks at the end, each CTA its next chunk as the last block of its
-current one starts, so a CTA that starts late takes fewer blocks (one that
-becomes resident after every chunk was claimed takes none).  The CTAs add their weight-gradient
-sums into FP64 accumulators and take a ticket on the arrival word; whichever
-CTA arrives last finishes the sum, and no CTA waits for another.  Up to 256
-rows the short backward launches one cluster of 16 CTAs,
-scheduled together on the SMs of one GPC, whose CTAs each wait for the other
-CTAs' FP32 partials of their columns and finish them, with no workspace.  Beside a
+The forward launches a plain grid of independent CTAs, one 64-thread CTA per
+block of 8 rows.  Up to 12 rows per SM on SM100 and SM103 (59 on SM107) the
+short forward launches one 256-thread CTA per block of 16 rows (fewer CTAs
+than SMs on SM100 and SM103; on SM107 with 205 SMs or more, as with 212 or
+216, at most 4 CTAs per SM on all SMs but 16, which fewer SMs do not keep at
+59 rows per SM).  From 976 rows per SM on SM100 and SM103 (800 on SM107) the
+mid forward launches whole waves of 6 CTAs per SM that each walk at most 2
+blocks of 16 rows; from 2400 rows per SM on SM100 and SM103 the long forward,
+and from 3000 rows per SM on SM103 (1740 on SM107, which routes no long
+forward) the extra-long forward, launch whole waves of 3 CTAs per SM that each
+walk at most 6 blocks of 32 rows.
+
+The backward cuts the rows into blocks of 8 rows and the blocks into
+``C = ceil(blocks / B)`` chunks of ``B = max(1, ceil(blocks / 8192))``
+consecutive blocks, and launches ``G = min(C, 8 * SMs)`` CTAs of 128 threads,
+at most one wave (8 CTAs per SM).  While ``C <= 8 * SMs`` the static backward
+gives every chunk its own CTA.  Past that the claimed backward runs: its CTAs
+claim runs of consecutive chunks from the workspace's claim counter, in
+halving rounds and then single chunks, each CTA its next run as the last block
+of its current run starts, so a CTA that starts late takes fewer chunks (one
+that becomes resident after every run was claimed takes none).  Each CTA adds
+the FP32 weight-gradient partials of its chunks exactly into 64-bit integer
+windows of the workspace and takes a ticket on the arrival word; whichever CTA
+arrives last rounds the exact sum once into ``dw``, and no CTA waits for
+another.  Up to 256 rows a BF16 weight gradient comes from the short backward:
+one cluster of 16 CTAs, scheduled together on the SMs of one GPC, whose CTAs
+each wait for the other CTAs' FP32 partials of their columns and finish them,
+with no workspace (an FP32 weight gradient has no short backward).  Beside a
 long-resident one-thread kernel on another stream each call must keep its
 speed: per token count, the median of seven event-timed calls with the side
 kernel resident is at most ``MAX_RATIO`` times the median of seven calls alone,
@@ -48,73 +52,76 @@ or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
 pairs, so host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the backward needs 20736 bytes of dynamic shared memory (on SM107 from
-1024 rows per SM each CTA of the long backward needs 10496), so a side
-kernel holding every SM with the default carveout delays its start until the
-side kernel exits (observed on B200 with the 20736-byte CTAs and on R200 with
-both sizes; no test here asserts that delay; documented in
-:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).
-The documented remedy is checked here: with the side kernel's preferred
-carveout set to the maximum shared memory, the backward (BF16 and FP32 weight
-gradients) and the forward start beside it and cost at most
-``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
-``ALL_SM_SPIN_MS`` lifetime; so does the short backward (6144 bytes a CTA)
-at 1 and 5 tokens (48 and 240 rows), which on SM100 and SM103 also starts
-beside it with the default and the maximum-L1 carveout.  On SM107 neither it
-nor the backward it replaces starts beside the side kernel with such a small
-carveout until that kernel exits (observed on R200): there the short backward
-must end at most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces.
+CTA of the static and the claimed backward needs 15616 bytes of dynamic shared
+memory (the launch record's ``dynamic_smem_bytes``: the two halves of the
+8 x 128 FP32 fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128
+columns, 7168 bytes, and the run cell, the arrival flag and the 8-entry claim
+table, 160 bytes, 15520 bytes rounded up), so a side kernel holding every SM
+with a small carveout can delay its start until the side kernel exits (no test
+here asserts that delay; documented in
+:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The documented remedy
+is checked here: with the side kernel's preferred carveout set to the maximum
+shared memory, the backward (BF16 and FP32 weight gradients) and the forward
+start beside it and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far
+below the side kernel's ``ALL_SM_SPIN_MS`` lifetime; so does the short
+backward (6144 bytes a CTA) at 1 and 5 tokens (48 and 240 rows), which on
+SM100 and SM103 also starts beside it with the default and the maximum-L1
+carveout.  On SM107 the short backward does not start beside the side kernel
+with such a small carveout until that kernel exits (observed on R200): there it
+must end at most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the
+static backward at the same rows).
 
 The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 #7548, item 1): busy / alone is at most the proportional ``N / (N - k)``, plus
-the share of one row block of an SM's resident CTAs in the call (the last
-chunks are single blocks, so the CTAs finish within about one block of each
-other), plus ``PROPORTIONAL_SLACK``.  The token counts give each CTA of the
-backward's one-wave grid 16, 32 and 160 row blocks: ``T = 3157``, ``6314`` and
-``31573`` on a 148-SM B200 (on SM100 and SM103 the first runs the backward,
-below the long backward's 1280 rows per SM, the others the long
-backward), where the earlier fixed one-wave grid of 16 blocks per CTA ran
-1.26-1.35 times slower beside any side kernel.  The long and mid forwards
-beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
-the share of one CTA's blocks in the call (a CTA whose slot the side kernel
-holds walks all of its blocks once it starts), plus ``PROPORTIONAL_SLACK``, at
-the token counts that give the long forward's CTA slots the fewest whole row
-blocks each at or above its threshold and four times that (25 and 100 on
-SM100 and SM103, from 2400 rows per SM; 19 and 76 on SM107, from 1740) and
-the mid forward's the fewest at or above its threshold and the most below the
-long forward's (11 and 24, 1056 and 2304 rows per SM, on SM100 and SM103; 9
-and 18, 864 and 1728 rows per SM, on SM107).  The short forward at 1 row per
-SM and at its threshold (12 rows per SM on SM100 and SM103, 59 on SM107; on
-SM107 also at 10 and 30 rows per SM) keeps its speed
-beside the one-thread kernel, starts beside the all-SM kernel with the
-max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
-side kernels and 16 CTAs of 1024 threads with the max-shared carveout) ends no
-later than the deterministic forward (the deterministic package's plain forward
-module, whatever the rows) beside the same side kernel: the busy median is at
-most the deterministic forward's busy median times ``1 +
-PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of
-the event timer (about 1 microsecond on SM103) and a half, the calls taking
-a few microseconds.  The two forwards' alone / busy pairs alternate round by
-round over the same stretch of time, which does not make a slow stretch of the
-host or the GPU fall on both alike: a measurement counts only when each
-forward's alone median is at most ``SHORT_MAX_ALONE_SPREAD`` times its fastest
-alone sample of that measurement, else it is taken again, at most
+the share in the call of one row block of each CTA of the one-wave grid, plus
+``PROPORTIONAL_SLACK``.  The token counts give each CTA of that grid
+(``8 * N`` CTAs) 16, 32 and 160 row blocks: ``T = 3157``, ``6314`` and
+``31573`` on a 148-SM B200, whose rows have more chunks than the grid has
+CTAs, so the claimed backward runs all three (there in chunks of 3, 5 and 24
+blocks).  The persistent forwards beside the same side kernels: busy / alone
+is at most ``N / (N - k)``, plus the share of one CTA's blocks in the call (a
+CTA whose slot the side kernel holds walks all of its blocks once it starts),
+plus ``PROPORTIONAL_SLACK``, at the token counts that give the module's CTA
+slots the fewest whole row blocks each at or above its threshold and the most
+below the threshold of the next module the architecture routes, or four times
+the fewest where it routes none: the mid forward 11 and 24 blocks of 16 rows
+(1056 and 2304 rows per SM) on SM100 and SM103, 9 and 18 (864 and 1728 rows
+per SM) on SM107; the long forward 25 and 100 blocks of 32 rows on SM100, 25
+and 31 on SM103; the extra-long forward 32 and 128 on SM103, 19 and 76 on
+SM107.  The short forward at 1 row per SM and at its threshold (12 rows per SM
+on SM100 and SM103, 59 on SM107; on SM107 also at 10 and 30 rows per SM) keeps
+its speed beside the one-thread kernel, starts beside the all-SM kernel with
+the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
+item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
+ends no later than the deterministic package's forward (its public forward
+entry point at the same rows) beside the same side kernel: the busy median is
+at most the deterministic forward's busy median times ``1 +
+PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of the
+event timer (about 1 microsecond on SM103) and a half, the calls taking a few
+microseconds.  The two forwards' alone / busy pairs alternate round by round
+over the same stretch of time, which does not make a slow stretch of the host
+or the GPU fall on both alike: a measurement counts only when each forward's
+alone median is at most ``SHORT_MAX_ALONE_SPREAD`` times its fastest alone
+sample of that measurement, else it is taken again, at most
 ``SHORT_EXTRA_ATTEMPTS`` more times, and the bound applies to the first
-measurement that counts (to the last one when none does).  The short
-backward at 1 and 5 tokens (48 and 240 rows) keeps its speed beside the
-one-thread kernel and, beside the short forward's side kernels, ends no later
-than the backward it replaces (the role's module, the one-wave backward, at
-the same rows) by the short forward's bound and measurement rule: there a
-measurement counts only when the short backward's and the replaced backward's
-alone medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest
-alone sample of that measurement.
+measurement that counts (to the last one when none does).  The short backward
+at 1 and 5 tokens (48 and 240 rows) keeps its speed beside the one-thread
+kernel and, beside the short forward's side kernels, ends no later than the
+backward it replaces (the role's module, the static backward, at the same
+rows) by the short forward's bound and measurement rule: there a measurement
+counts only when the short backward's and the replaced backward's alone
+medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest alone
+sample of that measurement.
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
-the call started.  In every test ``y``, ``dx`` and ``dz`` are bitwise those of
-the first call alone, every ``dw`` lies within the backend suite's budget of an
-FP64 reference (the FP32 runs and the FP64 cross-CTA sum depend on which blocks
-each CTA claimed), and the workspace is zero after every call.
+the call started.  In every test ``y``, ``dx``, ``dz`` and ``dw`` are bitwise
+those of the first call alone of the same entry point and module (a chunk's
+partial does not depend on the grid or on the CTA that claimed it, and the sum
+of the partials is exact), every ``dw`` also lies within the backend suite's
+budget of an FP64 reference, the short backward's ``dx`` and ``dz`` are
+bitwise those of the backward it replaces, and the workspace is zero after
+every call.
 """
 
 from __future__ import annotations
@@ -131,7 +138,6 @@ from tests.test_helpers.cake_package import cake_package
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
 det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
-det_loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
 forward = pkg.cake_rmsnorm_silu_gate_nondet_train_forward
 backward = pkg.cake_rmsnorm_silu_gate_nondet_train_backward
 workspace_for = pkg.cake_rmsnorm_silu_gate_nondet_train_backward_workspace
@@ -158,15 +164,6 @@ pytestmark = pytest.mark.skipif(
     or not pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
-
-
-@pytest.fixture(autouse=True)
-def nondeterministic_allowed():
-    enabled = torch.are_deterministic_algorithms_enabled()
-    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    torch.use_deterministic_algorithms(False)
-    yield
-    torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 def _inputs(tokens: int):
@@ -256,21 +253,14 @@ MAX_ALL_SM_EXTRA_MS = 1.0
 CARVEOUT_MAX_SHARED = 100
 # Item 1: (CTAs, threads) of side kernels that hold some SMs, the issue's
 # 1 x 128, 16 x 640 and 32 x 640, beside the backward at the token counts that
-# give each CTA of its one-wave grid this many row blocks.
+# give each CTA of its one-wave grid (``ctas_per_sm`` CTAs per SM, the CTAs per
+# SM its launch bounds hold at once) this many row blocks.
 PROPORTIONAL_SIDES = ((1, 128), (16, 640), (32, 640))
 PROPORTIONAL_BLOCKS_PER_CTA = (16, 32, 160)
-# CTAs of the backward an SM holds at once: 1024 threads (its launch bounds,
-# 64 registers a thread).
-BACKWARD_THREADS_PER_SM = 1024
 PROPORTIONAL_RUNS = 7
-# The noise margin of busy / alone over N / (N - k) plus one row block's
-# share.  Measured with this backward beside these tests' side kernels (1 x
-# 128, 16 x 640 and 32 x 640, default carveout) at 16 and 160 row blocks per
-# CTA, the median of 11 to 13 alternating alone / busy pairs: the largest
-# excess was -0.0074 on B200 (148 SMs; nsc-svg-slurm-1-gpu-129, job 2451658),
-# -0.0065 on GB300 (152 SMs; nvl72d148-T17, job 1459208) and -0.0084 on R200
-# (212 SMs; hecate0089, job 920765), and the largest excess of a single pair
-# +0.0081 (R200).  0.02 is that worst pair plus a margin for noise.
+# The margin for timing noise of busy / alone over N / (N - k) plus one row
+# block's share, and of the short forward's and the short backward's busy
+# medians over those of the calls they are compared with.
 PROPORTIONAL_SLACK = 0.02
 # The backend suite's weight-gradient budget:
 # |dw - dw64| <= |dw64| * 2^-7 + sum|terms| * 2^-20.
@@ -532,9 +522,10 @@ def _dw_reference(dy, x, z):
 
 
 def _check_outputs(stage: str, tokens: int, alone, busy, dw_reference=None) -> None:
-    """``y`` (forward) or ``dx`` and ``dz`` (backward) bitwise those of the
-    first call alone; every backward ``dw`` within the backend suite's budget
-    of ``dw_reference``."""
+    """``y`` (forward) or ``dx``, ``dz`` and ``dw`` (backward) of every call
+    of one entry point and module bitwise those of its first call alone; every
+    backward ``dw`` also within the backend suite's budget of
+    ``dw_reference``."""
     first = alone[0][1]
     for _t, out in alone + busy:
         if stage == "forward":
@@ -542,6 +533,7 @@ def _check_outputs(stage: str, tokens: int, alone, busy, dw_reference=None) -> N
             continue
         assert torch.equal(out[0], first[0]), f"dx tokens={tokens}"
         assert torch.equal(out[1], first[1]), f"dz tokens={tokens}"
+        assert torch.equal(out[2], first[2]), f"dw tokens={tokens} {out[2].dtype}"
         dw64, mag = dw_reference
         err = (out[2].double() - dw64).abs()
         bound = dw64.abs() * DW_REL_TOL + mag * DW_MAG_TOL
@@ -549,6 +541,16 @@ def _check_outputs(stage: str, tokens: int, alone, busy, dw_reference=None) -> N
             f"dw tokens={tokens} {out[2].dtype}: beyond the budget by "
             f"{(err - bound).max().item():.3e}"
         )
+
+
+def _check_replaced_rows(tokens: int, alone, replaced_alone) -> None:
+    """``dx`` and ``dz`` of the short backward's first call alone bitwise
+    those of the backward it replaces (the same row arithmetic; their weight
+    gradients sum different partials and are each checked by
+    :func:`_check_outputs`)."""
+    first, replaced = alone[0][1], replaced_alone[0][1]
+    assert torch.equal(replaced[0], first[0]), f"dx tokens={tokens} (replaced)"
+    assert torch.equal(replaced[1], first[1]), f"dz tokens={tokens} (replaced)"
 
 
 @pytest.mark.parametrize("tokens", ALL_SM_TOKENS)
@@ -608,28 +610,28 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     )
 
 
-def _claim_tokens(blocks_per_cta: int) -> tuple[int, float]:
-    """``(T, block_share)``: the most tokens ``T`` whose ``T * H`` rows give
-    each CTA of the BF16 weight-gradient backward's one-wave grid
-    (``backward_ctas``) at most ``blocks_per_cta`` row blocks, and the CTAs of
-    the module those rows run (the long backward from its threshold) that the
-    SMs hold at once over its row blocks, which bounds one row block's share
-    of the call alone."""
+def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int]:
+    """``(T, block_share, blocks_per_chunk, chunks)``: the most tokens ``T``
+    whose ``T * H`` rows give each CTA of the BF16 weight-gradient backward's
+    one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM, all
+    resident at once) at most ``blocks_per_cta`` row blocks, rows with more
+    chunks than that grid has CTAs, which the claimed backward runs; the share
+    of one row block of each of its CTAs in the call alone; and the chunks of
+    those rows (``backward_chunks``)."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    name = loader.route_module(arch, "bwd_bf16")
+    name = loader.route_module(arch, "bwd_bf16_mid")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
-    rows_per_cta = int(loader.MODULES[name]["grid_rule"]["rows_per_cta"])
-    tokens = blocks_per_cta * wave * rows_per_cta // H
-    name = loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms)
-    rows_per_cta = int(loader.MODULES[name]["grid_rule"]["rows_per_cta"])
-    blocks = -(-(tokens * H) // rows_per_cta)
-    ctas = loader.backward_ctas(name, tokens * H, sms)
-    assert ctas == loader.backward_ctas(name, loader.INT32_MAX, sms)
-    threads = int(loader.MODULES[name]["launch"]["block"][0])
-    resident = min(ctas, BACKWARD_THREADS_PER_SM // threads * sms)
-    return tokens, resident / blocks
+    rows_per_block = int(loader.MODULES[name]["grid_rule"]["rows_per_block"])
+    tokens = blocks_per_cta * wave * rows_per_block // H
+    rows = tokens * H
+    assert loader.module_for_rows(arch, "bwd_bf16", rows, sms) == name
+    ctas = loader.backward_ctas(name, rows, sms)
+    assert ctas == wave
+    blocks_per_chunk, chunks = loader.backward_chunks(name, rows)
+    blocks = -(-rows // rows_per_block)
+    return tokens, ctas / blocks, blocks_per_chunk, chunks
 
 
 @pytest.mark.parametrize(
@@ -639,7 +641,7 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, float]:
 def test_backward_slows_in_proportion_to_the_sms_held(
     blocks_per_cta: int, ctas: int, threads: int
 ) -> None:
-    tokens, block_share = _claim_tokens(blocks_per_cta)
+    tokens, block_share, blocks_per_chunk, chunks = _claim_tokens(blocks_per_cta)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
 
@@ -653,7 +655,8 @@ def test_backward_slows_in_proportion_to_the_sms_held(
     ratio = busy_ms / alone_ms
     print(
         f"HELD stage=backward tokens={tokens} heads={H} "
-        f"blocks_per_cta={blocks_per_cta} side={ctas}x{threads} "
+        f"blocks_per_cta={blocks_per_cta} blocks_per_chunk={blocks_per_chunk} "
+        f"chunks={chunks} side={ctas}x{threads} "
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
         f"ideal={ideal:.3f} block_share={block_share:.4f} "
         f"excess={ratio - ideal - block_share:.4f}"
@@ -668,13 +671,15 @@ def test_backward_slows_in_proportion_to_the_sms_held(
     )
 
 
-# The long and mid forwards beside the item 1 side kernels: the long forward's
-# CTA slots (3 per SM) get row blocks of 32 rows, the mid forward's (6 per SM)
-# row blocks of 16 rows, at the fewest whole blocks per slot at or above the
-# module's rows per SM on the device ("first": 25 and 11 on SM100 and SM103, 19
-# and 9 on SM107) and at four times that for the long forward, the most below
-# the long forward's rows per SM for the mid forward ("last": 100 and 24, 76
-# and 18).
+# The persistent forwards beside the item 1 side kernels: the CTA slots of the
+# long and the extra-long forward (3 per SM) get row blocks of 32 rows, the mid
+# forward's (6 per SM) row blocks of 16 rows, at the fewest whole blocks per
+# slot at or above the module's rows per SM on the device ("first": the mid
+# forward 11 on SM100 and SM103 and 9 on SM107, the long forward 25, the
+# extra-long forward 32 on SM103 and 19 on SM107) and at the most below the
+# rows per SM of the next module the architecture routes, else four times
+# "first" ("last": the mid forward 24 and 18, the long forward 100 on SM100
+# and 31 on SM103, the extra-long forward 128 on SM103 and 76 on SM107).
 FORWARD_EDGES = ("first", "last")
 
 
@@ -794,21 +799,12 @@ SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
     (16, 1024, CARVEOUT_MAX_SHARED),
 )
 SHORT_EXTRA_MS = 0.0015
-# A held measurement counts when each forward's alone median is at most this
-# many times its fastest alone sample in that measurement; otherwise it is taken
-# again, at most SHORT_EXTRA_ATTEMPTS more times.  The largest median-to-fastest
-# ratio was 1.43 in 170 held measurements on a GB300 node running only this
-# test file (20 runs on 2 GPUs), 1.43 in 80 more on that node with pytest,
-# pre-commit and compute-sanitizer work on its other GPUs (10 runs), and 1.38
-# in 160 on a B200 node (20 runs).  With compile and compute-sanitizer work on
-# the other GPUs of a second GB300 node, one measurement had alone medians of
-# 0.0103 and 0.0113 ms and failed the bound.
+# A held measurement counts when each compared call's alone median is at most
+# this many times its fastest alone sample in that measurement (a slow stretch
+# of the host or the GPU moves the median of calls of a few microseconds);
+# otherwise it is taken again, at most SHORT_EXTRA_ATTEMPTS more times.
 SHORT_MAX_ALONE_SPREAD = 1.7
 SHORT_EXTRA_ATTEMPTS = 2
-
-
-def _det_plain(arch, role, rows, sm_count):
-    return det_loader.route_module(arch, role)
 
 
 def _short_forward_tokens(rows_per_sm: int) -> int:
@@ -907,18 +903,10 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
         return (forward(x, z, w, EPS, out=y),)
 
     def call_det():
-        # the deterministic package's plain forward module whatever the rows
-        # (its short forward is this package's)
-        routed = det_loader.module_for_rows
-        det_loader.module_for_rows = _det_plain
-        try:
-            return (
-                det_pkg.cake_rmsnorm_silu_gate_det_train_forward(
-                    x, z, w, EPS, out=y_det
-                ),
-            )
-        finally:
-            det_loader.module_for_rows = routed
+        # the deterministic package's public forward at the same rows
+        return (
+            det_pkg.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y_det),
+        )
 
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
@@ -942,7 +930,9 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
-        _check_outputs("forward", tokens, alone + det_alone, busy + det_busy)
+        # each package's y repeats its own bits (the two forwards' bits differ)
+        _check_outputs("forward", tokens, alone, busy)
+        _check_outputs("forward", tokens, det_alone, det_busy)
         if counts:
             break
     assert (
@@ -958,11 +948,10 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
     )
 
 
-# The short backward: one token and the most whole tokens of
-# H heads within its 256 rows, beside the short forward's side kernels.  Its
-# held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD,
-# a threshold set from the short forward's held measurements above (no
-# measurement of the short backward went into it).
+# The short backward (BF16 weight gradient only): one token and the most whole
+# tokens of H heads within its 256 rows, beside the short forward's side
+# kernels.  Its held test takes the short forward's bound, slack and
+# SHORT_MAX_ALONE_SPREAD.
 SHORT_BACKWARD_TOKENS = (1, 5)
 SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
 # cudaSharedmemCarveoutMaxL1.  The test below checks that the short backward
@@ -970,15 +959,16 @@ SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
 # shared memory with this or the default carveout (at most
 # MAX_ALL_SM_EXTRA_MS more than alone), or on the architectures of
 # SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT that it ends at most
-# MAX_ALL_SM_EXTRA_MS after the backward it replaces (20736 bytes a CTA)
-# beside that side kernel.
+# MAX_ALL_SM_EXTRA_MS after the backward it replaces (the static backward,
+# 15616 bytes a CTA) beside that side kernel.
 CARVEOUT_MAX_L1 = 0
 
 
 def _short_backward(tokens: int) -> tuple[str, str]:
     """``(the short backward, the backward it replaces)``: the BF16
-    weight-gradient modules of ``tokens * H`` rows, where the architecture
-    routes the short backward (skips elsewhere)."""
+    weight-gradient modules of ``tokens * H`` rows (the second the role's
+    module, the static backward), where the architecture routes the short
+    backward (skips elsewhere)."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     name = loader.ROUTES[arch].get("bwd_bf16_short")
@@ -1021,15 +1011,13 @@ def test_short_backward_keeps_its_speed_beside_a_resident_kernel(tokens: int) ->
 
 
 @pytest.mark.parametrize("tokens", SHORT_BACKWARD_TOKENS)
-@pytest.mark.parametrize(
-    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
-)
 def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
-    dw_dtype: torch.dtype, tokens: int
+    tokens: int,
 ) -> None:
     _short_backward(tokens)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
+    dw_dtype = torch.bfloat16
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
 
     def call():
@@ -1052,11 +1040,11 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
     )
 
 
-# Architectures on which neither the short backward (6144 bytes a CTA) nor
-# the backward it replaces starts beside a side kernel holding every SM with
-# a small carveout (the default or the maximum-L1 one) until that kernel
-# exits (observed on R200): there the short backward must end at most
-# MAX_ALL_SM_EXTRA_MS after the backward it replaces beside it.
+# Architectures on which the short backward (6144 bytes a CTA) does not start
+# beside a side kernel holding every SM with a small carveout (the default or
+# the maximum-L1 one) until that kernel exits (observed on R200): there it
+# must end at most MAX_ALL_SM_EXTRA_MS after the backward it replaces (the
+# static backward, 15616 bytes a CTA) beside it.
 SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)
 
 
@@ -1098,6 +1086,7 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
             f"busy_ms={rep_busy_ms:.4f} extra_ms={rep_busy_ms - rep_alone_ms:.4f}"
         )
         _check_outputs("backward", tokens, rep_alone, rep_busy, _dw_reference(dy, x, z))
+        _check_replaced_rows(tokens, alone, rep_alone)
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         assert busy_ms - rep_busy_ms <= MAX_ALL_SM_EXTRA_MS, (
             f"tokens={tokens}: beside an all-SM kernel with the {label} carveout "
@@ -1134,6 +1123,7 @@ def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
             patch.setattr(pkg, "module_for_rows", lambda *_args: replaced)
             return backward(dy, x, z, w, EPS, workspace=workspace)
 
+    dw_reference = _dw_reference(dy, x, z)
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
     attempts = 1 + SHORT_EXTRA_ATTEMPTS
@@ -1156,13 +1146,10 @@ def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
-        _check_outputs(
-            "backward",
-            tokens,
-            alone + rep_alone,
-            busy + rep_busy,
-            _dw_reference(dy, x, z),
-        )
+        # each module's outputs repeat their own bits; dx and dz match across them
+        _check_outputs("backward", tokens, alone, busy, dw_reference)
+        _check_outputs("backward", tokens, rep_alone, rep_busy, dw_reference)
+        _check_replaced_rows(tokens, alone, rep_alone)
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         if counts:
             break

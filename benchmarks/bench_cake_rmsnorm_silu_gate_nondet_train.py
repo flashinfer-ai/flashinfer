@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake SiLU-gated RMSNorm training kernels
-(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) with the opt-in
-non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``:
-one backward kernel whose last CTA finishes the FP64 weight-gradient sum)
-against the deterministic package
+(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) of the non-deterministic
+package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
+approximate FP32 intrinsics, and one backward kernel whose CTAs add the
+weight-gradient partials exactly as 64-bit integer windows, the last CTA
+rounding the sum once) against the deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
-fixed-order weight-gradient reduction), each called through its own entry
-points.
+fixed-order weight-gradient reduction), each called through its own public
+entry points.
 
 Every row times, for both modes, on identical generated inputs:
 
@@ -32,6 +33,17 @@ Every row times, for both modes, on identical generated inputs:
   ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
+Each package picks its kernels from the rows and the SM count.  The
+non-deterministic forward runs its short forward up to 12 rows per SM on
+SM100 and SM103 (59 on SM107), its plain forward above that, and from 976 rows
+per SM on SM100 and SM103 (800 on SM107) a persistent forward (the mid, long
+or extra-long one).  Its backward runs one cluster of 16 CTAs up to 256 rows
+(BF16 weight gradient only), else one kernel of at most 8 CTAs per SM over
+chunks of rows: the static backward while every chunk has a CTA, the claimed
+backward past that.  At ``--heads 48`` the default token counts reach every
+one of these kernels that a 148-SM B200 routes (all but the extra-long
+forward, which SM103 and SM107 route).
+
 Timing uses CUPTI kernel activity with a cold L2
 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``); each stage reports
 the median and, as its variation, the samples' minimum, maximum and coefficient
@@ -40,11 +52,16 @@ non-deterministic one.  Memory columns report the bytes autograd keeps for the b
 (``saved``, retained between forward and backward), the peak allocation of one
 autograd forward plus backward beyond the inputs (``peak``, outputs included),
 the backward's temporary allocation with preallocated outputs and no caller
-workspace (``temp``) and the caller workspace of each mode (``workspace``).
-Output columns check the non-deterministic results against the deterministic
-ones: ``dx`` and ``dz`` bitwise, ``dw`` as the largest distance in BF16 units
-in the last place, and the number of distinct ``dw`` bit patterns over
-``--repeats`` backward calls.
+workspace (``temp``; the zero-filled ``torch.uint8`` workspaces that
+non-deterministic calls without a caller workspace keep, one per device,
+stream and kernel and a reserve per device, come from the calls before it) and
+the caller workspace of each mode (``workspace``: the non-deterministic one
+29192 bytes whatever the rows).  Output columns check the non-deterministic
+results against the deterministic ones: ``y``, ``dx`` and ``dz`` bitwise (the
+non-deterministic forward's approximate intrinsics need not give the
+deterministic ``y`` bits), ``dw`` as the largest distance in BF16 units in the
+last place, and the number of distinct ``dw`` bit patterns over ``--repeats``
+backward calls (1 for both modes: every output repeats bit for bit).
 
 Example::
 
@@ -302,7 +319,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             "cake_rmsnorm_silu_gate_nondet_train or "
             "cake_rmsnorm_silu_gate_det_train has no exported route on this device"
         )
-    torch.use_deterministic_algorithms(False)
     props = torch.cuda.get_device_properties(device)
     print(
         f"# {props.name}, sm_{props.major}{props.minor}, {props.multi_processor_count} SMs, "

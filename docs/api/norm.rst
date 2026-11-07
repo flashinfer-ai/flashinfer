@@ -251,22 +251,18 @@ short forward is not shown there.
    its architecture constants are the backend package's objects.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
-3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
-   alerts: every deterministic launch sums in a fixed order.  The
-   non-deterministic forward never alerts.  A non-deterministic backward that
-   computes the weight gradient raises PyTorch's alert immediately before its
-   order-varying launch (``RuntimeError``; with ``warn_only=True`` a
-   ``UserWarning``, then the non-deterministic kernel runs).  The one-cluster
-   backward of up to 256 rows (a fixed order), a call with no rows and a call
-   with ``compute_grad_weight=False`` do not alert.  The check runs on the
-   host: a CUDA Graph checks it when it is captured, not when it is replayed.
+3. Under ``torch.use_deterministic_algorithms(True)`` no call of either
+   package alerts: every deterministic launch sums in a fixed order, and every
+   output of the non-deterministic package repeats bit for bit (its
+   weight-gradient sum is exact, so the order of its additions does not change
+   the bits).
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
    and run the backward of their own package.  A backward workspace holds the
    raw partial sums of one package and serves only that package (FP32 for the
-   deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``), also in a call
-   with no rows.
+   deterministic package, a ``torch.uint8`` buffer for the non-deterministic
+   one): each backward refuses the other package's workspace (``ValueError``),
+   also in a call with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
@@ -342,29 +338,37 @@ Training SiLU-gated RMSNorm, non-deterministic weight gradient (Cake)
 
 The non-deterministic package (``nondet`` names; see the mode and dispatch
 rules above). Its entry points run only the standalone non-deterministic
-kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``):
+kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``).
+Every output (``y``, ``dx``, ``dz`` and ``dw``) repeats bit for bit from run to
+run; the outputs are not the deterministic package's bits.  The FP64 error of
+each output (relative L2 and the largest error relative to the largest
+reference value) is at most 1.1 times the deterministic package's on the same
+inputs, and within the deterministic package's absolute bounds.
 
-* The forward is the deterministic package's forward kernel (up to 12 rows
-  per SM on SM100 and SM103 and up to 59 on SM107, a forward with 16 threads
-  to a row, and from 976 rows per SM on SM100 and SM103 and from 800 on SM107,
-  a forward whose CTAs each walk several row blocks: the same bits).
-* The backward is one kernel: ``dx`` and ``dz`` are the deterministic
-  backward's bits, and the CTAs take row blocks (each CTA its own block when
-  the grid has a CTA for every block; past one wave of CTAs they claim the
-  blocks in chunks from the workspace's claim counter) and add their FP64
-  weight-gradient column sums into FP64 accumulators of the workspace in the
-  order they finish. The claimed blocks, and so the FP32 partial sums, and that
-  order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound (for FP32 normal
-  gates, terms and sums; with subnormal values both backwards can leave it).
-  Up to 256 rows the backward is one thread-block cluster of 16 CTAs that adds
-  the CTAs' partial sums in a fixed order on chip: the same bits on every
-  call, within the same bound, and no workspace.
-* The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``,
-  a few KiB whatever the token count) is zero after every call: zero it once
-  and reuse it, one per concurrently running stream. A buffer that anything
-  else wrote into is zeroed with
-  ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.
+* The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
+  ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
+  of several modules chosen from the row count and the SM count, all with the
+  same row arithmetic: a short forward up to 12 rows per SM on SM100 and SM103
+  (59 on SM107), the plain forward, from 976 rows per SM (800 on SM107) a
+  persistent forward whose CTAs each walk at most 2 row blocks, and from 2400
+  rows per SM on SM100 and SM103 a long forward (on SM103 from 3000 and on
+  SM107 from 1740, an extra-long forward that also prefetches its next block).
+* The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
+  backward's row arithmetic.  The weight gradient sums the deterministic
+  backward's chunk partials exactly in 64-bit integer windows and rounds once,
+  so it does not depend on the grid or on the order in which CTAs finish.  Up
+  to 64 rows per SM every chunk has its own CTA; past that the CTAs claim runs
+  of chunks at run time, so a CTA slowed by a kernel on another stream takes
+  fewer.  Up to 256 rows with a BF16 weight gradient the backward is one
+  thread-block cluster of 16 CTAs that sums on chip and takes no workspace.
+* The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
+  is a zero-filled ``torch.uint8`` tensor of 29192 bytes whatever the token
+  count, zero after every call: zero it once and reuse it, one per
+  concurrently running stream.  A buffer that anything else wrote into is
+  zeroed with ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.  Calls
+  without a workspace use one per stream and backward module, kept for the
+  process, and each device keeps a reserve of zero-filled workspaces for CUDA
+  Graph captures (about 1.8 MiB per 64 workspaces, at most 1024).
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_nondet_train
 
