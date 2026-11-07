@@ -543,8 +543,9 @@ def prims_ts_bf16_moe(
     r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100/SM103/SM107.
 
     Takes the arguments of :func:`~flashinfer.fused_moe.trtllm_bf16_moe` in the
-    same order and returns the same value. ``enable_pdl`` defaults to ``None``,
-    which enables PDL on devices that support it.
+    same order and returns the same value. Two defaults differ: ``enable_pdl``
+    is ``None``, which enables PDL on devices that support it, and
+    ``weight_layout`` is ``WeightLayout.MajorK``.
 
     Parameters
     ----------
@@ -673,8 +674,9 @@ def prims_ts_bf16_routed_moe(
     r"""BF16 Prims-TS MoE with precomputed packed or unpacked routing.
 
     Takes the arguments of :func:`~flashinfer.fused_moe.trtllm_bf16_routed_moe`
-    in the same order and returns the same value. ``enable_pdl`` defaults to
-    ``None``, which enables PDL on devices that support it.
+    in the same order and returns the same value. Two defaults differ:
+    ``enable_pdl`` is ``None``, which enables PDL on devices that support it,
+    and ``weight_layout`` is ``WeightLayout.MajorK``.
 
     Parameters
     ----------

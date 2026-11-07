@@ -1934,11 +1934,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
         # A PDL launch may start before the preceding grid finishes, so acquire
-        # it before reading any predecessor-written input: the device scale
-        # operands and sparse top-k lengths loaded below, and cache_seqs via the
-        # task manager. The acquire sits at body entry, as in the 1CTA sibling,
-        # so both arms of the later early-exit test are covered by position
-        # instead of by enumerating the reads under each one.
+        # it before the first global access an earlier grid may touch: the
+        # device scale operands and sparse top-k lengths loaded below,
+        # cache_seqs via the task manager, and every workspace and output write.
+        # The acquire sits at body entry, as in the 1CTA sibling, so both arms of
+        # the later early-exit test are covered by position instead of by
+        # enumerating the accesses under each one.
         if cutlass.const_expr(self.enable_pdl):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):

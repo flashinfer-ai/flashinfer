@@ -698,10 +698,12 @@ class BatchedGemmConfig:
     exit, so this kernel's CTAs can become resident while the predecessor is
     still running. The count, and the ``tile_idx``/``mn_limit`` entries the
     weight loaders use to prefetch the expert's weights and weight scale
-    factors, are then read without waiting for the predecessor, so they must
-    have been produced by a kernel that completed before the predecessor passed
-    its own grid wait and triggered ``launch_dependents`` (e.g. routing, with
-    the predecessor waiting on it before triggering).
+    factors, are then read without waiting for the predecessor, so the kernel
+    that produced them must have completed before this kernel could launch:
+    some kernel between the two must wait for the producer before it triggers
+    ``launch_dependents``. In the MoE, routing produces them and FC1 waits for
+    routing before it triggers; FC2 launches after FC1 either directly or, for
+    DeepSeek FP8, through an activation kernel that triggers on entry.
     """
 
     # Per-token scale factors. SF-A is consumed by the epilogue for plain FP8;
