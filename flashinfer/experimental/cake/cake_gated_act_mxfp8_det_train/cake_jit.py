@@ -45,7 +45,8 @@ A program launches one CTA per tile: ``tile_rows`` rows by ``tile_cols``
 columns of the gate half (:func:`launch_grid`): 128 columns for the forward and
 64 for the backward, or a narrower tile (64 or 32 columns for the forward, 32
 for the backward) that spreads a small problem over more SMs, and 32 rows, or
-64 or 128 for a program whose threads own two or four rows each.  ``M`` and
+64 or 128 for a program whose threads own two or four rows each, or 8 for a
+program that spends 16 lanes on each row.  ``M`` and
 ``K`` are runtime scalars, so a changed problem size never recompiles anything;
 building every library of the architecture (:func:`specs_for_arch`) before a
 CUDA Graph capture keeps the JIT out of the capture.
