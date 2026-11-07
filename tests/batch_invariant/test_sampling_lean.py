@@ -70,8 +70,6 @@ def test_lean_model_matches_python_engine_and_spec():
         elif tag == "lseout":
             _, N, temp, which, sx = line.split(" ", 4)
             lean[("lseout", int(N), temp == "true", which)] = sx
-        elif tag == "lsechain":
-            lean[("lsechain",)] = line.split(" ", 1)[1]
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -92,7 +90,4 @@ def test_lean_model_matches_python_engine_and_spec():
                 which,
             )
             checked += 1
-    # the entropy member's chain over symbolic statistics (its full strings are compared above per vocabulary)
-    assert lean[("lsechain",)] == lean_cases.entropy_chain_sexpr()
-    checked += 1
     assert checked == len(lean) >= 60

@@ -115,9 +115,8 @@ orders and the chains; `lake exe quantconformance` prints its terms for the gene
 ## Sampling
 
 `flashinfer.sampling.softmax(logits, temperature, batch_invariant=True[, out_dtype=])` and the new entries
-`flashinfer.sampling.log_softmax(logits, temperature)`, `flashinfer.sampling.log_probs(logits, token_ids,
-temperature, return_lse=, return_entropy=)` and `flashinfer.sampling.entropy(logits, temperature)` run one class,
-`lse.row`: the row maximum `m` and the sum `s` of the exponentials as the
+`flashinfer.sampling.log_softmax(logits, temperature)` and `flashinfer.sampling.log_probs(logits, token_ids,
+temperature, return_lse=)` run one class, `lse.row`: the row maximum `m` and the sum `s` of the exponentials as the
 engine's canonical trees over the vocabulary (an 8-element fold per slot, pairwise over the blocks of 256 elements,
 pairwise over the 32 lanes: a function of the vocabulary alone, never of the batch, the configuration or the device),
 and fixed chains over them. The operator's own softmax selects its reduction path by batch size, so a row's bits there
@@ -127,16 +126,7 @@ depend on the batch; the class is what the mode promises instead.
 |---|---|---|---|
 | `softmax(..., batch_invariant=True, out_dtype=)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions; `out_dtype=torch.float32` names the fp32 input's specification: the leaves of a 16-bit input are its exact widenings, so only the output conversion differs) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype, or `mul.rn(e_j, div.rn(1, s))` itself with `out_dtype=torch.float32`. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N`; temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype or fp32 output; `enable_pdl`; SM100 / SM103 / SM107 |
 | `log_softmax(logits, temperature)` | the same class and fingerprint (`fingerprint("log_softmax", ...)`) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape` | as above; this entry has no non-invariant implementation (`batch_invariant=False` raises) |
-| `log_probs(logits, token_ids, temperature, return_lse=, return_entropy=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`); with `return_entropy` also the entropy member below (its own fingerprint) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`, with `return_entropy` the row's entropy below (one launch; the tuple is `logp`, then `lse`, then `entropy` as asked); fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); `batch_invariant=False` raises |
-| `entropy(logits, temperature)` | the entropy member of `lse.row`; `fingerprint("entropy", N=, dtype=, temperature=)` (its own: the member's tree and chain; the class's other fingerprints do not move) | a third tree `W` with the digits of `s` over `w_j = ZSEL(e_j, mul.rn(e_j, z_j))`, `ZSEL(e, p) = +0 if e == 0 else p` an exact select (`setp.eq` + `selp`: a `-inf` logit's weight-less NaN product becomes the additive identity `+0`, the identity the padded elements feed; a NaN weight passes); `H = mul.rn(add.rn(lg2.approx.ftz(s), neg(div.rn(W, s))), ln 2)`, the natural entropy `-sum p ln p` of `softmax(x / T)` (`p_j = e_j / s`, `ln p_j = ln 2 (z_j - lg2 s)`); `W` rides the sum pass (no third pass); fp32 of shape `logits.shape[:-1]`; a one-hot row is exactly `0`, an all-`-inf` or NaN row is NaN | as above; `batch_invariant=False` raises |
-
-The entropy is what the RL trainers form next to the token log-probability on the same logits (verl's `entropy_from_logits`,
-Miles' `_VocabParallelEntropy`, NeMo RL's `ChunkedDistributedEntropy`: the entropy of `softmax(x / T)`), so the member
-produces it from the same trees in the same launch as `log_probs`; the two are the same bits whether asked together or
-separately. Against those trainers' torch formulas (`-(softmax * log_softmax).sum`, `logsumexp - (softmax * x).sum`, on
-the fp32 upcast) the member runs at 0.04-0.38 of the best one's time over vocabularies 32768 .. 262144 x 1 .. 4096 rows on
-both the Rubin NVL8 (SM107) and the B200 (SM100); inside the class it costs 1.1-1.6x the class's `logsumexp` (the pair
-pass is issue-bound: the sum pass gains a `mul`, the select and an `add` per element).
+| `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); `batch_invariant=False` raises |
 
 A row view into a wider tensor (the `[..., :vocab]` slice of a padded lm_head) whose row stride is a multiple of 16 bytes
 is read in place; other views are copied first (a placement). For a sampler and a trainer to agree bit for bit they must
@@ -158,14 +148,11 @@ trees). The dispatcher is a closed form of `(N, M, element bytes, SM count, whic
 (`default_config`): clusters when there are fewer rows than SMs, one CTA per 64 / 128 KB of the row otherwise; every
 pick is a member of the enumerated space and every member computes the class (the configuration-agreement tests).
 
-The Lean model (`lean/BIKernels/Sampling.lean`) instantiates the engine's invariance theorems on the three trees
-(`max_invariance`, `sum_invariance`, `w_invariance`), carries them through the chains (`lse_end_to_end` /
-`entropy_end_to_end`: for every valid placement and unit the kernel's probabilities, log-softmax elements, `lse` and
-entropy -- the last over the kernel's own three trees -- are the spec's up to the commutativity the engine normalises,
-hence `lse_bits_equal` / `entropy_bits_equal` under any commutative interpretation), and states the `-inf`-padded bucket
-kernel bit for bit under the restricted identity hypotheses the spec's digits claim (`max_padded_bits`, `sum_padded_bits`,
-`w_padded_bits`; `wTerm_neg_inf_identity` derives the entropy tree's hypothesis from `ex2(z(-inf)) = +0` and
-`ZSEL(+0, p) = +0`). The `Term` language gains the named opaque binary primitive `opq2` (`ZSEL` is `opq2 "zsel"`).
+The Lean model (`lean/BIKernels/Sampling.lean`) instantiates the engine's invariance theorems on the two trees
+(`max_invariance`, `sum_invariance`), carries them through the chains (`lse_end_to_end`: for every valid placement and
+unit the kernel's probabilities, log-softmax elements and `lse` are the spec's up to the commutativity the engine
+normalises, hence `lse_bits_equal` under any commutative interpretation), and states the `-inf`-padded bucket kernel
+bit for bit under the restricted identity hypotheses the spec's digits claim (`max_padded_bits`, `sum_padded_bits`).
 `lake exe samplingconformance` prints its terms for the generated cases (`lean/BIKernels/SamplingCases.lean`,
 rendered by `sampling/lean_cases.py`; kernel `decide` only), which the device-free test
 `tests/batch_invariant/test_sampling_lean.py` compares with the Python specification. Tests:

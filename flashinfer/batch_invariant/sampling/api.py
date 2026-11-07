@@ -7,10 +7,8 @@
 FlashInfer's argument forms (temperature ``None``, a scalar or a per-row tensor of f16 / bf16 / f32 / f64).
 :func:`log_softmax_batch_invariant` is :func:`flashinfer.sampling.log_softmax`: the fp32 log-softmax row.
 :func:`log_probs_batch_invariant` is :func:`flashinfer.sampling.log_probs`: the natural log-probability of one or ``K``
-token ids per row in fp32, and with ``return_lse`` / ``return_entropy`` the row's log-sum-exp / entropy (the same
-launch). :func:`entropy_batch_invariant` is :func:`flashinfer.sampling.entropy`: the natural entropy of
-``softmax(logits / temperature)`` per row in fp32 (the class's third tree, accumulated in the sum pass). Every
-unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
+token ids per row in fp32, and with ``return_lse`` the row's log-sum-exp (the same launch). Every unsupported input
+raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 
 :func:`lse_row` is the generic entry the tests drive (``mode=`` for every output of the class, ``config=`` to force a
 member of the enumerated space, ``sm_count=`` to ask the dispatcher for another part's pick).
@@ -25,7 +23,7 @@ import torch
 
 from ..support import check_device, unsupported
 from .schedule import LSEConfig, default_config, device_sm_count, max_vec_elems
-from .spec import ENTROPY, LOG_SOFTMAX, SOFTMAX, SOFTMAX_F32, Mode, scale_value
+from .spec import LOG_SOFTMAX, LOGP, LOGP_LSE, SOFTMAX, SOFTMAX_F32, Mode, scale_value
 
 CLASS = "lse.row"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -119,10 +117,10 @@ def lse_row(
     sm_count: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """One launch of the class for the outputs ``mode`` names: ``"probs"`` (the softmax row in the input dtype, or in
-    fp32 for ``probs_f32``), ``"logprobs"`` (the log-softmax row, fp32), ``"lse"`` (fp32 per row), ``"logp"`` (fp32:
+    fp32 for ``probs_f32``), ``"logprobs"`` (the log-softmax row, fp32), ``"lse"`` (fp32 per row) and ``"logp"`` (fp32:
     the log-probability of ``token_ids``, one id per row of shape ``logits.shape[:-1]`` or ``K`` ids per row of shape
-    ``logits.shape[:-1] + (K,)``, NaN for an id outside ``[0, N)``) and ``"entropy"`` (fp32 per row). Bitwise identical
-    for every ``config`` in :func:`schedule.all_valid_configs`, every batch composition and every ``sm_count``."""
+    ``logits.shape[:-1] + (K,)``, NaN for an id outside ``[0, N)``). Bitwise identical for every ``config`` in
+    :func:`schedule.all_valid_configs`, every batch composition and every ``sm_count``."""
     from .kernel import get_compiled_kernel, k_slots_for
 
     N = _check_logits(logits)
@@ -163,10 +161,6 @@ def lse_row(
     if mode.lse:
         lse_t = torch.empty(M, dtype=torch.float32, device=dev)
         out["lse"] = lse_t.view(lead)
-    ent_t = _dummy(dev, torch.float32)
-    if mode.entropy:
-        ent_t = torch.empty(M, dtype=torch.float32, device=dev)
-        out["entropy"] = ent_t.view(lead)
     logp_t = _dummy(dev, torch.float32).view(1, 8)
     tok = _dummy(dev, torch.int64).view(1, 8)
     K = 1
@@ -206,7 +200,7 @@ def lse_row(
         bool(enable_pdl),
         k_slots_for(K),
     )
-    kernel(x2, y, lse_t, tok, logp_t, ent_t, temp_arg, float(c), M, N, K)
+    kernel(x2, y, lse_t, tok, logp_t, temp_arg, float(c), M, N, K)
     return out
 
 
@@ -294,25 +288,21 @@ def log_probs_batch_invariant(
     enable_pdl: Optional[bool] = None,
     *,
     return_lse: bool = False,
-    return_entropy: bool = False,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ):
-    """``flashinfer.sampling.log_probs(logits, token_ids, temperature, return_lse=..., return_entropy=...)``: the class
-    ``lse.row``.
+    """``flashinfer.sampling.log_probs(logits, token_ids, temperature, return_lse=...)``: the class ``lse.row``.
 
     The natural log-probability of ``token_ids[r]`` under ``softmax(logits[r] / temperature)``, fp32 of shape
     ``logits.shape[:-1]`` for one id per row or ``logits.shape[:-1] + (K,)`` for ``K`` ids per row:
     ``logp = ((x_t - m) c - lg2(s)) ln2`` from the same two trees as the softmax (NaN for an id outside ``[0, N)``). With
-    ``return_lse`` also the row's natural log-sum-exp ``lse = (m c + lg2(s)) ln2``, with ``return_entropy`` also the
-    row's natural entropy (:func:`entropy_batch_invariant`), one launch for every combination: the tuple is ``logp``,
-    then ``lse`` if asked, then ``entropy`` if asked.
+    ``return_lse`` also the row's natural log-sum-exp ``lse = (m c + lg2(s)) ln2`` (one launch).
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it
     never falls back."""
     _check_logits(logits)
     res = lse_row(
-        Mode(logp=True, lse=return_lse, entropy=return_entropy),
+        LOGP_LSE if return_lse else LOGP,
         logits,
         temperature,
         token_ids,
@@ -320,41 +310,4 @@ def log_probs_batch_invariant(
         config=config,
         sm_count=sm_count,
     )
-    outs = [res["logp"]]
-    if return_lse:
-        outs.append(res["lse"])
-    if return_entropy:
-        outs.append(res["entropy"])
-    return outs[0] if len(outs) == 1 else tuple(outs)
-
-
-def entropy_batch_invariant(
-    logits: torch.Tensor,
-    temperature: Optional[Union[float, torch.Tensor]] = None,
-    enable_pdl: Optional[bool] = None,
-    *,
-    config: Optional[LSEConfig] = None,
-    sm_count: Optional[int] = None,
-) -> torch.Tensor:
-    """``flashinfer.sampling.entropy(logits, temperature)``: the entropy member of the class ``lse.row``.
-
-    The natural entropy ``-sum_j p_j ln p_j`` of ``softmax(logits / temperature)`` per row, fp32 of shape
-    ``logits.shape[:-1]``, from the row's three canonical trees: the maximum ``m``, the sum ``s`` of the weights
-    ``e_j = ex2((x_j - m) c)`` and ``W = sum_j ZSEL(e_j, e_j z_j)`` with ``ZSEL(e, p) = +0 if e == 0 else p`` (the exact
-    select that makes a ``-inf`` logit's weight-less product the additive identity), then ``H = (lg2(s) - W / s) ln2``.
-    ``W`` rides the sum pass (no third pass) and its tree has the sum's digits and placement. A row of ``-inf`` logits
-    is NaN like the class's other outputs; a one-hot row is exactly ``0``. The fingerprint is
-    ``flashinfer.batch_invariant.fingerprint("entropy", N=, dtype=, temperature=)`` (the member's own; the class's
-    other fingerprints do not move).
-
-    Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it
-    never falls back."""
-    _check_logits(logits)
-    return lse_row(
-        ENTROPY,
-        logits,
-        temperature,
-        enable_pdl=_pdl(enable_pdl, logits.device),
-        config=config,
-        sm_count=sm_count,
-    )["entropy"]
+    return (res["logp"], res["lse"]) if return_lse else res["logp"]
