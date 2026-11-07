@@ -167,8 +167,8 @@ CASES = (
 # the route-specific code, which is the tap / bias load form and the store
 # form): the two new multi-sub-tile geometries, a whole-row tile, the
 # S = 5 row below one stage and a narrow single-tile row (C = 640: three
-# 32-vector tiles on every backward route but ``bwd_dt`` and on the ``fwd`` /
-# ``fwd_bias`` routes, one 80-vector tile on the others).
+# 32-vector tiles on every backward route and on the ``fwd`` / ``fwd_bias``
+# routes, one 80-vector tile on ``fwd_dt``).
 ROUTE_CASES = (
     (1000, 512, "perf"),
     (4097, 1280, (1000, 0, 3, 3094)),
@@ -788,7 +788,7 @@ def test_channel_split_narrow_tiles_per_route() -> None:
     geometry = {"threads": 128, "vec": 8}
     assert loader.NARROW_TILE_ROUTES == {
         "fwd": ("fwd", "fwd_bias"),
-        "bwd": ("bwd", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
+        "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
     }
     for kind in loader.KINDS:
         role = loader.route_role(kind)

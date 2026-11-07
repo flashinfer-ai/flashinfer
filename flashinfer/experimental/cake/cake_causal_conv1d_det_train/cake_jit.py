@@ -3519,10 +3519,11 @@ SPLIT_ROLES = ("fwd", "bwd")
 # at 64 < cv < 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C =
 # 224), the forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
 # vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
-# the programs are unchanged.  The ``_dt`` backward route keeps one tile.
+# the programs are unchanged.  Every backward route takes the rule; the
+# ``fwd_dt`` forward route keeps one tile.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
     "fwd": ("fwd", "fwd_bias"),
-    "bwd": ("bwd", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
+    "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
 
