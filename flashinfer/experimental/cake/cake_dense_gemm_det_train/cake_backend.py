@@ -1326,15 +1326,18 @@ def _single_wgrad_swap(
 # T on GB300; the knobs after it are the row's program where the form yields (the 4096 -> 48 rule carries none: the
 # architecture default program runs there), and the planner drops a rule's form where the plan carries stream-K units,
 # the single-CTA form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses
-# a caller-forced form there.  Seven sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
-# knob-free eight-warp program (``_w8``), 4096 -> 512 and the kv_a 6144 -> 576 the eight-warp program with the early
-# accumulator release and the loader-issued scheduling queries (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
+# a caller-forced form there.  Eight sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
+# knob-free eight-warp program (``_w8``), 4096 -> 512, the kv_a 6144 -> 576 and the batched MLA value-projection row
+# (N 512, K 256) the eight-warp program with the early accumulator release and the loader-issued scheduling queries
+# (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
 # the one with the early accumulator release (``_w8r``).  Each measured faster than the row's program above the pair
 # spread at both T on GB200, except 4096 -> 64, 5120 -> 64 and the kv_a, where the form measured at least as fast as the
 # row's program there; the knobs after the form are the row's program where the form yields, and the raster group is the
 # row's measured launch parameter.  The two sm_100a 4096 -> 48 input-gradient T-exact keys (T 16231 and 16384, the GB
 # T-exact rules) carry ``w8r`` too: the eight-warp program with the early accumulator release, whole tiles through the
-# one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).
+# one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).  The batched MLA
+# absorbed-query forward (N 512, K 192) carries ``w8r``.  Both MLA rows measured faster than the row's previous program
+# at the three T on GB200 and GB300; sm_103a reads them through ``RULE_PARENT``.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1357,7 +1360,11 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
-    ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
+    # the MLA absorbed-query forward (batched 512 -> 192): the eight-warp program with the early accumulator release
+    ('sm_100a', False, True, False, False, True, 512, 192, None): {"form": 'w8r'},
+    # the MLA value-projection input gradient (batched 512 -> 256): the eight-warp program with the loader-issued
+    # scheduling queries and 256-byte L2 promotion, raster group 4
+    ('sm_100a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "promo": 'l2_256b', "group_m": 4},
     ('sm_100a', False, True, True, False, False, 2048, 4096, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
