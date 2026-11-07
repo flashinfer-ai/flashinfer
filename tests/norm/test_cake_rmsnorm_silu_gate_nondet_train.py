@@ -849,7 +849,8 @@ def reserve(monkeypatch: pytest.MonkeyPatch) -> dict:
     filled and seen ready by eager calls without a workspace."""
     monkeypatch.setattr(pkg, "_RESERVES", {})
     monkeypatch.setattr(pkg, "_CAPTURE_WORKSPACES", {})
-    x, z, w, dy = make(17, 48, seed=69)
+    # 1056 rows: past every small-row backward band, a backward with a workspace
+    x, z, w, dy = make(22, 48, seed=69)
     backward(dy, x, z, w, EPS)  # loads the module, fills the reserve
     torch.cuda.synchronize()
     backward(dy, x, z, w, EPS)  # sees the fill complete
@@ -1510,7 +1511,9 @@ def test_long_forward_grid_is_whole_waves_of_at_most_six_blocks_a_cta(
         "min_rows_per_sm": {"sm_100a": 2400, "sm_103a": 2400},
         "rows_per_block": 32,
     }
-    assert record["arches"] == ["sm_100a", "sm_103a"]
+    # shipped on every architecture, routed on sm_100a and sm_103a only
+    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
+    assert "fwd_long" not in loader.ROUTES["sm_107a"]
     # sm_107a's extra-long forward launches the same grid
     xlong = loader.MODULES[loader.ROUTES["sm_107a"]["fwd_xlong"]]
     assert loader.launch_grid(xlong, rows=rows, sm_count=sm_count) == (ctas, 1, 1)
@@ -1541,7 +1544,8 @@ def test_extra_long_forward_is_the_long_forwards_grid_from_its_rows_per_sm():
     assert loader.ROUTES["sm_107a"]["fwd_xlong"] == name
     assert "fwd_xlong" not in loader.ROUTES["sm_100a"]
     record = loader.MODULES[name]
-    assert record["arches"] == ["sm_103a", "sm_107a"]
+    # shipped on every architecture, routed on sm_103a and sm_107a only
+    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
     assert record["role"] == "fwd_xlong"
     long_record = loader.MODULES[loader.ROUTES["sm_103a"]["fwd_long"]]
     assert record["grid_rule"] == {
@@ -1890,7 +1894,8 @@ def test_short_backward_accumulates_and_skips_the_weight_gradient():
 
 
 def test_calls_without_workspace_share_one_buffer_per_stream():
-    x, z, w, dy = make(65, 7)
+    # 1043 rows: past every small-row backward band, a backward with a workspace
+    x, z, w, dy = make(149, 7)
     for _ in range(2):
         backward(dy, x, z, w, 1e-6)
     torch.cuda.synchronize()
@@ -1921,9 +1926,10 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
     workspaces for CUDA Graph captures (one allocation)."""
     monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
     monkeypatch.setattr(pkg, "_RESERVES", {})
-    # Small enough for the caching allocator's small pool, whose blocks are the
-    # requested sizes rounded up to 512 bytes.
-    x, z, w, dy = make(17, 48, seed=63)
+    # 1056 rows: past every small-row backward band (a backward with a
+    # workspace), and small enough for the caching allocator's small pool, whose
+    # blocks are the requested sizes rounded up to 512 bytes.
+    x, z, w, dy = make(22, 48, seed=63)
     leaves = [t.clone().requires_grad_(True) for t in (x, z, w)]
     for leaf in leaves:
         leaf.grad = torch.zeros_like(leaf)
@@ -1942,7 +1948,7 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
     key = (
         torch.cuda.current_device(),
         torch.cuda.current_stream().cuda_stream,
-        _backward_module(17 * 48),
+        _backward_module(22 * 48),
     )
     assert list(pkg._STREAM_WORKSPACES) == [key]
     for view in pkg._STREAM_WORKSPACES[key].values():
