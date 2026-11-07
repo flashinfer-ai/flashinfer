@@ -201,8 +201,8 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) void
-kernel_cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_batch_deepgemm_fp8_fc4b600bd3dfbc29a89b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -262,11 +262,11 @@ kernel_cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b(const __grid_constant__ CUte
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
-            // sf_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
+            // sf_full: 4 barriers, init_count=2
+            mbarrier_init(smem + 64, 2);
+            mbarrier_init(smem + 72, 2);
+            mbarrier_init(smem + 80, 2);
+            mbarrier_init(smem + 88, 2);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 2 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
@@ -625,96 +625,58 @@ kernel_cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b(const __grid_constant__ CUte
                 unsigned int flat_group_m_1 = selected_group_2 * shape_m + off_m_2;
                 unsigned int sfb_group_base_1 = selected_group_2 * (shape_n / 128);
                 unsigned int last_sfb_block_1 = shape_n / 128 - 1;
-                #pragma unroll 1
+                unsigned int sf_lane = (unsigned int)lane;
+                unsigned int sfa_off[4];
+                unsigned int sfb_off[4];
+                sfa_off[0] = (flat_group_m_1 + (unsigned int)0 + sf_lane) * sf_cols;
+                sfa_off[1] = (flat_group_m_1 + (unsigned int)32 + sf_lane) * sf_cols;
+                sfa_off[2] = (flat_group_m_1 + (unsigned int)64 + sf_lane) * sf_cols;
+                sfa_off[3] = (flat_group_m_1 + (unsigned int)96 + sf_lane) * sf_cols;
+                int sf_q0[16];
+                sf_q0[0] = SFA_bits[sfa_off[0]];
+                sf_q0[1] = SFA_bits[sfa_off[0] + 1];
+                sf_q0[2] = SFA_bits[sfa_off[1]];
+                sf_q0[3] = SFA_bits[sfa_off[1] + 1];
+                sf_q0[4] = SFA_bits[sfa_off[2]];
+                sf_q0[5] = SFA_bits[sfa_off[2] + 1];
+                sf_q0[6] = SFA_bits[sfa_off[3]];
+                sf_q0[7] = SFA_bits[sfa_off[3] + 1];
+                unsigned int sf_wa[4];
+                unsigned int sf_wb[4];
+                #pragma unroll 2
                 for (int iter_k_2 = 0; iter_k_2 < k_tiles; iter_k_2++) {
+                    unsigned int pf_k = (unsigned int)iter_k_2 + 1;
+                    unsigned int pf_col = ((pf_k < k_tiles) ? pf_k : k_tiles - 1) * 2;
+                    int sf_qn[16];
+                    sf_qn[0] = SFA_bits[sfa_off[0] + pf_col];
+                    sf_qn[1] = SFA_bits[sfa_off[0] + pf_col + 1];
+                    sf_qn[2] = SFA_bits[sfa_off[1] + pf_col];
+                    sf_qn[3] = SFA_bits[sfa_off[1] + pf_col + 1];
+                    sf_qn[4] = SFA_bits[sfa_off[2] + pf_col];
+                    sf_qn[5] = SFA_bits[sfa_off[2] + pf_col + 1];
+                    sf_qn[6] = SFA_bits[sfa_off[3] + pf_col];
+                    sf_qn[7] = SFA_bits[sfa_off[3] + pf_col + 1];
                     mbarrier_wait(tma_free_addr + (sf_stage) * 8, _phase_tma_free_1);
                     int sfa_base = smem_sfa_addr + sf_stage * 43008;
                     int sfb_base = smem_sfb_addr + sf_stage * 43008;
-                    unsigned int sf_lane = (unsigned int)lane;
-                    unsigned int sf_row_1_0 = (unsigned int)0 + sf_lane;
-                    unsigned int sfa_lane_dst_1_0 = sf_lane * 16;
-                    unsigned int sfa_idx0_1_0 = (flat_group_m_1 + sf_row_1_0) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfa_v_1_0 = (unsigned int)(SFA_bits[sfa_idx0_1_0] >> 23);
-                    unsigned int sfa_word_2_0 = sfa_v_1_0 | sfa_v_1_0 << 8 | sfa_v_1_0 << 16 | sfa_v_1_0 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfa_base + sfa_lane_dst_1_0), "r"(sfa_word_2_0));
-                    unsigned int sfa_v_1_1 = (unsigned int)(SFA_bits[sfa_idx0_1_0 + 1] >> 23);
-                    unsigned int sfa_word_2_1 = sfa_v_1_1 | sfa_v_1_1 << 8 | sfa_v_1_1 << 16 | sfa_v_1_1 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfa_base + 512) + sfa_lane_dst_1_0), "r"(sfa_word_2_1));
-                    unsigned int sf_row_1_1 = (unsigned int)32 + sf_lane;
-                    unsigned int sfa_lane_dst_1_1 = sf_lane * 16 + 4;
-                    unsigned int sfa_idx0_1_1 = (flat_group_m_1 + sf_row_1_1) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfa_v_1_2 = (unsigned int)(SFA_bits[sfa_idx0_1_1] >> 23);
-                    unsigned int sfa_word_2_2 = sfa_v_1_2 | sfa_v_1_2 << 8 | sfa_v_1_2 << 16 | sfa_v_1_2 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfa_base + sfa_lane_dst_1_1), "r"(sfa_word_2_2));
-                    unsigned int sfa_v_1_3 = (unsigned int)(SFA_bits[sfa_idx0_1_1 + 1] >> 23);
-                    unsigned int sfa_word_2_3 = sfa_v_1_3 | sfa_v_1_3 << 8 | sfa_v_1_3 << 16 | sfa_v_1_3 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfa_base + 512) + sfa_lane_dst_1_1), "r"(sfa_word_2_3));
-                    unsigned int sf_row_1_2 = (unsigned int)64 + sf_lane;
-                    unsigned int sfa_lane_dst_1_2 = sf_lane * 16 + 8;
-                    unsigned int sfa_idx0_1_2 = (flat_group_m_1 + sf_row_1_2) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfa_v_1_4 = (unsigned int)(SFA_bits[sfa_idx0_1_2] >> 23);
-                    unsigned int sfa_word_2_4 = sfa_v_1_4 | sfa_v_1_4 << 8 | sfa_v_1_4 << 16 | sfa_v_1_4 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfa_base + sfa_lane_dst_1_2), "r"(sfa_word_2_4));
-                    unsigned int sfa_v_1_5 = (unsigned int)(SFA_bits[sfa_idx0_1_2 + 1] >> 23);
-                    unsigned int sfa_word_2_5 = sfa_v_1_5 | sfa_v_1_5 << 8 | sfa_v_1_5 << 16 | sfa_v_1_5 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfa_base + 512) + sfa_lane_dst_1_2), "r"(sfa_word_2_5));
-                    unsigned int sf_row_1_3 = (unsigned int)96 + sf_lane;
-                    unsigned int sfa_lane_dst_1_3 = sf_lane * 16 + 12;
-                    unsigned int sfa_idx0_1_3 = (flat_group_m_1 + sf_row_1_3) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfa_v_1_6 = (unsigned int)(SFA_bits[sfa_idx0_1_3] >> 23);
-                    unsigned int sfa_word_2_6 = sfa_v_1_6 | sfa_v_1_6 << 8 | sfa_v_1_6 << 16 | sfa_v_1_6 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfa_base + sfa_lane_dst_1_3), "r"(sfa_word_2_6));
-                    unsigned int sfa_v_1_7 = (unsigned int)(SFA_bits[sfa_idx0_1_3 + 1] >> 23);
-                    unsigned int sfa_word_2_7 = sfa_v_1_7 | sfa_v_1_7 << 8 | sfa_v_1_7 << 16 | sfa_v_1_7 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfa_base + 512) + sfa_lane_dst_1_3), "r"(sfa_word_2_7));
-                    unsigned int sfb_block_idx = 0;
-                    unsigned int n_glob = off_n_2 + (unsigned int)0 + sf_lane;
-                    unsigned int n_sf_block = n_glob / 128;
-                    unsigned int n_sf_block_safe = ((n_glob < shape_n) ? n_sf_block : last_sfb_block_1);
-                    unsigned int sfb_idx0 = (sfb_group_base_1 + n_sf_block_safe) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfb_lane_dst = sfb_block_idx * 512 + sf_lane * 16;
-                    unsigned int sfb_v_1 = (unsigned int)(SFB_bits[sfb_idx0] >> 23);
-                    unsigned int sfb_word_1 = sfb_v_1 | sfb_v_1 << 8 | sfb_v_1 << 16 | sfb_v_1 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfb_base + sfb_lane_dst), "r"(sfb_word_1));
-                    unsigned int sfb_v_1_0 = (unsigned int)(SFB_bits[sfb_idx0 + 1] >> 23);
-                    unsigned int sfb_word_1_0 = sfb_v_1_0 | sfb_v_1_0 << 8 | sfb_v_1_0 << 16 | sfb_v_1_0 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfb_base + 512) + sfb_lane_dst), "r"(sfb_word_1_0));
-                    unsigned int sfb_block_idx_r_0 = 0;
-                    unsigned int n_glob_r_0 = off_n_2 + (unsigned int)32 + sf_lane;
-                    unsigned int n_sf_block_r_0 = n_glob_r_0 / 128;
-                    unsigned int n_sf_block_safe_r_0 = ((n_glob_r_0 < shape_n) ? n_sf_block_r_0 : last_sfb_block_1);
-                    unsigned int sfb_idx0_r_0 = (sfb_group_base_1 + n_sf_block_safe_r_0) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfb_lane_dst_r_0 = sfb_block_idx_r_0 * 512 + sf_lane * 16 + 4;
-                    unsigned int sfb_v_1_1 = (unsigned int)(SFB_bits[sfb_idx0_r_0] >> 23);
-                    unsigned int sfb_word_1_1 = sfb_v_1_1 | sfb_v_1_1 << 8 | sfb_v_1_1 << 16 | sfb_v_1_1 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfb_base + sfb_lane_dst_r_0), "r"(sfb_word_1_1));
-                    unsigned int sfb_v_1_2 = (unsigned int)(SFB_bits[sfb_idx0_r_0 + 1] >> 23);
-                    unsigned int sfb_word_1_2 = sfb_v_1_2 | sfb_v_1_2 << 8 | sfb_v_1_2 << 16 | sfb_v_1_2 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfb_base + 512) + sfb_lane_dst_r_0), "r"(sfb_word_1_2));
-                    unsigned int sfb_block_idx_r_1 = 0;
-                    unsigned int n_glob_r_1 = off_n_2 + (unsigned int)64 + sf_lane;
-                    unsigned int n_sf_block_r_1 = n_glob_r_1 / 128;
-                    unsigned int n_sf_block_safe_r_1 = ((n_glob_r_1 < shape_n) ? n_sf_block_r_1 : last_sfb_block_1);
-                    unsigned int sfb_idx0_r_1 = (sfb_group_base_1 + n_sf_block_safe_r_1) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfb_lane_dst_r_1 = sfb_block_idx_r_1 * 512 + sf_lane * 16 + 8;
-                    unsigned int sfb_v_1_3 = (unsigned int)(SFB_bits[sfb_idx0_r_1] >> 23);
-                    unsigned int sfb_word_1_3 = sfb_v_1_3 | sfb_v_1_3 << 8 | sfb_v_1_3 << 16 | sfb_v_1_3 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfb_base + sfb_lane_dst_r_1), "r"(sfb_word_1_3));
-                    unsigned int sfb_v_1_4 = (unsigned int)(SFB_bits[sfb_idx0_r_1 + 1] >> 23);
-                    unsigned int sfb_word_1_4 = sfb_v_1_4 | sfb_v_1_4 << 8 | sfb_v_1_4 << 16 | sfb_v_1_4 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfb_base + 512) + sfb_lane_dst_r_1), "r"(sfb_word_1_4));
-                    unsigned int sfb_block_idx_r_2 = 0;
-                    unsigned int n_glob_r_2 = off_n_2 + (unsigned int)96 + sf_lane;
-                    unsigned int n_sf_block_r_2 = n_glob_r_2 / 128;
-                    unsigned int n_sf_block_safe_r_2 = ((n_glob_r_2 < shape_n) ? n_sf_block_r_2 : last_sfb_block_1);
-                    unsigned int sfb_idx0_r_2 = (sfb_group_base_1 + n_sf_block_safe_r_2) * sf_cols + (unsigned int)iter_k_2 * 2;
-                    unsigned int sfb_lane_dst_r_2 = sfb_block_idx_r_2 * 512 + sf_lane * 16 + 12;
-                    unsigned int sfb_v_1_5 = (unsigned int)(SFB_bits[sfb_idx0_r_2] >> 23);
-                    unsigned int sfb_word_1_5 = sfb_v_1_5 | sfb_v_1_5 << 8 | sfb_v_1_5 << 16 | sfb_v_1_5 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfb_base + sfb_lane_dst_r_2), "r"(sfb_word_1_5));
-                    unsigned int sfb_v_1_6 = (unsigned int)(SFB_bits[sfb_idx0_r_2 + 1] >> 23);
-                    unsigned int sfb_word_1_6 = sfb_v_1_6 | sfb_v_1_6 << 8 | sfb_v_1_6 << 16 | sfb_v_1_6 << 24;
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfb_base + 512) + sfb_lane_dst_r_2), "r"(sfb_word_1_6));
+                    unsigned int pf_a_7_0 = (unsigned int)(sf_q0[0] >> 23);
+                    sf_wa[0] = pf_a_7_0 | pf_a_7_0 << 8 | pf_a_7_0 << 16 | pf_a_7_0 << 24;
+                    unsigned int pf_a_7_1 = (unsigned int)(sf_q0[2] >> 23);
+                    sf_wa[1] = pf_a_7_1 | pf_a_7_1 << 8 | pf_a_7_1 << 16 | pf_a_7_1 << 24;
+                    unsigned int pf_a_7_2 = (unsigned int)(sf_q0[4] >> 23);
+                    sf_wa[2] = pf_a_7_2 | pf_a_7_2 << 8 | pf_a_7_2 << 16 | pf_a_7_2 << 24;
+                    unsigned int pf_a_7_3 = (unsigned int)(sf_q0[6] >> 23);
+                    sf_wa[3] = pf_a_7_3 | pf_a_7_3 << 8 | pf_a_7_3 << 16 | pf_a_7_3 << 24;
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((unsigned int)sfa_base + sf_lane * 16), "r"(sf_wa[0]), "r"(sf_wa[1]), "r"(sf_wa[2]), "r"(sf_wa[3]));
+                    unsigned int pf_a_7_4 = (unsigned int)(sf_q0[1] >> 23);
+                    sf_wa[0] = pf_a_7_4 | pf_a_7_4 << 8 | pf_a_7_4 << 16 | pf_a_7_4 << 24;
+                    unsigned int pf_a_7_5 = (unsigned int)(sf_q0[3] >> 23);
+                    sf_wa[1] = pf_a_7_5 | pf_a_7_5 << 8 | pf_a_7_5 << 16 | pf_a_7_5 << 24;
+                    unsigned int pf_a_7_6 = (unsigned int)(sf_q0[5] >> 23);
+                    sf_wa[2] = pf_a_7_6 | pf_a_7_6 << 8 | pf_a_7_6 << 16 | pf_a_7_6 << 24;
+                    unsigned int pf_a_7_7 = (unsigned int)(sf_q0[7] >> 23);
+                    sf_wa[3] = pf_a_7_7 | pf_a_7_7 << 8 | pf_a_7_7 << 16 | pf_a_7_7 << 24;
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((unsigned int)(sfa_base + 512) + sf_lane * 16), "r"(sf_wa[0]), "r"(sf_wa[1]), "r"(sf_wa[2]), "r"(sf_wa[3]));
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
@@ -722,6 +684,157 @@ kernel_cake_batch_deepgemm_fp8_6bd449b1e45e0273fa0b(const __grid_constant__ CUte
                     }
                     sf_stage += 1;
                     if (sf_stage == 4) { sf_stage = 0; _phase_tma_free_1 ^= 1; }
+                    sf_q0[0] = sf_qn[0];
+                    sf_q0[1] = sf_qn[1];
+                    sf_q0[2] = sf_qn[2];
+                    sf_q0[3] = sf_qn[3];
+                    sf_q0[4] = sf_qn[4];
+                    sf_q0[5] = sf_qn[5];
+                    sf_q0[6] = sf_qn[6];
+                    sf_q0[7] = sf_qn[7];
+                }
+            }
+        }
+    }
+    // ---- Role: scales_b ----
+    if (warp == 7) {
+        { // scales_b_main
+            unsigned int sf_stage_1 = 0;
+            unsigned int num_workers_4 = (unsigned int)num_bids;
+            unsigned int worker_idx_4 = (unsigned int)bid;
+            unsigned int max_m_blocks_2 = (shape_m + 128 - 1) / 128;
+            unsigned int exact_pair_blocks_4 = 0;
+            #pragma unroll 1
+            for (int count_g_4 = 0; count_g_4 < num_groups; count_g_4++) {
+                unsigned int count_m_4 = (unsigned int)masked_m[count_g_4];
+                unsigned int count_m_blocks_4 = (count_m_4 + 128 - 1) / 128;
+                exact_pair_blocks_4 = exact_pair_blocks_4 + (count_m_blocks_4 + 1 - 1);
+            }
+            unsigned int scheduled_total_tiles_4 = exact_pair_blocks_4 * grid_n;
+            unsigned int current_group_idx_3 = 0;
+            unsigned int current_pair_cumsum_3 = 0;
+            unsigned int _phase_tma_free_2 = 1;
+            #pragma unroll 1
+            for (unsigned int tile_idx_3 = worker_idx_4; tile_idx_3 < scheduled_total_tiles_4; tile_idx_3 += num_workers_4) {
+                int has_tile_3 = 0;
+                unsigned int selected_group_3 = 0;
+                unsigned int selected_pair_start_3 = 0;
+                unsigned int selected_m_blocks_3 = 0;
+                unsigned int selected_pair_blocks_3 = 1;
+                #pragma unroll 1
+                for (int scan_g_3 = current_group_idx_3; scan_g_3 < num_groups; scan_g_3++) {
+                    unsigned int group_m_3 = (unsigned int)masked_m[scan_g_3];
+                    unsigned int m_blocks_scan_3 = (group_m_3 + 128 - 1) / 128;
+                    unsigned int pair_blocks_scan_3 = m_blocks_scan_3 + 1 - 1;
+                    unsigned int next_pair_cumsum_3 = current_pair_cumsum_3 + pair_blocks_scan_3;
+                    if (has_tile_3 == 0) {
+                        if (tile_idx_3 < next_pair_cumsum_3 * grid_n) {
+                            current_group_idx_3 = scan_g_3;
+                            selected_group_3 = scan_g_3;
+                            selected_pair_start_3 = current_pair_cumsum_3;
+                            selected_m_blocks_3 = m_blocks_scan_3;
+                            selected_pair_blocks_3 = pair_blocks_scan_3;
+                            has_tile_3 = 1;
+                            break;
+                        } else {
+                            current_pair_cumsum_3 = next_pair_cumsum_3;
+                        }
+                    }
+                }
+                unsigned int zero_u32_3 = (unsigned int)0;
+                unsigned int safe_tile_idx_3 = ((has_tile_3 != 0) ? tile_idx_3 : zero_u32_3);
+                unsigned int in_group_3 = safe_tile_idx_3 - selected_pair_start_3 * grid_n;
+                unsigned int pairs_per_l2_3 = selected_pair_blocks_3 * 16;
+                unsigned int l2_group_3 = in_group_3 / pairs_per_l2_3;
+                unsigned int first_n_3 = l2_group_3 * 16;
+                unsigned int in_l2_3 = in_group_3 % pairs_per_l2_3;
+                unsigned int remaining_n_3 = grid_n - first_n_3;
+                unsigned int n_l2_limit_3 = (unsigned int)16;
+                unsigned int n_in_l2_3 = ((remaining_n_3 > n_l2_limit_3) ? n_l2_limit_3 : remaining_n_3);
+                unsigned int pair_block_3 = in_l2_3 / n_in_l2_3;
+                unsigned int n_block_3 = first_n_3 + in_l2_3 % n_in_l2_3;
+                unsigned int raw_m_block_3 = pair_block_3;
+                unsigned int m_block_2 = ((raw_m_block_3 < max_m_blocks_2) ? raw_m_block_3 : pair_block_3);
+                unsigned int off_m_3 = m_block_2 * 128;
+                unsigned int off_n_3 = n_block_3 * 32;
+                unsigned int flat_group_m_2 = selected_group_3 * shape_m + off_m_3;
+                unsigned int sfb_group_base_2 = selected_group_3 * (shape_n / 128);
+                unsigned int last_sfb_block_2 = shape_n / 128 - 1;
+                unsigned int sf_lane_1 = (unsigned int)lane;
+                unsigned int sfa_off_1[4];
+                unsigned int sfb_off_1[4];
+                unsigned int pf_n_glob_1_0 = off_n_3 + (unsigned int)0 + sf_lane_1;
+                unsigned int pf_n_block_2_0 = pf_n_glob_1_0 / 128;
+                sfb_off_1[0] = (sfb_group_base_2 + ((pf_n_glob_1_0 < shape_n) ? pf_n_block_2_0 : last_sfb_block_2)) * sf_cols;
+                unsigned int pf_n_glob_1_1 = off_n_3 + (unsigned int)32 + sf_lane_1;
+                unsigned int pf_n_block_2_1 = pf_n_glob_1_1 / 128;
+                sfb_off_1[1] = (sfb_group_base_2 + ((pf_n_glob_1_1 < shape_n) ? pf_n_block_2_1 : last_sfb_block_2)) * sf_cols;
+                unsigned int pf_n_glob_1_2 = off_n_3 + (unsigned int)64 + sf_lane_1;
+                unsigned int pf_n_block_2_2 = pf_n_glob_1_2 / 128;
+                sfb_off_1[2] = (sfb_group_base_2 + ((pf_n_glob_1_2 < shape_n) ? pf_n_block_2_2 : last_sfb_block_2)) * sf_cols;
+                unsigned int pf_n_glob_1_3 = off_n_3 + (unsigned int)96 + sf_lane_1;
+                unsigned int pf_n_block_2_3 = pf_n_glob_1_3 / 128;
+                sfb_off_1[3] = (sfb_group_base_2 + ((pf_n_glob_1_3 < shape_n) ? pf_n_block_2_3 : last_sfb_block_2)) * sf_cols;
+                int sf_q0_1[16];
+                sf_q0_1[8] = SFB_bits[sfb_off_1[0]];
+                sf_q0_1[9] = SFB_bits[sfb_off_1[0] + 1];
+                sf_q0_1[10] = SFB_bits[sfb_off_1[1]];
+                sf_q0_1[11] = SFB_bits[sfb_off_1[1] + 1];
+                sf_q0_1[12] = SFB_bits[sfb_off_1[2]];
+                sf_q0_1[13] = SFB_bits[sfb_off_1[2] + 1];
+                sf_q0_1[14] = SFB_bits[sfb_off_1[3]];
+                sf_q0_1[15] = SFB_bits[sfb_off_1[3] + 1];
+                unsigned int sf_wa_1[4];
+                unsigned int sf_wb_1[4];
+                #pragma unroll 2
+                for (int iter_k_3 = 0; iter_k_3 < k_tiles; iter_k_3++) {
+                    unsigned int pf_k_1 = (unsigned int)iter_k_3 + 1;
+                    unsigned int pf_col_1 = ((pf_k_1 < k_tiles) ? pf_k_1 : k_tiles - 1) * 2;
+                    int sf_qn_1[16];
+                    sf_qn_1[8] = SFB_bits[sfb_off_1[0] + pf_col_1];
+                    sf_qn_1[9] = SFB_bits[sfb_off_1[0] + pf_col_1 + 1];
+                    sf_qn_1[10] = SFB_bits[sfb_off_1[1] + pf_col_1];
+                    sf_qn_1[11] = SFB_bits[sfb_off_1[1] + pf_col_1 + 1];
+                    sf_qn_1[12] = SFB_bits[sfb_off_1[2] + pf_col_1];
+                    sf_qn_1[13] = SFB_bits[sfb_off_1[2] + pf_col_1 + 1];
+                    sf_qn_1[14] = SFB_bits[sfb_off_1[3] + pf_col_1];
+                    sf_qn_1[15] = SFB_bits[sfb_off_1[3] + pf_col_1 + 1];
+                    mbarrier_wait(tma_free_addr + (sf_stage_1) * 8, _phase_tma_free_2);
+                    int sfa_base_1 = smem_sfa_addr + sf_stage_1 * 43008;
+                    int sfb_base_1 = smem_sfb_addr + sf_stage_1 * 43008;
+                    unsigned int pf_b_7_0 = (unsigned int)(sf_q0_1[8] >> 23);
+                    sf_wb_1[0] = pf_b_7_0 | pf_b_7_0 << 8 | pf_b_7_0 << 16 | pf_b_7_0 << 24;
+                    unsigned int pf_b_7_1 = (unsigned int)(sf_q0_1[10] >> 23);
+                    sf_wb_1[1] = pf_b_7_1 | pf_b_7_1 << 8 | pf_b_7_1 << 16 | pf_b_7_1 << 24;
+                    unsigned int pf_b_7_2 = (unsigned int)(sf_q0_1[12] >> 23);
+                    sf_wb_1[2] = pf_b_7_2 | pf_b_7_2 << 8 | pf_b_7_2 << 16 | pf_b_7_2 << 24;
+                    unsigned int pf_b_7_3 = (unsigned int)(sf_q0_1[14] >> 23);
+                    sf_wb_1[3] = pf_b_7_3 | pf_b_7_3 << 8 | pf_b_7_3 << 16 | pf_b_7_3 << 24;
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((unsigned int)sfb_base_1 + sf_lane_1 * 16), "r"(sf_wb_1[0]), "r"(sf_wb_1[1]), "r"(sf_wb_1[2]), "r"(sf_wb_1[3]));
+                    unsigned int pf_b_7_4 = (unsigned int)(sf_q0_1[9] >> 23);
+                    sf_wb_1[0] = pf_b_7_4 | pf_b_7_4 << 8 | pf_b_7_4 << 16 | pf_b_7_4 << 24;
+                    unsigned int pf_b_7_5 = (unsigned int)(sf_q0_1[11] >> 23);
+                    sf_wb_1[1] = pf_b_7_5 | pf_b_7_5 << 8 | pf_b_7_5 << 16 | pf_b_7_5 << 24;
+                    unsigned int pf_b_7_6 = (unsigned int)(sf_q0_1[13] >> 23);
+                    sf_wb_1[2] = pf_b_7_6 | pf_b_7_6 << 8 | pf_b_7_6 << 16 | pf_b_7_6 << 24;
+                    unsigned int pf_b_7_7 = (unsigned int)(sf_q0_1[15] >> 23);
+                    sf_wb_1[3] = pf_b_7_7 | pf_b_7_7 << 8 | pf_b_7_7 << 16 | pf_b_7_7 << 24;
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((unsigned int)(sfb_base_1 + 512) + sf_lane_1 * 16), "r"(sf_wb_1[0]), "r"(sf_wb_1[1]), "r"(sf_wb_1[2]), "r"(sf_wb_1[3]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
+                    if (elect_sync()) {
+                        mbarrier_arrive(sf_full_addr + (sf_stage_1) * 8);
+                    }
+                    sf_stage_1 += 1;
+                    if (sf_stage_1 == 4) { sf_stage_1 = 0; _phase_tma_free_2 ^= 1; }
+                    sf_q0_1[8] = sf_qn_1[8];
+                    sf_q0_1[9] = sf_qn_1[9];
+                    sf_q0_1[10] = sf_qn_1[10];
+                    sf_q0_1[11] = sf_qn_1[11];
+                    sf_q0_1[12] = sf_qn_1[12];
+                    sf_q0_1[13] = sf_qn_1[13];
+                    sf_q0_1[14] = sf_qn_1[14];
+                    sf_q0_1[15] = sf_qn_1[15];
                 }
             }
         }
