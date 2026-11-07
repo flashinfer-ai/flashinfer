@@ -5688,9 +5688,13 @@ def test_router_split_rules_are_measured_windows_and_resolve_by_device():
     # the measured rows and their counts, pinned here rather than read from the table under test
     assert {key: windows[0][2] for key, windows in ROUTER_SPLIT_RULES.items()} == {
         ("sm_100a", 148, "nn_t", 5120): 9,
+        ("sm_100a", 148, "nn_t", 6144): 3,
         ("sm_100a", 152, "nn_t", 5120): 9,
+        ("sm_100a", 152, "nn_t", 6144): 3,
         ("sm_103a", 148, "nn_t", 5120): 9,
+        ("sm_103a", 148, "nn_t", 6144): 3,
         ("sm_103a", 152, "nn_t", 5120): 9,
+        ("sm_103a", 152, "nn_t", 6144): 3,
     }
     assert all(len(windows) == 1 for windows in ROUTER_SPLIT_RULES.values())
     for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():

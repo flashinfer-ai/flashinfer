@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.cake_rmsnorm_det_train_backend``): the one spelling every exporter
+``flashinfer.experimental.cake.cake_rmsnorm_det_train``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -283,7 +283,7 @@ def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
 
 
 def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
-    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_loss``: the registry shape of
+    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``: the registry shape of
     :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
@@ -375,14 +375,14 @@ class Package:
 # nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
-        "flashinfer.cake_rmsnorm_det_train_backend",
-        "flashinfer/cake_rmsnorm_det_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_det_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_rmsnorm_train_backend",
-        "flashinfer/cake_rmsnorm_train_backend",
+        "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
+        "flashinfer/experimental/cake/cake_rmsnorm_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -441,20 +441,20 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_det_train_backend",
-        "flashinfer/cake_mhc_det_train_backend",
+        "flashinfer.experimental.cake.cake_mhc_det_train",
+        "flashinfer/experimental/cake/cake_mhc_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_det_train_head_backend",
-        "flashinfer/cake_mhc_det_train_head_backend",
+        "flashinfer.experimental.cake.cake_mhc_head_det_train",
+        "flashinfer/experimental/cake/cake_mhc_head_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_mhc_train_backend",
-        "flashinfer/experimental/cake/cake_mhc_train_backend",
+        "flashinfer.experimental.cake.cake_mhc_nondet_train",
+        "flashinfer/experimental/cake/cake_mhc_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -505,14 +505,14 @@ PACKAGES: tuple[Package, ...] = (
         requires=("flashinfer.experimental.cake.cake_kda_nondet_train",),
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_det_train_kcp",
-        "flashinfer/experimental/cake_gdn_det_train_kcp",
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp",
+        "flashinfer/experimental/cake/cake_gdn_det_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_train_kcp",
-        "flashinfer/experimental/cake_gdn_train_kcp",
+        "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
+        "flashinfer/experimental/cake/cake_gdn_nondet_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
@@ -535,8 +535,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_lm_head_det_loss,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_lm_head_loss",
-        "flashinfer/experimental/cake/cake_lm_head_loss",
+        "flashinfer.experimental.cake.cake_lm_head_nondet_train",
+        "flashinfer/experimental/cake/cake_lm_head_nondet_train",
         "cake_jit.py",
         refs_lm_head_loss,
     ),
@@ -627,14 +627,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_det_train",
-        "flashinfer/experimental/cake_gdn_det_train",
+        "flashinfer.experimental.cake.cake_gdn_det_train",
+        "flashinfer/experimental/cake/cake_gdn_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_gdn_train",
-        "flashinfer/experimental/cake/cake_gdn_train",
+        "flashinfer.experimental.cake.cake_gdn_nondet_train",
+        "flashinfer/experimental/cake/cake_gdn_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),

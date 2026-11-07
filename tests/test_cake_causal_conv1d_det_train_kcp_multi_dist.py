@@ -346,10 +346,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     info["retained_bytes"] = retained
     flags["retained"] = retained["plain"] == 0 and retained["handle"] == pool_bytes
     # the GDN package's context (duck-typed, the other call path): the same bits and counts
-    from flashinfer.experimental.cake_gdn_det_train_kcp import cake_kcp_plan as gplan
+    from flashinfer.experimental.cake.cake_gdn_det_train_kcp import (
+        cake_kcp_plan as gplan,
+    )
 
-    gpart, _ = _partition(gplan.partition_det_kcp, row[0], W, row[2])
-    gctx = gplan.build_context_det_kcp(gpart, dist.group.WORLD, rank, device)
+    gpart, _ = _partition(gplan.cake_gdn_det_train_kcp_partition, row[0], W, row[2])
+    gctx = gplan.cake_gdn_det_train_kcp_build_context(
+        gpart, dist.group.WORLD, rank, device
+    )
     g_single, cg_single = run(False, "direct", c=gctx)
     g_multi, cg_multi = run(True, "direct", c=gctx)
     g_handle, cg_handle = run(

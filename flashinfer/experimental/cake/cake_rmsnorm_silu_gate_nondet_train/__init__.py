@@ -56,14 +56,14 @@ its dtype is rounded to a multiple of the dtype's smallest subnormal
 its columns' weight gradient infinite or ``NaN``: ``NaN`` where the infinite
 term is in the last row and the last row block is partial (its padding rows
 reread that row and multiply it by zero), as in the deterministic backward.
-On sm_100a from 800 rows per SM and on sm_103a from 700, up to 12000 (from
-12000 the long backward, whose fold is the FP64 fold above), the mid backward
-runs instead: the long
-backward whose threads keep their folded FP32 runs, and whose CTAs keep their
-column sums over their row groups, as FP32 two-sum pairs (a sum and its error
-term) instead of FP64, converting a column's pair to FP64 once for the atomic
-add.  The error that fold itself adds to a CTA's column sum ``S`` of its FP32
-runs is at most ``C(k) * 2^-48 * A + 2^-53 * |S|`` (``k`` the folds of a
+On sm_100a from 800 rows per SM and on sm_103a from 700, up to 12000 (from 12000
+the long backward, whose fold is the FP64 fold above), and on sm_107a from 1024
+up to 3200 (from 3200 the long backward), the mid backward runs instead: the
+long backward whose threads keep their folded FP32 runs, and whose CTAs keep
+their column sums over their row groups, as FP32 two-sum pairs (a sum and its
+error term) instead of FP64, converting a column's pair to FP64 once for the
+atomic add.  The error that fold itself adds to a CTA's column sum ``S`` of its
+FP32 runs is at most ``C(k) * 2^-48 * A + 2^-53 * |S|`` (``k`` the folds of a
 thread, ``A`` the sum of the runs' magnitudes,
 ``C(k) = (k - 1)(k - 2) + 16 (k + 14)``; the FP64 fold's is
 ``(k + 14) * 2^-53 * A``): a bound on the fold alone, not on the error of
@@ -126,8 +126,8 @@ Host design (the input layout rules are the deterministic package's):
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
   backward module (two per weight-gradient dtype: the backward and the long
-  backward; three on sm_100a and sm_103a, with the mid backward) for every
-  stream that ran such a backward.  Such eager calls also
+  backward; three with the mid backward) for every stream that ran such a
+  backward.  Such eager calls also
   keep a reserve of 64 zero-filled workspaces per device (one allocation of
   about 272 KiB, filled outside any capture), from which a call during CUDA
   Graph capture takes the workspace of its capture and capture stream for
@@ -164,7 +164,8 @@ Host design (the input layout rules are the deterministic package's):
   its fifth CTA as one of its first four leaves): the mid backward up to
   12000 rows per SM and the long backward from there; and on sm_107a
   from 1024 rows per SM 128-thread CTAs of 8-row
-  blocks with ``ctas_per_sm = 8`` (one wave); on every architecture up to
+  blocks with ``ctas_per_sm = 8`` (one wave): the mid backward up to 3200 rows
+  per SM and the long backward from there; on every architecture up to
   256 rows the short backward launches one cluster of 16 256-thread CTAs
   (``cake_jit.backward_ctas`` 16), CTA ``r`` taking row block ``r``, its
   CTAs scheduled together on the SMs of one GPC.  When the other backwards'
@@ -177,8 +178,8 @@ Host design (the input layout rules are the deterministic package's):
   a CTA that starts late takes fewer blocks, and a CTA that becomes resident
   after the table ran out leaves without a row.  Each thread folds its FP32
   sums into FP64 after at most 16 of its rows (a CTA of a few blocks adds them
-  across its warps in FP32 first and converts once; the mid backward on
-  sm_100a and sm_103a folds them into FP32 two-sum pairs).  No kernel is
+  across its warps in FP32 first and converts once; the mid backward folds
+  them into FP32 two-sum pairs).  No kernel is
   cooperative, and no CTA waits for another but within the short backward's
   cluster (each CTA waits for the other CTAs' partials of its columns); no
   call synchronizes the host or the device, and every kernel runs on the
@@ -187,7 +188,8 @@ Host design (the input layout rules are the deterministic package's):
   B200, sm_100a): each 256-thread CTA of the backward (every architecture),
   of the long and the mid backward on sm_100a and sm_103a needs 20736 bytes
   of dynamic
-  shared memory (each 128-thread CTA of the long backward on sm_107a 10496),
+  shared memory (each 128-thread CTA of the mid and the long backward on
+  sm_107a 10496),
   so a kernel holding every SM with a small shared-memory carveout delays the
   start of those backwards until it exits;
   :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` documents the remedy.  The
@@ -719,12 +721,9 @@ def _stream_workspace_views(
     return views
 
 
-def _check_workspace(
-    workspace: torch.Tensor, device: torch.device, elements: int
-) -> torch.Tensor:
-    """The flat view of a caller's workspace of at least ``elements`` FP64
-    elements on ``device``; an FP32 tensor (the deterministic package's
-    workspace) is refused naming both modes' workspaces."""
+def _refuse_deterministic_workspace(workspace: Optional[torch.Tensor]) -> None:
+    """Refuse an FP32 tensor (the deterministic package's workspace), naming
+    both modes' workspaces."""
 
     if isinstance(workspace, torch.Tensor) and workspace.dtype == torch.float32:
         raise ValueError(
@@ -733,6 +732,16 @@ def _check_workspace(
             "the non-deterministic backward needs its own zero-filled FP64 "
             f"workspace ({__name__}.cake_rmsnorm_silu_gate_nondet_train_backward_workspace)"
         )
+
+
+def _check_workspace(
+    workspace: torch.Tensor, device: torch.device, elements: int
+) -> torch.Tensor:
+    """The flat view of a caller's workspace of at least ``elements`` FP64
+    elements on ``device``; an FP32 tensor (the deterministic package's
+    workspace) is refused naming both modes' workspaces."""
+
+    _refuse_deterministic_workspace(workspace)
     if (
         not isinstance(workspace, torch.Tensor)
         or workspace.device != device
@@ -809,6 +818,10 @@ def _backward(
             dw = grad_weight
     dx, dx_user = _output(grad_x, "grad_x", shape=shape, device=device)
     dz, dz_user = _output(grad_z, "grad_z", shape=shape, device=device)
+    # The other mode's workspace is refused for any row count, so before the
+    # return of a call with no rows; the size checks below depend on the
+    # backward module that the row count selects.
+    _refuse_deterministic_workspace(workspace)
     if rows == 0:
         if dw is not None and not accumulate_grad_weight:
             dw.zero_()

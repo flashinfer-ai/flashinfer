@@ -1,3 +1,5 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import BIKernels.Export
 import BIKernels.Cases
 /-! `lake exe conformance`: print the Lean model's terms for the generated cases. The Python test
@@ -82,3 +84,5 @@ def main : IO Unit := do
     IO.println s!"gemmmx4k128loop {nblk} {(kblockLoopMX4K128 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMx4K128 3 .zero nblk).sexpr}"
   for (steps, fmt) in gemmmx4k128OutCases do
     IO.println s!"gemmmx4k128out {steps} {fmt} {(outputKfoldMX4K128 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
+  for (name, P) in attnCases do
+    IO.println s!"attn {name} {(Attn.output P).sexpr}"

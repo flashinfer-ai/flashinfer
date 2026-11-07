@@ -213,14 +213,13 @@ kernel_cake_causal_conv1d_train_461d358d7090642c65de(__nv_bfloat16* __restrict__
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 1024);
     const int red_addr = smem + 1024;
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 17408);
     const int stage_buf_addr = smem + 17408;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
