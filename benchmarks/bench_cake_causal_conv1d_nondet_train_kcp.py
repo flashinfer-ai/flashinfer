@@ -26,7 +26,7 @@ group (W = 1).
 
 Rows: the single-rank benchmark's performance matrix (``C = 512`` over eight packed token counts and ``S = 250340``
 over the channel counts), each the same four-document pack (0.37 / 0.29 / 0.21 / rest of ``S``, nudged off a multiple
-of 64), token-sharded over the W ranks by ``flashinfer.cake_kda_det_train_kcp.partition_det_kcp`` (``--layout``;
+of 64), token-sharded over the W ranks by ``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_partition`` (``--layout``;
 ``contiguous``: equal token shares in order, documents cut at the shard boundaries, whose first tokens read their
 history rows through the halo exchange).  ``S`` is the whole pack; a rank holds about ``S / W`` tokens.  Every rank draws the whole pack
 from the same seed and keeps its fragments.
@@ -128,8 +128,8 @@ from bench_cake_causal_conv1d_nondet_train import (  # noqa: E402
     perf_rows,
 )
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
-    build_context_det_kcp,
-    partition_det_kcp,
+    cake_kda_det_train_kcp_build_context,
+    cake_kda_det_train_kcp_partition,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
@@ -389,8 +389,8 @@ class Problem:
         for n in self.lens:
             cu.append(cu[-1] + n)
         self.cu = cu
-        self.part = partition_det_kcp(cu, world, layout)
-        self.ctx = build_context_det_kcp(
+        self.part = cake_kda_det_train_kcp_partition(cu, world, layout)
+        self.ctx = cake_kda_det_train_kcp_build_context(
             self.part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
         )
         fragments = [f for f in self.part.fragments[rank] if f.length > 0]

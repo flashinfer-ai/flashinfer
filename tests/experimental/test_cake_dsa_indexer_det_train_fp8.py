@@ -244,6 +244,19 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
             "snake_l6_fallback_waves": None,
         },
         "sm_103a": {
+            "wide_wave_rule": [
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+            ],
             "lsf_single_rule": [64.0],
             "desc_walk_kinds": None,
             "snake_packed_rule": None,
@@ -518,7 +531,9 @@ def test_fp8_one_document_sm103_wide_call_runs_the_lsf_copy_within_the_rule():
         )
     policy = _fp8_policy(arch)
     assert policy.lsf_single_rule == [64.0]
-    # mean unit tiles (Tkv - T / 2) / 128: 544 and 56, both over 6.7 wide rounds per CTA (wide_rule)
+    # mean unit tiles (Tkv - T / 2) / 128: 544 and 56; on 152 CTAs the wide unit needs 7 waves (wide_wave_rule): long
+    # (an l6 call) needs 9 of the l6 unit (>= 1.15 x 7) over the 88.5-tile minimum (64 + 3.5 x (14 - 7)), short (top_k
+    # 256, a narrow call) 14 of the narrow unit (>= 1.7 x 7)
     long = dict(
         num_queries=8192, num_keys=73728, num_segments=1, ratio=1, top_k=2048, grid=152
     )
