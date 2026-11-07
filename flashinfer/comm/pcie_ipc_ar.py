@@ -58,9 +58,27 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
+def _spin_timeout_ns() -> int:
+    """``FLASHINFER_PCIE_IPC_TIMEOUT_S``: seconds a rank may wait for a peer.
+
+    Unset or 0 keeps the unbounded wait. Past the deadline the kernel reports
+    where it was waiting and traps, so a peer that died fails the step instead
+    of hanging it. The value does not change the protocol, so ranks that read
+    different values still interoperate.
+    """
+    raw = os.environ.get("FLASHINFER_PCIE_IPC_TIMEOUT_S", "0")
+    try:
+        seconds = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"FLASHINFER_PCIE_IPC_TIMEOUT_S must be a number of seconds, got {raw!r}"
+        ) from e
+    return max(0, int(seconds * 1e9))
+
+
 @functools.cache
 def get_pcie_ipc_comm_module():
-    module = gen_pcie_ipc_comm_module().build_and_load()
+    module = gen_pcie_ipc_comm_module(_spin_timeout_ns()).build_and_load()
 
     @register_custom_op("flashinfer::pcie_ipc_workspace_size", mutates_args=[])
     def workspace_size(

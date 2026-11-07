@@ -39,6 +39,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <type_traits>
 
 namespace flashinfer {
@@ -215,6 +216,49 @@ static_assert(!generation_reached(INT32_MAX, INT32_MIN),
 // Only the modular comparison gets both.
 static_assert(generation_reached(0, -1), "0 is one generation past -1");
 static_assert(!generation_reached(-1, 0), "-1 is one generation before 0");
+
+// Every wait on a peer below spins until the peer arrives. A peer that never
+// arrives (crashed, OOM-killed, a rank that took a different dispatch) leaves
+// the others spinning forever, inside a CUDA graph where the host cannot see
+// or interrupt it. FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS bounds that wait: past
+// the deadline one thread per module reports where it was waiting and traps,
+// turning a silent hang into a CUDA error a serving stack can restart from.
+// 0 (the default) compiles the guard out and keeps the unbounded wait.
+#ifndef FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS
+#define FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS 0ULL
+#endif
+
+#if FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
+static __device__ int spin_timeout_reported = 0;
+#endif
+
+struct SpinGuard {
+#if FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
+  uint32_t iters = 0;
+  unsigned long long start = 0;
+#endif
+  // Called once per failed poll. Reads the clock only every 4096 polls, so the
+  // cost in the loop is an increment and a predictable branch.
+  __device__ __forceinline__ void tick(const char* where) {
+#if FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
+    if ((++iters & 0xFFFu) != 0) return;
+    unsigned long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if (start == 0) {
+      start = now;
+    } else if (now - start > FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) {
+      if (atomicExch(&spin_timeout_reported, 1) == 0) {
+        printf(
+            "flashinfer pcie_ipc: %s waited %llu ms for a peer (block %d, thread %d); trapping\n",
+            where, (now - start) / 1000000ULL, blockIdx.x, threadIdx.x);
+      }
+      __trap();
+    }
+#else
+    (void)where;
+#endif
+  }
+};
 
 __device__ __forceinline__ void store_volatile_i32(int32_t* addr, int32_t value) {
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(value), "l"(addr));
@@ -636,7 +680,8 @@ __device__ __forceinline__ void block_barrier(uint64_t const* signal_ptrs, int r
     int32_t* peer_signal = reinterpret_cast<int32_t*>(signal_ptrs[peer]);
     store_release_i32(peer_signal + phase_offset(phase, block, rank, max_blocks, world_size), flag);
     int32_t* self_slot = self + phase_offset(phase, block, peer, max_blocks, world_size);
-    while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+    for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+         spin.tick(__func__)) {
     }
   }
   __syncthreads();
@@ -662,7 +707,8 @@ __device__ __forceinline__ void block_barrier_mask(uint64_t const* signal_ptrs, 
       store_release_i32(peer_signal + phase_offset(phase, block, rank, max_blocks, world_size),
                         flag);
       int32_t* self_slot = self + phase_offset(phase, block, peer, max_blocks, world_size);
-      while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+      for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+           spin.tick(__func__)) {
       }
     }
   }
@@ -684,7 +730,8 @@ __device__ __forceinline__ void island_owner_gather(uint64_t const* signal_ptrs,
   if (rank == owner && threadIdx.x < 4) {
     int peer = base + threadIdx.x;
     int32_t* self_slot = owner_signal + phase_offset(phase, block, peer, max_blocks, 8);
-    while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+    for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+         spin.tick(__func__)) {
     }
   }
   __syncthreads();
@@ -700,7 +747,8 @@ __device__ __forceinline__ void owner_pair_barrier(uint64_t const* signal_ptrs, 
     store_release_i32(cross_signal + phase_offset(phase, block, rank, max_blocks, 8), flag);
     int32_t* self_signal = reinterpret_cast<int32_t*>(signal_ptrs[rank]);
     int32_t* self_slot = self_signal + phase_offset(phase, block, cross_owner, max_blocks, 8);
-    while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+    for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+         spin.tick(__func__)) {
     }
   }
   __syncthreads();
@@ -719,7 +767,8 @@ __device__ __forceinline__ void island_owner_ready(uint64_t const* signal_ptrs, 
   } else if (threadIdx.x == 0) {
     int32_t* self_signal = reinterpret_cast<int32_t*>(signal_ptrs[rank]);
     int32_t* self_slot = self_signal + phase_offset(phase, block, owner, max_blocks, 8);
-    while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+    for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+         spin.tick(__func__)) {
     }
   }
   __syncthreads();
@@ -737,7 +786,8 @@ __device__ __forceinline__ void island_owner_ack(uint64_t const* signal_ptrs, in
     int peer = base + threadIdx.x;
     if (peer != owner) {
       int32_t* self_slot = owner_signal + phase_offset(phase, block, peer, max_blocks, 8);
-      while (!generation_reached(load_acquire_i32(self_slot), flag)) {
+      for (SpinGuard spin; !generation_reached(load_acquire_i32(self_slot), flag);
+           spin.tick(__func__)) {
       }
     }
   }
@@ -884,7 +934,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
         uint4 publish_value = clear_pos_zero_u4_16(local_value);
         store_u4_volatile(peer_buffer, peer_write_base + idx, publish_value);
         uint4 peer_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           peer_value = load_u4_volatile(local_buffer, local_poll_base + idx);
           if (!has_pos_zero_u4_16(peer_value)) {
             break;
@@ -900,7 +950,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
       }
       for (int idx = tid; idx < params.num_packs; idx += stride) {
         uint4 peer_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           peer_value = load_u4_volatile(local_buffer, local_poll_base + idx);
           if (!has_pos_zero_u4_16(peer_value)) {
             break;
@@ -924,7 +974,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
         clear_pos_zero_pack<T>(publish_value);
         store_pack_volatile<T>(peer_buffer, peer_write_base + idx, publish_value);
         Pack peer_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           peer_value = load_pack_volatile<T>(local_buffer, local_poll_base + idx);
           if (!has_pos_zero_pack<T>(peer_value)) {
             break;
@@ -941,7 +991,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
       }
       for (int idx = tid; idx < params.num_packs; idx += stride) {
         Pack peer_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           peer_value = load_pack_volatile<T>(local_buffer, local_poll_base + idx);
           if (!has_pos_zero_pack<T>(peer_value)) {
             break;
@@ -1044,7 +1094,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_ring_push_param_kernel(
     // into this rank's own slot for the all-gather passes to re-read.
     for (int idx = my_start + tid; idx < my_end; idx += stride) {
       uint4 values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
@@ -1093,7 +1143,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_ring_push_param_kernel(
       }
       int offset = stage_offset + owner * params.rank_stride_packs + idx;
       uint4 value;
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         value = load_u4_volatile(local_buffer, offset);
         if (!has_pos_zero_u4_16(value)) {
           break;
@@ -1130,7 +1180,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_ring_push_param_kernel(
     }
     for (int idx = my_start + tid; idx < my_end; idx += stride) {
       Pack values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
@@ -1172,7 +1222,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_ring_push_param_kernel(
       }
       int offset = stage_offset + owner * params.rank_stride_packs + idx;
       Pack value;
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         value = load_pack_volatile<T>(local_buffer, offset);
         if (!has_pos_zero_pack<T>(value)) {
           break;
@@ -1224,7 +1274,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_push_param_kernel(
     auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
     for (int idx = start + tid; idx < end; idx += stride) {
       uint4 values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
@@ -1262,7 +1312,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_push_param_kernel(
       }
       int offset = stage_offset + owner * params.rank_stride_packs + idx;
       uint4 value;
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         value = load_u4_volatile(local_buffer, offset);
         if (!has_pos_zero_u4_16(value)) {
           break;
@@ -1289,7 +1339,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_push_param_kernel(
     auto* local_buffer = reinterpret_cast<Pack*>(params.tmp_ptrs[params.rank]);
     for (int idx = start + tid; idx < end; idx += stride) {
       Pack values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
@@ -1324,7 +1374,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_push_param_kernel(
       }
       int offset = stage_offset + owner * params.rank_stride_packs + idx;
       Pack value;
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         value = load_pack_volatile<T>(local_buffer, offset);
         if (!has_pos_zero_pack<T>(value)) {
           break;
@@ -1370,7 +1420,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
 
       if (local_rank == chunk) {
         uint4 values[4];
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           bool waiting = false;
 #pragma unroll
           for (int peer_local = 0; peer_local < 4; ++peer_local) {
@@ -1403,7 +1453,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
 
         int cross_read = stage_offset + cross_owner * params.rank_stride_packs + idx;
         uint4 cross_sum;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           cross_sum = load_u4_volatile(local_buffer, cross_read);
           if (!has_pos_zero_u4_16(cross_sum)) {
             break;
@@ -1427,7 +1477,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
       } else {
         int final_offset = stage_offset + owner * params.rank_stride_packs + idx;
         uint4 final_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           final_value = load_u4_volatile(local_buffer, final_offset);
           if (!has_pos_zero_u4_16(final_value)) {
             break;
@@ -1454,7 +1504,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
 
       if (local_rank == chunk) {
         Pack values[4];
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           bool waiting = false;
 #pragma unroll
           for (int peer_local = 0; peer_local < 4; ++peer_local) {
@@ -1488,7 +1538,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
 
         int cross_read = stage_offset + cross_owner * params.rank_stride_packs + idx;
         Pack cross_sum;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           cross_sum = load_pack_volatile<T>(local_buffer, cross_read);
           if (!has_pos_zero_pack<T>(cross_sum)) {
             break;
@@ -1513,7 +1563,7 @@ __global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_push_param_kernel(
       } else {
         int final_offset = stage_offset + owner * params.rank_stride_packs + idx;
         Pack final_value;
-        while (true) {
+        for (SpinGuard spin;; spin.tick(__func__)) {
           final_value = load_pack_volatile<T>(local_buffer, final_offset);
           if (!has_pos_zero_pack<T>(final_value)) {
             break;
@@ -1999,7 +2049,7 @@ __global__ __launch_bounds__(1024, 1) void push_oneshot_param_kernel(
     uint4 reset = {0u, 0u, 0u, 0u};
     for (int idx = tid; idx < params.num_packs; idx += stride) {
       uint4 values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
@@ -2047,7 +2097,7 @@ __global__ __launch_bounds__(1024, 1) void push_oneshot_param_kernel(
     Pack reset = zero_pack<T>();
     for (int idx = tid; idx < params.num_packs; idx += stride) {
       Pack values[WorldSize];
-      while (true) {
+      for (SpinGuard spin;; spin.tick(__func__)) {
         bool waiting = false;
 #pragma unroll
         for (int peer = 0; peer < WorldSize; ++peer) {
