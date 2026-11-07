@@ -3349,7 +3349,8 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule); three ragged sm_107a weight-gradient keys add 3 sm_107a
     # keys (test_sm107a_ragged_wgrad_rules_plan_their_programs); the MLA absorbed-query forward adds one sm_100a key
     # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 10 sm_107a keys and re-values 2
-    # (test_sm107a_212_tranche_rules_plan_their_programs)
+    # (test_sm107a_212_tranche_rules_plan_their_programs); the MLA value-projection input gradient's head-interleaved
+    # raster adds one sm_103a key (test_round15_store_hint_knob)
     assert (
         len(ROW_RULES)
         == 109
@@ -3374,6 +3375,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
         + 3
         + 1
         + 10
+        + 1
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
@@ -3382,7 +3384,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 10
     assert (
         sum(k[0] == "sm_103a" for k in ROW_RULES)
-        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8
+        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8 + 1
     )
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -8616,8 +8618,8 @@ def test_sw_rules_plan_the_paced_store_programs(T):
 
 
 # the unbatched ragged ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a
-# input-gradient rows; the two sm_100a 4096 -> 48 T-exact keys that carry it are GB_T_EXACT_ROWS, the two batched MLA
-# rows of sm_100a are MLA_TEMPLATES rows)
+# input-gradient rows; the two sm_100a 4096 -> 48 T-exact keys that carry it are GB_T_EXACT_ROWS, the batched MLA rows
+# of sm_100a and sm_103a are MLA_TEMPLATES rows and test_round15_store_hint_knob's)
 EIGHT_WARP_ROWS = sorted(
     (
         key
