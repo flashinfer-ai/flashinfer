@@ -110,7 +110,7 @@ GROUP_SHAPE = (1024, 1024)
 # Two weight-gradient shapes (N, K) over K512_E3 whose ordered one-launch tails split,
 # the second needing strictly more tail slots and tickets than the first at every SM
 # count of SM_COUNTS (test_changed_shapes_grow_the_tail_at_every_sm_count).
-CHANGED_SHAPES = ((4864, 1024), (5120, 1024))
+CHANGED_SHAPES = ((7168, 1024), (4864, 1536))
 # The 256-wide k tile's wave-synchronised weight gradient (``main_wave`` where
 # ``wave_sync_archs[256]`` lists the architecture, sm_100a / sm_103a; ``main``
 # elsewhere): average rows below k512_min_rows_per_group, K >= wave_sync_min_k.
