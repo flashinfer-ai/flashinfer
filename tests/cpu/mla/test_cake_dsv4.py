@@ -2180,6 +2180,108 @@ def test_kernel_kwargs_hand_over_contiguous_index_spans():
     assert sep["swa_indices"] is swa and sep["compressed_indices"] is extra
 
 
+def _aligned_parent(rows: int, cols: int) -> torch.Tensor:
+    """A contiguous ``[rows, cols]`` int32 table at a 64-byte aligned address,
+    holding distinct values."""
+    raw = torch.zeros(rows * cols + 16, dtype=torch.int32)
+    start = ((-raw.data_ptr()) % 64) // raw.element_size()
+    parent = raw[start : start + rows * cols].view(rows, cols)
+    parent.copy_(torch.arange(rows * cols, dtype=torch.int32).view(rows, cols))
+    assert parent.data_ptr() % 64 == 0
+    return parent
+
+
+_OFF_BASE = r"must start at a 16-byte aligned address, got data_ptr\(\) % 16 == 4"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("compressed", [0, 132])
+def test_metadata_resolution_rejects_tables_off_the_index_row_loads(compressed):
+    """The BF16 / FP8 kernels load index rows 16 bytes at a time: a table whose
+    base is not 16-byte aligned, or whose row stride is not a multiple of 4,
+    is rejected before any launch, in the combined form and in the separate
+    form (either table, including a compressed column view)."""
+    rows, width = 5, 128 + compressed
+    lens = torch.full((rows,), 128 + compressed // 2, dtype=torch.int32)
+    parent = _aligned_parent(rows, width + 1)
+    odd = f"row stride that is a multiple of 4 elements, got {width + 1}"
+    # parent[:, 1:]: base +4 bytes, odd row stride.
+    with pytest.raises(ValueError, match=f"^sparse_indices {_OFF_BASE}"):
+        resolve_cake_dsv4_sparse_metadata(parent[:, 1:], lens, query_rows=rows)
+    # parent[:, :W]: aligned base, odd row stride.
+    with pytest.raises(ValueError, match=f"^sparse_indices must have a {odd}"):
+        resolve_cake_dsv4_sparse_metadata(parent[:, :width], lens, query_rows=rows)
+    # A one-row table has no row stride to keep.
+    one = resolve_cake_dsv4_sparse_metadata(parent[:1, :width], lens[:1], query_rows=1)
+    assert one.swa_indices.data_ptr() == parent.data_ptr()
+    if not compressed:
+        return
+    extra_lens = lens - 128
+    swa = _aligned_parent(rows, 128)
+    # Separate form, the SWA table off: parent[:, 1:129].
+    with pytest.raises(ValueError, match=f"^sparse_indices {_OFF_BASE}"):
+        resolve_cake_dsv4_sparse_metadata(
+            parent[:, 1:129],
+            extra_sparse_indices=parent[:, 129:],
+            extra_sparse_topk_lens=extra_lens,
+            query_rows=rows,
+        )
+    # Separate form, the compressed column view of parent[:, 1:] off.
+    with pytest.raises(ValueError, match=f"^extra_sparse_indices {_OFF_BASE}"):
+        resolve_cake_dsv4_sparse_metadata(
+            swa,
+            extra_sparse_indices=parent[:, 129:],
+            extra_sparse_topk_lens=extra_lens,
+            query_rows=rows,
+        )
+    # Separate form, the compressed table on an aligned base with an odd row stride.
+    with pytest.raises(ValueError, match=f"^extra_sparse_indices must have a {odd}"):
+        resolve_cake_dsv4_sparse_metadata(
+            swa,
+            extra_sparse_indices=parent[:, 128:width],
+            extra_sparse_topk_lens=extra_lens,
+            query_rows=rows,
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("compressed", [0, 132])
+def test_metadata_resolution_keeps_16_byte_offset_views_in_place(compressed):
+    """A view 16 bytes into a larger table with a row stride that is a multiple
+    of 4 is accepted as is: the bound tables keep its data_ptr and row stride
+    (no copy), in the combined and the separate form."""
+    rows, width = 5, 128 + compressed
+    lens = torch.full((rows,), 128 + compressed // 2, dtype=torch.int32)
+    # parent[:, 4:] of a [T, W + 4] parent: base +16 bytes, row stride W + 4.
+    parent = _aligned_parent(rows, width + 4)
+    view = parent[:, 4:]
+    assert view.data_ptr() == parent.data_ptr() + 16 and view.stride(0) == width + 4
+    meta = resolve_cake_dsv4_sparse_metadata(view, lens, query_rows=rows)
+    assert meta.swa_indices is view
+    assert meta.compressed_indices.data_ptr() == view.data_ptr() + (
+        128 * 4 if compressed else 0
+    )
+    assert meta.swa_index_stride == meta.compressed_index_stride == width + 4
+    kw = meta.kernel_kwargs()
+    assert kw["swa_indices"].data_ptr() == view.data_ptr()
+    assert kw["compressed_indices"].data_ptr() == meta.compressed_indices.data_ptr()
+    assert kw["swa_indices"].numel() == (rows - 1) * (width + 4) + width
+    if not compressed:
+        return
+    swa, extra = view[:, :128], view[:, 128:]
+    sep = resolve_cake_dsv4_sparse_metadata(
+        swa,
+        extra_sparse_indices=extra,
+        extra_sparse_topk_lens=lens - 128,
+        query_rows=rows,
+    )
+    assert sep.swa_indices is swa and sep.compressed_indices is extra
+    assert sep.swa_index_stride == sep.compressed_index_stride == width + 4
+    kw = sep.kernel_kwargs()
+    assert kw["swa_indices"].data_ptr() == view.data_ptr()
+    assert kw["compressed_indices"].data_ptr() == view.data_ptr() + 128 * 4
+
+
 _PERSISTENT_PLAN = _plan(
     ("tma_buffer", "tmap_q"),
     ("tma_buffer", "tmap_swa_kv"),

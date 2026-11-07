@@ -19,7 +19,10 @@ Host contract (flashinfer#4671 hardening)
   ``extra_sparse_indices [T, topk_c]``; ``extra_sparse_topk_lens`` counts
   compressed slots only and implies ``sparse_topk_lens_offset += 128``).
   Resolution never copies: a non-unit column stride or a non-int32 table is an
-  error.
+  error. The kernels load index rows 16 bytes (four int32) at a time, so every
+  bound table must start at a 16-byte aligned address and, with more than one
+  row, have a row stride that is a multiple of 4 elements. Other tables (for
+  example ``parent[:, 1:]`` of a ``[T, W + 1]`` parent) are an error as well.
 * **Padded rows.** ``num_query_tokens`` is the metadata row count ``T``.
   ``query`` and ``out`` may carry more rows; rows ``>= T`` are neither read nor
   written. Grids and workspace views derive from ``T``, never from query rows.
@@ -179,6 +182,8 @@ _HEAD_DIM = 512
 _TILE_KV = 128
 _SWA_WIDTH = 128
 _ALIGN = 128
+# The BF16 / FP8 programs load index rows this many bytes (four int32) at a time.
+_INDEX_ROW_ALIGN = 16
 
 # Deterministic workspace layout (byte offsets inside workspace_buffer).
 _DESCRIPTOR_SLAB_OFFSET = 0
@@ -435,6 +440,31 @@ def _int32_table(tensor: torch.Tensor, name: str, *, rows: Optional[int] = None)
     return tensor
 
 
+def _check_index_row_alignment(table: torch.Tensor, name: str) -> None:
+    """Reject an index table the 16-byte index-row loads cannot read.
+
+    The BF16 / FP8 programs load four int32 indices at a time from
+    ``data_ptr + 4 * (t * row_stride + c)`` with ``c`` a multiple of 4, so the
+    table must start 16-byte aligned and, past one row, have a row stride that
+    is a multiple of 4 elements. Row-tiled launches slice the table by row,
+    which keeps both properties. The NVFP4 family reads its tables one index
+    at a time and does not call this.
+    """
+    misaligned = table.data_ptr() % _INDEX_ROW_ALIGN
+    if misaligned:
+        raise ValueError(
+            f"{name} must start at a {_INDEX_ROW_ALIGN}-byte aligned address, got "
+            f"data_ptr() % {_INDEX_ROW_ALIGN} == {misaligned}: the kernels load "
+            f"index rows {_INDEX_ROW_ALIGN} bytes at a time"
+        )
+    if table.shape[0] > 1 and table.stride(0) % 4:
+        raise ValueError(
+            f"{name} must have a row stride that is a multiple of 4 elements, got "
+            f"{table.stride(0)}: the kernels load index rows {_INDEX_ROW_ALIGN} "
+            "bytes at a time"
+        )
+
+
 def _int32_lens(tensor: torch.Tensor, name: str, *, rows: int) -> torch.Tensor:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
@@ -475,6 +505,11 @@ def resolve_cake_dsv4_sparse_metadata(
 
     ``query_rows`` is the number of rows the query tensor provides; the metadata
     may describe fewer tokens (padded batch) but never more.
+
+    Every bound table must start at a 16-byte aligned address and, with more
+    than one row, have a row stride that is a multiple of 4 elements (the
+    BF16 / FP8 kernels load index rows 16 bytes at a time); other tables raise
+    ``ValueError``.
     """
     if isinstance(sparse_topk_lens_offset, bool) or not isinstance(
         sparse_topk_lens_offset, int
@@ -539,6 +574,11 @@ def resolve_cake_dsv4_sparse_metadata(
     if sparse_topk % 4:
         raise ValueError(
             f"sparse_topk (128 + compressed columns) must be a multiple of 4, got {sparse_topk}"
+        )
+    _check_index_row_alignment(swa, "sparse_indices")
+    if compressed is not swa:
+        _check_index_row_alignment(
+            compressed, "extra_sparse_indices" if separate else "sparse_indices"
         )
     lens = _int32_lens(lens, lens_name, rows=rows)
     return SparseMetadata(

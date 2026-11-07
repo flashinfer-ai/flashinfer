@@ -1948,8 +1948,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     in the combined convention or as ``extra_sparse_topk_lens`` counting
     compressed slots only, which implies a length offset of 128). The kernels
     use ``clamp(len + sparse_topk_lens_offset, 0, sparse_topk)`` entries of
-    each row. No copies are made: tables must be int32 with unit column stride
-    (row strides are free), and ``query``/``out``/KV pools must be densely
+    each row. No copies are made: tables must be int32 with unit column stride,
+    start at a 16-byte aligned address and, with more than one row, have a row
+    stride that is a multiple of 4 (the kernels load index rows 16 bytes at a
+    time), and ``query``/``out``/KV pools must be densely
     packed. ``workspace_buffer`` is carved deterministically and exactly per
     route (:func:`flashinfer.mla.cake_dsv4_workspace_requirement`); any
     buffer from the one-row minimum up works: when one launch over all
@@ -2071,8 +2073,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``. With ``backend="cake"``, the separate
-        compressed table ``[T, topk_c]`` INT32 (unit column stride; row stride
-        free) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
+        compressed table ``[T, topk_c]`` INT32 (unit column stride, 16-byte
+        aligned start and, with more than one row, a row stride that is a
+        multiple of 4) that pairs with a ``[T, 128]`` SWA ``sparse_indices``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32. With ``backend="cake"``, compressed-only lengths ``[T]`` that
