@@ -672,8 +672,8 @@ def cake_gqa_nondet_train_backward(
         dims,
         device_index,
     )
-    tile_base, pair_base, pair_order = _tile_plan(
-        cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
+    tile_base, pair_base, pair_order = _plan_tables(
+        cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q, dims, device_index
     )
     # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
     # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
@@ -744,6 +744,46 @@ def cake_gqa_nondet_train_backward(
         )
     _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
     return dq, dk_out, dv_out
+
+
+def _plan_tables(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
+    dims: Mapping[str, int],
+    device_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The tables of :func:`_tile_plan` from one ``bwd_plan`` launch (one CTA) into one int32 buffer, or from the
+    PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions.  Both write the same
+    integers."""
+    segments = dims["num_segments"]
+    bound = cake_jit.pair_bound(total_q, segments)
+    if bound > cake_jit.PLAN_MAX_PAIRS:
+        return _tile_plan(cu_seqlens_q, cu_seqlens_k, key_blocks, total_q)
+    tiles = (key_blocks + 1) * segments
+    tables = torch.empty(
+        tiles + segments + 1 + bound, dtype=torch.int32, device=cu_seqlens_q.device
+    )
+    tile_base = tables[:tiles]
+    pair_base = tables[tiles : tiles + segments + 1]
+    pair_order = tables[tiles + segments + 1 :]
+    _launch(
+        "bwd_plan",
+        {
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "tile_base": tile_base,
+            "pair_base": pair_base,
+            "pair_order": pair_order,
+            "num_segments": segments,
+            "key_blocks": key_blocks,
+            "pair_bound": bound,
+        },
+        dims,
+        device_index,
+    )
+    return tile_base, pair_base, pair_order
 
 
 def _tile_plan(

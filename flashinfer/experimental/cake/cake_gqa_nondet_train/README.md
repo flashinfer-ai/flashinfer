@@ -64,6 +64,7 @@ package exposes the same entry points (`cake_gqa_nondet`,
 |---|---|
 | `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 256 query rows of one (segment, query head), persistent tile tickets from a self-resetting counter |
 | `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
+| `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 16384 pairs of 128 query rows) |
 | `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head), looping the key head's query heads two at a time: S^T, dP^T, dK and dV (summed in FP32 in tensor memory, stored once as FP32 window gradients or as BF16), dS^T stored to the workspace |
 | `bwd_dq` | per chunk: dQ = dS K over the workspace into the FP32 accumulator (persistent over the Q-tile pairs, the pairs with the most key blocks first) |
 | `bwd_fold` | row-map form only: the FP32 window rows added into their destination rows in ascending window order (a stable sort of the row map) |
@@ -87,7 +88,7 @@ least one KV head and two key blocks, even past the budget.  Each chunk runs
 the main kernel and the dQ GEMM; each extra key-block chunk re-reads and
 rewrites the FP32 dQ accumulator once.  The chunks come from host values only
 (shapes, the segment count, `max_seqlen_k`, the budget); the tile numbering
-inside a chunk is computed on the device from `cu_seqlens`.  The budget moves
+inside a chunk is computed on the device from `cu_seqlens` (`bwd_plan`).  The budget moves
 the rounding of dQ (its last bits, not its accuracy); `out`, `lse`, dK and dV
 do not depend on it.
 
