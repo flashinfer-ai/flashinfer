@@ -61,6 +61,7 @@ class Caps(_impl.TPMoEScratchCaps):
                 fast_math=self.w4a16_fast_math,
                 numerical_recipe=None,
                 controls=_control_snapshot(),
+                nvfp4_inline_scales=weight.nvfp4_inline_scales,
             )
             configured = TUNING.configure(
                 query, device=detect_device(self.device).identity, search=False
