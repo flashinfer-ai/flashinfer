@@ -109,7 +109,9 @@ def cake_causal_conv1d_det_kcp(
     -------
     torch.Tensor
         BF16 ``y`` of ``x_local``'s shape.  The backward runs the head program, the backward halo exchange and the
-        fused ``dx`` + deterministic FP32 ``dweight`` kernel of this rank's fragments.
+        main ``dx`` + deterministic FP32 ``dweight`` program of this rank's fragments: with ``cooperative=False``
+        (the default) an ordinary launch followed by a fixed-order reduce program on the same stream, with
+        ``True`` one cooperative kernel.
     """
 
     return _kcp().cake_causal_conv1d_det_kcp(

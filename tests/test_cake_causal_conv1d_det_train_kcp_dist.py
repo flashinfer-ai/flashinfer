@@ -611,6 +611,14 @@ def _supported() -> bool:
     return is_cake_causal_conv1d_det_train_supported(torch.device("cuda"))
 
 
+def _skip_without_allocator_counts(report: dict) -> None:
+    # every other flag passed; the no-device-allocation flag is unmeasured on a rank whose allocator does not count
+    if not all(info["allocator_counts"] for info in report["info_by_rank"]):
+        pytest.skip(
+            "the caching allocator's statistics do not count device allocations here"
+        )
+
+
 @pytest.mark.parametrize("row", ROWS + ROWS_SCALE, ids=_row_id)
 def test_recompute_handle_rows(row) -> None:
     """Bitwise and per-phase collective counts of the checkpoint with / without a recompute handle, repeats per launch
@@ -631,6 +639,7 @@ def test_recompute_handle_rows(row) -> None:
             int(os.environ.get("SLURM_LOCALID", "0")),
         )
         assert report["pass"], report
+        _skip_without_allocator_counts(report)
         return
     if not _supported():
         pytest.skip("cake_causal_conv1d_det_train needs a supported CUDA device")
@@ -648,3 +657,4 @@ def test_recompute_handle_rows(row) -> None:
         with open(os.path.join(result_dir, _row_id(row) + ".json")) as fh:
             report = json.load(fh)
     assert report["pass"], report
+    _skip_without_allocator_counts(report)
