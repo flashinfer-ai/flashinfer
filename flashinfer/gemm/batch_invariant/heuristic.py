@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
-from .spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+from .spec import BLOCK_K, ELEM_BITS_OF, FP8_BLOCKSCALE_FMTS, MMA_K_OF, MMA_RATE_OF
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,7 @@ CONSTANTS: Dict[str, float] = dict(
     sw_gain=1.0,  # swizzle > 1 with many tiles in flight on both axes
     sw_partial=1.1,  # a swizzle that does not divide its axis (a partial last group)
     two_cta=0.9,  # the 2-CTA pair's shared B and halved per-CTA issue
+    promote_bytes_per_clk=256.0,  # the block-scale class's promotion pass: TMEM read + fma per fp32 of the CTA tile per K block
 )
 
 DECODE_M = 64  # up to this many rows the candidates are the `decode_sane` subset
@@ -318,6 +319,18 @@ def estimate_cycles(
     step = (
         max(mma_cycles, (a_bytes + b_bytes) / part.load_bytes_per_clk) + p["step_floor"]
     )
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        # the block-scale class promotes every accumulator element of the CTA tile once per K block (the epilogue warps'
+        # TMEM read and fma per fp32 value): one more per-k-step term next to the MMA and the operand traffic
+        promote = rows * tn * 4.0 / (BLOCK_K // kk) / p["promote_bytes_per_clk"]
+        step = (
+            max(
+                mma_cycles,
+                (a_bytes + b_bytes) / part.load_bytes_per_clk,
+                promote,
+            )
+            + p["step_floor"]
+        )
     body = waves * ksteps * step
     active = ctas_m * n_tiles * items
     l2_total = (
