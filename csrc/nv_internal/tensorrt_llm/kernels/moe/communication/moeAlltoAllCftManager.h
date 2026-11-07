@@ -19,17 +19,17 @@
 // ============================================================================
 // CFT (Compute Fabric Transport) LE Manager for MoE AlltoAll
 //
-// Manages the lifecycle of Logical Endpoints (LEs) for CFT handle-based
-// counted writes. Each rank creates one unicast LE per peer rank, bound to
-// its recv buffer in MNNVL workspace. LE IDs are exchanged across ranks so
-// that the dispatch kernel can use fabric.try_put.counted to write directly
-// to peer LEs.
+// Manages the lifecycle of the Logical Endpoints (LEs) through which CFT
+// fabric operations address peer memory. Each rank creates one unicast LE
+// bound to its slice of the MNNVL workspace (or to fabric memory of its own)
+// and imports the LE of every peer rank, so that kernels address a peer's
+// memory by LE ID and byte offset instead of a mapped virtual address.
 //
 // LE lifecycle:
 //   1. loadApis()           — cuGetProcAddress for all LE APIs
 //   2. createEndpoints()    — reserve IDs, create LEs, alloc fabric mem, bind
 //   3. exchangeEndpoints()  — export local LE, import all peers' LEs
-//   4. getLeId(target_rank) — kernel uses this to address puts
+//   4. getLeId(target_rank) — LE ID by which kernels address the target rank's memory
 //   5. destroy()            — unbind, destroy, release
 //
 // Requirements:
@@ -88,10 +88,10 @@ namespace kernels::moe_comm
 
 #if TLLM_CFT_HAS_CUDA_13_4_SUPPORT
 
-// Per-rank LE state: one unicast LE representing this rank's recv buffer
+// Per-rank LE state: one unicast LE representing this rank's memory
 struct RankLE
 {
-    CUlogicalEndpointId leId = 0;               //!< Logical endpoint ID for this rank's recv buffer.
+    CUlogicalEndpointId leId = 0;               //!< Logical endpoint ID for this rank's memory.
     CUmemGenericAllocationHandle memHandle = 0; //!< Generic allocation handle backing the bound fabric memory.
     CUdeviceptr backingPtr = 0;                 //!< Device pointer for the memory bound to the LE.
     size_t allocSize = 0;                       //!< Size in bytes of the LE-backed allocation.
@@ -157,8 +157,8 @@ public:
 
     // Step 2: Create this rank's unicast LE and bind it to fabric memory.
     //
-    // The LE represents this rank's recv buffer region. Other ranks will
-    // write into it using fabric.try_put.counted with the exported LE ID.
+    // The LE represents this rank's memory. Other ranks address it in CFT
+    // fabric operations by the exported LE ID.
     //
     // Args:
     //   deviceIdx: CUDA device index for this rank
@@ -248,8 +248,8 @@ public:
     //
     // Instead of allocating separate fabric memory, bind the LE to the MNNVL
     // workspace's memory handle. The LE then addresses the workspace directly —
-    // fabric.try_put.counted writes land in workspace recv_buffers, eliminating
-    // the duplicate allocation and the need to know payload layout at init time.
+    // CFT fabric operations on it access the workspace, without a duplicate
+    // allocation and without knowing the workspace layout at init time.
     //
     // Args:
     //   deviceIdx: CUDA device index for this rank
@@ -425,8 +425,7 @@ public:
         return importEndpoints(allHandles.data());
     }
 
-    // Get LE ID for writing to a target rank.
-    // Used by the dispatch kernel: fabric.try_put.counted(getLeId(target), offset, ...)
+    // Get the LE ID that addresses a target rank's memory in CFT fabric operations.
     CUlogicalEndpointId getLeId(int targetRank) const
     {
         return peerLeIds_[targetRank];

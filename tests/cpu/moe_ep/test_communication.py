@@ -570,11 +570,10 @@ class _FakeOneSidedModule:
         self.calls: dict = {}
 
     def moe_a2a_get_workspace_layout(self, *args):
-        # (ep_size, max_tokens, top_k, dispatch, combine input, CFT receive
-        # inbox, EPLB experts, CFT), then the sentinel limit, format and hidden
-        # size.
-        self.calls["layout"] = args[:8]
-        self.calls["sentinel_layout"] = args[8:11]
+        # (ep_size, max_tokens, top_k, dispatch, combine input, EPLB experts),
+        # then the sentinel limit, format and hidden size.
+        self.calls["layout"] = args[:6]
+        self.calls["sentinel_layout"] = args[6:9]
         metainfo = args[-1]
         metainfo.zero_()
         metainfo[_ONE_SIDED_LAYOUT["COMBINE_INPUT_SIZE_INDEX"]] = 1 << 16
@@ -673,12 +672,10 @@ def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
         extra_payload_bytes_per_token=16,
         eplb_stats_num_experts=4,
     )
-    ep, max_tokens, top_k, dispatch, combine_input, combine_recv, eplb, cft = (
-        fake_one_sided.module.calls["layout"]
-    )
+    ep, max_tokens, top_k, dispatch, combine_input, eplb = fake_one_sided.module.calls[
+        "layout"
+    ]
     assert (ep, max_tokens, top_k, eplb) == (2, 3, 2, 4)
-    # No CFT receive inbox or counters.
-    assert combine_recv == 0 and cft is False
     tokens = ep * max_tokens
     # NVFP4 values and scales, int32 ids, FP32 weights and the extra payload,
     # plus one alignment unit for each payload's own boundary.
@@ -700,7 +697,7 @@ def _fake_sentinel(monkeypatch, module) -> list:
 
     def layout_with_sentinel(*args):
         layout(*args)
-        max_tokens, metainfo = args[8], args[-1]
+        max_tokens, metainfo = args[6], args[-1]
         if max_tokens:
             extended.append(max_tokens)
             metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
@@ -925,7 +922,7 @@ def test_split_layer_step_bound_selects_sentinel(
             )
         )
         _, _, tokens_per_rank, args = calls["dispatch"]
-        assert (tokens_per_rank, args[8]) == (bound or 3, sentinel)
+        assert (tokens_per_rank, args[7]) == (bound or 3, sentinel)
     layer.destroy()
 
 
@@ -1154,12 +1151,10 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
         torch.int32,
         torch.float32,
     ]
-    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid, use_sentinel = args[
-        :9
-    ]
+    rank, ep, top_k, num_experts, eplb, id_index, invalid, use_sentinel = args[:8]
     assert (rank, ep, top_k, num_experts, eplb) == (0, 2, 4, 8, None)
     # A fence step leaves the padding rows' expert ids to the sanitize op.
-    assert use_cft is False and id_index == -1 and invalid == -1
+    assert id_index == -1 and invalid == -1
     assert use_sentinel is False
     assert args[-2] == 60
     assert calls["sanitize"][0].shape == (2, 2, 4)
@@ -1175,12 +1170,11 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     assert out.shape == (2, 8)
     payload, local_num_tokens = calls["combine"][:2]
     assert payload.shape == (2, 2, 8) and local_num_tokens == 2
-    assert calls["combine"][11] is False  # no CFT counted writes
-    assert calls["combine"][14] is out and calls["combine"][-1] is False
+    assert calls["combine"][13] is out and calls["combine"][-1] is False
 
     # A full-capacity step.
     comm.dispatch(hidden, ids, weights)
-    assert calls["dispatch"][2] == 3 and calls["dispatch"][3][6] == -1
+    assert calls["dispatch"][2] == 3 and calls["dispatch"][3][5] == -1
     assert calls["sanitize"][0].shape == (2, 3, 4)
     output = torch.empty(2, 8, dtype=torch.bfloat16)
     assert (

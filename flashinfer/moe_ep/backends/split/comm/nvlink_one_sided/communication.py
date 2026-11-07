@@ -272,17 +272,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             self._sentinel_format = sentinel_format
             sentinel_format_index = getattr(index, f"SENTINEL_FORMAT_{sentinel_format}")
         metainfo = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
-        # The module's CFT counted-write path stays unused: no CFT receive inbox
-        # or counters.
         self._module.moe_a2a_get_workspace_layout(
             self.ep_size,
             params.max_tokens_per_rank,
             params.top_k,
             dispatch_bytes,
             combine_input_bytes,
-            0,
             config.eplb_stats_num_experts,
-            False,
             self.sentinel_max_tokens,
             sentinel_format_index,
             params.hidden_size,
@@ -539,7 +535,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             params.top_k,
             params.num_experts,
             eplb_local_stats,
-            False,
             expert_id_index if use_sentinel else -1,
             params.invalid_expert_id,
             use_sentinel,
@@ -658,7 +653,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             state["combine_offset"],
             False,
             self.config.use_low_precision_combine,
-            False,
             self.config.enable_rank_mask,
             active_rank_mask,
             output,
