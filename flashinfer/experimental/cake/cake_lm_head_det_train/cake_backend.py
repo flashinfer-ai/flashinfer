@@ -11124,7 +11124,8 @@ class _LogprobKept(NamedTuple):
 
     key: tuple  # the call's options and its inputs' metadata and version counters
     refs: tuple  # weak references to the call's input tensors (None for an absent one)
-    logp: torch.Tensor  # an alias of the returned logp (its version counter tells an in-place change)
+    # an alias of the returned logp (its version counter tells an in-place change)
+    logp: torch.Tensor
     logp_version: int
     saved: tuple  # the tensors the forward saves past X, W and labels
     extra: Any = None  # a non-tensor the backward reads (the scalar temperature)
@@ -11148,9 +11149,8 @@ _LOGPROB_CHECKPOINT_CALLS: "weakref.WeakKeyDictionary[Any, _LogprobCalls]" = (
 
 def _logprob_call_key(inputs: tuple, options: tuple) -> tuple:
     """What a recomputed log-probability call must match to take its checkpointed call's row results."""
-    return tuple(
-        None if t is None else (_meta_key(t), t._version) for t in inputs
-    ) + (repr(options),)
+    meta = tuple(None if t is None else (_meta_key(t), t._version) for t in inputs)
+    return meta + (repr(options),)
 
 
 def _logprob_checkpoint_keep(

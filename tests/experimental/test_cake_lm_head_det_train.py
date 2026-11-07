@@ -12700,7 +12700,8 @@ def test_checkpointed_logprob_recomputation_runs_the_forward_after_a_change(
         assert len(seen) == 2, seen
         # the backward is the checkpointed call's (chunk size 64); the recomputed row results are the same bits
         plain = _logprob_step(inp, "plain", form, C=64, backend="reference")
-        assert _placement_bits(X.grad, plain["dX"]) and _placement_bits(W.grad, plain["dW"])
+        assert _placement_bits(X.grad, plain["dX"])
+        assert _placement_bits(W.grad, plain["dW"])
         return
 
     own = replace(inp, labels=inp.labels.clone())
