@@ -139,6 +139,22 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+def test_mxfp8_quantize_empty_rows():
+    """An empty row dimension returns empty outputs instead of launching 0 blocks."""
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    m, k = 0, 512
+    a = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+
+    a_fp8, a_sf = mxfp8_quantize(a)
+
+    assert a_fp8.shape == (m, k)
+    assert a_fp8.dtype == torch.float8_e4m3fn
+    assert a_sf.numel() == 0
+    torch.cuda.synchronize()
+
+
 def _mxfp8_grouped_test_input(batch_shape, dtype, init_data):
     if init_data == "random":
         return (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(

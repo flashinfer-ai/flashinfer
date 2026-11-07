@@ -277,6 +277,24 @@ def test_fp4_quantization(
         torch.testing.assert_close(scale_ans, scale_ref, rtol=0, atol=0)
 
 
+def test_fp4_quantize_empty_rows() -> None:
+    """An empty row dimension returns empty outputs instead of launching 0 blocks."""
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    m, k, sf_vec_size = 0, 512, 16
+    x = torch.empty((m, k), dtype=torch.bfloat16, device=device)
+    global_scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    out, out_scale = fp4_quantize(x, global_scale, sf_vec_size)
+
+    assert out.shape == (m, k // 2)
+    assert out.dtype == torch.uint8
+    assert out_scale.numel() == 0
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
