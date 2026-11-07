@@ -108,17 +108,19 @@ kernel_cake_deepgemm_fp4_gemm_0181597a4d65f627f485(const __grid_constant__ CUten
         // --- pipeline 'pipe' ---
         // full: 11 barriers, init_count=130
         // sf_full: 11 barriers, init_count=1
-        // empty: 11 barriers, init_count=1
+        // empty: 11 barriers, init_count=65
         // --- pipeline 'epi_pipe' ---
         // tmem_full: 2 barriers, init_count=1
         // tmem_empty: 2 barriers, init_count=256
         // tmem_overlap: 2 barriers, init_count=256
         // Warp-cooperative initialization in physical record order.
-        uint32_t _mbarrier_init_count_1_0 = 1;
+        uint32_t _mbarrier_init_count_1_0 = 65;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(22), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(11), "r"((uint32_t)(130)));
         mbarrier_init(smem + 222208 + lane * 8, _mbarrier_init_count_1_0);
         uint32_t _mbarrier_init_count_1_32 = 256;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_32) : "r"(lane), "n"(3), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_32) : "r"(lane), "n"(1), "r"((uint32_t)(65)));
         if (lane < 7) {
             mbarrier_init(smem + 222464 + lane * 8, _mbarrier_init_count_1_32);
         }
@@ -280,6 +282,9 @@ kernel_cake_deepgemm_fp4_gemm_0181597a4d65f627f485(const __grid_constant__ CUten
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 11) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }
