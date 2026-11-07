@@ -1693,7 +1693,7 @@ ROUTER_RULES: dict[
     # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
     # 10240 was not added).  On sm_100a the window ended at 16384 tokens: measured again against six splits, it was
     # up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to 6.9 % at 32768 (16385 to
-    # 24575 tokens not measured); it ends at 12288 tokens now (below).
+    # 24575 tokens not measured); its windows are 10240 to 12288 and 16385 to 28672 tokens now (below).
     # Hidden 4096 on sm_100a keeps the deterministic plan above its SIMT window: the head/tail partition with 44 head
     # units and five tail units per CTA pair ("H1x5p44"), measured again against the current deterministic plan at
     # 10240 to 16384 tokens, left the checkpointed step (two forwards and the backward pass) up to 2.7 % slower in
@@ -1722,14 +1722,18 @@ ROUTER_RULES: dict[
     # itself); next to a resident kernel it was up to 4.5 % slower at some kept token counts (data, not a condition
     # here).  A window ends at kept token counts and holds no token count that missed:
     # - sm_100a hidden 5120 "H0.5x3": kept at 12288 tokens, missed at 16128 (alone, one eager run, against six
-    #   splits): the window is 10240 to 12288 tokens.
+    #   splits) and at 16384 (against nine: alone in eager launches, and the checkpointed step in CUDA graphs), kept at
+    #   16385, 16400, 18432, 20480, 24576 and 28672 (against six), missed at 32768 (the checkpointed step in CUDA graphs
+    #   on one part): the windows are 10240 to 12288 and 16385 to 28672 tokens.
     # - sm_103a hidden 5120 "H0.5x3": missed at 16172 and 16231 tokens (alone, one eager run each, against nine
     #   splits), kept at 16232 and 16384 (against nine) and at 16385, 24576 and 32768 (against six): the window is
     #   16232 to 32768 tokens.
     # - sm_103a hidden 6144 "H1x5p44": missed at 16172, 16231 and 16384 tokens (against three splits) and at 16385
     #   (against six), kept at 20480 only: no window.
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 12288, "H0.5x3")),
+    ("sm_100a", "nn_t", 5120, 256): (
+        (1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 12288, "H0.5x3"), (16385, 28672, "H0.5x3"),
+    ),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16232, 32768, "H0.5x3")),

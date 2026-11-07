@@ -3399,12 +3399,20 @@ def test_router_units_policy(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_103a", sm_count=152, M=5120, N=256, K=16232
     ) == (304, 38, 20 * 508 // 2)
-    assert (
-        cake_backend.router_partition(
-            "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=12289
-        )
-        is None
-    )
+    # sm_100a hidden 5120 again from 16385 tokens (513 K blocks) to 28672 (896 K blocks)
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=16385
+    ) == (304, 38, 20 * 513 // 2)
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=28672
+    ) == (304, 38, 20 * 896 // 2)
+    for T in (12289, 16384, 28673):
+        assert (
+            cake_backend.router_partition(
+                "nn_t", arch="sm_100a", sm_count=152, M=5120, N=256, K=T
+            )
+            is None
+        ), T
     for arch in ("sm_100a", "sm_103a"):
         assert (
             cake_backend.router_partition("nn_t", arch=arch, sm_count=152, **wgrad5120)
@@ -3555,6 +3563,7 @@ ROUTER_WGRAD_WINDOWS = {
         (1, 256, "simt_n64m64s2"),
         (1, 128, "waves"),
         (10240, 12288, "H0.5x3"),
+        (16385, 28672, "H0.5x3"),
     ),
     ("sm_100a", 6144): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", 4096): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
@@ -4539,7 +4548,9 @@ ROUTER_SPLIT_RULE_WINDOW_EDGES = {
     ("sm_100a", 16128): False,
     ("sm_100a", 16129): False,
     ("sm_100a", 16384): False,
-    ("sm_100a", 16385): False,
+    ("sm_100a", 16385): True,
+    ("sm_100a", 28672): True,
+    ("sm_100a", 28673): False,
     ("sm_103a", 16171): False,
     ("sm_103a", 16172): False,
     ("sm_103a", 16231): False,
@@ -4556,8 +4567,8 @@ def test_router_wgrad_windows_at_the_deterministic_split_rule_rows():
     package's ``ROUTER_SPLIT_RULES`` rows (16129 to 16384 tokens: nine splits at hidden 5120, three at hidden 6144)
     runs this package's head/tail program only where a window was measured against that count and kept: sm_103a
     hidden 5120 "H0.5x3" from 16232 tokens.  Every other rule-row token count -- sm_100a hidden 5120 (its windows end
-    at 12288), sm_103a hidden 5120 below 16232, hidden 6144 on both (no head/tail window) -- runs the deterministic
-    program at the deterministic package's count of the row."""
+    at 12288 and start again at 16385), sm_103a hidden 5120 below 16232, hidden 6144 on both (no head/tail window) --
+    runs the deterministic program at the deterministic package's count of the row."""
 
     def part(arch, hidden, T):
         return cake_backend.router_partition(
