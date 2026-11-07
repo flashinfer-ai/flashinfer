@@ -401,11 +401,170 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _cgroup_inactive_file_bytes(stat_path: str, key: str) -> int:
+    """Inactive page cache in a cgroup ``memory.stat``, or 0 if unreadable."""
+    try:
+        with open(stat_path) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _cgroup_available_memory_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """Bytes left under the cgroup memory limit, or None if
+    unlimited/unreadable.
+
+    Inside containers /proc/meminfo reports *host* memory, so the cgroup
+    limit is what actually prevents an OOM kill.
+    cgroup's memory.current is profiled here to estimate the headroom, less
+    the inactive page cache the kernel reclaims before an OOM kill (the
+    working set kubelet uses), since reading weights fills that cache.
+    """
+    try:
+        with open(f"{root}/memory.max") as f:
+            limit = f.read().strip()
+        if limit != "max":
+            with open(f"{root}/memory.current") as f:
+                current = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{root}/memory.stat", "inactive_file"
+                )
+            return max(0, int(limit) - current)
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        with open(f"{root}/memory/memory.limit_in_bytes") as f:
+            limit_v1 = int(f.read())
+        if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
+            with open(f"{root}/memory/memory.usage_in_bytes") as f:
+                usage = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{root}/memory/memory.stat", "total_inactive_file"
+                )
+            return max(0, limit_v1 - usage)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_host_memory_bytes() -> Optional[int]:
+    """Best-effort available memory: the tighter of host MemAvailable and
+    the cgroup limit headroom, or None if neither is readable."""
+    candidates = []
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    candidates.append(int(line.split()[1]) * 1024)
+                    break
+    except OSError:
+        pass
+    cgroup = _cgroup_available_memory_bytes()
+    if cgroup is not None:
+        candidates.append(cgroup)
+    return min(candidates) if candidates else None
+
+
+def _read_mem_available_gb() -> Optional[int]:
+    """Available memory in whole GiB, or ``None`` when it cannot be read."""
+    available = _available_host_memory_bytes()
+    return None if available is None else available // (1 << 30)
+
+
+def _cgroup_cpu_quota(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """Whole CPUs the cgroup CPU quota allows, or ``None`` without a quota.
+
+    ninja lowers its default parallelism to this quota (``GetProcessorCount``):
+    the cgroup v1 quota since 1.11, the v2 ``cpu.max`` since 1.13.
+    """
+    try:
+        with open(f"{root}/cpu.max") as f:
+            quota, period = f.read().split()
+        return None if quota == "max" or int(quota) <= 0 else int(quota) // int(period)
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    # cgroup v1
+    try:
+        with open(f"{root}/cpu/cpu.cfs_quota_us") as f:
+            quota_v1 = int(f.read())
+        with open(f"{root}/cpu/cpu.cfs_period_us") as f:
+            period_v1 = int(f.read())
+        if quota_v1 > 0 and period_v1 > 0:
+            return quota_v1 // period_v1
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _ninja_default_jobs(cpu_count: int) -> int:
+    """ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2."""
+    if cpu_count <= 1:
+        return 2
+    if cpu_count == 2:
+        return 3
+    return cpu_count + 2
+
+
+@functools.cache
+def _warn_job_cap(cap: int, mem_per_job_gb: int) -> None:
+    """Log the cap once per distinct value, not once per compiled module."""
+    logger.warning(
+        "Capping ninja parallelism to %d job(s) (MAX_JOBS not set to a number; "
+        "budgeting %d GiB of available memory per job) to avoid OOM during JIT "
+        "compilation; set MAX_JOBS to override.",
+        cap,
+        mem_per_job_gb,
+    )
+
+
+def _memory_aware_job_cap() -> Optional[int]:
+    """Parallel-ninja-job cap from available memory, or ``None`` to keep ninja's
+    default. Read on every build, since memory can drop after the first one."""
+    # With MAX_JOBS unset, ninja runs ~nproc + 2 nvcc processes; each CUTLASS /
+    # FP4 compile can peak at several GiB, so on memory-constrained or
+    # unified-memory systems (e.g. DGX Spark GB10 / SM121a) the default
+    # OOM-kills nvcc (exit 137) and crashes the caller. Mirror the AOT per-job
+    # budget (scripts/jit_cache_build_common.sh: max(8, FLASHINFER_NVCC_THREADS
+    # * 2) GiB/job) and only ever lower below ninja's default.
+    mem_available_gb = _read_mem_available_gb()
+    if mem_available_gb is None:
+        return None
+
+    # ninja counts the CPUs this process may run on (sched_getaffinity).
+    if hasattr(os, "sched_getaffinity"):
+        cpu_count = len(os.sched_getaffinity(0))
+    else:
+        cpu_count = os.cpu_count() or 1
+
+    try:
+        nvcc_threads = int(os.environ.get("FLASHINFER_NVCC_THREADS", "1"))
+    except ValueError:
+        nvcc_threads = 1
+    # The 8 GiB floor also covers zero or negative thread counts.
+    mem_per_job_gb = max(8, nvcc_threads * 2)
+
+    mem_cap = max(1, mem_available_gb // mem_per_job_gb)
+    if mem_cap >= _ninja_default_jobs(cpu_count):
+        # No ninja version runs more jobs than fit; don't intervene.
+        return None
+    # Newer ninja also lowers its default to the cgroup CPU quota (v1 since
+    # 1.11, v2 since 1.13). Never pass more than that default, while a ninja
+    # that ignores the quota still gets a -j that fits memory.
+    cpu_quota = _cgroup_cpu_quota()
+    if cpu_quota is not None:
+        mem_cap = min(mem_cap, _ninja_default_jobs(min(cpu_count, cpu_quota)))
+    _warn_job_cap(mem_cap, mem_per_job_gb)
+    return mem_cap
+
+
 def _get_num_workers() -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         return int(max_jobs)
-    return None
+    return _memory_aware_job_cap()
 
 
 def run_ninja(

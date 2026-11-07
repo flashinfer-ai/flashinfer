@@ -1,3 +1,5 @@
+import io
+import logging
 import subprocess
 from types import SimpleNamespace
 
@@ -13,6 +15,26 @@ from flashinfer.utils import (
     is_fa3_prefill_head_dim_supported,
 )
 from tests.test_helpers import jit_utils
+
+
+@pytest.fixture(autouse=True)
+def _job_cap_test_env(monkeypatch):
+    # The cap warning is logged once per distinct cap; clear that record, and
+    # keep the host's cgroup CPU quota out of the CPU-count tests.
+    cpp_ext._warn_job_cap.cache_clear()
+    monkeypatch.setattr(cpp_ext, "_cgroup_cpu_quota", lambda: None)
+    yield
+    cpp_ext._warn_job_cap.cache_clear()
+
+
+def _set_cpu_count(monkeypatch, n):
+    # The cap counts CPUs through sched_getaffinity where it exists.
+    monkeypatch.setattr(
+        cpp_ext.os,
+        "sched_getaffinity",
+        lambda pid: set(range(n)) if pid == 0 else set(),
+        raising=False,
+    )
 
 
 @pytest.mark.cpu_only
@@ -566,3 +588,270 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_respects_explicit_max_jobs(monkeypatch):
+    monkeypatch.setenv("MAX_JOBS", "4")
+    # Even with very little memory, an explicit MAX_JOBS wins unchanged.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 1)
+    assert cpp_ext._get_num_workers() == 4
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_no_cap_when_memory_ample(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    _set_cpu_count(monkeypatch, 8)
+    # 999 GiB / 8 GiB-per-job = 124 >= ninja default (10) -> don't intervene.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 999)
+    assert cpp_ext._get_num_workers() is None
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_caps_when_memory_constrained(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 64 cores (ninja would run ~66 nvcc) but only 32 GiB -> 32 // 8 = 4 jobs.
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_budgets_for_nvcc_threads(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    # nvcc threads = 8 -> per-job budget max(8, 16) = 16 GiB -> 32 // 16 = 2.
+    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "8")
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 2
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_floors_at_one(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 4 GiB // 8 GiB-per-job = 0 -> floored to 1 (never zero).
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 4)
+    assert cpp_ext._get_num_workers() == 1
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_none_when_meminfo_unavailable(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    # Non-Linux / unreadable /proc/meminfo -> keep ninja's default parallelism.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: None)
+    assert cpp_ext._get_num_workers() is None
+
+
+@pytest.mark.cpu_only
+def test_cap_warning_emitted_once_across_compiles(monkeypatch, caplog):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    with caplog.at_level(logging.WARNING, logger="flashinfer.jit.cpp_ext"):
+        results = [cpp_ext._get_num_workers() for _ in range(5)]
+    # Every per-operator call returns the cap, but the warning is logged once.
+    assert results == [4, 4, 4, 4, 4]
+    cap_warnings = [
+        r for r in caplog.records if "Capping ninja parallelism" in r.getMessage()
+    ]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_low_core_matches_ninja_guess(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 2-core box: ninja's GuessParallelism is 3, not 4. 24 GiB / 8 == 3, so the
+    # default already fits -> don't intervene.
+    _set_cpu_count(monkeypatch, 2)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 24)
+    assert cpp_ext._get_num_workers() is None
+    # 16 GiB / 8 == 2 < 3 -> cap to 2.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
+    assert cpp_ext._get_num_workers() == 2
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_counts_only_affinity_cpus(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 24 CPUs online but pinned to 2 (taskset -c 0-1): ninja's default is 3.
+    # 64 GiB / 8 == 8 >= 3, so the cap must not raise parallelism to 8.
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 24)
+    _set_cpu_count(monkeypatch, 2)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 64)
+    assert cpp_ext._get_num_workers() is None
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_falls_back_to_cpu_count(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # Without sched_getaffinity (e.g. macOS), os.cpu_count() is used.
+    monkeypatch.delattr(cpp_ext.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 2)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
+    assert cpp_ext._get_num_workers() == 2
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_follows_memory_between_compiles(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # A server's first JIT build can run before weights and the KV pool take
+    # memory (on unified-memory systems, system RAM). Later builds must see
+    # the memory that is left.
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 999)
+    assert cpp_ext._get_num_workers() is None
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_under_cpu_quota(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # A pod limited to 4 CPUs on a 64-CPU host: ninja 1.11+ defaults to
+    # 4 + 2 = 6 jobs, older ninja to 64 + 2 = 66.
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_cgroup_cpu_quota", lambda: 4)
+    # 128 GiB / 8 == 16: cap to 6, never above the quota-aware default, while
+    # an older ninja still gets a -j that fits memory.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 128)
+    assert cpp_ext._get_num_workers() == 6
+    # 32 GiB / 8 == 4 < 6: cap to 4.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
+    # 999 GiB / 8 == 124 >= 66: no ninja version runs more jobs than fit.
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 999)
+    assert cpp_ext._get_num_workers() is None
+
+
+@pytest.mark.cpu_only
+def test_available_memory_uses_cgroup_limit(monkeypatch):
+    # Inside a container /proc/meminfo reports host memory; the cgroup limit's
+    # headroom is what an OOM kill enforces.
+    monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: 16 << 30)
+    assert cpp_ext._read_mem_available_gb() <= 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({"cpu.max": "400000 100000\n"}, 4),
+        ({"cpu.max": "50000 100000\n"}, 0),
+        ({"cpu.max": "max 100000\n"}, None),
+        ({"cpu.max": "0 100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "200000\n", "cpu/cpu.cfs_period_us": "100000\n"}, 2),
+        ({"cpu/cpu.cfs_quota_us": "-1\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "200000\n", "cpu/cpu.cfs_period_us": "0\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "0\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "1\n", "cpu/cpu.cfs_period_us": "1\n"}, 1),
+        ({"cpu.max": "1 100000\n"}, 0),
+        ({}, None),
+    ],
+)
+def test_cgroup_cpu_quota_reads_v2_then_v1(monkeypatch, tmp_path, files, expected):
+    monkeypatch.undo()  # the real reader, not the autouse fixture's stub
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    assert cpp_ext._cgroup_cpu_quota(tmp_path) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({"memory.max": "4096\n", "memory.current": "1024\n"}, 3072),
+        # Inactive page cache is reclaimed before an OOM kill, so it is headroom.
+        (
+            {
+                "memory.max": "8192\n",
+                "memory.current": "6144\n",
+                "memory.stat": "active_file 512\ninactive_file 2048\n",
+            },
+            4096,
+        ),
+        (
+            {
+                "memory/memory.limit_in_bytes": "8192\n",
+                "memory/memory.usage_in_bytes": "6144\n",
+                "memory/memory.stat": "inactive_file 1\ntotal_inactive_file 2048\n",
+            },
+            4096,
+        ),
+        ({"memory.max": "1024\n", "memory.current": "4096\n"}, 0),
+        ({"memory.max": "max\n"}, None),
+        (
+            {
+                "memory/memory.limit_in_bytes": "4096\n",
+                "memory/memory.usage_in_bytes": "1024\n",
+            },
+            3072,
+        ),
+        (
+            {
+                "memory/memory.limit_in_bytes": "1024\n",
+                "memory/memory.usage_in_bytes": "4096\n",
+            },
+            0,
+        ),
+        # cgroup v1 reports "unlimited" as a value near 2**63.
+        (
+            {
+                "memory/memory.limit_in_bytes": str(1 << 60) + "\n",
+                "memory/memory.usage_in_bytes": "1024\n",
+            },
+            None,
+        ),
+        ({}, None),
+    ],
+)
+def test_cgroup_available_memory_reads_v2_then_v1(tmp_path, files, expected):
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    assert cpp_ext._cgroup_available_memory_bytes(tmp_path) == expected
+
+
+@pytest.mark.cpu_only
+def test_available_memory_reads_meminfo_in_bytes(monkeypatch):
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/meminfo":
+            return io.StringIO("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cpp_ext, "open", fake_open, raising=False)
+    monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: None)
+    assert cpp_ext._available_host_memory_bytes() == 4 << 30
+
+
+@pytest.mark.cpu_only
+def test_get_num_workers_single_core_matches_ninja_guess(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 1 core: ninja's GuessParallelism is 2. 16 GiB / 8 == 2 fits it.
+    _set_cpu_count(monkeypatch, 1)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
+    assert cpp_ext._get_num_workers() is None
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 8)
+    assert cpp_ext._get_num_workers() == 1
+
+
+@pytest.mark.cpu_only
+def test_invalid_nvcc_threads_budgets_8_gib_per_job(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "four")
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    assert cpp_ext._get_num_workers() == 4
