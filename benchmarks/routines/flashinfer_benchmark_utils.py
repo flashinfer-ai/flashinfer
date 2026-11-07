@@ -194,6 +194,12 @@ output_column_dict = {
         "total_q",
         "total_kv",
     ],
+    # unified_gemm: the backend the all-candidates GemmLayer selected and the
+    # median host (CPU) time per layer call in microseconds.
+    "unified_gemm": [
+        "winner_backend",
+        "host_us_per_call",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -235,6 +241,7 @@ full_output_columns = (
     + output_column_dict["gdn"]
     + output_column_dict["kda"]
     + output_column_dict["msa"]
+    + output_column_dict["unified_gemm"]
     + output_column_dict["general"]
 )
 
@@ -275,6 +282,11 @@ benchmark_apis = {
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
     "unified_moe": [
         "unified_moe",
+    ],
+    # GemmLayer per backend plus the all-candidates layer; candidates come from
+    # supported_backends() at runtime, the arch table below is only the coarse gate.
+    "unified_gemm": [
+        "unified_gemm",
     ],
     "allreduce_comm": [
         "allreduce_fusion",
@@ -749,6 +761,18 @@ routine_cc_to_supported_backends = {
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
+    },
+    # GemmLayer over the NVFP4 (mm_fp4) and per-tensor FP8 (bmm_fp8) backends.
+    # Union of the backends' archs; the layer filters per quant pair itself.
+    "unified_gemm": {
+        "8.9": ["unified"],
+        "9.0": ["unified"],
+        "10.0": ["unified"],
+        "10.3": ["unified"],
+        "10.7": ["unified"],
+        "11.0": ["unified"],
+        "12.0": ["unified"],
+        "12.1": ["unified"],
     },
     # NORM
     "rmsnorm": {

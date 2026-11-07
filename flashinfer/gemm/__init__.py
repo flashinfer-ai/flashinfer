@@ -104,6 +104,28 @@ from .routergemm import (
 )
 
 # Import CuTe-DSL kernels if available
+# Unified GEMM API (design: docs/design_docs/flashinfer_gemm_api.md).
+from .api import (
+    BackendReport as BackendReport,
+    BackendUnsupported as BackendUnsupported,
+    CublasGemmConfig as CublasGemmConfig,
+    CudnnGemmConfig as CudnnGemmConfig,
+    CuteDslGemmConfig as CuteDslGemmConfig,
+    CutlassGemmConfig as CutlassGemmConfig,
+    DEFAULT_GEMM_BACKENDS as DEFAULT_GEMM_BACKENDS,
+    EpilogueConfig as EpilogueConfig,
+    ExecutionConfig as ExecutionConfig,
+    GemmActivationPack as GemmActivationPack,
+    GemmConfig as GemmConfig,
+    GemmProblem as GemmProblem,
+    GemmWeightPack as GemmWeightPack,
+    TrtllmGemmConfig as TrtllmGemmConfig,
+    prepare_activations as prepare_activations,
+    prepare_weight_pack as prepare_weight_pack,
+)
+from .layer import GemmLayer as GemmLayer, supported_backends as supported_backends
+from .nn import Linear as Linear, gemm as gemm, linear as linear
+
 _cute_dsl_kernels = []
 try:
     from flashinfer.cute_dsl.availability import (
@@ -228,6 +250,27 @@ __all__ = (
         "mm_M1_16_K7168_N896",
         "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
+        "BackendReport",
+        "BackendUnsupported",
+        "CublasGemmConfig",
+        "CudnnGemmConfig",
+        "CuteDslGemmConfig",
+        "CutlassGemmConfig",
+        "DEFAULT_GEMM_BACKENDS",
+        "EpilogueConfig",
+        "ExecutionConfig",
+        "GemmActivationPack",
+        "GemmConfig",
+        "GemmLayer",
+        "GemmProblem",
+        "GemmWeightPack",
+        "Linear",
+        "TrtllmGemmConfig",
+        "gemm",
+        "linear",
+        "prepare_activations",
+        "prepare_weight_pack",
+        "supported_backends",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels
