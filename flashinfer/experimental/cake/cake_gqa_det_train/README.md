@@ -114,9 +114,10 @@ plus two `[H_q / 2, rows_pad]` with `rows_pad = round_up(2 T_q + 128 B, 128)`,
 and the row-map form adds two FP32 window gradients `[T_k, H_kv, 256]`.
 `cake_gqa_det_train_workspace_bytes(T_q, H_q, B, total_k=, num_heads_kv=,
 max_seqlen_k=, row_map=, budget_bytes=)` returns the total.  A workspace keeps
-the largest size seen (`.nbytes`, `.release()`).  One workspace serves one
-stream at a time; without one, each device stream gets its own default
-workspace.
+only the scratch, at the largest size seen (`.nbytes`, `.release()`); the dS^T
+chunk and the window gradients come from PyTorch's caching allocator for each
+backward call and are freed when it returns.  One workspace serves one stream
+at a time; without one, each device stream gets its own default workspace.
 
 ## Checkpointing
 

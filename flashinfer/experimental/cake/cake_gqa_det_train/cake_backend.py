@@ -251,10 +251,11 @@ def cake_gqa_det_train_workspace_bytes(
     row_map: bool = False,
     budget_bytes: int = cake_jit.DEFAULT_WORKSPACE_BUDGET,
 ) -> int:
-    """Bytes of the backward workspace one call of these sizes needs: the scratch (FP32 ``dq_accum [H_q / 2,
-    rows_pad, 256]``, ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``, ``rows_pad = round_up(2 T_q + 128 B, 128)``),
-    with ``total_k`` / ``num_heads_kv`` given the dS^T chunk of ``budget_bytes`` (:func:`.cake_jit.chunk_plan`) and
-    with ``row_map`` the two FP32 window gradients ``[T_k, H_kv, 256]``."""
+    """Device bytes one backward call of these sizes needs beside its operands and outputs: the scratch a workspace
+    keeps (FP32 ``dq_accum [H_q / 2, rows_pad, 256]``, ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``, ``rows_pad =
+    round_up(2 T_q + 128 B, 128)``), plus, allocated for the call and freed when it returns, with ``total_k`` /
+    ``num_heads_kv`` given the dS^T chunk of ``budget_bytes`` (:func:`.cake_jit.chunk_plan`) and with ``row_map``
+    the two FP32 window gradients ``[T_k, H_kv, 256]``."""
     need = cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
     if total_q and total_k and num_heads_kv:
         plan = cake_jit.chunk_plan(
@@ -275,9 +276,10 @@ def cake_gqa_det_train_workspace_bytes(
 class CakeGQADetWorkspace:
     """Device scratch of the GQA training attention, reused across calls and shapes.
 
-    It holds the forward's tile counter (one ``uint32``, zeroed once; every launch leaves it zero), the backward
-    scratch, the dS^T workspace and the row-map window gradients, each grown to the largest shape seen and never
-    shrunk.  ``budget_bytes`` bounds the dS^T workspace of one backward call (default
+    It holds the forward's tile counter (one ``uint32``, zeroed once; every launch leaves it zero) and the backward
+    scratch, grown to the largest shape seen and never shrunk.  The dS^T workspace and the row-map window gradients
+    come from PyTorch's caching allocator for each backward call and are freed when it returns, so between calls
+    their memory serves other tensors.  ``budget_bytes`` bounds the dS^T workspace of one backward call (default
     :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`, 16 GiB): a call whose dS^T exceeds it runs in chunks (KV heads first,
     then key-block ranges).  The chunks depend on the shape, ``max_seqlen_k`` and the budget only, so one budget gives
     the same bits on every run; a different budget may round dQ differently.  One workspace serves one stream at a
@@ -310,18 +312,13 @@ class CakeGQADetWorkspace:
         self._views: Optional[tuple[tuple[int, int, int], tuple[torch.Tensor, ...]]] = (
             None
         )
-        self._ds: Optional[torch.Tensor] = None
-        self._window: Optional[torch.Tensor] = None
 
     @property
     def nbytes(self) -> int:
         """Device bytes the workspace holds now."""
-        held = sum(
+        return sum(
             0 if t is None else t.untyped_storage().nbytes()
-            for t in (self._scratch, self._ds, self._window)
-        )
-        return held + (
-            0 if self._counter is None else self._counter.untyped_storage().nbytes()
+            for t in (self._scratch, self._counter)
         )
 
     def tile_counter(self) -> torch.Tensor:
@@ -354,38 +351,29 @@ class CakeGQADetWorkspace:
         self._views = (key, views)
         return views
 
-    def ds_tiles(self, tiles: int) -> torch.Tensor:
-        """The dS^T workspace as BF16 ``[tiles * 256, 64]`` (``tiles`` 32 KiB tiles; the last one zeroed here)."""
-        lines = tiles * cake_jit.DS_TILE_LINES
-        need = lines * 64
-        if self._ds is None or self._ds.numel() < need:
-            self._ds = None
-            self._ds = torch.empty(need, dtype=torch.bfloat16, device=self.device)
-        ds = self._ds[:need].view(lines, 64)
-        ds[lines - cake_jit.DS_TILE_LINES :].zero_()
-        return ds
-
-    def window(
-        self, total_k: int, num_heads_kv: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The FP32 window gradients ``(dk_win, dv_win)``, each ``[T_k, H_kv, 256]``, of a row-map call."""
-        count = total_k * num_heads_kv * HEAD_DIM
-        if self._window is None or self._window.numel() < 2 * count:
-            self._window = None
-            self._window = torch.empty(
-                2 * count, dtype=torch.float32, device=self.device
-            )
-        shape = (total_k, num_heads_kv, HEAD_DIM)
-        return self._window[:count].view(shape), self._window[count : 2 * count].view(
-            shape
-        )
-
     def release(self) -> None:
-        """Drop the backward scratch, the dS^T workspace and the window gradients (the tile counter stays)."""
+        """Drop the backward scratch (the tile counter stays)."""
         self._views = None
         self._scratch = None
-        self._ds = None
-        self._window = None
+
+
+def _ds_tiles(tiles: int, device: torch.device) -> torch.Tensor:
+    """The dS^T workspace of one backward call as BF16 ``[tiles * 256, 64]`` (``tiles`` 32 KiB tiles; the last one,
+    the zero tile, zeroed here)."""
+    lines = tiles * cake_jit.DS_TILE_LINES
+    ds = torch.empty((lines, 64), dtype=torch.bfloat16, device=device)
+    ds[lines - cake_jit.DS_TILE_LINES :].zero_()
+    return ds
+
+
+def _windows(
+    total_k: int, num_heads_kv: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The FP32 window gradients ``(dk_win, dv_win)``, each ``[T_k, H_kv, 256]``, of one row-map call."""
+    both = torch.empty(
+        (2, total_k, num_heads_kv, HEAD_DIM), dtype=torch.float32, device=device
+    )
+    return both[0], both[1]
 
 
 _DEFAULT_WORKSPACES: dict[tuple[int, int], CakeGQADetWorkspace] = {}
@@ -686,9 +674,9 @@ def cake_gqa_det_train_backward(
     tile_base, pair_base, pair_order = _plan_tables(
         cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q, dims, device_index
     )
-    ds = ws.ds_tiles(plan["ws_tiles"])
+    ds = _ds_tiles(plan["ws_tiles"], device)
     if mode == "rowmap":
-        win_k, win_v = ws.window(total_k, heads_kv)
+        win_k, win_v = _windows(total_k, heads_kv, device)
     else:
         win_k, win_v = dk_out, dv_out
     values = {

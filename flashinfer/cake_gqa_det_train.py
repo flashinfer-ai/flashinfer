@@ -339,9 +339,9 @@ def cake_gqa_det_train_workspace(
 ) -> Any:
     r"""A workspace (``CakeGQADetWorkspace``) for :func:`cake_gqa_det` and its two halves.
 
-    It holds the forward's tile counter, the backward scratch, the dS^T workspace and the row-map window gradients,
-    grown to the largest shape seen and never shrunk (``.nbytes``; ``.release()`` drops all but the tile counter).
-    One workspace serves one stream at a time.
+    It holds the forward's tile counter and the backward scratch, grown to the largest shape seen and never shrunk
+    (``.nbytes``; ``.release()`` drops the scratch).  The dS^T workspace and the row-map window gradients are
+    allocated for each backward call and freed when it returns.  One workspace serves one stream at a time.
 
     Parameters
     ----------

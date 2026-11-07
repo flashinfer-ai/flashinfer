@@ -1085,28 +1085,70 @@ def test_dynamic_shapes_reuse_one_workspace(device) -> None:
         _assert_outputs_same_bits(shared, fresh, str(q_lens))
         sizes.append(ws.nbytes)
     assert sizes == sorted(sizes), "the workspace shrank"
-    # The scratch and the dS^T workspace each keep the largest size seen (the FP32 form holds no window).
+    # The workspace keeps the scratch at the largest size seen; the dS^T workspace is allocated per call.
     scratch = max(cake_jit.scratch_bytes(sum(q), 24, len(q)) for q, _k in shapes)
-    ds_tiles = max(
-        cake_jit.chunk_plan(
-            total_q=sum(q),
-            total_k=sum(k),
-            num_heads_q=24,
-            num_heads_kv=4,
-            num_segments=len(q),
-            max_seqlen_k=max(k),
-            budget_bytes=ws.budget_bytes,
-        )["ws_tiles"]
-        for q, k in shapes
-    )
     held = ws.nbytes - ws.tile_counter().untyped_storage().nbytes()
-    assert held == scratch + ds_tiles * cake_jit.DS_TILE_BYTES
-    # It holds what every call needs (``cake_gqa_det_train_workspace_bytes`` of each shape).
-    for q, k in shapes:
-        need = cake_backend.cake_gqa_det_train_workspace_bytes(
-            sum(q), 24, len(q), total_k=sum(k), num_heads_kv=4, max_seqlen_k=max(k)
+    assert held == scratch
+    for q, _k in shapes:
+        assert (
+            cake_backend.cake_gqa_det_train_workspace_bytes(sum(q), 24, len(q)) <= held
         )
-        assert need <= held, (q, need, held)
+
+
+def test_the_backward_frees_its_ds_workspace_and_windows(device) -> None:
+    """The dS^T workspace and the row-map window gradients live only while a backward runs: once the scratch has
+    grown, a row-map backward leaves only dQ allocated, after a peak of at least the dS^T chunk and the windows."""
+    q_lens, k_lens, h_q, h_kv = (3000, 77), (9000, 77), 24, 4
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device, seed=3)
+    row_map, n_dst = _window_row_map(x)
+    dst = [
+        torch.zeros(n_dst, h_kv, D, dtype=torch.float32, device=device)
+        for _ in range(2)
+    ]
+    out, lse = cake_backend.cake_gqa_det_train_forward(
+        x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+    )
+    plan = cake_jit.chunk_plan(
+        total_q=sum(q_lens),
+        total_k=sum(k_lens),
+        num_heads_q=h_q,
+        num_heads_kv=h_kv,
+        num_segments=len(q_lens),
+        max_seqlen_k=max(k_lens),
+        budget_bytes=ws.budget_bytes,
+    )
+    transient = (
+        plan["ws_tiles"] * cake_jit.DS_TILE_BYTES + 2 * 4 * sum(k_lens) * h_kv * D
+    )
+    for call in range(2):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        dq, _dk, _dv = cake_backend.cake_gqa_det_train_backward(
+            x["q"],
+            x["k"],
+            x["v"],
+            out,
+            lse,
+            x["dout"],
+            x["cu_q"],
+            x["cu_k"],
+            softmax_scale=SCALE,
+            workspace=ws,
+            max_seqlen_k=max(k_lens),
+            dk_acc=dst[0],
+            dv_acc=dst[1],
+            row_map=row_map,
+        )
+        torch.cuda.synchronize()
+        assert torch.cuda.max_memory_allocated(device) - before >= transient, call
+        if call:
+            kept = torch.cuda.memory_allocated(device) - before
+            assert kept == -(-dq.untyped_storage().nbytes() // 512) * 512, kept
+        del dq
+    held = ws.nbytes - ws.tile_counter().untyped_storage().nbytes()
+    assert held == cake_jit.scratch_bytes(sum(q_lens), h_q, len(q_lens))
 
 
 def test_launches_on_the_operands_device_and_stream(device) -> None:
