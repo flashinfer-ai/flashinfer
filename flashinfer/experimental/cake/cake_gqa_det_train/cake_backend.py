@@ -36,8 +36,9 @@ The package is the deterministic one of its family (``det``): every sum of
 the forward and the backward has one fixed order, so ``out``, ``lse``, dQ and
 every dK / dV form are bitwise reproducible run to run for one shape, one
 ``max_seqlen_k`` and one workspace budget (the budget sets the chunks and
-with them the dQ rounding).  The backward stores dS^T into a workspace and
-computes dK and dQ as GEMMs over it; it never adds with atomics, so it raises
+with them the dQ rounding).  The backward's main kernel sums dK and dV of a
+key block in tensor memory and stores dS^T into a workspace, and dQ is a GEMM
+over that workspace; it never adds with atomics, so it raises
 no PyTorch determinism alert.  The row-map form adds the FP32 window rows into
 their destination rows in ascending window order through a stable sort of
 the row map.
@@ -89,13 +90,12 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = dict(cake_jit.ARCH_BY_CAPABILIT
 HEAD_DIM: int = cake_jit.HEAD_DIM
 LOG2_E = math.log2(math.e)
 
-# The main kernel and the dK GEMM of each dK / dV output (the row-map form runs the FP32 window, then the fold).
+# The main kernel of each dK / dV output (the row-map form runs the FP32 window, then the fold).
 _MAIN_STAGE = {
     "bf16": "bwd_main_bf16",
     "fp32": "bwd_main_fp32",
     "rowmap": "bwd_main_fp32",
 }
-_DK_STAGE = {"bf16": "bwd_dk_bf16", "fp32": "bwd_dk_fp32", "rowmap": "bwd_dk_fp32"}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -589,9 +589,10 @@ def cake_gqa_det_train_backward(
     workspace chunks.  ``None`` bounds it by ``T_k``: always correct, with more (mostly empty) chunks.  It is never
     read from the device.
 
-    Every sum has one fixed order: dS^T goes to the workspace, dK and dQ are GEMMs over it, each output tile summed
-    in one order by one CTA pair, and the row-map destinations are folded in window order.  The bits depend on the
-    shape, ``max_seqlen_k`` and the workspace's ``budget_bytes`` only; no PyTorch determinism alert is raised.
+    Every sum has one fixed order: the main kernel sums dK and dV of a key block in tensor memory over the query
+    heads and Q tiles in one order, dS^T goes to the workspace and dQ is a GEMM over it, each output tile summed in one
+    order by one CTA pair, and the row-map destinations are folded in window order.  The bits depend on the shape,
+    ``max_seqlen_k`` and the workspace's ``budget_bytes`` only; no PyTorch determinism alert is raised.
     """
     dims = _check_operands(q, k, v, cu_seqlens_q, cu_seqlens_k)
     if max_seqlen_k is not None and int(max_seqlen_k) < 0:
@@ -737,7 +738,6 @@ def cake_gqa_det_train_backward(
                 "accumulate": 1 if index else 0,
             }
             _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
-            _launch(_DK_STAGE[mode], at, dims, device_index, **chunk)
             _launch("bwd_dq", at, dims, device_index, **chunk)
     if mode == "rowmap":
         # Window rows sorted by destination row, ties in window order; each destination row adds its run in order.

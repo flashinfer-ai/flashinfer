@@ -136,8 +136,6 @@ PAIR_STAGES = (
     "fwd",
     "bwd_main_fp32",
     "bwd_main_bf16",
-    "bwd_dk_fp32",
-    "bwd_dk_bf16",
     "bwd_dq",
 )
 FIRST_PARAMETER = {
@@ -146,8 +144,6 @@ FIRST_PARAMETER = {
     "bwd_plan": "cu_seqlens_q",
     "bwd_main_fp32": "Q",
     "bwd_main_bf16": "Q",
-    "bwd_dk_fp32": "dsw",
-    "bwd_dk_bf16": "dsw",
     "bwd_dq": "dsw",
     "bwd_fold": "dk_win",
     "bwd_post": "dQ_accum",
@@ -229,8 +225,6 @@ def test_registry_records_are_well_formed() -> None:
         "bwd_plan",
         "bwd_main_fp32",
         "bwd_main_bf16",
-        "bwd_dk_fp32",
-        "bwd_dk_bf16",
         "bwd_dq",
         "bwd_fold",
         "bwd_post",
@@ -259,12 +253,9 @@ def test_registry_records_are_well_formed() -> None:
         assert launch["block"][0] % 32 == 0, name
         # Every parameter the host passes is in the plan, in the order the kernel declares.
         assert cake_backend.parameters(name)[0] == FIRST_PARAMETER[rec["stage"]], name
-    # The two precisions of the main kernel and of the dK GEMM take one argument plan (one launch of the host).
+    # The two precisions of the main kernel take one argument plan (one launch of the host).
     for arch in ARCHES:
-        for fp32, bf16 in (
-            ("bwd_main_fp32", "bwd_main_bf16"),
-            ("bwd_dk_fp32", "bwd_dk_bf16"),
-        ):
+        for fp32, bf16 in (("bwd_main_fp32", "bwd_main_bf16"),):
             assert cake_backend.parameters(
                 cake_jit.stage_record(fp32, arch)
             ) == cake_backend.parameters(cake_jit.stage_record(bf16, arch)), (
@@ -480,13 +471,6 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
                         # A CTA pair per (key block of the chunk, KV head of the chunk, segment).
                         assert cake_jit.grid(stage, **dims, **chunk) == (
                             2 * chunk_blocks,
-                            hc,
-                            n,
-                        ), (label, stage)
-                    for stage in ("bwd_dk_fp32", "bwd_dk_bf16"):
-                        # A CTA pair per two key blocks of the chunk.
-                        assert cake_jit.grid(stage, **dims, **chunk) == (
-                            chunk_blocks,
                             hc,
                             n,
                         ), (label, stage)
@@ -1160,7 +1144,7 @@ def test_a_small_budget_matches_the_reference_and_repeats(layout, kind, device) 
 @pytest.mark.parametrize("kind", BUDGET_KINDS)
 @pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
 def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -> None:
-    """Under a small budget the backward launches main, dK and dQ once per chunk of the expected size, in that order:
+    """Under a small budget the backward launches main and dQ once per chunk of the expected size, in that order:
     the chunks cover every (KV head, key block) once, and the first key-block chunk of each KV-head chunk stores
     where the later ones add."""
     name, q_lens, k_lens, h_q, h_kv = layout
@@ -1171,7 +1155,7 @@ def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -
     launch = cake_backend._launch
 
     def record(stage, values, dims, device_index, **chunk):
-        if stage.startswith(("bwd_main", "bwd_dk", "bwd_dq")):
+        if stage.startswith(("bwd_main", "bwd_dq")):
             launches.append(
                 (stage.split("_")[1],)
                 + tuple(values[key] for key in ("h0", "hc", "n0", "n1", "accumulate"))
@@ -1182,15 +1166,10 @@ def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -
     ws = cake_backend.CakeGQADetWorkspace(device, budget_bytes=budget)
     _run(x, "bf16", workspace=ws, max_seqlen_k=_longest_k(x))
     torch.cuda.synchronize()
-    assert [stage for stage, *_ in launches] == ["main", "dk", "dq"] * (
-        len(launches) // 3
-    )
-    chunks = launches[::3]
+    assert [stage for stage, *_ in launches] == ["main", "dq"] * (len(launches) // 2)
+    chunks = launches[::2]
     for i, chunk in enumerate(chunks):
-        assert launches[3 * i + 1][1:] == launches[3 * i + 2][1:] == chunk[1:], (
-            name,
-            kind,
-        )
+        assert launches[2 * i + 1][1:] == chunk[1:], (name, kind)
     width = min(n_chunk, blocks)
     assert len(chunks) == -(-h_kv // h_chunk) * -(-blocks // width), (
         name,

@@ -17,9 +17,9 @@ depend only on the shapes, ``max_seqlen_k`` and the workspace budget.  Under
 ``torch.use_deterministic_algorithms(True)``, strict or with
 ``warn_only=True``, nothing alerts or warns.
 
-The backward stores dS^T into a workspace, one 32 KiB tile per (head pair,
-key block of 128 keys, Q tile of 64 rows), and computes dK and dQ as GEMMs
-over it.  The workspace's ``budget_bytes`` (default 16 GiB) bounds that
+The backward's main kernel sums dK and dV of each key block in tensor memory
+and stores dS^T into a workspace, one 32 KiB tile per (head pair, key block
+of 128 keys, Q tile of 64 rows); dQ is a GEMM over that workspace.  The workspace's ``budget_bytes`` (default 16 GiB) bounds that
 storage: a larger call runs in chunks of KV heads, then of key blocks, and
 the smallest chunk (one KV head, two key blocks) runs even past it.  A
 different budget can move the last bits of dQ, not its accuracy.  A row-map

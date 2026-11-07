@@ -87,8 +87,7 @@ entry takes a `deterministic=` keyword.
 | `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 256 query rows of one (segment, query head), persistent tile tickets from a self-resetting counter |
 | `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
 | `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 1024 pairs of 128 query rows) |
-| `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head): S^T, dP^T and dV (FP32 window or BF16), dS^T stored to the workspace |
-| `bwd_dk_fp32` / `bwd_dk_bf16` | per chunk: dK = dS^T Q over the workspace, a CTA pair per two key blocks (FP32 window or BF16) |
+| `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head): S^T, dP^T, dK and dV, dK and dV summed in tensor memory over every query head of the key head and stored once (FP32 window or BF16), dS^T stored to the workspace |
 | `bwd_dq` | per chunk: dQ = dS K over the workspace into the FP32 accumulator (persistent over the Q-tile pairs) |
 | `bwd_fold` | row-map form only: the FP32 window rows added into their destination rows in ascending window order (a stable sort of the row map) |
 | `bwd_post` | `dQ = bf16(acc * softmax_scale)` |

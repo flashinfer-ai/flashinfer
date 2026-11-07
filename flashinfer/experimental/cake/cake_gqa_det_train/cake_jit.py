@@ -31,8 +31,8 @@ and the manifest checker read it with ``ast.literal_eval``).
 The stages, in launch order: ``fwd`` (O and the natural-log LSE),
 ``bwd_pre`` (``dPsum``, ``LSE * log2(e)`` and the zeroed FP32 dQ accumulator
 in the pack-2 scratch layout), then per workspace chunk ``bwd_main_fp32`` /
-``bwd_main_bf16`` (S^T, dP^T and dV of a key block, dS^T stored to the
-workspace), ``bwd_dk_fp32`` / ``bwd_dk_bf16`` (dK = dS^T Q over the
+``bwd_main_bf16`` (S^T, dP^T, dK and dV of a key block, dK and dV summed
+in tensor memory over every query head of the key head, dS^T stored to the
 workspace) and ``bwd_dq`` (dQ = dS K over the workspace into the
 accumulator), then ``bwd_fold`` (row-map destinations only: the FP32 window
 rows added into their destination rows in ascending window order) and
@@ -61,8 +61,6 @@ STAGES = (
     "bwd_plan",
     "bwd_main_fp32",
     "bwd_main_bf16",
-    "bwd_dk_fp32",
-    "bwd_dk_bf16",
     "bwd_dq",
     "bwd_fold",
     "bwd_post",
@@ -233,72 +231,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gqa_det_train_4c8a8d57f2af096bf6f8",
         "stage": "bwd_main_bf16",
-    },
-    "bwd_dk_fp32": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "dsw"],
-            ["buffer", "Q"],
-            ["buffer", "tile_base"],
-            ["buffer", "cu_seqlens_q"],
-            ["buffer", "cu_seqlens_k"],
-            ["buffer", "dk_out"],
-            ["parameter", "num_segments"],
-            ["parameter", "h_kv"],
-            ["parameter", "group"],
-            ["parameter", "softmax_scale"],
-            ["parameter", "n0"],
-            ["parameter", "h0"],
-            ["parameter", "tile_stride"],
-            ["parameter", "zero_tile"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_det_train_f14da11bb54e8296852c",
-        "launch": {
-            "block": (192, 1, 1),
-            "cluster": (2, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 197632,
-            "use_pdl": False,
-        },
-        "library": "cake_gqa_det_train_f14da11bb54e8296852c",
-        "stage": "bwd_dk_fp32",
-    },
-    "bwd_dk_bf16": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "dsw"],
-            ["buffer", "Q"],
-            ["buffer", "tile_base"],
-            ["buffer", "cu_seqlens_q"],
-            ["buffer", "cu_seqlens_k"],
-            ["buffer", "dk_out"],
-            ["parameter", "num_segments"],
-            ["parameter", "h_kv"],
-            ["parameter", "group"],
-            ["parameter", "softmax_scale"],
-            ["parameter", "n0"],
-            ["parameter", "h0"],
-            ["parameter", "tile_stride"],
-            ["parameter", "zero_tile"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_det_train_be38524faf4118850662",
-        "launch": {
-            "block": (192, 1, 1),
-            "cluster": (2, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 197632,
-            "use_pdl": False,
-        },
-        "library": "cake_gqa_det_train_be38524faf4118850662",
-        "stage": "bwd_dk_bf16",
     },
     "bwd_dq": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -479,8 +411,8 @@ def scratch_bytes(total_q: int, num_heads_q: int, num_segments: int) -> int:
 
 
 def key_blocks(total_k: int, max_seqlen_k: Optional[int]) -> int:
-    """Key blocks of the longest segment, rounded up to even (the dK GEMM pairs them): from ``max_seqlen_k`` when the
-    caller gives it, else from ``T_k``, which bounds every segment."""
+    """Key blocks of the longest segment, rounded up to even (a workspace chunk spans whole pairs of key blocks): from
+    ``max_seqlen_k`` when the caller gives it, else from ``T_k``, which bounds every segment."""
     longest = total_k if max_seqlen_k is None else min(int(max_seqlen_k), total_k)
     blocks = max(1, -(-longest // BWD_TILE_KEYS))
     return blocks + (blocks & 1)
@@ -549,7 +481,7 @@ def grid(
     chunk_heads: int = 0,
 ) -> tuple[int, int, int]:
     """The launch grid of ``stage``; ``chunk_blocks`` / ``chunk_heads`` are the key blocks and KV heads of the
-    workspace chunk a ``bwd_main_*`` / ``bwd_dk_*`` / ``bwd_dq`` launch covers.  Tile counts are upper bounds from host
+    workspace chunk a ``bwd_main_*`` / ``bwd_dq`` launch covers.  Tile counts are upper bounds from host
     values (``sum_b ceil(len_b / n) <= T // n + B``); the kernels decode the segments on the device and retire the CTAs
     (or skip the work items) past the last tile."""
     if stage == "fwd":
@@ -564,8 +496,6 @@ def grid(
         return (rows // per_cta, num_heads_q // 2, 1)
     if stage in ("bwd_main_fp32", "bwd_main_bf16"):
         return (BWD_CLUSTER * chunk_blocks, chunk_heads, num_segments)
-    if stage in ("bwd_dk_fp32", "bwd_dk_bf16"):
-        return (BWD_CLUSTER * (-(-chunk_blocks // 2)), chunk_heads, num_segments)
     if stage == "bwd_dq":
         items = (
             pair_bound(total_q, num_segments)

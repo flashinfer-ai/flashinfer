@@ -29,8 +29,9 @@ The mode is part of the name: no entry takes a ``deterministic`` keyword
 has one fixed order: ``out``, ``lse``, dQ and every dK / dV form (BF16, FP32
 window, FP32 row-map adds with repeated destination rows) repeat bit for bit
 run to run, for one shape, one ``max_seqlen_k`` and one workspace budget.
-The backward stores dS^T into a workspace and computes dK and dQ as GEMMs
-over it, in chunks that fit the workspace's ``budget_bytes`` (default
+The backward's main kernel sums dK and dV of each key block in tensor
+memory and stores dS^T into a workspace; dQ is a GEMM over that workspace.
+The backward runs in chunks that fit the workspace's ``budget_bytes`` (default
 16 GiB; the smallest chunk, one KV head and two key blocks, runs even past
 it); it raises no PyTorch determinism alert.  The interface matches the
 non-deterministic counterpart ``flashinfer.cake_gqa_nondet_train``.
@@ -304,9 +305,9 @@ def cake_gqa_det_train_backward(
 
     Notes
     -----
-    Bitwise reproducible run to run for one shape, one ``max_seqlen_k`` and one workspace ``budget_bytes``: dS^T goes
-    to the workspace, dK and dQ are GEMMs over it with each output tile summed in one order, and the row-map
-    destinations are folded in ascending window order.  A call whose dS^T exceeds the budget runs in chunks (KV heads
+    Bitwise reproducible run to run for one shape, one ``max_seqlen_k`` and one workspace ``budget_bytes``: dK and dV
+    of a key block are summed in tensor memory in one order, dS^T goes to the workspace and dQ is a GEMM over it with
+    each output tile summed in one order, and the row-map destinations are folded in ascending window order.  A call whose dS^T exceeds the budget runs in chunks (KV heads
     first, then key-block ranges); the budget moves the dQ rounding, not its accuracy.  Raises no PyTorch
     determinism alert.
     """
