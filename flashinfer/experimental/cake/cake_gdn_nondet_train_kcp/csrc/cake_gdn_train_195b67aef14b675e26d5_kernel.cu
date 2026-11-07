@@ -556,28 +556,28 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + l2n_rsub * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + l2n_rsub * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb[0]), "r"(yb[1]), "r"(yb[2]), "r"(yb[3]) : "memory");
                 if (l2n_rsub < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb)[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb)[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub) * (long long)rstd_tstride + (long long)hq)) + (0)) = r[0];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 8) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 8) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb[4]), "r"(yb[5]), "r"(yb[6]), "r"(yb[7]) : "memory");
                 if (l2n_rsub + 8 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 8) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (4))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 8) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (4))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 8) * (long long)rstd_tstride + (long long)hq)) + (0)) = r[1];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 16) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 16) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb[8]), "r"(yb[9]), "r"(yb[10]), "r"(yb[11]) : "memory");
                 if (l2n_rsub + 16 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 16) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (8))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 16) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (8))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 16) * (long long)rstd_tstride + (long long)hq)) + (0)) = r[2];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 24) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 24) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb[12]), "r"(yb[13]), "r"(yb[14]), "r"(yb[15]) : "memory");
                 if (l2n_rsub + 24 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 24) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (12))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 24) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb + (12))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 24) * (long long)rstd_tstride + (long long)hq)) + (0)) = r[3];
                     }
@@ -820,28 +820,28 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + l2n_rsub * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + l2n_rsub * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_0[0]), "r"(yb_0[1]), "r"(yb_0[2]), "r"(yb_0[3]) : "memory");
                 if (l2n_rsub < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0)[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0)[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_0[0];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 8) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 8) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_0[4]), "r"(yb_0[5]), "r"(yb_0[6]), "r"(yb_0[7]) : "memory");
                 if (l2n_rsub + 8 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 8) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (4))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 8) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (4))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 8) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_0[1];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 16) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 16) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_0[8]), "r"(yb_0[9]), "r"(yb_0[10]), "r"(yb_0[11]) : "memory");
                 if (l2n_rsub + 16 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 16) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (8))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 16) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (8))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 16) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_0[2];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 24) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 24) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_0[12]), "r"(yb_0[13]), "r"(yb_0[14]), "r"(yb_0[15]) : "memory");
                 if (l2n_rsub + 24 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 24) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (12))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 24) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_0 + (12))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 24) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_0[3];
                     }
@@ -1084,28 +1084,28 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 32) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 32) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_1[0]), "r"(yb_1[1]), "r"(yb_1[2]), "r"(yb_1[3]) : "memory");
                 if (l2n_rsub + 32 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 32) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1)[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 32) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1)[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 32) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_1[0];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 40) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 40) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_1[4]), "r"(yb_1[5]), "r"(yb_1[6]), "r"(yb_1[7]) : "memory");
                 if (l2n_rsub + 40 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 40) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (4))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 40) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (4))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 40) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_1[1];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 48) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 48) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_1[8]), "r"(yb_1[9]), "r"(yb_1[10]), "r"(yb_1[11]) : "memory");
                 if (l2n_rsub + 48 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 48) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (8))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 48) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (8))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 48) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_1[2];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((q_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 56) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 56) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_1[12]), "r"(yb_1[13]), "r"(yb_1[14]), "r"(yb_1[15]) : "memory");
                 if (l2n_rsub + 56 < clen) {
-                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 56) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (12))[0];
+                    reinterpret_cast<int4*>(qn_out + (((long long)(ext0 + l2n_rsub + 56) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_1 + (12))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(q_rstd + ((long long)(ext0 + l2n_rsub + 56) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_1[3];
                     }
@@ -1348,28 +1348,28 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 32) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 32) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_2[0]), "r"(yb_2[1]), "r"(yb_2[2]), "r"(yb_2[3]) : "memory");
                 if (l2n_rsub + 32 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 32) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2)[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 32) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2)[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 32) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_2[0];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 40) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 40) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_2[4]), "r"(yb_2[5]), "r"(yb_2[6]), "r"(yb_2[7]) : "memory");
                 if (l2n_rsub + 40 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 40) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (4))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 40) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (4))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 40) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_2[1];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 48) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 48) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_2[8]), "r"(yb_2[9]), "r"(yb_2[10]), "r"(yb_2[11]) : "memory");
                 if (l2n_rsub + 48 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 48) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (8))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 48) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (8))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 48) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_2[2];
                     }
                 }
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((k_k_addr + (unsigned int)(l2n_c * 8 / 64 * 8192 + (l2n_rsub + 56) * 128 + l2n_c * 8 % 64 * 2 ^ (l2n_c * 8 / 64 * 8192 + (l2n_rsub + 56) * 128 + l2n_c * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(yb_2[12]), "r"(yb_2[13]), "r"(yb_2[14]), "r"(yb_2[15]) : "memory");
                 if (l2n_rsub + 56 < clen) {
-                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 56) * (long long)num_qk_heads + (long long)hq) * 128 + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (12))[0];
+                    reinterpret_cast<int4*>(kn_out + (((long long)(ext0 + l2n_rsub + 56) * (long long)num_qk_heads + (long long)hq) * 128ll + (long long)(l2n_c * 8)))[0] = reinterpret_cast<int4*>(yb_2 + (12))[0];
                     if (l2n_c == 0) {
                         *(reinterpret_cast<float*>(k_rstd + ((long long)(ext0 + l2n_rsub + 56) * (long long)rstd_tstride + (long long)hq)) + (0)) = r_2[3];
                     }
@@ -1480,7 +1480,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&gtr_r[0])) : "r"(gc_base + t_row * 4));
                         float bt = bt_r[0];
                         float gtr = gtr_r[0];
-                        long long aqk_base = ((long long)(irow0 + t_row) * (long long)num_heads + (long long)hv) * 64;
+                        long long aqk_base = ((long long)(irow0 + t_row) * (long long)num_heads + (long long)hv) * 64ll;
                         int s0_1_0 = half * 16;
                         float gsv_1_0[16];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2106,7 +2106,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                     }
                     if (group > j) {
                         int arow = tid_0 >> 1;
-                        long long akk_base = ((long long)(irow0 + arow) * (long long)num_heads + (long long)hv) * 64;
+                        long long akk_base = ((long long)(irow0 + arow) * (long long)num_heads + (long long)hv) * 64ll;
                         int sa0_1_0 = (tid_0 & 1) * 4 * 8;
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
                             :: "r"((akk_t_addr + (unsigned int)(sa0_1_0 / 64 * 8192 + arow * 128 + sa0_1_0 % 64 * 2 ^ (sa0_1_0 / 64 * 8192 + arow * 128 + sa0_1_0 % 64 * 2 >> 7 & 7) << 4))), "l"(akk + (akk_base + (long long)sa0_1_0)));
@@ -2937,8 +2937,8 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         __syncwarp();
                         if (elect_sync()) {
-                            long long grow0 = ((long long)(irow0 + w_id * 16) * (long long)num_heads + (long long)(hv - 1)) * 128;
-                            long long gpitch = (long long)num_heads * 128;
+                            long long grow0 = ((long long)(irow0 + w_id * 16) * (long long)num_heads + (long long)(hv - 1)) * 128ll;
+                            long long gpitch = (long long)num_heads * 128ll;
                             {
                                 void* _cpbulk_dst_290 = reinterpret_cast<void*>(w_out + grow0);
                                 asm volatile(
@@ -2954,98 +2954,98 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_292 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 2));
+                                void* _cpbulk_dst_292 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 2ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_292), "r"(l_s_addr + (unsigned int)((w_id * 16 + 2) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_293 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 3));
+                                void* _cpbulk_dst_293 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 3ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_293), "r"(l_s_addr + (unsigned int)((w_id * 16 + 3) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_294 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 4));
+                                void* _cpbulk_dst_294 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 4ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_294), "r"(l_s_addr + (unsigned int)((w_id * 16 + 4) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_295 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 5));
+                                void* _cpbulk_dst_295 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 5ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_295), "r"(l_s_addr + (unsigned int)((w_id * 16 + 5) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_296 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 6));
+                                void* _cpbulk_dst_296 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 6ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_296), "r"(l_s_addr + (unsigned int)((w_id * 16 + 6) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_297 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 7));
+                                void* _cpbulk_dst_297 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 7ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_297), "r"(l_s_addr + (unsigned int)((w_id * 16 + 7) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_298 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 8));
+                                void* _cpbulk_dst_298 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 8ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_298), "r"(l_s_addr + (unsigned int)((w_id * 16 + 8) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_299 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 9));
+                                void* _cpbulk_dst_299 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 9ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_299), "r"(l_s_addr + (unsigned int)((w_id * 16 + 9) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_300 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 10));
+                                void* _cpbulk_dst_300 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 10ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_300), "r"(l_s_addr + (unsigned int)((w_id * 16 + 10) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_301 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 11));
+                                void* _cpbulk_dst_301 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 11ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_301), "r"(l_s_addr + (unsigned int)((w_id * 16 + 11) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_302 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 12));
+                                void* _cpbulk_dst_302 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 12ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_302), "r"(l_s_addr + (unsigned int)((w_id * 16 + 12) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_303 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 13));
+                                void* _cpbulk_dst_303 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 13ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_303), "r"(l_s_addr + (unsigned int)((w_id * 16 + 13) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_304 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 14));
+                                void* _cpbulk_dst_304 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 14ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_304), "r"(l_s_addr + (unsigned int)((w_id * 16 + 14) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_305 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 15));
+                                void* _cpbulk_dst_305 = reinterpret_cast<void*>(w_out + (grow0 + gpitch * 15ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_305), "r"(l_s_addr + (unsigned int)((w_id * 16 + 15) * 272)), "r"((uint32_t)(256))
@@ -3066,98 +3066,98 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_308 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 2));
+                                void* _cpbulk_dst_308 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 2ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_308), "r"(a_s_addr + (unsigned int)((w_id * 16 + 2) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_309 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 3));
+                                void* _cpbulk_dst_309 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 3ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_309), "r"(a_s_addr + (unsigned int)((w_id * 16 + 3) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_310 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 4));
+                                void* _cpbulk_dst_310 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 4ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_310), "r"(a_s_addr + (unsigned int)((w_id * 16 + 4) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_311 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 5));
+                                void* _cpbulk_dst_311 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 5ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_311), "r"(a_s_addr + (unsigned int)((w_id * 16 + 5) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_312 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 6));
+                                void* _cpbulk_dst_312 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 6ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_312), "r"(a_s_addr + (unsigned int)((w_id * 16 + 6) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_313 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 7));
+                                void* _cpbulk_dst_313 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 7ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_313), "r"(a_s_addr + (unsigned int)((w_id * 16 + 7) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_314 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 8));
+                                void* _cpbulk_dst_314 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 8ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_314), "r"(a_s_addr + (unsigned int)((w_id * 16 + 8) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_315 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 9));
+                                void* _cpbulk_dst_315 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 9ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_315), "r"(a_s_addr + (unsigned int)((w_id * 16 + 9) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_316 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 10));
+                                void* _cpbulk_dst_316 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 10ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_316), "r"(a_s_addr + (unsigned int)((w_id * 16 + 10) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_317 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 11));
+                                void* _cpbulk_dst_317 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 11ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_317), "r"(a_s_addr + (unsigned int)((w_id * 16 + 11) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_318 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 12));
+                                void* _cpbulk_dst_318 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 12ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_318), "r"(a_s_addr + (unsigned int)((w_id * 16 + 12) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_319 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 13));
+                                void* _cpbulk_dst_319 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 13ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_319), "r"(a_s_addr + (unsigned int)((w_id * 16 + 13) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_320 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 14));
+                                void* _cpbulk_dst_320 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 14ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_320), "r"(a_s_addr + (unsigned int)((w_id * 16 + 14) * 272)), "r"((uint32_t)(256))
                                     : "memory");
                             }
                             {
-                                void* _cpbulk_dst_321 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 15));
+                                void* _cpbulk_dst_321 = reinterpret_cast<void*>(u_out + (grow0 + gpitch * 15ll));
                                 asm volatile(
                                     "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                     :: "l"(_cpbulk_dst_321), "r"(a_s_addr + (unsigned int)((w_id * 16 + 15) * 272)), "r"((uint32_t)(256))
@@ -3229,7 +3229,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_322 = reinterpret_cast<const unsigned*>(packed);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + rbase * 128)), "r"(_raw_stv8_322[0]), "r"(_raw_stv8_322[1]), "r"(_raw_stv8_322[2]), "r"(_raw_stv8_322[3]), "r"(_raw_stv8_322[4]), "r"(_raw_stv8_322[5]), "r"(_raw_stv8_322[6]), "r"(_raw_stv8_322[7]) : "memory");
+                                :: "l"((void*)(w_out + rbase * 128ll)), "r"(_raw_stv8_322[0]), "r"(_raw_stv8_322[1]), "r"(_raw_stv8_322[2]), "r"(_raw_stv8_322[3]), "r"(_raw_stv8_322[4]), "r"(_raw_stv8_322[5]), "r"(_raw_stv8_322[6]), "r"(_raw_stv8_322[7]) : "memory");
                         }
                         unsigned int packed_0[8];
                         #pragma unroll
@@ -3276,7 +3276,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_323 = reinterpret_cast<const unsigned*>(packed_0);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + rbase * 128)), "r"(_raw_stv8_323[0]), "r"(_raw_stv8_323[1]), "r"(_raw_stv8_323[2]), "r"(_raw_stv8_323[3]), "r"(_raw_stv8_323[4]), "r"(_raw_stv8_323[5]), "r"(_raw_stv8_323[6]), "r"(_raw_stv8_323[7]) : "memory");
+                                :: "l"((void*)(u_out + rbase * 128ll)), "r"(_raw_stv8_323[0]), "r"(_raw_stv8_323[1]), "r"(_raw_stv8_323[2]), "r"(_raw_stv8_323[3]), "r"(_raw_stv8_323[4]), "r"(_raw_stv8_323[5]), "r"(_raw_stv8_323[6]), "r"(_raw_stv8_323[7]) : "memory");
                         }
                         unsigned int packed_1[8];
                         #pragma unroll
@@ -3323,7 +3323,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_324 = reinterpret_cast<const unsigned*>(packed_1);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 16))), "r"(_raw_stv8_324[0]), "r"(_raw_stv8_324[1]), "r"(_raw_stv8_324[2]), "r"(_raw_stv8_324[3]), "r"(_raw_stv8_324[4]), "r"(_raw_stv8_324[5]), "r"(_raw_stv8_324[6]), "r"(_raw_stv8_324[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 16ll))), "r"(_raw_stv8_324[0]), "r"(_raw_stv8_324[1]), "r"(_raw_stv8_324[2]), "r"(_raw_stv8_324[3]), "r"(_raw_stv8_324[4]), "r"(_raw_stv8_324[5]), "r"(_raw_stv8_324[6]), "r"(_raw_stv8_324[7]) : "memory");
                         }
                         unsigned int packed_2[8];
                         #pragma unroll
@@ -3370,7 +3370,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_325 = reinterpret_cast<const unsigned*>(packed_2);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 16))), "r"(_raw_stv8_325[0]), "r"(_raw_stv8_325[1]), "r"(_raw_stv8_325[2]), "r"(_raw_stv8_325[3]), "r"(_raw_stv8_325[4]), "r"(_raw_stv8_325[5]), "r"(_raw_stv8_325[6]), "r"(_raw_stv8_325[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 16ll))), "r"(_raw_stv8_325[0]), "r"(_raw_stv8_325[1]), "r"(_raw_stv8_325[2]), "r"(_raw_stv8_325[3]), "r"(_raw_stv8_325[4]), "r"(_raw_stv8_325[5]), "r"(_raw_stv8_325[6]), "r"(_raw_stv8_325[7]) : "memory");
                         }
                         unsigned int packed_3[8];
                         #pragma unroll
@@ -3417,7 +3417,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_326 = reinterpret_cast<const unsigned*>(packed_3);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 32))), "r"(_raw_stv8_326[0]), "r"(_raw_stv8_326[1]), "r"(_raw_stv8_326[2]), "r"(_raw_stv8_326[3]), "r"(_raw_stv8_326[4]), "r"(_raw_stv8_326[5]), "r"(_raw_stv8_326[6]), "r"(_raw_stv8_326[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 32ll))), "r"(_raw_stv8_326[0]), "r"(_raw_stv8_326[1]), "r"(_raw_stv8_326[2]), "r"(_raw_stv8_326[3]), "r"(_raw_stv8_326[4]), "r"(_raw_stv8_326[5]), "r"(_raw_stv8_326[6]), "r"(_raw_stv8_326[7]) : "memory");
                         }
                         unsigned int packed_4[8];
                         #pragma unroll
@@ -3464,7 +3464,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_327 = reinterpret_cast<const unsigned*>(packed_4);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 32))), "r"(_raw_stv8_327[0]), "r"(_raw_stv8_327[1]), "r"(_raw_stv8_327[2]), "r"(_raw_stv8_327[3]), "r"(_raw_stv8_327[4]), "r"(_raw_stv8_327[5]), "r"(_raw_stv8_327[6]), "r"(_raw_stv8_327[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 32ll))), "r"(_raw_stv8_327[0]), "r"(_raw_stv8_327[1]), "r"(_raw_stv8_327[2]), "r"(_raw_stv8_327[3]), "r"(_raw_stv8_327[4]), "r"(_raw_stv8_327[5]), "r"(_raw_stv8_327[6]), "r"(_raw_stv8_327[7]) : "memory");
                         }
                         unsigned int packed_5[8];
                         #pragma unroll
@@ -3511,7 +3511,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_328 = reinterpret_cast<const unsigned*>(packed_5);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 48))), "r"(_raw_stv8_328[0]), "r"(_raw_stv8_328[1]), "r"(_raw_stv8_328[2]), "r"(_raw_stv8_328[3]), "r"(_raw_stv8_328[4]), "r"(_raw_stv8_328[5]), "r"(_raw_stv8_328[6]), "r"(_raw_stv8_328[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 48ll))), "r"(_raw_stv8_328[0]), "r"(_raw_stv8_328[1]), "r"(_raw_stv8_328[2]), "r"(_raw_stv8_328[3]), "r"(_raw_stv8_328[4]), "r"(_raw_stv8_328[5]), "r"(_raw_stv8_328[6]), "r"(_raw_stv8_328[7]) : "memory");
                         }
                         unsigned int packed_6[8];
                         #pragma unroll
@@ -3558,7 +3558,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_329 = reinterpret_cast<const unsigned*>(packed_6);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 48))), "r"(_raw_stv8_329[0]), "r"(_raw_stv8_329[1]), "r"(_raw_stv8_329[2]), "r"(_raw_stv8_329[3]), "r"(_raw_stv8_329[4]), "r"(_raw_stv8_329[5]), "r"(_raw_stv8_329[6]), "r"(_raw_stv8_329[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 48ll))), "r"(_raw_stv8_329[0]), "r"(_raw_stv8_329[1]), "r"(_raw_stv8_329[2]), "r"(_raw_stv8_329[3]), "r"(_raw_stv8_329[4]), "r"(_raw_stv8_329[5]), "r"(_raw_stv8_329[6]), "r"(_raw_stv8_329[7]) : "memory");
                         }
                         unsigned int packed_7[8];
                         #pragma unroll
@@ -3605,7 +3605,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_330 = reinterpret_cast<const unsigned*>(packed_7);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 64))), "r"(_raw_stv8_330[0]), "r"(_raw_stv8_330[1]), "r"(_raw_stv8_330[2]), "r"(_raw_stv8_330[3]), "r"(_raw_stv8_330[4]), "r"(_raw_stv8_330[5]), "r"(_raw_stv8_330[6]), "r"(_raw_stv8_330[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 64ll))), "r"(_raw_stv8_330[0]), "r"(_raw_stv8_330[1]), "r"(_raw_stv8_330[2]), "r"(_raw_stv8_330[3]), "r"(_raw_stv8_330[4]), "r"(_raw_stv8_330[5]), "r"(_raw_stv8_330[6]), "r"(_raw_stv8_330[7]) : "memory");
                         }
                         unsigned int packed_8[8];
                         #pragma unroll
@@ -3652,7 +3652,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_331 = reinterpret_cast<const unsigned*>(packed_8);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 64))), "r"(_raw_stv8_331[0]), "r"(_raw_stv8_331[1]), "r"(_raw_stv8_331[2]), "r"(_raw_stv8_331[3]), "r"(_raw_stv8_331[4]), "r"(_raw_stv8_331[5]), "r"(_raw_stv8_331[6]), "r"(_raw_stv8_331[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 64ll))), "r"(_raw_stv8_331[0]), "r"(_raw_stv8_331[1]), "r"(_raw_stv8_331[2]), "r"(_raw_stv8_331[3]), "r"(_raw_stv8_331[4]), "r"(_raw_stv8_331[5]), "r"(_raw_stv8_331[6]), "r"(_raw_stv8_331[7]) : "memory");
                         }
                         unsigned int packed_9[8];
                         #pragma unroll
@@ -3699,7 +3699,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_332 = reinterpret_cast<const unsigned*>(packed_9);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 80))), "r"(_raw_stv8_332[0]), "r"(_raw_stv8_332[1]), "r"(_raw_stv8_332[2]), "r"(_raw_stv8_332[3]), "r"(_raw_stv8_332[4]), "r"(_raw_stv8_332[5]), "r"(_raw_stv8_332[6]), "r"(_raw_stv8_332[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 80ll))), "r"(_raw_stv8_332[0]), "r"(_raw_stv8_332[1]), "r"(_raw_stv8_332[2]), "r"(_raw_stv8_332[3]), "r"(_raw_stv8_332[4]), "r"(_raw_stv8_332[5]), "r"(_raw_stv8_332[6]), "r"(_raw_stv8_332[7]) : "memory");
                         }
                         unsigned int packed_10[8];
                         #pragma unroll
@@ -3746,7 +3746,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_333 = reinterpret_cast<const unsigned*>(packed_10);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 80))), "r"(_raw_stv8_333[0]), "r"(_raw_stv8_333[1]), "r"(_raw_stv8_333[2]), "r"(_raw_stv8_333[3]), "r"(_raw_stv8_333[4]), "r"(_raw_stv8_333[5]), "r"(_raw_stv8_333[6]), "r"(_raw_stv8_333[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 80ll))), "r"(_raw_stv8_333[0]), "r"(_raw_stv8_333[1]), "r"(_raw_stv8_333[2]), "r"(_raw_stv8_333[3]), "r"(_raw_stv8_333[4]), "r"(_raw_stv8_333[5]), "r"(_raw_stv8_333[6]), "r"(_raw_stv8_333[7]) : "memory");
                         }
                         unsigned int packed_11[8];
                         #pragma unroll
@@ -3793,7 +3793,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_334 = reinterpret_cast<const unsigned*>(packed_11);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 96))), "r"(_raw_stv8_334[0]), "r"(_raw_stv8_334[1]), "r"(_raw_stv8_334[2]), "r"(_raw_stv8_334[3]), "r"(_raw_stv8_334[4]), "r"(_raw_stv8_334[5]), "r"(_raw_stv8_334[6]), "r"(_raw_stv8_334[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 96ll))), "r"(_raw_stv8_334[0]), "r"(_raw_stv8_334[1]), "r"(_raw_stv8_334[2]), "r"(_raw_stv8_334[3]), "r"(_raw_stv8_334[4]), "r"(_raw_stv8_334[5]), "r"(_raw_stv8_334[6]), "r"(_raw_stv8_334[7]) : "memory");
                         }
                         unsigned int packed_12[8];
                         #pragma unroll
@@ -3840,7 +3840,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_335 = reinterpret_cast<const unsigned*>(packed_12);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 96))), "r"(_raw_stv8_335[0]), "r"(_raw_stv8_335[1]), "r"(_raw_stv8_335[2]), "r"(_raw_stv8_335[3]), "r"(_raw_stv8_335[4]), "r"(_raw_stv8_335[5]), "r"(_raw_stv8_335[6]), "r"(_raw_stv8_335[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 96ll))), "r"(_raw_stv8_335[0]), "r"(_raw_stv8_335[1]), "r"(_raw_stv8_335[2]), "r"(_raw_stv8_335[3]), "r"(_raw_stv8_335[4]), "r"(_raw_stv8_335[5]), "r"(_raw_stv8_335[6]), "r"(_raw_stv8_335[7]) : "memory");
                         }
                         unsigned int packed_13[8];
                         #pragma unroll
@@ -3887,7 +3887,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_336 = reinterpret_cast<const unsigned*>(packed_13);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(w_out + (rbase * 128 + 112))), "r"(_raw_stv8_336[0]), "r"(_raw_stv8_336[1]), "r"(_raw_stv8_336[2]), "r"(_raw_stv8_336[3]), "r"(_raw_stv8_336[4]), "r"(_raw_stv8_336[5]), "r"(_raw_stv8_336[6]), "r"(_raw_stv8_336[7]) : "memory");
+                                :: "l"((void*)(w_out + (rbase * 128ll + 112ll))), "r"(_raw_stv8_336[0]), "r"(_raw_stv8_336[1]), "r"(_raw_stv8_336[2]), "r"(_raw_stv8_336[3]), "r"(_raw_stv8_336[4]), "r"(_raw_stv8_336[5]), "r"(_raw_stv8_336[6]), "r"(_raw_stv8_336[7]) : "memory");
                         }
                         unsigned int packed_14[8];
                         #pragma unroll
@@ -3934,7 +3934,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_337 = reinterpret_cast<const unsigned*>(packed_14);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(u_out + (rbase * 128 + 112))), "r"(_raw_stv8_337[0]), "r"(_raw_stv8_337[1]), "r"(_raw_stv8_337[2]), "r"(_raw_stv8_337[3]), "r"(_raw_stv8_337[4]), "r"(_raw_stv8_337[5]), "r"(_raw_stv8_337[6]), "r"(_raw_stv8_337[7]) : "memory");
+                                :: "l"((void*)(u_out + (rbase * 128ll + 112ll))), "r"(_raw_stv8_337[0]), "r"(_raw_stv8_337[1]), "r"(_raw_stv8_337[2]), "r"(_raw_stv8_337[3]), "r"(_raw_stv8_337[4]), "r"(_raw_stv8_337[5]), "r"(_raw_stv8_337[6]), "r"(_raw_stv8_337[7]) : "memory");
                         }
                         unsigned int packed_15[8];
                         #pragma unroll
@@ -3981,7 +3981,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_338 = reinterpret_cast<const unsigned*>(packed_15);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(aqk_out + rbase * 64)), "r"(_raw_stv8_338[0]), "r"(_raw_stv8_338[1]), "r"(_raw_stv8_338[2]), "r"(_raw_stv8_338[3]), "r"(_raw_stv8_338[4]), "r"(_raw_stv8_338[5]), "r"(_raw_stv8_338[6]), "r"(_raw_stv8_338[7]) : "memory");
+                                :: "l"((void*)(aqk_out + rbase * 64ll)), "r"(_raw_stv8_338[0]), "r"(_raw_stv8_338[1]), "r"(_raw_stv8_338[2]), "r"(_raw_stv8_338[3]), "r"(_raw_stv8_338[4]), "r"(_raw_stv8_338[5]), "r"(_raw_stv8_338[6]), "r"(_raw_stv8_338[7]) : "memory");
                         }
                         unsigned int packed_16[8];
                         #pragma unroll
@@ -4028,7 +4028,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_339 = reinterpret_cast<const unsigned*>(packed_16);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(aqk_out + (rbase * 64 + 16))), "r"(_raw_stv8_339[0]), "r"(_raw_stv8_339[1]), "r"(_raw_stv8_339[2]), "r"(_raw_stv8_339[3]), "r"(_raw_stv8_339[4]), "r"(_raw_stv8_339[5]), "r"(_raw_stv8_339[6]), "r"(_raw_stv8_339[7]) : "memory");
+                                :: "l"((void*)(aqk_out + (rbase * 64ll + 16ll))), "r"(_raw_stv8_339[0]), "r"(_raw_stv8_339[1]), "r"(_raw_stv8_339[2]), "r"(_raw_stv8_339[3]), "r"(_raw_stv8_339[4]), "r"(_raw_stv8_339[5]), "r"(_raw_stv8_339[6]), "r"(_raw_stv8_339[7]) : "memory");
                         }
                         unsigned int packed_17[8];
                         #pragma unroll
@@ -4075,7 +4075,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_340 = reinterpret_cast<const unsigned*>(packed_17);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(aqk_out + (rbase * 64 + 32))), "r"(_raw_stv8_340[0]), "r"(_raw_stv8_340[1]), "r"(_raw_stv8_340[2]), "r"(_raw_stv8_340[3]), "r"(_raw_stv8_340[4]), "r"(_raw_stv8_340[5]), "r"(_raw_stv8_340[6]), "r"(_raw_stv8_340[7]) : "memory");
+                                :: "l"((void*)(aqk_out + (rbase * 64ll + 32ll))), "r"(_raw_stv8_340[0]), "r"(_raw_stv8_340[1]), "r"(_raw_stv8_340[2]), "r"(_raw_stv8_340[3]), "r"(_raw_stv8_340[4]), "r"(_raw_stv8_340[5]), "r"(_raw_stv8_340[6]), "r"(_raw_stv8_340[7]) : "memory");
                         }
                         unsigned int packed_18[8];
                         #pragma unroll
@@ -4122,7 +4122,7 @@ kernel_cake_gdn_train_195b67aef14b675e26d5(const __grid_constant__ CUtensorMap q
                             const unsigned* _raw_stv8_341 = reinterpret_cast<const unsigned*>(packed_18);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(aqk_out + (rbase * 64 + 48))), "r"(_raw_stv8_341[0]), "r"(_raw_stv8_341[1]), "r"(_raw_stv8_341[2]), "r"(_raw_stv8_341[3]), "r"(_raw_stv8_341[4]), "r"(_raw_stv8_341[5]), "r"(_raw_stv8_341[6]), "r"(_raw_stv8_341[7]) : "memory");
+                                :: "l"((void*)(aqk_out + (rbase * 64ll + 48ll))), "r"(_raw_stv8_341[0]), "r"(_raw_stv8_341[1]), "r"(_raw_stv8_341[2]), "r"(_raw_stv8_341[3]), "r"(_raw_stv8_341[4]), "r"(_raw_stv8_341[5]), "r"(_raw_stv8_341[6]), "r"(_raw_stv8_341[7]) : "memory");
                         }
                         *(reinterpret_cast<float*>(g_cum + rbase) + (0)) = 0.0f;
                         *(reinterpret_cast<float*>(rowscale + rbase) + (0)) = 0.0f;

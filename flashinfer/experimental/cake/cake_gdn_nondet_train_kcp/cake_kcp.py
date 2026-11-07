@@ -223,8 +223,8 @@ TART_MODULE_OF = {
     "fwd_prep": "gdn_chunk_det_train_fwd_prep_v1",
     "kcp_fwdh_offset": "gdn_chunk_det_fwdh_v1_kcp",
     "kcp_fwdh_tape": "gdn_chunk_det_fwdh_v1_kcp",
-    "kcp_fwdh_out": "gdn_chunk_fwdh_out_v1_kcp",  # det-neutral: no det twin ships it yet
-    "kcp_fwdh_out_tape": "gdn_chunk_fwdh_out_tape_v1_kcp",  # det-neutral: no det twin ships it yet
+    "kcp_fwdh_out": "gdn_chunk_fwdh_out_v2_kcp",  # non-deterministic only: no det twin ships it
+    "kcp_fwdh_out_tape": "gdn_chunk_fwdh_out_tape_v2_kcp",  # non-deterministic only: no det twin ships it
     "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_v1_kcp",
     "kcp_affine_merge": "kda_chunk_kcp_affine_merge_fp32_v1",
     "fwd_o": "gdn_chunk_det_train_fwd_o_v1",

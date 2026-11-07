@@ -106,8 +106,8 @@ TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # omitted one, so these pairs are frozen together with the kernels' build signatures.  The kernel modules are, so
 # far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
 # of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
-# its row here).  The output walks' modules are det-neutral (``gdn_chunk_fwdh_out_v1_kcp``,
-# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them; the light replay's module
+# its row here).  The output walks' modules are this package's own (``gdn_chunk_fwdh_out_v2_kcp``,
+# ``gdn_chunk_fwdh_out_tape_v2_kcp``) and no det twin ships them; the light replay's module
 # (``gdn_chunk_train_fwd_prep_replay_l2n_v1``) is this package's own, with no det twin.
 IDENTITIES = {
     "fwd_prep": (
@@ -130,9 +130,9 @@ IDENTITIES = {
         f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
-    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v2_kcp", {}),
     "kcp_fwdh_out_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v2_kcp",
         {"vh": 64},
     ),
     "kcp_transfer_walk": (
@@ -203,7 +203,7 @@ IDENTITIES = {
 }
 # The tape-and-output walk: the output walk's kernel family under its own module (records named as the output walk's).
 _FWDH_OUT_TAPE_MODULE = IDENTITIES["kcp_fwdh_out"][0].replace(
-    ".gdn_chunk_fwdh_out_v1_kcp", ".gdn_chunk_fwdh_out_tape_v1_kcp"
+    ".gdn_chunk_fwdh_out_v2_kcp", ".gdn_chunk_fwdh_out_tape_v2_kcp"
 )
 IDENTITIES["kcp_fwdh_out_tape"] = (_FWDH_OUT_TAPE_MODULE, {})
 IDENTITIES["kcp_fwdh_out_tape_vh64"] = (_FWDH_OUT_TAPE_MODULE, {"vh": 64})
