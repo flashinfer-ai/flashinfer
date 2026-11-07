@@ -82,6 +82,76 @@ def validate_metadata(
     return AttentionMetadata(*values)
 
 
+_BATCH_INVARIANT_MODELS = frozenset(
+    {policy._MODEL_TYPE_DSV3_2, policy._MODEL_TYPE_GLM_NSA}
+)
+
+
+def _resolve_batch_invariant(
+    metadata: AttentionMetadata,
+    device: torch.device,
+    precision: str,
+    q_len_per_request: int,
+) -> ExecutionPlan:
+    """Decode plan whose chunking ignores the call's total token count.
+
+    The default route keys both the decode/prefill choice and chunks_per_block
+    on ``metadata.tokens`` (profiles, analytical ``select_cpb`` and the C++
+    wave heuristic all do), so a row's split/merge order changes with the
+    other rows in the call. Here the variant is always decode and the cpb is
+    the C++ wave heuristic evaluated for one request of ``q_len_per_request``
+    tokens, which is what that request alone gets today when no calibration
+    store is loaded. Calibration state is deliberately not consulted: it
+    differs across processes and hosts and would make the split depend on
+    which profile happened to be loaded.
+
+    ``q_len_per_request`` is clamped to the decode cutoff so a long request
+    reuses the 64-token geometry. Unclamped, the heuristic falls back to
+    cpb=1 (the finest split) once even one split per row exceeds three
+    waves, which is the most scratch and merge traffic for no benefit.
+    """
+    m = metadata
+    if m.model not in _BATCH_INVARIANT_MODELS:
+        raise ValueError(
+            "batch_invariant=True supports the FP8 DSv3.2 and GLM-NSA sparse-MLA "
+            f"formats only, got {policy._MODEL_TYPE_TO_FAMILY[m.model]}"
+        )
+    if m.extra_topk:
+        raise ValueError("batch_invariant=True does not support an extra KV segment")
+    if m.tokens > policy._DECODE_MAX_TOKENS:
+        raise AssertionError(
+            f"batch-invariant launches carry at most {policy._DECODE_MAX_TOKENS} "
+            f"tokens, got {m.tokens}"
+        )
+    sm, shared = device_caps(device)
+    from ._execution import metadata_candidates
+
+    if int(policy.KernelVariant.DECODE_SPLITK) not in metadata_candidates(
+        m, precision, sm, shared
+    ):
+        raise ValueError(
+            "batch_invariant=True requires the sparse-MLA decode kernel, which "
+            f"does not serve heads={m.heads}, topk={m.topk}, "
+            f"page_size={m.page_size}"
+        )
+    reference = resolve_attention(
+        **m._replace(
+            tokens=min(q_len_per_request, policy._DECODE_MAX_TOKENS), variant=0
+        )._asdict(),
+        precision=precision,
+        cpb=0,
+        sm_count=sm,
+        max_shared_bytes=shared,
+    )
+    return resolve_attention(
+        **m._replace(variant=0)._asdict(),
+        precision=precision,
+        cpb=int(reference.inspect()["cpb"]),
+        sm_count=sm,
+        max_shared_bytes=shared,
+    )
+
+
 def resolve_execution(
     metadata: AttentionMetadata,
     device: torch.device,
@@ -89,8 +159,13 @@ def resolve_execution(
     is_dsv4_nvfp4: bool,
     preference: int,
     decode_only: bool = False,
+    batch_invariant_q_len: int = 0,
 ) -> ExecutionPlan:
     m = metadata
+    if batch_invariant_q_len:
+        if is_dsv4_nvfp4:
+            raise ValueError("batch_invariant=True does not support NVFP4 KV")
+        return _resolve_batch_invariant(m, device, precision, batch_invariant_q_len)
     if is_dsv4_nvfp4:
         from ._dsv4_nvfp4_policy import (
             plan_nvfp4_sparse_mla_sm120,
@@ -261,9 +336,16 @@ def prepare(
     caller_lse=False,
     current=None,
     decode_only=False,
+    batch_invariant_q_len=0,
 ):
     plan = resolve_execution(
-        metadata, device, precision, is_dsv4_nvfp4, preference, decode_only
+        metadata,
+        device,
+        precision,
+        is_dsv4_nvfp4,
+        preference,
+        decode_only,
+        batch_invariant_q_len,
     )
     workspace = tuple(
         (tuple(shape), getattr(torch, str(dtype)), int(size), int(alignment))
@@ -491,6 +573,7 @@ def _functional_plan(
     preference=0,
     value_dim=0,
     decode_only=False,
+    batch_invariant_q_len=0,
 ):
     q = tensors[0]
     key = (
@@ -500,10 +583,14 @@ def _functional_plan(
         preference,
         value_dim,
         decode_only,
+        batch_invariant_q_len,
         tuple(tensor_signature(x) for x in tensors),
     )
     capturing = torch.cuda.is_current_stream_capturing()
-    if not capturing:
+    # A batch-invariant plan reads no calibration state, so a store refresh,
+    # a calibration epoch change or tuning mode never rebuilds it.
+    calibrated = not batch_invariant_q_len
+    if not capturing and calibrated:
         calibration.refresh_store()
     current = _functional_plans.get(key)
     if capturing:
@@ -511,10 +598,12 @@ def _functional_plan(
             raise ValueError(
                 "warm up functional attention metadata before CUDA graph capture"
             )
-    elif (
-        current is None
-        or current.epoch != calibration._constants_version
-        or tuning_enabled(is_dsv4_nvfp4)
+    elif current is None or (
+        calibrated
+        and (
+            current.epoch != calibration._constants_version
+            or tuning_enabled(is_dsv4_nvfp4)
+        )
     ):
         m = validate_metadata(
             *tensors,
@@ -535,6 +624,7 @@ def _functional_plan(
             caller_lse=True,
             current=current,
             decode_only=decode_only,
+            batch_invariant_q_len=batch_invariant_q_len,
         )
         _functional_plans[key] = current
     return current
@@ -617,7 +707,7 @@ def caller_run(
     )
 
 
-def functional_run(
+def _functional_launch(
     q,
     cache,
     indices,
@@ -625,23 +715,18 @@ def functional_run(
     workspace,
     scale,
     *,
-    lengths=None,
-    sink=None,
-    extra=None,
-    extra_indices=None,
-    extra_lengths=None,
-    lse=None,
-    kv_scale_format="auto",
-    is_dsv4_nvfp4=False,
-    extra_fp4=False,
-    lse_scale=1.0,
+    lengths,
+    sink,
+    extra,
+    extra_indices,
+    extra_lengths,
+    lse,
+    model,
+    is_dsv4_nvfp4,
+    extra_fp4,
+    lse_scale,
+    batch_invariant_q_len=0,
 ):
-    from ._execution import check_inline_scale_caches
-    from ._execution import resolve_model_type as _resolve_model_type
-
-    if not is_dsv4_nvfp4:
-        check_inline_scale_caches(kv_scale_format, cache, extra, extra_fp4)
-    model = 1 if is_dsv4_nvfp4 else _resolve_model_type(q.shape[-1], kv_scale_format)
     tensors = (
         q,
         cache,
@@ -656,7 +741,13 @@ def functional_run(
         None,
         None,
     )
-    current = _functional_plan(tensors, model, is_dsv4_nvfp4, extra_fp4)
+    current = _functional_plan(
+        tensors,
+        model,
+        is_dsv4_nvfp4,
+        extra_fp4,
+        batch_invariant_q_len=batch_invariant_q_len,
+    )
     capturing = torch.cuda.is_current_stream_capturing()
     requirements = current.workspace[:2] if lse is not None else current.workspace
     views, offset = [], 0
@@ -693,3 +784,74 @@ def functional_run(
         lse_scale,
     )
     return result
+
+
+def functional_run(
+    q,
+    cache,
+    indices,
+    output,
+    workspace,
+    scale,
+    *,
+    lengths=None,
+    sink=None,
+    extra=None,
+    extra_indices=None,
+    extra_lengths=None,
+    lse=None,
+    kv_scale_format="auto",
+    is_dsv4_nvfp4=False,
+    extra_fp4=False,
+    lse_scale=1.0,
+    batch_invariant_q_len=0,
+):
+    """Run one functional sparse-MLA call over flattened ``[T, H, D]`` rows.
+
+    A positive ``batch_invariant_q_len`` selects the batch-invariant route:
+    every row goes through the decode kernel with one cpb derived from that
+    per-request query length (see :func:`_resolve_batch_invariant`). Calls
+    above the 64-token decode cutoff are split into consecutive launches that
+    share the cpb and reuse the same scratch; with a fixed cpb rows are
+    independent, so the launch boundaries do not change any row's result. The
+    batch-invariant route returns ``lse`` (``None`` when the caller passed
+    none) instead of a workspace view that a later launch would overwrite.
+    """
+    from ._execution import check_inline_scale_caches
+    from ._execution import resolve_model_type as _resolve_model_type
+
+    if not is_dsv4_nvfp4:
+        check_inline_scale_caches(kv_scale_format, cache, extra, extra_fp4)
+    model = 1 if is_dsv4_nvfp4 else _resolve_model_type(q.shape[-1], kv_scale_format)
+    launch = functools.partial(
+        _functional_launch,
+        cache=cache,
+        workspace=workspace,
+        scale=scale,
+        sink=sink,
+        extra=extra,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+        model=model,
+        is_dsv4_nvfp4=is_dsv4_nvfp4,
+        extra_fp4=extra_fp4,
+        lse_scale=lse_scale,
+    )
+    if not batch_invariant_q_len:
+        return launch(q=q, indices=indices, output=output, lengths=lengths, lse=lse)
+    if is_dsv4_nvfp4 or extra is not None:
+        raise ValueError(
+            "batch_invariant=True supports a single FP8 DSv3.2/GLM-NSA KV segment"
+        )
+    step = policy._DECODE_MAX_TOKENS
+    for begin in range(0, q.shape[0], step):
+        rows = slice(begin, begin + step)
+        launch(
+            q=q[rows],
+            indices=indices[rows],
+            output=output[rows],
+            lengths=None if lengths is None else lengths[rows],
+            lse=None if lse is None else lse[rows],
+            batch_invariant_q_len=batch_invariant_q_len,
+        )
+    return None if lse is None else lse[: q.shape[0], : q.shape[1]]

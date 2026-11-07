@@ -1904,3 +1904,22 @@ def test_gdn_mtp_replayssm_fi_trace():
     _check_defn(defn, "gdn", "gated_delta_rule_mtp")
     for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
         assert defn["outputs"][name]["shape"] == defn["inputs"][name]["shape"]
+
+
+def test_mla_trace_dispatch_rejects_batch_invariant():
+    """The sparse MLA definition cannot carry the batch-invariant contract."""
+    from flashinfer.trace.templates.attention import (
+        trtllm_batch_decode_mla_sparse_trace,
+        trtllm_batch_decode_mla_trace_dispatch,
+    )
+
+    with pytest.raises(NotImplementedError, match="batch_invariant"):
+        trtllm_batch_decode_mla_trace_dispatch(
+            sparse_mla_top_k=2048, batch_invariant=True
+        )
+    assert (
+        trtllm_batch_decode_mla_trace_dispatch(
+            sparse_mla_top_k=2048, batch_invariant=False
+        )
+        is trtllm_batch_decode_mla_sparse_trace
+    )

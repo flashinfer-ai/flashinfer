@@ -370,6 +370,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     ] = "fp8",
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -404,6 +405,15 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     )
     primary_segment = segments[0]
     extra_segment = segments[1] if len(segments) > 1 else None
+    if batch_invariant and (
+        backend != "sparse" or kv_cache_format != "fp8" or extra_segment is not None
+    ):
+        raise ValueError(
+            "batch_invariant=True supports backend='sparse' with a single FP8 "
+            f"KV segment, got backend={backend!r}, "
+            f"kv_cache_format={kv_cache_format!r}, "
+            f"segments={len(segments)}"
+        )
 
     query_flat = _sparse_mla_reshape(
         query, (batch_size * q_len_per_request, num_heads, head_dim), "query"
@@ -510,6 +520,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
         is_dsv4_nvfp4=(kv_cache_format == "nvfp4"),
         extra_fp4=kv_cache_format in _DSV41_FP4_CA_KV_CACHE_FORMATS,
         lse_scale=lse_scale,
+        batch_invariant_q_len=q_len_per_request if batch_invariant else 0,
     )
 
     if return_lse:
@@ -619,6 +630,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
     return_lse: bool,
     lse_scale: float,
     kv_scale_format: str,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     del qk_nope_head_dim
     if sparse_mla_top_k <= 0:
@@ -656,6 +668,11 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
             f"kv_lora_rank={kv_lora_rank}, "
             f"qk_rope_head_dim={qk_rope_head_dim}, query dim={query.size(-1)}, "
             f"kv_scale_format={kv_scale_format!r}"
+        )
+    if batch_invariant and glm53_nope:
+        raise ValueError(
+            "batch_invariant=True supports the DSv3.2/GLM-NSA 512+64 layout "
+            "only, not GLM-5.3 native NoPE"
         )
     if workspace_buffer.device != query.device:
         raise ValueError(
@@ -703,6 +720,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
         return_lse=return_lse,
         lse_scale=lse_scale,
         kv_scale_format=kv_scale_format,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -3554,6 +3572,7 @@ def _mla_with_kv_cache_impl(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Execute MLA decode or prefill through the selected backend:
     TRTLLM-GEN, CuteDSL, XQA, Cake, or SM120/SM121 sparse kernels.
@@ -3778,6 +3797,31 @@ def _mla_with_kv_cache_impl(
     causal_seqlens_kv_global : Optional[torch.Tensor] = None
         Contiguous CUDA int32 tensor ``[batch_size]`` containing the global
         exclusive causal bound for the newest query token. Required with DCP.
+    batch_invariant : bool = False
+        Make each output row independent of the other rows in the call.
+        Supported only by the SM120/SM121 ``sparse`` backend with FP8
+        DSv3.2 or GLM-NSA KV (``qk_rope_head_dim=64``); other backends and
+        formats raise :class:`ValueError`.
+
+        By default the sparse backend picks the decode or prefill kernel and
+        the decode KV split (``chunks_per_block``) from the call's total token
+        count ``batch_size * q_len_per_request``, so a request's output can
+        change when other requests join the call. With ``batch_invariant=True``
+        every row uses the decode kernel and one split derived only from
+        ``q_len_per_request`` (``query.shape[1]``), the head count, top-k and
+        the device SM count. Calls above 64 total tokens run as several decode
+        launches with that split. Configuration profiles and calibration are
+        not consulted.
+
+        The guarantee is bitwise: a row's output depends on its own query,
+        KV cache, indices and ``q_len_per_request``, not on ``batch_size`` or
+        on the content of other rows. A request alone keeps the output of the
+        default route as long as it runs the decode kernel without a loaded
+        calibration store. The same token submitted with a different
+        ``q_len_per_request`` (e.g. ``[N, 1]`` instead of ``[1, N]`` rows) may
+        produce a different, equally deterministic result. Large calls trade
+        throughput for this guarantee because they no longer use the prefill
+        kernel.
 
     Note
     ----
@@ -3905,6 +3949,12 @@ def _mla_with_kv_cache_impl(
             resolved_backend = "sparse"
         elif cc[0] != 10:
             resolved_backend = "xqa"
+
+    if batch_invariant and resolved_backend != "sparse":
+        raise ValueError(
+            "batch_invariant=True is only supported by the SM120/SM121 sparse "
+            f"backend, got backend={resolved_backend!r}"
+        )
 
     # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
     # active top-k length; the SM120 sparse backend bounds each row by its
@@ -4499,6 +4549,7 @@ def _mla_with_kv_cache_impl(
             return_lse=return_lse,
             lse_scale=lse_scale,
             kv_scale_format=kv_scale_format,
+            batch_invariant=batch_invariant,
         )
 
     raise AssertionError(f"Unresolved MLA route: {resolved_backend}")
@@ -4539,6 +4590,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_mla_with_kv_cache_impl` for parameter documentation."""
     return _mla_with_kv_cache_impl(
@@ -4575,6 +4627,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -5211,6 +5264,7 @@ def trtllm_prefill_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run MLA with decode-compatible semantics for prefill callers.
 
@@ -5264,6 +5318,7 @@ def trtllm_prefill_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        batch_invariant=batch_invariant,
     )
 
 
