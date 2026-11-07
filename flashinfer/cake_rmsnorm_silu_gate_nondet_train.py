@@ -65,11 +65,11 @@ subnormal (``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite
 ``NaN`` where the infinite term is in the last row and the last row block
 is partial (its padding rows reread that row and multiply it by zero), as
 in the deterministic backward.  On SM100 from 800 rows per SM and on SM103
-from 700, up to 12000 (from 12000 the backward above), each thread keeps
-its folded FP32 runs,
-and each CTA its column sums over its row groups, as FP32 two-sum pairs
-(a sum and its error term) instead of FP64, and converts a column's pair
-to FP64 once for the atomic add.  The error that fold itself adds to a
+from 700, up to 12000 (from 12000 the backward above), and on SM107 from 1024 up
+to 3200 (from 3200 the backward above), each thread keeps its folded FP32 runs,
+and each CTA its column sums over its row groups, as FP32 two-sum pairs (a sum
+and its error term) instead of FP64, and converts a column's pair to FP64 once
+for the atomic add.  The error that fold itself adds to a
 CTA's column sum ``S`` of its FP32 runs is at most
 ``C(k) * 2^-48 * A + 2^-53 * |S|`` (``k`` the folds of a thread, ``A``
 the sum of the runs' magnitudes, ``C(k) = (k - 1)(k - 2) + 16 (k + 14)``;
@@ -142,9 +142,9 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's FP32 partial buffer: each backward refuses the other package's
 buffer (``ValueError``).  Calls without a workspace use one 4104-byte buffer
-per device, stream and backward kernel (one per weight-gradient dtype, two
-from 1024 rows per SM on SM107, two from 800 rows per SM on SM100 and from 700
-on SM103, and three from 12000 on both), kept for later calls; the
+per device, stream and backward kernel (one per weight-gradient dtype, two from
+800 rows per SM on SM100, from 700 on SM103 and from 1024 on SM107, and three
+from 12000 on SM100 and SM103 and from 3200 on SM107), kept for later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -156,12 +156,12 @@ B200, sm_100a, with the 20736-byte CTAs and on R200, sm_107a, with the
 20736-byte and the 10496-byte CTAs): above 256 rows, and on SM107 below 1024
 rows per SM, each CTA of the non-deterministic backward
 needs 20736 bytes of dynamic shared memory (an SM of sm_100a holds four such
-CTAs; from 1024 rows per SM on SM107 each CTA of the long backward needs 10496
-bytes), and an SM serves it only once it can switch to a shared-memory
-carveout that holds it.  A kernel on another stream whose CTAs hold every SM
-with a small carveout (for example a long-running kernel with little or no
-shared memory and the default carveout) therefore delays that backward's start
-until the kernel exits.  Setting
+CTAs; from 1024 rows per SM on SM107 each CTA of the mid and the long backward
+needs 10496 bytes), and an SM serves it only once it can switch to a
+shared-memory carveout that holds it.  A kernel on another stream whose CTAs
+hold every SM with a small carveout (for example a long-running kernel with
+little or no shared memory and the default carveout) therefore delays that
+backward's start until the kernel exits.  Setting
 ``cudaFuncAttributePreferredSharedMemoryCarveout`` to
 ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
 large dynamic shared-memory allocation, lets the backward start beside it.  The
@@ -436,13 +436,14 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column while the gate, the
     terms and the sums are FP32 normal numbers or zero (subnormal values
     and infinities: see the module documentation).  On SM100 from 800 rows
-    per SM and on SM103 from 700, up to 12000, the runs are folded, and a
-    CTA's column sums kept, as FP32 two-sum pairs, converted to FP64 once
-    per column (that fold's own error bound and its finite-overflow case:
-    see the module documentation).  Up to 256 rows one cluster of 16 CTAs
-    runs instead: the CTAs' FP32 partials of a column are added in a fixed
-    order in FP64, so ``dw`` is the same bits on every call (within the
-    same bound), and the workspace is not used.  The deterministic backward is
+    per SM and on SM103 from 700, up to 12000, and on SM107 from 1024 up to
+    3200, the runs are folded, and a CTA's column sums kept, as FP32 two-sum
+    pairs, converted to FP64 once per column (that fold's own error bound and
+    its finite-overflow case: see the module documentation).  Up to 256 rows one
+    cluster of 16 CTAs runs instead: the CTAs' FP32 partials of a column are
+    added in a fixed order in FP64, so ``dw`` is the same bits on every call
+    (within the same bound), and the workspace is not used.  The deterministic
+    backward is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`
     (``dw`` accumulated in FP32 per CTA chunk and in FP64 over the chunks in an
     order fixed by the row count).
