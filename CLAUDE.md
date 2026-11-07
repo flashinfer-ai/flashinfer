@@ -954,6 +954,7 @@ These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in 
 | `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
 | `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `_DUMP_MAX_SIZE_GB` in `flashinfer/api_logging.py`). |
 | `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
+| `FLASHINFER_DUMP_GRAPH_SNAPSHOTS` | `0` | `1` captures pre-call snapshots for named mutated inputs and their aliases, and post-call outputs, using graph device-copy nodes. Read once at import; adds device buffers and replay cost. See `docs/logging.rst`. |
 
 ##### Trace Capture
 

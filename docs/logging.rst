@@ -330,6 +330,65 @@ replay, so level-10 graph dumping is intended for short debugging runs.
 The metadata file records ``execution_status: "graph_capture_pending_flush"``
 for entries that have not yet been flushed.
 
+Capturing in-place inputs and outputs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The default reference-based path reads tensors after the graph finishes. For an
+in-place API, those values include the API's mutations. To record its pre-call
+inputs, set ``FLASHINFER_DUMP_GRAPH_SNAPSHOTS=1`` before importing FlashInfer,
+together with ``FLASHINFER_LOGLEVEL=10``. This opt-in records device-to-device
+copies before APIs with named ``mutates_args`` declarations. It also snapshots
+their input aliases and records returned tensors and mutated arguments after
+the call, so later graph operations cannot overwrite the saved outputs.
+The copies run again on every replay; CPU transfers and file writes remain
+outside capture.
+
+Public wrappers that delegate to an internal custom op must declare mutations
+at the logged boundary, using ``@flashinfer_api(mutates_args=("q", "k"))``.
+The internal custom op's declaration alone does not describe its caller's
+arguments. The public in-place RoPE APIs carry these declarations; arbitrary
+undeclared mutations cannot be inferred by the logger. The stateful APIs
+``append_paged_kv_cache``, ``rope_quantize_fp8_append_paged_kv_cache``,
+``gated_delta_rule_decode*``, ``gated_delta_rule_mtp`` and
+``selective_state_update`` still lack these declarations and are tracked as a
+follow-up in issue #7934. Until then, a snapshot of such a call records
+post-call state and must not be treated as a verified pre-call replay.
+
+For APIs returning ``None``, the mutated tensors are saved under
+``mutated_input__<input-key>`` in ``outputs.pt``. ``replay_from_dump(...,
+run=True, compare_outputs=True)`` compares these tensors after executing the
+reconstructed call, as well as any returned tensors. With this flag enabled,
+eager dumps also save and
+compare named mutated arguments, allowing eager/graph replay comparisons.
+Nested returned tensors use the same keys for dumping and comparison. An
+incomplete output dump (including one rejected by the size limit) reports
+``comparison_match=None`` and ``comparison_error="Output dump is incomplete"``;
+it cannot establish a match. A completed call with no tensor outputs and no
+declared mutated arguments can still compare successfully without an output
+tensor file. If an in-place API returns ``None`` and graph snapshots were not
+enabled before capture, there is no post-call state to compare; replay reports
+``comparison_match=None`` with a distinct "No post-call state recorded" error.
+Enable ``FLASHINFER_DUMP_GRAPH_SNAPSHOTS=1`` to record and compare the mutated
+arguments.
+
+Snapshots support strided, same-dtype storage aliases. Replay restores shared
+storage, repeated tensor references, shapes, strides and relative offsets.
+Distinct tensor objects with identical view geometry remain distinct. Older dumps
+without object identity metadata can restore storage aliases but cannot recover
+which references were the same tensor object. Only the span used by the
+participating views is retained; absolute storage offsets may therefore be
+rebased. Metadata records ``original_storage_offset`` for provenance. Mixed-dtype
+storage aliases, views whose non-overlap cannot be proven from their strides,
+conjugate/negative views, and unnamed mutation declarations are rejected with a dump error rather than
+producing an incorrect snapshot. Read-only inputs outside a mutated storage
+group retain the default deferred-reference behavior.
+Gaps between read-only alias views are zeroed during CPU materialization,
+without adding device copy nodes during capture.
+
+This mode adds persistent device buffers and copy nodes to the captured graph.
+Use dump filters and size limits to bound it, and clear the registry when the
+graph is no longer needed. It is intended for short reproducibility runs.
+
 Process IDs for Multi-GPU Environments
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
