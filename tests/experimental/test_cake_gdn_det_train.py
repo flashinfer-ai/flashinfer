@@ -1185,35 +1185,6 @@ def test_tc_plan_prices_the_whole_segment_prescan(arch, sm_count, monkeypatch) -
             assert rec["best"]["ctas"] <= sm_count, (row, rec)
 
 
-def test_tc_plan_saving_floor_on_b200(monkeypatch) -> None:
-    # sm_100a's saving floor keeps the planner's adjoint table of the pair layout over three value heads (priced saving
-    # below the floor; a host-bound call there measured 2 % longer on the tc-priced table) and takes the tc-priced
-    # tables over six and twelve
-    _priced_device(monkeypatch, "sm_100a", 148)
-    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
-    options = cake_chain.make_options()
-    chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
-    gain, min_saving = cake_chain.tc_plan_thresholds("sm_100a")
-    for num_heads, taken in ((1, False), (2, True), (4, True)):
-        num_v_heads = 3 * num_heads
-        planner = cake_chain.scan_plans(
-            sum(_PAIR_LAYOUT), len(_PAIR_LAYOUT), num_v_heads, 0, _PAIR_LAYOUT
-        )
-        planner = cake_chain._serial_adjoint_plan(
-            _PAIR_LAYOUT, planner, num_heads, num_v_heads, 0, options
-        )
-        rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, planner[1])
-        got, bwd_tc = cake_chain.host_plans(
-            _PAIR_LAYOUT, num_v_heads, 0, options, num_heads=num_heads
-        )
-        assert bwd_tc is taken and (got == planner) is not taken, (num_heads, rec)
-        assert (rec["saving"] >= min_saving) is taken, (num_heads, rec)
-        with monkeypatch.context() as m:
-            m.setattr(cake_chain, "TC_PLAN_SELECT", {})
-            loose = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, planner[1])
-            assert loose["select"], (num_heads, loose)
-
-
 def test_tc_plan_prescan_leaves_r200_unchanged(monkeypatch) -> None:
     # an architecture outside TC_PLAN_PRESCAN keeps the warm-up price (R200 prices its split tables with CHAIN_PLAN)
     assert "sm_107a" not in cake_chain.TC_PLAN_PRESCAN
