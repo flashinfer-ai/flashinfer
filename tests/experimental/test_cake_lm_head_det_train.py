@@ -12564,6 +12564,223 @@ def test_device_checkpointed_logprob_step_launches_the_gradient_gemms_once(glm_w
         assert _placement_bits(run[1], plain[1]), kind
 
 
+@contextlib.contextmanager
+def _logprob_forwards():
+    """The log-probability forwards (``forward_logprob`` / ``forward_logprob_temperature``) the main module's autograd
+    entries run, in order."""
+    seen: list = []
+    originals = (cake_backend.forward_logprob, cake_backend.forward_logprob_temperature)
+
+    def recording(original, name):
+        def forward(*args, **kwargs):
+            seen.append(name)
+            return original(*args, **kwargs)
+
+        return forward
+
+    cake_backend.forward_logprob = recording(originals[0], "logprob")
+    cake_backend.forward_logprob_temperature = recording(originals[1], "temperature")
+    try:
+        yield seen
+    finally:
+        cake_backend.forward_logprob, cake_backend.forward_logprob_temperature = (
+            originals
+        )
+
+
+def _logprob_temperature(inp, form):
+    if form is None:
+        return None
+    if form == "scalar":
+        return 0.7
+    return make_temperature(inp.T, "hetero", seed=inp.seed, device=inp.X.device)
+
+
+def _logprob_step(inp, kind, form, *, C=64, between=None, **kw):
+    """One step of the log-probability entry (``form``: no temperature, a scalar or a per-token one) under ``kind``;
+    ``between(X, W, logp)`` runs after the forward, before the backward.  Returns ``logp`` / ``dX`` / ``dW``."""
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    tau = _logprob_temperature(inp, form)
+    logps = []
+
+    def head(a, b):
+        if tau is None:
+            logp = cake_backend.cake_lm_head_det_train_logprob(
+                a, b, inp.labels, chunk_size=C, **kw
+            )
+        else:
+            logp = cake_backend.cake_lm_head_det_train_logprob_temperature(
+                a, b, inp.labels, chunk_size=C, temperature=tau, **kw
+            )
+        logps.append(logp)
+        return (logp * inp.dlogp).sum()
+
+    loss = _checkpointed(kind, head, X, W)
+    if between is not None:
+        between(X, W, logps[0])
+    loss.backward()
+    if X.is_cuda:
+        torch.cuda.synchronize()
+    return dict(logp=logps[0].detach(), dX=X.grad, dW=W.grad)
+
+
+# Forwards a checkpointed log-probability step runs.  The recomputation takes the checkpointed call's row results
+# when the checkpoint's hooks are innermost and it gets the same input tensors; the reentrant first pass has no graph
+# (nothing kept), ``copies_outside`` hands the recomputation copies and ``offload_inside`` puts other hooks innermost
+# (each runs the forward again).  ``nested`` and ``offload_outside`` (the same tensors on the CPU only) run one or two.
+_LOGPROB_FORWARDS = dict(
+    reentrant=2,
+    nonreentrant=1,
+    nonreentrant_no_early_stop=1,
+    nonreentrant_no_determinism_check=1,
+    copies_outside=2,
+    offload_inside=2,
+)
+
+
+@pytest.mark.parametrize("form", [None, "scalar", "tensor"])
+@pytest.mark.parametrize("kind", CHECKPOINT_KINDS)
+def test_checkpointed_logprob_step_runs_the_forward_once(kind, form):
+    """A non-reentrant checkpointed log-probability step runs the logits forward once: the recomputation takes the
+    checkpointed call's ``logp`` and row results instead of running it again.  ``logp`` / ``dX`` / ``dW`` are the
+    uncheckpointed step's bits for every checkpoint kind; ``"forward"`` placement keeps the second forward, with the
+    same bits.  No frame record is left behind."""
+    inp = _host_inputs(200, "ce")
+    plain = _logprob_step(inp, "plain", form, backend="reference")
+    with _logprob_forwards() as seen:
+        run = _logprob_step(inp, kind, form, backend="reference")
+    taken = len(seen)
+    want = _LOGPROB_FORWARDS.get(kind)
+    assert taken == want if want is not None else 1 <= taken <= 2, seen
+    _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
+    if kind not in ("reentrant", "offload_inside"):
+        with _placement("forward"), _logprob_forwards() as seen:
+            again = _logprob_step(inp, kind, form, backend="reference")
+        if want is None:
+            assert len(seen) >= taken, seen
+        else:
+            assert len(seen) == 2, seen
+        _assert_step_bits(again, plain, keys=("logp", "dX", "dW"))
+    gc.collect()
+    assert len(cake_backend._LOGPROB_CHECKPOINT_CALLS) == 0
+
+
+@pytest.mark.parametrize("form", [None, "tensor"])
+@pytest.mark.parametrize("change", ["labels", "logp", "options"])
+def test_checkpointed_logprob_recomputation_runs_the_forward_after_a_change(
+    change, form
+):
+    """The recomputation runs the forward again when an input of the checkpointed call (here the labels, which the
+    checkpointed function reads from outside the region) or its kept ``logp`` changed in place after the forward, or
+    when it calls the entry with other options: ``dX`` / ``dW`` are then those of the changed call (an uncheckpointed
+    step on it), never from a stale row result."""
+    inp = _host_inputs(200, "ce")
+    if change == "options":
+        # a checkpointed function whose recomputation passes another chunk size than its first pass
+        sizes = iter((64, 32))
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        tau = _logprob_temperature(inp, form)
+
+        def head(a, b):
+            kw = dict(chunk_size=next(sizes), backend="reference")
+            if tau is not None:
+                kw["temperature"] = tau
+                entry = cake_backend.cake_lm_head_det_train_logprob_temperature
+            else:
+                entry = cake_backend.cake_lm_head_det_train_logprob
+            return (entry(a, b, inp.labels, **kw) * inp.dlogp).sum()
+
+        with _logprob_forwards() as seen:
+            torch.utils.checkpoint.checkpoint(
+                head, X, W, use_reentrant=False, determinism_check="none"
+            ).backward()
+        assert len(seen) == 2, seen
+        plain = _logprob_step(inp, "plain", form, C=32, backend="reference")
+        assert _placement_bits(X.grad, plain["dX"]) and _placement_bits(W.grad, plain["dW"])
+        return
+
+    own = replace(inp, labels=inp.labels.clone())
+    ignored = own.labels.clone()
+    ignored[: own.T // 2] = -100
+
+    def between(X, W, logp):
+        with torch.no_grad():
+            if change == "labels":
+                own.labels.copy_(ignored)
+            else:
+                logp.mul_(1.0)
+
+    with _logprob_forwards() as seen:
+        # the changed labels change the valid-row index's shape: no metadata check on the recomputation
+        run = _logprob_step(
+            own,
+            "nonreentrant_no_determinism_check",
+            form,
+            between=between,
+            backend="reference",
+        )
+    assert len(seen) == 2, seen
+    changed = own if change == "logp" else replace(inp, labels=ignored)
+    plain = _logprob_step(changed, "plain", form, backend="reference")
+    assert _placement_bits(run["dX"], plain["dX"])
+    assert _placement_bits(run["dW"], plain["dW"])
+
+
+def test_checkpointed_logprob_retained_graph_takes_the_row_results_per_backward():
+    """Two backward passes through one retained checkpointed log-probability graph: each recomputation takes the kept
+    row results (one forward in all), each pair of gradients is the uncheckpointed step's bits."""
+    inp = _host_inputs(200, "ce")
+    plain = _logprob_step(inp, "plain", None, backend="reference")
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+
+    def head(a, b):
+        logp = cake_backend.cake_lm_head_det_train_logprob(
+            a, b, inp.labels, chunk_size=64, backend="reference"
+        )
+        return (logp * inp.dlogp).sum()
+
+    with _logprob_forwards() as seen:
+        loss = torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False)
+        first = torch.autograd.grad(loss, (X, W), retain_graph=True)
+        second = torch.autograd.grad(loss, (X, W))
+    assert len(seen) == 1, seen
+    for grads in (first, second):
+        assert _placement_bits(grads[0], plain["dX"])
+        assert _placement_bits(grads[1], plain["dW"])
+
+
+def _logits_gemm_keys(launched) -> int:
+    return sum(1 for key in launched if str(key[0]).startswith("gemm_logits"))
+
+
+@pytest.mark.parametrize("form", [None, "scalar", "tensor"])
+def test_device_checkpointed_logprob_step_runs_the_logits_gemms_once(glm_weight, form):
+    """A non-reentrant (plain, selective, under a dispatch mode) checkpointed log-probability step launches the
+    uncheckpointed step's logits and gradient GEMMs, no more, and gives its bits."""
+    _require_program(entry="logprob")
+    inp = _device_inputs(12289, "ce", W=glm_weight)
+    _logprob_step(inp, "plain", form, C=4096)
+    with _launch_record() as launched:
+        plain = _logprob_step(inp, "plain", form, C=4096)
+    logits, grads = _logits_gemm_keys(launched), _gradient_gemm_keys(launched)
+    assert logits >= 8 and grads >= 5, sorted({k[0] for k in launched})
+    for kind in (
+        "nonreentrant",
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+    ):
+        with _launch_record() as launched:
+            run = _logprob_step(inp, kind, form, C=4096)
+        assert _logits_gemm_keys(launched) == logits, kind
+        assert _gradient_gemm_keys(launched) == grads, kind
+        _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
+
+
 def _region_entry(entry, inp, X, W):
     """The scalar a selective-checkpoint region test differentiates: one det entry on ``X`` / ``W``."""
     if entry in ("loss", "loss_budget"):
