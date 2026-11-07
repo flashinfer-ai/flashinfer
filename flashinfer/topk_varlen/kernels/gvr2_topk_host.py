@@ -68,6 +68,7 @@ CUDA-graph capture.
 import math
 import operator
 import threading
+import warnings
 from collections.abc import Sequence
 
 import torch
@@ -191,6 +192,30 @@ def _big_regime(b: int, R: int, n4: int) -> bool:
     rows above 64K are mixed to bad (0.5x at 75-148 rows x 256K), so both keep
     upstream's regime, as do the split slab (R > 1) and b > 148."""
     return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
+
+
+def _small_row_sample(k: int, big: bool, R: int, aim: int, hint_free: bool) -> int:
+    """The streaming slab's ``sd_en`` (varlen launcher): 0, or a row length; rows
+    of max(2k, sd_en) < n <= SCAP then take the pair sample too (rows above SCAP
+    always do).
+
+    Upstream: 1 for K > 1024 off the big regime. FlashInfer-local, hint-free
+    launches: unsampled, a hinted row thresholds at the minimum of the previous
+    step's top-k and keeps about k survivors, but a hint-free row thresholds at
+    the minimum of its own first k values and keeps nearly all n of them. A
+    launch sized for a capacity far above its rows (a CUDA graph at the serving
+    width) runs every row up to SCAP that way: 128 rows of 16K columns at 1M
+    capacity, K=512, 17.7 us unsampled vs 6.2 us sampled (B200). The sample
+    stages about ``aim`` survivors instead, so it pays once n clears that count
+    (at n <= aim it runs 3-7% slower). The SPLIT slab (R > 1) gets 0: it ranks
+    every row of up to 16384 columns, above its SCAP, with the in-kernel register
+    path (``_main_reg_vpt``), so no row the gate admits reaches it. The 512- and
+    1024-thread one-CTA slabs do the same from an envelope of ``_MAIN_REG_ENV``
+    register rows (SCAP <= their register rows), so there the threshold acts on
+    narrower launches only."""
+    if not hint_free:
+        return int(k > 1024 and not big)
+    return aim if R == 1 else 0
 
 
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
@@ -914,6 +939,121 @@ def _regclus_stage_out(num_rows: int, k: int, paged: bool) -> bool:
     return bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
 
 
+# envelope, in register-path rows, from which the one-CTA-per-row main engines
+# compile the register path in (see _main_reg_vpt)
+_MAIN_REG_ENV = 8
+
+
+def _main_reg_vpt(blk: int, split: bool, n_env: int) -> int:
+    """Widest VPT of the in-kernel register path of a decode ``main`` engine
+    (FlashInfer-local; 0 = off). A CUDA-graph launch is planned for the
+    capacity, so it streams rows far shorter than that; with the path compiled
+    in, a row of at most BLK * VPT * 4 columns runs the register family's body
+    on its CTA instead (``GvrMainKernel`` ``reg_vpt``: the VPT 2 body for rows
+    up to BLK * 8, the VPT 4 body above), as SGLang's topk_v2 picks its register
+    path per row. VPT 4 is that family's widest rung: rows up to 16384 columns
+    at 1024 threads, 8192 at 512 (the 256-thread engine's smem cannot hold the
+    window). The SPLIT engines (1024 threads, up to 16 rows, 32 at K = 2048)
+    always compile it in. On the one-CTA-per-row engines the register body's
+    code moves ptxas's allocation of the streaming loops off the uniform
+    datapath, 0.5-1.5% on long rows and up to 4.5% on ragged batches, while a
+    batch whose rows all fit runs 1.15-3.4x faster (B200). In a launch sized to
+    its rows the longest row streams and sets the time of the one-wave grid,
+    so those engines compile the path in only when the envelope n_env holds at
+    least _MAIN_REG_ENV register rows: a launch planned for a capacity. A pure
+    function of the engine tuple and the envelope (fixed per ``warmup_varlen``
+    call), so the warmup band key needs no new axis."""
+    if split and blk == 1024:
+        return 4
+    return 4 if blk in (512, 1024) and n_env >= _MAIN_REG_ENV * blk * 16 else 0
+
+
+# FlashInfer-local: the clus engines rank a row of k < n <= 8192 columns with the
+# register family's VPT 2 body on rank 0 (``GvrClusKernel`` ``reg_vpt``) instead
+# of streaming it there alone (a solo row). Measured B200, K <= 1024 presets at
+# serving capacity, 17-74 rows: such rows 1.6-1.8x faster, longer rows within
+# +0.8%, batches of rows n <= k ~60 ns slower (the body's code costs that even
+# when no row takes it). A VPT 4 body for rows up to 16384 was 11-18% slower on
+# rows <= 8192; both bodies together made ptxas spill the streaming loops.
+_CLUS_REG_VPT = 2
+
+_MAX_CLUSTERS = {}
+
+
+def _max_clusters(cs: int) -> int:
+    """Clusters of ``cs`` CTAs of one CTA per SM (the 1024-thread decode engines)
+    that the CURRENT device runs at once: CUDA's occupancy query, cached per
+    device; 0 (no cluster path, with a warning) where it is unavailable. B200:
+    74, 33 and 15 for 2, 4 and 8, since its GPCs hold 16 to 20 SMs.
+
+    The query loads a probe kernel into the calling thread's current context. A
+    thread that has made no CUDA call yet has none (a warmup thread, or a process
+    before its first allocation), so the device's primary context is made current
+    first, as the CUDA runtime does on such a thread's first call."""
+    d = torch.cuda.current_device()
+    v = _MAX_CLUSTERS.get((d, cs))
+    if v is None:
+        try:
+            from cuda.bindings import driver
+            from cutlass import utils as _cutlass_utils
+
+            err, ctx = driver.cuCtxGetCurrent()
+            if err or not int(ctx):
+                _, dev = driver.cuDeviceGet(d)
+                _, ctx = driver.cuDevicePrimaryCtxRetain(dev)
+                driver.cuCtxSetCurrent(ctx)
+            v = int(_cutlass_utils.HardwareInfo(d).get_max_active_clusters(cs))
+        except Exception as e:  # noqa: BLE001 — no occupancy query: launch without clusters
+            warnings.warn(
+                f"gvr_2: cluster occupancy query failed ({type(e).__name__}: {e}); "
+                "SPLIT launches run without clusters",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            v = 0
+        _MAX_CLUSTERS[(d, cs)] = v
+    return v
+
+
+def _split_clusters(num_rows: int, r: int) -> tuple[int, int]:
+    """(cluster size, parts per row) of a decode SPLIT launch, FlashInfer-local;
+    (0, r) launches without clusters.
+
+    A launch planned for the capacity gets rows of 16K-131K columns that one
+    CTA's registers cannot hold (the register path, ``_main_reg_vpt``) but a
+    cluster's can: route() ranks them with the clustered register family at a
+    launch sized to them (5-7 us on B200), the SPLIT slab streams them (8-11 us).
+    With clusters of ``cs`` parts, such a row runs that family's body on its first
+    cluster (``GvrMainKernel`` ``clus_cs``). The parts per row must be a multiple
+    of ``cs`` and every cluster must fit one wave, so R drops to ``cs * min(r //
+    cs, clusters per row that fit)``; the widest of 8, 4 and 2 that keeps at least
+    3/4 of route()'s ``r`` is taken (B200: 8 at 1-3 rows, then 8, 4 or 2 as the
+    remainders fall; rows of up to 131072, 65536 or 32768 columns). Fewer parts
+    cost the slab's long rows more than they gain."""
+    for cs in (8, 4, 2):
+        parts = cs * min(r // cs, _max_clusters(cs) // num_rows)
+        if 4 * parts >= 3 * r:
+            return cs, parts
+    return 0, r
+
+
+def _main_engine(num_rows, n_route, npad, k, paged):
+    """The decode ``main`` engine of a varlen launch: (tpl, R, ``get_compiled``
+    cluster kwargs, route_streaming()'s rt). SPLIT launches take the cluster plan
+    of ``_split_clusters``; U stays route()'s."""
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
+    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    r_const = plan["rt"]["R"]
+    clus = {}
+    if tpl[5] and _main_reg_vpt(tpl[0], tpl[5], n_route):
+        cs, r_const = _split_clusters(num_rows, r_const)
+        if cs:
+            # staged emit as the clustered register kernel's, and always on unpaged
+            # launches: there the scattered emit makes ptxas spill the slab loops
+            clus = dict(clus_cs=cs, clus_stage=(not paged) or _regclus_stage_out(num_rows, k, paged))
+    return tpl, r_const, clus, plan["rt"]
+
+
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
@@ -1034,6 +1174,13 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     # the sampling-ladder scalars (SMP/TGT/Q/SS2/TGT2) are dead launch slots,
     # re-derived per row in-kernel by the route_dynamic clus mirror.
     # Per-row n / short-row handling in-kernel.
+    # FlashInfer-local: solo rows (see the device family note). U comes from
+    # the envelope (U = 8 at every serving capacity), so a live row of <= one
+    # BLK * U chunk (32K columns) already ran on rank 0 alone; it now skips
+    # the cluster protocol as well. Measured B200, DSv4 Flash rows at 262,208
+    # columns, 32 / 64 rows: 12-19% faster on 1K-32K-column rows. A
+    # same-process A/B on the four K <= 1024 model shapes measured longer
+    # rows 0.1-1.7% slower at CS = 2 and at most 0.3% slower at CS = 4.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         fn = _gate_first_call(
@@ -1047,6 +1194,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=pt_smem,
                 pdl=_DECODE_PDL,
+                solo=True,
+                reg_vpt=_CLUS_REG_VPT,
                 **pg,
             )
         )
@@ -1057,12 +1206,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
-    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
-    rt = plan["rt"]
-    r_const = rt["R"]
-    # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
-    # machinery in whenever SPLIT); normalize it out of the compile key so
+    tpl, r_const, clus, rt = _main_engine(num_rows, n_route, npad, k, paged)
+    # TSHG (tpl[6]) is dead under varlen (the ctor never compiles the TSH
+    # floor into a varlen engine); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
         dev.get_compiled(
@@ -1070,26 +1216,41 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             hint_free=hint_free,
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
+            reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
+            **clus,
             **pg,
         )
     )
     big = _big_regime(num_rows, r_const, n_route >> 2)
-    aim_base = (
-        ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
-        if big
-        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
-    )
+    # FlashInfer-local: the one-CTA slabs (R == 1) aim at 7k/4, except the
+    # 1024-thread one-wave slab at K = 512, which keeps upstream's 2k (upstream:
+    # 11k/8 at K >= 1024 and 3k/2 below off the big regime, 4k at K >= 1024 on
+    # it). The first threshold is the sample's rank-TGT rung, which keeps about
+    # `aim` values; the sample reads runs of 8 adjacent values, so on real rows,
+    # whose top scores come in runs, its estimate is coarse, and at 1.375-1.5k
+    # the rung kept fewer than k values on 28 of 441 captured DSv4 / V3.2 decode
+    # rows of 8K-262K columns (up to 21% of one layer's rows). Such a row streams
+    # a second time and the one-wave batch waits for it. At 7k/4 none misses and
+    # the staged count stays under 0.6 SCAP. The one-wave slab is the plan of a
+    # launch at a wide capacity at 75-148 rows (33-148 at K = 2048), whatever
+    # its rows; at 4k it staged 2.2x the candidates for no fewer misses (B200,
+    # at 7k/4: 32K-column rows 0.81-0.89x the 4k time with the caches cold,
+    # rows of 16K-524K columns 0.76-0.99x warm). The sample, sfac n / aim
+    # values, grows 2.3x, which costs rows streamed from DRAM at 96-144 rows up
+    # to 1.5% cold and 2.7% behind a warm producer (GLM-5.2 rows of 0.87M-1M
+    # columns). At K = 512 the slab keeps 2k: 7k/4 was slower there on
+    # 131K-column and deep-layer 32K-column rows.
+    aim_base = 2 * k if big and (r_const > 1 or k < 1024) else (7 * k) // 4
     sfac = (
         (32 if r_const == 2 else (48 if k > 1024 else 16))
         if r_const > 1
         else (64 if k >= 1024 else 32)
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
-    sd_en = 1 if (k > 1024 and not big) else 0
-    # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
-    # num_rows > 15 would strand small batches in SPLIT-main without the
-    # staged floor (a distribution-dependent tail regression); the kernel
-    # gates TSH per row at runtime anyway.
+    sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
+    # TSH-floor gate: SPLIT and K only (the CUDA form also needs num_rows >
+    # 15). The varlen kernel gives the rows it admits (n4 <= 32768) a 4x
+    # denser sample in place of the floor; see GvrMainKernel's ladder.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     # slot 0 (`n`) carries the envelope: the varlen prologue clamps each row's
     # kv-derived length to it, never to the row stride npad (arena tails)
@@ -2791,14 +2952,14 @@ def warmup_varlen(
         elif plan_free["kernel"] in ("reg", "regimg"):
             ekey = ("reg", tuple(plan_free["tpl"]), _reg_stage_out(r, sms))
         else:
-            p = route_streaming(
+            tpl, r_const, clus, _ = _main_engine(
                 r,
                 max(min(n_env_c, npad_c), int(top_k) + 1),
                 npad_c,
                 int(top_k),
-                force_main=True,
+                page_shift is not None,
             )
-            ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
+            ekey = ("main", tpl[:6], r_const, tuple(sorted(clus.items())))
         if ekey not in seen_keys:
             seen_keys.add(ekey)
             rows_list.append(r)
