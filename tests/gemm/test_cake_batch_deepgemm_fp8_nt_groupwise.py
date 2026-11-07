@@ -340,7 +340,7 @@ def test_n512_k128_groups_far_above_expected_m(groups, m, full, route):
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_scale, b_scale, masked_m, 1
     )
-    if _arch() in PACKED_ARCHS:
+    if _arch() in ("sm_100a", "sm_103a"):  # the N=512, K=128 routes' architectures
         assert prepared.route == route
     else:
         assert prepared.parent == "seed_masked_bn"
