@@ -884,10 +884,13 @@ def dispatch_programs(
     1 to ``chunk_capacity(max_rows)`` chunks, each at its first and its last row count (a
     call's lever depends on ``M`` through its chunk count and the reducers' ``M * N``
     limit, which a chunk's two ends bracket). Without ``k_l`` (the one-shot workspace
-    serves any ``K_l``): every program of the route's lever keys.
+    serves any ``K_l``): every program of the route's lever keys. On an architecture
+    without levers every call runs the main program, so no chunk is enumerated.
     """
 
     main = main_program(world_size, arch, max_rows)
+    if not LEVER_DISPATCH.get(arch):
+        return (main,)
     base = route_key(world_size, arch, max_rows)
     table = ROUTES.get(arch, {})
     if k_l is None:

@@ -703,6 +703,30 @@ def test_bound_k_l_dispatch_programs_are_the_programs_of_every_row_count(
             assert set(programs) == calls | {programs[0]}
 
 
+# Architectures whose calls all run the main program (no lever table entry).
+NO_LEVER_ARCHES = [arch for arch in ARCHES if not loader.LEVER_DISPATCH.get(arch)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not NO_LEVER_ARCHES, reason="every delivered architecture has a lever"
+)
+def test_dispatch_programs_without_a_lever_is_the_main_program_only(monkeypatch):
+    def no_call(*args, **kwargs):
+        raise AssertionError("dispatch_programs enumerated a call without a lever")
+
+    monkeypatch.setattr(loader, "call_program", no_call)
+    for arch, world_size in DELIVERED:
+        if arch not in NO_LEVER_ARCHES:
+            continue
+        for capacity in _capacities(arch, world_size):
+            main = loader.main_program(world_size, arch, capacity)
+            for k_l in (None, K_L):
+                assert loader.dispatch_programs(
+                    world_size, arch, capacity, _n(arch), k_l, sm_count=132
+                ) == (main,)
+
+
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
