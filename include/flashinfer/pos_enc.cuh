@@ -1641,6 +1641,12 @@ cudaError_t BatchQKApplyRotaryPosIds(
     size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1723,6 +1729,12 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                                size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
                                float rope_scale, float rope_theta, cudaStream_t stream = nullptr,
                                uint32_t nnz = 0) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1801,6 +1813,12 @@ cudaError_t BatchQKApplyLlama31Rotary(
     size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
     float low_freq_factor, float high_freq_factor, float old_context_length,
     cudaStream_t stream = nullptr, uint32_t nnz = 0) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
@@ -1863,6 +1881,12 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
     float high_freq_factor, float old_context_length, cudaStream_t stream = nullptr) {
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
