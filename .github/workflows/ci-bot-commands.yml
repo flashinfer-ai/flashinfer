@@ -199,7 +199,7 @@ jobs:
           # Includes the initial PR lookup and cleanup around the 420-second
           # selection cap; leave time within the ten-minute job for feedback.
           if ! timeout --kill-after=5s 450s env GH_TOKEN="$STATUS_TOKEN" \
-              python3 scripts/pr_checks/ai_test_scope.py \
+              python3 scripts/infra/pr_checks/ai_test_scope.py \
               --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
               --command-file "$RUNNER_TEMP/ci-bot-run-command.txt" \
               --output "$SCOPE_RESULT" --note "$SCOPE_NOTE"; then

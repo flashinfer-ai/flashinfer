@@ -143,7 +143,7 @@ Not implemented yet (TODO, exit code 2 when requested):
 
 * ``--built-wheel``: build the wheel and import every package from it,
   asserting ``build.json``, ``csrc/cake_ffi_checks.h`` and the sources are
-  present (model: scripts/task_test_jit_cache_package_build_import.sh).
+  present (model: scripts/infra/task_test_jit_cache_package_build_import.sh).
 * the JIT-path flag check (``get_compile_commands()`` flags are a superset of
   the manifest flags for one entry per package; needs ``FLASHINFER_CUDA_ARCH_LIST``
   set, ``FLASHINFER_JIT_DEBUG`` / ``FLASHINFER_JIT_VERBOSE`` unset, an

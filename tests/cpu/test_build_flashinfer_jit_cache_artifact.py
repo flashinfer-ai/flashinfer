@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[2]
-ARTIFACT_SCRIPT = REPO_ROOT / "scripts" / "build_flashinfer_jit_cache_artifact.sh"
+ARTIFACT_SCRIPT = (
+    REPO_ROOT / "scripts" / "infra" / "build_flashinfer_jit_cache_artifact.sh"
+)
 
 
 def _write_executable(path, content):
@@ -18,7 +20,7 @@ def _write_executable(path, content):
 
 def _run_artifact_script(tmp_path, *, inspect_exit=0, pull_failures=0, run_exit=0):
     test_repo = tmp_path / "repo"
-    script_dir = test_repo / "scripts"
+    script_dir = test_repo / "scripts" / "infra"
     script_dir.mkdir(parents=True)
     script = script_dir / ARTIFACT_SCRIPT.name
     shutil.copyfile(ARTIFACT_SCRIPT, script)

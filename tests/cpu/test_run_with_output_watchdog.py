@@ -8,7 +8,9 @@ import time
 from pathlib import Path
 
 
-WATCHDOG = Path(__file__).parents[2] / "scripts" / "run_with_output_watchdog.py"
+WATCHDOG = (
+    Path(__file__).parents[2] / "scripts" / "infra" / "run_with_output_watchdog.py"
+)
 
 
 def assert_process_stopped(pid: int, message: str) -> None:
