@@ -321,6 +321,8 @@ class MoEWeightPreparationPlan:
     # compact W4A8 launch within the inline capacity rebuilds its scale words;
     # larger capacities expand into scratch before execution.
     w4a8_csf_inline: bool = False
+    # N64 packing is independent of whether the final N tile has 64 rows.
+    w4a8_n64_repacked: bool = False
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)

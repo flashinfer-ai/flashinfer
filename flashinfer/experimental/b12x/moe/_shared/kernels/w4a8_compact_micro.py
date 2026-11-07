@@ -104,7 +104,7 @@ class _DirectW4A8CompactLaunch:
         # Inline MXFP4-CSF: both scale operands are compressed inline storage.
         self.csf_inline = bool(csf_inline)
         self.projection = W4A8CompactMicroProjectionKernel(
-            k, n, num_topk, csf_inline=self.csf_inline
+            k, n, num_topk, csf_inline=self.csf_inline, n64_repacked=True
         )
         self.activation = W4A8CompactMicroActivationKernel(
             n,
@@ -116,7 +116,7 @@ class _DirectW4A8CompactLaunch:
             source_tile_m=1,
             deterministic_output=True,
             direct_routes=True,
-            n64_repacked=self.n % 128 == 64,
+            n64_repacked=True,
             n64_tail=self.n % 128 == 64,
             csf_inline=self.csf_inline,
         )
