@@ -274,7 +274,7 @@ class CakeGQADetWorkspace:
     It holds the forward's tile counter (one ``uint32``, zeroed once; every launch leaves it zero), the backward
     scratch, the dS^T workspace and the row-map window gradients, each grown to the largest shape seen and never
     shrunk.  ``budget_bytes`` bounds the dS^T workspace of one backward call (default
-    :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`, 8 GiB): a call whose dS^T exceeds it runs in chunks (KV heads first,
+    :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`, 16 GiB): a call whose dS^T exceeds it runs in chunks (KV heads first,
     then key-block ranges).  The chunks depend on the shape, ``max_seqlen_k`` and the budget only, so one budget gives
     the same bits on every run; a different budget may round dQ differently.  One workspace serves one stream at a
     time: two launches running concurrently on different streams need two workspaces.  Autograd keeps only a weak
@@ -673,7 +673,7 @@ def cake_gqa_det_train_backward(
         dims,
         device_index,
     )
-    tile_base, pair_base = _tile_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"])
+    tile_base, pair_base, pair_order = _tile_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q)
     ds = ws.ds_tiles(plan["ws_tiles"])
     if mode == "rowmap":
         win_k, win_v = ws.window(total_k, heads_kv)
@@ -691,6 +691,7 @@ def cake_gqa_det_train_backward(
         "dsw": ds,
         "tile_base": tile_base,
         "pair_base": pair_base,
+        "pair_order": pair_order,
         "dq_accum": dq_accum,
         "dv_out": win_v,
         "dk_out": win_k,
@@ -735,15 +736,18 @@ def cake_gqa_det_train_backward(
 
 
 def _tile_plan(
-    cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, key_blocks: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, key_blocks: int, total_q: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The workspace tile numbering on the device, from the segment boundaries (no host read):
 
     - ``tile_base`` int32 ``[(key_blocks + 1) * B]``: the exclusive prefix sum, in (key block ``n``, segment ``b``)
       order, of ``cnt(b, n) = max(0, ceil(q_b / 64) - m_min(b, n))`` for ``n < ceil(k_b / 128)`` (else 0), ``m_min(b,
       n) = max(128 n - (k_b - q_b), 0) // 64`` the first Q tile key block ``n`` sees;
     - ``pair_base`` int32 ``[B + 1]``: the exclusive prefix sum of the segments' Q-tile pairs ``ceil(ceil(q_b / 64) /
-      2)``, the total last.
+      2)``, the total last;
+    - ``pair_order`` int32 ``[ceil(total_q / 128) + B]`` (a bound of the pairs): the dQ GEMM's work order, the pairs by
+      the key blocks their later Q tile sees, most first (stable), the positions past the total last. The order only
+      balances the work; it does not change any result bit.
     """
     cq = cu_seqlens_q.to(torch.int64)
     ck = cu_seqlens_k.to(torch.int64)
@@ -759,7 +763,16 @@ def _tile_plan(
     tile_base = (torch.cumsum(cnt, 0) - cnt).to(torch.int32)
     pair_base = torch.zeros(q_len.numel() + 1, dtype=torch.int64, device=cq.device)
     torch.cumsum((tiles + 1) // 2, 0, out=pair_base[1:])
-    return tile_base, pair_base.to(torch.int32)
+    pair = torch.arange(
+        (total_q + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS + q_len.numel(), device=cq.device
+    )
+    seg = torch.searchsorted(pair_base[1:].contiguous(), pair, right=True).clamp(max=q_len.numel() - 1)
+    last = torch.minimum(2 * (pair - pair_base[seg]) + 2, tiles[seg])
+    seen = (cake_jit.BWD_TILE_ROWS * last + (k_len - q_len)[seg] + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
+    seen = torch.minimum(seen.clamp(min=0), blocks[seg])
+    seen = torch.where(pair < pair_base[-1], seen, -1)
+    pair_order = torch.sort(-seen, stable=True).indices.to(torch.int32)
+    return tile_base, pair_base.to(torch.int32), pair_order
 
 
 # ----------------------------------------------------------------------------------------------------------------

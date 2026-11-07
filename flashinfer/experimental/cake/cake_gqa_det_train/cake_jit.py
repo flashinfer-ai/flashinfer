@@ -279,6 +279,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "K"],
             ["buffer", "tile_base"],
             ["buffer", "pair_base"],
+            ["buffer", "pair_order"],
             ["buffer", "cu_seqlens_q"],
             ["buffer", "cu_seqlens_k"],
             ["buffer", "dq_accum"],
@@ -402,7 +403,7 @@ SCRATCH_ALIGN = 256
 # splits the call into more chunks (KV heads first, then key-block ranges);
 # the key-block split re-reads and rewrites the FP32 dQ accumulator once per
 # extra chunk, and moves the dQ rounding (the bits, not the accuracy).
-DEFAULT_WORKSPACE_BUDGET = 8 << 30
+DEFAULT_WORKSPACE_BUDGET = 16 << 30
 
 
 def rows_pad(total_q: int, num_segments: int) -> int:

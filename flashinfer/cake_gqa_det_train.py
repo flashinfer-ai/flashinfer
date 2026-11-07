@@ -31,7 +31,7 @@ window, FP32 row-map adds with repeated destination rows) repeat bit for bit
 run to run, for one shape, one ``max_seqlen_k`` and one workspace budget.
 The backward stores dS^T into a workspace and computes dK and dQ as GEMMs
 over it, in chunks of at most the workspace's ``budget_bytes`` (default
-8 GiB); it raises no PyTorch determinism alert.  The interface matches the
+16 GiB); it raises no PyTorch determinism alert.  The interface matches the
 non-deterministic counterpart ``flashinfer.cake_gqa_nondet_train``.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
@@ -348,7 +348,7 @@ def cake_gqa_det_train_workspace(
     device : torch.device, str or int, optional
         The CUDA device; ``None`` is the current device.
     budget_bytes : int, optional
-        The bound of one backward call's dS^T workspace; ``None`` is 8 GiB.  A call whose dS^T exceeds it runs in
+        The bound of one backward call's dS^T workspace; ``None`` is 16 GiB.  A call whose dS^T exceeds it runs in
         chunks (at least one KV head and two key blocks per chunk, even past the budget).  The chunks set the dQ
         rounding: one budget gives the same bits on every run.
 
