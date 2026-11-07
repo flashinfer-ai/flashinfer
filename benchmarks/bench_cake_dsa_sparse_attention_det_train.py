@@ -253,11 +253,15 @@ def _snapshot(st, grads):
 
 
 def _repeat_bitwise(arm):
-    """Whether two steps of ``arm`` give the same bits for every tensor they return."""
+    """Whether two steps of ``arm`` give the same bits for every tensor they return (``out`` and ``lse`` alone
+    without a backward: a forward-only step leaves the accumulator it allocates unwritten)."""
     runs = []
     for _ in range(2):
         st = arm.forward()
-        grads = arm.backward(st) if arm.backward_available else {}
+        if arm.backward_available:
+            grads = arm.backward(st)
+        else:
+            st, grads = {"out": st["out"], "lse": st["lse"]}, {}
         torch.cuda.synchronize()
         runs.append(_snapshot(st, grads))
     first, second = runs
