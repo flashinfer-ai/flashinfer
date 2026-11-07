@@ -124,6 +124,13 @@ Caveats:
 - The cache is per-devcontainer by design: sccache's local storage supports a
   single server at a time, so two containers must not share one cache directory.
 
+PR runs skip the `AOT Build Import` lanes when `scripts/pr_checks/aot_scope.py`
+finds that no changed file can affect the provider wheels (docs, tests,
+benchmarks, and `flashinfer/**/*.py` that `flashinfer/aot.py` cannot import).
+Everything unclassified runs AOT, as do scheduled and manual runs. The rules and
+their limits are in that script's docstring; `tests/cpu/test_aot_scope.py` covers
+them.
+
 GitHub PR Test GPU jobs keep a different, per-runner cache: they set
 `CI_COMPILE_CACHE_DIR` to a directory under the runner's work directory, and
 `ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
