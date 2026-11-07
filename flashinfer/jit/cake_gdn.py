@@ -904,52 +904,65 @@ def _has_variant(
 # 668 and a held-out sample of 191), where the DV-split launch ran 0.57x to 1.20x the full-DV
 # launch: the rule routes 190 of them, all at least 1.05x (the first slower batch is at 1.05x the
 # longest-first limit and 1.29x the other).  On a second held-out sample, every one of the 87
-# batches it routes was faster as well (at least 1.02x).
+# batches it routes was faster as well (at least 1.02x).  The fit is on the BF16-I/O FP32-state
+# contract with an initial state; the other contracts of ``_RAGGED_DVSPLIT_CONTRACTS`` take the
+# same rule and constants.
 RAGGED_DVSPLIT_SEQ_TOKENS = 384
 RAGGED_DVSPLIT_LOAD_LONGEST_FIRST = 90
 RAGGED_DVSPLIT_LOAD = 20
+
+
+# The stateful contracts of the ragged DV-split route: (I/O dtype, state dtype, initial state).
+# Each stores a final state without checkpoints or state indices.
+_RAGGED_DVSPLIT_CONTRACTS: tuple[tuple[str, str, bool], ...] = (
+    ("bfloat16", "float32", True),
+    ("bfloat16", "bfloat16", True),
+    ("float16", "float32", True),
+    ("bfloat16", "float32", False),
+    ("float16", "float32", False),
+)
 
 
 @functools.cache
 def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
     """The ragged DV-split route: full-DV record name -> the route of its DV-split twin.
 
-    On sm_107a a BF16-I/O FP32-state full-DV batch with initial and final state (no
-    checkpoints, no state indices) is over the DV-split tile budget (``2 * num_seqs *
-    max(Hq, Hv) > 212``).  When its key also ships the DV-split record, a ragged batch runs
-    that record with one CTA per half tile (``one_cta_per_tile``; the launch grid is the
-    half-tile count): the two halves of a long sequence's tile run on two SMs and the short
-    sequences fill the others.  The resolver takes the route only for the batches whose longest
-    sequence bounds the launch (``RAGGED_DVSPLIT_LOAD``); on a balanced batch the doubled tile
-    count makes the DV-split launch slower.
+    On sm_107a a full-DV batch of a ``_RAGGED_DVSPLIT_CONTRACTS`` contract (BF16 I/O with
+    FP32 or BF16 state, or FP16 I/O with FP32 state, with an initial state; BF16 or FP16
+    I/O with FP32 state without one; a final state, no checkpoints, no state indices) is
+    over the DV-split tile budget (``2 * num_seqs * max(Hq, Hv) > 212``).  When its key also
+    ships the DV-split record of its contract, a ragged batch runs that record with one CTA
+    per half tile (``one_cta_per_tile``; the launch grid is the half-tile count): the two
+    halves of a long sequence's tile run on two SMs and the short sequences fill the others.
+    The resolver takes the route only for the batches whose longest sequence bounds the
+    launch (``RAGGED_DVSPLIT_LOAD``, the same rule and constants for every contract); on a
+    balanced batch the doubled tile count makes the DV-split launch slower.
 
     Keys: the sm_107a-only full-DV base and gate-stream records (and the gate-stream records'
-    prefetch twins) of that contract whose exact specializations also have a DV-split record (a
-    key without either record is not here, so it keeps its route or fails closed as before).  A
-    resolved full-DV record of these keys is over the tile budget: under it the key's own
-    DV-split record is served first.  Built once from the manifest.
+    prefetch twins) of each contract whose exact specializations also have a DV-split record
+    of that contract (a key without either record is not here, so it keeps its route or fails
+    closed as before).  A resolved full-DV record of these keys is over the tile budget: under
+    it the key's own DV-split record is served first.  Built once from the manifest.
     """
 
     arch: CakeGDNArch = "sm_107a"
-    stateful = {
-        "ENABLE_CHECKPOINTS": 0,
-        "SINGLE_CHUNK_NO_STATE": 0,
-        "STORE_FINAL_STATE": 1,
-        "UNIT_GATES": 0,
-        "USE_INITIAL_STATE": 1,
-        "USE_STATE_INDICES": 0,
-    }
 
     def schedule(
-        *, dvsplit: bool, gate_stream_full: bool, initial_state_prefetch: bool = False
+        *,
+        io_dtype: str,
+        state_dtype: str,
+        use_initial_state: bool,
+        dvsplit: bool,
+        gate_stream_full: bool,
+        initial_state_prefetch: bool = False,
     ) -> str:
         return cake_gdn_prefill_seq_schedule(
             arch,
             _prefill_schedule_attr(
                 dvsplit=dvsplit,
-                use_initial_state=True,
-                io_dtype="bfloat16",
-                state_dtype="float32",
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
                 single_chunk=False,
                 gatepipe4=False,
                 fullgrid_vhold=False,
@@ -962,33 +975,54 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
         )
 
     prefix = "flashinfer.cake_gdn.generated.prefill:"
-    full_dv = {
-        prefix
-        + schedule(
-            dvsplit=False,
-            gate_stream_full=gate_stream_full,
-            initial_state_prefetch=initial_state_prefetch,
+    # full-DV source schedule -> (the contract's DV-split schedule, its stateful specializations)
+    contracts: dict[str, tuple[str, dict[str, int]]] = {}
+    for io_dtype, state_dtype, use_initial_state in _RAGGED_DVSPLIT_CONTRACTS:
+        stateful = {
+            "ENABLE_CHECKPOINTS": 0,
+            "SINGLE_CHUNK_NO_STATE": 0,
+            "STORE_FINAL_STATE": 1,
+            "UNIT_GATES": 0,
+            "USE_INITIAL_STATE": int(use_initial_state),
+            "USE_STATE_INDICES": 0,
+        }
+        split = schedule(
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            use_initial_state=use_initial_state,
+            dvsplit=True,
+            gate_stream_full=False,
         )
         for gate_stream_full, initial_state_prefetch in (
             (False, False),
             (True, False),
             (True, True),
-        )
-    }
-    split = schedule(dvsplit=True, gate_stream_full=False)
+        ):
+            full_dv = schedule(
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                use_initial_state=use_initial_state,
+                dvsplit=False,
+                gate_stream_full=gate_stream_full,
+                initial_state_prefetch=initial_state_prefetch,
+            )
+            contracts[prefix + full_dv] = (split, stateful)
     routes: dict[str, CakeGDNRoute] = {}
     for record in _manifest()["variants"]:
         specializations = record["specializations"]
+        entry = contracts.get(record["source_schedule"])
+        if entry is None:
+            continue
+        twin_schedule, twin_stateful = entry
         if (
             record["domain"] != "prefill"
-            or record["source_schedule"] not in full_dv
             or record["tma_abi"] != "grid_constant"
             or record["architectures"] != [arch]
-            or any(specializations.get(k) != v for k, v in stateful.items())
+            or any(specializations.get(k) != v for k, v in twin_stateful.items())
             or not _has_variant(
                 arch=arch,
                 domain="prefill",
-                schedule_attr=split,
+                schedule_attr=twin_schedule,
                 specializations=specializations,
             )
         ):
@@ -996,7 +1030,7 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
         twin = _variant_for(
             arch=arch,
             domain="prefill",
-            schedule_attr=split,
+            schedule_attr=twin_schedule,
             specializations=specializations,
         )
         routes[record["name"]] = CakeGDNRoute(
@@ -1383,10 +1417,11 @@ def select_cake_gdn_prefill_variant(
         schedule_attr=schedule_attr,
         specializations=specializations,
     )
-    # Ragged DV-split route (``_ragged_dvsplit_routes``): with the host lengths, a batch whose
-    # full-DV record has a DV-split twin runs that twin, one CTA per half tile, when its longest
-    # sequence bounds the launch.  The rule itself keeps equal lengths (``max_seq_len`` exact):
-    # their load exceeds ``num_seqs * num_o_heads * max_seq_len``, and over the tile budget
+    # Ragged DV-split route (``_ragged_dvsplit_routes``): with the host lengths, a batch of a
+    # ``_RAGGED_DVSPLIT_CONTRACTS`` contract whose full-DV record has a DV-split twin runs that
+    # twin, one CTA per half tile, when its longest sequence bounds the launch.  The rule itself
+    # keeps equal lengths (``max_seq_len`` exact): their load exceeds
+    # ``num_seqs * num_o_heads * max_seq_len``, and over the tile budget
     # ``num_seqs * num_o_heads > 106`` is above both limits.  A DV-split record (``dvsplit``) is
     # never a key.  Host integers first, then one lookup on the resolved record; every other
     # call returns as before.

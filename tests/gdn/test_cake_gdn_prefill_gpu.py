@@ -978,6 +978,125 @@ def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent
         assert grids == [expected_grid, expected_grid]
 
 
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads", "seq_lens", "split"),
+    (
+        # BF16 I/O, BF16 state, with an initial state: Hq8/Hv16, 512 half tiles
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            (8, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_",
+        ),
+        # FP16 I/O, FP32 state, with an initial state: Hq4/Hv16, 512 half tiles
+        (
+            torch.float16,
+            torch.float32,
+            True,
+            (4, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_f16io_sm107a_l7_vec2_",
+        ),
+        # BF16 / FP16 I/O, FP32 state, no initial state: Hq16/Hv32, 1024 half tiles
+        (
+            torch.bfloat16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_sm107a_l7_vec2_",
+        ),
+        (
+            torch.float16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_f16io_sm107a_l7_vec2_",
+        ),
+    ),
+    ids=("bf16_state", "f16_io", "no_initial_state", "f16_io_no_initial_state"),
+)
+def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_of_each_contract_matches_independent_recurrence(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_lens, split
+):
+    # The BF16-state, FP16-I/O and no-initial-state contracts of the ragged DV-split route:
+    # a ragged batch over the DV-split tile budget whose critical path is its long first
+    # sequence runs its contract's DV-split body with one CTA per half tile when
+    # ``cu_seqlens_cpu`` is passed, else the full-DV body on the grid rule's grid.  Both
+    # match the reference recurrence and repeat bitwise.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the ragged DV-split route is sm_107a only")
+    num_q_heads, num_v_heads = heads
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    unrouted = _public_route(case)
+    assert unrouted.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert unrouted.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(
+        **_public_route_kwargs(case), host_seq_lens=seq_lens
+    )
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert split in routed.variant_name, routed.variant_name
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    sm_count = torch.cuda.get_device_properties(case["q"].device).multi_processor_count
+    full_dv_tiles = len(seq_lens) * max(heads)
+    full_dv_grid = cake_gdn._cake_gdn_prefill_grid_x(
+        full_dv_tiles, sm_count, False, sum(seq_lens)
+    )
+    assert full_dv_grid <= sm_count < 2 * full_dv_tiles
+    for host_copy, expected_grid in (
+        ({"cu_seqlens_cpu": _host_cu_seqlens(seq_lens)}, 2 * full_dv_tiles),
+        ({}, full_dv_grid),
+    ):
+        runs = []
+        grids.clear()
+        for _ in range(2):
+            case["output"].fill_(float("nan"))
+            if initial_state is None:
+                case["output_state"].fill_(float("nan"))
+            else:
+                case["output_state"].copy_(initial_state)
+            out, state = _launch(case, **host_copy)
+            torch.cuda.synchronize()
+            runs.append((out.clone(), state.clone()))
+        for out, state in runs:
+            assert torch.isfinite(out.float()).all()
+            assert torch.isfinite(state.float()).all()
+        torch.testing.assert_close(
+            runs[0][0].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            runs[0][1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(runs[0][0], runs[1][0])
+        assert torch.equal(runs[0][1], runs[1][1])
+        assert grids == [expected_grid, expected_grid]
+
+
 def _carry_segment(case, start, stop, initial_state):
     """``case`` cut to tokens ``[start, stop)`` of its one sequence, started from ``initial_state``."""
 
