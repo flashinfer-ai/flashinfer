@@ -317,7 +317,7 @@ def fused_moe_fp8(
     chains and rounding (:mod:`.spec_fp8`), the ``k`` slots folded in slot order in fp32 and converted once. ``config1`` /
     ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
-    from .permute import get_compiled_gather
+    from .permute import get_compiled_gather, warps_per_row
     from .schedule_fp8 import default_configs_fp8
 
     if (
@@ -373,7 +373,9 @@ def fused_moe_fp8(
     Tk = T * k
     x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
     if Tk:
-        get_compiled_gather(k, "e4m3")(xq, src, x_perm, Tk, H)
+        get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
+            xq, src, x_perm, Tk, H
+        )
     a = grouped_gemm_fp8(
         x_perm, w.w1q, w.s_w1, w.s_x, w.m_inter, counts, config1, w.chain1
     )  # [Tk, I] e4m3
