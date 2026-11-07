@@ -1259,7 +1259,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_train_839010029697ba22f745",
+        "kernel_symbol": "kernel_cake_gdn_train_46f95b7f72767d389f44",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -1267,7 +1267,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222976,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_839010029697ba22f745",
+        "library": "cake_gdn_train_46f95b7f72767d389f44",
         "stage": "dhu_tc2_dvl32",
     },
     "dhu_tc2_dvl32_modes": {
@@ -1300,7 +1300,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_train_839010029697ba22f745",
+        "kernel_symbol": "kernel_cake_gdn_train_b23c39f3c54704a28639",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -1308,7 +1308,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222976,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_839010029697ba22f745",
+        "library": "cake_gdn_train_b23c39f3c54704a28639",
         "stage": "dhu_tc2_dvl32_modes",
     },
     "dhu_tc2_dvl32_gm": {
@@ -1341,7 +1341,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_train_839010029697ba22f745",
+        "kernel_symbol": "kernel_cake_gdn_train_214243f9cfaf2e16a782",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1349,7 +1349,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223104,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_839010029697ba22f745",
+        "library": "cake_gdn_train_214243f9cfaf2e16a782",
         "stage": "dhu_tc2_dvl32_gm",
     },
     "piece_chain": {
@@ -1367,7 +1367,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_train_c0999bd9faec942831d6",
+        "kernel_symbol": "kernel_cake_gdn_train_df2a0e535ca9a0e8f86f",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1375,7 +1375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
-        "library": "cake_gdn_train_c0999bd9faec942831d6",
+        "library": "cake_gdn_train_df2a0e535ca9a0e8f86f",
         "stage": "piece_chain",
     },
     "dqkwg": {
