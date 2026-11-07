@@ -106,7 +106,10 @@ def test_route_tables_cover_every_delivered_world_size_once():
                     key = loader.route_key(world_size, arch, capacity)
                     assert key.endswith(suffix) and key in table
                     expected_keys.add(key)
-        assert set(table) == expected_keys
+        # Every other key extends one of those capacity routes by a lever suffix.
+        levers = loader.lever_suffixes(arch)[1:]
+        extended = {base + lever for base in expected_keys for lever in levers}
+        assert set(table) - expected_keys <= extended
         routed |= set(table.values())
         for world_size in UNDELIVERED_WORLD_SIZES:
             with pytest.raises(ValueError, match="delivered"):
@@ -508,6 +511,196 @@ def test_capacity_variants_select_a_program_by_exact_rows_capacity(arch):
         assert base != variant and {base, variant} <= set(loader.PROGRAMS)
     for world_size in loader.COMM_MODES[arch]:
         assert loader.program_variant(world_size, 1, arch) == ""
+
+
+def _capacities(arch, world_size):
+    """A plain capacity and every capacity variant of ``world_size`` on ``arch``."""
+
+    return [1024, 131072] + [
+        int(capacity)
+        for ws, capacity, _suffix in loader.CAPACITY_VARIANTS.get(arch, [])
+        if int(ws) == world_size
+    ]
+
+
+# Call shapes around every threshold of the lever rule (chunk counts, columns, K_l).
+LEVER_CHUNKS = (1, 4, 32, 95, 96, 97, 191, 192, 193, 512, 1024)
+LEVER_COLUMNS = (256, 3072, 8192, 12288, 16384, 49152)
+LEVER_K_L = (128, 768, 1536, 1664, 2048, 4096, 4224, 8192)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_lever_table_records_each_lever_once(arch):
+    table = loader.LEVER_DISPATCH[arch]
+    assert set(table) <= {"REDUCERS", "LOCKSTEP"}
+    suffixes = loader.lever_suffixes(arch)
+    assert suffixes[0] == "" and len(suffixes) == 2 ** len(table)
+    assert len(set(suffixes)) == len(suffixes)
+    if "REDUCERS" in table:
+        reducers = table["REDUCERS"]
+        assert reducers["suffix"].startswith("_")
+        assert set(reducers) <= {"suffix", "max_k_l", "mn_limit"}
+        assert set(reducers["max_k_l"]) <= set(loader.COMM_MODES[arch])
+        assert all(k > 0 and k % 128 == 0 for k in reducers["max_k_l"].values())
+        limits = reducers.get("mn_limit", {})
+        assert set(limits) <= set(reducers["max_k_l"])
+        assert all(limit > 0 for limit in limits.values())
+    if "LOCKSTEP" in table:
+        lockstep = table["LOCKSTEP"]
+        assert lockstep["suffix"].startswith("_") and lockstep["min_tiles"] > 0
+        assert lockstep["min_raster_group"] >= 2
+        assert loader.GEOMETRY[arch]["GRID_RULE"] == loader.GRID_RULE_SM_COUNT
+    for world_size in loader.COMM_MODES[arch]:
+        for chunks in LEVER_CHUNKS:
+            for n in LEVER_COLUMNS:
+                for k_l in LEVER_K_L:
+                    lever = loader.lever_variant(
+                        world_size, chunks * 128, n, k_l, arch, sm_count=132
+                    )
+                    assert lever in suffixes
+                    if not table:
+                        assert lever == ""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_reducer_lever_follows_its_k_l_bound_and_the_column_count(arch, world_size):
+    reducers = loader.LEVER_DISPATCH[arch].get("REDUCERS")
+    bound = None if reducers is None else reducers["max_k_l"].get(world_size)
+    if bound is None:
+        for k_l in LEVER_K_L:
+            lever = loader.lever_variant(
+                world_size, 128, 1 << 16, k_l, arch, sm_count=1
+            )
+            assert lever == ""
+        return
+    suffix = reducers["suffix"]
+    n = -(-bound * world_size // 256) * 256
+    assert loader.lever_variant(world_size, 128, n, bound, arch, sm_count=1) == suffix
+    assert loader.lever_variant(world_size, 128, n, 128, arch, sm_count=1) == suffix
+    assert (
+        loader.lever_variant(world_size, 128, n + 256, bound + 128, arch, sm_count=1)
+        == ""
+    )
+    # K_l * world_size above N keeps the route's program.
+    small = -(-(bound * world_size) // 256) * 256 - 256
+    if small >= 256 and bound * world_size > small:
+        assert (
+            loader.lever_variant(world_size, 128, small, bound, arch, sm_count=1) == ""
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_reducer_lever_stops_at_its_m_n_limit(arch, world_size):
+    reducers = loader.LEVER_DISPATCH[arch].get("REDUCERS")
+    if reducers is None or world_size not in reducers["max_k_l"]:
+        return
+    bound = reducers["max_k_l"][world_size]
+    n = -(-bound * world_size // 256) * 256
+    limit = reducers.get("mn_limit", {}).get(world_size)
+    if limit is None:
+        # Without a limit the reducer lever holds up to the largest M.
+        m = loader.MAX_ROWS_TIMES_COLS // n
+        lever = loader.lever_variant(world_size, m, n, bound, arch, sm_count=1)
+        assert lever == reducers["suffix"]
+        return
+    above = -(-limit // n)
+    below = loader.lever_variant(world_size, above - 1, n, bound, arch, sm_count=1)
+    at = loader.lever_variant(world_size, above, n, bound, arch, sm_count=1)
+    assert below == reducers["suffix"] and at == ""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_lockstep_lever_needs_the_raster_group_the_tiles_and_a_bounded_grid(
+    arch, world_size
+):
+    lockstep = loader.LEVER_DISPATCH[arch].get("LOCKSTEP")
+    n, k_l = 16384, 8192
+    if lockstep is None:
+        # Without the lockstep lever a call selects at most the reducer lever.
+        table = loader.LEVER_DISPATCH[arch]
+        allowed = {"", *(entry["suffix"] for entry in table.values())}
+        for chunks in LEVER_CHUNKS:
+            lever = loader.lever_variant(
+                world_size, chunks * 128, n, k_l, arch, sm_count=132
+            )
+            assert lever in allowed
+        return
+    suffix = lockstep["suffix"]
+    edge = -(-lockstep["min_tiles"] // loader.grid_n(n, arch)) * 128
+    assert loader.raster_group_m(edge, n, k_l, arch) >= lockstep["min_raster_group"]
+    assert loader.tiles(edge, n, arch) >= lockstep["min_tiles"]
+    assert loader.tiles(edge - 128, n, arch) < lockstep["min_tiles"]
+    assert loader.lever_variant(world_size, edge, n, k_l, arch, sm_count=132).endswith(
+        suffix
+    )
+    assert not loader.lever_variant(
+        world_size, edge - 128, n, k_l, arch, sm_count=132
+    ).endswith(suffix)
+    max_ctas = int(loader.GEOMETRY[arch]["MAX_CTAS"])
+    for sm_count in (0, max_ctas, max_ctas + 1):
+        lever = loader.lever_variant(world_size, edge, n, k_l, arch, sm_count=sm_count)
+        assert not lever.endswith(suffix)
+    # A raster group of 1 (K_l below the raster threshold) keeps the throttle off.
+    short = int(loader.GEOMETRY[arch]["RASTER_MIN_K"]) - 128
+    assert loader.raster_group_m(edge, n, short, arch) == 1
+    assert not loader.lever_variant(
+        world_size, edge, n, short, arch, sm_count=132
+    ).endswith(suffix)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_every_call_selects_a_delivered_program_of_its_route(arch, world_size):
+    for capacity in _capacities(arch, world_size):
+        base = loader.route_key(world_size, arch, capacity)
+        group = set(
+            loader.dispatch_programs(world_size, arch, capacity, 3072, sm_count=132)
+        )
+        assert loader.main_program(world_size, arch, capacity) in group
+        assert group <= set(loader.ROUTES[arch].values())
+        for chunks in LEVER_CHUNKS:
+            m = chunks * 128
+            for n in LEVER_COLUMNS:
+                if m > capacity or m * n > loader.MAX_ROWS_TIMES_COLS:
+                    continue
+                for k_l in LEVER_K_L:
+                    program = loader.call_program(
+                        world_size, arch, capacity, m, n, k_l, sm_count=132
+                    )
+                    lever = loader.lever_variant(
+                        world_size, m, n, k_l, arch, sm_count=132
+                    )
+                    assert program == loader.ROUTES[arch][base + lever]
+                    assert (
+                        program in group and arch in loader.PROGRAMS[program]["arches"]
+                    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_bound_k_l_dispatch_programs_are_the_programs_of_every_row_count(
+    arch, world_size
+):
+    for capacity in (4133, *_capacities(arch, world_size)[2:]):
+        for n, k_l in ((3072, 768), (8192, 4096), (16384, 8192)):
+            programs = loader.dispatch_programs(
+                world_size, arch, capacity, n, k_l, sm_count=132
+            )
+            calls = {
+                loader.call_program(world_size, arch, capacity, m, n, k_l, sm_count=132)
+                for m in range(1, capacity + 1, 64)
+            }
+            calls.add(
+                loader.call_program(
+                    world_size, arch, capacity, capacity, n, k_l, sm_count=132
+                )
+            )
+            assert programs[0] == loader.main_program(world_size, arch, capacity)
+            assert set(programs) == calls | {programs[0]}
 
 
 # --------------------------------------------------------------------------- #
@@ -1069,7 +1262,13 @@ def test_allocation_places_the_readiness_words_in_the_signal_pad_when_they_fit(
     workspace = backend._allocate_workspace(call, group, max_rows=1024)
     program = loader.main_program(world_size, arch, 1024)
     cluster_grid = loader.GEOMETRY[arch]["GRID_RULE"] == loader.GRID_RULE_CLUSTER_PAIRS
-    expected = [("load", program, arch), ("rendezvous", "receive workspace")]
+    # Without a bound K_l the one-shot workspace loads every program of its route.
+    programs = loader.dispatch_programs(
+        world_size, arch, 1024, n, sm_count=0 if cluster_grid else 148
+    )
+    assert programs[0] == program
+    expected = [("load", name, arch) for name in programs]
+    expected.append(("rendezvous", "receive workspace"))
     if mode == "nvls":
         expected.append(("multicast", s_bytes))
     if cluster_grid:
@@ -1078,6 +1277,7 @@ def test_allocation_places_the_readiness_words_in_the_signal_pad_when_they_fit(
     assert events == expected
     assert allocated == [(s_bytes, torch.uint8, torch.device("cuda", 0))]
     assert workspace.module is module and workspace.program == program
+    assert workspace.modules == {name: module for name in programs}
     assert (workspace.rank, workspace.world_size, workspace.n) == (1, world_size, n)
     assert (workspace.arch, workspace.comm_mode) == (arch, mode)
     assert workspace.transport == loader.transport(world_size, arch)
@@ -1214,6 +1414,7 @@ def _workspace(
     sm_count=148,
     program=None,
     module=None,
+    modules=None,
     multicast=None,
 ):
     arch = ARCHES[0] if arch is None else arch
@@ -1226,6 +1427,18 @@ def _workspace(
     cluster_grid = loader.GEOMETRY[arch]["GRID_RULE"] == loader.GRID_RULE_CLUSTER_PAIRS
     if mode == "nvls" and multicast is None:
         multicast = "S_mc"
+    program = program or loader.main_program(world_size, arch, max_rows)
+    if modules is None:
+        # Every program of the route (its lever programs included) runs ``module``.
+        modules = {
+            name: module
+            for name in (
+                program,
+                *loader.dispatch_programs(
+                    world_size, arch, max_rows, n, sm_count=sm_count
+                ),
+            )
+        }
     return backend._Workspace(
         rank=rank,
         world_size=world_size,
@@ -1234,8 +1447,9 @@ def _workspace(
         comm_mode=mode,
         transport=loader.transport(world_size, arch),
         n=n,
-        program=program or loader.main_program(world_size, arch, max_rows),
+        program=program,
         module=module,
+        modules=modules,
         max_rows=max_rows,
         rows_capacity=loader.ceil128(max_rows),
         chunk_capacity=c_cap,
@@ -1393,6 +1607,8 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(
     assert launcher.workspace_bytes == loader.workspace_bytes(4133, n, world_size, arch)
     assert launcher.flags_in_signal_pad
     assert launcher.program == loader.main_program(world_size, arch, 4133)
+    assert launcher.programs[0] == launcher.program
+    assert set(launcher.programs) == set(launcher.workspace.modules)
     for rows in (1, 129, 4133):
         bound = launcher._validate_call(*_operands(rows, n))
         assert (bound.m, bound.n, bound.k_l) == (rows, n, K_L)
@@ -1625,6 +1841,88 @@ def test_launch_refuses_a_workspace_of_another_architecture():
     )
     with pytest.raises(RuntimeError, match="another N, world size or architecture"):
         backend._launch(state, workspace, other, *([None] * 5))
+    assert state.poisoned is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_prepared_allocation_loads_every_program_its_calls_can_dispatch(
+    monkeypatch, arch, world_size
+):
+    n = _n(arch)
+    mode = _mode(arch, world_size)
+    handle = _FakeHandle(
+        rank=1,
+        world_size=world_size,
+        buffer_size=loader.workspace_bytes(4133, n, world_size, arch),
+        signal_pad_size=65536,
+        multicast_ptr=0x1000 if mode == "nvls" else None,
+    )
+    module = object()
+    events, _ = _patch_allocation(monkeypatch, handles=[handle], loaded=module)
+    call = _call(1, arch=arch, world_size=world_size)
+    workspace = backend._allocate_workspace(
+        call, _fake_group(world_size, 1), max_rows=4133, k_l=K_L
+    )
+    cluster_grid = loader.GEOMETRY[arch]["GRID_RULE"] == loader.GRID_RULE_CLUSTER_PAIRS
+    programs = loader.dispatch_programs(
+        world_size, arch, 4133, n, K_L, sm_count=0 if cluster_grid else 148
+    )
+    loads = [event for event in events if event[0] == "load"]
+    assert loads == [("load", name, arch) for name in programs]
+    # Every program is built before the rendezvous.
+    assert events.index(loads[-1]) < events.index(("rendezvous", "receive workspace"))
+    assert tuple(workspace.modules) == programs and workspace.program == programs[0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_launch_runs_the_program_each_call_dispatches(monkeypatch, arch, world_size):
+    state, workspace, _module, _tails = _launch_fixture(
+        monkeypatch, arch=arch, world_size=world_size
+    )
+    n = workspace.n
+    workspace.modules = {name: _Module() for name in workspace.modules}
+    expected = dict.fromkeys(workspace.modules, 0)
+    for m in (1, 129, 1000, 1024):
+        a, sa, w, sw = _operands(m, n)
+        call = _call(m, arch=arch, world_size=world_size)
+        out = _CudaLike((m, n), torch.bfloat16)
+        backend._launch(state, workspace, call, a, sa, w, sw, out)
+        program = loader.call_program(
+            world_size, arch, 1024, m, n, K_L, sm_count=workspace.sm_count
+        )
+        expected[program] += 1
+    assert {name: len(module.calls) for name, module in workspace.modules.items()} == (
+        expected
+    )
+    assert state.calls == 4 and state.poisoned is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, world_size", DELIVERED)
+def test_launch_refuses_a_program_the_workspace_did_not_load(
+    monkeypatch, arch, world_size
+):
+    state, workspace, module, _ = _launch_fixture(
+        monkeypatch, arch=arch, world_size=world_size
+    )
+    n = workspace.n
+    workspace.modules = {workspace.program: module}
+    for m in (1, 129, 1000):
+        a, sa, w, sw = _operands(m, n)
+        call = _call(m, arch=arch, world_size=world_size)
+        out = _CudaLike((m, n), torch.bfloat16)
+        program = loader.call_program(
+            world_size, arch, 1024, m, n, K_L, sm_count=workspace.sm_count
+        )
+        if program == workspace.program:
+            backend._launch(state, workspace, call, a, sa, w, sw, out)
+            continue
+        calls = len(module.calls)
+        with pytest.raises(RuntimeError, match="did not load program"):
+            backend._launch(state, workspace, call, a, sa, w, sw, out)
+        assert len(module.calls) == calls
     assert state.poisoned is False
 
 
