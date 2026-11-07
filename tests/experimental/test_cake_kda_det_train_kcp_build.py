@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_build = cake_package("cake_kda_det_train_kcp", "cake_build")
 cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")

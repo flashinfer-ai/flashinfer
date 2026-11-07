@@ -45,7 +45,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named through ``cake_package`` only; nothing
 # else of flashinfer is imported here.  The facade and the numerical-mode

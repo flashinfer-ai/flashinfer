@@ -378,7 +378,7 @@ no l2n stage).
 Tests:
 
 * `tests/experimental/test_cake_kda_train.py`: the backend suite against the
-  FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
+  FP64 reference of `tests/experimental/test_helpers/cake_kda_det_train_reference.py`,
   the comparison with the deterministic package, the hand-off twins'
   records and rows, and the tape WY twin's record, rule and tape backward.
 * `tests/experimental/test_cake_kda_train_api.py`: the facade, the mode

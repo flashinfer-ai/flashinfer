@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flashinfer import cake_lm_head_det_train as det_public  # noqa: E402
 from flashinfer import cake_lm_head_nondet_train as public  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
     DEFAULT_V,
     make_inputs,

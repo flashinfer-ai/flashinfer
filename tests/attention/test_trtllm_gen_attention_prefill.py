@@ -21,8 +21,10 @@ from flashinfer.mla import (
     smaller_mla_dimensions,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
-from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_with_mismatch_tolerance,
+)
 
 from tests.attention.test_trtllm_gen_attention_decode import (
     DTYPE_MAP,

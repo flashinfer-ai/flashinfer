@@ -19,7 +19,7 @@ import torch
 from flashinfer import gdn_prefill as prefill_mod
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit import cake_gdn as cake_gdn
-from tests.test_helpers import cake_profiler
+from tests.cake.test_helpers import cake_profiler
 
 
 @pytest.fixture(autouse=True)
@@ -1166,7 +1166,7 @@ def _forbidden_sync_names(names):
 def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
     """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window).
 
-    Sentinel kernels open and close the window (``tests.test_helpers.cake_profiler``): a
+    Sentinel kernels open and close the window (``tests.cake.test_helpers.cake_profiler``): a
     session whose device records miss a leading or the trailing one lost CUDA activity
     (some torch / CUPTI builds of the nightly images do), so the window is profiled again;
     after ``attempts`` such sessions the test is skipped.  The sentinels' own records are
@@ -1742,7 +1742,7 @@ def _live_arch(case):
 def _device_kernel_names(fn):
     """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded).
 
-    ``tests.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
+    ``tests.cake.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
     session that lost its CUDA records; ``fn`` runs once more as the profiler's warm-up call.
     """
 

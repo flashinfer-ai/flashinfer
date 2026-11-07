@@ -75,13 +75,13 @@ from tests.experimental.test_cake_kda_det_train_kcp_dist import (
     _requested,
     _to_global,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     error_metrics,
     kda_exact_forward,
     make_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")

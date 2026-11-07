@@ -55,12 +55,12 @@ import torch
 import flashinfer.cake_kda_det_train as det_api
 import flashinfer.cake_kda_train as facade
 from flashinfer.api_logging import ExperimentalWarning
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake.cake_kda_train")
 cake_backend = cake_package("cake.cake_kda_train", "cake_backend")

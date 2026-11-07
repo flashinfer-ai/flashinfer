@@ -636,7 +636,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     from flashinfer.experimental.cake.cake_rmsnorm_nondet_train import (
         cake_windows as windows,
     )
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     arch = loader.device_arch(_device().index or 0)
     found = _single_window(arch)
@@ -675,7 +675,7 @@ def test_a_single_kernel_window_launches_exactly_one_kernel(no_determinism) -> N
     torch.cuda.synchronize()
     # Every CUDA activity of the call, memsets and copies included, read
     # between sentinel kernels that prove the session kept the whole window (a
-    # session can lose its device records; see tests.test_helpers.cake_profiler).
+    # session can lose its device records; see tests.cake.test_helpers.cake_profiler).
     # When every session lost them, the workspace is still checked before the
     # launch count is skipped.
     lost = None

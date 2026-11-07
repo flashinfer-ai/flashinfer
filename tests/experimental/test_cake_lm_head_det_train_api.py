@@ -25,7 +25,7 @@ read when the module is imported and applied when it first reaches the backend. 
 tests here cover that wrapper: the (absent) marking, each variable's fallback and parsing, the
 cache configuration and, on a supported device, the pass-down through the public
 entry.  The backend tests live in ``test_cake_lm_head_det_train.py``, which imports the
-package only through ``tests.test_helpers.cake_package`` and reads no environment
+package only through ``tests.cake.test_helpers.cake_package`` and reads no environment
 variable.
 """
 
@@ -52,7 +52,7 @@ from flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend import (
     generated_program_available,
     stages_for_entry,
 )
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
 
 SEED = 20260930
 # Host-layer shapes (the wrapper's own checks never reach a kernel).

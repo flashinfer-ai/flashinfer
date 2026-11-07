@@ -45,15 +45,15 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     elementwise_gate,
     error_metrics,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_train", "cake_jit")

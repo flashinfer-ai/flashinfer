@@ -36,7 +36,7 @@ import torch
 
 import flashinfer.cake_lm_head_det_train as public
 from flashinfer.api_logging import ExperimentalWarning
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
 
 pytestmark = pytest.mark.cpu_only
 

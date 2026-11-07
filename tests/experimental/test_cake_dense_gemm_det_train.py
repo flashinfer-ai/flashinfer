@@ -28,7 +28,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.

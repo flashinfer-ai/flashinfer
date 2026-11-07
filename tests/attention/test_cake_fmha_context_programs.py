@@ -49,7 +49,9 @@ from flashinfer.utils import (
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
 )
-from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_with_mismatch_tolerance,
+)
 
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _COMPONENTS = ("context_bf16", "context_fp8", "context_nvfp4")

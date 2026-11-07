@@ -59,7 +59,10 @@ from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
     _same,
     _setup,
 )
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 # W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions;

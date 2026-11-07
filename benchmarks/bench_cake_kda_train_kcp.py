@@ -223,7 +223,7 @@ from flashinfer.experimental.cake_kda_det_train_kcp import (  # noqa: E402
 from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
     cake_kcp as nd_kcp,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     D,
     LOWER_BOUND,
     make_inputs,

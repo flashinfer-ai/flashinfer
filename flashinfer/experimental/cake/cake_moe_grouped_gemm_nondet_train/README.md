@@ -410,7 +410,7 @@ python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --help
 ```
 
 `test_cake_moe_grouped_gemm_nondet_train.py` (the backend suite, through
-`tests.test_helpers.cake_package("cake_moe_grouped_gemm_nondet_train")`) checks every
+`tests.cake.test_helpers.cake_package("cake_moe_grouped_gemm_nondet_train")`) checks every
 op, output dtype and stage form against a per-group fp64 reference (worst case
 over repeats), empty groups, the #6570 shape relaunched and on concurrent
 streams, CUDA graph replay with changed offsets, checkpointing, gradient

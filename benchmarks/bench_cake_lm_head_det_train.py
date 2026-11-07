@@ -91,7 +91,7 @@ from flashinfer.cake_lm_head_det_train import (
 )  # noqa: E402
 from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
     DEFAULT_LOSS_DIV,
     DEFAULT_V,

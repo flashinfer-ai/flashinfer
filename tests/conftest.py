@@ -39,7 +39,7 @@ _patch_cutlass_dsl_operand_major_mode()
 import flashinfer
 from flashinfer.jit import JitSpec, JitSpecNvcc, MissingJITCacheError
 
-pytest_plugins = ["tests.test_helpers.parametrize"]
+pytest_plugins = ["tests.infra.test_helpers.parametrize"]
 
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)

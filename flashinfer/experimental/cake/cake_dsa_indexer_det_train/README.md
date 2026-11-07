@@ -106,7 +106,7 @@ from this reduction (registry field `NUMERICS["zero_sign_policy"] =
 "positive_accumulator"`).  Ordering rule: `+0.0` and `-0.0` compare equal, an
 equal-score tie goes to the larger key id, and the written score keeps the
 computed bits -- it is never canonicalised.  The reference in
-`tests/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
+`tests/experimental/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
 model, so the bit-exact test cases compare like with like.
 
 ## FP8 form
@@ -395,12 +395,12 @@ per entry.  `csrc/.clang-format` disables formatting so the digests stay valid.
 ## Tests and benchmark
 
 Tests: `tests/experimental/test_cake_dsa_indexer_det_train.py` (the backend suite, which
-imports the package only through `tests/test_helpers/cake_package.py`),
+imports the package only through `tests/cake/test_helpers/cake_package.py`),
 `tests/experimental/test_cake_dsa_indexer_det_train_api.py` (the
 `flashinfer.cake_dsa_indexer_det_train` entry points) and
 `tests/experimental/test_cake_dsa_indexer_det_train_names.py` (the #8928 naming
 rules), with the independent
-FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
+FP64 / FP32 reference in `tests/experimental/test_helpers/cake_dsa_indexer_reference.py`
 (exact semantic cases incl. cutoff ties, all-equal scores, mixed signed zeros
 at the boundary with bit checks, negative scores and a few winners over a
 large tie; packed causality incl. explicit positive and negative offsets,
