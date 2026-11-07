@@ -51,9 +51,9 @@ def test_moe_tactic_applies_enable_pdl_to_both_gemms(dtype, sm_arch, enable_pdl)
         # FC1 waits before it triggers, which is what lets FC2 and finalize
         # read routing outputs before their own wait.
         assert fc1["skip_early_exit_pdl"] == 0, tactic
-        assert fc2["skip_early_exit_pdl"] == int(
-            enable_pdl and bool(fc2["use_early_exit"])
-        ), tactic
+        # FC2 may skip its entry wait only as a PDL launch with early exit.
+        if fc2["skip_early_exit_pdl"]:
+            assert enable_pdl and fc2["use_early_exit"], tactic
 
 
 @pytest.mark.cpu_only

@@ -396,6 +396,8 @@ class TestPrimsTsUnifiedValidation:
         # enable_pdl=None follows device support.
         monkeypatch.setattr("flashinfer.utils.device_support_pdl", lambda _: True)
         assert runner(None).get_cache_key_extras([]) == pdl_on.get_cache_key_extras([])
+        monkeypatch.setattr("flashinfer.utils.device_support_pdl", lambda _: False)
+        assert runner(None).get_cache_key_extras([]) == pdl_off.get_cache_key_extras([])
 
     def test_staged_routing_placeholders_match_bf16_runner(self):
         runner = self._runner(_config(execution=ExecutionConfig(enable_pdl=False)))
