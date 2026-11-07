@@ -509,10 +509,36 @@ def test_the_wy_stage_follows_the_architecture() -> None:
         "sm_103a": "wy_tc2",
         "sm_107a": "wy_tc2",
     }
-    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
-    assert (
-        cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
+    # wy_tc2 reads v in place: wy_tc's arguments and v's token pitch in heads
+    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == (
+        *cake_chain.LAUNCH_ARGS["wy_tc"],
+        "v_row_heads",
     )
+    plan, plan2 = (cake_jit.MODULES[name]["arg_plan"] for name in ("wy_tc", "wy_tc2"))
+    assert [arg for arg in plan2 if arg != ["parameter", "v_row_heads"]] == plan
+
+
+def test_v_rows_reads_whole_head_rows_in_place() -> None:
+    # the stages that read v take its token pitch in 128-element heads: the value heads of a packed
+    # [T, (2 H + HV) * 128] row, contiguous rows, and leading axes that fold into the token axis; other layouts
+    # are copied (None)
+    tokens, heads, v_heads = 8, 2, 6
+    width = (2 * heads + v_heads) * HEAD_DIM
+    row = torch.empty(2, tokens, width, dtype=torch.bfloat16)
+    packed = row[..., 2 * heads * HEAD_DIM :].unflatten(-1, (v_heads, HEAD_DIM))
+    assert cake_chain._v_rows(packed) == 2 * heads + v_heads
+    assert cake_chain._v_rows(packed[:1, :5]) == 2 * heads + v_heads
+    dense = torch.empty(2, tokens, v_heads, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(dense) == v_heads
+    head_major = torch.empty(1, v_heads, tokens, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(head_major.transpose(1, 2)) is None
+    half_head = torch.empty(1, tokens, v_heads * HEAD_DIM + 64, dtype=torch.bfloat16)
+    half_head = half_head[..., : v_heads * HEAD_DIM].unflatten(-1, (v_heads, HEAD_DIM))
+    assert cake_chain._v_rows(half_head) is None
+    batch_minor = torch.empty(tokens, 2, v_heads, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(batch_minor.transpose(0, 1)) is None
+    flat = torch.empty(tokens * v_heads * HEAD_DIM + 1, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(flat[1:].view(1, tokens, v_heads, HEAD_DIM)) is None
 
 
 def test_the_value_half_split_rule() -> None:

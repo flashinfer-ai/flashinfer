@@ -156,7 +156,8 @@ STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
 _TAPE_MODE = "det"
 
 # Kernel parameter names of every stage in call-site order; a delivered record whose parameters are these names in
-# another order is launched with the values reordered.
+# another order is launched with the values reordered.  The stages that read v (wy_tc2, wy_bwd, the tails) take its
+# token pitch in heads last (``v_row_heads``, :func:`_v_rows`).
 _PREP_ARGS = ("q", "k", "g", "beta", "beta32_out", "qn", "kn", "rstd_q", "rstd_k", "g_cs", "chunk_start", "chunk_len",
               "num_heads", "num_v_heads", "normalize_qk")  # fmt: skip
 # prep_tma takes q / k (dhu_tc2 qn / kn / w / do) as the tensors its binding encodes the tensor maps from
@@ -208,7 +209,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma": _PREP_TMA_ARGS,
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
-    "wy_tc2": _WY_ARGS,
+    "wy_tc2": _WY_ARGS + ("v_row_heads",),
     "fwd_ho": _FWD_HO_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
@@ -217,15 +218,15 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "dhu_tc2_wavefront": _DHU_TC2_WAVEFRONT_ARGS,
     "dhu_tc2_wavefront_split": _DHU_TC2_WAVEFRONT_ARGS,
     "dqkwg": _DQKWG_ARGS,
-    "wy_bwd": _WY_BWD_ARGS,
-    "wy_bwd_bf16": _WY_BWD_ARGS,
+    "wy_bwd": _WY_BWD_ARGS + ("v_row_heads",),
+    "wy_bwd_bf16": _WY_BWD_ARGS + ("v_row_heads",),
     "finalize": _FINALIZE_ARGS,
     "finalize_mlp": _FINALIZE_ARGS,
-    "tail_g2": _TAIL_ARGS,
-    "tail_g2_bf16": _TAIL_ARGS,
-    "tail_g2_bf16_wavefront": _TAIL_WAVEFRONT_ARGS,
-    "tail_g3": _TAIL_ARGS,
-    "tail_g3_bf16": _TAIL_ARGS,
+    "tail_g2": _TAIL_ARGS + ("v_row_heads",),
+    "tail_g2_bf16": _TAIL_ARGS + ("v_row_heads",),
+    "tail_g2_bf16_wavefront": _TAIL_WAVEFRONT_ARGS + ("v_row_heads",),
+    "tail_g3": _TAIL_ARGS + ("v_row_heads",),
+    "tail_g3_bf16": _TAIL_ARGS + ("v_row_heads",),
     "dhu_pre_dvl_r64k1": _DHU_PRE_DVL_ARGS,
     **{f"fwd_h_r{vb}k{ks}": _FWD_H_ARGS for vb, ks in REG_SCAN_CONFIGS},
     **{f"fwd_h_r{vb}k{ks}_split": _FWD_H_SPLIT_ARGS for vb, ks in PRESCAN_CONFIGS},
@@ -1408,9 +1409,49 @@ def _serial_adjoint_plan(
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
 # grid needs a second, short wave, slots < CTAs <= window x slots, prep_tma elsewhere.  Both give the same bits.  The
-# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.
+# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.  The tensor maps read q and k
+# through their strides, so prep_tma takes head views of a packed row (token stride (2 H + HV) x 128) in place; the
+# plain prep reads contiguous rows only.
 PREP_TMA_CONSTANTS = ("ctas_per_sm", "window")
 TMA_ALIGN_BYTES = 16
+
+
+def _tma_rows(t: torch.Tensor) -> bool:
+    """Whether the ``prep_tma`` tensor map of ``t`` (``[..., T, H, 128]``) reads it in place: a unit channel stride,
+    16-byte aligned head and token strides and address, and leading axes that fold into the token axis (the binding's
+    ``check_dense_leading_dims``)."""
+    if t.dim() < 3 or t.stride(-1) != 1 or t.stride(-3) <= 0:
+        return False
+    size = t.element_size()
+    head_bytes, token_bytes = t.stride(-2) * size, t.stride(-3) * size
+    if head_bytes % TMA_ALIGN_BYTES or token_bytes % TMA_ALIGN_BYTES:
+        return False
+    if t.data_ptr() % TMA_ALIGN_BYTES:
+        return False
+    expected = t.stride(-3)
+    for axis in range(t.dim() - 4, -1, -1):
+        expected *= t.size(axis + 1)
+        if t.size(axis) > 1 and t.stride(axis) != expected:
+            return False
+    return True
+
+
+def _v_rows(v: torch.Tensor) -> int | None:
+    """The token pitch of ``v`` (``[..., T, HV, 128]``) in 128-element heads when the stages that read v take it in
+    place (``wy_tc2``, ``wy_bwd``, the tails: a packed row's value heads, or contiguous rows), else ``None``: unit
+    element stride, a head pitch of 128 elements, a token pitch of whole heads and at least ``HV`` of them, a
+    16-byte aligned base (the 16-byte ``cp.async`` rows), and leading axes that flatten into the token axis."""
+    if v.dim() < 3 or v.stride(-1) != 1 or v.stride(-2) != HEAD_DIM:
+        return None
+    pitch = v.stride(-3)
+    if pitch % HEAD_DIM or pitch < v.size(-2) * HEAD_DIM or v.data_ptr() % 16:
+        return None
+    expected = pitch
+    for axis in range(v.dim() - 4, -1, -1):
+        expected *= v.size(axis + 1)
+        if v.size(axis) > 1 and v.stride(axis) != expected:
+            return None
+    return pitch // HEAD_DIM
 
 
 @cache
@@ -1748,10 +1789,12 @@ def _launch_wy(
     total_tokens,
     *,
     recompute,
+    v_rows,
 ):
     w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
-    _launch(wy_stage(arch), meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start,
-            meta.chunk_len, num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
+    stage = wy_stage(arch)
+    _launch(stage, meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
+            num_heads, num_v_heads, 1 if recompute else 0, *((v_rows,) if stage == "wy_tc2" else ()))  # fmt: skip
     return w, u
 
 
@@ -1936,15 +1979,16 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     # the length of a partial chunk (its 64-row tiles) while wy_tc(B) writes them: such rows enter fwd_ho only
     # through selects (v_new rows past the chunk's length are 0), so they do not change a bit.  A kernel that used them
     # arithmetically (a multiply by a zero mask) would make this form nondeterministic.
-    v, beta32, A = wy
+    v, beta32, A, v_rows = wy
     groups = cast("StreamGroups", meta.fwd_groups)
     n, na, ca = segs.num_segments, groups.split, groups.split_chunk
 
     wy_name = wy_stage(arch)
+    v_args = (v_rows,) if wy_name == "wy_tc2" else ()
 
     def wy_tc(c0, c1):
         _launch(wy_name, c1 - c0, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start[c0:c1],
-                meta.chunk_len[c0:c1], num_heads, num_v_heads, 0)  # fmt: skip
+                meta.chunk_len[c0:c1], num_heads, num_v_heads, 0, *v_args)  # fmt: skip
 
     def fwd_ho(s0, s1):
         _launch("fwd_ho", (s1 - s0) * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o,
@@ -1987,7 +2031,18 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    # q and k stay views when prep_tma reads them in place (a packed row's head views); v stays a view when the
+    # stages that read it take its row pitch (wy_tc reads contiguous rows only)
+    in_place = _tma_rows(q) and _tma_rows(k)
+    if not in_place:
+        q, k = q.contiguous(), k.contiguous()
+    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
+    if prep != "prep_tma" and in_place:
+        q, k = q.contiguous(), k.contiguous()
+    v_rows = _v_rows(v) if wy_stage(arch) == "wy_tc2" else None
+    if v_rows is None:
+        v = v.contiguous()
+        v_rows = num_v_heads
     g32 = g.contiguous()
     if g32.dtype != torch.float32:
         g32 = g32.float()
@@ -2004,7 +2059,6 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
     rstd_q = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     rstd_k = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     g_cs = torch.empty((total_tokens, num_v_heads), dtype=torch.float32, device=device)
-    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
     _launch(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks, num_heads if prep == "prep_tma" else num_v_heads,
             1, q, k, g32, beta, beta32, qn, kn, rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads,
             num_v_heads, 1 if normalize_qk else 0)  # fmt: skip
@@ -2022,11 +2076,12 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
             num_v_heads,
             total_tokens,
             recompute=False,
+            v_rows=v_rows,
         )
         wy = None
     else:  # wy_tc runs with fwd_ho as two sequence groups
         w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
-        wy = (v, beta32, A)
+        wy = (v, beta32, A, v_rows)
     workspaces = _workspaces(options)
     table = workspaces.table(_tensor_index(kn))
     h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, _table_rows(initial_state, meta), meta,
@@ -2069,6 +2124,9 @@ def cake_gdn_det_train_backward(
     device = qn.device
     index = _tensor_index(qn)
     table = workspaces.table(index)
+    v_rows = _v_rows(v)
+    if v_rows is None:  # a tape whose v is not one the stages read in place
+        v, v_rows = v.contiguous(), num_v_heads
     do = do.contiguous()
     if initial_state is None:
         initial_state = forward.get("initial_state")
@@ -2086,6 +2144,7 @@ def cake_gdn_det_train_backward(
             num_v_heads,
             total_tokens,
             recompute=True,
+            v_rows=v_rows,
         )
     else:
         w, u = forward["w"], forward["u"]
@@ -2248,14 +2307,14 @@ def cake_gdn_det_train_backward(
                     _launch("tail_g2_bf16_wavefront", meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"],
                             forward["rstd_k"], v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta,
                             meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, scale, normalize, flags,
-                            order)  # fmt: skip
+                            order, v_rows)  # fmt: skip
             finally:
                 join.record(side)  # the join
                 main.wait_event(join)
         elif groups is None:
             _launch(tail, meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
                     dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start, meta.chunk_len, num_heads,
-                    num_v_heads, scale, normalize)  # fmt: skip
+                    num_v_heads, scale, normalize, v_rows)  # fmt: skip
         else:
             # R form: the caller's stream runs dhu_tc2 of group A (the full rounds), then the tail of A while the side
             # stream runs dhu_tc2 of group B (the partial round), then joins it and runs the tail of B
@@ -2270,7 +2329,7 @@ def cake_gdn_det_train_backward(
             def tail_chunks(c0, c1):
                 _launch(tail, (c1 - c0) * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
                         dv2, h[c0:c1], dh[c0:c1], g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start[c0:c1],
-                        meta.chunk_len[c0:c1], num_heads, num_v_heads, scale, normalize)  # fmt: skip
+                        meta.chunk_len[c0:c1], num_heads, num_v_heads, scale, normalize, v_rows)  # fmt: skip
 
             main = torch.cuda.current_stream(index)
             side = _side_stream(index, main)
@@ -2303,7 +2362,7 @@ def cake_gdn_det_train_backward(
         table, "b_dg2", (total_tokens, num_v_heads), torch.float32, device
     )
     _launch("wy_bwd_bf16" if dbeta_bf16 else "wy_bwd", meta.num_chunks, num_v_heads, 1, kn, v, A, dw, dv2, g_cs,
-            beta32, dk2, dv, dbeta, dg2, meta.chunk_start, meta.chunk_len, num_heads, num_v_heads)  # fmt: skip
+            beta32, dk2, dv, dbeta, dg2, meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, v_rows)  # fmt: skip
     dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
     dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
     dg = torch.empty(
