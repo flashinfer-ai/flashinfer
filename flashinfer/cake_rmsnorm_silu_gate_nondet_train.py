@@ -43,7 +43,7 @@ streams.  The kernels are those of the standalone package
 - The forward computes ``rstd`` with ``rsqrt.approx`` and the SiLU gate with
   ``ex2.approx`` of ``-|z| log2(e)`` and ``rcp.approx`` (no flush of a nonzero
   sigmoid of a normal ``z``); its bits are not the deterministic package's.
-  Up to 48 rows per SM on SM100 and SM103 (59 on SM107) a forward with 16
+  Up to 12 rows per SM on SM100 and SM103 (59 on SM107) a forward with 16
   threads to a row runs, and past that forwards whose CTAs each walk several
   row blocks, in bands of rows per SM.  Each forward program's arithmetic is
   fixed, but the programs associate a row's sum of squares differently (the
@@ -228,7 +228,7 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
     inputs on the same device (its bits are not the deterministic package's;
     that one is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`).
-    Up to 48 rows per SM on SM100 / SM103 (59 on SM107) a forward with 16
+    Up to 12 rows per SM on SM100 / SM103 (59 on SM107) a forward with 16
     threads to a row runs, and past that forwards whose CTAs each walk several
     row blocks, in bands of rows per SM; the programs associate a row's sum of
     squares differently (the row count and the SM count pick the program), so

@@ -103,7 +103,7 @@ Host design (the input layout rules are the deterministic package's):
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count, the forward's by the bands of rows per SM of
   ``cake_jit.FORWARD_BANDS``): the forward launches one 64-thread CTA per
-  block of 8 rows; the short forward (up to 48 rows per SM on sm_100a and
+  block of 8 rows; the short forward (up to 12 rows per SM on sm_100a and
   sm_103a, 59 on sm_107a) one 256-thread CTA per block of 16 rows; and the
   persistent forwards a grid whose CTA ``b`` walks the blocks ``b``, ``b +
   grid``, ..., loading each next block while it computes the current one, in

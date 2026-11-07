@@ -122,8 +122,8 @@ device of `SMs` SMs runs the first band with `rows <= last * SMs`):
 
 | architecture | forward bands (rows per SM) |
 | --- | --- |
-| `sm_100a` | 1-48 `short`, 49-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
-| `sm_103a` | 1-48 `short`, 49-250 `mid`, 251-550 `xlong`, past 550 `mid` |
+| `sm_100a` | 1-12 `short`, 13-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
+| `sm_103a` | 1-12 `short`, 13-250 `mid`, 251-550 `xlong`, past 550 `mid` |
 | `sm_107a` | 1-59 `short`, 60-200 `mid`, 201-520 `xlong`, past 520 `mid` |
 
 The small-row backward bands (`BACKWARD_BANDS`, rows per call; a call with

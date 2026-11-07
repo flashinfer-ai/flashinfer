@@ -1113,19 +1113,22 @@ ROUTES: dict[str, dict[str, str]] = {
 # ``rows`` rows on a device of ``sm_count`` SMs runs the module of the first
 # band's routed ``role`` with ``rows <= last * sm_count``.  The cuts are the
 # measured fastest program at each rows per SM (CUPTI, cold L2), except the
-# short forward's end on sm_107a, 59 rows per SM, where its grid of one
-# 16-row block a CTA still fits one wave of 4 CTAs per SM on all SMs but 16
-# (from 205 SMs).  Host plan only: a new cut needs no new program.
+# short forward's end: 12 rows per SM on sm_100a and sm_103a, where its grid
+# of one 16-row block a CTA has at most as many CTAs as the SMs less 16 (from
+# 64 SMs), and 59 on sm_107a, where it fits one wave of 4 CTAs per SM on all
+# SMs but 16 (from 205 SMs), so beside a kernel holding 16 SMs it ends no
+# later than the plain forward.  Host plan only: a new cut needs no new
+# program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
-        (48, "fwd_short"),
+        (12, "fwd_short"),
         (140, "fwd_mid"),
         (400, "fwd_long"),
         (1000, "fwd_xlong"),
         (None, "fwd_mid"),
     ),
     "sm_103a": (
-        (48, "fwd_short"),
+        (12, "fwd_short"),
         (250, "fwd_mid"),
         (550, "fwd_xlong"),
         (None, "fwd_mid"),
