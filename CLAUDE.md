@@ -49,6 +49,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
+| Bound the PCIe IPC all-reduce wait for peers (seconds; a missing peer then traps instead of hanging; unset or `0` keeps the unbounded wait) | `export FLASHINFER_PCIE_IPC_TIMEOUT_S=60` |
 | Plan cake_fmha small-M decode splits on the device's SM count without reading the launch stream (on by default: splits follow the stream's SM partition; turn it off only when no small-M launch runs on a green context; `flashinfer.green_ctx` helpers turn it back on) | `export FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0` |
 | Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
 
