@@ -81,8 +81,8 @@ raises PyTorch's alert after its checks and before it allocates or launches
 anything: a `RuntimeError`, or with `warn_only=True` a `UserWarning`, after
 which the non-deterministic backward runs.  A call without a (query, key) pair
 launches nothing and does not alert.  Nothing falls back to a deterministic
-implementation; the deterministic package with the same interface is
-`flashinfer.cake_gqa_det_train`.
+implementation; the deterministic package `flashinfer.cake_gqa_det_train` is
+planned.
 
 ## Checkpointing and memory
 
