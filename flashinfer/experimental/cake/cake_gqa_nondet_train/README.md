@@ -164,9 +164,10 @@ device stream gets its own default workspace.
 - `H_q / H_kv` must be even.
 - `dout` of the low-level backward must be contiguous (autograd makes it so).
 - `sm_100a`, `sm_103a` and `sm_107a` only.
-- Tiny calls are slower than the previous version of this package: a
+- Tiny calls can be slower than the previous version of this package: a
   training step (forward and backward, row-map form, 24 query and 4 KV heads)
-  with up to about 2K query and 8K key tokens, 0.1 to 0.4 ms long, takes 40
-  to 100 us more for the extra launches (`bwd_plan`, the dQ GEMM, the fold
-  and the row-map sort).  From 16K query and 25K key tokens up, a step is 2
-  to 9 % faster on a GB200 and 5 to 13 % faster on an R200.
+  with up to about 2K query and 8K key tokens, 0.1 to 0.5 ms long, takes up
+  to about 0.1 ms more for the extra launches (`bwd_plan`, the dQ GEMM, the
+  fold and the row-map sort).  From 16K query and 25K key tokens up, a step
+  takes 2 to 8 % less time on a GB200, 6 to 11 % less on a B300 and 5 to
+  14 % less on an R200.
