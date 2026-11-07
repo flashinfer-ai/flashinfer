@@ -216,7 +216,8 @@ _STAGE_BINDINGS = {
 }
 # Stage fields one architecture replaces (the kernel symbol and bindings; the
 # launch contract otherwise holds): on sm_107a, stage_inputs also builds every
-# owner's route codes, so input_arrive only sends them.
+# owner's route codes, so input_arrive only sends them; local_unpermute pushes
+# each partial row into its source's local_partials (combine then reads them locally).
 _ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
     "sm_107a": {
         "stage_inputs": {
@@ -232,6 +233,18 @@ _ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 "pg_flags",
                 "route_codes_out",
                 "route_codes_peers",
+            ),
+        },
+        "local_unpermute": {
+            "symbol": "kernel_rank_major_exact_unpermute_v11",
+            "bindings": (
+                "expert_output",
+                "topk_weights",
+                "token_to_permuted",
+                "local_partials_peers",
+                "hidden_size",
+                "active_tokens_per_rank",
+                "pg_rank",
             ),
         },
     },
@@ -1671,6 +1684,17 @@ class BlackwellBf16RankMajorSession:
                 _INTERMEDIATE_SIZE,
             )
             return values, (*self._pointer_types(6), ctypes.c_int32)
+        if name == "local_unpermute" and self._arch == "sm_107a":
+            values = (
+                p(self._gemm2_output),
+                p(self._recv_weights),
+                p(self._token_to_permuted),
+                p(self._local_partials.peers),
+                _HIDDEN_SIZE,
+                active_tokens_per_rank,
+                self._rank,
+            )
+            return values, (*self._pointer_types(4), *(ctypes.c_int32,) * 3)
         if name == "local_unpermute":
             values = (
                 p(self._gemm2_output),

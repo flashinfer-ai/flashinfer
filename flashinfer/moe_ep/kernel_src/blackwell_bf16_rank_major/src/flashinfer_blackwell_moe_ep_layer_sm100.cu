@@ -4035,6 +4035,136 @@ kernel_rank_major_exact_unpermute_v8(__nv_bfloat16* __restrict__ expert_output, 
         }
     }
 }
+#if __CUDA_ARCH__ == 1070
+
+__global__ __launch_bounds__(128) void
+kernel_rank_major_exact_unpermute_v11(__nv_bfloat16* __restrict__ expert_output, float* __restrict__ topk_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* const* __restrict__ local_partials_peers, unsigned int hidden_size, int active_tokens_per_rank, int32_t pg_rank)
+{
+    // sm_107a: the arithmetic of kernel_rank_major_exact_unpermute_v8; the partial row goes with plain (weak) stores
+    // into the source's local_partials[this rank * 128 + token] (not written when no route of the token is owned here:
+    // combine adds +0.0 for this owner). No fence: partial_arrive_v1 (the next grid) waits for this grid's completion
+    // (griddepcontrol.wait: all memory operations of the prerequisite grid are performed and visible to it) before its
+    // st.release.sys to the source, whose combine acquires it (ld.acquire.sys) before it reads the row.
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    float* weights_stage = reinterpret_cast<float*>(smem_raw + 0);
+    const int weights_stage_addr = smem + 0;
+    int* inverse_stage = reinterpret_cast<int*>(smem_raw + 32);
+    const int inverse_stage_addr = smem + 32;
+
+    // === Task calls (dependency order) ===
+    int active_token = bid;
+    int src_rank = active_token / active_tokens_per_rank;
+    int src_token = active_token - src_rank * active_tokens_per_rank;
+    unsigned int token = (unsigned int)(src_rank * 128 + src_token);
+    unsigned int route_base = token * 8;
+    // topk_weights / token_to_permuted are written by earlier grids (route kernel or dispatch route CTA): every read of
+    // them follows griddepcontrol.wait. Before the wait only an L2 prefetch hint of their two 32-byte lines is issued
+    // (no memory-model effect; the values are loaded after the wait).
+    if (tid == 0) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(topk_weights + route_base) : "memory");
+    } else if (tid == 32) {
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(token_to_permuted + route_base) : "memory");
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (tid < 8) {
+        weights_stage[tid] = topk_weights[route_base + (unsigned int)tid];
+        inverse_stage[tid] = token_to_permuted[route_base + (unsigned int)tid];
+    }
+    __syncthreads();
+    float weights[8];
+    int rows[8];
+    unsigned long long row_offsets[8];
+    #pragma unroll
+    for (int route_slot = 0; route_slot < 8; route_slot++) {
+        float staged_weight = weights_stage[route_slot];
+        __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(staged_weight);
+        float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+        weights[route_slot] = _cvt_f32_0;
+        rows[route_slot] = inverse_stage[route_slot];
+        row_offsets[route_slot] = (unsigned long long)rows[route_slot] * (unsigned long long)hidden_size;
+    }
+    bool any_route = false;
+    #pragma unroll
+    for (int route_slot = 0; route_slot < 8; route_slot++) {
+        any_route |= rows[route_slot] != 32768;
+    }
+    if (!any_route) {
+        return;
+    }
+    __nv_bfloat16* final_output = local_partials_peers[src_rank];
+    unsigned long long output_base = (unsigned long long)(pg_rank * 128 + src_token) * (unsigned long long)hidden_size;
+    unsigned int vector_elements = hidden_size / 8 * 8;
+    // One 1024-column chunk per CTA (grid.y = 7): one loop trip instead of seven.
+    #pragma unroll 1
+    for (unsigned int base = blockIdx.y * 1024 + tid * 8; base < vector_elements; base += 1024 * gridDim.y) {
+        float accum[8];
+        accum[0] = 0.0f;
+        accum[1] = 0.0f;
+        accum[2] = 0.0f;
+        accum[3] = 0.0f;
+        accum[4] = 0.0f;
+        accum[5] = 0.0f;
+        accum[6] = 0.0f;
+        accum[7] = 0.0f;
+        #pragma unroll
+        for (int route_slot_1 = 0; route_slot_1 < 8; route_slot_1++) {
+            float _vec_load_0[8];
+            if (rows[route_slot_1] == 32768) {
+                // Non-local route: weight 0.0 times the all-+0.0 sentinel row; apply its +0.0 term without the load.
+                #pragma unroll
+                for (int element = 0; element < 8; element++) {
+                    asm volatile("add.ftz.f32 %0, %0, 0f00000000;" : "+f"(accum[element]));
+                }
+                continue;
+            }
+            {
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(expert_output + (row_offsets[route_slot_1] + (unsigned long long)base) + 0);
+                uint4 _vld_0[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_0[_blk] = _vptr_0[_blk];
+                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_0[_pair]));
+                    }
+                }
+            }
+            #pragma unroll
+            for (int element = 0; element < 8; element++) {
+                accum[element] = accum[element] + weights[route_slot_1] * _vec_load_0[element];
+            }
+        }
+        {
+            __nv_bfloat162 _pk[4];
+            _pk[0] = __floats2bfloat162_rn(accum[0 + 0], accum[0 + 1]);
+            _pk[1] = __floats2bfloat162_rn(accum[0 + 2], accum[0 + 3]);
+            _pk[2] = __floats2bfloat162_rn(accum[0 + 4], accum[0 + 5]);
+            _pk[3] = __floats2bfloat162_rn(accum[0 + 6], accum[0 + 7]);
+            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_output + (output_base + (unsigned long long)base)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+        }
+    }
+}
+#endif
 
 } // extern "C"
 
@@ -4138,6 +4268,78 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
             owners |= 1u << (expert >> 5);
         }
     }
+#if __CUDA_ARCH__ == 1070
+    // sm_107a: every routed owner pushed its partial row of this token into local_partials[owner * 128 + token]
+    // (exact_unpermute_v11) before its partial_arrive release: acquire every owner's mailbox (the forward does not
+    // complete before all owners arrived), then sum the local rows in owner order (+0.0 for owners without a route).
+    if (tid == 0) {
+        unsigned __epoch;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(__epoch) : "l"(pg_flags[pg_rank] + 1) : "memory");
+        const unsigned* __mailbox = pg_flags[pg_rank] + 2 + (1 * 2 + (int)(__epoch & 1u)) * pg_world;
+        unsigned int pending = 0xffu;
+        while (pending != 0u) {
+            #pragma unroll 1
+            for (int peer = 0; peer < 8; peer++) {
+                if (((pending >> peer) & 1u) == 0u) {
+                    continue;
+                }
+                unsigned __v;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + peer) : "memory");
+                if (__v != __epoch) {
+                    continue;
+                }
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__mailbox + peer) : "memory");
+                if (__v != __epoch) {
+                    continue;
+                }
+                pending &= ~(1u << peer);
+            }
+        }
+    }
+    __syncthreads();
+    float acc[8];
+    #pragma unroll
+    for (int element = 0; element < 8; element++) {
+        acc[element] = 0.0f;
+    }
+    unsigned int packed[8][4];
+    #pragma unroll
+    for (int peer = 0; peer < 8; peer++) {
+        if ((owners >> peer) & 1u) {
+            // L2-coherent loads (the rows were stored by the owners' GPUs)
+            asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(packed[peer][0]), "=r"(packed[peer][1]), "=r"(packed[peer][2]), "=r"(packed[peer][3])
+                : "l"(local_partials + ((unsigned long long)(peer * 128 + token) * 7168 + (unsigned long long)chunk * 1024 + (unsigned long long)tid * 8))
+                : "memory");
+        }
+    }
+    #pragma unroll
+    for (int peer = 0; peer < 8; peer++) {
+        if ((owners >> peer) & 1u) {
+            float packed_f32[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&packed_f32[_pair * 2])[0]), "=f"((&packed_f32[_pair * 2])[1])
+                    : "r"(packed[peer][_pair]));
+            }
+            #pragma unroll
+            for (int element = 0; element < 8; element++) {
+                acc[element] = acc[element] + packed_f32[element];
+            }
+        } else {
+            // The owner holds no route of this token: its partial row is all +0.0. Add that +0.0 explicitly.
+            #pragma unroll
+            for (int element = 0; element < 8; element++) {
+                asm volatile("add.ftz.f32 %0, %0, 0f00000000;" : "+f"(acc[element]));
+            }
+        }
+    }
+#else
     if (tid == 0) {
         #pragma unroll
         for (int peer = 0; peer < 8; peer++) {
@@ -4219,6 +4421,7 @@ kernel_rank_major_combine_v3(__nv_bfloat16* __restrict__ output, int32_t pg_worl
             }
         }
     }
+#endif
     {
         __nv_bfloat162 _pk[4];
         _pk[0] = __floats2bfloat162_rn(acc[0], acc[1]);
