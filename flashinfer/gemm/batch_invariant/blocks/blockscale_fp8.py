@@ -20,13 +20,19 @@ radix of 4 steps), so the kernel is the dense fp8 kernel with three changes, all
   caller's fp32 tensors are read with their own strides (the ``K`` and ``MN`` layouts are one kernel). Scales read by the promotion
   itself, one global load per block on the epilogue's critical path, bound the kernel by the load's latency (the smem carve-out
   leaves the L1 no room for the gathered lines);
-* **the promotion** (:func:`blockscale_epilogue_loop`): the epilogue warps consume one accumulator stage per block: ``scale =
+* **the promotion** (:func:`blockscale_epilogue_loop`): eight promotion warps in two warpgroups, each warpgroup owning one
+  contiguous column half of the tile (both read the same TMEM lane quadrants at different columns; the group index is a runtime
+  value that enters addresses only -- the TMEM columns, the group's C smem stage and store pipeline, the subtile stored -- so the
+  fold is one code site; a tile of one epilogue subtile keeps one group), consume one accumulator stage per block: ``scale =
   mul.rn(s_a, s_b)`` once per thread and block from the ring stage (each thread owns one output row -- the 32x32b TMEM atom of the
   128-row CTA tile -- so one A scale and one B scale serve it for the block), ``tcgen05.ld`` of the block partial per epilogue
-  subtile, ``sum = fma.rn(scale, P, sum)`` per element -- two elements per ``fma.rn.f32x2``, each lane the same correctly
-  rounded fma -- into a **register** running sum (the tile's elements of this thread:
-  ``cta_tile_m x tile_n / 128`` fp32), then the stage is released. After the last block the running sum goes through the chain
-  (the single ``cvt.rn``) and the dense store path.
+  subtile of the half, ``sum = fma.rn(scale, P, sum)`` per element -- two elements per ``fma.rn.f32x2``, each lane the same
+  correctly rounded fma -- into a **register** running sum (the half's elements of this thread: ``cta_tile_m x tile_n / 256``
+  fp32), then each warp fences its reads and arrives on the stage's barrier. After the last block the running sum goes through the
+  chain (the single ``cvt.rn``) and the dense store path, one C smem stage and TMA-store pipeline per warpgroup. Half the tile's
+  columns per thread lets the compiler issue the half's TMEM loads back to back (a single warpgroup's thread, at the register cap,
+  waited for one load's fmas before the next load); twelve warps per CTA: the promotion warpgroups, the MMA and TMA warps and two
+  idle warps filling the third warpgroup (``setmaxnreg`` budgets whole warpgroups, per role).
 
 Why registers and not a TMEM running sum (the chunk fold's `chunk_fold_pass`): the promotion runs once per k-tile, so a TMEM sum
 would add two TMEM passes (load, store) per block on top of the partial's load; the register sum reads TMEM once per block. The
@@ -61,12 +67,8 @@ from .operands import (
     ACC_DTYPE,
     BAR_EPILOGUE,
     BAR_TMEM_ALLOC,
-    EPILOGUE_WARPS,
     IN_DT,
-    MMA_WARP,
     OUT_DT,
-    THREADS,
-    TMA_WARP,
     StaticPlan,
     TmaSetup,
     build_grid,
@@ -75,6 +77,23 @@ from .operands import (
 IN_FMT = "e4m3_bs"
 TMEM_COLS = 512  # the accumulator ring's budget: the dense body's 512 TMEM columns
 MAX_ACC_STAGES = 8  # the ring's depth is capped: beyond it the hand-off barriers cost more than the latency they hide (empirical)
+NUM_PROMO_GROUPS = 2  # the promotion warps: two warpgroups, each owning every other epilogue subtile (a column half) of the tile
+NUM_PROMO_WARPS = 4 * NUM_PROMO_GROUPS
+PROMO_WARPS = tuple(range(NUM_PROMO_WARPS))
+MMA_WARP_BS = NUM_PROMO_WARPS
+TMA_WARP_BS = NUM_PROMO_WARPS + 1
+NUM_WARPS_BS = (
+    -(-(NUM_PROMO_WARPS + 2) // 4) * 4
+)  # whole warpgroups (setmaxnreg is a warpgroup instruction); the last warps idle
+THREADS_BS = 32 * NUM_WARPS_BS
+# register budgets per thread (setmaxnreg): the promotion warps hold the running sum and two blocks' partials, the rest little;
+# the sum over the warps stays within the register file
+PROMO_REGS = 224
+UNIFORM_REGS = 56
+BAR_GROUP = (
+    BAR_EPILOGUE,
+    BAR_EPILOGUE + 2,
+)  # one named barrier per promotion warpgroup (the C stage hand-off to its TMA store)
 NUM_SCALE_STAGES = 16  # the scale ring's depth: blocks whose scales wait in smem ahead of the promotion; deeper than the operand
 # ring plus the accumulator ring, so the operand stage is always the producer's binding wait (empirical)
 
@@ -259,14 +278,20 @@ def blockscale_epilogue_loop(
     sSFB: cute.Tensor,
     k_tile_cnt: cutlass.Int32,
 ):
-    """The promotion and the store (module docstring). ``sSFA`` ``(cta_tile_m, STAGE)`` and ``sSFB`` ``(STAGE,)`` are the scale
-    ring's smem (`blockscale_producer_loop` fills a stage per block); ``tCcC_base`` the output coordinates partitioned like C (each
-    thread finds its row within the CTA tile from them)."""
+    """The promotion and the store (module docstring) by two warpgroups, each owning one contiguous column half of the tile (both
+    read the same TMEM lane quadrants -- the 32x32b atom -- at different columns; a tile of one epilogue subtile is group 0's
+    alone). Per block each thread loads the group's subtiles of the block partial back to back (the register budget of a half
+    leaves the compiler free to issue them early), folds them with packed fmas and releases the stage. The group index is a
+    runtime value that enters addresses only (TMEM columns, the C smem stage, the subtile stored), never the fold. ``sSFA``
+    ``(cta_tile_m, STAGE)`` and ``sSFB`` ``(STAGE,)`` are the scale ring's smem; ``tCcC_base`` the output coordinates partitioned
+    like C (each thread finds its row within the CTA tile from them)."""
+    g = warp_idx // 4  # this warp's promotion group
+    tidx_g = tidx % 128  # the thread within its group
     # ((ATOM_M, MMA_M), (ATOM_N, MMA_N), ...)
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
     tCcC = transform_partitioned_tensor_layout(tCcC_base)
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
-    # TMEM -> registers: one epilogue subtile per copy
+    # the epilogue subtiles (the TMA store's unit): the 128-thread tiled copy of one subtile, shared by both groups
     copy_atom_t2r = get_tmem_load_op(
         st.cta_tile_shape_mnk,
         st.c_layout,
@@ -279,30 +304,36 @@ def blockscale_epilogue_loop(
     tiled_copy_t2r = tcgen05.make_tmem_copy(
         copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
     )
-    thr_t2r = tiled_copy_t2r.get_slice(tidx)
-    tTR_tAcc_base = thr_t2r.partition_S(
-        tAcc_epi
-    )  # (T2R, T2R_M, T2R_N, SUB_M, SUB_N, STAGE)
+    thr_t2r = tiled_copy_t2r.get_slice(tidx_g)
     tCgC_epi = cute.flat_divide(
         tCgC, epi_tile
     )  # (EPI_M, EPI_N, SUB_M, SUB_N, RestM, RestN, RestL)
     tTR_gC = thr_t2r.partition_D(tCgC_epi)
+    tCcC_epi = cute.flat_divide(tCcC, epi_tile)
     tTR_cC = thr_t2r.partition_D(
-        cute.flat_divide(tCcC, epi_tile)
+        tCcC_epi
     )  # the output coordinates in the accumulator's partition
     frag_shape = tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape
-    tTR_rP = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)  # one subtile's block partial
+    tTR_rP = cute.make_rmem_tensor(
+        frag_shape, ACC_DTYPE
+    )  # one subtile's values on the way to the store
     tTR_rC = cute.make_rmem_tensor(frag_shape, st.c_dtype)
     V = cute.size(tTR_rP)
-    assert V % 2 == 0, V  # the promotion packs element pairs
-    sub_m, sub_n = (
-        cute.size(tTR_tAcc_base, mode=[3]),
-        cute.size(tTR_tAcc_base, mode=[4]),
-    )
+    sub_m, sub_n = cute.size(tAcc_epi, mode=[2]), cute.size(tAcc_epi, mode=[3])
     assert sub_m == 1, (
         "the epilogue subtiles run along N only (the CTA tile's 128 rows are one subtile row)"
     )
     subtile_cnt = sub_n
+    groups = (
+        NUM_PROMO_GROUPS if subtile_cnt >= NUM_PROMO_GROUPS else 1
+    )  # a one-subtile tile is group 0's alone
+    per_group = subtile_cnt // groups  # subtiles per group: contiguous column halves
+    assert per_group * groups == subtile_cnt, (subtile_cnt, groups)
+    cols_g = per_group * cute.size(epi_tile[1])  # this group's columns
+    assert cols_g % 2 == 0, cols_g  # the promotion packs element pairs
+    tTR_tAcc_base = thr_t2r.partition_S(
+        tAcc_epi
+    )  # (T2R, T2R_M, T2R_N, SUB_M, SUB_N, STAGE)
     # the static shape of the fragment: every element of a fragment, and of every subtile of the tile, lies on ONE output row (the
     # 32x32b TMEM atom of the 128-row CTA tile), so one A scale serves the thread for a block; the columns of a tile lie in one
     # 128-column weight scale block (tile N divides 128), so one B scale does too
@@ -319,17 +350,21 @@ def blockscale_epilogue_loop(
         cute.size(epi_tile[1]) * subtile_cnt <= SCALE_BLOCK_N
         and SCALE_BLOCK_N % (cute.size(epi_tile[1]) * subtile_cnt) == 0
     )
-    # the running sum of the tile: this thread's `subtile_cnt x V` output elements, in registers
-    tTR_rSum = cute.make_rmem_tensor((subtile_cnt * V,), ACC_DTYPE)
-    # registers -> smem
+    VW = per_group * V  # this group's elements per thread
+    bufs = [
+        cute.make_rmem_tensor(frag_shape, ACC_DTYPE) for _ in range(per_group)
+    ]  # the block partial of the group's subtiles
+    tTR_rSum = cute.make_rmem_tensor(
+        (VW,), ACC_DTYPE
+    )  # the running sum of this group's half, in registers
+    # registers -> smem -> global: each group stores through its own C stage and its own TMA-store pipeline
     copy_atom_r2s = get_smem_store_op(
         st.c_layout, st.c_dtype, ACC_DTYPE, tiled_copy_t2r
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
-    thr_r2s = tiled_copy_r2s.get_slice(tidx)
+    thr_r2s = tiled_copy_r2s.get_slice(tidx_g)
     tRS_sC = thr_r2s.partition_D(sC)
     tRS_rC = tiled_copy_r2s.retile(tTR_rC)
-    # smem -> global (TMA store)
     bSG_sC, bSG_gC_all = cpasync.tma_partition(
         tma_atom_c,
         0,
@@ -337,35 +372,41 @@ def blockscale_epilogue_loop(
         cute.group_modes(sC, 0, 2),
         cute.group_modes(tCgC_epi, 0, 2),
     )
+    assert st.num_c_stage >= NUM_PROMO_GROUPS, st.num_c_stage
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, st.num_acc_stage
-    )
-    c_pipeline = pipeline.PipelineTmaStore.create(
-        num_stages=st.num_c_stage,
-        producer_group=pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(EPILOGUE_WARPS)
-        ),
-    )
-    sync = pipeline.NamedBarrier(
-        barrier_id=BAR_EPILOGUE, num_threads=32 * len(EPILOGUE_WARPS)
     )
     scale_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, NUM_SCALE_STAGES
     )
+    c_pipeline0 = pipeline.PipelineTmaStore.create(
+        num_stages=1,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+    )
+    c_pipeline1 = pipeline.PipelineTmaStore.create(
+        num_stages=1,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+    )
+    sync0 = pipeline.NamedBarrier(barrier_id=BAR_GROUP[0], num_threads=128)
+    sync1 = pipeline.NamedBarrier(barrier_id=BAR_GROUP[1], num_threads=128)
+    gsel = g if groups == 2 else cutlass.Int32(0)
+    active = (
+        (g == 0) if groups == 1 else (g >= 0)
+    )  # a one-subtile tile: group 1 has no columns
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         coord = work_tile.tile_idx
         mnl = (coord[0] // atom_thr_size, coord[1], coord[2])
-        tile_sched.advance_to_next_work()  # pre-advance: the executed count includes this tile
+        tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
-        num_tiles_executed = tile_sched.num_tiles_executed
         bSG_gC = bSG_gC_all[(None, None, None, mnl[0], mnl[1], mnl[2])]
+        bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
         # this thread's row within the CTA tile: the slot of its A scale in a ring stage
         irow = (
             tTR_cC[(None, None, None, 0, 0, mnl[0], mnl[1], mnl[2])][0][0]
             - tCcC[(None, None, mnl[0], mnl[1], mnl[2])][0][0]
         )
-        for i in cutlass.range_constexpr(subtile_cnt * V):
+        for i in cutlass.range_constexpr(VW):
             tTR_rSum[i] = CuteF32.const(0.0)  # acc_0 = +0
         for _kb in range(k_tile_cnt):  # blocks ascending: the block fold digit
             scale_pipeline.consumer_wait(
@@ -379,50 +420,73 @@ def blockscale_epilogue_loop(
             )  # read: the stage may take a later block
             scale_state.advance()
             acc_pipeline.consumer_wait(acc_state)  # block kb's fold is complete
-            tTR_tAcc = cute.group_modes(
-                tTR_tAcc_base[(None, None, None, None, None, acc_state.index)], 3, 5
-            )
-            for s in cutlass.range_constexpr(subtile_cnt):
-                cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rP)
-                for e in cutlass.range_constexpr(0, V, 2):
-                    # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on the
-                    # same operands (a packing placement, as the attention body's)
-                    r0, r1 = CuteF32.fma2(
-                        (scale, scale),
-                        (tTR_rP[e], tTR_rP[e + 1]),
-                        (tTR_rSum[s * V + e], tTR_rSum[s * V + e + 1]),
+            if active:
+                tTR_tAcc = cute.group_modes(
+                    tTR_tAcc_base[(None, None, None, None, None, acc_state.index)], 3, 5
+                )
+                for k in cutlass.range_constexpr(
+                    per_group
+                ):  # the group's subtiles, loads first
+                    cute.copy(
+                        tiled_copy_t2r,
+                        tTR_tAcc[(None, None, None, gsel * per_group + k)],
+                        bufs[k],
                     )
-                    tTR_rSum[s * V + e] = r0
-                    tTR_rSum[s * V + e + 1] = r1
+                for k in cutlass.range_constexpr(per_group):
+                    for e in cutlass.range_constexpr(0, V, 2):
+                        # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
+                        # the same operands (a packing placement, as the attention body's)
+                        r0, r1 = CuteF32.fma2(
+                            (scale, scale),
+                            (bufs[k][e], bufs[k][e + 1]),
+                            (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                        )
+                        tTR_rSum[k * V + e] = r0
+                        tTR_rSum[k * V + e + 1] = r1
             cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(
                     acc_state
-                )  # one arrive per warp: the stage is free once all four arrived
+                )  # one arrive per warp: the stage is free once all arrived
             acc_state.advance()
-        # the chain (one cvt.rn) and the store of the tile's fold, subtile by subtile
-        bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
-        num_prev_subtiles = num_tiles_executed * subtile_cnt
-        for s in cutlass.range_constexpr(subtile_cnt):
-            for e in cutlass.range_constexpr(V):
-                tTR_rP[e] = tTR_rSum[s * V + e]
-            apply_chain_pre_cvt(
-                chain, tTR_rP, None
-            )  # the chain's fp32 ops (none: the scales are in the fold)
-            acc_vec = tiled_copy_r2s.retile(tTR_rP).load()
-            tRS_rC.store(
-                acc_vec.to(st.c_dtype)
-            )  # the chain's cvt.rn <out>, exactly once
-            c_buffer = (num_prev_subtiles + s) % st.num_c_stage
-            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
-            cute.arch.fence_proxy("async.shared", space="cta")
-            sync.arrive_and_wait()
-            if warp_idx == EPILOGUE_WARPS[0]:
-                cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, s)])
-                c_pipeline.producer_commit()
-                c_pipeline.producer_acquire()
-            sync.arrive_and_wait()
-    c_pipeline.producer_tail()
+        # the chain (one cvt.rn) and the store of this group's half of the tile's fold, subtile by subtile
+        if active:
+            for k in cutlass.range_constexpr(per_group):
+                for e in cutlass.range_constexpr(V):
+                    tTR_rP[e] = tTR_rSum[k * V + e]
+                apply_chain_pre_cvt(
+                    chain, tTR_rP, None
+                )  # the chain's fp32 ops (none: the scales are in the fold)
+                acc_vec = tiled_copy_r2s.retile(tTR_rP).load()
+                tRS_rC.store(
+                    acc_vec.to(st.c_dtype)
+                )  # the chain's cvt.rn <out>, exactly once
+                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, gsel)])
+                cute.arch.fence_proxy("async.shared", space="cta")
+                if gsel == 0:
+                    sync0.arrive_and_wait()
+                else:
+                    sync1.arrive_and_wait()
+                if warp_idx == 4 * gsel:  # the group's leader warp issues the TMA store
+                    cute.copy(
+                        tma_atom_c,
+                        bSG_sC[(None, gsel)],
+                        bSG_gC[(None, gsel * per_group + k)],
+                    )
+                    if gsel == 0:
+                        c_pipeline0.producer_commit()
+                        c_pipeline0.producer_acquire()
+                    else:
+                        c_pipeline1.producer_commit()
+                        c_pipeline1.producer_acquire()
+                if gsel == 0:
+                    sync0.arrive_and_wait()
+                else:
+                    sync1.arrive_and_wait()
+    if gsel == 0:
+        c_pipeline0.producer_tail()
+    else:
+        c_pipeline1.producer_tail()
 
 
 class BlockScaleFp8Gemm:
@@ -500,7 +564,7 @@ class BlockScaleFp8Gemm:
             params,
         ).launch(
             grid=grid,
-            block=[THREADS, 1, 1],
+            block=[THREADS_BS, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
         )
@@ -526,7 +590,7 @@ class BlockScaleFp8Gemm:
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == TMA_WARP:
+        if warp_idx == TMA_WARP_BS:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_c)
@@ -569,8 +633,7 @@ class BlockScaleFp8Gemm:
             num_stages=st.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                len(EPILOGUE_WARPS) * (2 if use_2cta_instrs else 1),
+                pipeline.Agent.Thread, len(PROMO_WARPS) * (2 if use_2cta_instrs else 1)
             ),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -580,17 +643,17 @@ class BlockScaleFp8Gemm:
             num_stages=NUM_SCALE_STAGES,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, 32 * len(EPILOGUE_WARPS)
+                pipeline.Agent.Thread, 32 * len(PROMO_WARPS)
             ),
             defer_sync=True,
         )
         tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1)
+            barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(PROMO_WARPS) + 1)
         )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
-            allocator_warp_id=EPILOGUE_WARPS[0],
+            allocator_warp_id=PROMO_WARPS[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
@@ -674,12 +737,13 @@ class BlockScaleFp8Gemm:
         tCrB = tiled_mma.make_fragment_B(sB)  # (MMA, MMA_N, MMA_K, STAGE)
         acc_shape = tiled_mma.partition_shape_C(st.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(
-            cute.append(acc_shape, st.num_tmem_stages)
+            cute.append(acc_shape, st.num_acc_stage)
         )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # --- roles
-        if warp_idx == TMA_WARP:
+        if warp_idx == TMA_WARP_BS:
+            cute.arch.setmaxregister_decrease(UNIFORM_REGS)
             tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -703,7 +767,8 @@ class BlockScaleFp8Gemm:
                 sSFB,
                 tCcC,
             )
-        if warp_idx == MMA_WARP:
+        if warp_idx == MMA_WARP_BS:
+            cute.arch.setmaxregister_decrease(UNIFORM_REGS)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -729,7 +794,8 @@ class BlockScaleFp8Gemm:
             byte_alignment=128,
             swizzle=c_smem_layout_staged.inner,
         )
-        if warp_idx < MMA_WARP:
+        if warp_idx < NUM_PROMO_WARPS:
+            cute.arch.setmaxregister_increase(PROMO_REGS)
             tmem.allocate(st.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
@@ -758,3 +824,7 @@ class BlockScaleFp8Gemm:
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+        if warp_idx > TMA_WARP_BS:
+            cute.arch.setmaxregister_decrease(
+                UNIFORM_REGS
+            )  # the warps padding the last warpgroup: no role
