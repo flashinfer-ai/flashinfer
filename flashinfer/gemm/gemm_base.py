@@ -56,6 +56,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
     is_in_profile_measurement,
+    get_autotune_exclude_split_k,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -7061,6 +7062,29 @@ def _sm107_low_m_split_k(
     return 1
 
 
+def _mxfp8_low_m_fallback_split(
+    low_m_only: bool,
+    m: int,
+    n: int,
+    real_k: int,
+    ab_dtype,
+    split_k_kernel_cls,
+    device: torch.device,
+) -> int:
+    """K slices of the untuned low-M (M <= 32) MXFP8 tactic.
+
+    1 on SM100/SM103, where the persistent default also accumulates K in one
+    pass. On SM107 (``low_m_only``) the untuned pick splits K to fill the GPU,
+    except under exclude-split-K autotuning, where tactic ``-1`` must reduce
+    in the same order as every tactic ``is_split_free_tactic`` accepts.
+    """
+    if not low_m_only or get_autotune_exclude_split_k():
+        return 1
+    return _sm107_low_m_split_k(
+        m, n, real_k, ab_dtype, split_k_kernel_cls, get_device_sm_count(device)
+    )
+
+
 @functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
@@ -7102,6 +7126,16 @@ def _cute_dsl_gemm_mxfp8_runner(
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
+
+        def is_split_free_tactic(self, tactic) -> bool:
+            # Every split_k == 1 tactic accumulates K in one pass per output
+            # tile, in the same order as the fallback; split-K sums K slices
+            # across CTAs and rounds differently. Under the mode the fallback
+            # (-1) is a split_k == 1 tactic on SM107 too
+            # (_mxfp8_low_m_fallback_split).
+            if tactic is None or tactic == -1:
+                return True
+            return int(tactic[4]) == 1
 
         def get_valid_tactics(
             self,
@@ -7182,17 +7216,14 @@ def _cute_dsl_gemm_mxfp8_runner(
 
             if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
                 # Untuned low-M execution uses the corresponding base tactic.
-                fallback_split = (
-                    _sm107_low_m_split_k(
-                        m,
-                        n,
-                        real_k,
-                        cutlass.Float8E4M3FN,
-                        split_k_kernel_cls,
-                        get_device_sm_count(a.device),
-                    )
-                    if low_m_only
-                    else 1
+                fallback_split = _mxfp8_low_m_fallback_split(
+                    low_m_only,
+                    m,
+                    n,
+                    real_k,
+                    cutlass.Float8E4M3FN,
+                    split_k_kernel_cls,
+                    a.device,
                 )
                 fallback_tactic = (
                     split_k_kernel_cls.mma_tiler_mn_for_m(m),
@@ -7526,6 +7557,10 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
+        def is_split_free_tactic(self, tactic) -> bool:
+            # Every tactic, including the default, splits K across warps.
+            return False
+
         def supports_inputs(
             self, inputs: List[torch.Tensor], check_m: bool = True
         ) -> bool:
@@ -7621,8 +7656,11 @@ def _cute_dsl_mxfp8_runners(
     # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
     # one wave. On wider N the cluster split-K default is faster in back-to-back
     # PDL calls, where its prologue overlaps the previous kernel (#6839).
-    if warp.supports_inputs(inputs) and b.shape[1] // 16 <= get_device_sm_count(
-        a.device
+    # Exclude-split-K autotuning needs a fallback that does not split K.
+    if (
+        not get_autotune_exclude_split_k()
+        and warp.supports_inputs(inputs)
+        and b.shape[1] // 16 <= get_device_sm_count(a.device)
     ):
         return [warp, cluster_splitk]
     return [cluster_splitk, warp]
@@ -7651,8 +7689,10 @@ def _cute_dsl_mxfp8_runners_sm107(
     warp_grid_fits = n // (32 if n % 32 == 0 else 16) <= 2 * get_device_sm_count(
         a.device
     )
+    # Exclude-split-K autotuning needs a fallback that does not split K.
     if (
         warp is not None
+        and not get_autotune_exclude_split_k()
         and warp.supports_inputs(inputs)
         and m <= 8
         and k <= 2048
@@ -8778,6 +8818,16 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 bias_tensor is not None,
             )
 
+        def is_split_free_tactic(self, tactic) -> bool:
+            # Only split_k > 1 changes the reduction order: each CTA of the
+            # cluster accumulates its K share and the shares are summed in the
+            # epilogue. cta_k and the stage counts regroup the same MMA
+            # sequence. The untuned default (-1) is a split_k == 1 tactic
+            # (see forward).
+            if tactic is None or tactic == -1:
+                return True
+            return int(tactic[3]) == 1
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -8814,12 +8864,17 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 bias_tensor,
             ) = inputs
             if tactic is None or tactic == -1:
-                if not tactics:
+                # Untuned default: the first tactic that does not split K
+                # (the list is sorted so that it is also the nearest to the
+                # (4 * mma_k, 8 stages) default), so tactic -1 reduces K in
+                # the same order at every M (is_split_free_tactic).
+                tactic = next((t for t in tactics if t[3] == 1), None)
+                if tactic is None:
                     raise ValueError(
                         "The low-latency block-scaled GEMM kernel cannot "
                         f"implement problem {problem_mnkl}"
+                        + (" without split-K" if tactics else "")
                     )
-                tactic = tactics[0]
             elif tactic not in tactics:
                 raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
 
