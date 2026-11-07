@@ -1181,6 +1181,230 @@ MODULES: dict[str, dict[str, Any]] = {
             "words_per_tile": 2,
         },
     },
+    # Rendered by the exporter from the family adapter's scaffold: the forward
+    # with fast, sched dynamic, chunk_stages 2, pair_math, c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_d00a2892aa363564c673": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_d00a2892aa363564c673",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_d00a2892aa363564c673",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_d00a2892aa363564c673",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # Rendered by the exporter from the family adapter's scaffold: the forward
+    # with dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math, c_band
+    # 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_6211cda590057b12f1a2": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_6211cda590057b12f1a2",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_6211cda590057b12f1a2",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_6211cda590057b12f1a2",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # Rendered by the exporter from the family adapter's scaffold: the forward
+    # with bias, dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math,
+    # c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_77af6383ff00b1cd047c": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "b"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_77af6383ff00b1cd047c",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_77af6383ff00b1cd047c",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_77af6383ff00b1cd047c",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
     # Route ``bwd_dt`` (hand-written fallback, sm_100a / sm_103a): the fallback backward body
     # ``vec=8, copy="tma2d"`` with ``dtype_flags=True`` (bit 0: BF16 taps; bit 1, the BF16
     # ``dw`` store, is read by its reduce program); SiLU' at the BF16-rounded preactivation
@@ -3078,14 +3302,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "fwd": [
             "cake_causal_conv1d_det_train_f5497330bfd286211643",
             "cake_causal_conv1d_det_train_8665d0756b8240ecb4d0",
+            "cake_causal_conv1d_det_train_d00a2892aa363564c673",
         ],
         "fwd_bias": [
             "cake_causal_conv1d_det_train_08880ca12e4064bc8cdb",
             "cake_causal_conv1d_det_train_d829c95e1d610bc14b23",
+            "cake_causal_conv1d_det_train_77af6383ff00b1cd047c",
         ],
         "fwd_dt": [
             "cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e",
             "cake_causal_conv1d_det_train_176ebb3e14f7ad9c94dc",
+            "cake_causal_conv1d_det_train_6211cda590057b12f1a2",
         ],
     },
 }
