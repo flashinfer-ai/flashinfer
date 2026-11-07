@@ -976,4 +976,7 @@ class MoEEpSplitLayer(nn.Module):
             recv_topk_weights=received.topk_weights,
             recv_topk_idx_global=True,
             expert_tensors_scale=received.hidden_states_scale,
+            # An output written here needs no staging copy before the combine.
+            output=comm.get_combine_input_buffer(torch.bfloat16),
+            zero_rows_without_local_expert=not comm.combine_reads_only_local_expert_rows,
         )
