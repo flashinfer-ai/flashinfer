@@ -23,7 +23,8 @@ radix of 4 steps), so the kernel is the dense fp8 kernel with three changes, all
 * **the promotion** (:func:`blockscale_epilogue_loop`): the epilogue warps consume one accumulator stage per block: ``scale =
   mul.rn(s_a, s_b)`` once per thread and block from the ring stage (each thread owns one output row -- the 32x32b TMEM atom of the
   128-row CTA tile -- so one A scale and one B scale serve it for the block), ``tcgen05.ld`` of the block partial per epilogue
-  subtile, ``sum = fma.rn(scale, P, sum)`` per element into a **register** running sum (the tile's elements of this thread:
+  subtile, ``sum = fma.rn(scale, P, sum)`` per element -- two elements per ``fma.rn.f32x2``, each lane the same correctly
+  rounded fma -- into a **register** running sum (the tile's elements of this thread:
   ``cta_tile_m x tile_n / 128`` fp32), then the stage is released. After the last block the running sum goes through the chain
   (the single ``cvt.rn``) and the dense store path.
 
@@ -293,6 +294,7 @@ def blockscale_epilogue_loop(
     tTR_rP = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)  # one subtile's block partial
     tTR_rC = cute.make_rmem_tensor(frag_shape, st.c_dtype)
     V = cute.size(tTR_rP)
+    assert V % 2 == 0, V  # the promotion packs element pairs
     sub_m, sub_n = (
         cute.size(tTR_tAcc_base, mode=[3]),
         cute.size(tTR_tAcc_base, mode=[4]),
@@ -382,10 +384,16 @@ def blockscale_epilogue_loop(
             )
             for s in cutlass.range_constexpr(subtile_cnt):
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rP)
-                for e in cutlass.range_constexpr(V):
-                    tTR_rSum[s * V + e] = CuteF32.fma(
-                        scale, tTR_rP[e], tTR_rSum[s * V + e]
-                    )  # acc = fma(scale, P_kb, acc)
+                for e in cutlass.range_constexpr(0, V, 2):
+                    # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on the
+                    # same operands (a packing placement, as the attention body's)
+                    r0, r1 = CuteF32.fma2(
+                        (scale, scale),
+                        (tTR_rP[e], tTR_rP[e + 1]),
+                        (tTR_rSum[s * V + e], tTR_rSum[s * V + e + 1]),
+                    )
+                    tTR_rSum[s * V + e] = r0
+                    tTR_rSum[s * V + e + 1] = r1
             cute.arch.fence_view_async_tmem_load()  # the partial has been read
             sync.arrive_and_wait()
             with cute.arch.elect_one():
