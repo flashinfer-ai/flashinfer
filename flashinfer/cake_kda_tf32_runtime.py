@@ -258,12 +258,19 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # The B200 row (48, 2048, 1) covers the 37 to 48 tasks whose pair-share row
 # is (48, 2048): in paired timings of 144 held-out equal-length launches of
 # 38 to 48 tasks at 2049 to 14000 tokens the hybrid ran 0.87 to 0.98 times
-# the pair-share time on two B200s, every launch faster.
+# the pair-share time on two B200s, every launch faster.  The GB300 row
+# (50, 2048, 1) covers 37 to 50 tasks, inside the pair-share row (64, 2048):
+# in paired timings of 301 equal-length launches of 38 to 50 tasks at 2048 to
+# 14000 tokens the hybrid ran 0.88 to 1.00 times the pair-share time on two
+# GB300s, no launch slower.
 M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = (
     (36, 1024),
     (48, 2048, 1),
 )
-M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
+M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = (
+    (36, 1024),
+    (50, 2048, 1),
+)
 # The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
 # the work-bin table of a launch with more tasks than SMs leaves bins of two
 # tasks beside bins of one, and the two-task bins set the span.  Each two-task
@@ -1488,8 +1495,9 @@ def _m64_owner_helper_hybrid_program(name, *args, **kwargs):
 
 # The launches a one-helper row of the owner/helper rule takes run the loader's
 # ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` build of the module on a grid
-# (tasks, 3): the helper prepares the chunks c % 8 >= 4 of its task and the two
-# owners the others, with the same bits as the pair-share and routed programs.
+# (tasks, 3): the helper prepares the chunks c % 8 >= 4 (sm_100a) or c % 4 >= 2
+# (sm_103a) of its task and the two owners the others, with the same bits as the
+# pair-share and routed programs.
 def _m64_owner_helper_hybrid_factory(name, *args, **kwargs):
     """The hybrid owner/helper build of the factory row's M64 module, else
     ``_m64_owner_helper_factory``."""

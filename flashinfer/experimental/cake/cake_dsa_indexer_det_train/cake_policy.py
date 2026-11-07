@@ -88,7 +88,7 @@ POLICY_FIELDS = (
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
-    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
+    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6(, the top_k up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call, the tiles a one-segment minimum rises per wide wave below the next element, the wide waves from which it holds, the l6 / wide wave ratio W below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2)] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
     "desc_walk_kinds",  # [physical scan kinds whose descending-walk twin (key kind "<kind>_desc") a call with the sampled first threshold off runs, the same for a sampled call], or None; see select_program
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
@@ -118,6 +118,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "lsf_single_rule",  # [min mean unit tiles] from which a one-segment FP8 call of the wide unit runs the :lsf copy of its program, or None (never); read only by select_fp8_program
     "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
@@ -322,6 +323,7 @@ _OPTIONAL_RULE = (
     "l6_solo_rule",
     "snake_rule",
     "snake_cap_rule",
+    "lsf_single_rule",
     "tile_unroll_rule",
     "sample_shift_rule",
     "sample_class_rule",
@@ -396,6 +398,7 @@ class DispatchPolicy:
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
     lsf_programs: bool
+    lsf_single_rule: Optional[list]
     static_scan_kinds: list
     far_sample: int
     check_period_max: int
@@ -474,10 +477,22 @@ class DispatchPolicy:
             )
         waves = raw["wide_wave_rule"]
         if waves is not None and (
-            len(waves) != 3 or not all(_is_number(v) and v >= 0 for v in waves)
+            len(waves) not in (3, 11)
+            or not all(_is_number(v) and v >= 0 for v in waves)
+            or (
+                len(waves) == 11
+                and not (
+                    _is_int(waves[3])
+                    and waves[3] >= 1
+                    and waves[5] >= waves[2]
+                    and _is_int(waves[7])
+                    and waves[7] >= 1
+                    and waves[8] >= waves[1]
+                )
+            )
         ):
             raise ValueError(
-                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or None, got {waves!r}"
+                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or that with [the top_k (an int >= 1) up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call (>= the one-segment minimum), the tiles the one-segment minimum rises per wide wave below the next element, the wide waves (an int >= 1) from which it holds, the l6 / wide wave ratio W (>= the second element) below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2], each >= 0, or None, got {waves!r}"
             )
         desc = raw["desc_walk_kinds"]
         if desc is not None and (
@@ -557,6 +572,14 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['snake_cap_rule'] must be [max segments >= 1, max waves >= 1] or None, got {snake_cap!r}"
+            )
+        lsf_single = raw["lsf_single_rule"]
+        if lsf_single is not None and (
+            len(lsf_single) != 1
+            or not (_is_number(lsf_single[0]) and lsf_single[0] >= 0)
+        ):
+            raise ValueError(
+                f"policy['lsf_single_rule'] must be [min mean unit tiles >= 0] or None, got {lsf_single!r}"
             )
         shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
         shift_rule = raw["sample_shift_rule"]
@@ -944,14 +967,36 @@ class DispatchPolicy:
         if waves is not None:
             # the unit the other rules leave (three-warpgroup or narrow) against the wide unit, in waves of the
             # persistent grid: the wide unit when the other unit needs at least the record's ratio of the wide
-            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on)
+            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on).  An eleven-element
+            # rule raises that count by waves[6] tiles per wide wave below waves[7] (a short call's last waves cost
+            # the wide unit more), to at least waves[5] on a packed call (two or more segments) and to at least
+            # waves[9] / (W - 1) while the wave ratio W of the three-warpgroup unit to the wide unit stays below
+            # waves[8] (the fewer waves the wide unit saves, the more tiles its longer units need to pay for them),
+            # on a packed call then also to at least waves[10] / (W - 1) ** 2,
+            # and multiplies it by (top_k / waves[3]) ** waves[4] above top_k = waves[3] (each unit selects more
+            # candidates)
             other = self.block_q_l6 if three_wg else self.block_q_narrow
             ctas = max(1, int(grid))
             waves_wide = -(-units_wide // ctas)
             units_other = -(-int(num_queries) // other)
             waves_other = -(-units_other // ctas)
             if three_wg:
-                wide = waves_other >= waves[1] * waves_wide and mean_tiles >= waves[2]
+                floor = waves[2]
+                if len(waves) > 3:
+                    floor += waves[6] * max(0, int(waves[7]) - waves_wide)
+                    if int(num_segments) >= 2:
+                        floor = max(floor, waves[5])
+                    if waves_other < waves[8] * waves_wide:
+                        if waves_other > waves_wide:
+                            # 1 / (W - 1)
+                            inv = waves_wide / (waves_other - waves_wide)
+                            floor = max(floor, waves[9] * inv)
+                            if int(num_segments) >= 2:
+                                floor = max(floor, waves[10] * inv * inv)
+                        else:
+                            floor = float("inf")
+                    floor *= max(1.0, int(top_k) / waves[3]) ** waves[4]
+                wide = waves_other >= waves[1] * waves_wide and mean_tiles >= floor
             else:
                 wide = waves_other >= waves[0] * waves_wide
             return self.block_q_wide if wide else other
@@ -1125,6 +1170,21 @@ class DispatchPolicy:
         units = -(-int(num_queries) // max(1, int(block_q)))
         waves = -(-units // max(1, int(grid)))
         return int(num_segments) <= int(rule[0]) and waves <= int(rule[1])
+
+    def lsf_single_fits(
+        self, num_queries: int, num_keys: int, num_segments: int, ratio: int
+    ) -> bool:
+        """Whether a one-segment call reaches ``lsf_single_rule`` (at least its mean unit tiles; never where the record
+        leaves the rule None).  On one segment the :lsf copy walks the units of the plain program in the same order and
+        returns the same rows; on the FP8 sm_103a wide program it measures faster from 64 mean unit tiles on and slower
+        below, so ``select_fp8_program`` runs it on a one-segment wide call only within the rule."""
+        rule = self.lsf_single_rule
+        return (
+            rule is not None
+            and int(num_segments) == 1
+            and self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
+            >= rule[0]
+        )
 
     def tile_unroll_for(self, kind: str, top_k: int, snake: bool, block_q: int) -> int:
         rule = self.tile_unroll_rule
@@ -1954,7 +2014,8 @@ def select_fp8_program(
     architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
     program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind, with that
     kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
-    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered), with the decided tile
+    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered; also a one-segment call of
+    the wide unit within the record's ``lsf_single_rule``, ``DispatchPolicy.lsf_single_fits``), with the decided tile
     unroll where an FP8 program of it is registered, else the smallest registered one, and in the snake unit order
     where the decision marks it, the registry has the snake copy (``s1``) of that program and the call stays within
     the record's ``snake_cap_rule`` (``DispatchPolicy.snake_copy_fits``).  ``fp8_programs``:
@@ -1965,7 +2026,15 @@ def select_fp8_program(
     physical = choice.physical_kind
     if not any(kind == physical for kind, _lsf in programs):
         physical = FP8_KIND_FALLBACK.get(physical, physical)
-    unrolls = programs.get((physical, choice.lsf)) or programs.get((physical, False))
+    # lsf_single_rule: a one-segment call of the wide unit runs the :lsf copy within the rule (the plan leaves it off)
+    lsf = choice.lsf or (
+        physical == "wide"
+        and (physical, True) in programs
+        and policy.lsf_single_fits(
+            choice.num_queries, choice.num_keys, choice.num_segments, choice.ratio
+        )
+    )
+    unrolls = programs.get((physical, lsf)) or programs.get((physical, False))
     if not unrolls:
         raise NotImplementedError(
             f"the FP8 dispatch selected the {physical!r} scan kind, which no registered FP8 program serves "

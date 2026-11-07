@@ -23,10 +23,10 @@ Training mHC (Cake)
    The mode is part of every name: the deterministic module
    ``flashinfer.cake_mhc_det_train`` (``det``) and the non-deterministic module
    ``flashinfer.cake_mhc_nondet_train`` (``nondet``) export the same verbs, the
-   model's head is the deterministic module
-   ``flashinfer.cake_mhc_head_det_train``, and no entry point takes a
-   ``deterministic`` keyword. Each module imports its backend package under
-   ``flashinfer.experimental.cake`` on first use. The
+   model's head is the module pair ``flashinfer.cake_mhc_head_det_train``
+   (``det``) and ``flashinfer.cake_mhc_head_nondet_train`` (``nondet``), and no
+   entry point takes a ``deterministic`` keyword. Each module imports its
+   backend package under ``flashinfer.experimental.cake`` on first use. The
    former names below are removed, with no alias: importing them fails.
    FlashInfer 0.7.3's ``cake_mhc_train`` names were the deterministic package
    at the top level and the non-deterministic one under
@@ -165,8 +165,8 @@ as torch computes it for BF16 ``X`` ``[T, 4, H]``,
 ``cake_mhc_head_det_train_backward`` writes the gradient
 ``dX[:, i, :] = BF16(dY / 4)`` of each stream or adds it into a caller's
 ``dX`` (``accumulate=True``), and ``cake_mhc_head_det`` is the autograd form.
-The non-deterministic head module ``flashinfer.cake_mhc_head_nondet_train`` is
-a reserved name for a planned version; it does not exist yet.
+Its non-deterministic counterpart is the module
+``flashinfer.cake_mhc_head_nondet_train`` (below).
 
 .. currentmodule:: flashinfer.cake_mhc_head_det_train
 
@@ -255,8 +255,8 @@ hidden size before the capture. Every completed launch leaves the ticket words
 of its workspace at zero, so a replay needs no reset;
 ``cake_mhc_nondet_train_reset_workspace`` zeroes the buffer it is given.
 
-The head has no cross-token reduction and no counterpart in this module; use
-the deterministic head module ``flashinfer.cake_mhc_head_det_train`` above.
+The model's head is not part of this module: its non-deterministic module is
+``flashinfer.cake_mhc_head_nondet_train`` (below).
 
 .. currentmodule:: flashinfer.cake_mhc_nondet_train
 
@@ -277,3 +277,39 @@ the deterministic head module ``flashinfer.cake_mhc_head_det_train`` above.
     is_cake_mhc_nondet_train_supported
     CakeMHCNondetPrepareFunction
     CakeMHCNondetFinishFunction
+
+Training mHC head, non-deterministic (Cake)
+-------------------------------------------
+
+``flashinfer.cake_mhc_head_nondet_train`` is the model's head in the ``nondet``
+mode: the same function, tensor contracts, hidden sizes (4096, 5120 and 7168 on
+SM100 / SM103, 4096 on SM107) and autograd wiring as
+``flashinfer.cake_mhc_head_det_train``, computed by its own backend package
+``flashinfer.experimental.cake.cake_mhc_head_nondet_train`` (imported on first
+use). ``cake_mhc_head_nondet_train_forward`` returns the stream mean,
+``cake_mhc_head_nondet_train_backward`` writes the gradient of each stream or
+adds it into a caller's ``dX`` (``accumulate=True``), and
+``cake_mhc_head_nondet`` is the autograd form. The top level of ``flashinfer``
+re-exports none of these names. No entry point takes a ``deterministic``
+keyword, and nothing falls back to the deterministic module.
+
+The head is elementwise per token: it has no cross-token reduction, no atomic
+operation and no order-varying step. Its kernels are the deterministic head's,
+exported under the library names ``cake_mhc_train_head_*``, so it computes the
+same arithmetic in the same order: bit for bit ``X.mean(dim=1)`` and its
+gradient. The expected performance is the deterministic head's; this module
+offers no speedup. The ``nondet`` contract does not promise run-to-run
+identical bits, but this implementation is fixed-order: under
+``torch.use_deterministic_algorithms(True)`` its entry points raise no alert,
+and with ``warn_only=True`` they emit no warning.
+
+.. currentmodule:: flashinfer.cake_mhc_head_nondet_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_mhc_head_nondet_train_forward
+    cake_mhc_head_nondet_train_backward
+    cake_mhc_head_nondet
+    CakeMHCHeadNondetFunction
+    is_cake_mhc_head_nondet_train_supported

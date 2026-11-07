@@ -136,6 +136,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    lsf_single_rule=None,
     static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
@@ -747,11 +748,65 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
-        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], each >= 0, or None
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], or that with
+        # [top_k (an int >= 1), exponent, packed minimum (>= the one-segment one), rise per wave, waves (an int >= 1),
+        # low wave ratio (>= the second element), its tile coefficient, its packed coefficient], each >= 0, or None
         dict(wide_wave_rule=1.6),
         dict(wide_wave_rule=[]),
         dict(wide_wave_rule=[1.6, 1.3]),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0]),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                1.0,
+            ]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048.0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, True, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, -1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 64.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, -3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 0, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14.0, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.2, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, -40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, True, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, -9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, True]
+        ),
         dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
         dict(wide_wave_rule=[1.6, 1.3, True]),
         # the descending-walk kinds: [unsampled kinds, sampled kinds], ascending lists of physical scan kinds, or None
@@ -791,6 +846,13 @@ def test_policy_record_round_trip_and_validation():
         dict(snake_cap_rule=[1, 0]),
         dict(snake_cap_rule=[1.0, 40]),
         dict(snake_cap_rule=[True, 40]),
+        # the FP8 one-segment longest-first rule: [min mean unit tiles >= 0] or None
+        dict(lsf_single_rule=64.0),
+        dict(lsf_single_rule=[]),
+        dict(lsf_single_rule=[64.0, 1]),
+        dict(lsf_single_rule=[-1.0]),
+        dict(lsf_single_rule=[True]),
+        dict(lsf_single_rule=["64"]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -873,6 +935,14 @@ def test_policy_record_round_trip_and_validation():
     assert not capped.snake_copy_fits(65536, 1, 6, 212)
     assert not capped.snake_copy_fits(32768, 2, 6, 212)
     assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
+    single = DispatchPolicy.from_record(dict(record, lsf_single_rule=(64,)))
+    assert single.record()["lsf_single_rule"] == [64]
+    assert DispatchPolicy.from_record(single.record()) == single
+    # mean unit tiles (Tkv - T / (2 ratio)) / S / 128: 16384 x 16384 take 64, 16384 x 15360 take 56
+    assert single.lsf_single_fits(16384, 16384, 1, 1)
+    assert not single.lsf_single_fits(16384, 15360, 1, 1)
+    assert not single.lsf_single_fits(32768, 32768, 2, 1)
+    assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
     walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
     assert walked.desc_walk_kinds == [["wide"], []]
     assert walked.record()["desc_walk_kinds"] == [["wide"], []]
@@ -880,6 +950,26 @@ def test_policy_record_round_trip_and_validation():
     assert walked.desc_walk_for("wide", sampled=False)
     assert not walked.desc_walk_for("wide", sampled=True)
     assert not walked.desc_walk_for("l6", sampled=False)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            record,
+            wide_wave_rule=(1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0),
+        )
+    )
+    assert scaled.record()["wide_wave_rule"] == [
+        1.6,
+        1.3,
+        80.0,
+        2048,
+        1.1,
+        112.0,
+        3.5,
+        14,
+        1.3,
+        40.0,
+        9.0,
+    ]
+    assert DispatchPolicy.from_record(scaled.record()) == scaled
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1556,6 +1646,77 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert unit(712, 4096, K=256) == 8
     # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
     assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
+    # an eleven-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9] (no low wave-ratio minimum: its ratio is the
+    # second element's): the same decisions on one document of at least 14 wide waves at top_k <= 2048 (16384
+    # queries: 14 wide waves, 19 l6 waves)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            wide_wave_rule=[1.7, 1.3, 84.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0],
+        )
+    )
+
+    def scaled_unit(T, Tkv, K=2048, S=1):
+        return scaled.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    for T, Tkv in ((16384, 20480), (16384, 18432), (8192, 8192), (4096, 65536)):
+        assert scaled_unit(T, Tkv) == unit(T, Tkv)
+    assert scaled_unit(16384, 18432, K=1024) == unit(16384, 18432, K=1024) == 6
+    # 8192 queries take 7 wide waves (10 l6 waves): the floor rises by 3.5 x 7 to 108.5, so 96 mean tiles keep l6
+    # where the three-element rule takes the wide unit, and 128 take it
+    assert unit(8192, 16384) == 8
+    assert scaled_unit(8192, 16384) == 6
+    assert scaled_unit(8192, 20480) == 8
+    # two packed documents of 16384 queries in all need 112 mean tiles: 104 keep l6, 112 take the wide unit
+    assert scaled_unit(16384, 34816, S=2) == 6
+    assert scaled_unit(16384, 36864, S=2) == 8
+    # above top_k 2048 the floor grows as (top_k / 2048) ** 1.1: 131.2 at 3072, 180.1 at 4096
+    assert scaled_unit(16384, 24576, K=3072) == 6
+    assert scaled_unit(16384, 26624, K=3072) == 8
+    assert unit(16384, 20480, K=4096) == 8
+    assert scaled_unit(16384, 20480, K=4096) == 6
+    assert scaled_unit(16384, 32768, K=4096) == 8
+    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9]: below a wave ratio W = 1.26 the minimum is at least
+    # 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5 l6
+    # waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
+    # the 99-tile minimum of 4 wide waves; 8520 queries take 8 wide waves against 10 l6 waves (W = 1.25) and need 160
+    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324; 8192
+    # queries (7 wide waves, 10 l6 waves) keep the 88.5-tile minimum
+    low = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024, 512],
+            wide_wave_rule=[
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+            ],
+        )
+    )
+
+    def low_unit(T, Tkv, K=2048, S=1):
+        return low.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    assert low_unit(4096, 16384) == 6
+    assert low_unit(4096, 2048 + 159 * 128) == 6
+    assert low_unit(4096, 2048 + 160 * 128) == 8
+    assert low_unit(4096, 2048 + 159 * 256, S=2) == 6
+    assert low_unit(4096, 2048 + 160 * 256, S=2) == 8
+    assert low_unit(8520, 4260 + 159 * 128) == 6
+    assert low_unit(8520, 4260 + 160 * 128) == 8
+    assert low_unit(6144, 3072 + 239 * 128) == 6
+    assert low_unit(6144, 3072 + 240 * 128) == 8
+    assert low_unit(6144, 3072 + 323 * 256, S=2) == 6
+    assert low_unit(6144, 3072 + 324 * 256, S=2) == 8
+    assert low_unit(8192, 4096 + 89 * 128) == 8
 
 
 def test_sample_shift_rule_precedence():
