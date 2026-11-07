@@ -36,19 +36,23 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   other ``num_splits - 1`` partials with IEEE round-to-nearest adds, rounds once and stores (:func:`k1_plan` reads the
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
-  bit; three or more add in the order the splits finish;
+  bit; three or more add in the order the splits finish (no row of the tables runs three or more: only a caller's
+  explicit ``splits``).  The one-split rows store whole tiles, and the rows of :data:`K1_WGRAD_DET_RULES_BY_SM` run
+  another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
   ``sm_100a`` and 152-SM ``sm_103a`` parts, in that table's token ranges), before every other K1 table: a cluster
   program (:func:`k1_dsm_plan`) whose ``S`` CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's
   distributed shared memory -- each CTA sends the column quads another rank owns to that rank, adds the ``S``
   partials of its own quads in cluster-rank order and stores them once (no workspace, no ticket; the same bits on
   every run);
-* the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K block)
-  steps into ``units`` spans, alike or a head/tail partition of long head spans and short tail spans
-  (:func:`router_partition` reads the measured verdicts and token windows of :data:`ROUTER_RULES`; every other row and
-  token count runs the deterministic program); a segment that covers its tile's whole K range stores the
-  deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out`` is
-  zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
+* the K2 weight gradient: the deterministic program at the split count of its row's ``"det_s<n>"`` token window in
+  the router tables (:func:`router_det_splits`; the partials added in a fixed order), else at the deterministic
+  package's split count of the row.  A stream-K partition of the (tile, K block) steps into ``units`` spans
+  (:func:`router_partition`) runs only for a caller's explicit split count (also of the forward) and in the
+  ``"waves"`` windows on a part without a router table of its SM count; a segment that covers its tile's whole K
+  range stores the deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA
+  reduce-add (``out`` is zeroed on the launch's stream first).  The head/tail partitions (long head spans, short tail
+  spans) stay registered for an explicit table entry; no row of the shipped tables runs them.  A forward partition gives every element at most two partials,
   ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the same
   top-k;
 * the K2 weight and input gradients in the SIMT token windows of their rows in the router tables
@@ -64,11 +68,15 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
 Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs: a
 recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input gradient
 splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward rows of
-:data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another plan of those
-programs: the single-CTA program, every tile's whole K in one CTA.
+:data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 148-SM ``sm_100a`` and 152-SM ``sm_100a`` / ``sm_103a`` parts)
+run another plan of those programs (the single-CTA program, every tile's whole K in one CTA, or another named
+program), and the input-gradient rows of :data:`K1_DGRAD_RULES_BY_SM` another named program of that package (the
+deterministic plan's bits).
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
-of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
+of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials; in the
+shipped tables only a caller's explicit split count and the K2 ``"waves"`` windows on a part without a router table of
+its SM count -- raises
 PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
 and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
 launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
@@ -260,12 +268,15 @@ def _k2_launch_text(plan: Any) -> str:
 ROUTES: dict[str, str] = {
     "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split (the
     # rows of K1_FORWARD_RULES_BY_SM: another plan of the deterministic programs, whole K per tile)
-    "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split
+    "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split (the rows of
+    # K1_DGRAD_RULES_BY_SM: another program of the deterministic package, the same bits)
     "k1_nk": "det",
-    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
+    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; every row of the tables repeats bit
+    # for bit (two splits, the cluster program, one split), the others run the deterministic program
     "k2_kk": "atomic",  # router forward: the cluster SIMT program in its token windows; an explicit split count <= 2
     "k2_kn": "atomic",  # router input gradient: the SIMT program in its token windows, else one split
-    "k2_nn_t": "atomic",  # router weight gradient: stream-K over the token count
+    "k2_nn_t": "atomic",  # router weight gradient: the SIMT program in its token windows, else the deterministic
+    # program at the split count of the router tables (fixed order); stream-K only for an explicit split count
     "split": "det",  # the exact BF16x3 split of the router's second operand
 }
 
