@@ -500,14 +500,10 @@ def test_backward_at_grids_smaller_than_the_chunks(T, ctas, launches, monkeypatc
         assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
         assert torch.equal(main, torch.full_like(main, 3.0)), what
         assert not bool(ws.any()), what
-    assert launches == [
-        _backward_module(rows),
-        _backward_module(rows),
-        _backward_module(rows),
-        _backward_module(rows, torch.float32),
-        _backward_module(rows, torch.float32),
-        _backward_module(rows, torch.float32),
-    ], launches
+    # a call with compute_grad_weight=False runs the BF16 module whatever the
+    # dtype of grad_weight (it writes no weight gradient)
+    bf16, f32 = _backward_module(rows), _backward_module(rows, torch.float32)
+    assert launches == [bf16, bf16, bf16, f32, f32, bf16], launches
 
 
 @pytest.mark.parametrize("shape", [(0, 48, D), (5, 0, D), (0, D)])
@@ -638,8 +634,8 @@ def test_reset_workspace_clears_nonzero_scratch():
         torch.randint(1, 256, ws.shape, device=device, generator=g).to(torch.uint8)
     )
     offset = dict((b, o) for b, o, _ in WORKSPACE_LAYOUT)["dw_done"]
-    # a stale arrival ticket and a stale claim count
-    ws[offset : offset + 8].view(torch.int32).fill_(3)
+    # a stale arrival ticket and a stale claim count, no byte of them zero
+    ws[offset : offset + 8].view(torch.int32).fill_(0x03030303)
     assert bool(ws.ne(0).all())
     reset_workspace(ws)
     torch.cuda.synchronize()
