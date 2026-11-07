@@ -1,0 +1,17 @@
+{
+  "name": "llama-bf16-hd128",
+  "cuda_archs": ["9.0a", "10.0a"],
+  "modules": ["norm", "rope", "sampling", "page", "silu_and_mul", "topk"],
+  "include": [
+    "batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_bf16_*_head_dim_qk_128_head_dim_vo_128_posenc_0_use_swa_False_use_logits_cap_False_*",
+    "batch_decode_with_kv_cache_dtype_q_bf16_dtype_kv_bf16_*_head_dim_qk_128_head_dim_vo_128_posenc_0_use_swa_False_use_logits_cap_False",
+    "fmha_gen",
+    "fmha_cutlass_sm100a"
+  ],
+  "exclude": [],
+  "aot_config": {
+    "add_comm": false,
+    "add_moe": false,
+    "add_xqa": false
+  }
+}

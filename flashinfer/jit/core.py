@@ -138,6 +138,49 @@ def _record_jit_build(toolchain: str, name: str, seconds: float) -> None:
         logger.warning_once("Cannot write JIT build log %s: %s", log_path, str(e))
 
 
+_recorded_usage: set = set()
+_recorded_usage_lock = threading.Lock()
+
+
+def _record_jit_usage(spec: "JitSpec") -> None:
+    """Append the first request of each module to ``FLASHINFER_JIT_USAGE_LOG``.
+
+    Records every module a workload loads, whether it comes from an installed
+    jit-cache provider or is compiled at runtime, so that
+    ``scripts/custom_jit_cache.py`` can build a jit-cache holding exactly
+    those modules.
+    """
+    log_path = os.environ.get("FLASHINFER_JIT_USAGE_LOG")
+    if not log_path:
+        return
+    with _recorded_usage_lock:
+        if spec.name in _recorded_usage:
+            return
+        _recorded_usage.add(spec.name)
+    try:
+        cuda_archs = sorted(jit_env._target_cuda_architectures())
+    except Exception:
+        cuda_archs = []
+    line = json.dumps(
+        {
+            "name": spec.name,
+            "toolchain": spec.toolchain,
+            "aot": spec.is_aot if isinstance(spec, JitSpecNvcc) else None,
+            "cuda_archs": cuda_archs,
+            "flashinfer_version": jit_env.flashinfer_version,
+            "pid": os.getpid(),
+        }
+    )
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.warning_once("Cannot write JIT usage log %s: %s", log_path, str(e))
+
+
 def refresh_current_compilation_context() -> CompilationContext:
     """Refresh the cached compilation context in place.
 
@@ -370,6 +413,7 @@ class JitSpec(abc.ABC):
         ...
 
     def build_and_load(self) -> Any:
+        _record_jit_usage(self)
         cached = self.try_load()
         if cached is not None:
             return cached
@@ -383,8 +427,8 @@ class JitSpec(abc.ABC):
             if os.environ.get("FLASHINFER_DISABLE_JIT"):
                 raise MissingJITCacheError(
                     "JIT compilation is disabled via FLASHINFER_DISABLE_JIT "
-                    "environment variable, but the required module is not "
-                    "found in the JIT cache. Please add the missing module "
+                    f"environment variable, but the required module {self.name!r} "
+                    "is not found in the JIT cache. Please add the missing module "
                     "to the JIT cache build configuration.",
                     spec=self,
                 )
