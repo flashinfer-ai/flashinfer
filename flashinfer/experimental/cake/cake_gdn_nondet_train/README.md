@@ -8,12 +8,15 @@ fixed-order today, so two runs of one call on one device give the same bits;
 the contract does not promise run-to-run bits.  The
 results match the deterministic package
 `flashinfer.experimental.cake.cake_gdn_det_train` within that package's accuracy
-budgets, not bitwise: where the backward runs the package tail (see Chain),
-`dq` and `dk` are rounded to BF16 once, after the FP32 sum of the value heads'
-partials, where the deterministic package rounds each partial.  The output and
-the final state have the deterministic package's bits.  `dv`, `dg`, `dbeta` and the initial-state
-gradient have them too, except where the backward takes the adjoint table
-priced for `dhu_tc2` (see Chain); they then match within the same budgets.
+budgets, not bitwise: where the backward runs the package tail or a cluster
+tail of a value-head group of two or three (see Chain), `dq` and `dk` are
+rounded to BF16 once, after the FP32 sum of the value heads' partials, where the
+deterministic package rounds each partial.  The output and the final state have
+the deterministic package's bits.  `dv`, `dg`, `dbeta` and the initial-state
+gradient have them too, except where the backward runs the tcgen05 adjoint
+scan, which rounds `dv2` once on `sm_100a`, `sm_103a` and `sm_107a`, or takes
+the adjoint table priced for `dhu_tc2` (see Chain); they then match within the
+same budgets.
 On `sm_107a` a call may also take a deeper split table (see Chain); the
 outputs that depend on that table then match within the same budgets too.
 
@@ -116,7 +119,8 @@ This package exports four names at its root:
 | `cake_gdn_nondet_train_backward` | the backward chain over one forward tape |
 
 The planner and its helpers (`make_options`, `scan_plans`,
-`build_chunk_meta`, ...) stay in `cake_chain`.
+`build_chunk_meta`, ...) and the packed-row Function
+(`CakeGDNNondetPackedFunction`, see Chain) stay in `cake_chain`.
 
 ## Migration
 
@@ -151,12 +155,21 @@ take at most half the SMs runs `fwd_ho_vh2`: two CTAs per segment and value
 head, each the scan and output of one half of the value columns (the same
 bits).  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
-which a host-side cost rule selects on the host-table route.  On that route a
+which a host-side cost rule selects on the host-table route.  On `sm_100a`,
+`sm_103a` and `sm_107a` (`DVL32_ARCHS`) the tcgen05 scan runs as
+`dhu_tc2_dvl32`: it adds the FP32 `dv_local` values to `dv2`, so `dv2` rounds
+to BF16 once, where `dhu_tc2` rounds `dv_local` first (B200: 0.990-0.995 x
+`dhu_tc2`).  On that route a
 split `(64, 1)` plan runs the second pass of its adjoint scan on `dhu_tc2`,
 from the stitched segment states, where a second cost rule prices it at most
 0.95 of `dv_local` plus the register pass and, on `sm_100a`, at least 40 us
 cheaper; its pre-scan then computes the `dv_local` tiles of its chunks itself,
-so no `dv_local` stage runs.  Both forms give the same bits.  On a host-built
+so no `dv_local` stage runs.  That pre-scan (`dhu_pre_dvl_r64k1`) keeps its
+`dv_local` tile in BF16 in the segment map: an operand rounding, not a rounded
+partial sum of an output.  Its FP32-tile form `dhu_pre_dvl32_r64k1` ships but
+is not routed (`PRE_DVL32_ARCHS` is empty): on B200 it cost up to 1.2 % of the
+backward on the split plans of slow-decay gates.  The two pass-2 forms give the
+same bits on `dhu_tc2` and agree within the budgets on `dhu_tc2_dvl32`.  On a host-built
 table without plan pins, this package may also replace the planner's adjoint
 table (priced for the register scans) by the table priced for `dhu_tc2`
 itself: the serial table or a `(64, 1)` split table of any segment length,
@@ -174,14 +187,14 @@ times and fitted split costs, when it saves at least 2 us and prices at most
 its form; a serial table that
 the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
 tables.  On `sm_100a`, `sm_103a` and `sm_107a` (`SPLIT_R_FORM`) a value-head
-group of three with the `tail_g3` tail also keeps the planner's `(64, 1)` split
+group of three with its cluster tail also keeps the planner's `(64, 1)` split
 adjoint table when the `dhu_tc2` pricing runs its pass 2 and the two-stream rule
 groups its segments (the R form below; the deterministic package's table and
 groups).
 Elsewhere the forward table is the planner's.  A different table
 changes the bits of the outputs that depend on it (other segment boundaries),
 so the deterministic package's bits need its tables: pin `scan_config` /
-`segment_chunks`.  Then one of four
+`segment_chunks`.  Then one of six
 tails computes `dq`, `dk`, `dv`, `dg` and `dbeta`.  The device's architecture,
 the call's value-head group `G = HV / H` and its (chunk, value head) CTAs
 select the fastest one measured on B200, GB300 and R200 (the production rows, packs,
@@ -191,15 +204,31 @@ and the `tail` keyword pins one:
 | tail | selected for | `dq` / `dk` rounding | run to run today (not a contract) |
 |---|---|---|---|
 | `"tail"`: one tcgen05 kernel per (chunk, value head), a workspace slot per value head, the last CTA of a (chunk, key head) sums the slots | `G` other than 2 and 3 with at least the architecture's `TAIL_MIN_CTAS` chunks x `HV` | the value heads' FP32 partials summed in value-head order, one BF16 rounding after the FP32 L2-norm pullback | bitwise |
-| `"tail_g2"`: one cluster kernel per (chunk, key head) | `G = 2` | each value head's partial rounded to BF16, summed in a fixed order (the deterministic package's bits) | bitwise |
-| `"tail_g3"`: one three-CTA cluster kernel per (chunk, key head) | `G = 3` | as `"tail_g2"` | bitwise |
+| `"tail_g2_f32x"`: one two-CTA cluster kernel per (chunk, key head), the CTAs exchange their FP32 partials over distributed shared memory | `G = 2` | as `"tail"` (the same bits) | bitwise |
+| `"tail_g3_f32x"`: as `"tail_g2_f32x"` with three-CTA clusters | `G = 3` | as `"tail"` (the same bits) | bitwise |
+| `"tail_g2"`: the deterministic package's two-CTA cluster kernel | a pin at `G = 2` | each value head's partial rounded to BF16, summed in a fixed order (the deterministic package's bits) | bitwise |
+| `"tail_g3"`: the deterministic package's three-CTA cluster kernel | a pin at `G = 3` | as `"tail_g2"` | bitwise |
 | `"unfused"`: `dqkwg`, the WY pullback and the finalize | `G` other than 2 and 3 below the architecture's `TAIL_MIN_CTAS` chunks x `HV` | as `"tail_g2"` | bitwise |
 
 The cluster tails are the same on `sm_100a`, `sm_103a` and `sm_107a`
-(`CLUSTER_TAILS` holds them per architecture; `sm_107a` takes those of
-`sm_103a`).  In this package's backward (B200 / GB300), `tail_g3` measured
-1-6 % / 1-14 % faster than `"tail"` at `G = 3`, and `tail_g2` 16-19 % faster
-than `"tail"` at `G = 2` (the tail kernels alone).
+(`CLUSTER_TAILS` holds them per architecture; `sm_103a` and `sm_107a` take
+those of `sm_100a` until they are measured there).  On B200 (the tail kernels
+alone) `tail_g3_f32x` is 1.024-1.034 x `tail_g3` on the `(2, 6)` production
+rows and 1.034-1.051 x on the smaller head pairs, where `"tail"` is
+1.073-1.081 x `tail_g3` from 3,782 (chunk, value head) CTAs on and 0.99-1.006 x
+at 1,539-3,078 CTAs; `tail_g2_f32x` is 1.014-1.036 x `tail_g2`, which measured
+16-19 % faster than `"tail"` at `G = 2` (B200 and GB300).
+
+The cluster tails `tail_g2_f32x` and `tail_g3_f32x` read `v` and write `dq`,
+`dk` and `dv` through token-row strides.  When `q`, `k` and `v` are the head
+views of one packed BF16 row that requires grad (`row.split((H * 128, H * 128,
+HV * 128), -1)`, each viewed as `[B, T, heads, 128]`) and the call's tail is
+one of them, the row is the autograd input (`CakeGDNNondetPackedFunction`):
+the backward allocates one gradient row and the tail writes `dq`, `dk` and
+`dv` into its head views, so no concatenation runs.  Any other layout, another
+tail, or a row that records no gradient takes `CakeGDNNondetFunction`, with
+the same bits.  The forward still copies `v` into a contiguous tensor (the WY
+stage reads it contiguous).
 
 `TAIL_MIN_CTAS` holds the (chunk, value head) CTAs from which the package
 tail runs, per architecture and group class (`tail_min_ctas(arch, G)`):
@@ -217,8 +246,9 @@ is at least 16 % faster from 3072 CTAs on.  The backward time ratio `"tail"` /
 0.87 (`G = 1`) and 0.77-0.79 (`G = 4`) on R200 (216 SMs).
 
 Every tail meets the deterministic package's accuracy budgets.  `dv`, `dg`
-and `dbeta` have one writer each and the deterministic package's bits in
-every tail.
+and `dbeta` have one writer each and the same bits in every tail; they are
+the deterministic package's bits where the adjoint rounds `dv2` as that
+package does (see above).
 
 The workspace of `"tail"` holds one 64 KiB FP32 slot per (chunk, value head)
 of a launch, written before it is read, and one 32-bit arrival counter per
@@ -251,12 +281,12 @@ with `n < 2` or `n x HV <= SMs` is never split.  The groups follow the table
 order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
 value-head group of two runs the first `k` sequences on the caller's stream,
 then their fused tail while a side stream scans the rest; so does the scan
-beside `tail_g3` (a group of three) on `sm_100a` and `sm_103a`
+beside the cluster tail of a group of three on `sm_100a` and `sm_103a`
 (`TWO_STREAM_SERIAL_G3_ARCHS`, the deterministic package's rule).  The forward
 runs `wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream;
 once that `wy_tc` is done, the caller's stream runs those of the last `k`.  On
 `sm_100a`, `sm_103a` and `sm_107a` (`SPLIT_R_FORM`) the `dhu_tc2` pass 2 of a
-split adjoint table beside `tail_g3` runs the same way over its segments (`n`
+split adjoint table beside that tail runs the same way over its segments (`n`
 segments, the first `k` on the caller's stream).  The side
 stream is a stream of PyTorch's pool with the device's greatest priority, one
 per caller stream; it is forked from the caller's stream with events and joined
@@ -308,13 +338,13 @@ tail rule show.
 | `segment_chunks` | planner | segment length in chunks of the segment-parallel scans; `0` forces the serial scan; lengths above 128 (the chunks one pre-scan CTA covers) are not supported: a call whose plan then splits a sequence raises `ValueError` |
 | `finalize` | by size | finalize of the `"unfused"` tail: `"finalize"` or `"finalize_mlp"` (the latter needs `HV == 3 * H`) |
 | `warmup_log2` | `-10 / ln 2` | warm-up threshold of the pre-scans |
-| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits) |
+| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits as `"reg"` on `dhu_tc2`, within the budgets on `dhu_tc2_dvl32`) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order |
 | `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream |
-| `tail` | rule | backward tail (see Chain): `"tail"`, `"tail_g2"` (`HV == 2 * H` only), `"tail_g3"` (`HV == 3 * H` only) or `"unfused"` |
+| `tail` | rule | backward tail (see Chain): `"tail"`, `"tail_g2_f32x"` or `"tail_g2"` (`HV == 2 * H` only), `"tail_g3_f32x"` or `"tail_g3"` (`HV == 3 * H` only) or `"unfused"` |
 
 ## Limitations
 

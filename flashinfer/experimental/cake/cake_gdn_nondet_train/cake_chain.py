@@ -367,7 +367,8 @@ class ChainOptions:
     ``"unfused"`` tail; ``warmup_log2`` overrides the pre-scans' warm-up threshold; ``dhu_scan``
     forces the adjoint scan of a serial plan (``"reg"``: ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2``;
     ``None``: the selection rule) and the pass 2 of a split ``SDT_CONFIG`` plan on a host-built table (``"reg"``:
-    ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2`` after the fused pre-scan; the same bits); ``prep``
+    ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2`` after the fused pre-scan; the same bits on ``dhu_tc2``, within
+    the budgets on ``dhu_tc2_dvl32``); ``prep``
     forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
     grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule); ``save_state`` keeps the
     forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
