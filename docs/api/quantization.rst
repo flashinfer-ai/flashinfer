@@ -177,6 +177,22 @@ layout helpers used by the FP4 GEMM/MoE pipelines.
     shuffle_matrix_a
     shuffle_matrix_sf_a
 
+NVFP4 4over6 on SM12x
+~~~~~~~~~~~~~~~~~~~~~
+
+BF16 activation quantizers for SM120 / SM121 that are bit-identical to
+``fp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(err_mode="MSE", ...))``
+(packed values and the whole 128x4 swizzled scale buffer) and faster on SM12x.
+The dynamic variant also reduces the per-tensor amax and writes the global scale
+and the FP4 GEMM ``alpha`` in the same launch.
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_4over6_quantize_sm120
+    nvfp4_4over6_dynamic_quantize_sm120
+    nvfp4_4over6_dynamic_quantize_lora_down_sm120
+
 .. note::
 
     ``flashinfer.quantization.nvfp4_block_scale_interleave`` is an alias
