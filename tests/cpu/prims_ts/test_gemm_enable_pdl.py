@@ -488,3 +488,64 @@ def test_kernel_gates_every_pdl_element_on_enable_pdl():
     ]
     assert len(barriers) == 2
     assert all(any(b is g for g in guarded) for b in barriers)
+
+
+def test_store_task_waits_first_for_every_epilogue():
+    # The epilogue reads positions, scales and the Q/K norm weights before its
+    # first accumulator wait, so under PDL the store task waits before anything
+    # else whatever the epilogue is, and the resource graph says so.
+    tree = ast.parse(Path(api.__file__).with_name("kernel.py").read_text())
+    (create_store_task,) = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "create_store_task"
+    ]
+    (schedule,) = [
+        node
+        for node in create_store_task.body
+        if isinstance(node, ast.FunctionDef) and node.name == "store_schedule"
+    ]
+    first = schedule.body[0]
+    assert isinstance(first, ast.If) and _is_enable_pdl_guard(first.test)
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "wait_griddep"
+        for node in ast.walk(first)
+    )
+
+    (call,) = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_store_task"
+    ]
+    assert isinstance(call.args[-1], ast.Name) and call.args[-1].id == "pdl_wait"
+
+    (upstream,) = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "pdl_upstream" for t in node.targets
+        )
+    ]
+    assert isinstance(upstream, ast.IfExp)
+    assert isinstance(upstream.test, ast.Name) and upstream.test.id == "enable_pdl"
+    gmem_d_deps = [
+        value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values, strict=True)
+        if isinstance(key, ast.Name) and key.id == "gmem_d_resource"
+    ]
+    assert gmem_d_deps and all(
+        any(
+            isinstance(e, ast.Starred)
+            and isinstance(e.value, ast.Name)
+            and e.value.id == "pdl_upstream"
+            for e in deps.elts
+        )
+        for deps in gmem_d_deps
+    )
