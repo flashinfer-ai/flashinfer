@@ -26,6 +26,7 @@
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh"
@@ -36,6 +37,27 @@
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"
 
 namespace kernel_utils {
+
+// Programmatic dependent launch (PDL). With the attribute set, the grid can be
+// scheduled while the previous kernel in the stream is still draining, so the
+// launch latency overlaps that kernel's tail. A kernel launched this way runs
+// griddepcontrol.wait before it reads anything the previous kernel produced.
+template <typename... KernelArgs, typename... Args>
+inline cudaError_t launch_kernel_pdl(void (*kernel)(KernelArgs...), dim3 grid, dim3 block,
+                                     size_t smem_bytes, cudaStream_t stream, bool enable_pdl,
+                                     Args&&... args) {
+  cudaLaunchConfig_t config;
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem_bytes;
+  config.stream = stream;
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+  config.attrs = &attr;
+  config.numAttrs = 1;
+  return cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+}
 
 inline void find_divisor(uint32_t& mul, uint32_t& shr, int x) {
   auto find_log_2 = [](int x, bool round_up = false) {
@@ -340,6 +362,9 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
     }
     cutlass::arch::fence_view_async_shared();
   }
+  // Launched with PDL: wait for the kernel that produced A and its scales before
+  // any TMA load.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   int math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128 - 1, 0);
 
   float scale_b_r, scale_b_r_second_part;
@@ -700,7 +725,8 @@ class Fp8Gemm {
   // PlainGemm
   static void run(ElementA* gmem_a, int ld_a, ElementB* gmem_b, int ld_b, ElementD* gmem_d,
                   int ld_d, ElementScalar* scales_a, ElementScalar const* scales_b, int shape_m,
-                  int shape_n, int shape_k, cudaStream_t stream = 0, int guessed_m = TILE_M) {
+                  int shape_n, int shape_k, cudaStream_t stream = 0, int guessed_m = TILE_M,
+                  bool enable_pdl = false) {
     using ProblemVisitor = PlainGemmProblemVisitor<TILE_M, TILE_N>;
     // Need a factory for selecting WGMMA_OP, need to add E5M2 op if needed.
     using WGMMA_OP = typename Fp8MmaSelector<ElementA, ElementB, TILE_N>::Type;
@@ -720,9 +746,9 @@ class Fp8Gemm {
     typename ProblemVisitor::Input problem_input{shape_m};
     auto grid_size = ProblemVisitor::grid_dim(guessed_m, shape_n);
 
-    Kernel<<<grid_size, BLOCK_SIZE, smem_size, stream>>>(gmem_d, ld_d, scales_b, problem_input,
-                                                         shape_n, shape_k, tma_a_desc, tma_b_desc,
-                                                         tma_scales_a_desc, guessed_m);
+    kernel_utils::launch_kernel_pdl(Kernel, grid_size, BLOCK_SIZE, smem_size, stream, enable_pdl,
+                                    gmem_d, ld_d, scales_b, problem_input, shape_n, shape_k,
+                                    tma_a_desc, tma_b_desc, tma_scales_a_desc, guessed_m);
 #undef Kernel
   }
 
@@ -831,6 +857,10 @@ template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
                                    InputType const* const input, int dim_x, int dim_y) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+#if __CUDA_ARCH__ >= 900
+  // Launched with PDL: wait for the kernel that produced `input`.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   size_t scales_along_dim_x = div_up(dim_x, 128);
   size_t scales_along_dim_y = div_up(dim_y, 1);
   size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
@@ -1202,7 +1232,7 @@ void fp8_128x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const
 
 void gemm_dispatch_old(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
                        float* scales_a, float* scales_b, int shape_m, int shape_n, int shape_k,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, bool enable_pdl = false) {
   if (kNumDeviceSMs < 0) {
     kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
   }
@@ -1235,9 +1265,7 @@ void gemm_dispatch_old(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d
     GemmType::run(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), ld_a,                                 \
                   reinterpret_cast<__nv_fp8_e4m3*>(mat_b), ld_b,                                 \
                   reinterpret_cast<__nv_bfloat16*>(mat_d), ld_d, scales_a, scales_b, shape_m,    \
-                  shape_n, shape_k, stream                                                       \
-                                                                                                 \
-    );                                                                                           \
+                  shape_n, shape_k, stream, TILE_M, enable_pdl);                                 \
   }                                                                                              \
   break
 
@@ -1334,7 +1362,8 @@ void gemm_dispatch_old(void* mat_a, void* mat_b, void* mat_d, float* scales_a, f
 
 void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
                    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n,
-                   uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
+                   uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs,
+                   bool enable_pdl = false) {
   if (num_device_sms < 0) {
     num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
   }
@@ -1357,7 +1386,7 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
                        shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems,
                        best_num_tma_multicast, deep_gemm::GemmType::Normal,
                        static_cast<int*>(nullptr), stream, num_device_sms,
-                       static_cast<uint32_t>(best_smem_size));
+                       static_cast<uint32_t>(best_smem_size), enable_pdl);
   } else {
     auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size] =
         deep_gemm::jit::get_best_gemm_config(shape_n, shape_m, shape_k, num_problems,
@@ -1370,7 +1399,7 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
                              shape_n, shape_m, shape_k, best_block_m, best_block_n, block_k,
                              num_problems, best_num_tma_multicast, deep_gemm::GemmType::Normal,
                              static_cast<int*>(nullptr), stream, num_device_sms,
-                             static_cast<uint32_t>(best_smem_size));
+                             static_cast<uint32_t>(best_smem_size), enable_pdl);
   }
 }
 
@@ -1413,7 +1442,8 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b,
                   __nv_bfloat16* mat_d, int ld_d, uint32_t shape_m, uint32_t shape_n,
-                  uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream) {
+                  uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream,
+                  bool enable_pdl = false) {
   if (shape_m == 0) {
     return;
   }
@@ -1425,11 +1455,11 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
   }
   if (getDeepGemmEnabled()) {
     gemm_dispatch(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
-                  shape_k, stream);
+                  shape_k, stream, kNumDeviceSMs, enable_pdl);
   } else {
     gemm_dispatch_old(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b,
                       static_cast<int>(shape_m), static_cast<int>(shape_n),
-                      static_cast<int>(shape_k), stream);
+                      static_cast<int>(shape_k), stream, enable_pdl);
   }
 #endif
 }
@@ -1438,7 +1468,7 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
                   __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, int ld_b, float* scales_b,
                   __nv_bfloat16* mat_d, int ld_d, uint32_t shape_m, uint32_t shape_n,
                   uint32_t shape_k, cudaStream_t stream, bool internal_quantize_a = true,
-                  bool internal_quantize_b = true) {
+                  bool internal_quantize_b = true, bool enable_pdl = false) {
   if (shape_m == 0) {
     return;
   }
@@ -1447,15 +1477,17 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
   }
 
   if (internal_quantize_a) {
-    scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(fp8_mat_a, scales_a, mat_a, shape_k,
-                                                              shape_m);
+    auto quant_kernel = scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float>;
+    kernel_utils::launch_kernel_pdl(quant_kernel, kNumDeviceSMs * 8, 256, 0, stream, enable_pdl,
+                                    fp8_mat_a, scales_a, mat_a, static_cast<int>(shape_k),
+                                    static_cast<int>(shape_m));
   }
   if (internal_quantize_b) {
     scale_128x128_kernel<<<kNumDeviceSMs, 256, 0, stream>>>(fp8_mat_b, scales_b, mat_b, shape_k,
                                                             shape_n);
   }
   fp8_gemm_run(fp8_mat_a, ld_a, fp8_mat_b, ld_b, mat_d, ld_d, shape_m, shape_n, shape_k, scales_a,
-               scales_b, stream);
+               scales_b, stream, enable_pdl);
 }
 
 void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
