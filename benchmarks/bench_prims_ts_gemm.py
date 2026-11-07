@@ -16,6 +16,10 @@ that fails to launch is reported as failed and does not stop the rest.
 ``--epilogue qkv_qknorm_rope`` runs the fused QK-norm and RoPE epilogue.
 That kernel accepts only head_dim 128, so N must be divisible by 384.
 
+``--enable_pdl`` tunes and times the kernels launched with programmatic
+dependent launch (PDL), the API default on supporting devices. Without it
+they launch in plain stream order, as in flashinfer_benchmark.
+
 Run from the repository root: python -m benchmarks.bench_prims_ts_gemm
 """
 
@@ -79,7 +83,17 @@ def _rope(m: int, q_norm, k_norm, num_heads: int):
     return q_norm, k_norm, cos_sin, positions, num_heads
 
 
-def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out, rope=None):
+def _call(
+    dtype: str,
+    epilogue: str,
+    a,
+    weight,
+    a_scale,
+    weight_scale,
+    out,
+    rope=None,
+    enable_pdl: bool = False,
+):
     if epilogue == "qkv_qknorm_rope":
         q_norm, k_norm, cos_sin, positions, num_heads = rope
         common = dict(
@@ -87,6 +101,7 @@ def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out, rope
             num_kv_heads=num_heads,
             head_dim=_QKV_HEAD_DIM,
             out=out,
+            enable_pdl=enable_pdl,
         )
         if dtype == "fp8":
             return fp8_qkv_qknorm_rope(
@@ -115,9 +130,11 @@ def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out, rope
         )
     if dtype == "fp8":
         fn = fp8_linear_swiglu if epilogue == "swiglu" else fp8_linear
-        return fn(a, weight, a_scale, weight_scale, out=out)
+        return fn(a, weight, a_scale, weight_scale, out=out, enable_pdl=enable_pdl)
     fn = fp4_linear_swiglu if epilogue == "swiglu" else fp4_linear
-    return fn(a, a_scale, 1.0, weight, weight_scale, 1.0, out=out)
+    return fn(
+        a, a_scale, 1.0, weight, weight_scale, 1.0, out=out, enable_pdl=enable_pdl
+    )
 
 
 def _selected_tactic(
@@ -130,6 +147,7 @@ def _selected_tactic(
     weight_scale,
     out,
     rope=None,
+    enable_pdl: bool = False,
 ):
     """Return the tactic ``choose_one`` selects for these tensors.
 
@@ -148,7 +166,7 @@ def _selected_tactic(
 
     tuner.choose_one = _choose_one
     try:
-        _call(dtype, epilogue, a, weight, a_scale, weight_scale, out, rope)
+        _call(dtype, epilogue, a, weight, a_scale, weight_scale, out, rope, enable_pdl)
     finally:
         tuner.choose_one = choose_one
     return recorded[-1] if recorded else -1
@@ -278,6 +296,12 @@ def main() -> None:
         action="store_true",
         help="Time every searched tactic and mark the winner. Default prints only the winner.",
     )
+    parser.add_argument(
+        "--enable_pdl",
+        "--enable-pdl",
+        action="store_true",
+        help="Launch with programmatic dependent launch (PDL). Off unless given.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires a CUDA GPU")
@@ -359,14 +383,25 @@ def main() -> None:
     print(
         f"GPU={torch.cuda.get_device_name()} SM{major}{minor} "
         f"dtype={args.dtype} epilogue={args.epilogue} "
-        f"N={args.n} K={args.k}{heads} buckets={bucket_desc}",
+        f"N={args.n} K={args.k}{heads} buckets={bucket_desc} "
+        f"pdl={int(args.enable_pdl)}",
         flush=True,
     )
 
     tune_m = max(args.m)
     a, a_scale, out, rope = problem(tune_m)
     with autotune(True, **context):
-        _call(args.dtype, args.epilogue, a, weight, a_scale, weight_scale, out, rope)
+        _call(
+            args.dtype,
+            args.epilogue,
+            a,
+            weight,
+            a_scale,
+            weight_scale,
+            out,
+            rope,
+            args.enable_pdl,
+        )
 
     runner = None
     tactics = None
@@ -374,10 +409,20 @@ def main() -> None:
         arch = major * 10 + minor
         head_dim = _QKV_HEAD_DIM if num_heads is not None else None
         is_neox = False if num_heads is not None else None
+        # The same identity the public call tunes, so --all-tactics times the
+        # PDL mode the tuner picked from.
         runner = PrimsTsGemmRunner(
             op_name,
             GemmIdentity(
-                arch, operand, "bf16", args.epilogue, False, head_dim, is_neox, False
+                arch=arch,
+                operand_format=operand,
+                output_format="bf16",
+                epilogue=args.epilogue,
+                has_bias=False,
+                head_dim=head_dim,
+                is_neox=is_neox,
+                has_qkv_scale=False,
+                enable_pdl=args.enable_pdl,
             ),
         )
         tactics = legal_tactics(arch, operand, "bf16", args.epilogue)
@@ -395,6 +440,7 @@ def main() -> None:
                 weight_scale,
                 out,
                 rope,
+                args.enable_pdl,
             )
             bucket = _bucket_for(args.epilogue, m)
             if not args.all_tactics:
@@ -409,6 +455,7 @@ def main() -> None:
                         weight_scale,
                         out,
                         rope,
+                        args.enable_pdl,
                     )
 
                 samples = bench_gpu_time(
