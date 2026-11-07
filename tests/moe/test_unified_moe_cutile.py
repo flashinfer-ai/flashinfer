@@ -1744,6 +1744,50 @@ def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch
 
 @cutile_nvfp4_required
 @pytest.mark.parametrize(
+    "a16,tactic",
+    (
+        pytest.param(False, (32, 0, 128, 64, 2, 128, 64, 2), id="w4a4"),
+        pytest.param(False, (32, 1, 256, 64, 2, 128, 64, 2), id="w4a4-fused-gemm1"),
+        pytest.param(True, (32, 0, 128, 128, 2, 128, 128, 2), id="w4a16"),
+    ),
+)
+def test_cutile_nvfp4_persistent_grid_matches_one_cta_per_block(
+    a16, tactic, monkeypatch
+):
+    """A CTA looping over several M blocks matches one CTA per M block."""
+    from flashinfer.fused_moe.cutile import fp4
+
+    activation = SwiGLU()
+    config, activations, weights, _ = _make_nvfp4_case(activation, num_tokens=33)
+    runner_type = CuTileNvfp4Runner
+    if a16:
+        config = _fp4_config(
+            CuTileNvfp4Bf16Config,
+            (QuantFormat.NVFP4, QuantFormat.BF16),
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            activation=activation,
+            max_num_tokens=128,
+        )
+        runner_type = CuTileNvfp4Bf16Runner
+    runner = runner_type(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    # The persistent grid runs first, so that rows it skipped cannot be left
+    # over in the workspace by the one-CTA-per-block run.
+    with monkeypatch.context() as patch:
+        patch.setattr(fp4, "_PERSISTENT_MIN_ASSIGNMENTS", 1)
+        patch.setattr(fp4, "_PERSISTENT_MAX_K", 1 << 30)
+        patch.setattr(fp4, "_persistent_grid_m", lambda *_args: 1)
+        actual = runner.forward(inputs, tactic=tactic).clone()
+    expected = runner.forward(inputs, tactic=tactic).clone()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@cutile_nvfp4_required
+@pytest.mark.parametrize(
     (
         "activation",
         "num_tokens",
