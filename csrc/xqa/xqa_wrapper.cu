@@ -55,7 +55,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  TensorView output, double rcpOutScale, TensorView q,
                  Optional<TensorView> attentionSinks, TensorView kCacheVLLM, TensorView vCacheVLLM,
                  Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
-                 TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                 TensorView kvCachePageList, int64_t maxSeqLen, int64_t maxKvLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
                  int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
                  TensorView semaphores, TensorView scratch, bool enable_pdl) {
@@ -114,14 +114,14 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
         reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
         reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
         reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
-        reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+        reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen, maxKvLen,
         reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
 #if SPEC_DEC
         qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
         reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-        reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
-        kv_stride_head, stream);
+        reinterpret_cast<void*>(scratch.data_ptr()), scratch.numel() * get_element_size(scratch),
+        enable_pdl, kv_stride_page, kv_stride_token, kv_stride_head, stream);
     return;
   }
 #endif
