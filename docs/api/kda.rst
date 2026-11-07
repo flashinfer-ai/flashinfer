@@ -520,6 +520,26 @@ chunk-to-sequence tensor. Its workspace and launch use a graph-static chunk
 capacity derived from tensor shapes, while the GPU prefix supplies the actual
 chunk count on each replay.
 
+Measuring host overhead
+~~~~~~~~~~~~~~~~~~~~~~~
+
+On SM100/SM103, ``benchmarks/bench_recurrent_kda_prefill.py`` can report
+eager host-return and completed-call latency alongside its CUPTI GPU timings::
+
+    python benchmarks/bench_recurrent_kda_prefill.py \
+        --case-set h12 --backend auto --host-timing --inference-mode \
+        --json kda-inference.json
+
+``--inference-mode`` creates the inputs and runs the measurements inside
+``torch.inference_mode``. Omit it for versioned tensors: the lack of a version
+counter can change metadata caching and introduce host reads in serving loops.
+Host-return time includes Python dispatch and any synchronization inside the
+call; completed-call time also waits for GPU completion. These additional
+measurements do not flush L2, exclude state-pool reset, and cover only the
+FlashInfer candidate. They are not directly comparable to the cold-L2 CUPTI
+kernel samples or end-to-end serving throughput. ``--host-timing`` cannot be
+combined with ``--cuda-graph``.
+
 State and graph semantics
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
