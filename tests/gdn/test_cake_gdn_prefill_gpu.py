@@ -1097,6 +1097,92 @@ def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_of_each_contract_ma
         assert grids == [expected_grid, expected_grid]
 
 
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads"),
+    (
+        (torch.bfloat16, torch.bfloat16, True, (8, 32)),
+        (torch.bfloat16, torch.float32, False, (16, 32)),
+        (torch.float16, torch.float32, False, (16, 64)),
+    ),
+    ids=("bf16_state", "no_initial_state", "f16_io_no_initial_state"),
+)
+@pytest.mark.parametrize("seq_len", (2048, 2049), ids=("max2048", "max2049"))
+def test_public_cake_gdn_prefill_sm107a_vec2full_twin_equals_the_shared_record(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_len
+):
+    # A full-DV batch of the BF16-state contract (without gate streaming) or of the FP32-state
+    # contracts without an initial state runs the key's vec2-full twin record when its longest
+    # sequence is at most 2048 tokens and the shared record above that.  The twin only moves
+    # the state differently: with the rule's bound moved to the other side, the other record
+    # of the same key gives the same output and final state bit for bit, and both match the
+    # reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the vec2-full twin records are sm_107a only")
+    num_q_heads, num_v_heads = heads
+    seq_lens = (seq_len,) * 4
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        if initial_state is None:
+            case["output_state"].fill_(float("nan"))
+        else:
+            case["output_state"].copy_(initial_state)
+        out, state = _launch(case, cu_seqlens_cpu=_host_cu_seqlens(seq_lens))
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    twin_first = seq_len <= 2048
+    limit = cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+    cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = -1 if twin_first else 1 << 20
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = limit
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 2, loaded
+    twin, shared = loaded if twin_first else loaded[::-1]
+    assert "_sm107a_vec2full_i64meta_" in twin, loaded
+    assert shared == twin.replace("_sm107a_vec2full_i64meta_", "_sm107a_i64meta_")
+    twin_record = cake_gdn._kernel_record(twin)
+    shared_record = cake_gdn._kernel_record(shared)
+    assert twin_record["specializations"] == shared_record["specializations"]
+    assert twin_record["outputs"] != shared_record["outputs"]
+    (out, state), (other_out, other_state) = results
+    assert torch.isfinite(out.float()).all() and torch.isfinite(state.float()).all()
+    assert torch.equal(out, other_out)
+    assert torch.equal(state, other_state)
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def _carry_segment(case, start, stop, initial_state):
     """``case`` cut to tokens ``[start, stop)`` of its one sequence, started from ``initial_state``."""
 
