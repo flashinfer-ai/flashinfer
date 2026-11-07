@@ -1622,6 +1622,10 @@ class LowLatencyBlockscaledGemmKernel:
             tcgen05.commit(mma_epilog_full_bar, None, self.cta_group)
 
         # Release the tensor memory allocation
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (an epilogue or SFB warp has not arrived yet), it counts toward
+        # phase 0 and the parity-1 wait passes before their tcgen05.ld.
+        cute.arch.mbarrier_wait(tmem_alloc_result_bar, 0)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
