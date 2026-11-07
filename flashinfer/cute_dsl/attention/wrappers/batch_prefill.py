@@ -298,6 +298,10 @@ class BatchPrefillCuteDSLWrapper:
     ) -> None:
         """Compile the FMHA prefill kernel for the given configuration.
 
+        Sequence offsets and paged metadata may reside on CPU or CUDA. The
+        workspace device determines where runtime metadata and outputs live.
+        CPU offsets and lengths avoid device-to-host copies during planning.
+
         Parameters
         ----------
         qo_indptr : torch.Tensor
@@ -357,7 +361,7 @@ class BatchPrefillCuteDSLWrapper:
         """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
-        _require_dsl_arch(qo_indptr.device)
+        _require_dsl_arch(self.device)
 
         if num_qo_heads is None or num_kv_heads is None or head_dim_qk is None:
             raise ValueError("num_qo_heads, num_kv_heads and head_dim_qk are required")
@@ -390,7 +394,7 @@ class BatchPrefillCuteDSLWrapper:
                 )
             from flashinfer.page import get_seq_lens
 
-            device = qo_indptr.device
+            device = self.device
             seq_lens = get_seq_lens(
                 paged_kv_indptr.cpu(), paged_kv_last_page_len.cpu(), page_size
             )
@@ -398,7 +402,6 @@ class BatchPrefillCuteDSLWrapper:
             # per-item seqlen_k from these exactly as on the ragged path.
             kv_indptr = torch.zeros(seq_lens.numel() + 1, dtype=torch.int64)
             kv_indptr[1:] = torch.cumsum(seq_lens, 0)
-            kv_indptr = kv_indptr.to(device)
             self._paged_kv_indptr = paged_kv_indptr.to(torch.int32).to(device)
             self._paged_kv_indices = paged_kv_indices.to(torch.int32).to(device)
             self._paged_kv_last_page_len = paged_kv_last_page_len.to(torch.int32).to(
@@ -424,7 +427,7 @@ class BatchPrefillCuteDSLWrapper:
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(head_dim_qk)
         self._sm_scale = sm_scale
-        self._device = qo_indptr.device
+        self._device = self.device
         if variant is None:
             variant = StandardAttention()
         self._variant = variant
@@ -441,11 +444,13 @@ class BatchPrefillCuteDSLWrapper:
             raise ValueError(f"Unsupported input data type: {q_data_type}")
         self._in_dtype, self._out_dtype = _dtype_map[q_data_type]
 
-        # Sequence lengths from indptr
-        s_q = qo_indptr[1:] - qo_indptr[:-1]
-        s_k = kv_indptr[1:] - kv_indptr[:-1]
-        s_q_all = int(qo_indptr[-1].item())
-        s_k_all = int(kv_indptr[-1].item())
+        # Compute plan-time statistics on the host without scalar GPU readbacks.
+        qo_indptr_host = qo_indptr.cpu()
+        kv_indptr_host = kv_indptr.cpu()
+        s_q = qo_indptr_host[1:] - qo_indptr_host[:-1]
+        s_k = kv_indptr_host[1:] - kv_indptr_host[:-1]
+        s_q_all = int(qo_indptr_host[-1].item())
+        s_k_all = int(kv_indptr_host[-1].item())
         max_s_q = int(torch.max(s_q).item())
         max_s_k = int(torch.max(s_k).item())
         # The kernel loads the first KV tile of every valid Q tile
@@ -459,8 +464,8 @@ class BatchPrefillCuteDSLWrapper:
             )
 
         # Store for runtime
-        self._qo_indptr = qo_indptr.to(torch.int32)
-        self._kv_indptr = kv_indptr.to(torch.int32)
+        self._qo_indptr = qo_indptr.to(device=self.device, dtype=torch.int32)
+        self._kv_indptr = kv_indptr.to(device=self.device, dtype=torch.int32)
         self._s_q_all = s_q_all
         self._s_k_all = s_k_all
         self._o_padding = max_s_q

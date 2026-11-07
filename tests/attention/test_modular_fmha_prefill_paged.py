@@ -650,6 +650,58 @@ def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name, page_size):
     assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
 
 
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_cute_wrapper_cpu_metadata(paged, index_dtype):
+    """Host metadata must match GPU plans, including after lengths/pages change."""
+    _skip_unless_sm100()
+    from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+    workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+    host_plan = BatchPrefillCuteDSLWrapper(workspace)
+    device_plan = BatchPrefillCuteDSLWrapper(workspace)
+    plan_kw = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    for seed, (sq, sk) in enumerate([([3, 257], [17, 513]), ([257, 3], [513, 17])]):
+        q, k, v, cache, qo, kv, pg, ids, lpl = _build_wrapper_problem(
+            sq, sk, 16, seed=seed
+        )
+        qo, kv, pg, ids, lpl = (
+            tensor.to(index_dtype) for tensor in (qo, kv, pg, ids, lpl)
+        )
+        if paged:
+            device_plan.plan(
+                qo,
+                page_size=16,
+                paged_kv_indptr=pg,
+                paged_kv_indices=ids,
+                paged_kv_last_page_len=lpl,
+                **plan_kw,
+            )
+            host_plan.plan(
+                qo.cpu(),
+                page_size=16,
+                paged_kv_indptr=pg.cpu(),
+                paged_kv_indices=ids,
+                paged_kv_last_page_len=lpl.cpu(),
+                **plan_kw,
+            )
+            expected = device_plan.run_paged(q, cache)
+            actual = host_plan.run_paged(q, cache)
+        else:
+            device_plan.plan(qo, kv, **plan_kw)
+            host_plan.plan(qo.cpu(), kv.cpu(), **plan_kw)
+            expected = device_plan.run(q, k, v)
+            actual = host_plan.run(q, k, v)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_paged_wrapper_rejections():
     _skip_unless_sm100()
     (q, _, _, cache, qo, _, kv_pg, ids, lpl) = _build_wrapper_problem([300], [300], 16)
