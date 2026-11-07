@@ -1325,6 +1325,7 @@ class TPMoESparseFP4Binding:
     activation_amax: torch.Tensor | None = None
     layer_idx: int | None = None
     plan: object | None = None
+    decode_config: MoeDecodeConfig | None = None
 
     def run(self) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
         return b12x_sparse_moe_fp4(binding=self)
@@ -10269,6 +10270,7 @@ def build_tp_moe_sparse_fp4_binding(
     swiglu_beta: float | None = None,
     activation_amax: torch.Tensor | None = None,
     layer_idx: int | None = None,
+    decode_config: MoeDecodeConfig | None = None,
 ) -> TPMoESparseFP4Binding:
     if not isinstance(scratch, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool)):
         raise TypeError("scratch must be a TP MoE scratch object")
@@ -10327,6 +10329,7 @@ def build_tp_moe_sparse_fp4_binding(
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
         layer_idx=layer_idx,
+        decode_config=decode_config,
     )
 
 
@@ -14515,11 +14518,21 @@ def b12x_route_experts_fast(
 
 
 def b12x_sparse_moe_fp4(
-    *, binding: TPMoESparseFP4Binding, route_topk_launcher=None
+    *,
+    binding: TPMoESparseFP4Binding,
+    route_topk_launcher=None,
+    decode_config: MoeDecodeConfig | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, B12XTopKRouting]:
     """Execute a fully bound ``gate -> top-k -> routed experts`` block."""
     if not isinstance(binding, TPMoESparseFP4Binding):
         raise TypeError("binding must be a TPMoESparseFP4Binding")
+    config = decode_config if decode_config is not None else binding.decode_config
+    if config is None:
+        raise ValueError(
+            "b12x_sparse_moe_fp4 requires a decode_config. Declare the MoE with "
+            "fused_moe.plan_execution() and run it with fused_moe.run_sparse(), "
+            "or pass decode_config to build_tp_moe_sparse_fp4_binding()."
+        )
     hidden_states = binding.hidden_states
     experts = binding.experts
     workspace = binding.scratch
@@ -14604,6 +14617,7 @@ def b12x_sparse_moe_fp4(
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
         layer_idx=layer_idx,
+        decode_config=config,
     )
     routed_output = b12x_moe_fp4(binding=moe_binding)
     if routed_scaling_factor != 1.0:
