@@ -47,6 +47,20 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_SMEM_W_OFF 0
+#define SMEM_SMEM_W_STAGE_BYTES 1024
+#define SMEM_SMEM_W_STRIDE 1024
+#define SMEM_SMEM_RED_OFF 1024
+#define SMEM_SMEM_RED_STAGE_BYTES 64
+#define SMEM_SMEM_RED_STRIDE 64
+#define SMEM_SMEM_ACC_OFF 1088
+#define SMEM_SMEM_ACC_STAGE_BYTES 4096
+#define SMEM_SMEM_ACC_STRIDE 4096
+#define SMEM_TOTAL 5248
+#define THREADS 256
+
 #include <math_constants.h>
 
 __device__ __forceinline__ float approx_exp2(float x) {
@@ -92,7 +106,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9ee76b721fc2501c240d(__nv_bfloat16* 
 
     const int cta_rank = 0;
 
-    // Prologue
+    // Kernel setup ops
     float* smem_w = reinterpret_cast<float*>(smem_raw + 0);
     const int smem_w_addr = smem + 0;
     float* smem_red = reinterpret_cast<float*>(smem_raw + 1024);
