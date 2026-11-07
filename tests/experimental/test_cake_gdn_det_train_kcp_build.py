@@ -172,13 +172,12 @@ SELECT_RULES = ("always", "columns", "ctas_per_head")
 
 
 def _registry():
-    """The registry module, or a skip while the seed registry is not in the tree yet."""
-    return pytest.importorskip(f"{PACKAGE_IMPORT}.cake_jit")
+    """The registry module."""
+    return importlib.import_module(f"{PACKAGE_IMPORT}.cake_jit")
 
 
 def _backend():
-    """The backend module; it imports the registry, so it skips with it while the seed registry is not in the tree."""
-    _registry()
+    """The backend module."""
     return importlib.import_module(f"{PACKAGE_IMPORT}.cake_backend")
 
 
@@ -198,20 +197,58 @@ def _python_files() -> list[Path]:
     return sorted(p for p in PACKAGE_DIR.glob("*.py"))
 
 
+def _imported_names(node: ast.AST) -> list[str]:
+    """The module names one AST node imports: an import statement, or a call of ``importlib.import_module`` /
+    ``import_module`` / ``__import__`` with a literal string module name."""
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    if isinstance(node, ast.ImportFrom):
+        return [node.module or ""] + [alias.name for alias in node.names]
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        )
+        if name in ("import_module", "__import__"):
+            args = list(node.args[:1]) + [
+                k.value for k in node.keywords if k.arg == "name"
+            ]
+            return [
+                a.value
+                for a in args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            ]
+    return []
+
+
+def _kda_import_lines(source: str, filename: str = "<source>") -> list[int]:
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source, filename=filename))
+        if any("cake_kda" in name for name in _imported_names(node))
+    ]
+
+
 def test_the_package_imports_nothing_from_the_kda_training_package() -> None:
     offenders = []
     for path in _python_files():
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                names = [node.module or ""] + [alias.name for alias in node.names]
-            else:
-                continue
-            if any("cake_kda" in name for name in names):
-                offenders.append(f"{path.name}:{node.lineno}")
+        for lineno in _kda_import_lines(path.read_text(), str(path)):
+            offenders.append(f"{path.name}:{lineno}")
     assert not offenders, offenders
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import importlib\nimportlib.import_module('flashinfer.experimental.cake_kda_det_train.cake_build')\n",
+        "from importlib import import_module\nimport_module(name='flashinfer.experimental.cake_kda_det_train_kcp')\n",
+        "__import__('flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp')\n",
+        "from flashinfer.experimental.cake_kda_det_train import cake_build\n",
+    ],
+)
+def test_the_kda_scan_rejects_a_dynamic_import(source: str) -> None:
+    # the scan above, on a synthetic module that imports a KDA package by a literal dynamic import
+    assert _kda_import_lines(source)
 
 
 def test_the_package_reads_no_environment_variable() -> None:
@@ -253,7 +290,7 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     header too."""
     kda_dir = Path(
         importlib.import_module(
-            "flashinfer.experimental.cake_kda_det_train.cake_build"
+            "flashinfer.experimental.cake.cake_kda_det_train.cake_build"
         ).__file__
     ).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):

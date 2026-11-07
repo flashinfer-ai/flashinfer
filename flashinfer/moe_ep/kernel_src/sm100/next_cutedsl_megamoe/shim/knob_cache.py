@@ -226,11 +226,11 @@ def write_record(entry):
     identity = ("backend_revision", "device", "problem", "live_tokens")
     temporary = None
     try:
-        import fcntl
+        import _flashinfer_filelock as filelock
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path + ".lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            filelock.lock(lock.fileno())
             data = _read(path)
             data["entries"] = [
                 e

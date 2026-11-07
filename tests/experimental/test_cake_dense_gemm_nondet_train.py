@@ -476,11 +476,16 @@ def test_k2_routes_pass_enable_pdl(monkeypatch, pdl):
 
 
 def _without_forward_verdicts(monkeypatch) -> None:
-    """Clear the forward's shipped verdicts (the cluster SIMT windows of :data:`ROUTER_RULES`): no router table then
-    gives the forward a verdict, so the forward without a split count takes the deterministic program's binding."""
-    for key, rule in list(cake_backend.ROUTER_RULES.items()):
-        if key[1] == "kk" and rule is not None:
-            monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    """Clear the forward's shipped verdicts (the cluster SIMT windows of :data:`ROUTER_RULES` and of the tables of
+    :data:`ROUTER_RULES_BY_SM`): no router table then gives the forward a verdict, so the forward without a split
+    count takes the deterministic program's binding."""
+    for table in (
+        cake_backend.ROUTER_RULES,
+        *cake_backend.ROUTER_RULES_BY_SM.values(),
+    ):
+        for key, rule in list(table.items()):
+            if key[1] == "kk" and rule is not None:
+                monkeypatch.setitem(table, key, None)
 
 
 def _register(monkeypatch, arch: str, *templates: str) -> None:
@@ -527,7 +532,7 @@ def no_k1_chains(monkeypatch):
     (:func:`k1_chain_plan`), so a test of those tables holds them without it (``test_k1_chain_ranges`` holds the
     chain ranges).  The one-split ranges of :data:`K1_ONE_SPLIT_RANGES_BY_SM`, which come next, go too
     (``test_k1_152_sm_one_split_ranges`` holds them), and so do the cluster ranges of :data:`K1_DSM_RANGES_BY_SM`,
-    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_152_sm_dsm_ranges`` holds them)."""
+    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_dsm_ranges`` holds them)."""
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -1649,7 +1654,17 @@ def test_k1_152_sm_one_split_ranges_bind_the_one_split_program(monkeypatch):
 #: The ranges of :data:`K1_DSM_RANGES_BY_SM`, ``(arch, sm_count) -> {(d_in, d_out): ((min_tokens, max_tokens, (block_n,
 #: splits)), ...)}`` (FP32 out): the cluster program of that tile width and cluster size at every token count of a range.
 # fmt: off
-K1_152_DSM_RANGES = {
+K1_DSM_RANGES = {
+    ("sm_100a", 148): {
+        (4096, 32): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        (4096, 48): ((1024, 4095, (32, 2)), (4096, 16384, (64, 3)), (32768, 32768, (64, 3))),
+        (4096, 64): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        (4096, 128): ((1024, 12288, (64, 2)),),
+        (5120, 32): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
+        (5120, 48): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 32768, (64, 2))),
+        (5120, 64): ((1024, 2047, (64, 3)), (2048, 32768, (64, 2))),
+        (5120, 128): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
     ("sm_100a", 152): {
         (4096, 32): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
         (4096, 48): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
@@ -1660,28 +1675,32 @@ K1_152_DSM_RANGES = {
         (5120, 64): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         (5120, 128): ((1024, 6144, (128, 2)),),
     },
+    ("sm_103a", 152): {
+        (4096, 32): ((1024, 2047, (32, 3)), (2048, 4095, (32, 2)), (4096, 8191, (32, 3)), (8192, 12287, (32, 2)), (12288, 16383, (32, 3)), (16384, 24575, (32, 2)), (24576, 32768, (32, 3))),
+        (4096, 48): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        (4096, 64): ((1024, 2047, (32, 2)), (2048, 8191, (64, 3)), (8192, 12287, (32, 2)), (12288, 32768, (64, 3))),
+        (4096, 128): ((1024, 12288, (64, 2)),),
+        (5120, 32): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (8192, 12287, (32, 3)), (12288, 32768, (32, 2))),
+        (5120, 48): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 8192, (64, 3))),
+        (5120, 64): ((1024, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 12287, (64, 2)), (12288, 24576, (64, 3))),
+        (5120, 128): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
+}
+#: The token counts at which the rows of each part were measured (two 148-SM B200 parts, two 152-SM GB200 parts, two
+#: 152-SM GB300 parts).
+K1_DSM_MEASURED_TOKENS = {
+    ("sm_100a", 148): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_100a", 152): (1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_103a", 152): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
 }
 # fmt: on
-#: The token counts at which these rows were measured (two 152-SM GB200 parts).
-K1_152_DSM_MEASURED_TOKENS = (
-    1024,
-    2048,
-    3072,
-    4096,
-    6144,
-    8192,
-    12288,
-    16384,
-    24576,
-    32768,
-)
 
 
-def _k1_dsm_ranges_edges(ranges):
+def _k1_dsm_ranges_edges(ranges, part):
     """Token counts of a row's cluster ranges to plan at: every range's first and last token count and the token counts
-    next to them, and the measured token counts."""
+    next to them, and the token counts at which the rows of ``part`` were measured."""
     Ts = {t for lo, hi, _ in ranges for t in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1)}
-    return sorted(Ts | set(K1_152_DSM_MEASURED_TOKENS))
+    return sorted(Ts | set(K1_DSM_MEASURED_TOKENS[part]))
 
 
 def _k1_wgrad_plans(M, N, T, parts):
@@ -1707,22 +1726,24 @@ def _k1_wgrad_plans(M, N, T, parts):
     return plans
 
 
-def test_k1_152_sm_dsm_ranges(monkeypatch):
-    """On 152-SM sm_100a parts the FP32 rows ``4096 -> 32, 48, 64, 128`` and ``5120 -> 32, 48, 64, 128`` run the
-    cluster program of their ranges in :data:`K1_DSM_RANGES_BY_SM` (:func:`k1_dsm_plan`; :func:`plan_atomic_gemm`
-    plans it with ``dsm``, before every other K1 table) at every token count of a range.  A row's ranges are ordered
-    and disjoint, its first range starts and its last range ends at a measured token count, every range holds a
-    measured token count and ends at one or next to one (where the next range starts), and every range names a
-    program this checkout registers for sm_100a, with its cluster size baked into the module.  One token below or
-    above a row's ranges, BF16 out, every other row, every other SM count (148, 150, 151, 153, 160) and the other
-    architectures keep the plan they take without the table; every row's plan changes inside each of its ranges."""
+def test_k1_dsm_ranges(monkeypatch):
+    """On 148-SM and 152-SM sm_100a parts and on 152-SM sm_103a parts the FP32 rows ``4096 -> 32, 48, 64, 128`` and
+    ``5120 -> 32, 48, 64, 128`` run the cluster program of their ranges in :data:`K1_DSM_RANGES_BY_SM`
+    (:func:`k1_dsm_plan`; :func:`plan_atomic_gemm` plans it with ``dsm``, before every other K1 table) at every token
+    count of a range.  A row's ranges are ordered and disjoint, its first range starts and its last range ends at a
+    token count at which the part was measured, every range holds such a token count and ends at one or next to one
+    (where the next range starts), and every range names a program this checkout registers for the part's
+    architecture, with its cluster size baked into the module.  One token below or above a row's ranges, BF16 out,
+    every other row and every other part (SM count or architecture) keep the plan they take without the part's table
+    (another part's table where it has one); every row's plan changes inside each of its ranges."""
     table = cake_backend.K1_DSM_RANGES_BY_SM
     assert table == {
         part: {(part[0], 1, M, N, "f32"): want for (M, N), want in rows.items()}
-        for part, rows in K1_152_DSM_RANGES.items()
+        for part, rows in K1_DSM_RANGES.items()
     }
-    measured = set(K1_152_DSM_MEASURED_TOKENS)
-    for (arch, _), rows in table.items():
+    for part, rows in table.items():
+        arch = part[0]
+        measured = set(K1_DSM_MEASURED_TOKENS[part])
         for key, ranges in rows.items():
             assert ranges[0][0] in measured and ranges[-1][1] in measured, key
             for i, (lo, hi, (block_n, splits)) in enumerate(ranges):
@@ -1744,24 +1765,36 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
             arch=arch, L=1, M=M, N=N, K=T, out_f32=out_f32, sm_count=sm_count
         )
 
-    for (arch, sms), rows in K1_152_DSM_RANGES.items():
+    def held_by(part, M, N, T):
+        own = K1_DSM_RANGES.get(part, {}).get((M, N), ())
+        held = [v for lo, hi, v in own if lo <= T <= hi]
+        return held[0] if held else None
+
+    others = [
+        (a, s)
+        for a in ("sm_100a", "sm_103a")
+        for s in (147, 148, 150, 151, 152, 153, 160)
+    ]
+    others += [("sm_107a", 152), ("sm_107a", 212), ("sm_107a", 216)]
+    for part, rows in K1_DSM_RANGES.items():
+        arch, sms = part
         for (M, N), ranges in rows.items():
-            for T in _k1_dsm_ranges_edges(ranges):
-                held = [v for lo, hi, v in ranges if lo <= T <= hi]
-                assert p(arch, sms, M, N, T) == (held[0] if held else None), (M, N, T)
-                assert p(arch, sms, M, N, T, out_f32=False) is None, (M, N, T)
-                for other in (148, 150, 151, 153, 160):
-                    assert p(arch, other, M, N, T) is None, (M, N, T, other)
-                for other_arch in ("sm_103a", "sm_107a"):
-                    assert p(other_arch, sms, M, N, T) is None, (M, N, T)
-    shapes = sorted({mn for rows in K1_152_DSM_RANGES.values() for mn in rows})
+            for T in _k1_dsm_ranges_edges(ranges, part):
+                assert p(arch, sms, M, N, T) == held_by(part, M, N, T), (part, M, N, T)
+                assert p(arch, sms, M, N, T, out_f32=False) is None, (part, M, N, T)
+                for other in others:
+                    if other != part:
+                        want = held_by(other, M, N, T)
+                        assert p(*other, M, N, T) == want, (part, other, M, N, T)
+    shapes = sorted({mn for rows in K1_DSM_RANGES.values() for mn in rows})
     shapes += [(4096, 512), (6144, 32), (6144, 128), (5120, 1024)]
-    Ts = set(K1_152_DSM_MEASURED_TOKENS) | {255, 256, 512, 960, 1023, 16231, 40960}
-    for rows in K1_152_DSM_RANGES.values():
+    Ts = {255, 256, 512, 960, 1023, 16231, 40960}
+    for part, rows in K1_DSM_RANGES.items():
+        Ts |= set(K1_DSM_MEASURED_TOKENS[part])
         for ranges in rows.values():
-            Ts |= set(_k1_dsm_ranges_edges(ranges))
+            Ts |= set(_k1_dsm_ranges_edges(ranges, part))
     parts = [("sm_100a", s) for s in (148, 150, 151, 152, 153, 160)]
-    parts += [("sm_103a", 152), ("sm_107a", 212), ("sm_107a", 216)]
+    parts += [("sm_103a", 148), ("sm_103a", 152), ("sm_107a", 212), ("sm_107a", 216)]
 
     def plans():
         return {
@@ -1776,7 +1809,7 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
     without = plans()
     changed = {}
     for (arch, sms, M, N, T, f32), plan in with_table.items():
-        own = K1_152_DSM_RANGES.get((arch, sms), {}).get((M, N), ())
+        own = K1_DSM_RANGES.get((arch, sms), {}).get((M, N), ())
         held = [(i, v) for i, (lo, hi, v) in enumerate(own) if lo <= T <= hi]
         if f32 and held:
             i, (block_n, splits) = held[0]
@@ -1789,13 +1822,13 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
             )
             assert plan == want, (arch, sms, M, N, T)
             assert plan != without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T)
-            changed[(M, N, i)] = changed.get((M, N, i), 0) + 1
+            changed[(arch, sms, M, N, i)] = changed.get((arch, sms, M, N, i), 0) + 1
         else:
             assert plan == without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T, f32)
             assert plan is None or not plan[4], (arch, sms, M, N, T, f32)
     assert sorted(changed) == sorted(
-        (M, N, i)
-        for rows in K1_152_DSM_RANGES.values()
+        (*part, M, N, i)
+        for part, rows in K1_DSM_RANGES.items()
         for (M, N), ranges in rows.items()
         for i in range(len(ranges))
     )
@@ -1818,21 +1851,55 @@ def test_k1_152_sm_dsm_ranges(monkeypatch):
     ],
 )
 def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, T):
-    """The planner's launch at a token count of a cluster range is the range's cluster program: template
+    """The planner's launch at a token count of a cluster range of a 152-SM sm_100a part is the range's cluster
+    program (:func:`_assert_dsm_cluster_launch`)."""
+    _assert_dsm_cluster_launch(monkeypatch, ("sm_100a", 152), d_in, d_out, T)
+
+
+@pytest.mark.parametrize(
+    "part, d_in, d_out, T",
+    [
+        (("sm_103a", 152), 4096, 32, 1024),
+        (("sm_103a", 152), 4096, 32, 2048),
+        (("sm_103a", 152), 4096, 64, 8192),
+        (("sm_103a", 152), 4096, 128, 12288),
+        (("sm_103a", 152), 5120, 32, 6144),
+        (("sm_103a", 152), 5120, 48, 8192),
+        (("sm_103a", 152), 5120, 64, 24576),
+        (("sm_103a", 152), 5120, 128, 32768),
+        (("sm_100a", 148), 4096, 32, 4096),
+        (("sm_100a", 148), 4096, 48, 32768),
+        (("sm_100a", 148), 4096, 64, 12288),
+        (("sm_100a", 148), 4096, 128, 1024),
+        (("sm_100a", 148), 5120, 48, 2048),
+        (("sm_100a", 148), 5120, 64, 1024),
+        (("sm_100a", 148), 5120, 128, 4096),
+    ],
+)
+def test_k1_dsm_ranges_plan_the_cluster_launch_on_more_parts(
+    monkeypatch, part, d_in, d_out, T
+):
+    """The planner's launch at a token count of a cluster range of a 152-SM sm_103a or a 148-SM sm_100a part is the
+    range's cluster program (:func:`_assert_dsm_cluster_launch`)."""
+    _assert_dsm_cluster_launch(monkeypatch, part, d_in, d_out, T)
+
+
+def _assert_dsm_cluster_launch(monkeypatch, part, d_in, d_out, T):
+    """The planner's launch on ``part`` at a token count of a cluster range is the range's cluster program: template
     ``dense_proj_gemm_dsm_nn_n<block_n>_f32_t_s<splits>``, one chain, the transposed store, tiles of 128 ``d_in``
     columns by ``block_n`` ``d_out`` rows, ``splits`` CTAs per tile (a grid that is a multiple of the module's
-    cluster), no workspace and no tickets.  An explicit split count or tile width plans the CTA-pair program, and on
-    148 SMs or another architecture the row does not run the cluster program."""
-    _register_k1(monkeypatch, "sm_100a")
+    cluster), no workspace and no tickets; the program is registered for sm_100a and sm_103a.  An explicit split count
+    or tile width plans the CTA-pair program.  On another part the row runs the cluster program of that part's own
+    range at ``T`` and no cluster program where that part has none."""
+    arch, sms = part
+    _register_k1(monkeypatch, arch)
     G = torch.zeros(T, d_out, dtype=torch.bfloat16)
     X = torch.zeros(T, d_in, dtype=torch.bfloat16)
     out = torch.zeros(d_out, d_in, dtype=torch.float32)
-    kw = dict(transposed_out=True, arch="sm_100a", sm_count=152)
+    kw = dict(transposed_out=True, arch=arch, sm_count=sms)
     plan, a, b, out3, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
     ((block_n, splits),) = [
-        v
-        for lo, hi, v in K1_152_DSM_RANGES[("sm_100a", 152)][(d_in, d_out)]
-        if lo <= T <= hi
+        v for lo, hi, v in K1_DSM_RANGES[part][(d_in, d_out)] if lo <= T <= hi
     ]
     assert (
         isinstance(plan, cake_backend.CakeDenseGemmNondetProjectionPlan)
@@ -1857,9 +1924,9 @@ def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, 
         plan.grid == (plan.tiles * splits, 1, 1) and plan.items == plan.tiles * splits
     )
     assert plan.ws_f32_elems == 0 and plan.counters_u32 == 0
-    record = cake_jit.MODULES[cake_jit.KERNELS["sm_100a"][plan.template]]
+    record = cake_jit.MODULES[cake_jit.KERNELS[arch][plan.template]]
     assert plan.grid[0] % record["launch"]["cluster"][0] == 0
-    assert record["arches"] == ["sm_100a"]
+    assert record["arches"] == ["sm_100a", "sm_103a"]
     assert tuple(a.shape) == (1, T, d_in) and tuple(b.shape) == (1, T, d_out)
     assert tuple(out3.shape) == (1, d_out, d_in)
     explicit = cake_backend.plan_atomic_gemm(X.t(), G, out, splits=2, **kw)[0]
@@ -1867,16 +1934,25 @@ def test_k1_152_sm_dsm_ranges_plan_the_cluster_launch(monkeypatch, d_in, d_out, 
     assert explicit.template.startswith(cake_jit.TEMPLATE_PREFIXES[0])
     explicit = cake_backend.plan_atomic_gemm(X.t(), G, out, block_n=64, **kw)[0]
     assert explicit is not None and not explicit.dsm
-    for arch, sms in (("sm_100a", 148), ("sm_103a", 152)):
-        _register_k1(monkeypatch, arch)
+    others = [(a_, s_) for a_ in ("sm_100a", "sm_103a") for s_ in (148, 150, 152)]
+    for other_arch, other_sms in others:
+        if (other_arch, other_sms) == part:
+            continue
+        _register_k1(monkeypatch, other_arch)
         other = cake_backend.plan_atomic_gemm(
-            X.t(), G, out, transposed_out=True, arch=arch, sm_count=sms
+            X.t(), G, out, transposed_out=True, arch=other_arch, sm_count=other_sms
         )[0]
-        assert other is None or not other.dsm
+        own = K1_DSM_RANGES.get((other_arch, other_sms), {}).get((d_in, d_out), ())
+        held = [v for lo, hi, v in own if lo <= T <= hi]
+        if held:
+            assert other is not None and other.dsm, (other_arch, other_sms)
+            assert (other.block_n, other.splits) == held[0], (other_arch, other_sms)
+        else:
+            assert other is None or not other.dsm, (other_arch, other_sms)
     # a checkout that does not register the program: the deterministic program, with the reason
-    table = dict(cake_jit.KERNELS["sm_100a"])
+    table = dict(cake_jit.KERNELS[arch])
     table.pop(plan.template)
-    monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", table)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, table)
     missing = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
     assert missing[0] is None and plan.template in missing[4]
 
@@ -3368,7 +3444,8 @@ def test_router_units_policy(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_107a", sm_count=212, M=6144, N=256, K=16231
     ) == (5 * 106, 53, 24 * 508 // 2)
-    # the forward of the parts with a table of their own: the deterministic plan
+    # the forward of the parts with a table of their own at 16231 tokens: the deterministic plan (the 212-SM forward
+    # windows end at 192 tokens)
     for sms in (208, 212):
         for hidden in (4096, 5120, 6144):
             assert (
@@ -3545,8 +3622,9 @@ ROUTER_DGRAD_WINDOWS = {
         for arch in ("sm_100a", "sm_103a")
     },
 }
-# the forward's cluster SIMT windows (256 experts) of 152-SM parts, (arch, hidden) -> ((first, last, spec), ...); every
-# other part, row and token count runs the deterministic program
+# the forward's cluster SIMT windows (256 experts) of 152-SM parts, (arch, hidden) -> ((first, last, spec), ...), and of
+# the parts with a router table of their own (212-SM sm_107a), (arch, sm_count, hidden) -> ((first, last, spec), ...);
+# every other part, row and token count runs the deterministic program
 # fmt: off
 _FWD_SM_100A = (
     (1, 8, "simt_c8_kg4_l32_e8t4"), (9, 16, "simt_c8_kg4_l32_e8t16"), (17, 96, "simt_c8_ffma_l16_e16t32"),
@@ -3564,38 +3642,58 @@ ROUTER_FWD_WINDOWS = {
     ("sm_103a", 5120): _FWD_SM_103A,
     ("sm_103a", 6144): _FWD_SM_103A,
 }
+ROUTER_FWD_WINDOWS_BY_SM = {
+    ("sm_107a", 212, hidden): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32"))
+    for hidden in (4096, 5120, 6144)
+}
 # fmt: on
+# the part each architecture's forward SIMT windows are planned on in the CPU planner tests
+ROUTER_FWD_PARTS = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 212}
+
+
+def _fwd_windows(arch, sm_count, hidden):
+    """The forward's SIMT windows of the row ``(arch, "kk", hidden, 256)`` on a part of ``sm_count`` SMs: the part's
+    own (:data:`ROUTER_FWD_WINDOWS_BY_SM`) on a part with a router table of its own, :data:`ROUTER_FWD_WINDOWS` on the
+    SM count of :data:`ROUTER_RULES` (:data:`ROUTER_SM_COUNT`), none on any other SM count."""
+    if (arch, sm_count) in ROUTER_BY_SM_PARTS:
+        return ROUTER_FWD_WINDOWS_BY_SM.get((arch, sm_count, hidden), ())
+    if sm_count == cake_backend.ROUTER_SM_COUNT[arch]:
+        return ROUTER_FWD_WINDOWS.get((arch, hidden), ())
+    return ()
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_router_forward_simt_windows(arch):
-    """The forward runs its cluster SIMT program only inside its token windows of the 152-SM table (:data:`ROUTER_RULES`
-    on :data:`ROUTER_SM_COUNT` SMs; not one SM more or fewer, not on the parts with a table of their own), at the
-    first and last token count of each window and not one token past the last; no partition there
-    (:func:`router_partition`); a caller's split count, another experts count or hidden size, or ``K`` off a multiple
-    of the cluster's chunk runs no SIMT program."""
+    """The forward runs its cluster SIMT program only inside its token windows of the table of the part's SM count
+    (:data:`ROUTER_RULES` on :data:`ROUTER_SM_COUNT` SMs, the part's own table of :data:`ROUTER_RULES_BY_SM` on 212-SM
+    sm_107a parts; not one SM more or fewer, not on the other parts with a table of their own), at the first and last
+    token count of each window and not one token past the last; no partition there (:func:`router_partition`); a
+    caller's split count, another experts count or hidden size, or ``K`` off a multiple of the cluster's chunk runs no
+    SIMT program."""
     measured = cake_backend.ROUTER_SM_COUNT[arch]
     own = {sms for a, sms in ROUTER_BY_SM_PARTS if a == arch}
     for hidden in (4096, 5120, 6144):
         windows = ROUTER_FWD_WINDOWS.get((arch, hidden), ())
         assert cake_backend.ROUTER_RULES[(arch, "kk", hidden, 256)] == (windows or None)
-        for sms in own:
-            assert (
-                cake_backend.ROUTER_RULES_BY_SM[(arch, sms)][(arch, "kk", hidden, 256)]
-                is None
-            )
         tokens = {1, 2, 64, 129, 192, 193, 224, 256, 1024, 16231}
         for first, last, _ in windows:
             tokens |= {first, last, last + 1}
+        for sms in own:
+            by_sm = ROUTER_FWD_WINDOWS_BY_SM.get((arch, sms, hidden), ())
+            assert cake_backend.ROUTER_RULES_BY_SM[(arch, sms)][
+                (arch, "kk", hidden, 256)
+            ] == (by_sm or None)
+            for first, last, _ in by_sm:
+                tokens |= {first, last, last + 1}
         for sms in sorted(
-            {148, 151, 152, 153, 208, 212, 216, measured - 1, measured, measured + 1}
+            {148, 151, 152, 153, 208, 211, 212, 213, 216}
+            | {measured - 1, measured, measured + 1}
         ):
             for T in sorted(tokens):
                 kw = dict(arch=arch, M=T, N=256, K=hidden, sm_count=sms)
-                spec = (
-                    next((s for a, b, s in windows if a <= T <= b), None)
-                    if sms == measured
-                    else None
+                spec = next(
+                    (s for a, b, s in _fwd_windows(arch, sms, hidden) if a <= T <= b),
+                    None,
                 )
                 tile = cake_backend.router_forward_simt(**kw)
                 assert tile == cake_backend.router_forward_simt_tile(spec), (
@@ -3656,7 +3754,10 @@ def test_router_forward_simt_specs_and_templates():
     with pytest.raises(ValueError, match="unknown router partition spec"):
         cake_backend.router_units_of("simt_c8_kg4_l32_e8t4", 2, 2, 192, 152)
     served = {}
-    for (arch, _hidden), windows in ROUTER_FWD_WINDOWS.items():
+    for (arch, *_), windows in (
+        *ROUTER_FWD_WINDOWS.items(),
+        *ROUTER_FWD_WINDOWS_BY_SM.items(),
+    ):
         for _, _, spec in windows:
             template = cake_backend.router_forward_simt_template(
                 cake_backend.router_forward_simt_tile(spec)
@@ -3687,26 +3788,26 @@ def test_router_forward_simt_specs_and_templates():
                 ], template
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_router_forward_simt_plans_its_program(monkeypatch, arch):
-    """``plan_atomic_router`` of a forward launch ``X @ W.T`` in a window on 152 SMs: the program of the window's
-    tile over the activations' and the router weight's rows in place (``lda`` / ``ldb`` their row strides; strided
-    rows a multiple of 4 elements) on ``8 N / experts x ceil(T / tokens)`` CTAs, every element stored once (no part
-    tiles); rows that are not a multiple of 4 elements, or a template the checkout does not register, run the
-    deterministic program; the argument values of the launch name the program's parameters and keep the call's PDL
-    flag."""
-    hidden, N = 5120, 256
+    """``plan_atomic_router`` of a forward launch ``X @ W.T`` in a window of the architecture's part
+    (:data:`ROUTER_FWD_PARTS`: 152 SMs, 212 SMs on sm_107a): the program of the window's tile over the activations'
+    and the router weight's rows in place (``lda`` / ``ldb`` their row strides; strided rows a multiple of 4 elements)
+    on ``8 N / experts x ceil(T / tokens)`` CTAs, every element stored once (no part tiles); rows that are not a
+    multiple of 4 elements, or a template the checkout does not register, run the deterministic program; the argument
+    values of the launch name the program's parameters and keep the call's PDL flag."""
+    hidden, N, sms = 5120, 256, ROUTER_FWD_PARTS[arch]
     monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
     X, W, out = torch.zeros(1, hidden), torch.zeros(N, hidden), torch.zeros(1, N)
     plan, reason = cake_backend.plan_atomic_router(
-        X, W.t(), out, arch=arch, sm_count=152
+        X, W.t(), out, arch=arch, sm_count=sms
     )
-    first_spec = ROUTER_FWD_WINDOWS[(arch, hidden)][0][2]
+    first_spec = _fwd_windows(arch, sms, hidden)[0][2]
     first_template = cake_backend.router_forward_simt_template(
         cake_backend.router_forward_simt_tile(first_spec)
     )
     assert plan is None and f"{first_template} is not registered" in reason
-    for first, last, spec in ROUTER_FWD_WINDOWS[(arch, hidden)]:
+    for first, last, spec in _fwd_windows(arch, sms, hidden):
         kind, lanes, experts, tokens = cake_backend.router_forward_simt_tile(spec)
         _register(
             monkeypatch,
@@ -3718,7 +3819,7 @@ def test_router_forward_simt_plans_its_program(monkeypatch, arch):
             W = torch.zeros(N, hidden + 4)[:, :hidden]
             out = torch.zeros(T, N)
             plan, reason = cake_backend.plan_atomic_router(
-                X, W.t(), out, arch=arch, sm_count=152
+                X, W.t(), out, arch=arch, sm_count=sms
             )
             assert plan is not None, (T, reason)
             assert (
@@ -3767,14 +3868,14 @@ def test_router_forward_simt_plans_its_program(monkeypatch, arch):
             # rows of the router weight off a multiple of 4 elements: the deterministic program
             W2 = torch.zeros(N, hidden + 2)[:, :hidden]
             plan2, reason2 = cake_backend.plan_atomic_router(
-                X, W2.t(), out, arch=arch, sm_count=152
+                X, W2.t(), out, arch=arch, sm_count=sms
             )
             assert plan2 is None, (T, reason2)
             # one SM more: the deterministic program
             assert (
-                cake_backend.plan_atomic_router(X, W.t(), out, arch=arch, sm_count=153)[
-                    0
-                ]
+                cake_backend.plan_atomic_router(
+                    X, W.t(), out, arch=arch, sm_count=sms + 1
+                )[0]
                 is None
             )
 
@@ -3943,8 +4044,8 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
     """A part whose SM count has a table in :data:`ROUTER_RULES_BY_SM` takes that table only (every row of
     :data:`ROUTER_RULES` of its architecture has an entry there, and rows measured on that SM count only may too; no
     ``"waves"`` window, closed head/tail or SIMT windows of the weight gradient, closed SIMT windows of the input
-    gradient); one SM more or fewer runs the deterministic program, and the measured SM count of
-    :data:`ROUTER_RULES` decides as before."""
+    gradient and closed cluster SIMT windows of the forward); one SM more or fewer runs the deterministic program, and
+    the measured SM count of :data:`ROUTER_RULES` decides as before."""
     for (arch, sms), table in cake_backend.ROUTER_RULES_BY_SM.items():
         assert sms != cake_backend.ROUTER_SM_COUNT[arch]
         assert set(table) >= {k for k in cake_backend.ROUTER_RULES if k[0] == arch}
@@ -3952,9 +4053,12 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
             assert key_arch == arch
             if rule is None:
                 continue
-            assert layout in ("nn_t", "kn") and isinstance(rule, tuple)
+            assert layout in ("kk", "nn_t", "kn") and isinstance(rule, tuple)
             for first, last, spec in rule:
                 assert 1 <= first <= last <= 32768
+                if layout == "kk":
+                    assert cake_backend.router_forward_simt_tile(spec) is not None
+                    continue
                 if layout == "kn":
                     assert cake_backend.router_simt_tile(spec) is not None
                     continue
@@ -6389,27 +6493,32 @@ def test_router_tables_count_their_changes():
 
 def test_router_memo_follows_the_router_tables(monkeypatch):
     """The memo of the router tables (``_router_memo``) is kept while no table changes and derived again after any
-    change: the forward verdicts of the 152-SM table ship, and with them cleared none is seen; a forward verdict set in any table, and its removal, are seen at the next call;
+    change: the forward verdicts of the 152-SM table and of the 212-SM sm_107a table ship, and with them cleared none is seen; a forward verdict set in any table, and its removal, are seen at the next call;
     a table rebound in place of one is seen, and one that does not count its changes (a plain ``dict``) is read on
     every call; ``cake_dense_gemm_nondet_train_convenience_cache_clear`` drops the memo."""
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     memo = cake_backend._router_memo()
     assert memo.tracked and memo.forward_verdicts and not memo.without_verdict
     assert cake_backend._router_memo() is memo
-    # the shipped forward verdicts: the cluster SIMT windows of the 152-SM table; without them no table gives one
+    # the shipped forward verdicts: the cluster SIMT windows of the 152-SM table and of the 212-SM sm_107a table;
+    # without them no table gives one
     shipped = [
         k
         for k, rule in cake_backend.ROUTER_RULES.items()
         if k[1] == "kk" and rule is not None
     ]
     assert {k[0] for k in shipped} == {"sm_100a", "sm_103a"}
-    assert not any(
-        key[1] == "kk" and rule is not None
-        for table in cake_backend.ROUTER_RULES_BY_SM.values()
+    shipped_by_sm = [
+        (part, key)
+        for part, table in cake_backend.ROUTER_RULES_BY_SM.items()
         for key, rule in table.items()
-    )
+        if key[1] == "kk" and rule is not None
+    ]
+    assert {part for part, _ in shipped_by_sm} == {("sm_107a", 212)}
     for key in shipped:
         monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    for part, key in shipped_by_sm:
+        monkeypatch.setitem(cake_backend.ROUTER_RULES_BY_SM[part], key, None)
     memo = cake_backend._router_memo()
     assert memo.tracked and not memo.forward_verdicts
     own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
@@ -6914,19 +7023,25 @@ def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
     assert len(fill.calls) == int(atomic and launch.k2.fill is not None)
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-@pytest.mark.parametrize("T", [1, 16, 17, 128, 129, 192, 193])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("T", [1, 8, 9, 16, 17, 128, 129, 192, 193])
 def test_router_forward_entry_binds_the_simt_program(monkeypatch, arch, T):
-    """Without a split count the forward's call in a SIMT window of a 152-SM part binds the
-    cluster program's launch in ``_K2_ENTRY_CACHE`` (planned once into ``_K2_ATOMIC_CACHE``): one launch per call of
-    the program with the entry point's tensors -- ``X``, ``W`` and ``out`` read in place --, the launch's dimensions
-    and row strides, the device's PDL flag and the grid of the cluster tiles; no split, no fill.  Past the windows the
-    call binds the deterministic program (four splits) through this package's binding."""
+    """Without a split count the forward's call in a SIMT window of the architecture's part (:data:`ROUTER_FWD_PARTS`:
+    152 SMs, 212 SMs on sm_107a) binds the cluster program's launch in ``_K2_ENTRY_CACHE`` (planned once into
+    ``_K2_ATOMIC_CACHE``): one launch per call of the program with the entry point's tensors -- ``X``, ``W`` and
+    ``out`` read in place --, the launch's dimensions and row strides, the device's PDL flag and the grid of the
+    cluster tiles; no split, no fill.  Past the windows the call binds the deterministic program (four splits) through
+    this package's binding."""
     entry_fn, fill = _cpu_k2_launches(monkeypatch, arch)
+    sms = ROUTER_FWD_PARTS[arch]
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sms, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
     split = Recorder()
     monkeypatch.setattr(det_backend, "split_fp32_to_bf16x3_det_", split)
     H, E = 5120, 256
-    spec = next((s for a, b, s in ROUTER_FWD_WINDOWS[(arch, H)] if a <= T <= b), None)
+    spec = next((s for a, b, s in _fwd_windows(arch, sms, H) if a <= T <= b), None)
     # in a window the activations' rows are strided (read in place)
     X = torch.empty(T, H) if spec is None else torch.empty(T, H + 8)[:, :H]
     W, out = torch.empty(E, H), torch.empty(T, E)
@@ -7684,7 +7799,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
         }
         for arch in cake_jit.KERNELS
     }
-    assert dsm["sm_100a"]
+    assert dsm["sm_100a"] and dsm["sm_103a"]
     for arch, table in cake_jit.KERNELS.items():
         assert dsm[arch] <= set(table), (arch, sorted(dsm[arch] - set(table)))
         assert {t for t in table if t.startswith(cake_jit.TEMPLATE_PREFIXES[7])} == dsm[
@@ -8042,7 +8157,7 @@ def _force_k1_rule(monkeypatch, G, X, out, splits, block_n=None):
 @pytest.fixture
 def no_k1_dsm(monkeypatch):
     """Take the cluster ranges of :data:`K1_DSM_RANGES_BY_SM` out of the planner for a test of the K1 tables it comes
-    before (:func:`plan_atomic_gemm` reads it first; ``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds it),
+    before (:func:`plan_atomic_gemm` reads it first; ``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds it),
     with the convenience caches cleared before and after: no entry planned without the table outlives the test."""
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -8387,24 +8502,32 @@ def test_gpu_torch_deterministic_mode_alerts_before_an_order_varying_launch(
     assert _arena_tickets_zero()
 
 
+#: The cluster program of the shipped row ``4096 -> 64`` FP32 at 2048 tokens on each part of
+#: :data:`K1_DSM_RANGES_BY_SM`: ``(block_n, splits)``.
+K1_DSM_ALERT_ROWS = {
+    ("sm_100a", 148): (32, 2),
+    ("sm_100a", 152): (64, 3),
+    ("sm_103a", 152): (64, 3),
+}
+
+
 def test_gpu_the_cluster_program_does_not_alert(torch_determinism):
-    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens of :data:`K1_DSM_RANGES_BY_SM` (152-SM ``sm_100a``
-    parts: the cluster program at three splits, added in cluster-rank order) launches without an alert or a warning
-    under ``torch.use_deterministic_algorithms(True)``, and with ``warn_only=True``: the planning call, the call from
-    the cached key and the prepared launch run the cluster program (by kernel name), and every output meets the
-    deterministic package's FP32 budget against FP64 (:func:`_k1_check`).  ``test_the_cluster_program_does_not_alert``
-    checks the same calls on the CPU binding.  A part of any other SM count or architecture skips."""
+    """The shipped cluster row ``4096 -> 64`` FP32 at 2048 tokens of :data:`K1_DSM_RANGES_BY_SM` (the cluster program
+    of :data:`K1_DSM_ALERT_ROWS` on the part: two or three splits, added in cluster-rank order) launches without an
+    alert or a warning under ``torch.use_deterministic_algorithms(True)``, and with ``warn_only=True``: the planning
+    call, the call from the cached key and the prepared launch run the cluster program (by kernel name), every output
+    meets the deterministic package's FP32 budget against FP64 (:func:`_k1_check`), and all of them have the same
+    bits.  ``test_the_cluster_program_does_not_alert`` checks the same calls on the CPU binding.  A part of any other SM
+    count or architecture skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
-    if (arch, sm_count) != ("sm_100a", 152):
-        pytest.skip(
-            f"the cluster row is shipped for 152-SM sm_100a parts, not {arch} on {sm_count} SMs"
-        )
+    if (arch, sm_count) not in K1_DSM_ALERT_ROWS:
+        pytest.skip(f"no K1 cluster row is shipped for {arch} on {sm_count} SMs")
     T, N, M = 2048, 64, 4096
     dsm = cake_backend.k1_dsm_plan(
         arch=arch, L=1, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
     )
-    assert dsm == (64, 3)
+    assert dsm == K1_DSM_ALERT_ROWS[(arch, sm_count)]
     _require_template(arch, cake_backend.dsm_k1_template(*dsm))
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     g = torch.Generator(device=device).manual_seed(SEED + 99)
@@ -8453,6 +8576,7 @@ def test_gpu_the_cluster_program_does_not_alert(torch_determinism):
     torch.use_deterministic_algorithms(False)
     for i, result in enumerate(got):
         _k1_check(result, ref, f"cluster program call {i}")
+        assert torch.equal(result, got[0]), f"cluster program call {i}: other bits"
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
 
 
@@ -9466,25 +9590,39 @@ def _device_simt_windows(arch, sm_count, layout) -> list:
 
 def test_gpu_router_forward_simt_windows_keep_the_fp64_rule(monkeypatch):
     """Unforced (``cake_dense_gemm_nondet_train_router_forward(...)``, no split count), at the first and the last token count of
-    each forward SIMT window of the device's architecture (:data:`ROUTER_FWD_WINDOWS`; on a part whose SM count is not
-    :data:`ROUTER_SM_COUNT` the measured count is set to the device's, so the program runs there too) and two seeds:
-    the planner gives the window's cluster program, which the call launches (no program of the deterministic
-    package); three calls into a NaN-poisoned ``out`` give finite values and the same bits (every element stored once,
-    the ranks' partials added in rank order); the relative Frobenius error against FP64 of the exact operands is
-    within ``ROUTER_REL_FRO_MAX``, every element within the error bound of a sum of ``K`` FP32 products in any order,
-    and the top-8 experts of every row are FP64's except near ties; a CUDA graph captured after the eager call replays
-    the same bits.  The ratio to the error of the deterministic program is printed, not checked.  A part with a router
-    table of its own runs the deterministic program at these token counts."""
+    each forward SIMT window of the device's part (on a part with a router table of its own its windows,
+    :data:`ROUTER_FWD_WINDOWS_BY_SM`; else those of the architecture, :data:`ROUTER_FWD_WINDOWS`, and on a part whose
+    SM count is not :data:`ROUTER_SM_COUNT` the measured count is set to the device's, so the program runs there too)
+    and two seeds: the planner gives the window's cluster program, which the call launches (no program of the
+    deterministic package); three calls into a NaN-poisoned ``out`` give finite values and the same bits (every element
+    stored once, the ranks' partials added in rank order); the relative Frobenius error against FP64 of the exact
+    operands is within ``ROUTER_REL_FRO_MAX``, every element within the error bound of a sum of ``K`` FP32 products in
+    any order, and the top-8 experts of every row are FP64's except near ties; a CUDA graph captured after the eager
+    call replays the same bits.  The ratio to the error of the deterministic program is printed, not checked.  A part
+    with a router table of its own and no forward window in it runs the deterministic program at the token counts of
+    the architecture's windows."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
-    windows = [
+    arch_windows = [
         (h, a, b, s)
         for (ar, h), w in ROUTER_FWD_WINDOWS.items()
         if ar == arch
         for a, b, s in w
     ]
-    if (arch, sm_count) in cake_backend.ROUTER_RULES_BY_SM or not windows:
-        for hidden, first, last, _ in windows:
+    own = (arch, sm_count) in cake_backend.ROUTER_RULES_BY_SM
+    assert own == ((arch, sm_count) in ROUTER_BY_SM_PARTS)
+    windows = (
+        [
+            (h, a, b, s)
+            for (ar, sms, h), w in ROUTER_FWD_WINDOWS_BY_SM.items()
+            if (ar, sms) == (arch, sm_count)
+            for a, b, s in w
+        ]
+        if own
+        else arch_windows
+    )
+    if not windows:
+        for hidden, first, last, _ in arch_windows:
             for T in (first, last):
                 kw = dict(arch=arch, M=T, N=256, K=hidden, sm_count=sm_count)
                 assert cake_backend.router_forward_simt(**kw) is None, (hidden, T)
@@ -9492,7 +9630,7 @@ def test_gpu_router_forward_simt_windows_keep_the_fp64_rule(monkeypatch):
             f"ROUTER_FWD_SIMT_FP64 {arch} sm_count={sm_count}: no forward window on this part"
         )
         return
-    if sm_count != cake_backend.ROUTER_SM_COUNT[arch]:
+    if not own and sm_count != cake_backend.ROUTER_SM_COUNT[arch]:
         monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
     ran = 0
     for hidden, first, last, spec in windows:
@@ -10056,7 +10194,7 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm):
     ``K1_P1_EDGES`` the deterministic program itself misses the BF16 budget for some seed: the edge asserts the route
     only, and the FP64 rule runs at the entry's token count of the same range instead (none: no check).  The cluster
     ranges of :data:`K1_DSM_RANGES_BY_SM`, which come before these tables, are taken out
-    (``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds them).  A part of any other SM count skips."""
+    (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them).  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -10187,7 +10325,7 @@ def test_gpu_k1_152_sm_one_split_ranges_run_at_their_edges(no_k1_dsm):
     output meets that budget too.  One token below and one above a range the row takes the route the planner gives it
     without the range (another program or the deterministic program), within the same budget.  The cluster ranges of
     :data:`K1_DSM_RANGES_BY_SM`, which come before the one-split ranges and hold some of these token counts on
-    ``sm_100a``, are taken out (``test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges`` holds them).  A part of any other
+    ``sm_100a``, are taken out (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them).  A part of any other
     SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
@@ -10263,13 +10401,14 @@ def test_gpu_k1_152_sm_one_split_ranges_run_at_their_edges(no_k1_dsm):
     assert ran
 
 
-def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
+def test_gpu_k1_dsm_ranges_run_at_their_edges():
     """Unforced (no split count), on a part of exactly the SM count of a table of
-    :data:`K1_DSM_RANGES_BY_SM` (152-SM ``sm_100a`` parts): at the first and the last token count of every range of a
-    row the prepared launch runs the range's cluster program (by kernel name) and its output meets the deterministic
-    package's FP32 budget against FP64 (:func:`_k1_check`: relative Frobenius error at most 5e-5, max error at most
-    1e-3 times the largest reference element) in each of ``RERUNS`` launches into a NaN-poisoned ``out``; the
-    convenience path binds the same program, with no arena, and its output meets that budget too.  One token below a
+    :data:`K1_DSM_RANGES_BY_SM` (148-SM and 152-SM ``sm_100a``, 152-SM ``sm_103a`` parts): at the first and the last
+    token count of every range of a row the prepared launch runs the range's cluster program (by kernel name) and its
+    output meets the deterministic package's FP32 budget against FP64 (:func:`_k1_check`: relative Frobenius error at
+    most 5e-5, max error at most 1e-3 times the largest reference element) with the same bits in each of ``RERUNS``
+    launches into a NaN-poisoned ``out``; the convenience path binds the same program, with no arena, and its output
+    has those bits too.  One token below a
     row's first range, one above its last and next to a gap between two of its ranges the row takes the route the
     planner gives it without the table (another program or the deterministic program), within the same budget.  A
     part of any other SM count or architecture skips."""
@@ -10320,11 +10459,13 @@ def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
             _assert_ran(prepared.launch, prepared.module_name)
             torch.cuda.synchronize()
             _k1_check(out, ref, what)
+            first = out.clone()
             for i in range(RERUNS):
                 out.fill_(float("nan"))
                 prepared.launch()
                 torch.cuda.synchronize()
                 _k1_check(out, ref, f"{what} run {i}")
+                assert torch.equal(out, first), f"{what} run {i}: other bits"
             cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
             conv = torch.full_like(out, float("nan"))
             assert (
@@ -10337,6 +10478,7 @@ def test_gpu_k1_152_sm_dsm_ranges_run_at_their_edges():
             assert entry.plan.dsm and entry.arena is None, what
             assert (entry.plan.block_n, entry.plan.splits) == dsm, what
             _k1_check(conv, ref, f"{what} convenience")
+            assert torch.equal(conv, first), f"{what} convenience: other bits"
             ran += 1
     print(
         f"K1_DSM_RANGES {arch} sm_count={sm_count}: {ran} token counts ran the cluster program"

@@ -17,7 +17,7 @@ Context-parallel (KCP) packed width-4 depthwise causal convolution + SiLU traini
 non-deterministic package: thin stable entry points over the experimental backend module
 ``flashinfer.experimental.cake.cake_causal_conv1d_nondet_train.kcp`` (imported on first use).  The deterministic
 KCP package is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp` (``cake_causal_conv1d_det_kcp``,
-``cake_causal_conv1d_det_multi_kcp``, ``RecomputeHandleDetKcp``); this module never runs it.
+``cake_causal_conv1d_det_kcp_multi``, ``CakeCausalConv1dDetKcpRecomputeHandle``); this module never runs it.
 
 Numerical mode (the same rule as every non-deterministic training package): the module name chooses the package,
 and no entry point takes a mode keyword.  "torch deterministic mode" is ``torch.use_deterministic_algorithms(True)``,
@@ -35,8 +35,8 @@ with or without ``warn_only=True``::
 The backward reads torch's deterministic setting when it runs (the autograd backward included).  Every rank of
 ``ctx.group`` runs the same entry points (and the same torch deterministic setting) for a call.
 
-Contract: the context of the KDA step (``ContextDetKcp`` from
-``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp``), FP32 taps and no bias, the halo exchanges (one
+Contract: the context of the KDA step (``CakeKDADetKcpContext`` from
+``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context``), FP32 taps and no bias, the halo exchanges (one
 ``all_to_all_single`` per direction, with recompute handles for communication-free checkpoint recomputes, #7818),
 the recompute-handle rules and the multi-tensor calls are the deterministic KCP package's.  The main backward is ONE
 ordinary launch (no cooperative attribute, no grid barrier) whose CTAs add their FP32 ``dweight`` rows into zeroed
@@ -46,8 +46,8 @@ run to run (its cross-rank reduction remains the framework's).  The package is c
 recompute (``torch.utils.checkpoint``, reentrant or not) runs the same package.
 
 Name map (the deterministic package -> this module): ``cake_causal_conv1d_det_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_multi_kcp`` ->
-:func:`cake_causal_conv1d_nondet_kcp_multi`, ``RecomputeHandleDetKcp`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
+:func:`cake_causal_conv1d_nondet_kcp`, ``cake_causal_conv1d_det_kcp_multi`` ->
+:func:`cake_causal_conv1d_nondet_kcp_multi`, ``CakeCausalConv1dDetKcpRecomputeHandle`` -> ``CakeCausalConv1dNondetKcpRecomputeHandle``
 (any object with an ``entries`` dict serves either package)::
 
     from flashinfer.cake_causal_conv1d_nondet_train_kcp import (
@@ -106,8 +106,8 @@ def cake_causal_conv1d_nondet_kcp(
         partition's order; ``C`` is a multiple of 8.
     weight : torch.Tensor
         FP32 ``[C, 4]`` contiguous taps.
-    ctx : ContextDetKcp
-        From ``flashinfer.cake_kda_det_train_kcp.build_context_det_kcp`` (the same context the KDA step of the rank
+    ctx : CakeKDADetKcpContext
+        From ``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_build_context`` (the same context the KDA step of the rank
         uses).
     recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional
         Keyword-only, default ``None``.  A handle (any object with an ``entries`` dict) makes the checkpoint
@@ -178,7 +178,7 @@ def cake_causal_conv1d_nondet_kcp_multi(
         fragments; each ``C_i`` is a multiple of 8 (they may differ).
     weights : sequence of torch.Tensor
         FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
-    ctx : ContextDetKcp
+    ctx : CakeKDADetKcpContext
         As in :func:`cake_causal_conv1d_nondet_kcp`.  Every rank of the group calls this function once per layer, in
         the same order, with the same tensor count and channel counts.
     recompute_handle : CakeCausalConv1dNondetKcpRecomputeHandle, optional

@@ -36,7 +36,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
 | GDN ReplaySSM u-cache flush kernel with an fp16 state pool (on SM100 served by the UMMA backend; `gated_delta_rule_mtp_ucache_flush(backend=...)`) | `export GDN_UCACHE_STATE_DTYPE=fp16` |
-| Opt in to multi-wave KV split in trtllm-gen GQA decode (long or mixed-length KV) | `export FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1` |
+| Opt in to multi-wave KV split in trtllm-gen GQA decode (long or mixed-length KV; `2` = wave-fill split, see the table below) | `export FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
@@ -976,6 +976,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` | unset | `flashinfer/utils.py` (`backend_requirement`), `flashinfer/api_logging.py` | `1` lets `backend="auto"` (dispatch heuristics and autotuning) select backends marked `@experimental_backend` (see the "Experimental Code" section). Explicit use never needs it: calling an `@flashinfer_experimental_api` function or passing `backend="<experimental>"` always works and emits an `ExperimentalWarning` once. Without it, automatic selection considers only stable backends. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
+| `FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT` | unset | `include/flashinfer/trtllm/fmha/fmhaKernels.cuh` | KV split of trtllm-gen GQA decode (not MLA), read once per process. `1`: when one wave of CTAs gives at most 2 KV splits, split KV over up to 4 waves. `2` (for long, mixed-length KV): when one wave gives 1..15 splits, take the largest split <= min(16, tuned maximum) within 8 waves and with `ceil(attention window / split) >= 4096`, whose waves are at least 4/5 as full as the fullest candidate's; one-wave splits of 9..15 take the 4-wave split capped the same way; base CTAs above the SM count use the `1` rule. Any other value keeps the stock one-wave split. The attention window comes from `max_seq_len` (or the sliding window), not from the per-request KV lengths, so short or uniform KV under a large bound can be slower. A raised split that does not fit the workspace falls back to the stock split. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
 | `FLASHINFER_SM107_MEGA_CHECK_ROUTES` | `0` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `1` enables routing value checks. By default, the caller is responsible for valid routing. Metadata checks and staging remain active. Set before warmup and graph capture; changing it requires recapturing graphs. |
 | `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. When routing checks are enabled, both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
@@ -1132,6 +1133,11 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
 
 ## Build System Details
 
+- **Portable descriptor locks**: `_flashinfer_filelock` uses stdlib `fcntl.flock`
+  on Unix and Portalocker's `Win32Locker` on Windows for shared/exclusive locks.
+  Callers own file opening, timeout policy and cleanup; nonblocking contention
+  raises `BlockingIOError`. The top-level module keeps standalone tools free of
+  GPU imports. Existing `filelock.FileLock` users remain unchanged.
 - **Build backend**: Custom PEP 517 backend in `build_backend.py`
 - **Data directories**: Build creates symlinks for editable installs:
   - `3rdparty/cutlass` → `flashinfer/data/cutlass`

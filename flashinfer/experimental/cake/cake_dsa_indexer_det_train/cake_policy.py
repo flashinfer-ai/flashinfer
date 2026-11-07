@@ -37,7 +37,12 @@ architecture registers).  ``l6_solo_rule`` may prefer the three-warpgroup unit
 without a CTA pair on calls that do not split, and ``l6_solo_unsampled_max_queries``
 the unpaired form of a CTA-pair l6 plan on short calls with the sampled first threshold off (``select_program``, which takes
 the registered scan keys so that it never picks an unregistered program;
-without them the preference stays off).  A record may also
+without them the preference stays off).  ``snake_packed_rule`` bounds the
+snake unit order of packed calls by their mean unit tiles, sampling mode and
+waves of the persistent grid,
+and ``snake_l6_fallback_waves`` lets a sampling-off call of few waves that the
+l6 preference moves run the plain-order l6 program where the snake-order one
+is not registered.  A record may also
 replace the sampled rank shift from a ``top_k`` of ``sample_shift_rule[0]`` on
 (``sample_shift_for``); an explicit ``sample_shift_permille`` knob still
 overrides it.  The candidate-capacity floor may depend on ``top_k`` the same
@@ -88,7 +93,8 @@ POLICY_FIELDS = (
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
     "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
-    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
+    "wide_wave_rule",  # [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles against l6(, the top_k up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call, the tiles a one-segment minimum rises per wide wave below the next element, the wide waves from which it holds, the l6 / wide wave ratio W below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2)] replacing wide_rule and wide_first_rule, or None; see unit_block_q_for
+    "desc_walk_kinds",  # [physical scan kinds whose descending-walk twin (key kind "<kind>_desc") a call with the sampled first threshold off runs, the same for a sampled call], or None; see select_program
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
@@ -103,6 +109,8 @@ POLICY_FIELDS = (
     "snake_default",  # snake unit order when no rule applies
     "snake_rule",  # [program kinds, min mean tiles, min mean tiles (ratio > 1), min unit-cost spread], or None
     "snake_cap_rule",  # [max segments, max waves of the persistent grid] within which an FP8 call the decision marks snake runs the snake copy of its program, or None (no cap); read only by select_fp8_program
+    "snake_packed_rule",  # [program kinds, min mean unit tiles sampled, min mean unit tiles with sampling off or None (never), max waves or None] a call of two or more segments needs for the snake order of snake_rule beyond that many waves of its persistent grid, or None (snake_rule alone); see snake_for
+    "snake_l6_fallback_waves",  # max waves of the planned program's persistent grid within which a sampling-off call the l6 preference moves runs the plain-order l6 program where the snake-order one is not registered, or None; see select_program
     "tile_unroll_default",  # tile-loop unroll when no rule applies
     "tile_unroll_factor",  # tile-loop unroll when the rule applies
     "tile_unroll_rule",  # [program kinds, min top_k, yields to the snake order], or None
@@ -117,6 +125,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "lsf_single_rule",  # [min mean unit tiles] from which a one-segment FP8 call of the wide unit runs the :lsf copy of its program, or None (never); read only by select_fp8_program
     "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
@@ -301,6 +310,7 @@ _NUMBER = (
 )
 _OPTIONAL_INT = (
     "l6_solo_unsampled_max_queries",
+    "snake_l6_fallback_waves",
     "cand_cap_floor",
     "cand_cap_floor_unsampled",
     "cand_cap_ceiling",
@@ -313,6 +323,7 @@ _OPTIONAL_RULE = (
     "l6_rule",
     "wide_first_rule",
     "wide_wave_rule",
+    "desc_walk_kinds",
     "split_wave_rule",
     "split_wave_scope",
     "split_fit_rule",
@@ -320,6 +331,8 @@ _OPTIONAL_RULE = (
     "l6_solo_rule",
     "snake_rule",
     "snake_cap_rule",
+    "lsf_single_rule",
+    "snake_packed_rule",
     "tile_unroll_rule",
     "sample_shift_rule",
     "sample_class_rule",
@@ -365,6 +378,7 @@ class DispatchPolicy:
     wide_rule: list
     wide_first_rule: Optional[list]
     wide_wave_rule: Optional[list]
+    desc_walk_kinds: Optional[list]
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
@@ -379,6 +393,8 @@ class DispatchPolicy:
     snake_default: bool
     snake_rule: Optional[list]
     snake_cap_rule: Optional[list]
+    snake_packed_rule: Optional[list]
+    snake_l6_fallback_waves: Optional[int]
     tile_unroll_default: int
     tile_unroll_factor: int
     tile_unroll_rule: Optional[list]
@@ -393,6 +409,7 @@ class DispatchPolicy:
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
     lsf_programs: bool
+    lsf_single_rule: Optional[list]
     static_scan_kinds: list
     far_sample: int
     check_period_max: int
@@ -471,10 +488,35 @@ class DispatchPolicy:
             )
         waves = raw["wide_wave_rule"]
         if waves is not None and (
-            len(waves) != 3 or not all(_is_number(v) and v >= 0 for v in waves)
+            len(waves) not in (3, 11)
+            or not all(_is_number(v) and v >= 0 for v in waves)
+            or (
+                len(waves) == 11
+                and not (
+                    _is_int(waves[3])
+                    and waves[3] >= 1
+                    and waves[5] >= waves[2]
+                    and _is_int(waves[7])
+                    and waves[7] >= 1
+                    and waves[8] >= waves[1]
+                )
+            )
         ):
             raise ValueError(
-                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or None, got {waves!r}"
+                f"policy['wide_wave_rule'] must be [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles] or that with [the top_k (an int >= 1) up to which the tile minima hold, their exponent in top_k above it, the minimum of a packed call (>= the one-segment minimum), the tiles the one-segment minimum rises per wide wave below the next element, the wide waves (an int >= 1) from which it holds, the l6 / wide wave ratio W (>= the second element) below which the minimum is at least the next element / (W - 1) and on a packed call at least the last / (W - 1) ** 2], each >= 0, or None, got {waves!r}"
+            )
+        desc = raw["desc_walk_kinds"]
+        if desc is not None and (
+            len(desc) != 2
+            or not all(
+                isinstance(kinds, (list, tuple))
+                and all(isinstance(k, str) and k in PHYSICAL_KINDS for k in kinds)
+                and list(kinds) == sorted(set(kinds))
+                for kinds in desc
+            )
+        ):
+            raise ValueError(
+                f"policy['desc_walk_kinds'] must be [unsampled kinds, sampled kinds] (ascending lists of physical scan kinds {PHYSICAL_KINDS}) or None, got {desc!r}"
             )
         pair_units = raw["pair_units"]
         if (
@@ -541,6 +583,37 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['snake_cap_rule'] must be [max segments >= 1, max waves >= 1] or None, got {snake_cap!r}"
+            )
+        lsf_single = raw["lsf_single_rule"]
+        if lsf_single is not None and (
+            len(lsf_single) != 1
+            or not (_is_number(lsf_single[0]) and lsf_single[0] >= 0)
+        ):
+            raise ValueError(
+                f"policy['lsf_single_rule'] must be [min mean unit tiles >= 0] or None, got {lsf_single!r}"
+            )
+        packed = raw["snake_packed_rule"]
+        if packed is not None and (
+            len(packed) != 4
+            or not isinstance(packed[0], (list, tuple))
+            or not packed[0]
+            or not all(
+                isinstance(k, str) and k in KINDS and k != "split" for k in packed[0]
+            )
+            or list(packed[0]) != sorted(set(packed[0]))
+            or not _is_number(packed[1])
+            or packed[1] < 0
+            or not (packed[2] is None or (_is_number(packed[2]) and packed[2] >= 0))
+            or not (packed[3] is None or (_is_int(packed[3]) and packed[3] >= 1))
+        ):
+            raise ValueError(
+                f"policy['snake_packed_rule'] must be [ascending program kinds {KINDS} but split, min mean unit tiles sampled >= 0, "
+                f"min mean unit tiles with sampling off >= 0 or None, max waves >= 1 or None] or None, got {packed!r}"
+            )
+        fallback = raw["snake_l6_fallback_waves"]
+        if fallback is not None and fallback < 1:
+            raise ValueError(
+                f"policy['snake_l6_fallback_waves'] must be an integer >= 1 or None, got {fallback!r}"
             )
         shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
         shift_rule = raw["sample_shift_rule"]
@@ -928,14 +1001,36 @@ class DispatchPolicy:
         if waves is not None:
             # the unit the other rules leave (three-warpgroup or narrow) against the wide unit, in waves of the
             # persistent grid: the wide unit when the other unit needs at least the record's ratio of the wide
-            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on)
+            # unit's waves (against the three-warpgroup unit also from a mean unit tile count on).  An eleven-element
+            # rule raises that count by waves[6] tiles per wide wave below waves[7] (a short call's last waves cost
+            # the wide unit more), to at least waves[5] on a packed call (two or more segments) and to at least
+            # waves[9] / (W - 1) while the wave ratio W of the three-warpgroup unit to the wide unit stays below
+            # waves[8] (the fewer waves the wide unit saves, the more tiles its longer units need to pay for them),
+            # on a packed call then also to at least waves[10] / (W - 1) ** 2,
+            # and multiplies it by (top_k / waves[3]) ** waves[4] above top_k = waves[3] (each unit selects more
+            # candidates)
             other = self.block_q_l6 if three_wg else self.block_q_narrow
             ctas = max(1, int(grid))
             waves_wide = -(-units_wide // ctas)
             units_other = -(-int(num_queries) // other)
             waves_other = -(-units_other // ctas)
             if three_wg:
-                wide = waves_other >= waves[1] * waves_wide and mean_tiles >= waves[2]
+                floor = waves[2]
+                if len(waves) > 3:
+                    floor += waves[6] * max(0, int(waves[7]) - waves_wide)
+                    if int(num_segments) >= 2:
+                        floor = max(floor, waves[5])
+                    if waves_other < waves[8] * waves_wide:
+                        if waves_other > waves_wide:
+                            # 1 / (W - 1)
+                            inv = waves_wide / (waves_other - waves_wide)
+                            floor = max(floor, waves[9] * inv)
+                            if int(num_segments) >= 2:
+                                floor = max(floor, waves[10] * inv * inv)
+                        else:
+                            floor = float("inf")
+                    floor *= max(1.0, int(top_k) / waves[3]) ** waves[4]
+                wide = waves_other >= waves[1] * waves_wide and mean_tiles >= floor
             else:
                 wide = waves_other >= waves[0] * waves_wide
             return self.block_q_wide if wide else other
@@ -1085,15 +1180,65 @@ class DispatchPolicy:
         ) <= float(rule[0])
 
     def snake_for(
-        self, kind: str, num_queries: int, num_keys: int, num_segments: int, ratio: int
+        self,
+        kind: str,
+        num_queries: int,
+        num_keys: int,
+        num_segments: int,
+        ratio: int,
+        sampled: bool = True,
+        grid: Optional[int] = None,
     ) -> bool:
+        """The snake unit order of a program kind: where ``snake_rule`` names the kind, from its mean unit tiles (the
+        ratio-1 or the ratio > 1 floor) and unit-cost spread on.  On a call of two or more segments whose kind
+        ``snake_packed_rule`` names, the order also needs the rule's mean unit tiles for the call's sampling mode
+        (``sampled``: the sampled first threshold is on; with it off a None floor keeps the plain order), unless the call
+        needs at most ``snake_packed_rule[3]`` waves of a persistent grid of ``grid`` CTAs (``ceil(ceil(T / block_q) /
+        slots)``, slots = CTAs, or CTA pairs for a pair kind; never without ``grid``): the snake order balances the last
+        waves of one causal document and of calls of few waves, and packed documents of few tiles over more waves run
+        faster in the plain order."""
         rule = self.snake_rule
         if rule is None or kind not in rule[0]:
             return self.snake_default
         r = max(1, int(ratio))
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
         spread = min(1.0, int(num_queries) / max(1.0, r * float(num_keys)))
-        return mean_tiles >= (rule[1] if r == 1 else rule[2]) and spread >= rule[3]
+        snake = mean_tiles >= (rule[1] if r == 1 else rule[2]) and spread >= rule[3]
+        packed = self.snake_packed_rule
+        if (
+            snake
+            and packed is not None
+            and int(num_segments) >= 2
+            and kind in packed[0]
+        ):
+            floor = packed[1] if sampled else packed[2]
+            if floor is not None and mean_tiles >= float(floor):
+                return True
+            if packed[3] is None or grid is None:
+                return False
+            pair = kind.startswith("pair_")
+            block_q = getattr(self, f"block_q_{kind[5:] if pair else kind}")
+            ctas = max(1, int(grid))
+            slots = max(1, (ctas - ctas % 2) // 2) if pair else ctas
+            units = -(-int(num_queries) // int(block_q))
+            return -(-units // slots) <= int(packed[3])
+        return snake
+
+    def snake_l6_fallback_for(
+        self, num_queries: int, block_q: int, pair: bool, grid: int, sampled: bool
+    ) -> bool:
+        """Whether a sampling-off call (``sampled`` False) planned on the unit ``block_q`` (a CTA pair where ``pair``)
+        over a persistent grid of ``grid`` CTAs needs at most ``snake_l6_fallback_waves`` waves of that grid,
+        ``ceil(ceil(T / block_q) / slots)`` with ``slots`` the grid's CTAs (its CTA pairs for a pair program).  Such a
+        call, which ``l6_solo_for`` moves to the unpaired l6 unit, runs that unit's plain-order program where its
+        snake-order program is not registered (``select_program``); never where the record leaves the field None."""
+        cap = self.snake_l6_fallback_waves
+        if cap is None or sampled:
+            return False
+        ctas = max(1, int(grid))
+        slots = max(1, (ctas - ctas % 2) // 2) if pair else ctas
+        units = -(-int(num_queries) // max(1, int(block_q)))
+        return -(-units // slots) <= int(cap)
 
     def snake_copy_fits(
         self, num_queries: int, num_segments: int, block_q: int, grid: int
@@ -1110,6 +1255,21 @@ class DispatchPolicy:
         waves = -(-units // max(1, int(grid)))
         return int(num_segments) <= int(rule[0]) and waves <= int(rule[1])
 
+    def lsf_single_fits(
+        self, num_queries: int, num_keys: int, num_segments: int, ratio: int
+    ) -> bool:
+        """Whether a one-segment call reaches ``lsf_single_rule`` (at least its mean unit tiles; never where the record
+        leaves the rule None).  On one segment the :lsf copy walks the units of the plain program in the same order and
+        returns the same rows; on the FP8 sm_103a wide program it measures faster from 64 mean unit tiles on and slower
+        below, so ``select_fp8_program`` runs it on a one-segment wide call only within the rule."""
+        rule = self.lsf_single_rule
+        return (
+            rule is not None
+            and int(num_segments) == 1
+            and self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
+            >= rule[0]
+        )
+
     def tile_unroll_for(self, kind: str, top_k: int, snake: bool, block_q: int) -> int:
         rule = self.tile_unroll_rule
         if rule is None or (bool(rule[2]) and snake):
@@ -1124,6 +1284,13 @@ class DispatchPolicy:
             if lookup in rule[0] and int(top_k) >= int(rule[1])
             else self.tile_unroll_default
         )
+
+    def desc_walk_for(self, physical_kind: str, sampled: bool) -> bool:
+        """The call runs the descending-walk twin of its scan program (key kind ``<physical_kind>_desc``, the same unit,
+        split, pair, tile unroll and fit form): ``desc_walk_kinds`` names the physical kind for the call's sampling
+        mode (``select_program`` takes the twin only where the registry has it)."""
+        rule = self.desc_walk_kinds
+        return rule is not None and physical_kind in rule[1 if sampled else 0]
 
     def sample_fit_for(
         self,
@@ -1612,7 +1779,12 @@ def select_program(
     split with the unpaired l6 unit only where that unit would not split and its program key is registered.  A record's
     ``wide_pair_snake_only`` (sampled calls) drops the CTA pair of a wide unit that would not walk the snake order where the
     unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
-    limits the two-way wave split.
+    limits the two-way wave split.  A record's ``desc_walk_kinds`` runs the descending-walk twin of the decided program
+    (key kind ``<kind>_desc``) where it names the kind for the call's sampling mode and ``scan_keys`` has the twin.
+    ``snake_packed_rule`` keeps packed calls of few mean unit tiles over more than a few
+    waves in the plain unit order (``snake_for``), and ``snake_l6_fallback_waves`` lets a sampling-off call the l6 preference moves run the plain-order
+    l6 program where the snake-order one is not registered, within that many waves of the planned program's persistent
+    grid (``snake_l6_fallback_for``).
     """
     T, Tkv, S, r, K = (
         int(num_queries),
@@ -1629,6 +1801,7 @@ def select_program(
         if sample_tiles_max is None
         else int(sample_tiles_max)
     )
+    sampled = tiles > 0
     shift = (
         policy.sample_shift_for(K)
         if sample_shift_permille is None
@@ -1665,10 +1838,10 @@ def select_program(
         and policy.wide_pair_snake_only
         and block_q == policy.block_q_wide
         and not policy.snake_for(
-            policy.program_kind(block_q, False, True), T, Tkv, S, r
+            policy.program_kind(block_q, False, True), T, Tkv, S, r, sampled, grid
         )
     ):
-        wide_snake = policy.snake_for("wide", T, Tkv, S, r)
+        wide_snake = policy.snake_for("wide", T, Tkv, S, r, sampled, grid)
         wide_key = scan_key(
             physical_kind("wide", "wide"),
             policy.tile_unroll_for("wide", K, wide_snake, block_q),
@@ -1681,7 +1854,10 @@ def select_program(
     # l6_solo_rule / l6_solo_unsampled_max_queries: a call that does not split takes the l6 unit without a CTA pair where
     # ``l6_solo_for`` prefers it (sampling off: every call, or with the query bound a CTA-pair l6 plan of at most that many
     # queries; sampled: several segments or short units), the l6 unit would not split either (the split rule
-    # alone, before the registration guard of ``n_split_for``) and the program it picks is in ``scan_keys``; else the plan above
+    # alone, before the registration guard of ``n_split_for``) and the program it picks is in ``scan_keys``; else the plan above.
+    # snake_l6_fallback_waves: a sampling-off call whose snake-order l6 program is not registered takes the plain-order
+    # one instead where the planned program needs at most that many waves of its persistent grid
+    solo_plain = False
     if (
         not split
         and (block_q, pair) != (policy.block_q_l6, False)
@@ -1695,19 +1871,36 @@ def select_program(
         )
         and policy.split_rule_for(T, Tkv, S, r, grid, policy.block_q_l6, tiles > 0) == 1
     ):
-        solo_snake = policy.snake_for("l6", T, Tkv, S, r)
+        solo_snake = policy.snake_for("l6", T, Tkv, S, r, sampled, grid)
+        solo_fit = policy.sample_fit_for(T, Tkv, S, r, cap, "l6")
         solo_key = scan_key(
             "l6",
             policy.tile_unroll_for("l6", K, solo_snake, policy.block_q_l6),
             solo_snake,
-            policy.sample_fit_for(T, Tkv, S, r, cap, "l6"),
+            solo_fit,
             lsf,
         )
+        if (
+            scan_keys is not None
+            and solo_key not in scan_keys
+            and solo_snake
+            and policy.snake_l6_fallback_for(T, block_q, pair, grid, sampled)
+        ):
+            solo_key = scan_key(
+                "l6",
+                policy.tile_unroll_for("l6", K, False, policy.block_q_l6),
+                False,
+                solo_fit,
+                lsf,
+            )
+            solo_plain = True
         if scan_keys is not None and solo_key in scan_keys:
             block_q, pair = policy.block_q_l6, False
+        else:
+            solo_plain = False
     kind = policy.program_kind(block_q, split, pair)
     unit = policy.unit_name(block_q)
-    snake = policy.snake_for(kind, T, Tkv, S, r)
+    snake = False if solo_plain else policy.snake_for(kind, T, Tkv, S, r, sampled, grid)
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
     physical = physical_kind(kind, unit)
@@ -1759,6 +1952,13 @@ def select_program(
     )
     scan_entries = grid_ctas * block_q * cap
     staging = T * n_split * K if split else 0
+    key = scan_key(physical, unroll, snake, fit, lsf)
+    # desc_walk_kinds: the descending-walk twin of the decided program, where the record names its kind for the call's
+    # sampling mode and the registry has it (no registry: off); the plan, the knobs and the workspace stay
+    if scan_keys is not None and policy.desc_walk_for(physical, tiles > 0):
+        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit, lsf)
+        if desc_key in scan_keys:
+            key = desc_key
     return ProgramChoice(
         num_queries=T,
         num_keys=Tkv,
@@ -1798,7 +1998,7 @@ def select_program(
         rank_persist_ctas=int(policy.rank_persist_ctas_per_sm)
         if rank_persistent
         else 0,
-        scan_key=scan_key(physical_kind(kind, unit), unroll, snake, fit, lsf),
+        scan_key=key,
         merge_key=MERGE_KEY if split else None,
         finalize_key=finalize_key(
             rank_threads,
@@ -1923,7 +2123,8 @@ def select_fp8_program(
     architecture's FP8 record ``policy`` (``fp8_policy_record``) with the registry's ``scan_keys``, run by the FP8
     program (``fp8_program_choice``) of the decided physical kind -- of its ``FP8_KIND_FALLBACK`` kind, with that
     kind's sampled first threshold and check period (``fallback_knobs``), where no FP8 program of the decided kind is
-    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered), with the decided tile
+    registered -- in the decided segment order (``:lsf`` where its FP8 copy is registered; also a one-segment call of
+    the wide unit within the record's ``lsf_single_rule``, ``DispatchPolicy.lsf_single_fits``), with the decided tile
     unroll where an FP8 program of it is registered, else the smallest registered one, and in the snake unit order
     where the decision marks it, the registry has the snake copy (``s1``) of that program and the call stays within
     the record's ``snake_cap_rule`` (``DispatchPolicy.snake_copy_fits``).  ``fp8_programs``:
@@ -1934,7 +2135,15 @@ def select_fp8_program(
     physical = choice.physical_kind
     if not any(kind == physical for kind, _lsf in programs):
         physical = FP8_KIND_FALLBACK.get(physical, physical)
-    unrolls = programs.get((physical, choice.lsf)) or programs.get((physical, False))
+    # lsf_single_rule: a one-segment call of the wide unit runs the :lsf copy within the rule (the plan leaves it off)
+    lsf = choice.lsf or (
+        physical == "wide"
+        and (physical, True) in programs
+        and policy.lsf_single_fits(
+            choice.num_queries, choice.num_keys, choice.num_segments, choice.ratio
+        )
+    )
+    unrolls = programs.get((physical, lsf)) or programs.get((physical, False))
     if not unrolls:
         raise NotImplementedError(
             f"the FP8 dispatch selected the {physical!r} scan kind, which no registered FP8 program serves "

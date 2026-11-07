@@ -9,7 +9,6 @@ from __future__ import annotations
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -19,6 +18,8 @@ import tempfile
 import time
 from typing import Any, Iterator, Mapping, Sequence
 import json
+
+import _flashinfer_filelock as filelock
 
 
 class WorkerStatus(str, Enum):
@@ -426,11 +427,11 @@ def gpu_lock(
 
     def acquire(descriptor: int) -> None:
         if timeout_seconds is None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            filelock.lock(descriptor)
             return
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                filelock.lock(descriptor, blocking=False)
                 return
             except BlockingIOError:
                 elapsed = time.monotonic() - started
@@ -448,7 +449,7 @@ def gpu_lock(
             acquire(stream.fileno())
             acquired = True
         finally:
-            fcntl.flock(turnstile.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(turnstile.fileno())
         # Diagnostic only; ownership is the flock, not this content.
         stream.seek(0)
         stream.truncate()
@@ -457,7 +458,7 @@ def gpu_lock(
         yield path
     finally:
         if acquired:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(stream.fileno())
         turnstile.close()
         stream.close()
 

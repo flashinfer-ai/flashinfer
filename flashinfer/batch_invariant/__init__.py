@@ -79,6 +79,12 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _attention_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(head_dim)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
@@ -156,6 +162,17 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
+    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
 }
 
 
@@ -186,6 +203,13 @@ def fingerprint(op: str, **dims) -> str:
     (``gemm.mxfp4.*128`` on SM107; ``gemm.nvfp4.*128`` on SM107 for the weight shapes its chunk rule leaves unsplit,
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
+
+    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
+    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
+    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
+    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
+    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
+    class's no-window sample row and covers windowed calls too.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
