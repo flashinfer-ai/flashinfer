@@ -985,6 +985,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_wave_rule": None,
         "split_wave_scope": None,
         "split_fit_rule": [4096],
+        "split_resident_rule": [4096, 32768, 49152, 32, 8],
         "split_units": ["l6", "narrow"],
         "pair_rule": [128.0, 256.0, 512],
         "pair_units": ["l6"],
@@ -1071,6 +1072,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_wave_rule": None,
         "split_wave_scope": None,
         "split_fit_rule": [4096],
+        "split_resident_rule": [4096, 32768, 49152, 32, 8],
         "split_units": ["l6", "narrow"],
         "pair_rule": [64.0, 1024.0, 512],
         "pair_units": ["l6"],
@@ -1157,6 +1159,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_wave_rule": [1000, 0.12],
         "split_wave_scope": [["narrow"], 1, True],
         "split_fit_rule": [4096],
+        "split_resident_rule": None,
         "split_units": ["narrow", "wide"],
         "pair_rule": [0.0, 4096.0, 512],
         "pair_units": ["l6", "narrow", "wide"],
@@ -1263,11 +1266,20 @@ POLICY: dict[str, dict[str, Any]] = {
 # the descending-walk programs are BF16 programs.  Each FP8 record leaves the
 # BF16 snake rules of packed calls and of the l6 fallback off
 # (snake_packed_rule, snake_l6_fallback_waves), so the FP8 plans keep their
-# own measured rules.
+# own measured rules.  Each FP8 record names every split field itself, so the
+# FP8 split counts stay as measured (no split-resident rule) whatever the BF16
+# split rule becomes.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {
         "static_scan_kinds": [],
         "wide_wave_rule": [1.7, 1.3, 84.0],
+        "split_max": 16,
+        "split_min_range_tiles": 32,
+        "split_wave_rule": None,
+        "split_wave_scope": None,
+        "split_fit_rule": [4096],
+        "split_resident_rule": None,
+        "split_units": ["l6", "narrow"],
         "desc_walk_kinds": None,
         "snake_packed_rule": None,
         "snake_l6_fallback_waves": None,
@@ -1292,13 +1304,26 @@ POLICY_FP8: dict[str, dict[str, Any]] = {
             60.0,
         ],
         "lsf_single_rule": [64.0],
+        "split_max": 16,
+        "split_min_range_tiles": 32,
+        "split_wave_rule": None,
+        "split_wave_scope": None,
+        "split_fit_rule": [4096],
+        "split_resident_rule": None,
+        "split_units": ["l6", "narrow"],
         "desc_walk_kinds": None,
         "snake_packed_rule": None,
         "snake_l6_fallback_waves": None,
     },
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
+        "split_max": 16,
+        "split_min_range_tiles": 32,
+        "split_wave_rule": [1000, 0.12],
+        "split_wave_scope": [["narrow"], 1, True],
         "split_fit_rule": None,
+        "split_resident_rule": None,
+        "split_units": ["narrow", "wide"],
         "snake_cap_rule": [1, 40],
         "desc_walk_kinds": None,
         "snake_packed_rule": None,

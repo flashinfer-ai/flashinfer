@@ -100,6 +100,7 @@ POLICY_FIELDS = (
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
     "split_wave_scope",  # [unit geometries, max segments, sampled calls only] the two-way split of split_wave_rule is limited to, or None (every call)
     "split_fit_rule",  # [merge chunk entries]: a call the split rule splits takes ceil(mean unit keys / top_k) splits, rounded up to whole merge chunks, where that is more and fits split_max and the grid; or None
+    "split_resident_rule",  # [merge chunk entries, fit entries, merge-resident entries, max splits, min splits] replacing split_max and split_fit_rule on a call the split rule splits, or None; see split_rule_for
     "split_units",  # unit geometries ("l6", "narrow", "wide") whose split program the architecture registers; any other unit never splits
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
     "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
@@ -332,6 +333,7 @@ _OPTIONAL_RULE = (
     "split_wave_rule",
     "split_wave_scope",
     "split_fit_rule",
+    "split_resident_rule",
     "pair_rule",
     "l6_solo_rule",
     "snake_rule",
@@ -389,6 +391,7 @@ class DispatchPolicy:
     split_wave_rule: Optional[list]
     split_wave_scope: Optional[list]
     split_fit_rule: Optional[list]
+    split_resident_rule: Optional[list]
     split_units: list
     pair_rule: Optional[list]
     pair_units: list
@@ -568,6 +571,16 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['split_fit_rule'] must be [merge chunk entries >= 1] or None, got {fit_rule!r}"
+            )
+        resident = raw["split_resident_rule"]
+        if resident is not None and (
+            len(resident) != 5
+            or not all(_is_int(v) and v >= 1 for v in resident)
+            or not 2 <= resident[4] <= resident[3]
+        ):
+            raise ValueError(
+                f"policy['split_resident_rule'] must be [merge chunk entries, fit entries, merge-resident entries, max splits, "
+                f"min splits] (positive integers, 2 <= min splits <= max splits) or None, got {resident!r}"
             )
         solo = raw["l6_solo_rule"]
         if solo is not None and (
@@ -1104,7 +1117,14 @@ class DispatchPolicy:
         """The split rule alone (no registration guard): ``min(grid // units, mean tiles // split_min_range_tiles,
         split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1 -- inside
         ``split_wave_scope`` only (its unit geometries, calls of at most its segment count, and with its third item the
-        sampled calls only: ``sampled`` says whether the call's sampled first threshold is on)."""
+        sampled calls only: ``sampled`` says whether the call's sampled first threshold is on).
+
+        With ``top_k`` given, a call that rule splits takes the count of ``split_resident_rule`` [chunk, fit, resident,
+        max, min] where the record sets it: ``min(grid // units, resident // top_k, max, max(min, n_fit if n_fit x top_k
+        <= fit else max))``, at least 2, with ``n_fit = ceil(mean unit keys / top_k)`` rounded up to whole merge chunks
+        of ``chunk`` entries.  The merge keeps its ``n x top_k`` staged entries in shared memory up to ``resident``
+        entries, so the count stays there; below it more splits shorten each split's scan.  Otherwise
+        ``split_fit_rule``."""
         units = max(1, -(-int(num_queries) // int(block_q)))
         mean_tiles = self._mean_unit_tiles_floor(
             num_queries, num_keys, num_segments, ratio
@@ -1141,20 +1161,33 @@ class DispatchPolicy:
 
             if eff(2) - eff(1) >= float(rule[1]):
                 n = 2
-        fit = self.split_fit_rule
-        if fit is not None and n > 1 and top_k is not None and int(top_k) > 0:
-            # split_fit_rule: a split call whose splits can each hold at most top_k keys needs no selection inside a
-            # split; the merge reads its staging in chunks of fit[0] entries, so the split count is rounded up to whole
-            # chunks (more splits in the last chunk cost the merge nothing)
-            segments = max(1, int(num_segments))
-            r = max(1, int(ratio))
-            mean_keys = max(
-                0.0, (int(num_keys) - int(num_queries) / (2 * r)) / segments
+        if n == 1 or top_k is None or int(top_k) <= 0:
+            return n
+        k = int(top_k)
+        segments = max(1, int(num_segments))
+        r = max(1, int(ratio))
+        mean_keys = max(0.0, (int(num_keys) - int(num_queries) / (2 * r)) / segments)
+
+        def fit_splits(chunk: int) -> int:
+            # splits that hold at most top_k keys each, rounded up to whole merge chunks of ``chunk`` entries (more
+            # splits in the last chunk cost the merge nothing)
+            per_chunk = max(1, int(chunk) // k)
+            return -(-max(1, -(-int(mean_keys) // k)) // per_chunk) * per_chunk
+
+        resident = self.split_resident_rule
+        if resident is not None:
+            chunk, fit_entries, resident_entries, most, least = (
+                int(v) for v in resident
             )
-            k = int(top_k)
-            n_fit = max(1, -(-int(mean_keys) // k))
-            per_chunk = max(1, int(fit[0]) // k)
-            n_fit = -(-n_fit // per_chunk) * per_chunk
+            n_fit = fit_splits(chunk)
+            want = n_fit if n_fit * k <= fit_entries else most
+            n = min(int(grid) // units, resident_entries // k, most, max(least, want))
+            return max(2, n)
+        fit = self.split_fit_rule
+        if fit is not None:
+            # split_fit_rule: a split call whose splits can each hold at most top_k keys needs no selection inside a
+            # split; the merge reads its staging in chunks of fit[0] entries
+            n_fit = fit_splits(int(fit[0]))
             if n < n_fit <= min(int(grid) // units, self.split_max):
                 n = n_fit
         return n

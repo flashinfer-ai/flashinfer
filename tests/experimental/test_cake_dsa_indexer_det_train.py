@@ -119,6 +119,7 @@ _COMMON = dict(
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
     split_fit_rule=None,
+    split_resident_rule=None,
     l6_solo_rule=None,
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
@@ -1280,6 +1281,15 @@ def test_policy_record_round_trip_and_validation():
         dict(split_units=["split_l6"]),
         dict(split_units=["wide", "l6"]),
         dict(split_units=["l6", "l6"]),
+        # the split-resident rule: [chunk, fit, resident, max splits, min splits], positive integers, 2 <= min <= max
+        dict(split_resident_rule=4096),
+        dict(split_resident_rule=[4096, 32768, 49152, 32]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, 8, 1]),
+        dict(split_resident_rule=[0, 32768, 49152, 32, 8]),
+        dict(split_resident_rule=[4096, 32768, 49152.0, 32, 8]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, True]),
+        dict(split_resident_rule=[4096, 32768, 49152, 32, 1]),
+        dict(split_resident_rule=[4096, 32768, 49152, 8, 32]),
         # the unpaired three-warpgroup preference: [max mean unit tiles >= 0, min segments >= 1] or None
         dict(l6_solo_rule=128),
         dict(l6_solo_rule=[]),
@@ -2734,12 +2744,14 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
 
 
 def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
-    """``split_fit_rule`` [4096] on every architecture: a split call whose mean unit keys fit ceil(keys / top_k) <=
-    split_max splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the
-    floor rule, and so does a call the floor rule does not split."""
+    """``split_fit_rule`` [4096] on every architecture (sm_100a and sm_103a with their ``split_resident_rule`` off): a
+    split call whose mean unit keys fit ceil(keys / top_k) <= split_max splits takes that count rounded up to whole
+    4096-entry merge chunks; a call that needs more keeps the floor rule, and so does a call the floor rule does not
+    split."""
     for arch, grid in (("sm_100a", 152), ("sm_103a", 152), ("sm_107a", 212)):
         p = policy_for(arch)
         assert p.split_fit_rule == [4096], arch
+        p = DispatchPolicy.from_record(dict(p.record(), split_resident_rule=None))
         # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True) == 5
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 2048) == 12
@@ -2750,6 +2762,39 @@ def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
         assert p.split_rule_for(4, 22018, 1, 1, grid, p.block_q_l6, True, 4096) == 6
         # the floor rule does not split 8192 keys: no fit split either
         assert p.split_rule_for(1, 8192, 1, 1, grid, p.block_q_l6, True, 2048) == 1
+
+
+def test_split_resident_rule_keeps_the_merge_resident():
+    """``split_resident_rule`` [4096, 32768, 49152, 32, 8] on sm_100a and sm_103a (sm_107a: None, ``split_fit_rule``): a
+    call the floor rule splits takes ``min(grid // units, 49152 // top_k, 32, max(8, n_fit if n_fit x top_k <= 32768
+    else 32))`` splits, at least 2; ``n_fit`` = ceil(mean unit keys / top_k) in whole 4096-entry merge chunks.  A call
+    the floor rule does not split, or one without ``top_k``, keeps the floor rule."""
+    assert policy_for("sm_107a").split_resident_rule is None
+    for arch in ("sm_100a", "sm_103a"):
+        p = policy_for(arch)
+        assert p.split_resident_rule == [4096, 32768, 49152, 32, 8], arch
+        for grid in (148, 152):
+
+            def n(T, Tkv, block_q=p.block_q_l6, top_k=None, sampled=True):
+                return p.split_rule_for(T, Tkv, 1, 1, grid, block_q, sampled, top_k)
+
+            # 4 queries x 22018 keys (one l6 unit): n_fit 11 -> 12 at top_k 2048 (24576 entries)
+            assert n(4, 22018) == 5 and n(4, 22018, top_k=2048) == 12
+            assert n(4, 30466, top_k=2048, sampled=False) == 16
+            # 41986 keys: n_fit 22 x 2048 > 32768 entries, so 32, capped at the 24 splits the merge keeps resident
+            assert n(4, 41986, top_k=2048) == 24
+            # top_k 4096: 6 fitting splits lifted to 8; 65536 keys: 16 fitting splits, 12 resident
+            assert n(4, 22018, top_k=4096) == 8 and n(4, 65536, top_k=4096) == 12
+            # top_k 256 / 512: n_fit 64 / 32 (16384 entries) capped at 32 splits
+            assert n(1, 16384, p.block_q_narrow, 256) == 32
+            assert n(1, 16384, p.block_q_narrow, 512) == 32
+            # 64 queries (16 narrow units): the grid caps the count
+            assert n(64, 16384, p.block_q_narrow, 256) == grid // 16
+            # the floor rule does not split 8192 keys: no split either
+            assert n(1, 8192, top_k=2048) == 1
+        # the FP8 record keeps every split field of the measured FP8 plans (no split-resident rule)
+        fp8 = cake_policy.fp8_policy_record(p.record(), cake_jit.POLICY_FP8[arch])
+        assert fp8["split_resident_rule"] is None and fp8["split_fit_rule"] == [4096]
 
 
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
