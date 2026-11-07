@@ -293,8 +293,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     }
     flags["y_dx_within_one_bf16_ulp_of_fp64"] = worst_y <= 1.0 and worst_dx <= 1.0
     flags["dw_sum_within_budget_of_fp64"] = worst_dw <= 1.0
+    # The first nondet call of the context (the single calls) also runs the rank-agreement check of #8946: one
+    # all_gather_into_tensor per phase; every later call issues only the halo exchanges.
     flags["counts"] = (
-        cs_direct["calls"] == table(n, 0, n)
+        cs_direct["calls"] == table(n + 1, 0, n + 1)
         and cm_direct["calls"] == table(1, 0, 1)
         and cm_plain["calls"] == table(1, 1, 1)
         and cm_handle["calls"] == table(1, 0, 1)

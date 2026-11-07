@@ -127,6 +127,8 @@ uses the trimmed host path's per-context cache (the ``host_trim`` test knob sele
 
 from __future__ import annotations
 
+import hashlib
+import weakref
 from typing import Any, Optional
 
 import torch
@@ -207,13 +209,17 @@ def _exchange(
     send_splits: tuple[int, ...],
     recv_splits: tuple[int, ...],
     ctx: Any,
+    agree: tuple[str, tuple[int, ...], bool],
 ) -> tuple[torch.Tensor, Optional[Any]]:
     """One ``all_to_all_single`` of ``send`` (rows in destination-rank order) into a fresh ``[recv_rows, C]`` tensor,
     issued asynchronously on the current stream; with one rank the send buffer is the received pool (no collective).
-    Returns ``(recv, work)``; the caller waits ``work`` at the first consumer."""
+    ``agree`` = ``(phase, channels, multi)`` of the call: the first exchange of a (context, phase) runs the
+    rank-agreement check first (:func:`_agree`).  Returns ``(recv, work)``; the caller waits ``work`` at the first
+    consumer."""
 
     if int(ctx.world_size) == 1:
         return send, None
+    _agree(ctx, *agree, device=send.device)
     recv = torch.empty((recv_rows, send.shape[1]), dtype=send.dtype, device=send.device)
     work = dist.all_to_all_single(
         recv,
@@ -282,6 +288,107 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
             f"ctx.cu_seqlens_local names {n_frag} fragments but ctx.n_frag is {int(ctx.n_frag)}"
         )
     return cu, n_frag
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Rank agreement and one mode per collective (FlashInfer issue #8946): every rank of a call must pass a context built
+# from the same partition and call the same entry (this package's nondet entry, single or multi) with the same
+# channel counts.  The first eager exchange of each (context, phase) -- phase "fwd" or "bwd" -- all-gathers one int64[8]
+# fingerprint per rank over ``ctx.group`` and compares them on the host (the call's only collective beyond the halo
+# exchange and its only host sync, once per context and phase); every rank raises the same ``ValueError`` naming the
+# ranks and fields that differ.  Later calls, recompute with a handle (no exchange) and graph replays do nothing.  A
+# first call inside a CUDA-graph capture raises: run one eager call first.  One rank: no check.  The layout is shared
+# with the deterministic KCP package's protocol (field 1 = mode: 1 det, 2 nondet).
+#   [0] protocol 0x4B43504650310001; [1] mode (2); [2] phase (1 fwd, 2 bwd); [3] (entry << 32) | n_tensors (entry 1
+#   single, 2 multi); [4] channels (C, or for multi the low 63 bits of sha256(",".join(C_i))); [5] (world_size << 8) |
+#   conv width; [6] low 63 bits of sha256 of the partition (world size, layout, cu_seqlens, every fragment's doc, off,
+#   length, rank, slot); [7] launch form (fwd 0, bwd 1).
+AGREE_PROTOCOL = 0x4B43504650310001
+AGREE_MODE = 2  # nondet
+AGREE_FIELDS = ("protocol", "mode", "phase", "entry/tensors", "channels", "world/width", "partition", "form")
+_AGREE_PHASES = {"fwd": 1, "bwd": 2}
+_AGREED: "weakref.WeakKeyDictionary[Any, set]" = weakref.WeakKeyDictionary()
+_AGREED_PINNED: dict[int, tuple[Any, set]] = {}  # contexts that are not weak-referenceable (pinned)
+
+
+def _low63(digest: bytes) -> int:
+    return int.from_bytes(digest[:8], "little") & (2**63 - 1)
+
+
+def _partition_hash(part: Any) -> int:
+    text = (
+        f"{int(part.world_size)}|{part.layout}|"
+        + ",".join(str(int(c)) for c in part.cu_seqlens)
+        + "|"
+        + ";".join(
+            f"{f.doc},{f.off},{f.length},{f.rank},{f.slot}"
+            for rank_frags in part.fragments
+            for f in rank_frags
+        )
+    )
+    return _low63(hashlib.sha256(text.encode("utf-8")).digest())
+
+
+def _fingerprint(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool) -> list[int]:
+    part = getattr(ctx, "partition", None)
+    if part is None:
+        raise TypeError(
+            "ctx has no `partition`: a multi-rank call needs the context of the KCP plan builder "
+            "(the rank-agreement check hashes its partition)"
+        )
+    if multi:
+        width = _low63(hashlib.sha256(",".join(str(int(c)) for c in channels).encode("utf-8")).digest())
+    else:
+        width = int(channels[0])
+    return [
+        AGREE_PROTOCOL,
+        AGREE_MODE,
+        _AGREE_PHASES[phase],
+        ((2 if multi else 1) << 32) | len(channels),
+        width,
+        (int(ctx.world_size) << 8) | int(ctx.conv_kernel_size),
+        _partition_hash(part),
+        0 if phase == "fwd" else 1,
+    ]
+
+
+def _agreed_phases(ctx: Any) -> set:
+    try:
+        return _AGREED.setdefault(ctx, set())
+    except TypeError:
+        return _AGREED_PINNED.setdefault(id(ctx), (ctx, set()))[1]
+
+
+def _agree(ctx: Any, phase: str, channels: tuple[int, ...], multi: bool, device: torch.device) -> None:
+    """The rank-agreement check of a (context, phase): see the block comment above."""
+
+    world = int(ctx.world_size)
+    if world == 1:
+        return
+    done = _agreed_phases(ctx)
+    if phase in done:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError(
+            f"the first {phase} call of a KCP context ran inside a CUDA-graph capture: the rank-agreement check of "
+            "#8946 needs one eager call per context and phase before a capture"
+        )
+    mine = torch.tensor(_fingerprint(ctx, phase, channels, multi), dtype=torch.int64, device=device)
+    every = torch.empty(world * len(AGREE_FIELDS), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(every, mine, group=ctx.group)
+    rows = every.view(world, len(AGREE_FIELDS)).cpu().tolist()
+    bad = [
+        (rank, [AGREE_FIELDS[i] for i, (a, b) in enumerate(zip(row, rows[0], strict=True)) if a != b])
+        for rank, row in enumerate(rows)
+        if row != rows[0]
+    ]
+    if bad:
+        detail = "; ".join(f"rank {rank} differs from rank 0 in {', '.join(fields)}" for rank, fields in bad)
+        raise ValueError(
+            f"KCP rank agreement failed on the first {phase} call of this context (#8946: every rank passes the "
+            f"same partition and calls the same entry, mode and channel counts): {detail}"
+        )
+    done.add(phase)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -902,6 +1009,7 @@ def _kcp_forward(
             send_splits=tuple(halo.fwd_send_rows),
             recv_splits=tuple(halo.fwd_recv_rows),
             ctx=ctx,
+            agree=("fwd", (C,), False),
         )
     else:
         hist, work = _hist, None
@@ -1055,6 +1163,7 @@ def _kcp_forward_trim(
             send_splits=e["send_splits"],
             recv_splits=e["recv_splits"],
             ctx=ctx,
+            agree=("fwd", (C,), False),
         )
     else:
         hist, work = _hist, None
@@ -1264,6 +1373,7 @@ def _kcp_backward(
         send_splits=tuple(halo.bwd_send_rows),
         recv_splits=tuple(halo.bwd_recv_rows),
         ctx=ctx,
+        agree=("bwd", (C,), False),
     )
     if S == 0:
         if work is not None:
@@ -1568,6 +1678,7 @@ def _kcp_backward_trim(
         send_splits=e["send_splits"],
         recv_splits=e["recv_splits"],
         ctx=ctx,
+        agree=("bwd", (C,), False),
     )
     if S == 0:
         if work is not None:
@@ -1912,6 +2023,7 @@ def _kcp_forward_multi(
             send_splits=e0["send_splits"],
             recv_splits=e0["recv_splits"],
             ctx=ctx,
+            agree=("fwd", tuple(c[1] for c in calls), True),
         )
         if work is not None:
             work.wait()
@@ -2100,6 +2212,7 @@ def _kcp_backward_multi(
             send_splits=e0["send_splits"],
             recv_splits=e0["recv_splits"],
             ctx=ctx,
+            agree=("bwd", tuple(c[1] for c in calls), True),
         )
         if work is not None:
             work.wait()
