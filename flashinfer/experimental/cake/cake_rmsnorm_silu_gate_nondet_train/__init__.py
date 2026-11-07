@@ -52,8 +52,7 @@ its ``dx`` and ``dz`` the same arithmetic, that sums the weight gradient on
 chip in a fixed order and rounds it once, the same bits on every call.  The
 exact tiny backward (4 or 8 teams of the deterministic backward's 128-thread
 CTA a CTA) adds the deterministic backward's chunk partials in its reduction
-order in FP64; the tiny backward (BF16 weight gradient only, 256-thread
-CTAs) adds every CTA's FP32 partial of a column in rank order in FP64.
+order in FP64.
 
 Mode: the mode is part of the name (``nondet``).  No entry point takes a
 ``deterministic`` keyword (passing one is a ``TypeError``), and no call of this
@@ -133,10 +132,9 @@ Host design (the input layout rules are the deterministic package's):
   that, thread 0 of every CTA claiming runs of chunks with a relaxed atomic
   increment on the workspace's claim counter, so a CTA that starts late takes
   fewer chunks; a small-row backward one cluster of 16 CTAs
-  (``cake_jit.backward_ctas`` 16) scheduled together on the SMs of one GPC:
-  the tiny backward's 256-thread CTA ``r`` running the 16-row blocks ``r``,
-  ``r + 16``, ..., and team ``q`` of the exact tiny backward's CTA ``r`` the
-  8-row block ``r + 16 q``.  No kernel is cooperative; no
+  (``cake_jit.backward_ctas`` 16) scheduled together on the SMs of one GPC,
+  team ``q`` of the exact tiny backward's CTA ``r`` running the 8-row block
+  ``r + 16 q``.  No kernel is cooperative; no
   call synchronizes the host or the device, and every kernel runs on the
   current torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548): a kernel

@@ -27,7 +27,7 @@ within the deterministic FP64 sum's error of a rounding boundary.
 | `y` | `rstd` with `rsqrt.approx`, the sigmoid with `ex2.approx` and `rcp.approx`, FP32 products, one rounding to BF16 | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
 | `dx` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
 | `dz` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dw` (BF16 or FP32) | the deterministic backward's FP32 chunk partials, summed exactly in 64-bit integer windows, one rounding | bit for bit | within the deterministic budget `abs(dw64) * 2^-7 + sum(abs(terms)) * 2^-20`; at most 1.1 times the deterministic package's |
+| `dw` (BF16 or FP32) | the deterministic backward's FP32 chunk partials, summed exactly in 64-bit integer windows (in the small-row bands: on chip in the deterministic pair's order in FP64), one rounding | bit for bit | within the deterministic budget `abs(dw64) * 2^-7 + sum(abs(terms)) * 2^-20`; at most 1.1 times the deterministic package's; in every band a column with an infinite or NaN term has the FP64 reference's class (`+inf`, `-inf` or `NaN`), also when the row count is not a multiple of the row block |
 
 "At most 1.1 times the deterministic package's" holds for both error measures
 the tests compute on the same inputs: the relative L2 error and the largest
@@ -114,7 +114,6 @@ the same inputs on the same device.
 | `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | its forward bands |
 | `bwd_bf16_t512`, `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its bands (at most 512) |
 | `bwd_bf16_t1024`, `bwd_f32_t1024` | exact tiny backward of 8 teams | the rows of its bands (at most 1024) |
-| `bwd_bf16_short` | tiny backward: one cluster of 16 CTAs of 256 threads, the weight gradient summed on chip, no workspace; BF16 weight gradient only | the rows of its bands |
 | `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | past the bands, while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
 | `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time | past 8 chunks per SM |
 
@@ -132,9 +131,9 @@ The small-row backward bands (`BACKWARD_BANDS`, rows per call; a call with
 
 | architecture | BF16 weight gradient | FP32 weight gradient |
 | --- | --- | --- |
-| `sm_100a` | 1-192 `t512`, 193-256 `short`, 257-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-1024 `t1024` |
-| `sm_103a` | 1-512 `short`, 513-620 `t1024` | 1-512 `t512`, 513-720 `t1024` |
-| `sm_107a` | 1-120 `t512`, 121-256 `short`, 257-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-900 `t1024` |
+| `sm_100a` | 1-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-1024 `t1024` |
+| `sm_103a` | 1-512 `t512`, 513-620 `t1024` | 1-512 `t512`, 513-720 `t1024` |
+| `sm_107a` | 1-512 `t512`, 513-1024 `t1024` | 1-512 `t512`, 513-900 `t1024` |
 
 The backward cuts the rows into 8-row blocks and the blocks into the
 deterministic backward's chunks: `blocks_per_chunk = max(1, ceil(blocks /

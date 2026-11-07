@@ -1767,10 +1767,10 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 
 
 def _block_rows(name: str) -> int:
-    """The rows of one row block of the backward module ``name``: 16 for the
-    tiny backward of 256-thread CTAs (``bwd_bf16_short``), 8 for the exact
-    tiny backward's teams and the static and the claimed backward."""
-    return 16 if loader.MODULES[name]["role"] == "bwd_bf16_short" else 8
+    """The rows of one row block of the backward module ``name``: 8 for the
+    exact tiny backward's teams and the static and the claimed backward."""
+    assert name in loader.MODULES, name
+    return 8
 
 
 def _last_block_rows(block: int, first: int, last: int | None) -> dict[str, int]:
@@ -1787,12 +1787,6 @@ def _last_block_rows(block: int, first: int, last: int | None) -> dict[str, int]
 
 
 @requires_device
-@pytest.mark.xfail(
-    reason="padded lanes of the last row block multiply a copy of the last row "
-    "by 0, so an infinite grad_out there gives a NaN weight-gradient column; "
-    "remove this mark once the backward masks those lanes",
-    strict=False,
-)
 @pytest.mark.parametrize("count", ["rem1", "remmax"])
 @pytest.mark.parametrize("tier", BACKWARD_TIERS)
 @pytest.mark.parametrize(

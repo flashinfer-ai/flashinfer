@@ -1277,31 +1277,20 @@ CLAIMED_ROUTES = {"bwd_bf16_mid": 8, "bwd_f32_mid": 8}
 
 
 # The small-row backward bands of each architecture and backward role: (last
-# row, role) in increasing rows, each band's module one cluster of 16 CTAs
-# whatever the rows (the measured fastest program at each row count; the
-# tiny backward of 256-thread CTAs, ``bwd_bf16_short``, for a BF16 weight
-# gradient only).
+# row, role) in increasing rows, each band's module one cluster of 16 CTAs of
+# the exact tiny backward whatever the rows (the measured fastest of its 4-
+# and 8-team programs at each row count).
 BACKWARD_BANDS = {
     "sm_100a": {
-        "bwd_bf16": (
-            (192, "bwd_bf16_t512"),
-            (256, "bwd_bf16_short"),
-            (512, "bwd_bf16_t512"),
-            (1024, "bwd_bf16_t1024"),
-        ),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (1024, "bwd_f32_t1024")),
     },
     "sm_103a": {
-        "bwd_bf16": ((512, "bwd_bf16_short"), (620, "bwd_bf16_t1024")),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (620, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (720, "bwd_f32_t1024")),
     },
     "sm_107a": {
-        "bwd_bf16": (
-            (120, "bwd_bf16_t512"),
-            (256, "bwd_bf16_short"),
-            (512, "bwd_bf16_t512"),
-            (1024, "bwd_bf16_t1024"),
-        ),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (900, "bwd_f32_t1024")),
     },
 }
@@ -1343,13 +1332,11 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     short, mid, long and extra-long forwards and the forward, each where the
     architecture's bands name it), a backward role's small-row module in the
     rows of its ``BACKWARD_BANDS`` band (each band at most its module's
-    ``max_rows``, the FP32 weight gradient never on the BF16-only tiny
-    backward), past them the claimed backward where the rows have more chunks
+    ``max_rows``), past them the claimed backward where the rows have more chunks
     than ``more_chunks_than_per_sm * sm_count``, else the static backward.  No
     grid rule carries rows per SM: the bands are host plan only."""
     assert loader.FORWARD_BANDS == FORWARD_BANDS
     assert loader.BAND_ROLES == (
-        "bwd_bf16_short",
         "bwd_bf16_t512",
         "bwd_bf16_t1024",
         "bwd_f32_t512",
@@ -1437,16 +1424,15 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     assert "fwd_long" not in routes
     # the backward on every architecture: the small-row backwards in their
     # bands whatever the SMs (on sm_100a the 4-team exact tiny backward up to
-    # 192 rows of a BF16 weight gradient and 512 of an FP32 one, the 8-team
-    # one up to 1024), the static backward from the next row up to 64 rows per
+    # 512 rows, the 8-team one up to 1024), the static backward from the next row up to 64 rows per
     # SM (8 chunks of one 8-row block per SM), the claimed backward past it,
     # at every larger row count
     for rows, role, band in (
         (1, "bwd_bf16", "bwd_bf16_t512"),
         (192, "bwd_bf16", "bwd_bf16_t512"),
-        (193, "bwd_bf16", "bwd_bf16_short"),
-        (256, "bwd_bf16", "bwd_bf16_short"),
-        (257, "bwd_bf16", "bwd_bf16_t512"),
+        (193, "bwd_bf16", "bwd_bf16_t512"),
+        (256, "bwd_bf16", "bwd_bf16_t512"),
+        (512, "bwd_bf16", "bwd_bf16_t512"),
         (513, "bwd_bf16", "bwd_bf16_t1024"),
         (1024, "bwd_f32", "bwd_f32_t1024"),
         (1, "bwd_f32", "bwd_f32_t512"),
@@ -1770,7 +1756,6 @@ SHORT_BACKWARD_GRIDS = [
 # role -> (threads a CTA, max_rows, dynamic shared memory bytes or None to take
 # the record's) of the small-row backwards.
 SMALL_ROW_BACKWARDS = {
-    "bwd_bf16_short": (256, 3072, 6144),
     "bwd_bf16_t512": (512, 512, None),
     "bwd_bf16_t1024": (1024, 1024, None),
     "bwd_f32_t512": (512, 512, None),
@@ -1781,13 +1766,15 @@ SMALL_ROW_BACKWARDS = {
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
 def test_small_row_backwards_are_one_cluster(rows, sm_count):
     """Every small-row backward: one cluster of 16 CTAs whatever the rows and
-    the SMs, up to its ``max_rows``, no workspace and no chunks; the tiny
-    backward of 256-thread CTAs only for a BF16 weight gradient."""
+    the SMs, up to its ``max_rows``, no workspace and no chunks; no
+    architecture routes a short backward (``bwd_bf16_short`` or
+    ``bwd_f32_short``)."""
     for role, (threads, most, smem) in SMALL_ROW_BACKWARDS.items():
         name = loader.ROUTES["sm_100a"][role]
         for arch in ("sm_100a", "sm_103a", "sm_107a"):
             assert loader.ROUTES[arch][role] == name
             assert "bwd_f32_short" not in loader.ROUTES[arch]
+            assert "bwd_bf16_short" not in loader.ROUTES[arch]
         record = loader.MODULES[name]
         assert record["role"] == role
         assert record["grid_rule"] == {

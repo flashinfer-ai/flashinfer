@@ -71,7 +71,7 @@ backward of a BF16 weight gradient at 1 and 5 tokens (48 and 240 rows, the
 program of each one's band), which on SM100 and SM103 also starts beside it
 with the default and the maximum-L1 carveout.  On SM107 it does not start
 beside the side kernel with such a small carveout until that kernel exits
-(observed on R200 for the 256-thread tiny backward): there it must end at
+(observed on R200 for the small-row backwards): there it must end at
 most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the static
 backward at the same rows).
 
@@ -1087,9 +1087,10 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
     )
 
 
-# Architectures on which the short backward (6144 bytes a CTA) does not start
-# beside a side kernel holding every SM with a small carveout (the default or
-# the maximum-L1 one) until that kernel exits (observed on R200): there it
+# Architectures on which the small-row backward (the exact tiny backward,
+# 19584 bytes a CTA at 4 teams) does not start beside a side kernel holding
+# every SM with a small carveout (the default or the maximum-L1 one) until that
+# kernel exits (observed on R200): there it
 # must end at most MAX_ALL_SM_EXTRA_MS after the backward it replaces (the
 # static backward, 15616 bytes a CTA) beside it.
 SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)

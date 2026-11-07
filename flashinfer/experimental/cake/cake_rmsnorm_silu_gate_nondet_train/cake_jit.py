@@ -71,10 +71,7 @@ same bits) that sums the weight gradient on chip in a fixed order and rounds
 once, with no workspace: the exact tiny backward (``<role>_t512`` and
 ``<role>_t1024``: 4 or 8 teams of the deterministic backward's 128-thread CTA
 a CTA, up to 512 or 1024 rows, its weight gradient the deterministic pair's
-bits) and, for a BF16 weight gradient only, the tiny backward
-(``bwd_bf16_short``: CTAs of 256 threads, CTA ``r`` adding every CTA's FP32
-partial of its eight columns in rank order in FP64).  ``BACKWARD_BANDS``
-gives each its rows on each architecture.
+bits).  ``BACKWARD_BANDS`` gives each its rows on each architecture.
 
 Grids (:func:`launch_grid`): the forward and the short forward launch one
 CTA per block of ``rows_per_cta`` rows; the extra-long, long and mid forwards
@@ -594,80 +591,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_win": 3584,
         },
     },
-    # The short backward into a BF16 weight gradient (or none, with
-    # compute_grad_weight=False): one cluster of 16 CTAs of 256 threads, the
-    # backward's row arithmetic (16 lanes per row, the gate on packed FP32
-    # pairs), CTA r of the cluster finishing the weight-gradient columns 8r to
-    # 8r + 7 from every CTA's FP32 partials in rank order in FP64, no
-    # workspace (build {"cluster": 16, "out": "bf16", "threads": 256}), up to
-    # 3072 rows; BACKWARD_BANDS gives it its rows.
-    "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "x"],
-            ["buffer", "z"],
-            ["buffer", "w"],
-            ["buffer", "dx"],
-            ["buffer", "dz"],
-            ["buffer", "dw"],
-            ["parameter", "rows"],
-            ["parameter", "heads"],
-            ["parameter", "dy_tok"],
-            ["parameter", "dy_head"],
-            ["parameter", "x_tok"],
-            ["parameter", "x_head"],
-            ["parameter", "z_tok"],
-            ["parameter", "z_head"],
-            ["parameter", "eps"],
-            ["parameter", "accumulate"],
-            ["parameter", "weight_grad"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 16,
-            "kind": "cluster",
-            "max_rows": 3072,
-        },
-        "kernel": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
-        "launch": {
-            "block": (256, 1, 1),
-            "cluster": (16, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 6144,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
-        "logical": {
-            "accumulate": "accumulate",
-            "dw": "dw",
-            "dx": "dx",
-            "dy": "dy",
-            "dy_head": "dy_head",
-            "dy_tok": "dy_tok",
-            "dz": "dz",
-            "eps": "eps",
-            "heads": "heads",
-            "rows": "rows",
-            "w": "w",
-            "weight_grad": "weight_grad",
-            "x": "x",
-            "x_head": "x_head",
-            "x_tok": "x_tok",
-            "z": "z",
-            "z_head": "z_head",
-            "z_tok": "z_tok",
-        },
-        "role": "bwd_bf16_short",
-    },
     # The exact small-row backward into a BF16 weight gradient (or none, with
     # compute_grad_weight=False):
     # one cluster of 16 CTAs of 4 teams of the deterministic backward's
@@ -1148,7 +1071,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
-        "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_t1024": "cake_rmsnorm_silu_gate_train_770965c403d4b2946fba",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
@@ -1163,7 +1085,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
-        "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_t1024": "cake_rmsnorm_silu_gate_train_770965c403d4b2946fba",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
@@ -1178,7 +1099,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
-        "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_t1024": "cake_rmsnorm_silu_gate_train_770965c403d4b2946fba",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
@@ -1223,31 +1143,20 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
 # of ``rows`` rows runs the module of the first band's routed ``role`` with
 # ``rows <= last`` (``last`` at most the module's ``max_rows``), and past the
 # last band the static or the claimed backward.  The cuts are the measured
-# fastest program at each row count (CUPTI, cold L2): the exact tiny backward
-# of 4 teams (``_t512``) or 8 (``_t1024``) and, for a BF16 weight gradient
-# only, the tiny backward of 256-thread CTAs (``_short``).  Host plan only: a
-# new cut needs no new program.
+# fastest exact tiny backward at each row count (CUPTI, cold L2): 4 teams
+# (``_t512``) or 8 (``_t1024``).  Host plan only: a new cut needs no new
+# program.
 BACKWARD_BANDS: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
     "sm_100a": {
-        "bwd_bf16": (
-            (192, "bwd_bf16_t512"),
-            (256, "bwd_bf16_short"),
-            (512, "bwd_bf16_t512"),
-            (1024, "bwd_bf16_t1024"),
-        ),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (1024, "bwd_f32_t1024")),
     },
     "sm_103a": {
-        "bwd_bf16": ((512, "bwd_bf16_short"), (620, "bwd_bf16_t1024")),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (620, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (720, "bwd_f32_t1024")),
     },
     "sm_107a": {
-        "bwd_bf16": (
-            (120, "bwd_bf16_t512"),
-            (256, "bwd_bf16_short"),
-            (512, "bwd_bf16_t512"),
-            (1024, "bwd_bf16_t1024"),
-        ),
+        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
         "bwd_f32": ((512, "bwd_f32_t512"), (900, "bwd_f32_t1024")),
     },
 }
@@ -1268,7 +1177,6 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
 # The backward's small-row roles, which ``BACKWARD_BANDS`` routes by the rows.
 BAND_ROLES = (
-    "bwd_bf16_short",
     "bwd_bf16_t512",
     "bwd_bf16_t1024",
     "bwd_f32_t512",
