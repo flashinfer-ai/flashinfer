@@ -51,7 +51,9 @@ def measure_samples(trial, weights, repeats, settings, process_group):
     from flashinfer.autotuner.autotuner import (
         _CuptiInfraError,
         _cupti_measure_spans,
+        _flush_l2,
         _load_cupti,
+        _make_l2_flush_buffer,
         _profile_measurement_scope,
     )
     from flashinfer.tllm_utils import delay_kernel
@@ -99,16 +101,15 @@ def measure_samples(trial, weights, repeats, settings, process_group):
             torch.cuda.synchronize()
         run = graph.replay if graph is not None else launch
         if settings["cold_l2"]:
-            flush = torch.empty(
+            flush = _make_l2_flush_buffer(
                 2 * tuner._get_l2_cache_size_in_bytes(trial.device.index),
-                dtype=torch.uint8,
-                device=trial.device,
+                trial.device,
             )
 
         def prologue():
             barrier()
             if flush is not None:
-                flush.zero_()
+                _flush_l2(flush)
 
         def check_ready(error):
             errors = gather(error)
