@@ -33,10 +33,15 @@ xqa_nvcc_flags = [
 ]
 
 
+# Row budget of the SM90 kernel's SPEC_Q_SEQ_LEN (SWAP_AB) specialization; see
+# the ``specDecQLen * headGrpSize <= 32`` static_assert in csrc/xqa/mha_sm90.cu.
+SWAP_AB_MAX_Q_ROWS = 32
+
+
 def swap_ab_eligible(q_seq_len: int, head_group_ratio: int) -> bool:
     """True when the shape fits the SM90 kernel's SPEC_Q_SEQ_LEN (SWAP_AB)
     specialization."""
-    return q_seq_len * head_group_ratio <= 32
+    return q_seq_len * head_group_ratio <= SWAP_AB_MAX_Q_ROWS
 
 
 @functools.cache
@@ -48,6 +53,62 @@ def ragged_q_changes_build(q_seq_len: int, head_group_ratio: int) -> bool:
     """True when ragged Q changes the build: it suppresses SPEC_Q_SEQ_LEN
     (SWAP_AB), which only the SM90 kernel uses."""
     return swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
+
+
+# Name component for a spec-dec module that carries no SPEC_Q_SEQ_LEN
+# specialization. The draft length is a runtime argument there, so one module
+# serves every length and the name must not claim a specialization.
+SPEC_Q_SEQ_LEN_GENERIC = 0
+
+
+def spec_dec_build_q_seq_len(
+    q_seq_len: int, head_group_ratio: int, use_ragged_q: bool = False
+) -> int:
+    """The part of ``q_seq_len`` that changes the build.
+
+    ``SPEC_Q_SEQ_LEN`` (SWAP_AB) is the only compile-time use of the draft
+    length, and ``csrc/xqa/mha_sm90.cu`` is its only consumer. Where that
+    specialization is not compiled in, the draft length reaches the kernel as a
+    runtime argument and one module serves every length, so modules must not be
+    keyed by it: those builds all report ``SPEC_Q_SEQ_LEN_GENERIC``.
+    """
+    if q_seq_len <= 1:
+        return q_seq_len
+    if use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio):
+        return SPEC_Q_SEQ_LEN_GENERIC
+    if swap_ab_eligible(q_seq_len, head_group_ratio):
+        return q_seq_len
+    return SPEC_Q_SEQ_LEN_GENERIC
+
+
+def generic_spec_dec_q_seq_len(head_group_ratio: int) -> int:
+    """A draft length that always takes the generic (non-SWAP_AB) spec-dec build
+    for ``head_group_ratio``: the first length past ``swap_ab_eligible``.
+
+    Clamped to 2 so the result still selects a spec-dec build when the group
+    ratio alone exceeds the SWAP_AB row budget and no length is eligible.
+    """
+    return max(2, SWAP_AB_MAX_Q_ROWS // head_group_ratio + 1)
+
+
+def xqa_module_key(
+    q_seq_len: int, head_group_ratio: int, use_ragged_q: bool
+) -> tuple[int, bool]:
+    """Canonical ``(q_seq_len, use_ragged_q)`` for module identity.
+
+    Both only change the build through the SPEC_Q_SEQ_LEN (SWAP_AB)
+    specialization, so every request that does not compile it in shares one
+    module and must map to one key: a second key would build an identical
+    module under a second name and re-register the same torch op.
+    """
+    use_ragged_q = use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio)
+    if (
+        q_seq_len > 1
+        and spec_dec_build_q_seq_len(q_seq_len, head_group_ratio, use_ragged_q)
+        == SPEC_Q_SEQ_LEN_GENERIC
+    ):
+        return generic_spec_dec_q_seq_len(head_group_ratio), False
+    return q_seq_len, use_ragged_q
 
 
 def gen_xqa_module(
@@ -158,11 +219,16 @@ def gen_xqa_module(
     else:
         flag_sm90_mha = ["-DUSE_SM90_MHA=0"]
 
-    # Suffix the URI only when ragged Q actually changes the compile flags
-    # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
-    ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
+    # Name by the draft length that reaches nvcc, not the requested one. Where
+    # the SPEC_Q_SEQ_LEN specialization is not compiled in -- because the shape
+    # is not SWAP_AB-eligible, or because ragged Q suppressed it -- every length
+    # compiles the same module, so they must all answer to one name. This also
+    # subsumes the old "_ragged_q" suffix: ragged Q only ever differed from a
+    # uniform request by suppressing that specialization, which the name now
+    # states directly.
+    name_q_seq_len = spec_dec_build_q_seq_len(q_seq_len, head_group_ratio, use_ragged_q)
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{name_q_seq_len}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
