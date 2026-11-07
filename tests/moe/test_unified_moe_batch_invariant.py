@@ -1110,3 +1110,55 @@ def test_combine_and_gather_warp_placements_keep_the_bits():
             assert torch.equal(bits(xps[0]), bits(x[(src // k).long()])), (fmt, T)
             assert all(torch.equal(bits(xps[0]), bits(xp)) for xp in xps[1:]), (fmt, T)
             assert warps_per_row(Tk, H // (16 // x.element_size()), sms) in (1, 2, 4, 8)
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "T,k,E,method",
+    [
+        (1, 8, 128, "softmax_renorm"),
+        (7, 4, 8, "softmax_renorm"),
+        (16, 16, 1024, "softmax_renorm"),
+        (13, 8, 128, "sigmoid_bias_renorm_scaled"),
+        (0, 8, 128, "softmax_renorm"),
+    ],
+)
+def test_route_plan_equals_route_and_plan(T, k, E, method):
+    """``api.route_plan`` (the routing and the permutation plan in one launch for small token counts) gives the route kernel's
+    bits and the plan's integers: experts, weights, counts, dest and src equal those of ``route`` followed by ``permute_plan``."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    meth = (
+        S.SOFTMAX_RENORM if method == "softmax_renorm" else S.SIGMOID_BIAS_RENORM_SCALED
+    )
+    g = torch.Generator().manual_seed(T * 7 + E)
+    logits = (torch.randn(max(T, 1), E, generator=g) * 2).float()[:T].cuda()
+    bias = (torch.randn(E, generator=g) * 0.1).float().cuda() if meth.bias else None
+    scale = 2.5 if meth.scaled else None
+    ex, w = api.route(logits, k, meth, bias, scale)
+    counts, dest, src = api.permute_plan(ex, E)
+    ex2, w2, counts2, dest2, src2 = api.route_plan(logits, k, meth, bias, scale)
+    torch.cuda.synchronize()
+    assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2))
+    assert (
+        torch.equal(counts, counts2)
+        and torch.equal(dest, dest2)
+        and torch.equal(src, src2)
+    )
+
+
+@needs_device
+def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
+    """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
+    (the same ids and weights from ``route``) bit for bit."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)[:4]
+    layer, W = _layer(k, E, I), _weights(w1, w2)
+    out = layer(_logits_pack(x, logits), W)
+    ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+    out2 = layer(_routed_pack(x, ids, wts), W)
+    assert torch.equal(bits(out), bits(out2))

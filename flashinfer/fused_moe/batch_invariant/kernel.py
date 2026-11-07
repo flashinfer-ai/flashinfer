@@ -29,6 +29,7 @@ from .permute import (  # noqa: F401
     get_compiled_positions,
 )
 from .route import get_compiled_route  # noqa: F401
+from .route_plan import get_compiled_route_plan  # noqa: F401
 
 
 def _device(device: Optional[torch.device]) -> torch.device:
