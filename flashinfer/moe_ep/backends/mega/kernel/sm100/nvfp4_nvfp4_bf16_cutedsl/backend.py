@@ -75,6 +75,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
+        self._gin_device: int | None = None
+        self.requires_collective_forward_validation = config.internode
+        self.supports_live_token_tuning = not config.internode
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}
         # knobs="auto": tune at the first compute() (weights + staged inputs
@@ -98,9 +101,88 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
+        if self._kernel_config.internode:
+            from ......core.runtime.bootstrap import TORCH_DIST
+
+            return frozenset({TORCH_DIST})
         return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
     def validate_init(
+        self, bootstrap: BootstrapConfig, fleet_params: FleetParams
+    ) -> None:
+        if not self._kernel_config.internode:
+            return self._validate_init_local(bootstrap, fleet_params)
+        import torch.distributed as dist
+        from ......kernel_src.sm100.cutedsl_megamoe import collective_gin_preflight
+
+        k = self._kernel_config
+        self._gin_fleet_params = fleet_params
+        error = None
+        try:
+            self._validate_init_local(bootstrap, fleet_params)
+            self._gin_device = torch.cuda.current_device()
+            if (
+                k.activation != "swiglu"
+                or k.swiglu_alpha is not None
+                or k.swiglu_beta is not None
+                or k.gate_up_clamp is not None
+                or k.activation_clamp is not None
+                or k.situ_beta is not None
+                or k.situ_linear_beta is not None
+                or k.enable_in_kernel_fc2_reduce
+                or k.combine_dtype != "bf16"
+                or k.enable_fc1_activation_per_token_scale
+                or any(
+                    value is not None
+                    for value in (k.fc1_alpha, k.fc2_alpha, k.fc1_norm_const)
+                )
+                or not k.apply_routing_weights_before_fc2
+                or (
+                    bootstrap.world_size,
+                    k.ranks_per_node,
+                    fleet_params.max_tokens_per_rank,
+                    fleet_params.token_hidden_size,
+                    k.intermediate_size,
+                    fleet_params.num_experts,
+                    k.top_k,
+                )
+                != (4, 2, 32, 7168, 1536, 48, 4)
+            ):
+                raise ValueError(
+                    "GIN v1 requires the qualified N2R2 NVFP4/BF16 standard-SwiGLU case; no activation/scale/combine overrides."
+                )
+            if (
+                k.knobs is not None
+                or k.finalize_mode not in (FinalizeMode.AUTO, FinalizeMode.DEFAULT)
+                or k.num_valid_tokens_tensor is not None
+                or k.mma_tiler_mnk is not None
+                or k.cluster_shape_mn is not None
+                or k.schedule_policy is not None
+                or k.input_norm_const != 1.0
+                or not k.fast_math
+            ):
+                raise ValueError(
+                    "GIN v1 does not support tuning/custom finalize/shape or math overrides."
+                )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        collective_gin_preflight(
+            dist,
+            phase="backend-init",
+            signature=(
+                bootstrap.world_size,
+                k.ranks_per_node,
+                fleet_params.max_tokens_per_rank,
+                fleet_params.token_hidden_size,
+                k.intermediate_size,
+                fleet_params.num_experts,
+                k.top_k,
+            ),
+            local_error=error,
+            requested_group=bootstrap.process_group,
+        )
+
+    def _validate_init_local(
         self,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
@@ -208,7 +290,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             enable_fc1_activation_per_token_scale=(
                 k.enable_fc1_activation_per_token_scale
             ),
-            knobs=self._workspace_knobs(fleet_params),
+            knobs=None if k.internode else self._workspace_knobs(fleet_params),
+            internode=k.internode,
+            ranks_per_node=k.ranks_per_node,
+            process_group=self._ep_bootstrap.process_group,
         )
         if mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
@@ -225,6 +310,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
     def _finalize_mode(self, fleet_params: FleetParams) -> FinalizeMode:
         k = self._kernel_config
+        if k.internode:
+            return FinalizeMode.DEFAULT
         if k.finalize_mode is not FinalizeMode.AUTO:
             return k.finalize_mode
         if self._cake_reducer_supported(fleet_params):
@@ -240,12 +327,114 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return _cake_reducer_supported(self._kernel_config, fleet_params)
 
     def validate_forward(
+        self, t: "MoEEpTensors", fleet_params: FleetParams, *, quantize_input: bool
+    ) -> None:
+        if not self._kernel_config.internode:
+            return self._validate_forward_local(
+                t, fleet_params, quantize_input=quantize_input
+            )
+        self.validate_collective_forward(
+            t, fleet_params, quantize_input=quantize_input, compile_tokens_per_rank=None
+        )
+
+    def validate_collective_forward(
         self,
         t: "MoEEpTensors",
         fleet_params: FleetParams,
         *,
         quantize_input: bool,
+        compile_tokens_per_rank: int | None,
     ) -> None:
+        capturing = torch.cuda.is_current_stream_capturing()
+        import torch.distributed as dist
+        from ......kernel_src.sm100.cutedsl_megamoe import collective_gin_preflight
+
+        error = None
+        try:
+            if (
+                compile_tokens_per_rank is not None
+                and compile_tokens_per_rank < t.num_tokens
+            ):
+                raise ValueError(
+                    "compile_tokens_per_rank cannot be smaller than the live token count"
+                )
+            if compile_tokens_per_rank is not None:
+                raise ValueError(
+                    "GIN does not support compile token buckets; use the default "
+                    "fixed workspace capacity (compile_tokens_per_rank=None)."
+                )
+            if capturing and not self._thunk_states:
+                raise ValueError(
+                    "GIN capture requires warmup on all ranks before capture."
+                )
+            self._validate_forward_local(
+                t,
+                fleet_params,
+                quantize_input=quantize_input,
+                check_route_values=not capturing,
+            )
+            if t.num_tokens > fleet_params.max_tokens_per_rank:
+                raise ValueError("GIN live token count exceeds capacity.")
+            if t.output is not None and (
+                t.output.dtype != torch.bfloat16
+                or t.output.device != t.hidden_states.device
+                or t.output.ndim != 2
+                or t.output.shape[0] < t.num_tokens
+                or t.output.shape[1] != fleet_params.token_hidden_size
+            ):
+                raise ValueError("GIN caller output shape, dtype or device is invalid.")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        collective_gin_preflight(
+            dist,
+            phase="backend-forward",
+            # Mixed eager/capture would launch on only the eager ranks.
+            # CPU agreement runs during capture, never during graph replay.
+            signature=("nvfp4-gin-v1", capturing, compile_tokens_per_rank),
+            local_error=error,
+        )
+
+    def _validate_forward_local(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: FleetParams,
+        *,
+        quantize_input: bool,
+        check_route_values: bool = True,
+    ) -> None:
+        if self._kernel_config.internode:
+            if any(
+                value is not None
+                for value in (t.fc1_alpha, t.fc2_alpha, t.fc1_norm_const)
+            ):
+                raise ValueError(
+                    "GIN runtime epilogue-scale overrides are not qualified."
+                )
+            expected_dtype = (
+                torch.bfloat16 if quantize_input else torch.float4_e2m1fn_x2
+            )
+            if t.hidden_states.dtype != expected_dtype:
+                raise ValueError(f"GIN hidden_states must have dtype {expected_dtype}.")
+            if t.topk_ids.dtype not in (torch.int32, torch.int64):
+                raise ValueError("GIN route IDs must be int32 or int64.")
+            if t.topk_weights.dtype != torch.float32:
+                raise ValueError("GIN route weights must be FP32.")
+            tensors = [t.hidden_states, t.topk_ids, t.topk_weights]
+            if not quantize_input and t.scales is not None:
+                if t.scales.dtype != torch.float8_e4m3fn:
+                    raise ValueError("GIN activation SF must be float8_e4m3fn.")
+                tensors.append(t.scales)
+            current_device = torch.cuda.current_device()
+            if current_device != self._gin_device:
+                raise ValueError("GIN inputs must use the session's bound CUDA device.")
+            device = torch.device("cuda", current_device)
+            if any(
+                tensor.device != device or not tensor.is_contiguous()
+                for tensor in tensors
+            ):
+                raise ValueError(
+                    "GIN inputs must be contiguous on the bound CUDA device."
+                )
         validate_nvfp4_forward_inputs(
             t.hidden_states,
             t.topk_ids,
@@ -260,6 +449,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens=t.hidden_states.shape[0],
             enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
         )
+        if self._kernel_config.internode and check_route_values:
+            ids = t.topk_ids
+            if torch.any((ids < -1) | (ids >= fleet_params.num_experts)).item():
+                raise ValueError(
+                    "GIN route IDs must be -1 or a valid global expert ID."
+                )
 
     def stage_inputs(
         self,
@@ -269,7 +464,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         quantize_input: bool,
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
-        # The layer runs validate_forward() only for the first forward of a
+        # GIN validates eagerly on every public call; capture checks metadata
+        # only and requires valid route values on every replay. Other backends
+        # run validate_forward() only for the first forward of a
         # workspace (later forwards are gated on a stable input signature that
         # does not cover this optional tensor).  Presence and metadata of the
         # per-token scale are per-forward facts -- a forward that omits it
@@ -358,6 +555,14 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         transformed_weights: TransformedMegaWeights,
     ) -> None:
         frontend = workspace._frontend
+        if frontend.config.internode:
+            error = None
+            try:
+                self._prepared_thunk_state(workspace, transformed_weights)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            frontend._gin_agree(error, "capture-ready")
+            return
         mega = frontend._mega
         if mega is None or mega.compiled is None:
             raise RuntimeError(
@@ -414,7 +619,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
-        stream = torch.cuda.current_stream().cuda_stream
+        # GIN preparation is collective. A stream change on only one rank
+        # must not create a local cache miss and a different collective order.
+        # Its session thunk binds the current stream at execution/capture.
+        stream = (
+            None if fe.config.internode else torch.cuda.current_stream().cuda_stream
+        )
         weight_identity = tuple(
             id(tensor) for transformed in transformed_weights for tensor in transformed
         )
@@ -426,6 +636,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         state = self._thunk_states.get(key)
         if state is None or key[2] is None:
+            if fe.config.internode and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GIN capture requires a prepared launch; call layer.warmup() "
+                    "with this workspace and weights before capture."
+                )
             # A pooled frontend can be recompiled by another layer. Release
             # thunks retaining the old compiled session and its freed scratch.
             self._thunk_states = {
@@ -493,8 +708,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self._autotune_pending = False
         # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
         # the clamp, and rebuilds the 12-field inputs bundle on every call.
-        # Build once per (workspace, weights, compiled-session, STREAM) and
-        # reuse. The stream is part of the key because the thunk's launch
+        # Build once per workspace, weights and compiled session. Off thunks
+        # also key on STREAM because their launch
         # kwargs bind it at build time — a graph capture runs on a capture
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/activation change nulls the compiled session,
@@ -558,6 +773,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         k = self._kernel_config
+        if k.internode:
+            return None
         if k.knobs == "auto":
             # Autotune retunes (and recompiles) the workspace's shared
             # frontend at first compute; give each session its own buffer.

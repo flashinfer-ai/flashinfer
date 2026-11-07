@@ -5,14 +5,17 @@
 # dialect, so fall back to no-op markers when the import is unavailable.
 try:
     from cutlass.cute.experimental import iket  # Latest tot DKG.
-except (ImportError, NotImplementedError):  # pragma: no cover -- fallback for wheels without cute.iket
+    iket_available = True
+except (ImportError, NotImplementedError):  # pragma: no cover
     # ``cute.experimental`` raises NotImplementedError (NOT ImportError) on
     # CUDA toolkits < 13.1, so the public-release / CTK-12.9 CI wheels land
     # here; catch both so the no-op shim below actually takes over instead
     # of propagating up through ``epilogue.py``'s ImportError-only guard.
     try:
         from cutlass.cute import iket  # type: ignore
+        iket_available = True
     except (ImportError, NotImplementedError):
+        iket_available = False
         import warnings
 
         warnings.warn(

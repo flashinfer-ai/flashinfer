@@ -115,6 +115,68 @@ replace its own device snapshot.
   kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
   next re-sync.
 
+## Targeted legacy NVFP4 GIN migration
+
+The original snapshot SHA and all existing pending patches above remain the
+baseline. This is a partial MR !100 import, not a snapshot update:
+
+- MR base: `41a45039cf81c150f969907dffdd0ba2f10661ca`.
+- Donor: `bc461f87c7b8fdee98fe3655fd2b77fd7819b1e6`, identical tree to merge
+  `f863d7540614bd546a42867c21adbf51d573061a`.
+- Targeted device dependency port: shared `token_comm`, `ptx_helpers`,
+  `grid_sync`, `iket_compat`; new `lsa_peer_mapper`, `megamoe_config`,
+  `token_segments`, `nccl_gin_layout`, common `direct_meta`/`pipeline_timing`;
+  legacy NVFP4 `custom_ext`, `epilogue_refactor`, `fc1_fc2_fuse_sched`,
+  `kernel_fc12`, `megamoe_kernel`, `moe_utils`, `topk_reduce`.
+- The GIN layout module is byte-identical to the fixed donor. Other files
+  are selectively merged to retain FI sparse decode, masked/static/persistent
+  reduction, custom activation, per-token scale and singleton-TMA behavior.
+  Existing FI `inputs_process`, runners and BF16/MXFP8 kernels are retained.
+- Host adaptation lives in `shim/gin.py`, `shim/gin_debug.py` and the NVFP4
+  shim/backend. The core accesses only the package exports and a generic
+  collective-forward-validation capability; it never imports raw sources.
+- **Pending-upstream correctness diff, token-back generation:** GIN deferral
+  now waits for `internode_barrier_counter+1`, rather than sampling
+  `combine_issue_counter+1`. A fast relay producer can increment the latter
+  before a slow consumer samples it, causing a wait for the next launch and
+  circular tail deadlock. Job 3576773 localized that guard after nine exact
+  matrix iterations. The rail generation advances after token-back retirement,
+  giving a stable current-launch target. Validation is tracked in the audit.
+- The internode constructor rejects relay without NCCL GIN before lowering.
+  The imported, unused explicit FP4 manual-decoder option and its `_f4man`
+  name token are omitted; FI's pre-existing environment-controlled non-GIN
+  FP4 decode branch remains unchanged. These are local subset adaptations,
+  not additional non-GIN features.
+- Optional `FLASHINFER_GIN_GUARD_DIAGNOSTICS=1` prints fixed source-site tags
+  before device guards trap; it is disabled by default. No support check is
+  bypassed. The old shared `nvlink_barrier` keyword defaults remain available
+  for FI graph probes; GIN callers pass explicit local rank/thread counts.
+- Internode mode is experimental and default-off. The fixed N2R2 geometry
+  passes strong protocol/math/byte/relaunch/public-lifetime qualification
+  (final jobs 3576874/3576878, exit 0). Additional geometries remain disabled.
+  Subsequent GB200 qualification passes 40 strong/public tests per rank,
+  21 NCCL-only checks and 10 off finalizer/cache/graph checks. Additional queued
+  replay tests cover the public layer, split staging/compute and prepared
+  launch helpers. Initialization stays outside capture; GPU pointers/resources
+  remain live through replay. Graph replay performs no Python/Gloo preflight.
+  Capture initialization and compile-bucket errors reject collectively; local
+  post-session allocation failures coordinate cleanup before any workspace
+  escapes. Cleanup failure is job-fatal. See jobs 3595270/3595271 in the design
+  record; default-off isolation (including ignored GIN topology) and both
+  legacy FP4 environment decoder branches are verified.
+  All 24 off performance gates
+  pass against legacy F_BASE. Internode public host overhead is reduced; raw
+  native-donor comparisons remain inconclusive due to baseline dispersion.
+  See the [PR design](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
+  for exact scopes; no universal speedup is claimed.
+
+The recovered original vendor object is available in the receiving checkout.
+It is not an ancestor of MR !100. See the
+[design and validation record](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
+for the fixed sources, implementation, supported scope and validation results.
+Detailed source audits and experiment artifacts are retained in the separate
+investigation archive rather than checked into this package.
+
 ## Related trees
 
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` is a **separate snapshot**

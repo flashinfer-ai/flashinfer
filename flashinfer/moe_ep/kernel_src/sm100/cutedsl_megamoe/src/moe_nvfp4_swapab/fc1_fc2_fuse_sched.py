@@ -18,6 +18,7 @@ from cutlass.cutlass_dsl import (
     dsl_user_op,
 )
 from cutlass._mlir import ir
+from src.token_segments import merged_token_segment, scheduled_token_segments
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
@@ -98,6 +99,9 @@ class _FusedFc12SchedState:
         current_expert_tile_end: Int32,
         current_group_fc1_subphase_end: Int32,
         current_group_end: Int32,
+        current_segment: Int32,
+        current_group_sub1_end: Int32,
+        current_group_sub2_end: Int32,
         cumulative_fc1_tiles_at_group_end: Int32,
         cumulative_fc2_tiles_at_group_end: Int32,
         # Physical-row / token-block running cumulatives.  Each invariant is
@@ -135,6 +139,9 @@ class _FusedFc12SchedState:
         self.current_expert_tile_end = current_expert_tile_end
         self.current_group_fc1_subphase_end = current_group_fc1_subphase_end
         self.current_group_end = current_group_end
+        self.current_segment = current_segment
+        self.current_group_sub1_end = current_group_sub1_end
+        self.current_group_sub2_end = current_group_sub2_end
         self.cumulative_fc1_tiles_at_group_end = cumulative_fc1_tiles_at_group_end
         self.cumulative_fc2_tiles_at_group_end = cumulative_fc2_tiles_at_group_end
         self.current_data_cumul = current_data_cumul
@@ -159,6 +166,9 @@ class _FusedFc12SchedState:
         values.extend(extract_mlir_values(self.current_expert_tile_end))
         values.extend(extract_mlir_values(self.current_group_fc1_subphase_end))
         values.extend(extract_mlir_values(self.current_group_end))
+        values.extend(extract_mlir_values(self.current_segment))
+        values.extend(extract_mlir_values(self.current_group_sub1_end))
+        values.extend(extract_mlir_values(self.current_group_sub2_end))
         values.extend(extract_mlir_values(self.cumulative_fc1_tiles_at_group_end))
         values.extend(extract_mlir_values(self.cumulative_fc2_tiles_at_group_end))
         values.extend(extract_mlir_values(self.current_data_cumul))
@@ -193,6 +203,9 @@ class _FusedFc12SchedState:
             current_expert_tile_end=_take(self.current_expert_tile_end),
             current_group_fc1_subphase_end=_take(self.current_group_fc1_subphase_end),
             current_group_end=_take(self.current_group_end),
+            current_segment=_take(self.current_segment),
+            current_group_sub1_end=_take(self.current_group_sub1_end),
+            current_group_sub2_end=_take(self.current_group_sub2_end),
             cumulative_fc1_tiles_at_group_end=_take(self.cumulative_fc1_tiles_at_group_end),
             cumulative_fc2_tiles_at_group_end=_take(self.cumulative_fc2_tiles_at_group_end),
             current_data_cumul=_take(self.current_data_cumul),
@@ -301,7 +314,20 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # serialization is type-discriminated below.
         expert_token_sizes: Optional[cute.Tensor] = None,
         expert_token_prefix_sum: Optional[cute.Tensor] = None,
+        expert_pool_base: Optional[cute.Tensor] = None,
+        expert_sf_pool_base: Optional[cute.Tensor] = None,
+        intra_token_sizes: Optional[cute.Tensor] = None,
+        relay_pool_base: Optional[cute.Tensor] = None,
+        relay_sf_pool_base: Optional[cute.Tensor] = None,
+        segment_major: bool = False,
+        segment_fc1_first: bool = False,
         tail_split_pairs: bool = False,
+        # Within one expert, iterate the token blocks fastest (default: the
+        # weight blocks fastest).  Token-fast keeps all token blocks of an
+        # expert on the same weight tile at the same time, so a weight tile is
+        # read from DRAM once even when the expert's weights exceed L2.
+        fc1_token_fast: bool = False,
+        fc2_token_fast: bool = False,
     ):
         """Create fused fc12 scheduler params.
 
@@ -359,9 +385,66 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
                 f"and 1 along the weight axis, got cluster_shape_mn={tuple(self.cluster_shape_mn)}"
             )
         self.tail_split_pairs = bool(tail_split_pairs)
+        if self.tail_split_pairs and (
+            intra_token_sizes is not None or segment_major
+        ):
+            raise ValueError(
+                "tail_split_pairs cannot be combined with the intra/relay "
+                "token-segment layout (intra_token_sizes / segment_major): the "
+                "tail-split tile arithmetic assumes one token segment per expert"
+            )
+        if tail_split_pairs and (fc1_token_fast or fc2_token_fast):
+            raise ValueError("token-fast tile order is not combined with tail_split_pairs")
+        self.fc1_token_fast = bool(fc1_token_fast)
+        self.fc2_token_fast = bool(fc2_token_fast)
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
+        if (expert_pool_base is None) != (expert_sf_pool_base is None):
+            raise ValueError(
+                "expert_pool_base and expert_sf_pool_base must be provided together"
+            )
+        self.expert_pool_base = expert_pool_base
+        self.expert_sf_pool_base = expert_sf_pool_base
+        relay_segment_fields = (
+            intra_token_sizes,
+            relay_pool_base,
+            relay_sf_pool_base,
+        )
+        relay_segment_count = sum(v is not None for v in relay_segment_fields)
+        if relay_segment_count not in (0, len(relay_segment_fields)):
+            raise ValueError(
+                "intra_token_sizes, relay_pool_base, and relay_sf_pool_base "
+                "must be provided together"
+            )
+        if relay_segment_count and expert_pool_base is None:
+            raise ValueError(
+                "two-segment scheduling requires expert_pool_base and "
+                "expert_sf_pool_base"
+            )
+        self.intra_token_sizes = intra_token_sizes
+        self.relay_pool_base = relay_pool_base
+        self.relay_sf_pool_base = relay_sf_pool_base
+        if segment_major and intra_token_sizes is None:
+            raise ValueError(
+                "segment_major requires the two-segment relay layout "
+                "(intra_token_sizes, relay_pool_base, relay_sf_pool_base)"
+            )
+        # Segment-major order emits, per group, all intranode FC1 tiles, then
+        # all intranode FC2 tiles, then relay FC1, then relay FC2, so FC2 work
+        # on NVLink-delivered tokens no longer waits behind relay arrival in
+        # each cluster's static stride. Tile identities and counter indices
+        # are unchanged (Invariant I7); only the emission order differs.
+        self.segment_major = segment_major
+        # FC1-first segment order: (FC1, intra) -> (FC1, relay) -> (FC2, intra)
+        # -> (FC2, relay). Relay FC1 tiles start as soon as the intranode FC1
+        # tiles are exhausted, instead of after every intranode FC2 tile, so
+        # the relay FC1 critical path begins earlier and no FC2 tile is
+        # claimed while its FC1 block is still in flight. Only the emission
+        # order changes (Invariant I7); readiness spins stay as they are.
+        if segment_fc1_first and not segment_major:
+            raise ValueError("segment_fc1_first requires segment_major")
+        self.segment_fc1_first = segment_fc1_first
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -408,6 +491,13 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             values.extend(extract_mlir_values(self.expert_token_sizes))
         else:
             values.extend(extract_mlir_values(self.expert_token_prefix_sum))
+        if self.expert_pool_base is not None:
+            values.extend(extract_mlir_values(self.expert_pool_base))
+            values.extend(extract_mlir_values(self.expert_sf_pool_base))
+        if self.intra_token_sizes is not None:
+            values.extend(extract_mlir_values(self.intra_token_sizes))
+            values.extend(extract_mlir_values(self.relay_pool_base))
+            values.extend(extract_mlir_values(self.relay_sf_pool_base))
         return values
 
     def __new_from_mlir_values__(
@@ -426,7 +516,11 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.token_padding_block = self.token_padding_block
         result.sf_padding_block = self.sf_padding_block
         result.load_balance_mode = self.load_balance_mode
+        result.segment_major = self.segment_major
+        result.segment_fc1_first = self.segment_fc1_first
         result.tail_split_pairs = self.tail_split_pairs
+        result.fc1_token_fast = self.fc1_token_fast
+        result.fc2_token_fast = self.fc2_token_fast
 
         # Type-discriminated rebind: Python int fields copy from
         # prototype (``self``), Int32 fields consume from ``values``.
@@ -474,6 +568,40 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             )
             idx += t_len
             result.expert_token_sizes = None
+        if self.expert_pool_base is not None:
+            t_len = len(extract_mlir_values(self.expert_pool_base))
+            result.expert_pool_base = new_from_mlir_values(
+                self.expert_pool_base, values[idx : idx + t_len]
+            )
+            idx += t_len
+            t_len = len(extract_mlir_values(self.expert_sf_pool_base))
+            result.expert_sf_pool_base = new_from_mlir_values(
+                self.expert_sf_pool_base, values[idx : idx + t_len]
+            )
+            idx += t_len
+        else:
+            result.expert_pool_base = None
+            result.expert_sf_pool_base = None
+        if self.intra_token_sizes is not None:
+            t_len = len(extract_mlir_values(self.intra_token_sizes))
+            result.intra_token_sizes = new_from_mlir_values(
+                self.intra_token_sizes, values[idx : idx + t_len]
+            )
+            idx += t_len
+            t_len = len(extract_mlir_values(self.relay_pool_base))
+            result.relay_pool_base = new_from_mlir_values(
+                self.relay_pool_base, values[idx : idx + t_len]
+            )
+            idx += t_len
+            t_len = len(extract_mlir_values(self.relay_sf_pool_base))
+            result.relay_sf_pool_base = new_from_mlir_values(
+                self.relay_sf_pool_base, values[idx : idx + t_len]
+            )
+            idx += t_len
+        else:
+            result.intra_token_sizes = None
+            result.relay_pool_base = None
+            result.relay_sf_pool_base = None
         assert idx == len(values), (
             f"Fused fc12 sched params type-discrim mismatch: idx={idx} "
             f"len(values)={len(values)}"
@@ -659,6 +787,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             current_expert_tile_end=Int32(0),
             current_group_fc1_subphase_end=Int32(0),
             current_group_end=Int32(0),
+            current_segment=Int32(0),
+            current_group_sub1_end=Int32(0),
+            current_group_sub2_end=Int32(0),
             cumulative_fc1_tiles_at_group_end=Int32(0),
             cumulative_fc2_tiles_at_group_end=Int32(0),
             current_data_cumul=Int32(0),
@@ -1048,30 +1179,88 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             )
             state.current_token_offset = token_offset
         state.current_this_expert_token_cnt = this_expert_token_cnt
+        if cutlass.const_expr(self.params.expert_pool_base is not None):
+            state.current_data_cumul = Int32(
+                self.params.expert_pool_base[state.current_expert_idx]
+            )
+            state.current_sf_cumul = Int32(
+                self.params.expert_sf_pool_base[state.current_expert_idx]
+            )
         state.current_token_block_count = (
             this_expert_token_cnt + Int32(cluster_tile_m) - 1
         ) // Int32(cluster_tile_m)
+        if cutlass.const_expr(self.params.intra_token_sizes is not None):
+            intra_count = Int32(
+                self.params.intra_token_sizes[state.current_expert_idx]
+            )
+            relay_count = cutlass.max(
+                this_expert_token_cnt - intra_count, Int32(0)
+            )
+            intra_count, relay_count = scheduled_token_segments(
+                intra_count, relay_count, cluster_tile_m,
+            )
+            state.current_token_block_count = (
+                (intra_count + Int32(cluster_tile_m) - 1)
+                // Int32(cluster_tile_m)
+                + (relay_count + Int32(cluster_tile_m) - 1)
+                // Int32(cluster_tile_m)
+            )
 
         # --- Step 3: slide expert_tile_start / expert_tile_end.
         state.current_expert_tile_start = state.current_expert_tile_end
         # Prebind due to DSL AST.
         tiles_in_expert = Int32(0)
+        segment_block_count = state.current_token_block_count
+        if cutlass.const_expr(self.params.segment_major):
+            # Segment-major order walks the group's experts once per
+            # (phase, segment) sub-phase, so an expert contributes only the
+            # current segment's token blocks here. The counter index space
+            # still uses the total (intra + relay) block count above.
+            sm_intra_count = Int32(
+                self.params.intra_token_sizes[state.current_expert_idx]
+            )
+            sm_relay_count = cutlass.max(
+                this_expert_token_cnt - sm_intra_count, Int32(0)
+            )
+            sm_intra_count, sm_relay_count = scheduled_token_segments(
+                sm_intra_count, sm_relay_count, cluster_tile_m,
+            )
+            sm_intra_blocks = (
+                sm_intra_count + Int32(cluster_tile_m) - 1
+            ) // Int32(cluster_tile_m)
+            sm_relay_blocks = (
+                sm_relay_count + Int32(cluster_tile_m) - 1
+            ) // Int32(cluster_tile_m)
+            segment_block_count = sm_intra_blocks
+            if state.current_segment != Int32(0):
+                segment_block_count = sm_relay_blocks
         if state.current_phase == Int32(BlockPhase.Linear1):
-            tiles_in_expert = fc12_expert_phase_tiles(
-                this_expert_token_cnt,
-                self._num_fc1_intermediate_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
+            tiles_in_expert = (
+                segment_block_count * self._num_fc1_intermediate_blocks
             )
+            if cutlass.const_expr(params.tail_split_pairs):
+                # Tail-split pair tasks: the last cluster block of an expert
+                # with an odd CTA-tile count is covered by ceil(W/2) pair
+                # tasks instead of W (single-segment experts only).
+                tiles_in_expert = fc12_expert_phase_tiles(
+                    this_expert_token_cnt,
+                    self._num_fc1_intermediate_blocks,
+                    cluster_tile_m,
+                    params.cta_tile_shape_mnk[0],
+                    params.tail_split_pairs,
+                )
         else:
-            tiles_in_expert = fc12_expert_phase_tiles(
-                this_expert_token_cnt,
-                self._num_fc2_hidden_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
+            tiles_in_expert = (
+                segment_block_count * self._num_fc2_hidden_blocks
             )
+            if cutlass.const_expr(params.tail_split_pairs):
+                tiles_in_expert = fc12_expert_phase_tiles(
+                    this_expert_token_cnt,
+                    self._num_fc2_hidden_blocks,
+                    cluster_tile_m,
+                    params.cta_tile_shape_mnk[0],
+                    params.tail_split_pairs,
+                )
         state.current_expert_tile_end = (
             state.current_expert_tile_start + tiles_in_expert
         )
@@ -1090,6 +1279,61 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state.current_expert_idx = state.current_group_first_expert - Int32(1)
         state.current_expert_tile_end = state.current_group_fc1_subphase_end
         # Zero previous-expert cache before rewinding to group start.
+        state.current_this_expert_token_cnt = Int32(0)
+        state.current_token_block_count = Int32(0)
+        state.current_data_cumul = state.group_start_data_cumul
+        state.current_sf_cumul = state.group_start_sf_cumul
+        state.current_token_block_cumul = state.group_start_token_block_cumul
+        self._advance_expert_within_phase(loc=loc, ip=ip)
+
+    @dsl_user_op
+    @cute.jit
+    def _switch_subphase_segment_major(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Advance the group to its next (phase, segment) sub-phase.
+
+        Segment-major order is (FC1, intra) -> (FC2, intra) -> (FC1, relay)
+        -> (FC2, relay). Every sub-phase re-walks the group's experts from the
+        group-start cumul checkpoint, exactly as ``_switch_to_fc2`` does for
+        the expert-major order. Never called from the last sub-phase.
+        """
+        state = self._fused_state
+        next_phase = Int32(BlockPhase.Linear2)
+        next_segment = Int32(0)
+        next_tile_end = state.current_group_fc1_subphase_end
+        if cutlass.const_expr(self.params.segment_fc1_first):
+            # (FC1, intra) -> (FC1, relay) -> (FC2, intra) -> (FC2, relay)
+            next_phase = Int32(BlockPhase.Linear1)
+            next_segment = Int32(1)
+            if state.current_segment != Int32(0):
+                # (FC1, relay) -> (FC2, intra)
+                next_phase = Int32(BlockPhase.Linear2)
+                next_segment = Int32(0)
+                next_tile_end = state.current_group_sub1_end
+            if state.current_phase == Int32(BlockPhase.Linear2):
+                # (FC2, intra) -> (FC2, relay)
+                next_phase = Int32(BlockPhase.Linear2)
+                next_segment = Int32(1)
+                next_tile_end = state.current_group_sub2_end
+        else:
+            if state.current_phase == Int32(BlockPhase.Linear2):
+                # (FC2, intra) -> (FC1, relay)
+                next_phase = Int32(BlockPhase.Linear1)
+                next_segment = Int32(1)
+                next_tile_end = state.current_group_sub1_end
+            if state.current_segment != Int32(0):
+                # (FC1, relay) -> (FC2, relay)
+                next_phase = Int32(BlockPhase.Linear2)
+                next_segment = Int32(1)
+                next_tile_end = state.current_group_sub2_end
+        state.current_phase = next_phase
+        state.current_segment = next_segment
+        state.current_expert_idx = state.current_group_first_expert - Int32(1)
+        state.current_expert_tile_end = next_tile_end
         state.current_this_expert_token_cnt = Int32(0)
         state.current_token_block_count = Int32(0)
         state.current_data_cumul = state.group_start_data_cumul
@@ -1155,6 +1399,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cumulative_fc1 = base_fc1
         cumulative_fc2 = base_fc2
         expert_cursor = state.current_group_first_expert
+        # Per-segment block totals for the segment-major sub-phase layout.
+        group_intra_blocks = Int32(0)
+        group_relay_blocks = Int32(0)
 
         while expert_cursor < self.expert_cnt and cumulative_fc1 < threshold:
             # Only the per-expert token count drives the group greedy walk
@@ -1174,20 +1421,50 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     loc=loc,
                     ip=ip,
                 )
-            cumulative_fc1 = cumulative_fc1 + fc12_expert_phase_tiles(
-                token_count_e,
-                self._num_fc1_intermediate_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
-            )
-            cumulative_fc2 = cumulative_fc2 + fc12_expert_phase_tiles(
-                token_count_e,
-                self._num_fc2_hidden_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
-            )
+            token_block_count_e = (
+                token_count_e + Int32(cluster_tile_m) - 1
+            ) // Int32(cluster_tile_m)
+            if cutlass.const_expr(self.params.intra_token_sizes is not None):
+                intra_count_e = Int32(
+                    self.params.intra_token_sizes[expert_cursor]
+                )
+                relay_count_e = cutlass.max(
+                    token_count_e - intra_count_e, Int32(0)
+                )
+                intra_count_e, relay_count_e = scheduled_token_segments(
+                    intra_count_e, relay_count_e, cluster_tile_m,
+                )
+                token_block_count_e = (
+                    (intra_count_e + Int32(cluster_tile_m) - 1)
+                    // Int32(cluster_tile_m)
+                    + (relay_count_e + Int32(cluster_tile_m) - 1)
+                    // Int32(cluster_tile_m)
+                )
+                group_intra_blocks = group_intra_blocks + (
+                    intra_count_e + Int32(cluster_tile_m) - 1
+                ) // Int32(cluster_tile_m)
+                group_relay_blocks = group_relay_blocks + (
+                    relay_count_e + Int32(cluster_tile_m) - 1
+                ) // Int32(cluster_tile_m)
+            fc1_tiles_e = token_block_count_e * self._num_fc1_intermediate_blocks
+            fc2_tiles_e = token_block_count_e * self._num_fc2_hidden_blocks
+            if cutlass.const_expr(params.tail_split_pairs):
+                fc1_tiles_e = fc12_expert_phase_tiles(
+                    token_count_e,
+                    self._num_fc1_intermediate_blocks,
+                    cluster_tile_m,
+                    params.cta_tile_shape_mnk[0],
+                    params.tail_split_pairs,
+                )
+                fc2_tiles_e = fc12_expert_phase_tiles(
+                    token_count_e,
+                    self._num_fc2_hidden_blocks,
+                    cluster_tile_m,
+                    params.cta_tile_shape_mnk[0],
+                    params.tail_split_pairs,
+                )
+            cumulative_fc1 = cumulative_fc1 + fc1_tiles_e
+            cumulative_fc2 = cumulative_fc2 + fc2_tiles_e
             expert_cursor = expert_cursor + Int32(1)
 
         state.current_group_last_expert_exclusive = expert_cursor
@@ -1199,15 +1476,50 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # Previous group's end = this group's start in tile space.
         group_start_tile = state.current_group_end
-        state.current_group_fc1_subphase_end = (
-            group_start_tile + group_total_fc1_tiles
-        )
-        state.current_group_end = (
-            state.current_group_fc1_subphase_end + group_total_fc2_tiles
-        )
+        if cutlass.const_expr(self.params.segment_major):
+            # Four sub-phases: intra FC1, intra FC2, relay FC1, relay FC2.
+            # The totals equal group_total_fc1_tiles + group_total_fc2_tiles.
+            state.current_group_fc1_subphase_end = (
+                group_start_tile
+                + group_intra_blocks * self._num_fc1_intermediate_blocks
+            )
+            if cutlass.const_expr(self.params.segment_fc1_first):
+                # Sub-phase 2 = (FC1, relay), sub-phase 3 = (FC2, intra).
+                state.current_group_sub1_end = (
+                    state.current_group_fc1_subphase_end
+                    + group_relay_blocks * self._num_fc1_intermediate_blocks
+                )
+                state.current_group_sub2_end = (
+                    state.current_group_sub1_end
+                    + group_intra_blocks * self._num_fc2_hidden_blocks
+                )
+            else:
+                state.current_group_sub1_end = (
+                    state.current_group_fc1_subphase_end
+                    + group_intra_blocks * self._num_fc2_hidden_blocks
+                )
+                state.current_group_sub2_end = (
+                    state.current_group_sub1_end
+                    + group_relay_blocks * self._num_fc1_intermediate_blocks
+                )
+            state.current_group_end = (
+                state.current_group_sub2_end
+                + group_relay_blocks * self._num_fc2_hidden_blocks
+            )
+        else:
+            state.current_group_fc1_subphase_end = (
+                group_start_tile + group_total_fc1_tiles
+            )
+            state.current_group_end = (
+                state.current_group_fc1_subphase_end + group_total_fc2_tiles
+            )
 
         # No-op push barrier before priming the group's first expert.
         state.current_phase = Int32(BlockPhase.Linear1)
+        if cutlass.const_expr(self.params.segment_major):
+            # Only the segment-major order reads current_segment; leaving it
+            # untouched otherwise lets the loop-carried state fold to main's.
+            state.current_segment = Int32(0)
         state.current_expert_idx = state.current_group_first_expert - Int32(1)
         state.current_expert_tile_end = group_start_tile
         state.current_this_expert_token_cnt = Int32(0)
@@ -1239,23 +1551,100 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_intermediate_or_hidden_block_idx = Int32(0)
 
         is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
+        num_token_blocks = state.current_token_block_count
         if is_fc1:
             num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
-            cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
-            )
+            if const_expr(params.fc1_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
+                )
         else:
             num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
-            # Keep token-block as the slow axis in both phases.
-            cluster_token_block_idx = local_id // num_fc2_hidden_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc2_hidden_blocks
+            if const_expr(params.fc2_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                # Token-block as the slow axis (default).
+                cluster_token_block_idx = local_id // num_fc2_hidden_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc2_hidden_blocks
+                )
+
+        # The relay specialization schedules two independently aligned
+        # segments per expert. Map the scheduler-global block index to the
+        # segment-local physical block while keeping the release/fc1-done
+        # counter index unique across both segments.
+        segment_token_count = state.current_this_expert_token_cnt
+        segment_cluster_token_block_idx = cluster_token_block_idx
+        physical_data_cumul = state.current_data_cumul
+        physical_sf_cumul = state.current_sf_cumul
+        counter_token_block_cumul = state.current_token_block_cumul
+        if cutlass.const_expr(self.params.intra_token_sizes is not None):
+            intra_count = Int32(
+                self.params.intra_token_sizes[state.current_expert_idx]
             )
+            relay_count = cutlass.max(
+                state.current_this_expert_token_cnt - intra_count, Int32(0)
+            )
+            merged = Boolean(False)
+            merged = merged_token_segment(
+                intra_count, relay_count, params.cluster_tile_m,
+            )
+            intra_count, relay_count = scheduled_token_segments(
+                intra_count, relay_count, params.cluster_tile_m,
+            )
+            # The default physical segment is intra. Its final tile threshold
+            # must be clipped by the intra subtotal, not by the unified expert
+            # count; otherwise an intra tile waits for relay-token credits that
+            # are intentionally published into the next counter slot.
+            segment_token_count = intra_count
+            intra_cluster_blocks = (
+                intra_count + Int32(params.cluster_tile_m) - 1
+            ) // Int32(params.cluster_tile_m)
+            # Expert-major order derives the segment from the block index;
+            # segment-major order carries it in scheduler state and local_id
+            # already indexes blocks inside that segment.
+            is_relay_block = cluster_token_block_idx >= intra_cluster_blocks
+            relay_block_in_segment = (
+                cluster_token_block_idx - intra_cluster_blocks
+            )
+            if cutlass.const_expr(self.params.segment_major):
+                is_relay_block = state.current_segment != Int32(0)
+                relay_block_in_segment = cluster_token_block_idx
+            if is_relay_block:
+                segment_token_count = relay_count
+                segment_cluster_token_block_idx = relay_block_in_segment
+                physical_data_cumul = Int32(
+                    self.params.relay_pool_base[
+                        state.current_expert_idx, Int32(0)
+                    ]
+                )
+                physical_sf_cumul = Int32(
+                    self.params.relay_sf_pool_base[
+                        state.current_expert_idx, Int32(0)
+                    ]
+                )
+                if merged:
+                    # A merged scheduling segment includes intranode rows.
+                    # Its start is the published expert base, while the
+                    # published relay base still identifies the first relay row.
+                    physical_data_cumul = state.current_data_cumul
+                    physical_sf_cumul = state.current_sf_cumul
+                counter_token_block_cumul = (
+                    counter_token_block_cumul + intra_cluster_blocks
+                )
 
         # Cluster → CTA granularity (mirrors MoESchedulerBase._get_work_tile_for_linear_idx)
         cta_token_block_idx = (
-            cluster_token_block_idx * params.cluster_shape_mn[0]
+            segment_cluster_token_block_idx * params.cluster_shape_mn[0]
             + self.cta_id_in_cluster[0]
         )
         cta_intermediate_or_hidden_block_idx = (
@@ -1309,7 +1698,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # right boundary.
         token_idx_start_in_expert = cta_token_block_idx * Int32(cta_tile_m)
         remaining_in_expert = (
-            state.current_this_expert_token_cnt - token_idx_start_in_expert
+            segment_token_count - token_idx_start_in_expert
         )
         remaining_in_expert = cutlass.max(remaining_in_expert, Int32(0))
         valid_tokens_in_cta_tile = cutlass.min(remaining_in_expert, Int32(cta_tile_m))
@@ -1332,18 +1721,20 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 expert_idx=state.current_expert_idx,
                 tile_m_idx=tile_m_idx,
                 tile_n_idx=tile_n_idx,
-                cumulative_data_physical_row=state.current_data_cumul,
-                cumulative_sf_physical_row=state.current_sf_cumul,
-                cumulative_token_block_count=state.current_token_block_cumul,
+                cumulative_data_physical_row=physical_data_cumul,
+                cumulative_sf_physical_row=physical_sf_cumul,
+                cumulative_token_block_count=counter_token_block_cumul,
                 valid_tokens_in_cta_tile=valid_tokens_in_cta_tile,
                 phase_and_peek=phase_and_split,
             )
         else:
-            fc1_counter_index = cluster_token_block_idx
+            fc1_counter_index = segment_cluster_token_block_idx
             cluster_tile_m = params.cluster_shape_mn[0] * cta_tile_m
-            cluster_start = cluster_token_block_idx * Int32(cluster_tile_m)
+            cluster_start = (
+                segment_cluster_token_block_idx * Int32(cluster_tile_m)
+            )
             remaining_cluster = cutlass.max(
-                state.current_this_expert_token_cnt - cluster_start, Int32(0)
+                segment_token_count - cluster_start, Int32(0)
             )
             valid_tokens_in_cluster_tile = cutlass.min(remaining_cluster, Int32(cluster_tile_m))
             # Pack: high 16b = per-CTA tile count, low 16b = cluster-level count.
@@ -1354,9 +1745,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 expert_idx=state.current_expert_idx,
                 tile_m_idx=tile_m_idx,
                 tile_n_idx=tile_n_idx,
-                cumulative_data_physical_row=state.current_data_cumul,
-                cumulative_sf_physical_row=state.current_sf_cumul,
-                cumulative_token_block_count=state.current_token_block_cumul,
+                cumulative_data_physical_row=physical_data_cumul,
+                cumulative_sf_physical_row=physical_sf_cumul,
+                cumulative_token_block_count=counter_token_block_cumul,
                 valid_tokens_in_cta_cluster_tile=valid_tokens_in_cta_cluster_tile,
                 phase_and_peek=phase_and_split,
                 fc1_counter_index=fc1_counter_index,
@@ -1419,18 +1810,71 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         is_valid = cluster_linear_tile_idx < state.current_group_end
         if is_valid:
-            # fc1 → fc2 phase transition inside current group, if crossed.
-            if (
-                state.current_phase == Int32(BlockPhase.Linear1)
-                and cluster_linear_tile_idx >= state.current_group_fc1_subphase_end
-            ):
-                self._switch_to_fc2(loc=loc, ip=ip)
-                self._fused_state = (
-                    self._fused_state
-                )  # DSL carry
+            if cutlass.const_expr(self.params.segment_major):
+                # Cross every completed (phase, segment) sub-phase. A cluster's
+                # stride can skip more than one when a sub-phase is small, so
+                # this is a loop rather than a single switch.
+                subphase_end = state.current_group_fc1_subphase_end
+                if cutlass.const_expr(self.params.segment_fc1_first):
+                    # (FC1,intra)=fc1_subphase_end (FC1,relay)=sub1 (FC2,intra)=sub2 (FC2,relay)=end
+                    if state.current_segment != Int32(0):
+                        subphase_end = state.current_group_sub1_end
+                    if state.current_phase == Int32(BlockPhase.Linear2):
+                        subphase_end = state.current_group_sub2_end
+                        if state.current_segment != Int32(0):
+                            subphase_end = state.current_group_end
+                else:
+                    if state.current_phase == Int32(BlockPhase.Linear2):
+                        subphase_end = state.current_group_sub1_end
+                    if state.current_segment != Int32(0):
+                        subphase_end = state.current_group_sub2_end
+                        if state.current_phase == Int32(BlockPhase.Linear2):
+                            subphase_end = state.current_group_end
+                is_last_subphase = Int32(0)
+                if state.current_segment != Int32(0):
+                    if state.current_phase == Int32(BlockPhase.Linear2):
+                        is_last_subphase = Int32(1)
+                while (
+                    cluster_linear_tile_idx >= subphase_end
+                    and is_last_subphase == Int32(0)
+                ):
+                    self._switch_subphase_segment_major(loc=loc, ip=ip)
+                    self._fused_state = self._fused_state  # DSL carry
+                    state = self._fused_state
+                    subphase_end = state.current_group_fc1_subphase_end
+                    if cutlass.const_expr(self.params.segment_fc1_first):
+                        # (FC1,intra)=fc1_subphase_end (FC1,relay)=sub1 (FC2,intra)=sub2 (FC2,relay)=end
+                        if state.current_segment != Int32(0):
+                            subphase_end = state.current_group_sub1_end
+                        if state.current_phase == Int32(BlockPhase.Linear2):
+                            subphase_end = state.current_group_sub2_end
+                            if state.current_segment != Int32(0):
+                                subphase_end = state.current_group_end
+                    else:
+                        if state.current_phase == Int32(BlockPhase.Linear2):
+                            subphase_end = state.current_group_sub1_end
+                        if state.current_segment != Int32(0):
+                            subphase_end = state.current_group_sub2_end
+                            if state.current_phase == Int32(BlockPhase.Linear2):
+                                subphase_end = state.current_group_end
+                    is_last_subphase = Int32(0)
+                    if state.current_segment != Int32(0):
+                        if state.current_phase == Int32(BlockPhase.Linear2):
+                            is_last_subphase = Int32(1)
+                state = self._fused_state  # re-bind alias
             else:
-                self._fused_state = self._fused_state  # balanced else-side rebind
-            state = self._fused_state  # re-bind alias
+                # fc1 → fc2 phase transition inside current group, if crossed.
+                if (
+                    state.current_phase == Int32(BlockPhase.Linear1)
+                    and cluster_linear_tile_idx >= state.current_group_fc1_subphase_end
+                ):
+                    self._switch_to_fc2(loc=loc, ip=ip)
+                    self._fused_state = (
+                        self._fused_state
+                    )  # DSL carry
+                else:
+                    self._fused_state = self._fused_state  # balanced else-side rebind
+                state = self._fused_state  # re-bind alias
 
             # non-PyIR: carry loop-condition fields as locals.
             inner_expert_tile_end = state.current_expert_tile_end
@@ -1502,14 +1946,18 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 cluster_linear_tile_idx = (
                     self._advance_work_linear_tile_idx_static(loc=loc, ip=ip)
                 )
+                self._gen_work_from_cluster_idx(
+                    cluster_linear_tile_idx, loc=loc, ip=ip
+                )
             else:  # "clc"
                 raise NotImplementedError(
                     "load_balance_mode='clc' is reserved; CLC scheduler is "
                     "MoEDynamicPersistentTileScheduler, not the mega scheduler"
                 )
-            self._gen_work_from_cluster_idx(
-                cluster_linear_tile_idx, loc=loc, ip=ip
-            )
+            if const_expr(self.params.load_balance_mode == "atomic_counter"):
+                self._gen_work_from_cluster_idx(
+                    cluster_linear_tile_idx, loc=loc, ip=ip
+                )
 
         # Codegen-time flip after the first trace site so subsequent traces
         # (the while-body call) pick the vanilla path.  This Python

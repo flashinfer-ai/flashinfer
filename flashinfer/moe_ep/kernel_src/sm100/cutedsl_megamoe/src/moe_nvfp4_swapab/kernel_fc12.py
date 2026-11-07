@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel for SM100."""
 
+import sys
 from typing import Literal, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -37,6 +38,13 @@ from common.host_utils import get_cutedsl_target_arch
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
 from src.token_comm import CombineFormat
+from common.pipeline_timing import (
+    FC_TILE_PHASE_FC1,
+    FC_TILE_PHASE_FC2,
+    FC_TILE_TIMELINE_MAX_TILES,
+    PIPELINE_STAGE_FC1_FC2,
+)
+from src.ptx_helpers import read_clock64, read_globaltimer
 
 
 # token_comm_args is an opaque subclass-owned bundle.  The base only forwards it
@@ -46,6 +54,22 @@ from src.token_comm import CombineFormat
 # =============================================================================
 # Sm100SwapABSwigluFp4Fc12Kernel
 # =============================================================================
+
+
+# L2 eviction-priority encodings for the TMA ``.L2::cache_hint`` operand, the
+# same ``createpolicy`` constants CUTLASS uses (``cute/arch/copy_sm90_tma.hpp``,
+# ``CacheHintSm90``). Weights and their scale factors are streamed once per
+# token tile and are hinted evict-first; the token / FC1-output B operand and
+# its scale factors are re-read by every M tile of the same token tile and are
+# hinted evict-last. ``tma_cache_hint`` (constructor option) is a bit mask:
+# bit 0 hints the weights evict-first, bit 1 hints the B operand evict-last.
+# The lean 3072-token run (two token tiles per expert, weights re-read from
+# L2 by the second tile) is 18% slower with evict-first weights, so the two
+# hints are selectable independently.
+TMA_CACHE_HINT_WEIGHTS_EVICT_FIRST = 1
+TMA_CACHE_HINT_B_EVICT_LAST = 2
+TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
+TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
 
 
 class Sm100SwapABSwigluFp4Fc12Kernel:
@@ -71,6 +95,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         token_padding_block: int,
         sf_padding_block: int,
         load_balance_mode: Literal["static", "atomic_counter"] = "static",
+        sched_segment_major: bool = False,
+        sched_segment_fc1_first: bool = False,
         # Optional scheduler/codegen knobs.
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         force_static_sched: bool = True,
@@ -92,6 +118,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         situ_linear_beta: Optional[float] = None,
         enable_fc1_activation_per_token_scale: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        # GEMM-stage codegen options; subclasses pass their own (the MegaMoE
+        # kernel fixes both, see megamoe_kernel.py). Plain bools/str so
+        # cute.const_expr folds the MMA-loop branch at trace time.
+        mma_pipelined_kloop: bool = False,
+        sf_tmem_stages: Literal["1", "ab"] = "1",
+        task_reg_cnt: int = 72,
+        tma_cache_hint: int = 0,
+        # Timing probes (MegaMoEDiagnostics); codegen-affecting.
+        pipeline_timing: bool = False,
+        fc_tile_timeline: bool = False,
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -128,6 +164,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
+        self.sched_segment_major = sched_segment_major
+        self.sched_segment_fc1_first = sched_segment_fc1_first
 
         self.sf_vec_size = sf_vec_size
         self.scenario = scenario
@@ -195,7 +233,61 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # register allocation because setmaxnreg emission is gated by
         # ``self.enable_token_comm`` inside the device kernel.
         self.epi_reg_cnt = 256
-        self.task_reg_cnt = 72
+        # Registers per thread for the sched/TMA-A/TMA-B/MMA warpgroup (warps
+        # 4-7). With 16 warps the CTA starts at 128 regs/thread; the epilogue
+        # warpgroup grows to 256, so the other three warpgroups shrink. The
+        # communication warpgroups (8-15) stay at ``comm_reg_cnt``. Budget:
+        # 4*256 + 4*task + 8*72 <= 2048, so the task warpgroup can take up to
+        # 112. The historical split (72) is the default; the constructor
+        # option is part of the kernel cache key.
+        self.task_reg_cnt = int(task_reg_cnt)
+        if self.task_reg_cnt % 8 or not 24 <= self.task_reg_cnt <= 112:
+            raise ValueError(
+                "task_reg_cnt must be a multiple of 8 in [24, 112], got "
+                f"{self.task_reg_cnt}"
+            )
+        self.comm_reg_cnt = 72
+        # Software-pipelined k-slab loop for the MMA warp: issue slab k's UMMAs,
+        # then wait for slab k+1 and copy its scale factors while the UMMAs run,
+        # then release slab k. Needs one TMEM SF slot per AB stage so the copy
+        # for slab k+1 never targets the slot the in-flight UMMAs read. On for
+        # the MegaMoE kernel, off for the lean kernel (the lean 3072-token proxy
+        # is slower with it). Kept as a plain bool so ``cute.const_expr`` folds
+        # the MMA-loop branch at trace time (a property makes const_expr
+        # non-constant, and the DSL then traces both branches -- see
+        # the 2026-09-08 GEMM-stage attribution note, retired to git history).
+        self.mma_pipelined_kloop = bool(mma_pipelined_kloop)
+        # Scale-factor TMEM staging mode: "1" keeps the historical single TMEM
+        # SF slot, "ab" allocates one slot per AB smem stage (resolved to a
+        # count in ``_setup_attributes`` once ``num_ab_stage`` is known); the
+        # pipelined loop needs "ab" (the prefetched scale-factor copy needs
+        # its own TMEM slot) and selects it.
+        if sf_tmem_stages not in ("1", "ab"):
+            raise ValueError(
+                f"sf_tmem_stages must be '1' or 'ab'; got {sf_tmem_stages!r}"
+            )
+        self.sf_tmem_stages_mode = "ab" if self.mma_pipelined_kloop else sf_tmem_stages
+        # TMA L2 cache hints on the mainloop operand loads, a bit mask (see
+        # TMA_CACHE_HINT_* above): 1 = weights evict-first, 2 = B operand
+        # evict-last, 3 = both. Codegen-affecting (kernel-name suffix
+        # ``_tmach{mask}``). Plain int so cute.const_expr folds it.
+        if tma_cache_hint not in (0, 1, 2, 3):
+            raise ValueError(
+                f"tma_cache_hint must be 0, 1, 2 or 3; got {tma_cache_hint!r}"
+            )
+        self.tma_cache_hint = int(tma_cache_hint)
+        # Timing probes: plain bools so cute.const_expr folds every probe
+        # branch at trace time.
+        if fc_tile_timeline and not pipeline_timing:
+            raise ValueError("fc_tile_timeline requires pipeline_timing")
+        self.pipeline_timing_enabled = bool(pipeline_timing)
+        self.fc_tile_timeline_enabled = bool(fc_tile_timeline)
+        self.tma_hint_weights_evict_first = bool(
+            self.tma_cache_hint & TMA_CACHE_HINT_WEIGHTS_EVICT_FIRST
+        )
+        self.tma_hint_b_evict_last = bool(
+            self.tma_cache_hint & TMA_CACHE_HINT_B_EVICT_LAST
+        )
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(
@@ -230,6 +322,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             "moe_fc12_fuse_nvfp4"
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
             f"_expert_shape_{exp}_grouphint_{self.group_hint}"
+            f"_segmajor_{int(self.sched_segment_major)}"
+            f"{'_segfc1first' if self.sched_segment_fc1_first else ''}"
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
@@ -237,6 +331,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
             f"_situ{self.situ_beta}_linear{self.situ_linear_beta}"
             f"{act_scale}"
+            f"{'_sfstab' if self.sf_tmem_stages_mode == 'ab' else ''}"
+            f"{'_kpipe' if self.mma_pipelined_kloop else ''}"
+            f"{'' if self.tma_cache_hint == 0 else f'_tmach{self.tma_cache_hint}'}"
+            f"{'' if self.task_reg_cnt == 72 else f'_treg{self.task_reg_cnt}'}"
+            f"{'_ptim' if self.pipeline_timing_enabled else ''}"
+            f"{'_fctl1' if self.fc_tile_timeline_enabled else ''}"
         )
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -400,7 +500,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             combine_format=self.combine_format,
             non_ubulk_fc2_store=self.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-            token_back_by_dispatch=self.token_back_by_dispatch,
+            token_back_by_dispatch=getattr(
+                self, "epilogue_token_back_by_dispatch",
+                self.token_back_by_dispatch,
+            ),
             epi_flag_batch=self.epi_flag_batch,
             acc_dtype=self.acc_dtype,
             allow_overlap_acc=True,
@@ -408,6 +511,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             gate_up_clamp=self.gate_up_clamp,
+            fc_tile_timeline=self.fc_tile_timeline_enabled,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
         )
@@ -499,6 +603,51 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.num_tma_load_bytes = (
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
+
+        # Scale-factor TMEM staging. Each k-slab copies SFA/SFB from smem to
+        # TMEM (tcgen05.cp) before its MMAs read them. With a single TMEM SF
+        # slot the copy for slab k+1 targets the columns the MMAs of slab k
+        # are still reading, so the tensor pipe idles for the whole copy
+        # latency on every slab (the per-tile FC timeline measured 51% of the
+        # MMA warp's loop inside these copies). With one slot per AB smem
+        # stage the copy targets the slot of its own stage; that slot's last
+        # reader finished before the TMA refill of the stage became visible,
+        # so the copy overlaps the previous slab's MMAs. ``sf_tmem_stages``
+        # selects 1 (historical) or "ab" (= num_ab_stage). The value is part
+        # of the compiled-kernel name.
+        self.num_sf_tmem_stages = (
+            self.num_ab_stage if self.sf_tmem_stages_mode == "ab" else 1
+        )
+        sf_tmem_cols_needed = (
+            self.num_accumulator_tmem_cols
+            + self.num_sf_tmem_cols * self.num_sf_tmem_stages
+        )
+        if sf_tmem_cols_needed > self.num_tmem_alloc_cols and self.num_sf_tmem_stages > 1:
+            # One SF slot per AB stage does not fit beside the accumulators for
+            # this tile (256x256x256 with five stages asks for 704 of 512
+            # columns), and the pipelined k-loop needs those slots. Fall back to
+            # the historical single slot and in-order loop, which is what the
+            # kernel ran before either option existed. The decision is a pure
+            # function of the tile configuration, so the compiled kernel stays
+            # deterministic for a given configuration.
+            print(
+                f"[fc12] SF TMEM staging needs {sf_tmem_cols_needed} columns "
+                f"(acc {self.num_accumulator_tmem_cols} + {self.num_sf_tmem_stages} x "
+                f"{self.num_sf_tmem_cols}) but only {self.num_tmem_alloc_cols} are "
+                "allocated: using one SF slot and the in-order k-loop",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.sf_tmem_stages_mode = "1"
+            self.mma_pipelined_kloop = False
+            self.num_sf_tmem_stages = 1
+            sf_tmem_cols_needed = self.num_accumulator_tmem_cols + self.num_sf_tmem_cols
+        if sf_tmem_cols_needed > self.num_tmem_alloc_cols:
+            raise ValueError(
+                f"SF TMEM staging needs {sf_tmem_cols_needed} columns "
+                f"(acc {self.num_accumulator_tmem_cols} + {self.num_sf_tmem_stages} x "
+                f"{self.num_sf_tmem_cols}) but only {self.num_tmem_alloc_cols} are allocated"
+            )
 
     def _smem_misc_budget_bytes(self) -> int:
         """SMEM bytes reserved for everything outside the AB / SF stage
@@ -640,6 +789,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
     # tracing, so they may issue PTX / TMA / NamedBarrier / spin_wait freely.
     # ``token_comm_args`` is forwarded as-is (the base never reads its fields).
 
+    def token_comm_hook_prepare_device_resources(self, token_comm_args):
+        """Materialize optional device resources at kernel entry."""
+        pass
+
     def token_comm_extra_smem_storage_class(self) -> Optional[type]:
         """Return an ``@cute.struct`` class for the subclass's extra SMEM
         region (= ``token_comm_storage``), or ``None`` if no extra SMEM is
@@ -655,6 +808,21 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         dispatch->fc1 release counter, or ``None`` to disable the fc1
         phase peek entirely.  Called once at ext construction time."""
         return None
+
+    def token_comm_hook_fc1_ready_peek_scope(self) -> str:
+        """Memory scope of the sched-warp fc1-ready peek (``"gpu"`` or
+        ``"sys"``). The base kernel has GPU-scope writers only."""
+        return "gpu"
+
+    @cute.jit
+    def token_comm_hook_cta_linear_id(self):
+        """Return the grid-wide CTA id used by optional timing records.
+
+        The lean kernel never reaches this hook because timing writers are
+        guarded by ``enable_token_comm``.  MegaMoE overrides it with the CTA
+        identity owned by its TokenComm implementation.
+        """
+        return cutlass.Int32(0)
 
     @cute.jit
     def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
@@ -688,6 +856,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         warp_idx,
         lane_idx,
         tidx,
+        ab_smem_ptr=None,
     ):
         """Subclass dispatch warp body; no-op in the lean kernel."""
         pass
@@ -709,12 +878,25 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
     def token_comm_hook_kernel_tail(
         self,
         token_comm_args,
+        token_comm_storage=None,
         *,
         warp_idx,
         lane_idx,
         tidx,
     ):
         """Subclass kernel-tail hook; no-op in the lean kernel."""
+        pass
+
+    @cute.jit
+    def token_comm_hook_epilogue_exit(
+        self,
+        token_comm_args,
+        token_comm_storage=None,
+        *,
+        warp_idx,
+        lane_idx,
+    ):
+        """Subclass hook right after the epilogue tile loop; no-op in the lean kernel."""
         pass
 
     def mainloop_s2t_copy_and_partition(
@@ -778,6 +960,13 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # ── Sizes-mode per-expert token count (MegaMoE path) ─────────────
         # (experts,) Int32 raw token counts (NOT cumulative).
         expert_token_sizes: Optional[cute.Tensor] = None,
+        # Optional physical pool bases for independently padded intra/relay
+        # regions in the internode MegaMoE path.
+        expert_pool_base: Optional[cute.Tensor] = None,
+        expert_sf_pool_base: Optional[cute.Tensor] = None,
+        intra_token_sizes: Optional[cute.Tensor] = None,
+        relay_pool_base: Optional[cute.Tensor] = None,
+        relay_sf_pool_base: Optional[cute.Tensor] = None,
         # ── MegaMoE bundle (Optional) ────────────────────────────────────
         # Opaque subclass bundle; None for the lean path.
         token_comm_args=None,
@@ -1217,6 +1406,13 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             is_swap_ab=True,
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
+            expert_pool_base=expert_pool_base,
+            expert_sf_pool_base=expert_sf_pool_base,
+            intra_token_sizes=intra_token_sizes,
+            relay_pool_base=relay_pool_base,
+            relay_sf_pool_base=relay_sf_pool_base,
+            segment_major=self.sched_segment_major,
+            segment_fc1_first=self.sched_segment_fc1_first,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
 
@@ -1375,6 +1571,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        # Materialize by-value device resources before runtime warp branches.
+        # Nested @cute.jit calls receive the already-built native handles rather
+        # than reconstructing DevComm inside a child MLIR region.
+        self.token_comm_hook_prepare_device_resources(token_comm_args)
+
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, None, 0))
         sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
@@ -1397,6 +1598,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(
                 token_comm_args
             ),
+            fc1_ready_peek_scope=self.token_comm_hook_fc1_ready_peek_scope(),
         )
 
         warp_idx = cute.arch.warp_idx()
@@ -1650,6 +1852,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
             a_full_mcast_mask = None
             sfa_full_mcast_mask = None
+            tma_policy_a = None
+            if cutlass.const_expr(self.tma_hint_weights_evict_first):
+                tma_policy_a = cutlass.Int64(TMA_CACHE_HINT_EVICT_FIRST)
             if cutlass.const_expr(self.is_a_mcast or use_2cta_instrs):
                 a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                     cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
@@ -1664,6 +1869,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             sfa_cta_layout = a_cta_layout
 
             thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_start = read_globaltimer()
 
             work_tile_info = sched_consumer.consume_work()
 
@@ -1736,6 +1946,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_a,
                             mcast_mask=a_full_mcast_mask,
+                            cache_policy=tma_policy_a,
                         )
                         cute.copy(
                             tma_atom_fc1_weight_sf,
@@ -1744,6 +1955,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_sfa,
                             mcast_mask=sfa_full_mcast_mask,
+                            cache_policy=tma_policy_a,
                         )
                 else:
                     # ── fc2 phase A-side (no readiness gate) ─────────────
@@ -1809,6 +2021,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_a,
                             mcast_mask=a_full_mcast_mask,
+                            cache_policy=tma_policy_a,
                         )
                         cute.copy(
                             tma_atom_fc2_weight_sf,
@@ -1817,12 +2030,26 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_sfa,
                             mcast_mask=sfa_full_mcast_mask,
+                            cache_policy=tma_policy_a,
                         )
 
                 iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
             ab_producer.tail()
+
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_end = read_globaltimer()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    cta_linear_id = self.token_comm_hook_cta_linear_id()
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 0
+                    ] = expert_start
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 1
+                    ] = expert_end
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
@@ -1831,6 +2058,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
             b_full_mcast_mask = None
             sfb_full_mcast_mask = None
+            tma_policy_b = None
+            if cutlass.const_expr(self.tma_hint_b_evict_last):
+                tma_policy_b = cutlass.Int64(TMA_CACHE_HINT_EVICT_LAST)
             if cutlass.const_expr(self.is_b_mcast or use_2cta_instrs):
                 b_full_mcast_mask = cpasync.create_tma_multicast_mask(
                     cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
@@ -1871,11 +2101,26 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             ) // self.cta_tile_shape_mnk[0]
 
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_start = read_globaltimer()
 
+
+            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                # Per-tile timeline: TMA-B owns identity, claim and ready.
+                fctl_seq = cutlass.Int32(0)
+                fctl_cta = self.token_comm_hook_cta_linear_id()
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = (
                     work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
                 )
+                if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                    fctl_claim = read_globaltimer()
+                    fctl_ready = cutlass.Int64(0)
+                    fctl_phase = cutlass.Int64(0)
+                    fctl_wait = cutlass.Int64(0)
+                    fctl_loop_t0 = cutlass.Int64(0)
 
                 if is_phase_linear1:
                     # ── fc1 phase B-side (activation + activation_sf) ────
@@ -1889,6 +2134,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
                         token_comm_args, work_tile_info,
                     )
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_ready = read_globaltimer()
+                        fctl_phase = cutlass.Int64(FC_TILE_PHASE_FC1)
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_b, desc_ptr_b = ext.get_gmem_tensor(
@@ -1952,10 +2200,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_loop_t0 = read_clock64()
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_bt0 = read_clock64()
                         handle = ab_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_wait = fctl_wait + (read_clock64() - fctl_bt0)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -1966,6 +2220,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_b,
                             mcast_mask=b_full_mcast_mask,
+                            cache_policy=tma_policy_b,
                         )
                         cute.copy(
                             tma_atom_activation_sf,
@@ -1974,6 +2229,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_sfb,
                             mcast_mask=sfb_full_mcast_mask,
+                            cache_policy=tma_policy_b,
                         )
                 else:
                     # ── fc2 phase B-side ─────────────────────────────────
@@ -2012,6 +2268,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             fail_sleep_cycles=500,
                         )
                         iket.range_pop()
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_ready = read_globaltimer()
+                        fctl_phase = cutlass.Int64(FC_TILE_PHASE_FC2)
 
                     # fc1 workspace is fc2 GEMM-B/SFB for this token block.
                     k_tile_cnt = k_tile_cnt_fc2
@@ -2087,10 +2346,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_producer.reset()
                     peek_ab_empty_status = ab_producer.try_acquire()
 
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_loop_t0 = read_clock64()
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_bt0 = read_clock64()
                         handle = ab_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_wait = fctl_wait + (read_clock64() - fctl_bt0)
                         peek_ab_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_empty_status = ab_producer.try_acquire()
@@ -2101,6 +2366,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_b,
                             mcast_mask=b_full_mcast_mask,
+                            cache_policy=tma_policy_b,
                         )
                         cute.copy(
                             tma_atom_fc1_output_sf_as_fc2_input,
@@ -2109,11 +2375,53 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             tma_bar_ptr=handle.barrier,
                             tma_desc_ptr=desc_ptr_sfb,
                             mcast_mask=sfb_full_mcast_mask,
+                            cache_policy=tma_policy_b,
                         )
+                if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                    if cute.arch.lane_idx() == cutlass.Int32(0):
+                        if fctl_seq < cutlass.Int32(FC_TILE_TIMELINE_MAX_TILES):
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 0
+                            ] = fctl_phase
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 1
+                            ] = cutlass.Int64(work_tile_info.expert_idx)
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 2
+                            ] = cutlass.Int64(work_tile_info.tile_m_idx)
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 3
+                            ] = cutlass.Int64(work_tile_info.tile_n_idx)
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 4
+                            ] = fctl_claim
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 5
+                            ] = fctl_ready
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 8
+                            ] = fctl_wait
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 9
+                            ] = read_clock64() - fctl_loop_t0
+                    fctl_seq = fctl_seq + cutlass.Int32(1)
                 iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
             ab_producer.tail()
+
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_end = read_globaltimer()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    cta_linear_id = self.token_comm_hook_cta_linear_id()
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 0
+                    ] = expert_start
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 1
+                    ] = expert_end
 
         # ════════════════════════════════════════════════════════════════════
         # MMA warp (warp 4)
@@ -2176,7 +2484,15 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             # from the enclosing scope (computed once before the TMA warps).
 
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_start = read_globaltimer()
 
+
+            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                fctl_seq = cutlass.Int32(0)
+                fctl_cta = self.token_comm_hook_cta_linear_id()
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = (
                     work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
@@ -2195,6 +2511,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 else:
                     acc_stage_index = acc_producer_state.index
 
+                if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                    fctl_mwait = cutlass.Int64(0)
+                    fctl_macq = cutlass.Int64(0)
+                    fctl_ms2t = cutlass.Int64(0)
+                    fctl_missue = cutlass.Int64(0)
+                    fctl_mrel = cutlass.Int64(0)
+                    # ``fctl_mt0`` holds the pre-wait timestamp; the pipelined
+                    # k-loop first assigns it in its prologue and then again per
+                    # iteration, so bind it to a defined Int64 before any ``for``
+                    # (the DSL rejects a variable that is None before a dynamic
+                    # loop and becomes Int64 inside it).
+                    fctl_mt0 = cutlass.Int64(0)
+                    fctl_mloop_t0 = read_clock64()
                 if is_leader_cta:
                     tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
@@ -2202,7 +2531,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     peek_ab_full_status = cutlass.Boolean(1)
                     iket.range_push("mma_acquire")
                     peek_ab_full_status = ab_consumer.try_wait()
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_ma0 = read_clock64()
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                        fctl_macq = read_clock64() - fctl_ma0
                     iket.range_pop()
 
                     # Apply TMEM pointer offset hack when mma_tiler_n == 64.
@@ -2222,46 +2555,304 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                    if cutlass.const_expr(self.mma_pipelined_kloop):
+                        # Software-pipelined order (see __init__): the SF copies
+                        # and the full-barrier wait of slab k+1 overlap the UMMAs
+                        # of slab k. Every slab's SF lands in the TMEM slot of
+                        # its own AB stage (num_sf_tmem_stages == num_ab_stage).
+                        # Prologue: slab 0 resident and its SF copied.
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_mt0 = read_clock64()
+                        kpipe_cur = ab_consumer.wait_and_advance(peek_ab_full_status)
+                        if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                            fctl_mwait = fctl_mwait + (read_clock64() - fctl_mt0)
                         peek_ab_full_status = cutlass.Boolean(1)
-                        if k_tile + 1 < k_tile_cnt:
+                        if k_tile_cnt > cutlass.Int32(1):
                             peek_ab_full_status = ab_consumer.try_wait()
-
-                        s2t_stage_coord = (None, None, None, None, handle.index)
-                        cute.copy(
-                            tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t[s2t_stage_coord],
-                            tCtSFA_compact_s2t,
+                        kp0_cols = kpipe_cur.index * cutlass.Int32(self.num_sf_tmem_cols)
+                        kp0_sfa_t = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_tmem_ptr + self.num_accumulator_tmem_cols + kp0_cols,
+                                dtype=self.sf_dtype,
+                            ),
+                            tCtSFA_layout,
                         )
-                        cute.copy(
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[s2t_stage_coord],
-                            tCtSFB_compact_s2t,
+                        kp0_sfb_t = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_tmem_ptr
+                                + self.num_accumulator_tmem_cols
+                                + self.num_sfa_tmem_cols
+                                + kp0_cols,
+                                dtype=self.sf_dtype,
+                            ),
+                            tCtSFB_layout,
                         )
-
-                        # tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        tile_crd = (None, None, None, handle.index)
+                        (_, _, kp0_sfa_dst) = self.mainloop_s2t_copy_and_partition(sSFA, kp0_sfa_t)
+                        (_, _, kp0_sfb_dst) = self.mainloop_s2t_copy_and_partition(sSFB, kp0_sfb_t)
+                        kp0_coord = (None, None, None, None, kpipe_cur.index)
+                        cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t[kp0_coord], kp0_sfa_dst)
+                        cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t[kp0_coord], kp0_sfb_dst)
+                        for k_tile in cutlass.range(0, k_tile_cnt - 1, 1, unroll=1):
+                            # UMMAs of slab k; its SF is already in slot kpipe_cur.index.
+                            kpc_cols = kpipe_cur.index * cutlass.Int32(self.num_sf_tmem_cols)
+                            kpc_sfa_t = cute.make_tensor(
+                                cute.recast_ptr(
+                                    acc_tmem_ptr + self.num_accumulator_tmem_cols + kpc_cols,
+                                    dtype=self.sf_dtype,
+                                ),
+                                tCtSFA_layout,
+                            )
+                            kpc_sfb_t = cute.make_tensor(
+                                cute.recast_ptr(
+                                    acc_tmem_ptr
+                                    + self.num_accumulator_tmem_cols
+                                    + self.num_sfa_tmem_cols
+                                    + kpc_cols,
+                                    dtype=self.sf_dtype,
+                                ),
+                                tCtSFB_layout,
+                            )
+                            kpc_sfb_mma_t = kpc_sfb_t
+                            if cutlass.const_expr(self.mma_tiler[1] == 64):
+                                kpc_sfb_mma_t = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        acc_tmem_ptr
+                                        + self.num_accumulator_tmem_cols
+                                        + self.num_sfa_tmem_cols
+                                        + kpc_cols
+                                        + sfb_shift,
+                                        dtype=self.sf_dtype,
+                                    ),
+                                    tCtSFB_layout,
+                                )
+                            kpc_crd = (None, None, None, kpipe_cur.index)
+                            dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                                acc_tensor=tCtAcc,
+                                a_frag_tile=tCrA[kpc_crd],
+                                b_frag_tile=tCrB[kpc_crd],
+                                sfa_tensor=kpc_sfa_t,
+                                sfb_tensor=kpc_sfb_mma_t,
+                                k_tile_idx=k_tile,
+                                valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                                mma_tiler_mnk=self.mma_tiler_mnk,
+                            )
+                            # Wait for slab k+1 and copy its SF while the UMMAs run.
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mt0 = read_clock64()
+                            kpipe_next = ab_consumer.wait_and_advance(peek_ab_full_status)
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mwait = fctl_mwait + (read_clock64() - fctl_mt0)
+                            peek_ab_full_status = cutlass.Boolean(1)
+                            if k_tile + 2 < k_tile_cnt:
+                                peek_ab_full_status = ab_consumer.try_wait()
+                            kpn_cols = kpipe_next.index * cutlass.Int32(self.num_sf_tmem_cols)
+                            kpn_sfa_t = cute.make_tensor(
+                                cute.recast_ptr(
+                                    acc_tmem_ptr + self.num_accumulator_tmem_cols + kpn_cols,
+                                    dtype=self.sf_dtype,
+                                ),
+                                tCtSFA_layout,
+                            )
+                            kpn_sfb_t = cute.make_tensor(
+                                cute.recast_ptr(
+                                    acc_tmem_ptr
+                                    + self.num_accumulator_tmem_cols
+                                    + self.num_sfa_tmem_cols
+                                    + kpn_cols,
+                                    dtype=self.sf_dtype,
+                                ),
+                                tCtSFB_layout,
+                            )
+                            (_, _, kpn_sfa_dst) = self.mainloop_s2t_copy_and_partition(sSFA, kpn_sfa_t)
+                            (_, _, kpn_sfb_dst) = self.mainloop_s2t_copy_and_partition(sSFB, kpn_sfb_t)
+                            kpn_coord = (None, None, None, None, kpipe_next.index)
+                            cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t[kpn_coord], kpn_sfa_dst)
+                            cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t[kpn_coord], kpn_sfb_dst)
+                            kpipe_cur.release()
+                            kpipe_cur = kpipe_next
+                        # Epilogue: the last slab's UMMAs, then its release.
+                        kpl_cols = kpipe_cur.index * cutlass.Int32(self.num_sf_tmem_cols)
+                        kpl_sfa_t = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_tmem_ptr + self.num_accumulator_tmem_cols + kpl_cols,
+                                dtype=self.sf_dtype,
+                            ),
+                            tCtSFA_layout,
+                        )
+                        kpl_sfb_t = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_tmem_ptr
+                                + self.num_accumulator_tmem_cols
+                                + self.num_sfa_tmem_cols
+                                + kpl_cols,
+                                dtype=self.sf_dtype,
+                            ),
+                            tCtSFB_layout,
+                        )
+                        kpl_sfb_mma_t = kpl_sfb_t
+                        if cutlass.const_expr(self.mma_tiler[1] == 64):
+                            kpl_sfb_mma_t = cute.make_tensor(
+                                cute.recast_ptr(
+                                    acc_tmem_ptr
+                                    + self.num_accumulator_tmem_cols
+                                    + self.num_sfa_tmem_cols
+                                    + kpl_cols
+                                    + sfb_shift,
+                                    dtype=self.sf_dtype,
+                                ),
+                                tCtSFB_layout,
+                            )
+                        kpl_crd = (None, None, None, kpipe_cur.index)
                         dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
                             acc_tensor=tCtAcc,
-                            a_frag_tile=tCrA[tile_crd],
-                            b_frag_tile=tCrB[tile_crd],
-                            sfa_tensor=tCtSFA,
-                            sfb_tensor=tCtSFB_mma,
-                            k_tile_idx=k_tile,
+                            a_frag_tile=tCrA[kpl_crd],
+                            b_frag_tile=tCrB[kpl_crd],
+                            sfa_tensor=kpl_sfa_t,
+                            sfb_tensor=kpl_sfb_mma_t,
+                            k_tile_idx=k_tile_cnt - cutlass.Int32(1),
                             valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )
-                        handle.release()
+                        kpipe_cur.release()
+                    else:
+                        for k_tile in cutlass.range(
+                            0, k_tile_cnt, 1, unroll=1
+                        ):
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mt0 = read_clock64()
+                            handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mwait = fctl_mwait + (read_clock64() - fctl_mt0)
+                            peek_ab_full_status = cutlass.Boolean(1)
+                            if k_tile + 1 < k_tile_cnt:
+                                peek_ab_full_status = ab_consumer.try_wait()
+
+                            s2t_stage_coord = (None, None, None, None, handle.index)
+                            # SF TMEM slot for this k-slab: slot 0 (single-slot
+                            # mode) or the slot of the AB smem stage being
+                            # consumed (num_sf_tmem_stages == num_ab_stage).
+                            tCtSFA_dst = tCtSFA_compact_s2t
+                            tCtSFB_dst = tCtSFB_compact_s2t
+                            tCtSFA_use = tCtSFA
+                            tCtSFB_use = tCtSFB_mma
+                            if cutlass.const_expr(self.num_sf_tmem_stages > 1):
+                                sf_slot_cols = handle.index * cutlass.Int32(
+                                    self.num_sf_tmem_cols
+                                )
+                                sfa_slot_ptr = cute.recast_ptr(
+                                    acc_tmem_ptr
+                                    + self.num_accumulator_tmem_cols
+                                    + sf_slot_cols,
+                                    dtype=self.sf_dtype,
+                                )
+                                tCtSFA_use = cute.make_tensor(sfa_slot_ptr, tCtSFA_layout)
+                                sfb_slot_ptr = cute.recast_ptr(
+                                    acc_tmem_ptr
+                                    + self.num_accumulator_tmem_cols
+                                    + self.num_sfa_tmem_cols
+                                    + sf_slot_cols,
+                                    dtype=self.sf_dtype,
+                                )
+                                tCtSFB_slot = cute.make_tensor(sfb_slot_ptr, tCtSFB_layout)
+                                (_, _, tCtSFA_dst) = self.mainloop_s2t_copy_and_partition(
+                                    sSFA, tCtSFA_use
+                                )
+                                (_, _, tCtSFB_dst) = self.mainloop_s2t_copy_and_partition(
+                                    sSFB, tCtSFB_slot
+                                )
+                                tCtSFB_use = tCtSFB_slot
+                                if cutlass.const_expr(self.mma_tiler[1] == 64):
+                                    sfb_mma_ptr = cute.recast_ptr(
+                                        acc_tmem_ptr
+                                        + self.num_accumulator_tmem_cols
+                                        + self.num_sfa_tmem_cols
+                                        + sf_slot_cols
+                                        + sfb_shift,
+                                        dtype=self.sf_dtype,
+                                    )
+                                    tCtSFB_use = cute.make_tensor(sfb_mma_ptr, tCtSFB_layout)
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_ms0 = read_clock64()
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[s2t_stage_coord],
+                                tCtSFA_dst,
+                            )
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[s2t_stage_coord],
+                                tCtSFB_dst,
+                            )
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mi0 = read_clock64()
+                                fctl_ms2t = fctl_ms2t + (fctl_mi0 - fctl_ms0)
+
+                            # tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                            tile_crd = (None, None, None, handle.index)
+                            dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                                acc_tensor=tCtAcc,
+                                a_frag_tile=tCrA[tile_crd],
+                                b_frag_tile=tCrB[tile_crd],
+                                sfa_tensor=tCtSFA_use,
+                                sfb_tensor=tCtSFB_use,
+                                k_tile_idx=k_tile,
+                                valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                                mma_tiler_mnk=self.mma_tiler_mnk,
+                            )
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mr0 = read_clock64()
+                                fctl_missue = fctl_missue + (fctl_mr0 - fctl_mi0)
+                            handle.release()
+                            if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                                fctl_mrel = fctl_mrel + (read_clock64() - fctl_mr0)
 
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
+                if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled):
+                    fctl_mma_end = read_globaltimer()
+                    if cute.arch.lane_idx() == cutlass.Int32(0):
+                        if fctl_seq < cutlass.Int32(FC_TILE_TIMELINE_MAX_TILES):
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 6
+                            ] = fctl_mma_end
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 10
+                            ] = fctl_mwait
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 11
+                            ] = read_clock64() - fctl_mloop_t0
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 12
+                            ] = fctl_macq
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 13
+                            ] = fctl_ms2t
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 14
+                            ] = fctl_missue
+                            token_comm_args.fc_tile_timeline[
+                                fctl_cta, fctl_seq, 15
+                            ] = fctl_mrel
+                    fctl_seq = fctl_seq + cutlass.Int32(1)
 
                 iket.range_pop()
 
                 work_tile_info = sched_consumer.consume_work()
 
             acc_pipeline.producer_tail(acc_producer_state)
+
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_end = read_globaltimer()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    cta_linear_id = self.token_comm_hook_cta_linear_id()
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 0
+                    ] = expert_start
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 1
+                    ] = expert_end
 
         # ════════════════════════════════════════════════════════════════════
         # Epilogue warps (warps 0-3)
@@ -2296,6 +2887,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 fc1_activation_per_token_scale=fc1_activation_per_token_scale,
             )
 
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_start = read_globaltimer()
+
             self.epilogue.run(
                 epi_smem_storage=epi_smem_storage,
                 tmem_ptr=acc_tmem_ptr,
@@ -2310,9 +2906,36 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 tidx=tidx,
                 optional_epi_args=optional_epi_args,
                 token_comm_args=token_comm_args,
+                fc_tile_cta_id=(
+                    self.token_comm_hook_cta_linear_id()
+                    if cutlass.const_expr(self.enable_token_comm and self.fc_tile_timeline_enabled)
+                    else None
+                ),
             )
+            if cutlass.const_expr(self.enable_token_comm):
+                # MegaMoE: the tile loop has returned (last accumulator
+                # consumed, tail flag fire done); the subclass may publish
+                # the combine ring here and stamp the epilogue exit.
+                self.token_comm_hook_epilogue_exit(
+                    token_comm_args,
+                    token_comm_storage,
+                    warp_idx=warp_idx,
+                    lane_idx=cute.arch.lane_idx(),
+                )
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
+            if cutlass.const_expr(
+                self.enable_token_comm and self.pipeline_timing_enabled
+            ):
+                expert_end = read_globaltimer()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    cta_linear_id = self.token_comm_hook_cta_linear_id()
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 0
+                    ] = expert_start
+                    token_comm_args.pipeline_timing[
+                        cta_linear_id, warp_idx, PIPELINE_STAGE_FC1_FC2, 1
+                    ] = expert_end
             tmem.free(tmem.retrieve_ptr(self.acc_dtype), self.num_tmem_alloc_cols)
 
 
@@ -2328,7 +2951,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # to fc1 -> arrive on dispatch-to-sched NamedBarrier).
         if cutlass.const_expr(self.enable_token_comm):
             if warp_idx >= self.dispatch_warp_id[0]:
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.warpgroup_reg_dealloc(self.comm_reg_cnt)
 
                 lane_idx_for_dispatch = cute.arch.lane_idx()
                 if cutlass.const_expr(self.token_back_standalone):
@@ -2339,6 +2962,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             warp_idx=warp_idx,
                             lane_idx=lane_idx_for_dispatch,
                             tidx=tidx,
+                            ab_smem_ptr=sA.iterator,
                         )
                     else:
                         self.token_comm_hook_token_back_warp_body(
@@ -2355,6 +2979,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         warp_idx=warp_idx,
                         lane_idx=lane_idx_for_dispatch,
                         tidx=tidx,
+                        ab_smem_ptr=sA.iterator,
                     )
 
         # ════════════════════════════════════════════════════════════════════
@@ -2370,6 +2995,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         lane_idx = cute.arch.lane_idx()
         self.token_comm_hook_kernel_tail(
             token_comm_args,
+            token_comm_storage,
             warp_idx=warp_idx,
             lane_idx=lane_idx,
             tidx=tidx,

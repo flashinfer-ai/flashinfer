@@ -39,6 +39,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    # Opt-in legacy SM100 NCCL GIN path. All default-PG ranks must participate.
+    internode: bool = field(default=False, kw_only=True)
+    ranks_per_node: int | None = field(default=None, kw_only=True)
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     activation: Literal["swiglu", "situ"] = "swiglu"
@@ -98,6 +101,10 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
+        if self.internode and self.kernel_name != "sm100_nvfp4_nvfp4_bf16_cutedsl":
+            raise ValueError(
+                "internode GIN is available only with the legacy sm100_nvfp4_nvfp4_bf16_cutedsl selector."
+            )
         validate_finalize_mode(
             self.finalize_mode, tuple(FinalizeMode), self.num_valid_tokens_tensor
         )
