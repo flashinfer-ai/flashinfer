@@ -31,7 +31,9 @@ Backward: the adjoint offsets ``d_f`` (the reverse walk from zero) and, unless
 the forward's transfer was kept, ``M_f^T`` again go to the owners (``b1``), the
 owner walks each chain backwards (``X <- M_f^T X + d_f``) and returns every
 crossing-out fragment's ``dS_out`` (``b2``); the local adjoint recurrence runs
-from it.  One compute stream; the collectives are asynchronous on the caller's
+from it.  One compute stream (the forward's summary pair may fork onto a side
+stream and join back before the next launch, see "Summary walk streams" below);
+the collectives are asynchronous on the caller's
 process group and waited at their first consumer.  Shipped schedule (adopted in an
 earlier revision): ``wait_first`` -- no merge
 or tape walk is issued while a collective is in flight, and the tape walks of a
@@ -93,6 +95,25 @@ The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
 (``_Tables.walk_form``) and looked up on every later launch: the eager call
 carries no per-launch list scheduling.
+
+Summary walk streams (``WALK_STREAMS_DEFAULT = "auto"``): the forward's
+summary pair -- K1 ``_offset`` and K3 over the offset walk list, into the c1
+send tiles at ``P = 1`` and the staging planes at ``P > 1`` (also in the
+replay forward of a replay-mode backward and in a checkpoint recompute's stage
+walks) -- reads the same local operands, writes disjoint tiles and feeds the
+next launch only, so K3 may run on a per-device side stream beside K1: an
+event recorded on the call's stream forks the side stream, an event recorded
+on the side stream joins it back before the next launch (:func:`_offset_pair`;
+capturable, bitwise the one-stream form).  The rule :func:`walk_streams`
+decides per pair from host-known inputs (the chains, the head count and the
+SM count, once per table set: ``_Tables.walk_streams``): two streams when K1
+alone fills a wave of its ``2 N`` slots (``len(chains) * H >= 2 N``), one
+stream below.  The first pair of a table set over its list on a
+device runs on one stream (it uploads the launches' device tables); the
+previous host path (``host_trim=0``) keeps one stream.  The test knob
+``walk_streams`` (``"one"`` / ``"two"``) forces a form for the A/B record;
+``LAST_CALL[kind]["walk_streams"]`` records ``(decided form, form run,
+n_walk)`` per pair.
 
 The bracket is host-side runtime state, so it is never issued inside a CUDA
 stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
@@ -445,12 +466,19 @@ FWD_O_FUSE_DEFAULT = 1
 # tape CTAs).
 WALK_FORMS = ("auto", "full", "split")
 WALK_FORM_DEFAULT = "auto"
+# Walk streams of the forward's summary pair (K1 ``_offset`` + K3 over the offset walk list, :func:`_offset_pair`): "auto"
+# (shipped) = the rule :func:`walk_streams` per pair (two streams once K1 fills a wave, one stream below); "one" / "two" force
+# a form, _kcp_test_knobs only (the A/B record).  The two kernels read the same operands and write disjoint tiles, so
+# the form never changes a bit.
+WALK_STREAMS = ("auto", "one", "two")
+WALK_STREAMS_DEFAULT = "auto"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
     "cols_rule": COLS_RULES,
     "walk_geometry": WALK_GEOMETRIES,
     "walk_form": WALK_FORMS,
+    "walk_streams": WALK_STREAMS,
     "graph": GRAPH_MODES,
     "graph_cap": GRAPH_CAPS,
     "host_trim": HOST_TRIMS,
@@ -806,6 +834,50 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
         else None,
         device_index=call.device.index,
     )
+
+
+def walk_streams(
+    chains: Sequence[int],
+    num_heads: int,
+    sm_count: int,
+    *,
+    knob: str = WALK_STREAMS_DEFAULT,
+) -> str:
+    """The stream form of one summary pair (K1 ``_offset`` and K3 over the same walk list, :func:`_offset_pair`):
+    ``"two"`` (K3 on a side stream beside K1) or ``"one"`` (K3 after K1 on the call's stream).  ``chains`` are the
+    chunk counts of the listed segments, ``knob`` the ``walk_streams`` test knob (``"one"`` / ``"two"`` force a form).
+
+    Both programs run two CTAs per SM: K1 launches ``c1 = len(chains) * num_heads`` CTAs, K3 ``2 * c1``.  With
+    ``N = sm_count``, two streams only when K1 alone fills at least one wave of its ``2 N`` slots (``c1 >= 2 N``),
+    one stream below.  The layer A/B (W4, 16384 tokens per rank) sets the bound: two streams on its interior ranks'
+    pair at ``c1 = 512`` (8 walks at H 64) make the layer's forward faster on sm_100a, sm_103a and sm_107a, while on
+    the pair at ``c1 = 256`` (16 walks at H 16, one pair per forward) they make it slower on sm_100a and sm_103a
+    (152 SMs) and no faster on sm_107a (212 SMs).  An empty list is ``"one"`` (no launch)."""
+    if knob not in WALK_STREAMS:
+        raise ValueError(f"walk_streams must be one of {WALK_STREAMS}, got {knob!r}")
+    if knob != "auto":
+        return knob
+    if not len(chains):
+        return "one"
+    return "two" if len(chains) * int(num_heads) >= 2 * int(sm_count) else "one"
+
+
+_PAIR_STREAMS: dict[
+    int, tuple[Any, Any, Any]
+] = {}  # device index -> (side stream, fork event, join event)
+
+
+def _pair_streams(device_index: int) -> tuple[Any, Any, Any]:
+    """The side stream of the summary pair on device ``device_index`` and its fork / join events: created once per
+    device and process (at the first two-stream decision, an eager call) and reused by every later pair."""
+    hit = _PAIR_STREAMS.get(device_index)
+    if hit is None:
+        hit = _PAIR_STREAMS[device_index] = (
+            torch.cuda.Stream(device=device_index),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        )
+    return hit
 
 
 class KcpPreconditionError(RuntimeError):
@@ -3532,6 +3604,28 @@ class _Tables:
             )
         return form
 
+    def walk_streams(
+        self, walk: Sequence[int], H: int, sm_count: int, knob: str
+    ) -> str:
+        """The stream form (``"one"`` / ``"two"``) of the summary pair over the segments ``walk``
+        (:func:`walk_streams` on the chunk counts of its listed segments, the head count ``H``, the device's SM count
+        and the ``walk_streams`` knob): evaluated once per ``(walk list, H, SM count, knob)`` of this table set and
+        looked up on every later pair (keyed by value, like :meth:`walk_form`)."""
+        key = (tuple(walk), int(H), int(sm_count), str(knob))
+        cache = self.__dict__.setdefault("_walk_streams", {})
+        form = cache.get(key)
+        if form is None:
+            if len(cache) >= self.ID_CACHE_MAX:
+                cache.clear()
+            seg = self.hp.seg_chunk_start
+            form = cache[key] = walk_streams(
+                [int(seg[s + 1]) - int(seg[s]) for s in walk],
+                int(H),
+                int(sm_count),
+                knob=str(knob),
+            )
+        return form
+
     def pool_sizes(self, backward: bool) -> dict[str, int]:
         names = cake_kcp_plan.FWD_POOLS + (cake_kcp_plan.BWD_POOLS if backward else ())
         return {
@@ -4369,6 +4463,7 @@ class CakeKDADetKcpOptions:
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
     walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 and fused forward walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
+    walk_streams: str = WALK_STREAMS_DEFAULT  # the stream form of the forward's summary pair: "auto" (shipped) = the walk_streams rule per pair; "one" / "two" via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only
@@ -4518,20 +4613,26 @@ def _options(kwargs: dict[str, Any]) -> CakeKDADetKcpOptions:
     ).check()
 
 
-# The validated options of an empty ``**options``: (the plan module's SAVE_TRANSFER_DEFAULT it resolved, the options).
-_DEFAULT_OPTIONS: list[tuple[Any, CakeKDADetKcpOptions]] = []
+# The validated options of an empty ``**options``: (the plan module's SAVE_TRANSFER_DEFAULT it resolved, the options'
+# field values in ``dataclasses.fields`` order).
+_DEFAULT_OPTIONS: list[tuple[Any, tuple[Any, ...]]] = []
 
 
 def _default_options() -> CakeKDADetKcpOptions:
     """``_options({})``: an entry point called without keyword options validates the defaults, which depend on no
     input (only on this module's defaults and the plan module's ``SAVE_TRANSFER_DEFAULT``, the cache key); the first
-    call validates them through the full path, every call gets a fresh copy of that result (equal field by field)."""
+    call validates them through the full path and keeps the field values, every call builds a fresh
+    :class:`CakeKDADetKcpOptions` from them (equal field by field).  The copy is the dataclass ``__init__`` with the values
+    in field order: no ``__post_init__`` (the check stays explicit), and unlike a ``__dict__`` copy it also works for
+    a ``slots=True`` dataclass, at about the same host cost per call."""
     key = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
     if not _DEFAULT_OPTIONS or _DEFAULT_OPTIONS[0][0] is not key:
-        _DEFAULT_OPTIONS[:] = [(key, _options({"_kcp_test_knobs": None}))]
-    opts = object.__new__(CakeKDADetKcpOptions)
-    opts.__dict__.update(_DEFAULT_OPTIONS[0][1].__dict__)
-    return opts
+        opts = _options({"_kcp_test_knobs": None})
+        values = tuple(
+            getattr(opts, f.name) for f in dataclasses.fields(CakeKDADetKcpOptions)
+        )
+        _DEFAULT_OPTIONS[:] = [(key, values)]
+    return CakeKDADetKcpOptions(*_DEFAULT_OPTIONS[0][1])
 
 
 def _with_option_signature(fn):
@@ -4682,6 +4783,11 @@ class CakeKDADetKcpCall:
         self.walk_form_log: list[
             tuple[str, str, int]
         ] = []  # (program, form, n_walk) per K1 / K2 walk launch
+        # "auto": the walk_streams rule per summary pair; "one" / "two" forced
+        self.walk_streams = str(opts.walk_streams)
+        self.walk_streams_log: list[
+            tuple[str, str, int]
+        ] = []  # (decided form, form run, n_walk) per summary pair (_offset_pair)
         self.merge_fuse = str(opts.merge_fuse)  # fused carry merges
         self.saved_carry = int(
             opts.saved_carry
@@ -4893,6 +4999,9 @@ def _record(kind: str, call: CakeKDADetKcpCall) -> None:
         "walk_forms": list(
             call.walk_form_log
         ),  # (record, form, n_walk) per K1 / K2 walk launch: the registry's rule or the walk_form knob
+        "walk_streams": list(
+            call.walk_streams_log
+        ),  # (decided form, form run, n_walk) per summary pair: the walk_streams rule or knob, and the streams it ran on
         # the host path of this call (1 trimmed = shipped / 0 previous; same launches)
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)
@@ -5286,19 +5395,11 @@ def _summaries(call: CakeKDADetKcpCall) -> None:
     composes the crossing-out fragments' segments (forward family -> ``B_f``, adjoint family -> ``M_f^T``)."""
     tb = call.tb
     if tb.P == 1:
-        call.walk(
-            "kcp_fwdh_offset",
+        _offset_pair(
+            call,
             tb.walk_offset,
-            h0=None,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
-        )
-        call.walk(
-            "kcp_transfer_walk",
-            tb.walk_offset,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
-            init_mode=0,
-            use_u=0,
-            write_transposed=0,
+            call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
+            call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
         )
         return
     _stage_walks(call)
@@ -5313,19 +5414,79 @@ def _summaries(call: CakeKDADetKcpCall) -> None:
 def _stage_walks(call: CakeKDADetKcpCall) -> None:
     """``P > 1``: the K1 ``_offset`` / K3 walks of every segment into the staging planes ``stage_b`` / ``stage_m``."""
     tb = call.tb
-    call.walk(
-        "kcp_fwdh_offset",
+    _offset_pair(
+        call,
         tb.walk_offset,
-        h0=None,
-        out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
     )
-    call.walk(
-        "kcp_transfer_walk",
-        tb.walk_offset,
-        out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-        init_mode=0,
-        use_u=0,
-        write_transposed=0,
+
+
+def _offset_pair(
+    call: CakeKDADetKcpCall, walk: Sequence[int], out_b: Indexed, out_m: Indexed
+) -> None:
+    """The summary pair over ``walk``: K1 ``_offset`` (the walk from zero into ``out_b``) and K3 (the transfer into
+    ``out_m``), in this issue order.  The two read the same local operands and write disjoint tiles, and the next
+    launch reads both, so they may run concurrently: on two streams (:func:`walk_streams`, the call's
+    ``walk_streams`` knob) K1 goes on the call's stream and K3 on the device's side stream
+    (:func:`_pair_streams`) between a fork (an event recorded on the call's stream, waited by the side stream) and
+    a join (an event recorded on the side stream, waited by the call's stream) -- every launch after the pair, the
+    ``c1`` collective included, is ordered after both.  The fork / join are stream-ordered event operations, so a
+    CUDA-graph capture of the call captures them as graph dependencies.
+
+    Allocator: the side stream allocates nothing.  Its operands -- the arena views, the pools ``out_m`` addresses
+    (built here, before the fork, on the call's stream) and the table set's device tables -- are owned by the
+    workspace, the call or the table set and stay alive past the join, which the call's stream waits for before any
+    later launch; a block allocated on the call's stream is reused by the caching allocator only on that stream, so
+    no reuse can overtake the side stream's work.  The device tables of a launch are uploaded on the current stream
+    at its table set's first launch (never under a capture), so the first pair of a table set over ``walk`` on a
+    device runs on one stream (its K3 would otherwise read a table K1 uploads after the fork); once both launches
+    have been issued, their tables are resident and later pairs take the decided form.  Two streams run only on the
+    trimmed host path (``host_trim=1``) of the kernel backend on a CUDA device; the previous host path and other
+    backends keep one stream.  ``call.walk_streams_log`` records ``(decided form, form run, n_walk)``."""
+    if len(walk) == 0:
+        return
+    k3_args = {"out": out_m, "init_mode": 0, "use_u": 0, "write_transposed": 0}
+    if not isinstance(
+        call, CakeKDADetKcpCall
+    ):  # a test's driver call: the two launches in order
+        call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+        call.walk("kcp_transfer_walk", walk, **k3_args)
+        return
+    decided, streams, seen, key = "one", None, None, None
+    if call.device.type == "cuda" and isinstance(call.backend, KernelBackend):
+        index = (
+            call.device.index
+            if call.device.index is not None
+            else torch.cuda.current_device()
+        )
+        decided = call.tb.walk_streams(
+            walk, call.H, cake_jit.sm_count(index), call.walk_streams
+        )
+        if decided == "two" and call.host_trim:
+            seen = call.tb.__dict__.setdefault("_pair_seen", set())
+            key = (id(walk), index)  # the table set's own list object
+            pair = _pair_streams(index)  # created in the eager first pair of the key
+            streams = pair if key in seen else None
+    if streams is None:
+        call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+        call.walk("kcp_transfer_walk", walk, **k3_args)
+        if seen is not None:
+            seen.add(key)  # both launches issued: their device tables are resident
+    else:
+        side, fork, join = streams
+        main = torch.cuda.current_stream(call.device)
+        fork.record(main)
+        side.wait_event(fork)
+        try:
+            call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+            with torch.cuda.stream(side):
+                call.walk("kcp_transfer_walk", walk, **k3_args)
+        finally:  # the join also on an error: a capture never ends with the side stream unjoined
+            join.record(side)
+            main.wait_event(join)
+    call.walk_streams_log.append(
+        (decided, "one" if streams is None else "two", len(walk))
     )
 
 
