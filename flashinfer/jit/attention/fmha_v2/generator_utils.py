@@ -10,6 +10,7 @@
 
 import logging
 import os
+import platform
 import subprocess
 from collections import namedtuple
 from enum import IntEnum
@@ -3789,31 +3790,24 @@ def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None
     # Make sure we have a bin directory.
     if not os.path.exists("bin"):
         os.mkdir("bin")
-    cmd = [
-        "nvcc",
-        "-I",
-        "src",
-        "-Xcompiler",
-        "-Wno-enum-compare",
-        "--std=c++17",
-        "-o",
-        "bin/print_traits.exe",
-        "generated/print_kernel_traits.cu",
-    ]
+    cmd = ["nvcc", "-I", "src"]
+    if platform.system() == "Windows":
+        cmd += ["--std=c++20", "-D_USE_MATH_DEFINES", "-Xcompiler", "/Zc:preprocessor"]
+    else:
+        cmd += ["-Xcompiler", "-Wno-enum-compare", "--std=c++17"]
+    cmd += ["-o", "bin/print_traits.exe", "generated/print_kernel_traits.cu"]
     # The trait headers include flashinfer/math.cuh, including vendored CCCL headers.
     for include_dir in [*get_cccl_includes(), jit_env.FLASHINFER_INCLUDE_DIR]:
         cmd.extend(["-I", str(include_dir.resolve())])
     if "CUDA_PATH" in os.environ:
         cmd[0] = os.environ["CUDA_PATH"] + "/bin/" + cmd[0]
     # print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))
-    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    output, error = process.communicate()
+    subprocess.run(cmd, stdout=subprocess.PIPE, check=True)
     # print('Running "bin/print_traits.exe":')
-    process = subprocess.Popen(
-        "bin/print_traits.exe", stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    process = subprocess.run(
+        ["bin/print_traits.exe"], stdout=subprocess.PIPE, check=True
     )
-    output, error = process.communicate()
-    output_str = output.decode("utf-8").strip()
+    output_str = process.stdout.decode("utf-8").strip()
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output_str.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)

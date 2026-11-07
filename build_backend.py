@@ -29,10 +29,26 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from build_utils import get_cuda_tile_compile_dependency_requirements, get_git_version
+from build_utils import (
+    apply_cutlass_patches,
+    get_cuda_tile_compile_dependency_requirements,
+    get_git_version,
+)
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
+
+
+def _load_spdlog_patch():
+    # The JIT and the wheel build share one definition of the spdlog rewrite; the
+    # package itself is not importable at build time, so load the module by path.
+    import importlib.util
+
+    path = _root / "flashinfer" / "jit" / "spdlog_patch.py"
+    spec = importlib.util.spec_from_file_location("flashinfer_spdlog_patch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
@@ -427,7 +443,6 @@ def _check_nccl_version_drift(wheel: Path) -> None:
     If the wheel's installed nccl.h has a different code, warn — we'll build
     against the wheel's ABI which may differ from the submodule we patched.
     """
-    import re
 
     src = _root / "3rdparty" / "nccl" / "src" / "nccl.h.in"
     wheel_h = wheel / "include" / "nccl.h"
@@ -1102,6 +1117,8 @@ def write_if_different(path: Path, content: str) -> None:
 
 
 def _create_data_dir(use_symlinks=True):
+    # Both source packaging and AOT use this populated CUTLASS checkout.
+    apply_cutlass_patches(_root / "3rdparty" / "cutlass")
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
@@ -1343,6 +1360,23 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    if os.name != "nt":
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+        _slim_wheel(Path(wheel_directory) / name)
+        return name
+
+    spdlog_patch = _load_spdlog_patch()
+    header = (
+        _root / "3rdparty" / "spdlog" / "include" / spdlog_patch.SPDLOG_FORMAT_HEADER
+    )
+    original = header.read_bytes()
+    patched = spdlog_patch.patch_bundled_format_h(original.decode("utf-8")).encode(
+        "utf-8"
+    )
+    try:
+        header.write_bytes(patched)
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    finally:
+        header.write_bytes(original)
     _slim_wheel(Path(wheel_directory) / name)
     return name

@@ -27,6 +27,7 @@
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -93,8 +94,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
   static constexpr int totalExpertCounts = BlockKernelMaxNumTokens * MaxNumExperts;
-  __shared__ int8_t __attribute((aligned(128))) smemOffset[totalExpertCounts];
-  __shared__ int8_t __attribute((aligned(128))) smemKIdx[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemOffset[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemKIdx[totalExpertCounts];
 
   using Scan = cub::BlockScan<int32_t, NumThreadsBlock>;
   __shared__ typename Scan::TempStorage tempStorage;
@@ -787,8 +788,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Cl
   static constexpr int NumWarpsBlock = ClusterBlockDim / WarpSize;
   static_assert(ClusterBlockDim % WarpSize == 0);
   static_assert(ClusterBlockDim <= NumThreads);
-  __shared__ TypePacked __attribute((
-      aligned(128))) smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
+  __shared__ TypePacked __align__(128)
+      smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
   routingIndicesClusterKernelBody<KernelParams, BaseType, ClusterBlockDim, NumWarpsBlock>(
       params, smemPackedScoreIdx);
 }
@@ -1200,14 +1201,14 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
     static constexpr bool kNeedsAux = PolicyPairNeedsAux<PreProc, PostProc>::value;
     static constexpr int kAuxSize = kNeedsAux ? MaxNumExperts : 1;
 
-    static constexpr float invalidScoreFloat = -INFINITY;
+    static constexpr float invalidScoreFloat = -std::numeric_limits<float>::infinity();
 
     // Per-expert smem arrays:
     //   smemBiased[e] = topK selection key for expert e
     //   smemAux[e]    = auxiliary data for expert e (only used / written when
     //                   PolicyPairNeedsAux<PreProc, PostProc>::value is true)
-    __shared__ BaseType __attribute((aligned(128))) smemBiased[MaxNumExperts];
-    __shared__ BaseType __attribute((aligned(128))) smemAuxStorage[kAuxSize];
+    __shared__ BaseType __align__(128) smemBiased[MaxNumExperts];
+    __shared__ BaseType __align__(128) smemAuxStorage[kAuxSize];
     BaseType* auxPtr = kNeedsAux ? smemAuxStorage : smemBiased;
 
     auto block = cg::this_thread_block();
@@ -1262,10 +1263,8 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
                   LaneTopKNumWorkerWarps <= kBlockScoresKernelBlockDim / WarpSize &&
                   LaneTopKMergeValuesPerLane <= 64 &&
                   PostprocessSupportsLaneOwnedTopK<PostProc>::value) {
-      __shared__ BaseType
-          __attribute((aligned(128))) smemIntermediateScores[LaneTopKNumIntermediate];
-      __shared__ int32_t
-          __attribute((aligned(128))) smemIntermediateExperts[LaneTopKNumIntermediate];
+      __shared__ BaseType __align__(128) smemIntermediateScores[LaneTopKNumIntermediate];
+      __shared__ int32_t __align__(128) smemIntermediateExperts[LaneTopKNumIntermediate];
 
       if (warpIdx < LaneTopKNumWorkerWarps) {
         BaseType localScores[LaneTopKValuesPerWorkerLane];

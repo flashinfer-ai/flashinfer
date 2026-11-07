@@ -21,6 +21,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#include <cuda/std/bit>
 #include <cuda/std/cfloat>
 #include <iterator>
 #include <memory>
@@ -470,7 +471,7 @@ class TllmGenFmhaKernel {
     auto sageParamEncode = [](int blockSize) -> int32_t {
       FLASHINFER_CHECK((blockSize & (blockSize - 1)) == 0,
                        "SageAttention block size must be a power of 2.");
-      return blockSize == 0 ? 0 : __builtin_ctz(static_cast<unsigned int>(blockSize));
+      return blockSize == 0 ? 0 : cuda::std::countr_zero(static_cast<unsigned int>(blockSize));
     };
     kernelParams.ptrSageAttnSfsQ = params.ptrSageAttnSfsQ;
     kernelParams.ptrSageAttnSfsK = params.ptrSageAttnSfsK;
@@ -569,9 +570,14 @@ class TllmGenFmhaKernel {
     if (!ctaLaunchParams.mMultiWaveKvSplit) {
       return true;
     }
-    // acc *= x; false on int64 overflow.
+    // acc *= x; false on int64 overflow. Written without __builtin_mul_overflow, which
+    // MSVC does not provide; the operands are non-negative counts.
     auto const mulTo = [](int64_t& acc, int64_t x) {
-      return !__builtin_mul_overflow(acc, x, &acc);
+      if (acc < 0 || x < 0 || (x != 0 && acc > INT64_MAX / x)) {
+        return false;
+      }
+      acc *= x;
+      return true;
     };
     int64_t numCtas = ctaLaunchParams.mNumCtasX;
     if (!mulTo(numCtas, ctaLaunchParams.mNumCtasY) || !mulTo(numCtas, ctaLaunchParams.mNumCtasZ) ||
@@ -585,9 +591,9 @@ class TllmGenFmhaKernel {
         !mulTo(partialOBytes, kernelMeta.mStepQ) ||
         !mulTo(partialOBytes, kernelMeta.mHeadDimPerCtaV) ||
         !mulTo(partialOBytes, kernelMeta.m2CtaMma ? 2 : 1) ||
-        !mulTo(partialOBytes, /*bytesPerPartialElt=*/2) ||
-        __builtin_add_overflow(statsBytes, partialOBytes, &bytes) ||
-        static_cast<uint64_t>(bytes) > params.mMultiCtasKvScratchBytes) {
+        !mulTo(partialOBytes, /*bytesPerPartialElt=*/2) || statsBytes > INT64_MAX - partialOBytes ||
+        static_cast<uint64_t>(bytes = statsBytes + partialOBytes) >
+            params.mMultiCtasKvScratchBytes) {
       return false;
     }
     totalNumCtas = static_cast<int32_t>(numCtas);

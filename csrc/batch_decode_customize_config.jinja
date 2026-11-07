@@ -19,11 +19,11 @@ using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
-constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
-constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
-constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
-constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
-constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
+static constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+static constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
+static constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
+static constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
+static constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
 struct Params {
   using DTypeQ = DTypeQ;

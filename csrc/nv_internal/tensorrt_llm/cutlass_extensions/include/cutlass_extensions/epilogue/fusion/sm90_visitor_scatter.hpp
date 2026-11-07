@@ -36,6 +36,7 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 #include "cutlass_extensions/arch/copy_red_global.hpp"
@@ -293,19 +294,25 @@ struct Sm90ScatterPtrArray {
     using CopyOpR2GRed = decltype(get_reduction_op<ElementOutput, MaxVecSize>());
     using CopyOpR2GStg = UniversalCopy<uint_bit_t<Copy_Atom<CopyOpR2GRed,ElementOutput>::NumValSrc * sizeof_bits_v<ElementOutput>>>;
 
+    // Hoist EpilogueTile sizes out of the lambda so NVCC can evaluate them
+    // as constexpr even when args is captured by reference through a
+    // complex template chain (e.g. SM120 block-scaled MMA atoms).
+    constexpr int EpiTileM = CUTE_STATIC_V(size<0>(EpilogueTile{}));
+    constexpr int EpiTileN = CUTE_STATIC_V(size<1>(EpilogueTile{}));
+
     auto make_tiled_r2g = [&](auto copy_op)
     {
       using CopyAtomR2G = Copy_Atom<decltype(copy_op),ElementOutput>;
       constexpr int VecSize = CopyAtomR2G::NumValSrc;
       if constexpr (cutlass::gemm::detail::is_k_major<StrideOutput>()) {
-        constexpr int ThreadsMajor = size<1>(args.epi_tile) / VecSize;
+        constexpr int ThreadsMajor = EpiTileN / VecSize;
         constexpr int ThreadsMinor = NumThreads / ThreadsMajor;
         return make_tiled_copy(CopyAtomR2G{},
           Layout<Shape<Int<ThreadsMinor>, Int<ThreadsMajor>>, Stride<Int<ThreadsMajor>, _1>>{},
           Layout<Shape<_1, Int<VecSize>>>{});
       }
       else if constexpr (cutlass::gemm::detail::is_mn_major<StrideOutput>()) {
-        constexpr int ThreadsMajor = size<0>(args.epi_tile) / VecSize;
+        constexpr int ThreadsMajor = EpiTileM / VecSize;
         constexpr int ThreadsMinor = NumThreads / ThreadsMajor;
         return make_tiled_copy(CopyAtomR2G{},
           Layout<Shape<Int<ThreadsMajor>, Int<ThreadsMinor>>, Stride<_1, Int<ThreadsMajor>>>{},
@@ -750,6 +757,168 @@ struct FusionCallbacks<
   // Ctor inheritance
   using Impl::Impl;
 
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// SM120 dispatch policy specializations
+// Sm120PtrArrayTmaWarpSpecialized reuses the SM90 epilogue collective but needs
+// its own FusionCallbacks partial specializations so that template matching
+// selects the correct (scatter-aware) Arguments type instead of falling through
+// to the default LinearCombination Arguments.
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+  int StagesC,
+  int StagesD,
+  int FragmentSize,
+  bool ReuseSmemC,
+  bool DelayTmaStore,
+  int NumEpilogueWarpGroups,
+  class GmemLayoutTagOut,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias,
+  class ElementScale,
+  class ElementScalar,
+  int AlignmentBias,
+  int AlignmentOutput,
+  FloatRoundStyle RoundStyle,
+  class CtaTileShapeMNK,
+  class EpilogueTile,
+  class SmemLayoutAtom,
+  class CopyOpR2S
+>
+struct FusionCallbacks<
+    epilogue::Sm120PtrArrayTmaWarpSpecialized<StagesC,
+                                             StagesD,
+                                             FragmentSize,
+                                             ReuseSmemC,
+                                             DelayTmaStore,
+                                             NumEpilogueWarpGroups
+                                            >,
+    fusion::ScaledAccPerRowBiasPerColScaleScatter<GmemLayoutTagOut,
+                                                  ElementOutput,
+                                                  ElementCompute,
+                                                  ElementBias,
+                                                  ElementScale,
+                                                  ElementScalar,
+                                                  AlignmentBias,
+                                                  AlignmentOutput,
+                                                  RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile,
+    SmemLayoutAtom,
+    CopyOpR2S
+> : FusionCallbacks<
+      epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC,
+                                               StagesD,
+                                               FragmentSize,
+                                               ReuseSmemC,
+                                               DelayTmaStore,
+                                               NumEpilogueWarpGroups>,
+      fusion::ScaledAccPerRowBiasPerColScaleScatter<GmemLayoutTagOut,
+                                                    ElementOutput,
+                                                    ElementCompute,
+                                                    ElementBias,
+                                                    ElementScale,
+                                                    ElementScalar,
+                                                    AlignmentBias,
+                                                    AlignmentOutput,
+                                                    RoundStyle>,
+      CtaTileShapeMNK,
+      EpilogueTile,
+      SmemLayoutAtom,
+      CopyOpR2S
+    > {
+
+  using Base = FusionCallbacks<
+    epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize,
+                                             ReuseSmemC, DelayTmaStore, NumEpilogueWarpGroups>,
+    fusion::ScaledAccPerRowBiasPerColScaleScatter<GmemLayoutTagOut, ElementOutput, ElementCompute,
+                                                  ElementBias, ElementScale, ElementScalar,
+                                                  AlignmentBias, AlignmentOutput, RoundStyle>,
+    CtaTileShapeMNK, EpilogueTile, SmemLayoutAtom, CopyOpR2S
+  >;
+
+  using Base::Base;
+  using typename Base::Arguments;
+};
+
+template <
+  int StagesC,
+  int StagesD,
+  int FragmentSize,
+  bool ReuseSmemC,
+  bool DelayTmaStore,
+  int NumEpilogueWarpGroups,
+  class GmemLayoutTagOut,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias,
+  class ElementScale,
+  class ElementScalar,
+  int AlignmentBias,
+  int AlignmentOutput,
+  FloatRoundStyle RoundStyle,
+  class CtaTileShapeMNK,
+  class EpilogueTile,
+  class SmemLayoutAtom,
+  class CopyOpR2S
+>
+struct FusionCallbacks<
+    epilogue::Sm120PtrArrayTmaWarpSpecialized<StagesC,
+                                             StagesD,
+                                             FragmentSize,
+                                             ReuseSmemC,
+                                             DelayTmaStore,
+                                             NumEpilogueWarpGroups
+                                            >,
+    fusion::ScaledAccPerColBiasPerRowScaleScatter<GmemLayoutTagOut,
+                                                  ElementOutput,
+                                                  ElementCompute,
+                                                  ElementBias,
+                                                  ElementScale,
+                                                  ElementScalar,
+                                                  AlignmentBias,
+                                                  AlignmentOutput,
+                                                  RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile,
+    SmemLayoutAtom,
+    CopyOpR2S
+> : FusionCallbacks<
+      epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC,
+                                               StagesD,
+                                               FragmentSize,
+                                               ReuseSmemC,
+                                               DelayTmaStore,
+                                               NumEpilogueWarpGroups>,
+      fusion::ScaledAccPerColBiasPerRowScaleScatter<GmemLayoutTagOut,
+                                                    ElementOutput,
+                                                    ElementCompute,
+                                                    ElementBias,
+                                                    ElementScale,
+                                                    ElementScalar,
+                                                    AlignmentBias,
+                                                    AlignmentOutput,
+                                                    RoundStyle>,
+      CtaTileShapeMNK,
+      EpilogueTile,
+      SmemLayoutAtom,
+      CopyOpR2S
+    > {
+
+  using Base = FusionCallbacks<
+    epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize,
+                                             ReuseSmemC, DelayTmaStore, NumEpilogueWarpGroups>,
+    fusion::ScaledAccPerColBiasPerRowScaleScatter<GmemLayoutTagOut, ElementOutput, ElementCompute,
+                                                  ElementBias, ElementScale, ElementScalar,
+                                                  AlignmentBias, AlignmentOutput, RoundStyle>,
+    CtaTileShapeMNK, EpilogueTile, SmemLayoutAtom, CopyOpR2S
+  >;
+
+  using Base::Base;
+  using typename Base::Arguments;
 };
 
 } // namespace cutlass::epilogue::fusion

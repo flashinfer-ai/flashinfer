@@ -83,8 +83,8 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // this is a full table of which token is routed to which expert.
   // the assumption here is that there are no more than 128 experts.
   // we use a stride of 33 instead of 32 to avoid shared memory bank conflicts.
-  __shared__ int32_t __attribute((
-      aligned(128))) smemExpertTokenCountFull[WarpKernelMaxNumTokens][WarpKernelSmemStride];
+  __shared__ int32_t __align__(128)
+      smemExpertTokenCountFull[WarpKernelMaxNumTokens][WarpKernelSmemStride];
   static_assert(WarpKernelSmemStride == WarpSize + 1);
   static_assert(KernelParams::MaxNumExperts / sizeof(int32_t) <= WarpSize);
 
@@ -342,7 +342,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
   using TypePacked = PackedScoreIdx<OutputT>;
-  __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps];
+  __shared__ TypePacked __align__(128) smemPackedScoreIdx[NumWarps];
 
   uint32_t const clusterBlockRank = blockIdx.x;
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
