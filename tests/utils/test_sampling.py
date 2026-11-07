@@ -2342,6 +2342,29 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+@pytest.mark.parametrize("vocab_size", [32000, 152064])
+def test_top_p_renorm_probs_deterministic_boundary(vocab_size):
+    """is_deterministic=True is bitwise reproducible when top_p lands on a cumulative-mass boundary."""
+    g = torch.Generator().manual_seed(1234)
+    logits = (torch.randn(64, vocab_size, generator=g) * 3.0).to("cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    cum = probs.double().sort(dim=-1, descending=True).values.cumsum(dim=-1)
+    cum = cum / cum[:, -1:]
+    targets = 0.5 + 0.45 * torch.rand(64, generator=g, dtype=torch.float64)
+    j = torch.searchsorted(cum, targets.unsqueeze(1).to("cuda:0"))
+    top_p = cum.gather(1, j).squeeze(1).float()
+
+    base = flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
+    for _ in range(10):
+        again = flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p, is_deterministic=True
+        )
+        assert torch.equal(again, base), "deterministic renorm differed across calls"
+
+    sums = base.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [4, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
@@ -2467,13 +2490,13 @@ def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 152064])
 @pytest.mark.parametrize("k", [10, 500])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
     """is_deterministic=True must be bitwise reproducible across invocations.
 
-    The default multi-CTA path accumulates the renormalization sum with float
+    The float multi-CTA path accumulates the renormalization sum with float
     atomicAdd, so CTA arrival order changes the last-bit rounding and repeated
     calls on identical input differ bitwise. Replicated execution (e.g.
     tensor-parallel ranks running the sampler redundantly on identical inputs)
@@ -2492,14 +2515,71 @@ def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
         again = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
         assert torch.equal(again, base), "deterministic renorm differed across calls"
 
-    # Same kept support as the default kernel; values match within the
+    # Same kept support as the float kernel; values match within the
     # fixed-point quantization noise (far below the test tolerance).
-    ref = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    ref = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=False)
     assert torch.equal(base > 0, ref > 0)
     torch.testing.assert_close(base, ref, rtol=1e-3, atol=1e-3)
 
     sums = base.float().sum(dim=-1)
     torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
+
+
+def _boundary_tie_rows(rows, vocab_size, pad):
+    out = torch.full((len(rows), vocab_size), pad, dtype=torch.float32, device="cuda:0")
+    for i, row in enumerate(rows):
+        out[i, : len(row)] = torch.tensor(row, dtype=torch.float32, device="cuda:0")
+    return out
+
+
+def _kept_sets(mask):
+    return [set(torch.nonzero(row).flatten().tolist()) for row in mask]
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_k_renorm_probs_keeps_boundary_ties(vocab_size, is_deterministic):
+    """Every token >= the k-th largest is kept, so ties at k survive together."""
+    rows = [[0.4, 0.3, 0.3], [0.25, 0.25, 0.25, 0.25], [0.5, 0.2, 0.2, 0.1]]
+    expected = [{0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2}]
+    probs = _boundary_tie_rows(rows, vocab_size, 0.0)
+    for k in (2, torch.full((3,), 2, dtype=torch.int32, device="cuda:0")):
+        out = flashinfer.sampling.top_k_renorm_probs(
+            probs, k, is_deterministic=is_deterministic
+        )
+        assert _kept_sets(out > 0) == expected
+        assert torch.equal(out[0, 1], out[0, 2])
+        sums = out.sum(dim=-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+def test_top_k_mask_logits_keeps_boundary_ties(vocab_size):
+    """Every logit >= the k-th largest is kept, so ties at k survive together."""
+    rows = [[1.0, 0.5, 0.5], [2.0, 1.0, 1.0, 1.0], [3.0, 2.0, 2.0, 1.0]]
+    expected = [{0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2}]
+    logits = _boundary_tie_rows(rows, vocab_size, -10.0)
+    for k in (2, torch.full((3,), 2, dtype=torch.int32, device="cuda:0")):
+        out = flashinfer.sampling.top_k_mask_logits(logits, k)
+        assert _kept_sets(torch.isfinite(out)) == expected
+        assert torch.equal(out[torch.isfinite(out)], logits[torch.isfinite(out)])
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_p_renorm_probs_keeps_boundary_ties(vocab_size, is_deterministic):
+    """A token is kept when its strictly-greater mass is below top_p, so ties survive together."""
+    rows = [[0.4, 0.3, 0.3], [0.5, 0.2, 0.2, 0.1], [0.25, 0.25, 0.25, 0.25]]
+    top_p = torch.tensor([0.5, 0.6, 0.3], device="cuda:0")
+    expected = [{0, 1, 2}, {0, 1, 2}, {0, 1, 2, 3}]
+    probs = _boundary_tie_rows(rows, vocab_size, 0.0)
+    out = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=is_deterministic
+    )
+    assert _kept_sets(out > 0) == expected
+    assert torch.equal(out[0, 1], out[0, 2])
+    sums = out.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
