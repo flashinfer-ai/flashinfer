@@ -948,8 +948,8 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
-    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing, no
-    finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing from
+    logits, no finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
     non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
     an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
@@ -984,12 +984,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             "parallel",
         ),
-        (
-            dict(
-                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
-            ),
-            "n_group",
-        ),
         (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
         with pytest.raises(errors) as excinfo:
@@ -1013,6 +1007,31 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # the ungated weights with the gated class: refused at the call, not computed
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2()))
+    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
+    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    grouped = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=2,
+                topk_group=1,
+            ),
+            quant=QuantConfig(),
+            experts=ExpertConfig(intermediate_size=I),
+            backend=BackendOptions((BatchInvariantMoeConfig(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack(x, logits), W)
+    assert "n_group" in str(excinfo.value)
+    g_ids, g_wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(
+        bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+        bits(layer(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
+    )
     # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
     llama = MoELayer(
         MoEConfig(
