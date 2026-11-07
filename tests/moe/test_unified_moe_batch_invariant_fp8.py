@@ -1,0 +1,1096 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The fp8 per-tensor batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeFp8Config``): the W8A8
+classes ``moe.e4m3.<act>``, one per typed activation of the layer and its scalars, on the surface of the TRTLLM-Gen fp8
+per-tensor backend (e4m3 activations quantized with the static ``hidden_states_scale_global``, the weights prepared with
+the two calibrated multipliers, every routing input mode).
+
+The class has exact CPU models of everything but the tensor-core step (the routing, the static input quantization, the
+fused e4m3 quantization of the activation chain on the alpha-scaled accumulators, GEMM2's scaled chain, the slot-order
+combine), so the tests are bit comparisons: the layer's output against the class composed from its own pieces (the
+routing on the CPU, the grouped GEMM1 as the raw fp32 fold, the CPU chain with the exact requantization, the dense
+batch-invariant fp8 GEMM per expert for GEMM2, the CPU combine) for several activations, run-to-run determinism including
+CUDA-graph replay, batch / permutation / sub-batch invariance, agreement of every tactic the autotuner may pick, the three
+routing input modes giving the same bits, the error contract, and a plausibility observation against FlashInfer's torch
+reference of the fp8 per-tensor MoE. The device-free tests pin the registration, the fingerprint dimensions, the
+agreement of the vectorised and the exact CPU chains on adversarial accumulators and scales, the input quantization, the
+weight preparation's multipliers and the dispatcher's membership in the enumerated space at the nominal parts.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from flashinfer import batch_invariant as bi
+from flashinfer.fused_moe import (
+    GELU,
+    BackendOptions,
+    BatchInvariantMoeFp8Config,
+    ExecutionConfig,
+    ExpertConfig,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    MoEActivationPack,
+    MoEConfig,
+    MoEFinalizeConfig,
+    MoELayer,
+    MoEWeightPack,
+    PowLU,
+    QuantConfig,
+    QuantFormat,
+    ReLU,
+    ReLU2,
+    RoutingConfig,
+    RoutingInputMode,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+)
+from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
+from flashinfer.fused_moe.batch_invariant.runner import BatchInvariantMoeRunner
+from flashinfer.fused_moe.batch_invariant.runner_fp8 import (
+    MOE_FP8_ARCHS,
+    BatchInvariantMoeFp8Runner,
+)
+from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.tllm_enums import RoutingMethodType
+
+_supported = torch.cuda.is_available() and bi.is_supported_device(
+    torch.device("cuda"), MOE_FP8_ARCHS
+)
+needs_device = pytest.mark.skipif(
+    not _supported,
+    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
+)
+
+_SWIGLU = SwiGLU()
+#: The activations the GPU composition covers: the default gated chain, a parameterised gated chain whose clamps bite in
+#: dequantized units, the erf GELU, the tanh GELU, PowLU, and the ungated ReLU^2 and GELU.
+ACTIVATIONS = [
+    SwiGLU(),
+    SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    SwiGLUStep(limit=3.0),
+    GeGLU(),
+    GeGLUTanh(),
+    SiTU(),
+    PowLU(),
+    ReLU2(),
+    Identity(),
+    GELU(),
+    ReLU(),
+    SiLU(),
+]
+ACTIVATION_IDS = [
+    "swiglu",
+    "swiglu_oai",
+    "swiglu_step_limit3",
+    "geglu",
+    "geglu_tanh",
+    "situ",
+    "powlu",
+    "relu2",
+    "identity",
+    "gelu",
+    "relu",
+    "silu",
+]
+M_INTER = 24.0  # the intermediate multiplier: large enough that the adversarial problems saturate some e4m3 outputs
+
+
+def bits(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(
+        {1: torch.int8, 2: torch.int16, 4: torch.int32}[t.element_size()]
+    )
+
+
+def _problem(
+    T: int,
+    k: int,
+    H: int,
+    I: int,
+    E: int,
+    seed: int,
+    gated: bool = True,
+    adversarial: bool = False,
+):
+    """bf16 activations, logits and canonical weights (``w1 [E, 2I, H]`` rows ``[up, gate]``; ``[E, I, H]`` ungated), and
+    the static input multiplier ``448 / amax(x)``."""
+    g = torch.Generator().manual_seed(seed)
+    if adversarial:
+        x = (
+            torch.randn(T, H, generator=g)
+            * torch.exp2(torch.randint(-8, 6, (T, 1), generator=g).float())
+        ).to(torch.bfloat16)
+        logits = (torch.randn(T, E, generator=g) * 2).float()
+        logits[0, : min(k, E)] = 1.0
+        span = torch.exp2(torch.randint(-3, 3, (E, 1, 1), generator=g).float())
+    else:
+        x = (torch.randn(T, H, generator=g) * 0.5).to(torch.bfloat16)
+        logits = (torch.randn(T, E, generator=g) * 2).float()
+        span = 1.0
+    n1 = 2 * I if gated else I
+    w1 = (torch.randn(E, n1, H, generator=g) * 0.05 * span).to(torch.bfloat16)
+    w2 = (torch.randn(E, H, I, generator=g) * 0.05 * span).to(torch.bfloat16)
+    amax = x.float().abs().amax().clamp_min(1e-30)
+    m_x = (448.0 / amax).reshape(1)
+    return x.cuda(), logits.cuda(), w1.cuda(), w2.cuda(), m_x.cuda()
+
+
+def _config(
+    k: int,
+    E: int,
+    I: int,
+    act=_SWIGLU,
+    method=RoutingMethodType.Renormalize,
+    tune_max: int = 4096,
+):
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=E, top_k=k, method=method),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
+        experts=ExpertConfig(intermediate_size=I),
+        activation=act,
+        backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+    )
+
+
+def _layer(*args, device="cuda", **kw):
+    return MoELayer(_config(*args, **kw), device=torch.device(device))
+
+
+def _weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    m_x: torch.Tensor,
+    act=_SWIGLU,
+    m_inter: float = M_INTER,
+) -> MoEWeightPack:
+    pack = MoEWeightPack({})
+    view = BatchInvariantMoeFp8Config.prepare_weights(
+        w1,
+        w2,
+        hidden_states_scale_global=m_x,
+        intermediate_scale_global=m_inter,
+        num_local_experts=w1.shape[0],
+        hidden_size=w1.shape[2],
+        intermediate_size=w2.shape[2],
+        activation=act,
+    )
+    pack.prepare_for(BatchInvariantMoeFp8Runner.backend_key, view)
+    return pack
+
+
+def _xq(x: torch.Tensor, m_x: torch.Tensor) -> torch.Tensor:
+    xq, scale = BatchInvariantMoeFp8Config.prepare_activations(
+        x, hidden_states_scale_global=m_x
+    )
+    assert scale is None and xq.dtype == torch.float8_e4m3fn
+    return xq
+
+
+def _logits_pack(
+    xq: torch.Tensor, logits: torch.Tensor, bias=None
+) -> MoEActivationPack:
+    return MoEActivationPack(
+        xq,
+        None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+        routing_bias=bias,
+    )
+
+
+def _routed_pack(
+    xq: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, packed: bool = False
+) -> MoEActivationPack:
+    if packed:
+        return MoEActivationPack(
+            xq,
+            None,
+            topk_ids=ids.contiguous(),
+            topk_weights=weights.float().contiguous(),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+    return MoEActivationPack(
+        xq,
+        None,
+        topk_ids=ids.contiguous(),
+        topk_weights=weights.contiguous(),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+
+
+# ----------------------------------------------------------------------------- device-free
+
+
+def test_backend_is_registered_and_never_a_default_candidate():
+    """The config is a known backend of the layer, mapped to its runner, absent from the default candidates, and declares the
+    fp8 per-tensor quantization pair, the three routing modes and every activation class of the layer (the bf16 runner's)."""
+    assert BatchInvariantMoeFp8Config in ALL_BACKEND_CONFIGS
+    assert _BACKEND_RUNNERS[BatchInvariantMoeFp8Config] is BatchInvariantMoeFp8Runner
+    assert not any(
+        isinstance(c, BatchInvariantMoeFp8Config) for c in _DEFAULT_BACKEND.candidates
+    )
+    assert [
+        a
+        for a in (89, 90, 100, 103, 107, 110, 120, 121)
+        if BatchInvariantMoeFp8Config.supported(a)
+    ] == [100, 103, 107]
+    assert issubclass(BatchInvariantMoeFp8Runner, BatchInvariantMoeRunner)
+    assert (
+        BatchInvariantMoeFp8Runner.backend_key
+        == "batch_invariant_fp8"
+        != BatchInvariantMoeRunner.backend_key
+    )
+    assert BatchInvariantMoeFp8Runner.supported_quant_variants == (
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    )
+    assert set(BatchInvariantMoeFp8Runner.supported_routing_modes) == {
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    }
+    assert (
+        set(BatchInvariantMoeFp8Runner.supported_activation_classes)
+        == set(BatchInvariantMoeRunner.supported_activation_classes)
+        == {
+            SwiGLU,
+            SwiGLUStep,
+            GeGLU,
+            GeGLUTanh,
+            SiTU,
+            PowLU,
+            ReLU2,
+            Identity,
+            GELU,
+            ReLU,
+            SiLU,
+        }
+    )
+    assert repr(BatchInvariantMoeFp8Config()) == "BatchInvariantMoeFp8Config()"
+    assert (
+        "fused_moe_fp8" in bi.CLASSES and bi.class_name("fused_moe_fp8") == "moe.e4m3"
+    )
+
+
+def test_fingerprint_dimensions_and_classes():
+    """``fingerprint("fused_moe_fp8", ...)`` takes the geometry, the routing method and the activation; it differs from the bf16
+    class's at the same dimensions; every listed activation is its own class; the routing method is a dimension; the scales'
+    values are not."""
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant import spec_fp8 as S8
+
+    dims = dict(H=2048, I=768, top_k=8, num_experts=128)
+    fp = bi.fingerprint("fused_moe_fp8", **dims)
+    assert fp.startswith("moe-") and len(fp) == 20
+    assert fp != bi.fingerprint("fused_moe", **dims)
+    assert (
+        bi.fingerprint("fused_moe_fp8", method="Renormalize", act="swiglu", **dims)
+        == fp
+    )
+    assert bi.fingerprint("fused_moe_fp8", act=SwiGLU(), **dims) == fp
+    assert (
+        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.Sigmoid, **dims) != fp
+    )
+    assert bi.fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=64) != fp
+    fps = {bi.fingerprint("fused_moe_fp8", act=a, **dims) for a in ACTIVATIONS}
+    assert len(fps) == len(ACTIVATIONS) and fp in fps
+    assert bi.fingerprint("fused_moe_fp8", act="relu2", **dims) == bi.fingerprint(
+        "fused_moe_fp8", act=ReLU2(), **dims
+    )
+    with pytest.raises(ValueError):
+        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.Llama4, **dims)
+    with pytest.raises(TypeError):
+        bi.fingerprint("fused_moe_fp8", m_x=1.0, **dims)
+    for cfg in ACTIVATIONS:
+        a = S.activation_of(cfg)
+        assert bi.fingerprint(
+            "fused_moe_fp8", act=cfg, **dims
+        ) == S8.spec_fingerprint_fp8(
+            2048, 768, 8, 128, S.SOFTMAX_RENORM, a.act, a.params, a.gated
+        )
+    s = S8.Fp8MoESpec(64, 32, 2, 8)
+    assert (
+        s.name == "moe.e4m3.swiglu"
+        and S8.Fp8MoESpec(64, 32, 2, 8, act="relu2", gated=False).name
+        == "moe.e4m3.relu2"
+    )
+
+
+def _adversarial_accumulators(limits, n_random: int, seed: int) -> torch.Tensor:
+    f32 = torch.float32
+    inf = torch.tensor(float("inf"), dtype=f32)
+    edges = []
+    for lim in limits:
+        t = torch.tensor(float(lim), dtype=f32)
+        up, down = torch.nextafter(t, inf), torch.nextafter(t, -inf)
+        edges += [t, -t, up, down, -up, -down]
+    special = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            2.0**-149,
+            -(2.0**-149),
+            2.0**-127,
+            1e-30,
+            -1e-30,
+            1e-3,
+            -1e-3,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            8.0,
+            -8.0,
+            87.0,
+            -87.0,
+            88.0,
+            -88.0,
+            448.0,
+            -448.0,
+            464.0,
+            -464.0,
+            1e4,
+            -1e4,
+            1e30,
+            -1e30,
+            3.0e38,
+            -3.0e38,
+        ],
+        dtype=f32,
+    )
+    g = torch.Generator().manual_seed(seed)
+    rnd = torch.randn(n_random, generator=g) * torch.exp2(
+        torch.randint(-12, 12, (n_random,), generator=g).float()
+    )
+    parts = [special, rnd.to(f32)]
+    if edges:
+        parts.insert(1, torch.stack(edges))
+    return torch.cat(parts)
+
+
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_vectorised_and_exact_chains_agree_on_adversarial_accumulators_and_scales(act):
+    """The vectorised GEMM1 chain (``reference_fp8.w8a8_gemm1_cpu`` / ``w8a8_gemm1_act_cpu`` through ``TorchF32``) and the exact one
+    (``spec_fp8.glu_quant_e4m3_elem`` / ``act_quant_e4m3_elem`` through ``ExactF32``) give the same e4m3 values on adversarial fp32
+    accumulators (zeros of both signs, subnormals, the exp clamp's edges, the e4m3 maximum and beyond, the configuration's
+    clamp limits and their neighbours, spread magnitudes) with spread per-row weight scales and intermediate multipliers;
+    the saturating conversion is exercised. The GEMM2 chain likewise."""
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import reference_fp8 as R8
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant import spec_fp8 as S8
+
+    a = S.activation_of(act)
+    limits = [p for p in a.params if p is not None]
+    g = _adversarial_accumulators(limits, 160, seed=20)
+    u = torch.roll(_adversarial_accumulators(limits, 160, seed=21), 5)
+    n = g.numel()
+    gen = torch.Generator().manual_seed(22)
+    s_w = torch.exp2((torch.rand(n, generator=gen) * 2 - 1) * 8).float()
+    s_x, m_inter = fp32.to_f32(0.0073), fp32.to_f32(37.0)
+    alpha = [fp32.mul(s_x, float(v)) for v in s_w.tolist()]
+    if a.gated:
+        vec = R8.w8a8_gemm1_cpu(
+            g.view(-1, 1), u.view(-1, 1), s_x, s_w, m_inter, a.act, a.params
+        ).view(-1)
+        exact = [
+            S8.glu_quant_e4m3_elem(R.ExactF32, gi, ui, al, m_inter, a.act, a.params)
+            for gi, ui, al in zip(g.tolist(), u.tolist(), alpha, strict=True)
+        ]
+    else:
+        vec = R8.w8a8_gemm1_act_cpu(
+            g.view(-1, 1), s_x, s_w, m_inter, a.act, a.params
+        ).view(-1)
+        exact = [
+            S8.act_quant_e4m3_elem(R.ExactF32, gi, al, m_inter, a.act, a.params)
+            for gi, al in zip(g.tolist(), alpha, strict=True)
+        ]
+    ex = torch.tensor(exact, dtype=torch.float32)
+    bad = (bits(vec) != bits(ex)).nonzero().flatten()[:8].tolist()
+    assert not bad, [
+        (i, g[i].item(), u[i].item(), vec[i].item(), ex[i].item()) for i in bad
+    ]
+    assert (vec.abs() <= 448).all()
+    if (
+        not limits
+    ):  # a clamped chain's activation stays below the e4m3 maximum at this multiplier
+        assert (vec.abs() == 448).any(), "the saturating conversion is exercised"
+    assert torch.equal(bits(R8.e4m3_bytes(vec).float()), bits(vec)), (
+        "the e4m3 values convert to bytes exactly"
+    )
+    # GEMM2: the scaled accumulator to bf16
+    vec2 = R8.w8a8_gemm2_cpu(g.view(-1, 1), m_inter, s_w).view(-1)
+    ex2 = torch.tensor(
+        [
+            S8.scaled_out_elem(R.ExactF32, gi, fp32.mul(m_inter, float(v)), "bf16")
+            for gi, v in zip(g.tolist(), s_w.tolist(), strict=True)
+        ],
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    assert torch.equal(bits(vec2), bits(ex2))
+
+
+def test_input_quantization_and_dequantization_scales_are_the_declared_chains():
+    """``prepare_activations`` is ``cvt.rn.satfinite.e4m3(mul(x, m_x))`` bit for bit on adversarial values (saturation, subnormals,
+    signed zeros, ties); the dequantization scales are the correctly rounded reciprocals of the multipliers; the weight
+    multipliers are FlashInfer's ``448 / amax`` and the quantized experts are the chain's bytes."""
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.fused_moe.batch_invariant import reference_fp8 as R8
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        weight_multipliers,
+    )
+    from flashinfer.fused_moe.prepare import _quantize_fp8_per_expert
+
+    x = _adversarial_accumulators([448.0, 1.0], 2000, seed=5).to(torch.bfloat16)
+    x = x[: x.numel() // 16 * 16].view(-1, 16)
+    for m in (0.007, 1.0, 3.0, 2.0**20):
+        q, scale = BatchInvariantMoeFp8Config.prepare_activations(
+            x, hidden_states_scale_global=m
+        )
+        assert scale is None and q.dtype == torch.float8_e4m3fn and q.shape == x.shape
+        ex = torch.tensor(
+            [
+                fp32.to_fp8(fp32.mul(float(v), fp32.to_f32(m)), "e4m3")
+                for v in x.float().view(-1).tolist()
+            ],
+            dtype=torch.float32,
+        )
+        assert torch.equal(bits(q.float().view(-1)), bits(ex)), m
+        inv = R8.dequant_scale(torch.tensor([m], dtype=torch.float32))
+        assert inv.item() == fp32.div(1.0, fp32.to_f32(m))
+    w1 = (torch.randn(4, 64, 32, generator=torch.Generator().manual_seed(3)) * 0.1).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn(4, 32, 32, generator=torch.Generator().manual_seed(4)) * 0.1).to(
+        torch.bfloat16
+    )
+    W = MoEWeightsE4M3.prepare(w1, w2, 2.0, 16.0)
+    q_fi, m_fi = _quantize_fp8_per_expert(w2)
+    assert torch.equal(bits(W.m_w2), bits(m_fi)) and torch.equal(
+        bits(weight_multipliers(w2)), bits(m_fi)
+    )
+    assert torch.equal(bits(W.s_w2), bits(R8.dequant_scale(m_fi)))
+    ex = torch.tensor(
+        [
+            fp32.to_fp8(fp32.mul(float(v), float(mm)), "e4m3")
+            for e in range(4)
+            for v in w2[e].float().view(-1).tolist()
+            for mm in (m_fi[e].item(),)
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.equal(bits(W.w2q.float().view(-1)), bits(ex))
+    # observation: FlashInfer's torch cast of the same scaled values gives the same bytes (its conversion rounds to nearest even)
+    assert torch.equal(W.w2q.view(torch.uint8), q_fi.view(torch.uint8))
+    assert (
+        W.gated
+        and W.intermediate_size == 32
+        and W.w1q.shape == (4, 64, 32)
+        and W.m_inter.item() == 16.0
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        MoEWeightsE4M3.prepare(
+            w1[:, :, :24].contiguous(), w2[:, :24].contiguous(), 2.0, 16.0
+        )  # H = 24
+
+
+@pytest.mark.parametrize(
+    "family,sm_count",
+    [("sm_107", 212), ("sm_107", 204), ("sm_100", 148), ("sm_103", 152)],
+)
+def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
+    """The dispatcher's pick for every bench geometry and token count lies in the enumerated grouped fp8 space of its GEMM, for
+    the gated and the ungated classes, at the nominal parts; the ranked list is short, distinct and inside the space."""
+    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
+        all_valid_configs_fp8,
+        default_configs_fp8,
+        gemm1_chain,
+        rank_grouped_fp8,
+    )
+
+    geoms = [
+        (2048, 768, 128, 8),
+        (4096, 14336, 8, 2),
+        (7168, 2048, 256, 8),
+        (5120, 8192, 16, 1),
+        (512, 256, 64, 6),
+        (1024, 512, 64, 8),
+    ]
+    for H, I, E, k in geoms:
+        s1 = set(all_valid_configs_fp8(2 * I, H, E, gemm1_chain("silu")))
+        s1u = set(all_valid_configs_fp8(I, H, E, gemm1_chain("relu2", (), False)))
+        s2 = set(all_valid_configs_fp8(H, I, E, GEMM2_CHAIN))
+        assert s1 and s1u and s2
+        for T in (1, 7, 64, 300, 800, 4096, 16384):
+            c1, c2 = default_configs_fp8(
+                T, k, H, I, E, sm_count, family, True, nominal=True
+            )
+            assert c1 in s1 and c2 in s2, (
+                family,
+                T,
+                H,
+                I,
+                E,
+                k,
+                c1.describe(),
+                c2.describe(),
+            )
+            c1u, _ = default_configs_fp8(
+                T, k, H, I, E, sm_count, family, False, nominal=True
+            )
+            assert c1u in s1u, (family, T, H, I, E, k, c1u.describe())
+            ranked = rank_grouped_fp8(
+                rows_per_expert(T, k, E),
+                H,
+                I,
+                E,
+                GEMM2_CHAIN,
+                sm_count,
+                family,
+                3,
+                nominal=True,
+            )
+            assert (
+                1 <= len(ranked) <= 3
+                and len(set(ranked)) == len(ranked)
+                and all(c in s2 for c in ranked)
+            )
+    # the acceptance: 16-byte e4m3 rows of every operand
+    assert (
+        all_valid_configs_fp8(2 * 760, 2048, 128, gemm1_chain("silu")) == []
+    )  # I % 16
+    assert all_valid_configs_fp8(2048, 760, 128, GEMM2_CHAIN) == []  # K % 16
+
+
+def test_unsupported_device_raises_before_any_kernel():
+    """The runner on a CPU device fails its support check with the mode's error naming the class."""
+    runner = BatchInvariantMoeFp8Runner(_config(8, 64, 256), torch.device("cpu"))
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        runner._check_support()
+    assert "moe.e4m3" in str(excinfo.value) and "cpu" in str(excinfo.value)
+
+
+# ----------------------------------------------------------------------------- GPU
+
+
+def _reference_route(logits: torch.Tensor, k: int, method):
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    return R.route_cpu(logits.cpu(), k, S.METHOD_OF_FLASHINFER[method])
+
+
+def _reference_ffn(
+    xq: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, view: dict, act
+) -> torch.Tensor:
+    """The class composed on the device from its own pieces: the class's permutation (the rows gathered by torch indexing),
+    GEMM1 as the grouped fp8 kernel with the unscaled fp32 identity epilogue (the same fold; any record of the space gives its
+    bits), the CPU chain of the activation with the exact e4m3 requantization on those accumulators and the view's scales,
+    GEMM2 as the dense batch-invariant fp8 GEMM per expert (``mm_fp8_batch_invariant`` with unit scales, fp32 out: the raw
+    fold at this weight shape, asserted unsplit), the CPU GEMM2 chain, the CPU slot-order combine. Bit for bit what the
+    fused op must produce."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import reference_fp8 as R8
+    from flashinfer.fused_moe.batch_invariant.api import permute_plan
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        grouped_gemm_fp8,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
+    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import Fp8Chain
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import all_valid_configs_fp8
+    from flashinfer.gemm.batch_invariant.api import mm_fp8_batch_invariant
+    from flashinfer.gemm.batch_invariant.schedule import chunks_for
+
+    W = MoEWeightsE4M3.from_view(view)
+    T, H = xq.shape
+    E, k = W.num_experts, ids.shape[1]
+    I = W.intermediate_size
+    assert chunks_for(H, I, "e4m3") == 1
+    counts, dest, src = permute_plan(ids, E)
+    n = T * k
+    x_perm = xq[(src // k).long()].contiguous()
+    raw = Fp8Chain("plain", "silu", "f32", (), False)
+    acc = grouped_gemm_fp8(
+        x_perm,
+        W.w1q,
+        W.s_w1,
+        W.s_x,
+        W.m_inter,
+        counts,
+        all_valid_configs_fp8(W.w1q.shape[1], H, E, raw)[0],
+        raw,
+    )
+    off = torch.cat([torch.zeros(1, dtype=torch.int64), counts.cpu().long().cumsum(0)])
+    sw1 = torch.repeat_interleave(W.s_w1.cpu(), counts.cpu().long())
+    sw2 = torch.repeat_interleave(W.s_w2.cpu(), counts.cpu().long())
+    if act.gated:
+        u = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)
+        g = acc.view(-1, I // GROUP, 2, GROUP)[:, :, 1, :].reshape(-1, I)
+        a_vals = R8.w8a8_gemm1_cpu(
+            g.cpu(), u.cpu(), W.s_x.cpu(), sw1, W.m_inter.cpu(), act.act, act.params
+        )
+    else:
+        a_vals = R8.w8a8_gemm1_act_cpu(
+            acc.cpu(), W.s_x.cpu(), sw1, W.m_inter.cpu(), act.act, act.params
+        )
+    a = R8.e4m3_bytes(a_vals).to(xq.device)
+    acc2 = torch.empty(n, H, dtype=torch.float32, device=xq.device)
+    one = torch.ones(1, dtype=torch.float32, device=xq.device)
+    for e in range(E):
+        lo, hi = int(off[e]), int(off[e + 1])
+        if hi > lo:
+            acc2[lo:hi] = mm_fp8_batch_invariant(
+                a[lo:hi].contiguous(), W.w2q[e].t(), one, one, out_dtype=torch.float32
+            )
+    y_perm = R8.w8a8_gemm2_cpu(acc2.cpu(), W.s_inter.cpu(), sw2)
+    y = y_perm[dest.view(-1).long().cpu()]
+    ident = torch.arange(n, dtype=torch.int32).view(T, k)
+    return R.combine_cpu(y, ident, weights.cpu()), dict(
+        a=a, counts=counts, dest=dest, acc=acc
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("act", ACTIVATIONS, ids=ACTIVATION_IDS)
+def test_layer_matches_the_class_composition(act):
+    """The layer (from logits) == the class's own routing on the CPU, the fused e4m3 chain of the activation on the raw grouped
+    accumulators, the dense batch-invariant fp8 GEMM per expert and the CPU combine: the oracle ladder of the class, bit for
+    bit, for every activation; the fused op's intermediate e4m3 rows equal the CPU chain's bytes."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        fused_moe_fp8,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 300, 6, 512, 256, 64
+    chain = activation_of(act)
+    x, logits, w1, w2, m_x = _problem(
+        T, k, H, I, E, seed=1, gated=chain.gated, adversarial=True
+    )
+    xq = _xq(x, m_x)
+    W = _weights(w1, w2, m_x, act)
+    layer = _layer(k, E, I, act)
+    out = layer(_logits_pack(xq, logits), W)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    view = W.get_view(BatchInvariantMoeFp8Runner.backend_key)
+    ref, pieces = _reference_ffn(xq, ids.cuda(), weights.cuda(), view, chain)
+    assert torch.equal(bits(out.cpu()), bits(ref))
+    _, im = fused_moe_fp8(
+        xq,
+        ids.cuda(),
+        weights.cuda(),
+        MoEWeightsE4M3.from_view(view),
+        return_intermediates=True,
+    )
+    assert torch.equal(im["a"].view(torch.uint8), pieces["a"].view(torch.uint8))
+    if not [
+        p for p in chain.params if p is not None
+    ]:  # an unclamped chain: the adversarial problem saturates some intermediates
+        assert (im["a"].float().abs() == 448).any()
+
+
+@needs_device
+def test_the_largest_expert_count_routes_and_runs():
+    """1024 experts: the class's routing from the logits equals the CPU model and the layer equals the class composition."""
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 96, 8, 256, 128, 1024
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=9, adversarial=True)
+    xq = _xq(x, m_x)
+    ids, wts = route(logits, k)
+    ref_ids, ref_w = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    assert torch.equal(ids.cpu(), ref_ids) and torch.equal(bits(wts.cpu()), bits(ref_w))
+    W = _weights(w1, w2, m_x)
+    out = _layer(k, E, I)(_logits_pack(xq, logits), W)
+    ref, _ = _reference_ffn(
+        xq,
+        ids,
+        wts,
+        W.get_view(BatchInvariantMoeFp8Runner.backend_key),
+        activation_of(_SWIGLU),
+    )
+    assert torch.equal(bits(out.cpu()), bits(ref))
+
+
+@needs_device
+def test_three_routing_modes_agree_and_runs_are_deterministic():
+    """From logits, pre-routed unpacked (fp32 and bf16 weights) and pre-routed packed give the bits of the class on their inputs;
+    repeated runs and a CUDA-graph replay reproduce them."""
+    T, k, H, I, E = 257, 8, 1024, 512, 128
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=2, adversarial=True)
+    xq = _xq(x, m_x)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2, m_x)
+    out_l = layer(_logits_pack(xq, logits), W)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out_u = layer(_routed_pack(xq, ids.cuda(), weights.cuda()), W)
+    assert torch.equal(bits(out_l), bits(out_u))
+    w16 = weights.to(torch.bfloat16)
+    out_u16 = layer(_routed_pack(xq, ids.cuda(), w16.cuda()), W)
+    out_p = layer(_routed_pack(xq, ids.cuda(), w16.cuda(), packed=True), W)
+    assert torch.equal(bits(out_u16), bits(out_p))
+    assert torch.equal(
+        bits(out_u16), bits(layer(_routed_pack(xq, ids.cuda(), w16.float().cuda()), W))
+    )
+    for _ in range(3):
+        assert torch.equal(bits(layer(_logits_pack(xq, logits), W)), bits(out_l))
+    stream = torch.cuda.Stream()
+    pack = _logits_pack(xq, logits)
+    with torch.cuda.stream(stream):
+        layer(pack, W)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out_g = layer(pack, W)
+    torch.cuda.synchronize()
+    for _ in range(2):
+        out_g.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out_g), bits(out_l))
+
+
+@needs_device
+def test_batch_permutation_and_subbatch_invariance():
+    """A token's bits do not depend on the batch size, its position, its neighbours or the expert loads the other tokens create."""
+    T, k, H, I, E = 500, 8, 512, 256, 64
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=3, adversarial=True)
+    xq = _xq(x, m_x)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2, m_x)
+    full = bits(layer(_logits_pack(xq, logits), W))
+    for n in (1, 2, 7, 64, 200, 333):
+        assert torch.equal(
+            bits(layer(_logits_pack(xq[:n], logits[:n]), W)), full[:n]
+        ), n
+    perm = torch.randperm(T, generator=torch.Generator().manual_seed(4)).cuda()
+    assert torch.equal(
+        bits(layer(_logits_pack(xq[perm].contiguous(), logits[perm].contiguous()), W)),
+        full[perm],
+    )
+    for n in (1, 2, 7, 64, 200):
+        idx = torch.randperm(T, generator=torch.Generator().manual_seed(n))[:n].cuda()
+        assert torch.equal(
+            bits(
+                layer(_logits_pack(xq[idx].contiguous(), logits[idx].contiguous()), W)
+            ),
+            full[idx],
+        ), n
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    base = bits(layer(_routed_pack(xq, ids, weights), W))
+    g = torch.Generator().manual_seed(5)
+    x_extra = _xq(
+        (torch.randn(556, H, generator=g) * 0.5).to(torch.bfloat16).cuda(), m_x
+    )
+    w_extra = torch.rand(556, k, generator=g).cuda()
+    for t in (0, T // 2, T - 1):
+        hot = ids[t : t + 1].expand(556, k).contiguous()
+        out = layer(
+            _routed_pack(
+                torch.cat([xq[t : t + 1], x_extra]),
+                torch.cat([ids[t : t + 1], hot]),
+                torch.cat([weights[t : t + 1], w_extra]),
+            ),
+            W,
+        )
+        assert torch.equal(bits(out)[:1], base[t : t + 1]), ("hot group", t)
+        mine = set(ids[t].tolist())
+        others = (
+            torch.tensor(
+                [e for e in range(E) if e not in mine][:k],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            .view(1, k)
+            .expand(556, k)
+            .contiguous()
+        )
+        out = layer(
+            _routed_pack(
+                torch.cat([xq[t : t + 1], x_extra]),
+                torch.cat([ids[t : t + 1], others]),
+                torch.cat([weights[t : t + 1], w_extra]),
+            ),
+            W,
+        )
+        assert torch.equal(bits(out)[:1], base[t : t + 1]), ("unrelated hot experts", t)
+
+
+@needs_device
+def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
+    """Every tactic the autotuner may pick (the dispatcher's ranked fp8 record pairs) gives the same bits; tuning the layer
+    profiles them and the output before, during and after tuning is one output."""
+    from flashinfer.autotuner import AutoTuner, autotune
+
+    T, k, H, I, E = 300, 6, 1024, 512, 64
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=6, adversarial=True)
+    xq = _xq(x, m_x)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2, m_x)
+    runner = layer.runners[0]
+    assert isinstance(runner, BatchInvariantMoeFp8Runner)
+    pack = _logits_pack(xq, logits)
+    ref = bits(layer(pack, W))
+    inputs = runner.pack_inputs(pack, W)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
+    for t in tactics:
+        assert torch.equal(
+            bits(runner.forward(runner.pack_inputs(pack, W), tactic=t)), ref
+        ), t
+    failed_before = (
+        len(AutoTuner.get().stats.failed_tactics)
+        if hasattr(AutoTuner.get(), "stats")
+        else 0
+    )
+    with autotune(True):
+        assert torch.equal(bits(layer(pack, W)), ref)
+    assert torch.equal(bits(layer(pack, W)), ref)
+    if hasattr(AutoTuner.get(), "stats"):
+        assert len(AutoTuner.get().stats.failed_tactics) == failed_before
+
+
+@needs_device
+def test_routing_methods_from_logits_match_the_cpu_model():
+    """Every routing method the class implements, from logits, selects and weights as the exact CPU model; the layer's bits follow."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 64, 4, 512, 256, 32
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=7, adversarial=True)
+    xq = _xq(x, m_x)
+    bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(8)) * 0.1)
+        .float()
+        .cuda()
+    )
+    W = _weights(w1, w2, m_x)
+    for method in (
+        RoutingMethodType.Default,
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.Sigmoid,
+        RoutingMethodType.SigmoidRenorm,
+        RoutingMethodType.DeepSeekV3,
+    ):
+        rm = S.METHOD_OF_FLASHINFER[method]
+        kwargs = {"routed_scaling_factor": 1.75} if rm.scaled else {}
+        layer = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kwargs),
+                quant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+                ),
+                experts=ExpertConfig(intermediate_size=I),
+                activation=SwiGLU(),
+                backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )
+        b = bias if rm.bias else None
+        out = layer(_logits_pack(xq, logits, b), W)
+        ex, w = R.route_cpu(
+            logits.cpu(),
+            k,
+            rm,
+            b.cpu() if b is not None else None,
+            1.75 if rm.scaled else None,
+        )
+        ref = layer(_routed_pack(xq, ex.cuda(), w.cuda()), W)
+        assert torch.equal(bits(out), bits(ref)), method
+
+
+@needs_device
+def test_unsupported_inputs_raise_and_nothing_falls_back():
+    """The error contract: a configuration outside the classes raises the mode's error at build or at the first call (top_k /
+    num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing, no finalize, an
+    intermediate size that is not a multiple of 16, bf16 activations handed to the fp8 layer, an activation scale tensor,
+    weights prepared for another activation, an unimplemented routing method from logits); a zero-token call returns an
+    empty output."""
+    k, H, I, E = 6, 512, 256, 64
+    errors = (bi.BatchInvariantUnsupportedError, RuntimeError, NotImplementedError)
+    for cfg_kw, what in (
+        (dict(k=17), "top_k"),
+        (dict(E=1025), "num_experts"),
+        (dict(I=264), "intermediate_size"),
+    ):
+        with pytest.raises(errors) as excinfo:
+            _layer(cfg_kw.get("k", k), cfg_kw.get("E", E), cfg_kw.get("I", I))
+        assert what in str(excinfo.value) or "moe.e4m3" in str(excinfo.value)
+    routing = RoutingConfig(num_experts=E, top_k=k)
+    experts = ExpertConfig(intermediate_size=I)
+    quant = QuantConfig(
+        weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+    )
+    for kw, what in (
+        (
+            dict(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k, method=RoutingMethodType.DeepSeekV3
+                ),
+                experts=ExpertConfig(intermediate_size=I, num_fused_shared_experts=1),
+            ),
+            "fused shared experts",
+        ),
+        (
+            dict(
+                experts=ExpertConfig(
+                    intermediate_size=I,
+                    local_expert_offset=E // 2,
+                    local_num_experts=E // 2,
+                )
+            ),
+            "parallel",
+        ),
+        (
+            dict(
+                routing=RoutingConfig(num_experts=E, top_k=k, n_group=2, topk_group=1)
+            ),
+            "n_group",
+        ),
+        (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
+    ):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=kw.get("routing", routing),
+                    quant=quant,
+                    experts=kw.get("experts", experts),
+                    backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+                    finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert what in str(excinfo.value) or "moe.e4m3" in str(excinfo.value), what
+    # the bf16 quantization pair never reaches this runner
+    with pytest.raises(errors):
+        MoELayer(
+            MoEConfig(
+                routing=routing,
+                quant=QuantConfig(),
+                experts=experts,
+                backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+    layer = _layer(k, E, I)
+    x, logits, w1, w2, m_x = _problem(8, k, H, I, E, seed=9)
+    xq = _xq(x, m_x)
+    W = _weights(w1, w2, m_x)
+    with pytest.raises(errors):
+        layer(
+            _logits_pack(x, logits), W
+        )  # bf16 activations: no runner accepts the pack
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        layer(
+            MoEActivationPack(
+                xq,
+                m_x,
+                routing_input_mode=RoutingInputMode.FromLogits,
+                routing_logits=logits,
+            ),
+            W,
+        )  # a scale tensor
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        layer(
+            _logits_pack(xq, logits), _weights(w1[:, :I].contiguous(), w2, m_x, ReLU2())
+        )  # the ungated weights with the gated class
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        layer(
+            _logits_pack(xq, logits), _weights(w1, w2, m_x, GeGLU())
+        )  # another activation's chain
+    llama = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=1, method=RoutingMethodType.Llama4
+            ),
+            quant=quant,
+            experts=experts,
+            backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+        ),
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        llama(_logits_pack(xq, logits), W)
+    ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
+    assert llama(_routed_pack(xq, ids, torch.ones(8, 1, device="cuda")), W).shape == (
+        8,
+        H,
+    )
+    out = layer(_logits_pack(xq[:0], logits[:0]), W)
+    assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+def _torch_fp8_reference(x, ids, weights, view, act) -> torch.Tensor:
+    """FlashInfer's torch reference of the fp8 per-tensor MoE (``tests/moe/test_unified_moe_fp8.py``'s form) on the class's own
+    quantized experts and scales: dequantized e4m3 operands, fp32 products, the intermediate requantized through the same
+    multiplier, bf16 expert outputs, the routed sum."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import MoEWeightsE4M3
+    from tests.moe.utils import compute_reference_activation
+
+    W = MoEWeightsE4M3.from_view(view)
+    fp8_max = 448.0
+    x_deq = x.float() / W.m_x
+    I = W.intermediate_size
+    out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
+    for e in range(W.num_experts):
+        tok, slot = torch.where(ids == e)
+        if tok.numel() == 0:
+            continue
+        w1 = W.w1q[e].float() * W.s_w1[e]
+        if W.gated:  # back to the canonical [up, gate] rows for the torch activation
+            w1 = w1.view(I // 8, 2, 8, -1)
+            w1 = torch.cat([w1[:, 0].reshape(I, -1), w1[:, 1].reshape(I, -1)], 0)
+        gemm1 = (x_deq[tok] @ w1.t()).to(torch.bfloat16)
+        inter = compute_reference_activation(gemm1, act, I).float()
+        inter_q = (inter * W.m_inter).clamp(-fp8_max, fp8_max).to(
+            torch.float8_e4m3fn
+        ).float() / W.m_inter
+        y = (inter_q @ (W.w2q[e].float() * W.s_w2[e]).t()).to(torch.bfloat16).float()
+        out[tok] += weights[tok, slot, None] * y
+    return out.to(torch.bfloat16)
+
+
+@needs_device
+@pytest.mark.parametrize("act", [SwiGLU(), ReLU2()], ids=["swiglu", "relu2"])
+def test_plausible_against_flashinfers_fp8_torch_reference(act):
+    """An observation, not a promise of the class: on moderate inputs the layer lands near FlashInfer's torch reference of the
+    fp8 per-tensor MoE computed on the class's own quantized experts (the differences are the fold order and the chain's
+    rounding points: the reference rounds GEMM1 to bf16 before the activation, the class does not)."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 128, 4, 512, 256, 32
+    x, logits, w1, w2, m_x = _problem(
+        T, k, H, I, E, seed=11, gated=activation_of(act).gated
+    )
+    xq = _xq(x, m_x)
+    W = _weights(w1, w2, m_x, act, m_inter=8.0)
+    out = _layer(k, E, I, act)(_logits_pack(xq, logits), W).float()
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ref = _torch_fp8_reference(
+        xq,
+        ids.cuda(),
+        weights.cuda(),
+        W.get_view(BatchInvariantMoeFp8Runner.backend_key),
+        act,
+    ).float()
+    cos = torch.nn.functional.cosine_similarity(
+        out.view(-1), ref.view(-1), dim=0
+    ).item()
+    rel = ((out - ref).abs().max() / ref.abs().max().clamp_min(1e-30)).item()
+    assert cos > 0.999 and rel < 5e-2, (cos, rel)
