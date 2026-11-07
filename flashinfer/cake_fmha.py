@@ -2152,17 +2152,29 @@ _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
 }
 # Per target and mask, per JIT pack: further calls of the other flag forms the
 # runtime-size BF16 programs serve past :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`,
-# as boxes ``(batch, keys, work)``: a call of at most ``batch`` requests, at
-# most ``keys`` cache keys and at most ``work`` of ``batch_size * num_q_heads *
-# max_q_len * max_kv_len`` takes its form's program (``None``: no bound).  B200,
-# causal pack 8: one request over at most 8192 keys ran faster than the JIT
-# module beyond the A/A band in every one of 10 layouts (1 x 1024 .. 8192 x
-# 8192 keys at 32 query and 4 KV heads, 1 x 8192 x 8192 at 64 and 8, sinks and
-# LSE).
+# as boxes ``(batch, keys, query x keys, work)``: a call of at most ``batch``
+# requests, at most ``keys`` cache keys, at most that ``max_q_len *
+# max_kv_len`` and at most ``work`` of ``batch_size * num_q_heads * max_q_len *
+# max_kv_len`` takes its form's program (``None``: no bound).  Within each box
+# the programs ran faster than the JIT module beyond the A/A band in every
+# layout timed (10 layouts; 2 for the B200 rows of 1, 64, 1000 and over 8192
+# queries).  B200, causal pack 8, one request: 1 .. 32768 queries x 6145 ..
+# 8192 keys at 8 .. 64 query heads.  GB300, causal pack 1: 1 .. 128 requests
+# x 32 .. 16384 queries x 16384 keys at 8 .. 32 heads; not causal pack 16:
+# 1 .. 16 requests x 512 .. 16384 queries x 4096 .. 16384 keys at 64 and 128
+# query heads.  Sinks and LSE alike.
 _CONTEXT_BF16_RUNTIME_FLAG_BOXES: dict[
-    str, dict[bool, dict[int, tuple[tuple[int | None, int | None, int | None], ...]]]
+    str,
+    dict[
+        bool,
+        dict[int, tuple[tuple[int | None, int | None, int | None, int | None], ...]],
+    ],
 ] = {
-    "sm100a": {True: {8: ((1, 8192, 1 << 32),)}},
+    "sm100a": {True: {8: ((1, 8192, None, 1 << 32),)}},
+    "sm103a": {
+        True: {1: ((None, 16384, None, 1 << 32),)},
+        False: {16: ((None, None, 1 << 26, 1 << 33),)},
+    },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
 # program an exact, runtime-size or (every page size) one-stage route names
@@ -8982,8 +8994,9 @@ def select_cake_fmha_context_route(
             or any(
                 (box_batch is None or batch_size <= box_batch)
                 and (box_keys is None or max_kv_len <= box_keys)
+                and (box_area is None or max_q_len * max_kv_len <= box_area)
                 and (box_work is None or work <= box_work)
-                for box_batch, box_keys, box_work in boxes
+                for box_batch, box_keys, box_area, box_work in boxes
             )
         )
     ):
