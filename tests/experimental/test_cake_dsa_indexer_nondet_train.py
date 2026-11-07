@@ -2294,7 +2294,9 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     # the scan binding zeroes nothing: the device's one empty region, no per-call view
@@ -2347,7 +2349,9 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runner._tail_shared
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
@@ -2489,7 +2493,9 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert not host_memsets and runner._ticket_restore is None
         return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
 
