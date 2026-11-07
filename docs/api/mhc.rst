@@ -213,9 +213,9 @@ reduction's order. Each element of ``dfn`` folds its per-chunk Kahan pairs
 ascending chunk order as a compensated FP32 sum, adds the caller's ``dfn`` last
 with ``accumulate=True`` and rounds once, so it is within one FP32 rounding of
 the exact sum plus ``O(P^2 u^2) (|start| + sum |acc|)`` and
-``O(P u) sum |comp|`` (``u = 2^-24``). The
-deterministic package folds its per-chunk partials in FP64, and the chunk
-sizes follow the host rule, so the low-order bits of ``dfn`` can differ from
+``O(P u) sum |comp|`` (``u = 2^-24``). The token chunks are the
+deterministic package's; it folds the same chunks' pairs in FP64, each
+rounded once to FP32 first, so the low-order bits of ``dfn`` can differ from
 the deterministic ``dfn``.
 
 Under ``torch.use_deterministic_algorithms(True)`` no entry point raises an

@@ -66,20 +66,22 @@ six programs of this package take their place:
   SMs are free.  Every unit is the dynamic form's unit of the same tokens
   (``dX`` bit for bit, the same parameter fold), and the grid folds the slot
   pairs of this geometry's chunks into ``dfn`` in chunk order.
-  :func:`bwd_slab_atomic_program` picks it per token count and device where
-  :func:`lpt_chunks` (calibrated per architecture by ``BWD_SLAB_LPT`` at hidden
-  4096, per architecture and size by ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168,
-  and per board -- architecture, SM count and hidden size -- where
+  :func:`bwd_slab_atomic_program` would pick it per token count and device
+  where :func:`lpt_chunks` (calibrated per architecture by ``BWD_SLAB_LPT`` at
+  hidden 4096, per architecture and size by ``BWD_SLAB_LPT_HIDDEN`` at 5120 and
+  7168, and per board -- architecture, SM count and hidden size -- where
   ``BWD_SLAB_LPT_OVERRIDES`` holds a cell) returns a geometry, and ``dynr``
-  elsewhere;
-* ``cake_mhc_train_bwd_slab_fold__dynr_os`` and
-  ``cake_mhc_train_bwd_slab_fold__lpt_os`` (every architecture): the same two
-  forms with the units drawn slab-fastest (``order="slab"``: unit ``u`` is
-  column slab ``u % (H / 64)`` of token chunk ``u / (H / 64)``, instead of slab
-  ``u / P`` of chunk ``u % P``; under ``lpt`` the big chunks' units still come
-  first).  The units and the kernel parameters are the same; only the order in
-  which the units run changes, so every output is the same bits.
-  :func:`bwd_slab_atomic_program` appends
+  elsewhere.  No table of record calibrates it (every entry is ``None`` and no
+  board has a cell): its chunks cover other token ranges than the
+  deterministic chunks, so its ``dfn`` error against FP64 is another draw than
+  the deterministic package's, and at hidden 4096 it exceeded 1.1x of it on
+  GB300 and R200.  Every call runs the one-size chunks of :func:`k7_chunks`;
+* ``cake_mhc_train_bwd_slab_fold__dynr_os`` (every architecture): the same
+  dynamic form with the units drawn slab-fastest (``order="slab"``: unit ``u``
+  is column slab ``u % (H / 64)`` of token chunk ``u / (H / 64)``, instead of
+  slab ``u / P`` of chunk ``u % P``).  The units and the kernel parameters are
+  the same; only the order in which the units run changes, so every output is
+  the same bits.  :func:`bwd_slab_atomic_program` appends
   ``_os`` to the form it picks where :func:`bwd_slab_order` (the token-count
   bands of ``BWD_SLAB_ORDER`` per hidden size and architecture, or of the
   board's cell of ``BWD_SLAB_ORDER_OVERRIDES``) names ``"slab"``.
@@ -93,10 +95,9 @@ column slab have records per size under the deterministic suffix ``__h<H>``
 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
 ``cake_mhc_train_bwd_slab_fold__dynr__h<H>``,
 ``cake_mhc_train_bwd_slab_fold__dynr_os__h<H>``), and on sm_100a the two-size
-column slab too (``cake_mhc_train_bwd_slab_fold__lpt__h<H>``,
-``cake_mhc_train_bwd_slab_fold__lpt_os__h<H>``), picked as at hidden 4096.
-sm_103a has no ``lpt`` calibration of these sizes yet (``BWD_SLAB_LPT_HIDDEN`` is
-``None`` there): its column slab runs ``dynr`` in the ``"chunk"`` band of
+column slab ``cake_mhc_train_bwd_slab_fold__lpt__h<H>`` too, which no table of
+record picks (``BWD_SLAB_LPT_HIDDEN`` is ``None`` at every architecture).  The
+column slab runs ``dynr`` in the ``"chunk"`` band of
 ``BWD_SLAB_ORDER`` and ``dynr_os`` in the ``"slab"`` band above it (on the
 152-SM board at 7168 in the bands of its cell of ``BWD_SLAB_ORDER_OVERRIDES``:
 ``"slab"`` also on 47 of the 48 token-count segments in 33793..63091 whose
@@ -117,10 +118,12 @@ compensated fold of at most ``P`` per-chunk slot pairs ``(acc, comp)`` (``P <=
 ``lpt``) and the entry value ``in`` under ``accumulate``: within one FP32
 rounding of ``in + sum (acc - comp)`` plus ``O(P^2 u^2) (|in| + sum |acc|)``
 and ``O(P u) sum |comp|`` (``u = 2^-24``); no addition flushes a subnormal.
-The deterministic package folds its per-chunk partials (the same units' pairs,
-each rounded once to FP32) in FP64 instead, and the ``lpt`` chunks can cover
-other token ranges, so ``dfn`` can differ from the deterministic ``dfn`` in the
-low-order bits.
+Under the tables of record every call runs the chunks of :func:`k7_chunks`,
+the deterministic column slab's: each pair ``(acc, comp)`` is the unit of the
+same tokens, and ``acc - comp`` rounded to FP32 is the deterministic partial of
+that unit.  The deterministic package folds those rounded partials in FP64
+instead, so ``dfn`` can differ from the deterministic ``dfn`` in the low-order
+bits (by the partials' roundings, which this fold does not make).
 The deterministic package's backward fn splits (``fn_split__tv128__t``,
 ``fn_split__tv128_t128__t``, ``fn_split__tv128__h<H>__t``) have no copy here:
 the atomic fn splits replace them.  The deterministic package's
@@ -164,7 +167,7 @@ column slab's two-size geometry is this package's own rule
 (:func:`lpt_chunks`, with its launch values :func:`slab_plan`), still a
 pure function of ``(T, SM count, architecture, hidden size)``; where
 it fires, the column slab's chunks differ from the deterministic
-chunks.  Which program a call launches is a rule of the same kind
+chunks (the tables of record let it fire nowhere).  Which program a call launches is a rule of the same kind
 (rounds 2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
 :func:`bwd_token_program` name the mapping-pass, coefficient-pass and
 token-owner forms of record per token count and board (the mapping pass's
@@ -179,8 +182,8 @@ the backward, whose form the atomic fn split of the architecture keeps) with
 its launch grid :func:`fn_split_grid` (``FN_SPLIT_GRID`` per program:
 H / 16 CTAs, 256 at hidden 4096, and H / 8 for the 128-thread form);
 the column-slab pass's form is :func:`bwd_slab_atomic_program`:
-``dynr``, or ``lpt`` where :func:`lpt_chunks` returns a geometry (every
-architecture at hidden 4096, sm_100a at 5120 and 7168), with ``_os`` where
+``dynr``, or ``lpt`` where :func:`lpt_chunks` returns a geometry (nowhere
+under the tables of record), with ``_os`` where
 :func:`bwd_slab_order` names the slab-fastest unit order (both read the cell
 of the device's board in ``BWD_SLAB_LPT_OVERRIDES`` / ``BWD_SLAB_ORDER_OVERRIDES``
 where one exists: the SM count picks it); the residual
@@ -205,7 +208,7 @@ sm_103a; sm_107a serves 4096 only), copied under the same rule as hidden 4096:
 the deterministic ``__h<H>`` records but the backward fn split, the column slab
 and the reduction, and a ``bwd_finish`` of the deterministic token-owner
 records, the atomic fn split ``__h<H>`` and the column slab ``dynr__h<H>`` and
-``dynr_os__h<H>`` (and ``lpt__h<H>`` and ``lpt_os__h<H>`` on sm_100a).
+``dynr_os__h<H>`` (and ``lpt__h<H>`` on sm_100a).
 Every rule takes the hidden size as its last argument and reads its tables
 through ``_tab`` as the deterministic registry's do (``H_TABLES`` spells every
 table for 5120 and 7168: a size it does not spell is an error, never the 4096
@@ -4267,93 +4270,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab_fold__lpt_os": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn"],
-            ["buffer", "param_partial"],
-            ["buffer", "dscale"],
-            ["buffer", "dbase"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["parameter", "chunks"],
-            ["parameter", "accumulate"],
-            ["buffer", "ticket"],
-            ["parameter", "p_big"],
-            ["parameter", "rpc_small"],
-            ["buffer", "dfn_slot"],
-            ["buffer", "slab_cnt"],
-            ["parameter", "prow"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "lpt_chunks",
-            "kind": "slab_chunks",
-            "slabs": 64,
-        },
-        "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_slab_fold__lpt_os",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_fold__lpt_os",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 228480,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_train_bwd_slab_fold__lpt_os",
-        "logical": {
-            "P": "lpt_parts",
-            "T": "rows",
-            "X": "x_flat",
-            "accumulate": "accumulate",
-            "chunks": "param_rows",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dbase": "dbase",
-            "dfn": "dfn",
-            "dfn_slot": "dfn_slot",
-            "dscale": "dscale",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "p_big": "lpt_big_parts",
-            "param_partial": "param_partial",
-            "prow": "prow",
-            "rpc": "lpt_rows_per_chunk",
-            "rpc_small": "lpt_small_rows_per_chunk",
-            "slab_cnt": "slab_cnt",
-            "ticket": "ticket",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": {
-            "kind": "program",
-            "program": "lpt_os",
-            "rule": "bwd_slab_atomic_program",
-        },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
     "cake_mhc_train_fn_split__h5120": {
         "arches": [
             "sm_100a",
@@ -5557,91 +5473,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "dynr_os",
-            "rule": "bwd_slab_atomic_program",
-        },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
-    "cake_mhc_train_bwd_slab_fold__lpt_os__h5120": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn"],
-            ["buffer", "param_partial"],
-            ["buffer", "dscale"],
-            ["buffer", "dbase"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["parameter", "chunks"],
-            ["parameter", "accumulate"],
-            ["buffer", "ticket"],
-            ["parameter", "p_big"],
-            ["parameter", "rpc_small"],
-            ["buffer", "dfn_slot"],
-            ["buffer", "slab_cnt"],
-            ["parameter", "prow"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "lpt_chunks",
-            "kind": "slab_chunks",
-            "slabs": 80,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_train_bwd_slab_fold__lpt_os__h5120",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_fold__lpt_os__h5120",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 228480,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_train_bwd_slab_fold__lpt_os__h5120",
-        "logical": {
-            "P": "lpt_parts",
-            "T": "rows",
-            "X": "x_flat",
-            "accumulate": "accumulate",
-            "chunks": "param_rows",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dbase": "dbase",
-            "dfn": "dfn",
-            "dfn_slot": "dfn_slot",
-            "dscale": "dscale",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "p_big": "lpt_big_parts",
-            "param_partial": "param_partial",
-            "prow": "prow",
-            "rpc": "lpt_rows_per_chunk",
-            "rpc_small": "lpt_small_rows_per_chunk",
-            "slab_cnt": "slab_cnt",
-            "ticket": "ticket",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": {
-            "kind": "program",
-            "program": "lpt_os",
             "rule": "bwd_slab_atomic_program",
         },
         "workspace_rule": {
@@ -6859,91 +6690,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab_fold__lpt_os__h7168": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn"],
-            ["buffer", "param_partial"],
-            ["buffer", "dscale"],
-            ["buffer", "dbase"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["parameter", "chunks"],
-            ["parameter", "accumulate"],
-            ["buffer", "ticket"],
-            ["parameter", "p_big"],
-            ["parameter", "rpc_small"],
-            ["buffer", "dfn_slot"],
-            ["buffer", "slab_cnt"],
-            ["parameter", "prow"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "lpt_chunks",
-            "kind": "slab_chunks",
-            "slabs": 112,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_train_bwd_slab_fold__lpt_os__h7168",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_fold__lpt_os__h7168",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 228480,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_train_bwd_slab_fold__lpt_os__h7168",
-        "logical": {
-            "P": "lpt_parts",
-            "T": "rows",
-            "X": "x_flat",
-            "accumulate": "accumulate",
-            "chunks": "param_rows",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dbase": "dbase",
-            "dfn": "dfn",
-            "dfn_slot": "dfn_slot",
-            "dscale": "dscale",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "p_big": "lpt_big_parts",
-            "param_partial": "param_partial",
-            "prow": "prow",
-            "rpc": "lpt_rows_per_chunk",
-            "rpc_small": "lpt_small_rows_per_chunk",
-            "slab_cnt": "slab_cnt",
-            "ticket": "ticket",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": {
-            "kind": "program",
-            "program": "lpt_os",
-            "rule": "bwd_slab_atomic_program",
-        },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
     "cake_mhc_train_fwd_coef__rt64__h5120": {
         "arches": [
             "sm_100a",
@@ -7213,17 +6959,17 @@ MODULES: dict[str, dict[str, Any]] = {
 # (their group-row forms ``_trows_dyn`` included, on sm_100a and sm_103a at
 # hidden 4096), the atomic fn split of the architecture (launched after the
 # token-owner pass, as its programmatic dependent) and the column slab's fold
-# forms (``dynr``, ``lpt`` and their slab-fastest copies ``dynr_os``,
-# ``lpt_os``: one per call by ``bwd_slab_atomic_program``; no reduction
-# record): all four at hidden 4096
+# forms (``dynr``, ``lpt`` and the slab-fastest copy ``dynr_os``: one per
+# call by ``bwd_slab_atomic_program``, which under the tables of record names
+# ``dynr`` or ``dynr_os``; no reduction record): all three at hidden 4096
 # on every architecture and on sm_100a at hidden 5120 and 7168 (``__h<H>``),
 # ``dynr`` and ``dynr_os`` (``__h<H>``) on sm_103a at hidden 5120 and 7168.  On
-# sm_107a the ``_os`` copies run only on the boards whose cell of
+# sm_107a the ``_os`` copy runs only on the boards whose cell of
 # ``BWD_SLAB_ORDER_OVERRIDES`` names ``"slab"`` (212 SMs); its other boards
-# select ``dynr`` and ``lpt`` alone.
+# select ``dynr`` alone.
 # The launch order is the route order.  A record ships for the architectures of
 # its ``arches`` (the sm_103a-only forms for sm_103a alone, the ``lpt__h<H>``
-# and ``lpt_os__h<H>`` column slabs for sm_100a alone, the ``dynr_os__h<H>``
+# column slabs for sm_100a alone, the ``dynr_os__h<H>``
 # column slabs for sm_100a and sm_103a); the device code is folded over those
 # architectures.
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -7240,7 +6986,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_slab_fold__dynr",
             "cake_mhc_train_bwd_slab_fold__lpt",
             "cake_mhc_train_bwd_slab_fold__dynr_os",
-            "cake_mhc_train_bwd_slab_fold__lpt_os",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__g2sm_le1024",
@@ -7303,7 +7048,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_slab_fold__dynr__h5120",
             "cake_mhc_train_bwd_slab_fold__lpt__h5120",
             "cake_mhc_train_bwd_slab_fold__dynr_os__h5120",
-            "cake_mhc_train_bwd_slab_fold__lpt_os__h5120",
         ],
         "bwd_prepare_h5120": [
             "cake_mhc_train_bwd_prepare__t160__h5120",
@@ -7348,7 +7092,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_slab_fold__dynr__h7168",
             "cake_mhc_train_bwd_slab_fold__lpt__h7168",
             "cake_mhc_train_bwd_slab_fold__dynr_os__h7168",
-            "cake_mhc_train_bwd_slab_fold__lpt_os__h7168",
         ],
         "bwd_prepare_h7168": [
             "cake_mhc_train_bwd_prepare__t224__h7168",
@@ -7398,7 +7141,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_slab_fold__dynr",
             "cake_mhc_train_bwd_slab_fold__lpt",
             "cake_mhc_train_bwd_slab_fold__dynr_os",
-            "cake_mhc_train_bwd_slab_fold__lpt_os",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__t128",
@@ -7545,7 +7287,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_slab_fold__dynr",
             "cake_mhc_train_bwd_slab_fold__lpt",
             "cake_mhc_train_bwd_slab_fold__dynr_os",
-            "cake_mhc_train_bwd_slab_fold__lpt_os",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__t128__a7",
@@ -8053,8 +7794,9 @@ FWD_COEF_REGIMES = {"sm_100a": "round7", "sm_103a": "round5", "sm_107a": "round9
 # BWD_ROW_BANDS -- the deterministic package's token-owner rules, verbatim.  K7 is this package's column slab: the dynr
 # record (``cake_mhc_train_bwd_slab_fold__dynr``, the deterministic "dynr" form with the dfn slot fold and the parameter
 # fold) on every architecture, or its two-size tail schedule ``lpt`` where the screen of BWD_SLAB_LPT (H 4096) or
-# BWD_SLAB_LPT_HIDDEN (H 5120 / 7168) fires, each as its slab-fastest ``_os`` record where BWD_SLAB_ORDER names
-# "slab" (``bwd_slab_atomic_program``): the deterministic package's per-architecture column-slab and final-reduction
+# BWD_SLAB_LPT_HIDDEN (H 5120 / 7168) fires (nowhere under the tables of record), dynr as its slab-fastest ``_os``
+# record where BWD_SLAB_ORDER names "slab" (``bwd_slab_atomic_program``): the deterministic package's per-architecture
+# column-slab and final-reduction
 # (K8) rules do not apply here.
 # BWD_TOKEN_PROGRAM: the token-owner program per architecture outside every regime of BWD_TOKEN_REGIMES and every band
 # of BWD_TOKEN_BANDS. sm_107a: "dot_ao8_l2l" (dot_ao8 +
@@ -8170,8 +7912,16 @@ FWD_FINISH_ROWS = {"production": 4, "r2": 2}
 # k7_chunks chunks and leaving tokens after them, then S = 1..5 small chunks sharing the rest; at most 32 chunks) by
 # the list-scheduling makespan of their units in draw order on the device's SMs (a unit costs o_tiles plus its
 # 64-token tiles, each to the least loaded SM, the big units first; the fewest chunks, then the biggest, among equal
-# makespans) and runs the best on the "lpt" record (or "lpt_os": BWD_SLAB_ORDER) where its makespan is at most keep
-# times the one-size chunks'. Calibrated on the chunk-order records by package-level A/B: the rule's geometry against
+# makespans) and runs the best on the "lpt" record (the chunk order; no two-size record of the slab order ships) where
+# its makespan is at most keep times the one-size chunks'. Every entry of this table and of BWD_SLAB_LPT_HIDDEN is None
+# and BWD_SLAB_LPT_OVERRIDES has no cell, so every call runs the one-size chunks of k7_chunks, the deterministic column
+# slab's: each dfn slot pair is the deterministic unit's sum of the same tokens before its rounding. A two-size
+# geometry sums other token ranges per chunk, so its dfn error against FP64 is another draw than the deterministic
+# package's: under the former calibrations below (and the 212-SM board's cell (1876, (0.5, 0.97)), (33600, (0.5,
+# 0.985)), (34368, (0.5, 0.98)), (None, (0.5, 0.97))) the worst-element dfn error of the four-times-accumulated case at
+# H 4096, T 16263 read 1.105x the deterministic package's median on GB300 and 1.161x on R200 with 212 SMs, over the
+# 1.1x bound, where the one-size chunks read 1.000x. The former calibrations, measured on the chunk-order records by
+# package-level A/B: the rule's geometry against
 # dynr and a null-control rerun of dynr in one process, paired per replay group, on the finish / backward /
 # checkpointed-step graphs; the deltas below are against the faster dynr arm. sm_100a (0.5, 0.99): on 148 SMs it
 # fires at 1536 / 2048 / 2560 / 3584 / 14928 / 15566 / 15590 / 16114 of the 19 benchmark token counts (finish
@@ -8190,11 +7940,12 @@ FWD_FINISH_ROWS = {"production": 4, "r2": 2}
 # read them at call time, the route plans bind them per token count, and host_plan carries none of them. The table is
 # calibrated at H 4096; lpt_chunks reads BWD_SLAB_LPT_HIDDEN at the other sizes, and a board's cell of
 # BWD_SLAB_LPT_OVERRIDES before either.
-BWD_SLAB_LPT = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
+BWD_SLAB_LPT = {"sm_100a": None, "sm_103a": None, "sm_107a": None}
 # BWD_SLAB_LPT_HIDDEN: BWD_SLAB_LPT per hidden size other than 4096 -- the same screen over the size's H / 64 slabs and
 # its k7_chunks chunks, calibrated per (architecture, hidden size); a size it does not list is a ValueError, never the
-# H 4096 value. None where no lpt__h<H> record is routed: sm_103a (no GB300 calibration of these sizes yet) and sm_107a
-# (hidden 4096 only). sm_100a, by the package-level A/B of BWD_SLAB_LPT on 148 SMs over 80 token counts in 1024..65536
+# H 4096 value. None at every architecture, as BWD_SLAB_LPT (the column slab runs the deterministic one-size chunks);
+# sm_103a and sm_107a had no calibration of these sizes (sm_107a routes hidden 4096 only), and sm_100a's former one,
+# by the package-level A/B of BWD_SLAB_LPT on 148 SMs over 80 token counts in 1024..65536
 # (the ones that fire at keep 0.995, 8 replay groups): H 5120 (1.0, 0.99) fires at 28 of them, backward -188.5 us and
 # checkpointed step -113.4 us in sum, none slower in a 16-group rerun (20656 reads +0.1 / -0.1 us); keep 0.995 fires at
 # 46 but adds 25534 and 34557, whose backward reads +7.6 / +12.9 us in every one of 16 groups. H 7168 (1.0, 0.98) fires
@@ -8205,13 +7956,14 @@ BWD_SLAB_LPT = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5,
 # 3072 / 15288 (-3.8 / -4.8 / -4.8 / -10.1 us), and at H 7168 also at 512 (-1.8 us) and 24576 (+2.2 us within its 4 us
 # null, checkpointed step -21 us).
 BWD_SLAB_LPT_HIDDEN = {
-    5120: {"sm_100a": (1.0, 0.99), "sm_103a": None, "sm_107a": None},
-    7168: {"sm_100a": (1.0, 0.98), "sm_103a": None, "sm_107a": None},
+    5120: {"sm_100a": None, "sm_103a": None, "sm_107a": None},
+    7168: {"sm_100a": None, "sm_103a": None, "sm_107a": None},
 }
 # BWD_SLAB_ORDER: the column slab's unit order per hidden size and architecture -- ascending token-count bands
 # ((t_upper, order), ..., (None, order)) whose first band with T <= t_upper (None: every T) gives "chunk" (the "dynr" /
-# "lpt" records: unit u is column slab u / P of chunk u % P) or "slab" (the "dynr_os" / "lpt_os" records: slab
-# u % (H / 64) of chunk u / (H / 64)); bwd_slab_order reads it and bwd_slab_atomic_program appends "_os" to the form
+# "lpt" records: unit u is column slab u / P of chunk u % P) or "slab" (the "dynr_os" record: slab
+# u % (H / 64) of chunk u / (H / 64); the measurements below also name the former "lpt_os" record, the two-size
+# schedule in this order); bwd_slab_order reads it and bwd_slab_atomic_program appends "_os" to the form
 # lpt_chunks picks. Both orders run the same units and fold the dfn slots in the same chunk order: every output is the
 # same bits. Package-level A/B: the slab order against the chunk order (the same two-size calibration) and a
 # null-control rerun of the chunk order in one process, fresh CUDA graphs of every arm per replay group, the arm order
@@ -8380,14 +8132,9 @@ BWD_SLAB_ORDER_OVERRIDES: dict[
         (None, "slab"),
     ),
 }
-BWD_SLAB_LPT_OVERRIDES: dict[tuple[str, int, int], Any] = {
-    ("sm_107a", 212, 4096): (
-        (1876, (0.5, 0.97)),
-        (33600, (0.5, 0.985)),
-        (34368, (0.5, 0.98)),
-        (None, (0.5, 0.97)),
-    ),
-}
+# BWD_SLAB_LPT_OVERRIDES holds no cell: the 212-SM board's bands above were its cell of ("sm_107a", 212, 4096) until
+# the tables of record stopped calibrating the two-size schedule (BWD_SLAB_LPT); that board keeps its order cell.
+BWD_SLAB_LPT_OVERRIDES: dict[tuple[str, int, int], Any] = {}
 
 # FWD_FINISH_COL_SPLIT: the residual mixing's sub-tokens per token (half tokens of 2048 columns at H 4096).
 FWD_FINISH_COL_SPLIT = 2
@@ -9046,10 +8793,10 @@ def host_plan(
 def slab_plan(
     rows: int, sm_count: int, arch: str, hidden: int = HIDDEN
 ) -> dict[str, int]:
-    """The chunks of the column slab's ``lpt`` / ``lpt_os`` records of hidden size ``hidden`` for ``rows`` tokens:
+    """The chunks of the column slab's ``lpt`` records of hidden size ``hidden`` for ``rows`` tokens:
     :func:`lpt_chunks`'s two-size geometry of the size, else the one-size chunks of :func:`k7_chunks` at the size
-    (``lpt_big_parts == lpt_parts``; always these where the size's calibration is ``None``, as on sm_103a and
-    sm_107a at 5120 and 7168).  A size :data:`HIDDEN_SIZES` does not list is a ``ValueError`` (as in
+    (``lpt_big_parts == lpt_parts``; always these where the size's calibration is ``None``, as at every size and
+    architecture under the tables of record).  A size :data:`HIDDEN_SIZES` does not list is a ``ValueError`` (as in
     :func:`host_plan`).  Read at call time (not cached: :func:`_lpt_plan` caches the screen) and kept out of
     :func:`host_plan`, which the workspace envelope reads at every 64-token tile.  A geometry that is not a two-size
     partition of the rows is a ``ValueError``."""
@@ -9444,8 +9191,8 @@ def selected_modules(
     this package's column-slab rule at every hidden size, at the call's SM
     count: on sm_103a at 5120 / 7168, whose route holds the ``dynr__h<H>`` and
     ``dynr_os__h<H>`` records, the rule names one of these at every token
-    count, and on sm_107a, whose route holds all four forms, it names
-    ``dynr_os`` / ``lpt_os`` only on the boards whose cell of
+    count, and on sm_107a, whose route holds all three forms, it names
+    ``dynr_os`` only on the boards whose cell of
     ``BWD_SLAB_ORDER_OVERRIDES`` names ``"slab"``; the fn split of
     ``bwd_finish`` is one record per architecture and hidden size).  A route
     with column-slab records selects exactly one of them: a call whose

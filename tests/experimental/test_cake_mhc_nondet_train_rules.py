@@ -33,14 +33,13 @@ and record scalars of every hidden size on its boards of record
   ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
   ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
   ``cake_mhc_train_bwd_slab_fold__dynr`` and
-  ``cake_mhc_train_bwd_slab_fold__lpt`` on all three and their slab-fastest
-  copies ``cake_mhc_train_bwd_slab_fold__dynr_os`` /
-  ``cake_mhc_train_bwd_slab_fold__lpt_os`` on all three too; at 5120
+  ``cake_mhc_train_bwd_slab_fold__lpt`` on all three and the slab-fastest
+  copy ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three too; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
   ``cake_mhc_train_bwd_slab_fold__dynr__h<H>`` and
   ``cake_mhc_train_bwd_slab_fold__dynr_os__h<H>`` on sm_100a / sm_103a and
-  ``cake_mhc_train_bwd_slab_fold__lpt__h<H>`` /
-  ``cake_mhc_train_bwd_slab_fold__lpt_os__h<H>`` on sm_100a.  Their
+  ``cake_mhc_train_bwd_slab_fold__lpt__h<H>`` on sm_100a (no ``lpt_os``
+  record: no two-size calibration of record).  Their
   records keep the launch, grid and roles of the deterministic records they
   replace (the fn splits with the static PDL attribute: they follow the
   token-owner pass; the column slab with its fold arguments ``dfn_slot``,
@@ -54,9 +53,9 @@ and record scalars of every hidden size on its boards of record
   except ``bwd_finish``: the deterministic token-owner records (the group-row
   forms inside ``BWD_ROW_BANDS``, the run-time-count record at another Sinkhorn
   count), the atomic fn split of the architecture and size, the column slab's
-  forms (one per call by ``bwd_slab_atomic_program``: ``dynr``, ``lpt``,
-  ``dynr_os`` and ``lpt_os`` at hidden 4096 on every architecture and at 5120
-  and 7168 on sm_100a; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no
+  forms (one per call by ``bwd_slab_atomic_program``: ``dynr``, ``lpt`` and
+  ``dynr_os`` at hidden 4096 on every architecture and at 5120 and 7168 on
+  sm_100a; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``), no
   reduction; every program the column slab's tables and board cells can name
   has a record on the route, and every ``_os`` record a band of them that names
   it; the route plans bind the column slab's parameter rows (``prow`` and
@@ -84,15 +83,16 @@ and record scalars of every hidden size on its boards of record
   ``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
   ``slab_plan``): its geometries, its token-count bands (the unit order of
   record, and the banded calibration form under a test table), its board cells
-  (those of record: sm_107a with 212 SMs at 4096, and the order cell of sm_103a
+  (those of record: the order cells of sm_107a with 212 SMs at 4096 and of sm_103a
   with 152 SMs at 7168, whose ``"slab"`` bands below 63092 hold column-slab
   chunk counts of at least 19; the exact key ``(arch, SM count, hidden)`` under
   a test table; every other board, the 212-SM board to 1876 tokens and the
   152-SM board outside those ``"slab"`` bands, selecting and planning as
   without them, also in the route plans) and
-  its selection at every hidden size (where the size's table calibrates the
-  architecture: every architecture at 4096, sm_100a at 5120 and 7168; elsewhere
-  the one-size chunks of ``k7_chunks`` without running the screen), its
+  its selection at every hidden size (no table of record calibrates an
+  architecture, so every call runs the one-size chunks of ``k7_chunks``, the
+  deterministic column slab's; the rule under the former calibrations and the
+  kernel test's screen), its
   call-time lookup and a workspace envelope that never runs its screen;
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
@@ -174,15 +174,12 @@ OWN = {
         f"cake_mhc_train_bwd_slab_fold__lpt__h{hidden}": NEW_HIDDEN_LPT_ARCHES
         for hidden in NEW_HIDDEN_SIZES
     },
-    # The slab-fastest copies, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
-    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band (lpt_os where the size's
-    # two-size calibration of the architecture is not None too).
+    # The slab-fastest copies of dynr, on the architectures whose BWD_SLAB_ORDER bands of the size, or a board cell of
+    # BWD_SLAB_ORDER_OVERRIDES at the size (sm_107a: the 212-SM board's), hold a "slab" band. No lpt_os record ships:
+    # no two-size calibration of record is other than None (LPT_OF_RECORD), so no table can name one.
     "cake_mhc_train_bwd_slab_fold__dynr_os": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab_fold__lpt_os": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h5120": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab_fold__lpt_os__h5120": ("sm_100a",),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h7168": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab_fold__lpt_os__h7168": ("sm_100a",),
 }
 SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
 LPT = "cake_mhc_train_bwd_slab_fold__lpt"
@@ -218,7 +215,9 @@ ZERO_PREFIX_BYTES = 768
 # "chunk" to 2047 / 5108 tokens at hidden 4096 / 7168 and "slab" above, "slab" at every token count at 5120; on
 # sm_103a "chunk" to 13278 / 28825 / 63091 tokens at hidden 4096 / 5120 / 7168 and "slab" above; "chunk" at every size
 # on sm_107a, which routes neither 5120 nor 7168) and the two-size calibration at hidden 4096 (BWD_SLAB_LPT: one
-# (o_tiles, keep) per architecture); the board cells of record replace both on their board alone (below).
+# (o_tiles, keep) or None per architecture: None on every one, so every call runs the deterministic one-size chunks of
+# k7_chunks and dfn's per-chunk sums are the deterministic column slab's); the board cells of record replace both on
+# their board alone (below).
 ORDER = {
     4096: {
         "sm_100a": ((2047, "chunk"), (None, "slab")),
@@ -236,10 +235,10 @@ ORDER = {
         "sm_107a": ((None, "chunk"),),
     },
 }
-LPT_OF_RECORD = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
+LPT_OF_RECORD = {"sm_100a": None, "sm_103a": None, "sm_107a": None}
 # The board cells of record (BWD_SLAB_ORDER_OVERRIDES / BWD_SLAB_LPT_OVERRIDES, keyed (arch, SM count, hidden)): R200
-# with 212 SMs at hidden 4096 keeps the chunk order and (0.5, 0.97) to 1876 tokens, then runs the slab order with (0.5,
-# 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above; GB300 (sm_103a with 152 SMs) at hidden 7168 has an
+# with 212 SMs at hidden 4096 keeps the chunk order to 1876 tokens, then runs the slab order (no calibration cell: the
+# two-size schedule is calibrated nowhere); GB300 (sm_103a with 152 SMs) at hidden 7168 has an
 # order cell alone (no lpt record of the size there): the chunk order to 33792 tokens, then the slab order on 47 of the
 # 48 token-count segments in 33793..63091 whose column-slab chunk count is at least 19 (GB300_CELL_MIN_P; GB300_CELL_TIE
 # keeps the chunk order), its last band from 62465 running into the table's slab band from 63092.
@@ -308,14 +307,7 @@ ORDER_OVERRIDES = {
         (None, "slab"),
     ),
 }
-LPT_OVERRIDES = {
-    ("sm_107a", 212, 4096): (
-        (1876, (0.5, 0.97)),
-        (33600, (0.5, 0.985)),
-        (34368, (0.5, 0.98)),
-        (None, (0.5, 0.97)),
-    ),
-}
+LPT_OVERRIDES: dict = {}
 # The GB300 order cell and the token counts it changes: BWD_SLAB_ORDER of sm_103a at 7168 runs the chunk order to
 # 63091 tokens and the slab order above, so the cell differs from it in its "slab" bands in GB300_CELL_SPAN alone, at
 # GB300_CELL_SLAB_T token counts, each with a column-slab chunk count (k7_chunks at 152 SMs and hidden 7168) of at
@@ -358,36 +350,31 @@ LPT_SWEEP = tuple(
 )
 # The kernel test's screen calibration (o_tiles, keep), the working value the rule is exercised at on every board.
 LPT_SCREEN = (1.0, 0.99)
-# The 19 benchmark token counts of the BWD_SLAB_LPT calibration, and per board the geometries the tables of record pick
-# there (on sm_100a / sm_103a the token counts the comment of BWD_SLAB_LPT names; on sm_107a with 212 SMs, under its
-# board cell, those of (0.5, 0.97), which the cell keeps to 1876 tokens (1024; 1536 fires under neither) and whose
-# geometries its band (0.5, 0.985) keeps at 2048 / 2560 / 3072 / 3584 (the screen's best geometry does not depend on
-# keep), and 15566 / 15590 / 16263 / 32768, which that band adds; every other one keeps the one-size form: dynr, or
-# dynr_os where the board's unit-order band is "slab").
+# The 19 benchmark token counts of the former BWD_SLAB_LPT calibration, and per board the geometries the tables of
+# record pick there: none (every one keeps the one-size form: dynr, or dynr_os where the board's unit-order band is
+# "slab"). LPT_FORMER_FIRES: the geometries the screen picks there under the former calibrations (sm_100a (0.5, 0.99),
+# sm_103a (0.5, 0.98); on sm_107a with 212 SMs (0.5, 0.985), the band of the board's former cell over 1877..33600):
+# the rule itself is unchanged, only no table of record calibrates it.
 BENCH_T = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 15566, 15590, 16114, 16132, 16164,
            16263, 32768, 65536)  # fmt: skip
-LPT_FIRES = (
-    ("sm_100a", 148, {1536: (3, 704, 2, 128), 2048: (3, 960, 2, 128), 2560: (3, 1152, 2, 256), 3584: (4, 1600, 2, 192),
-                      14928: (12, 1536, 9, 384), 15566: (12, 1600, 9, 448), 15590: (12, 1600, 9, 448),
-                      16114: (12, 1664, 9, 384)}),
-    ("sm_103a", 152, {1024: (3, 448, 2, 128), 1536: (3, 704, 2, 128), 2048: (9, 256, 7, 128), 8192: (10, 1088, 7, 192),
-                      14928: (8, 2112, 7, 192), 15288: (10, 2048, 7, 320), 16132: (10, 2176, 7, 320),
-                      16164: (10, 2176, 7, 320), 16263: (8, 2304, 7, 192)}),
-    ("sm_107a", 212, {1024: (4, 320, 3, 64), 2048: (4, 640, 3, 128), 2560: (4, 832, 3, 64), 3072: (4, 960, 3, 192),
-                      3584: (4, 1152, 3, 128), 15566: (18, 1152, 13, 128), 15590: (18, 1152, 13, 128),
-                      16263: (17, 1216, 13, 128), 32768: (14, 2496, 13, 320)}),
+LPT_FIRES = (("sm_100a", 148, {}), ("sm_103a", 152, {}), ("sm_107a", 212, {}))
+LPT_FORMER_FIRES = (
+    ("sm_100a", 148, (0.5, 0.99), {14928: (12, 1536, 9, 384), 15566: (12, 1600, 9, 448), 16114: (12, 1664, 9, 384)}),
+    ("sm_103a", 152, (0.5, 0.98), {14928: (8, 2112, 7, 192), 15288: (10, 2048, 7, 320), 16263: (8, 2304, 7, 192)}),
+    ("sm_107a", 212, (0.5, 0.985), {15566: (18, 1152, 13, 128), 16263: (17, 1216, 13, 128),
+                                    32768: (14, 2496, 13, 320)}),
 )  # fmt: skip
 # At hidden 5120 and 7168, the token counts the two-size rule of the size is pinned at (the benchmark token counts and
-# 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: on B200 the
-# token counts its comment names (H 5120 1024 / 8192 / 15566 / 15590 / 16263 / 32768; H 7168 1024 / 2048 / 3072 /
-# 15288 / 24576); nowhere on the boards without a calibration of the size (sm_103a, sm_107a).
+# 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: none.
+# LPT_SCREEN_FIRES_HIDDEN: on B200 the geometries the kernel test's screen (1.0, 0.99) picks at token counts where the
+# former calibrations of these sizes fired (H 5120 (1.0, 0.99), H 7168 (1.0, 0.98)).
 LPT_HIDDEN_T = tuple(sorted({*BENCH_T, 24576}))
-LPT_FIRES_HIDDEN = (
-    ("sm_100a", 148, 5120, {1024: (9, 128, 7, 64), 8192: (13, 704, 11, 256), 15566: (13, 1408, 11, 64),
-                            15590: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
-    ("sm_100a", 148, 7168, {1024: (2, 896, 1, 128), 2048: (7, 384, 5, 64), 3072: (7, 576, 5, 128),
-                            15288: (10, 1664, 9, 320), 24576: (11, 2560, 9, 768)}),
-    *((arch, sm, hidden, {}) for arch, sm in det.RULES_BOARDS if arch != "sm_100a" for hidden in NEW_HIDDEN_SIZES),
+LPT_FIRES_HIDDEN = tuple(
+    (arch, sm, hidden, {}) for arch, sm in det.RULES_BOARDS for hidden in NEW_HIDDEN_SIZES
+)
+LPT_SCREEN_FIRES_HIDDEN = (
+    ("sm_100a", 148, 5120, {15566: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
+    ("sm_100a", 148, 7168, {2048: (7, 384, 5, 64), 15288: (10, 1664, 9, 320), 24576: (11, 2560, 9, 768)}),
 )  # fmt: skip
 # The deterministic programs this package does not copy: the column slab and the final reduction (the backward fn
 # splits, whose libraries the forward does not share, have no copy either).
@@ -2116,8 +2103,10 @@ _TWO_SIZE_CASES = [
 def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> None:
     """At every token count of record and of ``LPT_SWEEP``, at every hidden size of the board's architecture, under
     the size's table of record (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168) and under the
-    kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record: ``None`` never fires;
-    ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, else ``dynr``, with ``_os``
+    kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record (with the size's unit
+    order set to ``"chunk"`` at every token count and no board cell: no two-size record of the slab order ships):
+    ``None`` never fires; ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, else
+    ``dynr``, with ``_os``
     where the board's unit-order band (:func:`_order_cell`: the size's ``BWD_SLAB_ORDER``, or the board's cell) is
     ``"slab"``, and the selection holds that one column-slab record of the size; ``slab_plan`` is the geometry, else
     the one-size chunks of ``host_plan``.  A geometry is 64-token multiples, ``1 <= p_big <= P <= 32``, big chunks
@@ -2130,6 +2119,9 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
     fired, counted = [], 0
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(table, arch, value)
+        if calibration == "screen":
+            patch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, "chunk"),))
+            patch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
         _clear_plans()
         try:
             for T in sorted(set(T_VALUES) | set(LPT_SWEEP)):
@@ -2194,11 +2186,11 @@ def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> Non
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm", "fires"), LPT_FIRES)
 def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -> None:
-    """Under the tables of record (the board's cells where it has them) the two-size schedule runs exactly at the
-    benchmark token counts of ``LPT_FIRES``, with these geometries: a table that stops firing would ship dynr alone
-    without a failing test.  The program is ``lpt`` or ``lpt_os`` there (``dynr`` / ``dynr_os`` elsewhere), ``_os``
-    exactly where the board's unit-order band (:func:`_order_cell`) is ``"slab"``: on sm_107a with 212 SMs the
-    chunk-order programs at 1024 and 1536, the ``_os`` ones from 2048."""
+    """Under the tables of record (the board's cells where it has them) the two-size schedule runs at none of the
+    benchmark token counts (``LPT_FIRES``): a table that starts firing would sum other token ranges per chunk than
+    the deterministic column slab without a failing test.  The program is ``dynr`` / ``dynr_os``, ``_os`` exactly
+    where the board's unit-order band (:func:`_order_cell`) is ``"slab"``: on sm_107a with 212 SMs ``dynr`` at 1024
+    and 1536, ``dynr_os`` from 2048."""
     _clear_plans()
     try:
         got = {T: nd.lpt_chunks(T, sm, arch) for T in BENCH_T}
@@ -2215,15 +2207,41 @@ def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm", "calibration", "fires"), LPT_FORMER_FIRES)
+def test_two_size_rule_under_the_former_calibrations(
+    arch: str, sm: int, calibration: tuple, fires: dict, monkeypatch
+) -> None:
+    """The rule is unchanged: with the board's former calibration written into ``BWD_SLAB_LPT`` (no board cells)
+    ``lpt_chunks`` gives the geometries of ``LPT_FORMER_FIRES`` at their token counts, ``slab_plan`` binds them, and
+    ``bwd_slab_atomic_program`` names ``lpt`` there (``lpt_os`` in a ``"slab"`` band of the table's unit order)."""
+    monkeypatch.setitem(nd.BWD_SLAB_LPT, arch, calibration)
+    monkeypatch.setattr(nd, "BWD_SLAB_LPT_OVERRIDES", {})
+    monkeypatch.setattr(nd, "BWD_SLAB_ORDER_OVERRIDES", {})
+    _clear_plans()
+    try:
+        for T, geometry in fires.items():
+            assert tuple(nd.lpt_chunks(T, sm, arch)) == geometry, T
+            assert nd.slab_plan(T, sm, arch) == dict(
+                zip(LPT_HOST_KEYS, geometry, strict=True)
+            ), T
+            slab_order = _band_at(T, nd.BWD_SLAB_ORDER[HIDDEN][arch]) == "slab"
+            assert nd.bwd_slab_atomic_program(T, sm, arch) == "lpt" + (
+                "_os" if slab_order else ""
+            ), T
+    finally:
+        _clear_plans()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm", "hidden", "fires"), LPT_FIRES_HIDDEN)
 def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
     arch: str, sm: int, hidden: int, fires: dict
 ) -> None:
-    """At hidden 5120 and 7168 under the table of record (``BWD_SLAB_LPT_HIDDEN``) the two-size schedule runs exactly
-    at the token counts of ``LPT_FIRES_HIDDEN`` with these geometries, ``slab_plan`` the geometry there (on B200 the
-    token counts the table's comment names; nowhere on the boards the size's table does not calibrate, which have no
-    ``lpt`` record of the size).  The screen's plans are cached per hidden size: after the H 4096 plan of the same
-    token count, SM count and ``o_tiles``, the size's plan is its own."""
+    """At hidden 5120 and 7168 under the table of record (``BWD_SLAB_LPT_HIDDEN``) the two-size schedule runs at none
+    of the token counts of ``LPT_HIDDEN_T`` (``LPT_FIRES_HIDDEN``).  Under the kernel test's screen on B200, whose
+    routes hold the ``lpt`` record of these sizes, it gives the geometries of ``LPT_SCREEN_FIRES_HIDDEN``, ``slab_plan``
+    the geometry there, and the screen's plans are cached per hidden size: after the H 4096 plan of the same token
+    count, SM count and ``o_tiles``, the size's plan is its own."""
     _clear_plans()
     try:
         got = {T: nd.lpt_chunks(T, sm, arch, hidden=hidden) for T in LPT_HIDDEN_T}
@@ -2239,15 +2257,24 @@ def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
     for T, program in programs.items():
         slab_order = _band_at(T, _order_cell(arch, sm, hidden)) == "slab"
         assert program.endswith("_os") == slab_order, (T, program)
-    assert bool(fires) == (arch in OWN[_lpt(hidden)]), (arch, hidden)
-    for T, geometry in fires.items():
-        assert nd.slab_plan(T, sm, arch, hidden) == dict(
-            zip(LPT_HOST_KEYS, geometry, strict=True)
-        ), T
-        o_tiles = float(_calibration_at(_lpt_table(hidden)[arch], T)[0])
-        at_4096 = nd._lpt_plan(T, sm, o_tiles)
-        plan = nd._lpt_plan(T, sm, o_tiles, hidden=hidden)
-        assert plan[2] == geometry and plan != at_4096, (T, plan, at_4096)
+    assert not fires, (arch, hidden)
+    screened = [
+        f for a, s, h, f in LPT_SCREEN_FIRES_HIDDEN if (a, s, h) == (arch, sm, hidden)
+    ]
+    assert bool(screened) == (arch in OWN[_lpt(hidden)] and sm == 148), (arch, sm)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(_lpt_table(hidden), arch, LPT_SCREEN)
+        _clear_plans()
+        try:
+            for T, geometry in (screened[0] if screened else {}).items():
+                assert nd.slab_plan(T, sm, arch, hidden) == dict(
+                    zip(LPT_HOST_KEYS, geometry, strict=True)
+                ), T
+                at_4096 = nd._lpt_plan(T, sm, LPT_SCREEN[0])
+                plan = nd._lpt_plan(T, sm, LPT_SCREEN[0], hidden=hidden)
+                assert plan[2] == geometry and plan != at_4096, (T, plan, at_4096)
+        finally:
+            _clear_plans()
 
 
 def _heap_makespan(units: list[int], sm: int, o_tiles: float) -> float:
@@ -2310,15 +2337,14 @@ def test_two_size_makespan_runs_are_the_unit_by_unit_schedule() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("order", ("chunk", "slab"))
+@pytest.mark.parametrize("order", ("chunk",))
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
 def test_forced_geometry_is_read_at_call_time(
     monkeypatch, hidden: int, order: str
 ) -> None:
     """``lpt_chunks`` and ``BWD_SLAB_ORDER`` are module globals read at call time, at every hidden size (on B200, whose
-    routes hold the ``lpt`` record of each size, and its ``lpt_os`` copy where B200's ``BWD_SLAB_ORDER`` of the size
-    has a ``"slab"`` band -- a size without one skips the ``"slab"`` case; the size's order set to ``order`` for every
-    token count): a replacement that forces a geometry at one token count moves ``slab_plan``,
+    routes hold the ``lpt`` record of each size; the size's order set to ``order``, the chunk order, for every token
+    count: no two-size record of the slab order ships): a replacement that forces a geometry at one token count moves ``slab_plan``,
     ``bwd_slab_atomic_program``, the selection and the size's ``lpt`` (``lpt_os``) record's launch grid (``min(SMs, H
     / 64 x P)``) there, never the ``dynr`` (``dynr_os``) record's; a forced geometry that does not cover the tokens is
     a ``ValueError``; without the replacement the size's table decides (``None``: ``dynr`` / ``dynr_os`` and the
@@ -2326,10 +2352,6 @@ def test_forced_geometry_is_read_at_call_time(
     at): at 80 / 112 slabs both forced grids are the SM count, so only that record shows that ``launch_grid`` reads
     the record's hidden size."""
     arch, sm, T = "sm_100a", 148, 2049
-    if order == "slab" and arch not in OWN.get(_lpt_os(hidden), ()):
-        pytest.skip(
-            f'{arch} holds no {_lpt_os(hidden)}: no "slab" band of hidden {hidden}'
-        )
     monkeypatch.setattr(nd, "sm_count", lambda _index: sm)
     monkeypatch.setattr(nd, "device_arch", lambda _index: arch)
     monkeypatch.setitem(nd.BWD_SLAB_ORDER[hidden], arch, ((None, order),))
@@ -2645,7 +2667,8 @@ def test_slab_overrides_of_record() -> None:
     SM count that is a positive int (never ``None``: the table itself is the cell of every SM count) and a hidden size
     the architecture routes (an int, never ``None``: a cell of every size would apply a 4096 calibration at 5120 and
     7168); an order cell is token-count bands of ``"chunk"`` / ``"slab"``, a calibration cell ``None``, one
-    ``(o_tiles, keep)`` or bands of such values.  On each board with a cell, on both sides of every band edge of its
+    ``(o_tiles, keep)`` or bands of such values (no calibration cell is of record).  On each board with a cell, on
+    both sides of every band edge of its
     two cells: every program they can name has its record on the ``bwd_finish`` route of the size (a ``"slab"`` band
     the ``dynr_os`` record, and ``lpt_os`` where the calibration is not ``None``); ``bwd_slab_order`` and
     ``_lpt_calibration`` read the cells with the board's SM count and the tables without one.  Below the order cell's
@@ -2661,7 +2684,7 @@ def test_slab_overrides_of_record() -> None:
         ),
         (nd.BWD_SLAB_LPT_OVERRIDES, _valid_lpt_cell),
     ):
-        assert cells
+        assert cells or cells is nd.BWD_SLAB_LPT_OVERRIDES
         for key, cell in cells.items():
             arch, sm, hidden = key
             assert arch in nd.ARCHES, key
@@ -3068,10 +3091,9 @@ def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     SM count, architecture and module loader replaced: nothing is built or launched; both plan caches emptied for
     every board and table state, since they are keyed by the device index, not its SM count), at 1876, 1877, 4096 and
     15566 tokens, the backward's one column-slab launch is the record ``bwd_slab_atomic_program`` names with the
-    device's SM count, and an ``lpt`` / ``lpt_os`` launch binds the ``lpt_*`` values of ``slab_plan``.  Against the
-    plans with both tables of board cells emptied, only the 212-SM board's differ, and only from 1877 tokens:
-    ``dynr_os`` at 1877 and 4096 where the tables run ``dynr``, and at 15566 ``lpt_os`` with the geometry of
-    :data:`LPT_FIRES` where the tables run ``dynr``."""
+    device's SM count, and no launch binds the ``lpt_*`` values (no table of record picks the two-size schedule).
+    Against the plans with both tables of board cells emptied, only the 212-SM board's differ, and only from 1877
+    tokens: ``dynr_os`` at 1877, 4096 and 15566 where the tables run ``dynr``."""
     arch, hidden = "sm_107a", HIDDEN
     boards, token_counts = (208, 212, 216), (1876, 1877, 4096, 15566)
     shipped = {
@@ -3087,7 +3109,6 @@ def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     for sm in boards:
         if sm != 212:
             assert shipped[sm] == tables[sm], (sm, shipped[sm], tables[sm])
-    fires = next(f for a, s, f in LPT_FIRES if (a, s) == (arch, 212))
     assert shipped[212][1876] == tables[212][1876], shipped[212][1876]
     assert {T: tables[212][T] for T in token_counts[1:]} == {
         1877: (SLAB, None),
@@ -3097,7 +3118,7 @@ def test_route_plan_binds_the_board_cells(monkeypatch) -> None:
     assert {T: shipped[212][T] for T in token_counts[1:]} == {
         1877: (SLAB_OS, None),
         4096: (SLAB_OS, None),
-        15566: (LPT_OS, fires[15566]),
+        15566: (SLAB_OS, None),
     }, shipped[212]
 
 

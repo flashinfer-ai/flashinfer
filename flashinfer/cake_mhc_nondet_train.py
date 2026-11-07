@@ -33,13 +33,14 @@ device (each sum runs in an order fixed by the token count and the device).
 stores the ``dfn`` Kahan pair (sum ``acc``, compensation ``comp``) of every
 (column slab, token chunk) unit in its chunk's slots of the backward
 workspace, and once every unit has stored its pair the grid folds the pairs
-(``P <= 32`` token chunks; the chunk sizes are the host rule's per token count
+(``P <= 32`` token chunks, the deterministic package's chunks per token count
 and device) into ``dfn`` in ascending chunk order as a compensated FP32 sum,
 the caller's ``dfn`` last under ``accumulate=True``, with one rounding: within
 one FP32 rounding of the exact sum plus ``O(P^2 u^2) (|start| + sum |acc|)``
-and ``O(P u) sum |comp|`` per element (``u = 2^-24``).  The deterministic package folds its per-chunk partials in
-FP64, and its chunk sizes can differ, so the low-order bits of ``dfn`` can
-differ from the deterministic ``dfn``.  ``dX``, ``dscale`` and ``dbase`` are
+and ``O(P u) sum |comp|`` per element (``u = 2^-24``).  The deterministic
+package folds the same chunks' pairs in FP64, each rounded once to FP32
+first, so the low-order bits of ``dfn`` can differ from the deterministic
+``dfn``.  ``dX``, ``dscale`` and ``dbase`` are
 bitwise the deterministic values (the column-slab pass folds the parameter
 gradients in the deterministic reduction's order), and so are the forward,
 the statistics replay and ``backward_prepare`` (copies of the deterministic
@@ -503,10 +504,9 @@ def cake_mhc_nondet_train_backward_finish(
     FP32 sum, the caller's ``dfn`` last under ``accumulate=True``, with one
     rounding: within one FP32 rounding of the exact sum plus
     ``O(P^2 u^2) (|start| + sum |acc|)`` and ``O(P u) sum |comp|``
-    (``u = 2^-24``).  The deterministic package folds its partials in FP64 and
-    the chunk sizes are the host rule's per token count and device, so the
-    low-order bits can differ from the deterministic ``dfn`` (see the module
-    docstring).
+    (``u = 2^-24``).  The deterministic package folds the same chunks' pairs
+    in FP64, each rounded once to FP32 first, so the low-order bits can differ
+    from the deterministic ``dfn`` (see the module docstring).
 
     Parameters
     ----------

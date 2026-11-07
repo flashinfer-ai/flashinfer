@@ -31,8 +31,8 @@ residual mixing and ``backward_prepare`` run copies of the deterministic
 programs (the same bits).  ``backward_finish`` runs the deterministic
 token-owner pass, the atomic fn split (beside the token-owner pass, as its
 programmatic dependent) and the column slab (see :mod:`.cake_jit`; its
-dynamic-schedule form, or at the token counts and devices the host rule
-picks, the two-size tail schedule over other chunk sizes) and no final
+dynamic-schedule form over the deterministic package's token chunks: the
+host rule's two-size tail schedule is calibrated for no device) and no final
 reduction kernel.  ``dX`` is the deterministic package's bits, and so are
 ``dscale`` and ``dbase``: the column slab folds the token-owner pass's
 parameter rows in the deterministic reduction's order.  The column slab stores
@@ -43,10 +43,9 @@ pairs into ``dfn`` in ascending chunk order as a compensated FP32 sum, the
 caller's ``dfn`` last under ``accumulate=True``, with one rounding: within one
 FP32 rounding of the exact sum plus ``O(P^2 u^2) (|start| + sum |acc|)`` and
 ``O(P u) sum |comp|`` (``u = 2^-24``), no addition flushing a subnormal.  The
-deterministic package folds its per-chunk partials in FP64 (each pair rounded
-once to FP32, where the chunks are the same), and under the two-size schedule the chunks cover other token
-ranges, so ``dfn`` can differ from the deterministic package's ``dfn`` in the
-low-order bits.
+deterministic package folds the same chunks' pairs in FP64, each rounded once
+to FP32 first, so ``dfn`` can differ from the deterministic package's ``dfn``
+in the low-order bits.
 
 Mode: the names keep the package's own prefix (``cake_mhc_nondet_train_*``,
 ``CakeMHCNondet*Function``); no entry point takes a ``deterministic`` keyword
@@ -1706,14 +1705,14 @@ def cake_mhc_nondet_train_backward_finish(
     them: hidden 4096 above 14927 tokens on sm_100a and sm_103a; see
     :mod:`.cake_jit`), rounded once, bitwise the deterministic package's.
     ``dfn`` folds the per-chunk FP32 Kahan pairs (sum ``acc``, compensation
-    ``comp``) of at most ``P <= 32`` token chunks (the host rule's chunk sizes
-    per token count and device) per element in ascending chunk order as a
+    ``comp``) of at most ``P <= 32`` token chunks (the deterministic package's
+    chunks per token count and device) per element in ascending chunk order as a
     compensated FP32 sum, the caller's ``dfn`` last under ``accumulate=True``,
     rounded once: within one FP32 rounding of the exact sum plus
     ``O(P^2 u^2) (|start| + sum |acc|)`` and ``O(P u) sum |comp|``
     (``u = 2^-24``).
-    It can differ from the deterministic package's ``dfn`` (an FP64 fold, over
-    other chunks where the two-size schedule runs) in the low-order bits.
+    It can differ from the deterministic package's ``dfn`` (an FP64 fold of
+    the same pairs, each rounded once to FP32) in the low-order bits.
     With ``T == 0`` nothing is launched: ``dX`` is empty and the parameter
     gradients are zeroed (``accumulate=False``) or left untouched
     (``accumulate=True``).
@@ -1868,8 +1867,9 @@ def _backward_finish(
     rows_mode = plan["group_rows"] and int(sinkhorn_iters) == SINKHORN_ITERS
     # The atomic fn split writes the transposed operand layout and, without
     # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks or the lpt record over the host rule's two-size chunks,
-    # or their slab-fastest _os copies where bwd_slab_order names "slab")
+    # one-size chunks, its slab-fastest _os copy where bwd_slab_order names
+    # "slab", or the lpt record where a calibration of the host rule picks
+    # two-size chunks; the tables of record pick none)
     # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
     # ``T`` rows of the padded ``dz'`` record, draws its work units from the
     # workspace's self-resetting ticket word, stores each unit's dfn Kahan
