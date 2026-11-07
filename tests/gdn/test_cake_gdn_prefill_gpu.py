@@ -827,6 +827,95 @@ def test_public_cake_gdn_prefill_sm107a_gatestream_one_cta_per_tile_runs_the_twi
     )
 
 
+def test_public_cake_gdn_prefill_sm107a_f16io_gatestream_twins_equal_the_base_record(
+    monkeypatch,
+):
+    # The FP16-I/O full-DV key with several short tiles per CTA runs the gate-stream
+    # prefetch twin on the persistent grid and the gate-stream twin without the prefetch
+    # with one CTA per tile; with the twin rule off for the FP16-I/O body it runs the base
+    # record.  The twins only move data differently: all three outputs and final states
+    # are equal bit for bit and match the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the FP16-I/O gate-stream twins are sm_107a only")
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        io_dtype=torch.float16,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    total_tiles = len(case["seq_lens"]) * case["num_v_heads"]
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        case["output_state"].fill_(float("nan"))
+        out, state = _launch(case)
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    assert len(grids) == 1 and grids[0] < total_tiles, grids
+    (prefetch,) = loaded
+    assert "_initial_f16io_gatestream_full_pf_sm107a_i64meta_" in prefetch, prefetch
+    real_sm_count = prefill_mod._cake_gdn_sm_count
+    monkeypatch.setattr(
+        prefill_mod, "_cake_gdn_sm_count", lambda _device_index: total_tiles
+    )
+    run()
+    assert grids[1:] == [total_tiles], grids
+    assert loaded[1:] == [prefetch.replace("_gatestream_full_pf_", "_gatestream_full_")]
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_sm_count", real_sm_count)
+    monkeypatch.setattr(
+        cake_gdn,
+        "_GATE_STREAM_FULL_BASES",
+        cake_gdn._GATE_STREAM_FULL_BASES
+        - {"flashinfer_blackwell_gdn_prefill_initial_f16io"},
+    )
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 3
+    assert "_initial_f16io_sm107a_i64meta_" in loaded[2], loaded
+    record = cake_gdn._kernel_record(loaded[2])
+    for name in loaded[:2]:
+        assert (
+            cake_gdn._kernel_record(name)["specializations"]
+            == record["specializations"]
+        )
+    base_out, base_state = results[2]
+    for out, state in results[:2]:
+        assert torch.equal(out, base_out)
+        assert torch.equal(state, base_state)
+    torch.testing.assert_close(
+        base_out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        base_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent_recurrence(
     monkeypatch,
 ):

@@ -1,6 +1,6 @@
 """FP64 references, accuracy checks and registry readers shared by the coverage
 suites of the Cake RMSNorm training package with the non-deterministic weight
-gradient (``tests/norm/test_cake_rmsnorm_train_{ckpt,windows,all_sm,dist}.py``).
+gradient (``tests/norm/test_cake_rmsnorm_nondet_train_{ckpt,windows,all_sm,dist}.py``).
 
 The budget is the deterministic package's: BF16 ``y`` / ``dx`` at ``atol = rtol =
 1e-2`` after normalizing both sides to unit scale, FP32 ``rstd`` at relative L2

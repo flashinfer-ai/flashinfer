@@ -30,6 +30,7 @@ limitations under the License.
 # ``test_cake_dsa_indexer_det_train_api.py`` and their #8928 naming rules by
 # ``test_cake_dsa_indexer_det_train_names.py``.
 
+import dataclasses
 import itertools
 import json
 import os
@@ -111,6 +112,7 @@ _COMMON = dict(
     cand_cap_ceiling_unsampled=None,
     wide_first_rule=None,
     wide_wave_rule=None,
+    desc_walk_kinds=None,
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
@@ -134,6 +136,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    lsf_single_rule=None,
     static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
@@ -745,13 +748,76 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
-        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], each >= 0, or None
+        # the wave rule: [min narrow / wide wave ratio, min l6 / wide wave ratio, min mean unit tiles], or that with
+        # [top_k (an int >= 1), exponent, packed minimum (>= the one-segment one), rise per wave, waves (an int >= 1),
+        # low wave ratio (>= the second element), its tile coefficient, its packed coefficient], each >= 0, or None
         dict(wide_wave_rule=1.6),
         dict(wide_wave_rule=[]),
         dict(wide_wave_rule=[1.6, 1.3]),
-        dict(wide_wave_rule=[1.6, 1.3, 80.0, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14]),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0]),
+        dict(
+            wide_wave_rule=[
+                1.6,
+                1.3,
+                80.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.3,
+                40.0,
+                9.0,
+                1.0,
+            ]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048.0, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, True, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, -1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 64.0, 3.5, 14, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, -3.5, 14, 1.3, 40.0, 9.0]
+        ),
+        dict(wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 0, 1.3, 40.0, 9.0]),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14.0, 1.3, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.2, 40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, -40.0, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, True, 9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, -9.0]
+        ),
+        dict(
+            wide_wave_rule=[1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, True]
+        ),
         dict(wide_wave_rule=[-1.0, 1.3, 80.0]),
         dict(wide_wave_rule=[1.6, 1.3, True]),
+        # the descending-walk kinds: [unsampled kinds, sampled kinds], ascending lists of physical scan kinds, or None
+        dict(desc_walk_kinds="wide"),
+        dict(desc_walk_kinds=[]),
+        dict(desc_walk_kinds=[["wide"]]),
+        dict(desc_walk_kinds=[["wide"], [], []]),
+        dict(desc_walk_kinds=[["wide_desc"], []]),
+        dict(desc_walk_kinds=[["wide", "wide"], []]),
+        dict(desc_walk_kinds=[["wide", "l6"], []]),
+        dict(desc_walk_kinds=[[1], []]),
         # the units that split: an ascending list of unit geometries (may be empty)
         dict(split_units="l6"),
         dict(split_units=["split_l6"]),
@@ -780,6 +846,13 @@ def test_policy_record_round_trip_and_validation():
         dict(snake_cap_rule=[1, 0]),
         dict(snake_cap_rule=[1.0, 40]),
         dict(snake_cap_rule=[True, 40]),
+        # the FP8 one-segment longest-first rule: [min mean unit tiles >= 0] or None
+        dict(lsf_single_rule=64.0),
+        dict(lsf_single_rule=[]),
+        dict(lsf_single_rule=[64.0, 1]),
+        dict(lsf_single_rule=[-1.0]),
+        dict(lsf_single_rule=[True]),
+        dict(lsf_single_rule=["64"]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -862,6 +935,41 @@ def test_policy_record_round_trip_and_validation():
     assert not capped.snake_copy_fits(65536, 1, 6, 212)
     assert not capped.snake_copy_fits(32768, 2, 6, 212)
     assert DispatchPolicy.from_record(record).snake_copy_fits(1 << 20, 64, 6, 212)
+    single = DispatchPolicy.from_record(dict(record, lsf_single_rule=(64,)))
+    assert single.record()["lsf_single_rule"] == [64]
+    assert DispatchPolicy.from_record(single.record()) == single
+    # mean unit tiles (Tkv - T / (2 ratio)) / S / 128: 16384 x 16384 take 64, 16384 x 15360 take 56
+    assert single.lsf_single_fits(16384, 16384, 1, 1)
+    assert not single.lsf_single_fits(16384, 15360, 1, 1)
+    assert not single.lsf_single_fits(32768, 32768, 2, 1)
+    assert not DispatchPolicy.from_record(record).lsf_single_fits(1024, 1 << 20, 1, 1)
+    walked = DispatchPolicy.from_record(dict(record, desc_walk_kinds=[["wide"], []]))
+    assert walked.desc_walk_kinds == [["wide"], []]
+    assert walked.record()["desc_walk_kinds"] == [["wide"], []]
+    assert DispatchPolicy.from_record(walked.record()) == walked
+    assert walked.desc_walk_for("wide", sampled=False)
+    assert not walked.desc_walk_for("wide", sampled=True)
+    assert not walked.desc_walk_for("l6", sampled=False)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            record,
+            wide_wave_rule=(1.6, 1.3, 80.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0),
+        )
+    )
+    assert scaled.record()["wide_wave_rule"] == [
+        1.6,
+        1.3,
+        80.0,
+        2048,
+        1.1,
+        112.0,
+        3.5,
+        14,
+        1.3,
+        40.0,
+        9.0,
+    ]
+    assert DispatchPolicy.from_record(scaled.record()) == scaled
     scoped = DispatchPolicy.from_record(
         dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
     )
@@ -1538,6 +1646,77 @@ def test_wide_wave_rule_compares_waves_of_the_persistent_grid():
     assert unit(712, 4096, K=256) == 8
     # the record without the field keeps the rounds-and-work rule: 512 / 148 = 3.5 rounds < 6 -> narrow
     assert NARROW_PAIR_POLICY.unit_block_q_for(4096, 65536, 1, 1, 148, 2048) == 4
+    # an eleven-element rule [.., 84, 2048, 1.1, 112, 3.5, 14, 1.3, 40, 9] (no low wave-ratio minimum: its ratio is the
+    # second element's): the same decisions on one document of at least 14 wide waves at top_k <= 2048 (16384
+    # queries: 14 wide waves, 19 l6 waves)
+    scaled = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            wide_wave_rule=[1.7, 1.3, 84.0, 2048, 1.1, 112.0, 3.5, 14, 1.3, 40.0, 9.0],
+        )
+    )
+
+    def scaled_unit(T, Tkv, K=2048, S=1):
+        return scaled.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    for T, Tkv in ((16384, 20480), (16384, 18432), (8192, 8192), (4096, 65536)):
+        assert scaled_unit(T, Tkv) == unit(T, Tkv)
+    assert scaled_unit(16384, 18432, K=1024) == unit(16384, 18432, K=1024) == 6
+    # 8192 queries take 7 wide waves (10 l6 waves): the floor rises by 3.5 x 7 to 108.5, so 96 mean tiles keep l6
+    # where the three-element rule takes the wide unit, and 128 take it
+    assert unit(8192, 16384) == 8
+    assert scaled_unit(8192, 16384) == 6
+    assert scaled_unit(8192, 20480) == 8
+    # two packed documents of 16384 queries in all need 112 mean tiles: 104 keep l6, 112 take the wide unit
+    assert scaled_unit(16384, 34816, S=2) == 6
+    assert scaled_unit(16384, 36864, S=2) == 8
+    # above top_k 2048 the floor grows as (top_k / 2048) ** 1.1: 131.2 at 3072, 180.1 at 4096
+    assert scaled_unit(16384, 24576, K=3072) == 6
+    assert scaled_unit(16384, 26624, K=3072) == 8
+    assert unit(16384, 20480, K=4096) == 8
+    assert scaled_unit(16384, 20480, K=4096) == 6
+    assert scaled_unit(16384, 32768, K=4096) == 8
+    # [1.7, 1.15, 64, 2048, 1.1, 112, 3.5, 14, 1.26, 40, 9]: below a wave ratio W = 1.26 the minimum is at least
+    # 40 / (W - 1) mean tiles, on a packed call also 9 / (W - 1) ** 2.  4096 queries take 4 wide waves against 5 l6
+    # waves (W = 1.25), so they need 160 mean tiles (packed too: 9 x 16 = 144) where 4096 x 16384 (112 tiles) clear
+    # the 99-tile minimum of 4 wide waves; 8520 queries take 8 wide waves against 10 l6 waves (W = 1.25) and need 160
+    # too; 6144 queries take 6 wide waves against 7 l6 waves (W = 7 / 6) and need 240, on two documents 324; 8192
+    # queries (7 wide waves, 10 l6 waves) keep the 88.5-tile minimum
+    low = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024, 512],
+            wide_wave_rule=[
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+            ],
+        )
+    )
+
+    def low_unit(T, Tkv, K=2048, S=1):
+        return low.unit_block_q_for(T, Tkv, S, 1, 148, K)
+
+    assert low_unit(4096, 16384) == 6
+    assert low_unit(4096, 2048 + 159 * 128) == 6
+    assert low_unit(4096, 2048 + 160 * 128) == 8
+    assert low_unit(4096, 2048 + 159 * 256, S=2) == 6
+    assert low_unit(4096, 2048 + 160 * 256, S=2) == 8
+    assert low_unit(8520, 4260 + 159 * 128) == 6
+    assert low_unit(8520, 4260 + 160 * 128) == 8
+    assert low_unit(6144, 3072 + 239 * 128) == 6
+    assert low_unit(6144, 3072 + 240 * 128) == 8
+    assert low_unit(6144, 3072 + 323 * 256, S=2) == 6
+    assert low_unit(6144, 3072 + 324 * 256, S=2) == 8
+    assert low_unit(8192, 4096 + 89 * 128) == 8
 
 
 def test_sample_shift_rule_precedence():
@@ -1850,6 +2029,71 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
         assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
 
 
+def test_desc_walk_kinds_runs_the_descending_wide_twin_with_sampling_off():
+    """sm_103a ``desc_walk_kinds`` ``[["wide"], []]``: a call with the sampled first threshold off whose plan is the
+    single-CTA wide program runs its descending-walk twin (key kind ``wide_desc``: the same unit, split, tile unroll, fit
+    and longest-first form; the same ids and score bits); sampled calls, every other kind and sm_100a / sm_107a (field
+    None) keep their program.  On a grid of shapes in both modes and on every frozen SM count, each plan equals the plan
+    of the record without the field except for exactly that key; the sampled list ``[["wide"], ["wide"]]`` moves sampled
+    wide calls the same way; without a registry the field is inert."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in ("sm_100a", "sm_107a"):
+        assert policy_for(arch).desc_walk_kinds is None
+        assert not any(":wide_desc:" in k for k in cake_jit.PROGRAM_KEYS[arch])
+    p, keys = policy_for("sm_103a"), cake_jit.PROGRAM_KEYS["sm_103a"]
+    assert p.desc_walk_kinds == [["wide"], []]
+    desc = sorted(k for k in keys if k.startswith("scan:wide_desc:"))
+    assert len(desc) == 8
+    assert all(k.replace("scan:wide_desc:", "scan:wide:") in keys for k in desc)
+    plain = DispatchPolicy.from_record(dict(p.record(), desc_walk_kinds=None))
+    both = DispatchPolicy.from_record(
+        dict(p.record(), desc_walk_kinds=[["wide"], ["wide"]])
+    )
+
+    def plan(policy, T, Tkv, S, sample, grid, top_k=2048, scan_keys=keys):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=scan_keys,
+        )
+
+    def twin(choice):
+        key = choice.scan_key.replace("scan:wide:", "scan:wide_desc:", 1)
+        if choice.physical_kind != "wide" or key not in keys:
+            return choice
+        return dataclasses.replace(choice, scan_key=key)
+
+    moved = {False: 0, True: 0}
+    for q, k, S, top_k, sample, grid in itertools.product(
+        (1024, 4096, 8192, 16384),
+        (32768, 131072, 262144),
+        (1, 2, 8),
+        (512, 2048),
+        (None, 0),
+        _FROZEN_GRIDS["sm_103a"],
+    ):
+        T, Tkv = q * S, k * S
+        if q > k or T > 131072:
+            continue
+        base = plan(plain, T, Tkv, S, sample, grid, top_k)
+        sampled = base.sample_tiles_max > 0
+        want = base if sampled else twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k) == want, (T, Tkv, S, sample)
+        assert plan(both, T, Tkv, S, sample, grid, top_k) == twin(base)
+        assert plan(p, T, Tkv, S, sample, grid, top_k, scan_keys=None) == plan(
+            plain, T, Tkv, S, sample, grid, top_k, scan_keys=None
+        )
+        moved[sampled] += twin(base) != base
+    assert moved[False] > 0 and moved[True] > 0, moved
+
+
 def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
     """sm_100a / sm_103a ``l6_solo_unsampled_max_queries`` 16384 (no ``l6_solo_rule``): a call with the sampled first
     threshold off and at most 16384 queries whose plan is the CTA-pair l6 unit without a split runs the unpaired l6 unit;
@@ -2133,7 +2377,8 @@ def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_t
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
     """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
     the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
-    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program).  A
+    descending-walk twin (key kind ``<kind>_desc``) is not a decided kind: its ascending program carries the form."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -2141,7 +2386,9 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
             {
                 key.split(":")[1]
                 for key in keys
-                if key.startswith("scan:") and key.endswith(":f1")
+                if key.startswith("scan:")
+                and key.endswith(":f1")
+                and not key.split(":")[1].endswith("_desc")
             }
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch

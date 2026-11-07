@@ -22,18 +22,20 @@ No device is needed; nothing is built or launched.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_det_train_kcp", "cake_build")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_build = cake_package("cake.cake_kda_det_train_kcp", "cake_build")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
+kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -710,7 +712,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_det_train_kcp"
+        == "flashinfer.experimental.cake.cake_kda_det_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp
@@ -747,3 +749,70 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     with pytest.raises(RuntimeError):
         kcp_jit.test_library_name("kcp_transfer_walk_three_mma", "sm_90a")
     kcp_jit._test_manifest.cache_clear()
+
+
+REPO = Path(__file__).resolve().parents[2]
+PACKAGE_NAME = "flashinfer.experimental.cake.cake_kda_det_train_kcp"
+SINGLE_RANK_NAME = "flashinfer.experimental.cake.cake_kda_det_train"
+
+
+def _manifest_checker():
+    """``scripts/check_cake_build_manifests.py`` of this checkout, loaded as a module (it never imports flashinfer)."""
+    path = REPO / "scripts" / "check_cake_build_manifests.py"
+    if not path.is_file():
+        pytest.skip(
+            "scripts/check_cake_build_manifests.py is not beside this test (installed package)"
+        )
+    spec = importlib.util.spec_from_file_location("check_cake_build_manifests", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules.setdefault("check_cake_build_manifests", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_manifest_checker_row_requires_the_single_rank_package() -> None:
+    """The checker's row of this package names its directory and requires the single-rank sibling, and its
+    manifest declares that sibling (``common.requires.packages``)."""
+    checker = _manifest_checker()
+    row = checker.package_named(PACKAGE_NAME)
+    assert row is not None
+    assert (row.path, row.loader) == (
+        "flashinfer/experimental/cake/cake_kda_det_train_kcp",
+        "cake_kcp_jit.py",
+    )
+    assert row.requires == (SINGLE_RANK_NAME,)
+    assert checker.check_requires(row) == []
+    assert checker.check_required_packages(row, cake_build.manifest()) == []
+
+
+def test_manifest_checker_required_packages_rule() -> None:
+    """``check_required_packages``: the manifest lists the directory names of ``Package.requires`` sorted and without
+    duplicates (as #8928 specifies), whatever the order of ``Package.requires``, and lists none when the package
+    requires none."""
+    checker = _manifest_checker()
+
+    def package(*requires: str):
+        return checker.Package(
+            "p.pkg", "p/pkg", "cake_jit.py", checker.refs_generic, requires=requires
+        )
+
+    def manifest(**requires):
+        return {"common": {"requires": {"cuda_toolkit": {"min": "12.8"}, **requires}}}
+
+    def messages(row, document):
+        return [f.message for f in checker.check_required_packages(row, document)]
+
+    two = package("p.sib", "p.other")
+    assert messages(two, manifest(packages=["other", "sib"])) == []
+    assert messages(package(), manifest()) == []
+    (missing,) = messages(two, manifest())
+    assert "common.requires.packages is missing; expected ['other', 'sib']" in missing
+    (unsorted,) = messages(two, manifest(packages=["sib", "other"]))
+    assert "!= ['other', 'sib']" in unsorted
+    (duplicate,) = messages(two, manifest(packages=["other", "other", "sib"]))
+    assert "!= ['other', 'sib']" in duplicate
+    (dotted,) = messages(two, manifest(packages=["p.other", "p.sib"]))
+    assert "!= ['other', 'sib']" in dotted
+    (extra,) = messages(package(), manifest(packages=["sib"]))
+    assert "Package.requires is empty" in extra

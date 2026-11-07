@@ -51,7 +51,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | mHC | det | single rank | `cake_mhc_det_train` | `cake_mhc_det_train_prepare`, `cake_mhc_det_train_finish` | `CakeMHCDetPrepareFunction`, `CakeMHCDetFinishFunction` | functions unchanged; classes `CakeMHCDetTrain*Function` |
 | | nondet | single rank | `cake_mhc_nondet_train` | `cake_mhc_nondet_train_prepare`, `cake_mhc_nondet_train_finish` | `CakeMHCNondetPrepareFunction`, `CakeMHCNondetFinishFunction` | `experimental.cake.cake_mhc_train` / `cake_mhc_train_*` |
 | mHC head | det | single rank | `cake_mhc_head_det_train` | `cake_mhc_head_det` | `CakeMHCHeadDetFunction` | `cake_mhc_det_train_head` / `CakeMHCDetTrainHeadFunction` |
-| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | planned |
+| | nondet | single rank | `cake_mhc_head_nondet_train` | `cake_mhc_head_nondet` | `CakeMHCHeadNondetFunction` | new; no former name |
 | GDN | det | single rank | `cake_gdn_det_train` (new top-level facade) | `cake_gdn_det` | `CakeGDNDetFunction` | `experimental.cake_gdn_det_train` / `chunk_gated_delta_rule_det` |
 | | det | KCP | `cake_gdn_det_train_kcp` | `cake_gdn_det_kcp` | `CakeGDNDetKcpFunction` | `chunk_gdn_det_kcp` / `ChunkGDNDetFunctionKcp` |
 | | nondet | single rank | `cake_gdn_nondet_train` | `cake_gdn_nondet` | `CakeGDNNondetFunction` | `experimental.cake.cake_gdn_train` / `chunk_gated_delta_rule(deterministic=False)` |
@@ -89,14 +89,14 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 ## Decisions
 
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
-- **mHC head becomes its own family.** It ships `det` now; `nondet` is planned.
-- **Missing versions keep their reserved names:** mHC head `nondet`, DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
+- **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
+- **Missing versions keep their reserved names:** DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
 
 ## Current names
 
 | Training family | Canonical backend / route name |
 | --- | --- |
-| LM head + loss | `cake_lm_head_det_train` (deterministic: module `flashinfer.cake_lm_head_det_train`, backend `flashinfer.experimental.cake.cake_lm_head_det_train`); `cake.cake_lm_head_loss` (non-deterministic) |
+| LM head + loss | `cake_lm_head_det_train` (deterministic: module `flashinfer.cake_lm_head_det_train`, backend `flashinfer.experimental.cake.cake_lm_head_det_train`); `cake_lm_head_nondet_train` (non-deterministic: module `flashinfer.cake_lm_head_nondet_train`, backend `flashinfer.experimental.cake.cake_lm_head_nondet_train`) |
 
 ### LM head + loss
 
@@ -107,8 +107,8 @@ nothing. The former names are removed without aliases: importing one fails.
 
 | Name | Former names (removed, no alias) |
 | --- | --- |
-| module `flashinfer.cake_lm_head_det_train` | the deterministic entries of `flashinfer.chunked_lm_head` (that module keeps only the non-deterministic dispatchers) |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_det_loss`; before the `det` naming `chunked_lm_head_loss` (now a non-deterministic dispatcher) |
+| module `flashinfer.cake_lm_head_det_train` | the deterministic entries of `flashinfer.chunked_lm_head` (that module is removed; its non-deterministic entries are now `flashinfer.cake_lm_head_nondet_train`) |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_det_loss`; before the `det` naming `chunked_lm_head_loss` |
 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob` | `flashinfer.chunked_lm_head.chunked_lm_head_det_logprob`; before the `det` naming `chunked_lm_head_logprob` |
 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload` | `flashinfer.chunked_lm_head.chunked_lm_head_det_preload`; before the `det` naming `chunked_lm_head_preload` |
 | `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob` | `flashinfer.chunked_lm_head.chunked_lm_head_det_support_logprob`; before the `det` naming `chunked_lm_head_support_logprob` |
@@ -144,29 +144,31 @@ Both LM-head facades read them through the private module
 
 ### LM head + loss: non-deterministic package
 
-The non-deterministic package `flashinfer.experimental.cake.cake_lm_head_loss`
+The non-deterministic package `flashinfer.experimental.cake.cake_lm_head_nondet_train`
+(module `flashinfer.cake_lm_head_nondet_train`)
 keeps every precision boundary of the deterministic package (BF16 logits and
 `dlogits`, FP32 loss arithmetic, FP32 `dX` and cross-chunk `dW` accumulation,
 one final cast each) and relaxes only run-to-run bitwise reproducibility: the
 dX GEMM of a chunk of more than one K slice adds its partial tiles into the
 FP32 `dX` accumulator in an unordered FP32 reduction (a one-slice chunk stores
 its rows as the deterministic package does). `loss`, `logp` and `lse` keep
-their fixed order. Its names are the deterministic names without `det`:
+their fixed order. Its names carry `nondet` where the deterministic names carry `det`:
 
 | Deterministic name | Non-deterministic name | The same name in the deterministic package |
 | --- | --- | --- |
-| package `flashinfer.experimental.cake.cake_lm_head_det_train` | package `flashinfer.experimental.cake.cake_lm_head_loss` | none |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss` | `flashinfer.chunked_lm_head.chunked_lm_head_loss(..., deterministic=False)` | `chunked_lm_head_loss` is this package's dispatcher; it needs `deterministic=False` |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob` | `chunked_lm_head_logprob(..., deterministic=False)` | dispatcher; `deterministic=False` required |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload` | `chunked_lm_head_preload(..., deterministic=False)` | dispatcher; `deterministic=False` required |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob` | `chunked_lm_head_support_logprob(..., deterministic=False)` | dispatcher; `deterministic=False` required |
-| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl` | `chunked_lm_head_support_kl(..., deterministic=False)` | dispatcher; `deterministic=False` required |
+| package `flashinfer.experimental.cake.cake_lm_head_det_train` | package `flashinfer.experimental.cake.cake_lm_head_nondet_train` | none |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss` | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_loss` | none |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob` | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_logprob` | none |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_preload` | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_preload` | none |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_logprob` | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_support_logprob` | none |
+| `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_support_kl` | `flashinfer.cake_lm_head_nondet_train.cake_lm_head_nondet_train_support_kl` | none |
+| `cake_backend.cake_lm_head_det_train_{loss,logprob,logprob_temperature}` (also in `cake_backend_opt_in`), `cake_backend.cake_lm_head_det_train_logprob_keep` | `cake_backend.cake_lm_head_nondet_train_{loss,logprob,logprob_temperature}` (also in `cake_backend_opt_in`), `cake_backend.cake_lm_head_nondet_train_logprob_keep` | none |
 | `cake_backend.prepare_lm_head_det_loss` | `cake_backend.prepare_lm_head_loss` | removed, no alias |
 | `cake_backend.validate_lm_head_det_inputs` | `cake_backend.validate_lm_head_inputs` | removed, no alias |
 | `cake_backend.lm_head_det_loss_workspace_size` | `cake_backend.lm_head_loss_workspace_size` | removed, no alias |
 | `cake_backend.LmHeadDetLossRunner` | `cake_backend.LmHeadLossRunner` | removed, no alias |
-| `cake_backend.CakeLMHeadDet{Loss,Logprob}Function` | `cake_backend.ChunkedLmHead{Loss,Logprob}Function` | removed, no aliases |
-| `cake_support.CakeLMHeadDetSupportFunction` | `cake_support.SupportLogprobFunction` | removed, no alias |
+| `cake_backend.CakeLMHeadDet{Loss,Logprob,LogprobTemperature}Function` (also in `cake_backend_opt_in`), `cake_backend.CakeLMHeadDetLogprobKeepFunction` | `cake_backend.CakeLMHeadNondet{Loss,Logprob,LogprobTemperature}Function` (also in `cake_backend_opt_in`), `cake_backend.CakeLMHeadNondetLogprobKeepFunction` | none |
+| `cake_support.CakeLMHeadDetSupportFunction` | `cake_support.CakeLMHeadNondetSupportFunction` | none |
 | `cake_jit.load_cake_lm_head_det_loss_module` | `cake_jit.load_cake_lm_head_loss_module` | removed, no alias |
 | programs `cake_lm_head_det_loss_<20 hex>` | programs `cake_lm_head_loss_<20 hex>`, libraries `cake_lm_head_loss_<20 hex>_<arch>` | none |
 
@@ -177,18 +179,17 @@ Mode and dispatch rules:
 
 | Call | Result |
 | --- | --- |
-| `chunked_lm_head_{loss,logprob,preload,support_logprob,support_kl}(...)` with the default or any `deterministic` other than `False` (`True`, `None`, `0`, `1`, `"False"`) | `ValueError`, raised before any package import or torch query; it names `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_<same suffix>` and says "pass deterministic=False for the non-deterministic path" |
-| the same with `deterministic=False` | the non-deterministic package, after the same argument checks and with the same `FLASHINFER_CAKE_LM_HEAD_LOSS_*` fallbacks |
-| the same with `deterministic=False` while `torch.use_deterministic_algorithms(True)` is in effect (also `warn_only=True`) | the non-deterministic package; its alert decides (the row below); no fallback to the deterministic entry; a `k_slices` pin reaches it unchanged, and the dispatcher itself warns nothing |
+| `cake_lm_head_nondet_train_{loss,logprob,preload,support_logprob,support_kl}(...)` | the non-deterministic package, after the same argument checks as the deterministic entries and with the same `FLASHINFER_CAKE_LM_HEAD_LOSS_*` fallbacks; the module reads no torch flag and imports no deterministic module |
+| the same while `torch.use_deterministic_algorithms(True)` is in effect (also `warn_only=True`) | the non-deterministic package; its alert decides (the last row); no fallback to the deterministic entry; a `k_slices` pin reaches it unchanged, and the module itself warns nothing |
 | `cake_lm_head_det_train_{loss,logprob,preload,support_logprob,support_kl}(..., deterministic=<any>)`; likewise every function and autograd `Function` of the deterministic package | `TypeError` (none has a `deterministic` parameter); torch's deterministic mode changes nothing |
-| a non-deterministic package entry (`flashinfer.experimental.cake.cake_lm_head_loss`) with `deterministic` other than `False` (its default `True` included) | `ValueError` before any launch, naming the deterministic entry `flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_<suffix>` and saying "pass deterministic=False for the non-deterministic path"; `backward_loss` and `ForwardResult.backward` take no `deterministic` (they continue a `forward_loss` call) |
+| `cake_lm_head_nondet_train_{loss,logprob,preload,support_logprob,support_kl}(..., deterministic=<any>)`; likewise every function and autograd `Function` of the non-deterministic package | `TypeError` (none has a `deterministic` parameter), raised before any work |
 | a non-deterministic package entry while `torch.use_deterministic_algorithms(True)` is in effect | PyTorch's alert (`RuntimeError`, or a `UserWarning` with `warn_only=True`, after which the call runs) only right before a K-sliced dX launch: a `gemm_dx_red` chunk of more than one dX slice (the counted two-slice chunks of the zero-gradient row skip included) or the candidate-support backward's dense dX at more than one slice (`sm_100a` cells only); fixed-order launches do not alert (one-slice dX, the weight-gradient GEMMs in chunk order, the deferred last-chunk weight gradient, the budget recompute, the casts, the support sparse passes, forward-only calls) |
 
 Zero-weight policy rows (`objective="policy"`, a valid label and
 `loss_weights == 0`): the non-deterministic loss entry leaves them out of the
 gradient path, as it does ignored rows.
 
-| | `cake_lm_head_det_train_loss` | `chunked_lm_head_loss(..., deterministic=False)` |
+| | `cake_lm_head_det_train_loss` | `cake_lm_head_nondet_train_loss` |
 | --- | --- | --- |
 | gradient rows of the chunk loop | every valid row | `(labels >= 0) & (loss_weights != 0)` (a NaN weight stays in) |
 | `logp` of a zero-weight row (`return_logp=True`) | the loss path | a logp-only pass of the log-probability forward kernels |
@@ -197,10 +198,10 @@ gradient path, as it does ignored rows.
 | host synchronizations | one count readback | one count readback (both counts in it) |
 | not applied | -- | a call of fewer than `cake_backend.zero_weight_min_rows()` rows (default 4096), `compact_rows=False`, `objective="ce"`, the log-probability entry, the prepared runner, a caller-given `num_valid_rows`; `memory_mode="budget"` without `num_valid_rows` splits the rows (its bound still counts every valid row) |
 
-Candidate-support entries (`chunked_lm_head_support_logprob` /
-`chunked_lm_head_support_kl`):
+Candidate-support entries (`cake_lm_head_nondet_train_support_logprob` /
+`cake_lm_head_nondet_train_support_kl`):
 
-| | `cake_lm_head_det_train_support_*` | `chunked_lm_head_support_*(..., deterministic=False)` |
+| | `cake_lm_head_det_train_support_*` | `cake_lm_head_nondet_train_support_*` |
 | --- | --- | --- |
 | outputs, sparse `dX`, `dW` | the deterministic programs | the same programs: the same bits |
 | dense `dX` | per vocabulary block an FP32 product block, added into the chunk sum in block order | each block's GEMM adds into the chunk sum from its epilogue: one K slice (the same bits) at every shape outside the measured cells of `support_dx_form`; two or three K slices inside them (B200 only: five classes of H, token chunk and vocabulary block, at H 2048 to 6144): an unordered FP32 sum within the accuracy budgets |
@@ -208,8 +209,8 @@ Candidate-support entries (`chunked_lm_head_support_logprob` /
 | sparse `dW` long segments | parts summed in part order | the same |
 
 The non-deterministic package adds no environment variable; the
-`FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables apply to the `det` entries and to
-the dispatchers, and its binding caches take the same two binding-cache settings.
+`FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables apply to the `det` and the `nondet`
+entries, and its binding caches take the same two binding-cache settings.
 
 ## Family migration tables
 
@@ -221,8 +222,10 @@ Family rename PRs:
 | Family | Mode | PR |
 |---|---|---|
 | LM head + loss | det | #8925 |
+| LM head + loss | nondet | #8952 |
 | DSA indexer | det | #8936 |
 | GQA HD256 | nondet | #8939 |
+| KDA | nondet (single rank and KCP) | KDA family PR |
 
 ### GQA HD256: non-deterministic package
 
@@ -242,3 +245,28 @@ Family rename PRs:
 No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
 
 Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
+
+### KDA: non-deterministic packages (single rank and KCP)
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.cake_kda_train` (mode selector, `deterministic=` keyword) | `flashinfer.cake_kda_nondet_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.experimental.cake.cake_kda_train` | `flashinfer.experimental.cake.cake_kda_nondet_train` |
+| `chunk_kda` | `cake_kda_nondet` |
+| `chunk_kda_fwd` / `chunk_kda_bwd` | `cake_kda_nondet_train_forward` / `cake_kda_nondet_train_backward` |
+| `kda_train_arena`, `kda_train_workspace`, `kda_train_workspace_bytes`, `kda_train_saved_bytes` | `cake_kda_nondet_train_arena`, `cake_kda_nondet_train_workspace`, `cake_kda_nondet_train_workspace_bytes`, `cake_kda_nondet_train_saved_bytes` |
+| `is_kda_train_supported` | `is_cake_kda_nondet_train_supported` |
+| backend `ChunkKDAFunction`, `KdaWorkspace`, `KdaChunkSaved`, `KdaArena` | `CakeKDANondetFunction`, `CakeKDANondetWorkspace`, `CakeKDANondetChunkSaved`, `CakeKDANondetArena` |
+| module `flashinfer.cake_kda_train_kcp` | `flashinfer.cake_kda_nondet_train_kcp` (stable API, `@flashinfer_api`) |
+| package `flashinfer.experimental.cake_kda_train_kcp` | `flashinfer.experimental.cake.cake_kda_nondet_train_kcp` |
+| `chunk_kda_kcp` | `cake_kda_nondet_kcp` |
+| `chunk_kda_fwd_kcp` / `chunk_kda_bwd_kcp` | `cake_kda_nondet_train_kcp_forward` / `cake_kda_nondet_train_kcp_backward` |
+| `partition_kcp`, `build_context_kcp` | `cake_kda_nondet_train_kcp_partition`, `cake_kda_nondet_train_kcp_build_context` |
+| `kda_workspace_bytes_kcp`, `kda_saved_bytes_kcp`, `kda_comm_bytes_kcp`, `kda_handoff_bytes_kcp` | `cake_kda_nondet_train_kcp_workspace_bytes`, `cake_kda_nondet_train_kcp_saved_bytes`, `cake_kda_nondet_train_kcp_comm_bytes`, `cake_kda_nondet_train_kcp_handoff_bytes` |
+| `reduce_gate_param_grads_kcp`, `kcp_handoff_stats` | `cake_kda_nondet_train_kcp_reduce_gate_param_grads`, `cake_kda_nondet_train_kcp_handoff_stats` |
+| `ContextKcp`, `PartitionKcp`, `WorkspaceKcp`, `SavedKcp`, `RecomputeHandleKcp`, `OptionsKcp` | `CakeKDANondetKcpContext`, `CakeKDANondetKcpPartition`, `CakeKDANondetKcpWorkspace`, `CakeKDANondetKcpSaved`, `CakeKDANondetKcpRecomputeHandle`, `CakeKDANondetKcpOptions` |
+| backend `ChunkKDAFunctionKcp`, `CallKcp`, `FragmentKcp` | `CakeKDANondetKcpFunction`, `CakeKDANondetKcpCall`, `CakeKDANondetKcpFragment` |
+
+No aliases: the old names fail at import. No entry takes `deterministic=`; the former selector default (`deterministic=True` ran the deterministic package) is gone, so a caller of the deterministic path imports `flashinfer.cake_kda_det_train` / `flashinfer.cake_kda_det_train_kcp`. No launch of these packages is unordered: under `torch.use_deterministic_algorithms(True)` (also with `warn_only=True`) the entries run the non-deterministic package and raise no alert and no warning; nothing falls back to the deterministic package. A workspace, saved set or arena option of the deterministic package is refused with `ValueError` naming the mode.
+
+Build identities keep their names: program / library stems `cake_kda_train_<20 hex>[_kcp]`, kernel symbols, csrc file names and the `cake_jit` / `cake_kcp_jit` records; `build.json` changes only `"package"`, and the KCP package's `build.json` / `build.test.json` declare their single-rank sibling in `common.requires.packages` (`["cake_kda_nondet_train"]`). The KCP package imports that sibling by name from its own parent package (`_single_rank.py`), so vendoring builds ship the two directories side by side. Internal backend helpers (`plan`, `workspace_bytes`, `saved_bytes`, `kcp_plan`, `KcpPreconditionError`, ...) keep their names.
