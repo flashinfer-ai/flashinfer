@@ -1,0 +1,458 @@
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
+index 90fcb9011e..ad6be73166 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
+@@ -1071,6 +1071,7 @@ kernel_cake_kimi_k3_attn_res_0d77890adbb0f7175149(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
+index 1487bec4cf..46f7882f7d 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
+@@ -1096,6 +1096,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_kernel.cu
+index 5d7eb74a93..9be3409952 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_1974170f2264826fd01b_kernel.cu
+@@ -1025,6 +1025,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
+index 844700c3a6..30707ae0a5 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
+@@ -1034,6 +1034,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
+index f66e6f4e97..b4321c2e3d 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
+@@ -1023,6 +1023,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
+index a2f7607a6e..2d971fa1d7 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
+@@ -1080,6 +1080,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
+index 1c3d50b227..a4527e87b8 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
+@@ -1079,6 +1079,7 @@ kernel_cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_53790424af406f2edf30_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_53790424af406f2edf30_kernel.cu
+index 9153b1d510..03116e0879 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_53790424af406f2edf30_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_53790424af406f2edf30_kernel.cu
+@@ -1015,6 +1015,7 @@ kernel_cake_kimi_k3_attn_res_53790424af406f2edf30(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
+index a7c588f96f..4b0405ffdc 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
+@@ -1061,6 +1061,7 @@ kernel_cake_kimi_k3_attn_res_55b1ddf9602fd45a1404(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
+index 3b7f09cac3..3b71bbedc8 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
+@@ -1275,6 +1275,7 @@ kernel_cake_kimi_k3_attn_res_5e7c661caa058a3ed916(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+ #if __CUDA_ARCH__ == 1000
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
+index e4151c58cb..7f31c2e29a 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
+@@ -1087,6 +1087,7 @@ kernel_cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
+index e7897fa0c1..b24f4ec76d 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
+@@ -962,6 +962,9 @@ kernel_cake_kimi_k3_attn_res_709f669fe8647d61aaf0(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            if (bid >= M) {
++                mbarrier_wait_relaxed(norm_ready_addr, 0);
++            }
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 0, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
+index bf84c3cdd2..d7497e9735 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
+@@ -1097,6 +1097,7 @@ kernel_cake_kimi_k3_attn_res_74f8cbf06549fb15441f(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7c8168585b950bb93dc9_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7c8168585b950bb93dc9_kernel.cu
+index b1aee87b3d..48416d47de 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7c8168585b950bb93dc9_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7c8168585b950bb93dc9_kernel.cu
+@@ -1111,6 +1111,7 @@ kernel_cake_kimi_k3_attn_res_7c8168585b950bb93dc9(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
+index d9bc022e44..0801841602 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
+@@ -1314,6 +1314,7 @@ kernel_cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_80715310f7aa0cb02593_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_80715310f7aa0cb02593_kernel.cu
+index 76099d014e..2d298708d1 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_80715310f7aa0cb02593_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_80715310f7aa0cb02593_kernel.cu
+@@ -577,6 +577,7 @@ kernel_cake_kimi_k3_attn_res_80715310f7aa0cb02593(__nv_bfloat16* __restrict__ ou
+                 consumer_stage += 1;
+                 if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+         }
+     }
+ 
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
+index 606dff18da..ab92ea133a 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
+@@ -1166,6 +1166,7 @@ kernel_cake_kimi_k3_attn_res_8149765ce4eb797a1263(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+ #if __CUDA_ARCH__ == 1000
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
+index 0fa3ed7e99..0796eb319b 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
+@@ -1047,6 +1047,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
+index d0a951955b..b61d9fc667 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
+@@ -1088,6 +1088,7 @@ kernel_cake_kimi_k3_attn_res_923c80c79dc7e5f529c3(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
+index 36be755bf4..de794456ec 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
+@@ -1104,6 +1104,7 @@ kernel_cake_kimi_k3_attn_res_970f5ee5b6e600f64d47(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_kernel.cu
+index 2acf34a487..64589ced35 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99cdfcf0127721240020_kernel.cu
+@@ -1054,6 +1054,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
+index 1f6dd88935..7e32dcbbea 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
+@@ -955,6 +955,7 @@ kernel_cake_kimi_k3_attn_res_99f148a06e530e457f4a(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait_relaxed(norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 0, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
+index ce23207b18..43440cde28 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
+@@ -1059,6 +1059,7 @@ kernel_cake_kimi_k3_attn_res_9f31bc7a05f97159bb96(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
+index b73f6d8fbc..f56bd3c677 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
+@@ -1084,6 +1084,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a15c9b10e0c06764bb50_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a15c9b10e0c06764bb50_kernel.cu
+index 43ee95b495..ab28dfedb1 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a15c9b10e0c06764bb50_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a15c9b10e0c06764bb50_kernel.cu
+@@ -1015,6 +1015,7 @@ kernel_cake_kimi_k3_attn_res_a15c9b10e0c06764bb50(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
+index e2e880ff5d..65070fa20f 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
+@@ -1073,6 +1073,7 @@ kernel_cake_kimi_k3_attn_res_a2129211efec0ffa911f(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
+index 94c3712c3d..00c4c22daf 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
+@@ -1279,6 +1279,7 @@ kernel_cake_kimi_k3_attn_res_ab92afb21c782d62a0ad(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+ #if __CUDA_ARCH__ == 1000
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
+index f9679cba27..dab1a26064 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
+@@ -1413,6 +1413,7 @@ kernel_cake_kimi_k3_attn_res_b885dd8a2d8b94643f50(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ba11780fad8db3117e12_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ba11780fad8db3117e12_kernel.cu
+index 5698e43d0e..0511f508e9 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ba11780fad8db3117e12_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ba11780fad8db3117e12_kernel.cu
+@@ -1030,6 +1030,7 @@ kernel_cake_kimi_k3_attn_res_ba11780fad8db3117e12(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
+index 5d61a08a4f..18795eedfd 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
+@@ -1085,6 +1085,7 @@ kernel_cake_kimi_k3_attn_res_bc41069b56c74214c587(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
+index 5465eb9a2b..40c7b1fbf1 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
+@@ -1072,6 +1072,7 @@ kernel_cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
+index d960b77a52..62f37dd310 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
+@@ -1093,6 +1093,7 @@ kernel_cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
+index f8765e6ee0..92581210d6 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
+@@ -1089,6 +1089,7 @@ kernel_cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d99fda249fb6c79c8622_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d99fda249fb6c79c8622_kernel.cu
+index c90d20625d..169c3ad9fa 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d99fda249fb6c79c8622_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d99fda249fb6c79c8622_kernel.cu
+@@ -961,6 +961,7 @@ kernel_cake_kimi_k3_attn_res_d99fda249fb6c79c8622(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_dbd88df98cdb78e41a4c_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_dbd88df98cdb78e41a4c_kernel.cu
+index 81f514b7bb..800f089db9 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_dbd88df98cdb78e41a4c_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_dbd88df98cdb78e41a4c_kernel.cu
+@@ -1062,6 +1062,7 @@ kernel_cake_kimi_k3_attn_res_dbd88df98cdb78e41a4c(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+         }
+     }
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
+index 336296d63d..d2e73bf195 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
+@@ -1087,6 +1087,7 @@ kernel_cake_kimi_k3_attn_res_e682c53fdd5475bf33f5(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
+index d708933118..338e458300 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
+@@ -1207,6 +1207,7 @@ kernel_cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
+index b1c1840497..ac01824125 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
+@@ -1031,6 +1031,7 @@ kernel_cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            mbarrier_wait(output_norm_ready_addr, 0);
+             // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");

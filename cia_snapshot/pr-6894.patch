@@ -1,0 +1,258 @@
+diff --git a/docs/design_docs/autotuner_v2.md b/docs/design_docs/autotuner_v2.md
+index 3b9f9f1bf43..14a25d170eb 100644
+--- a/docs/design_docs/autotuner_v2.md
++++ b/docs/design_docs/autotuner_v2.md
+@@ -218,12 +218,14 @@ Persistence and orchestration stay separate responsibilities.
+ - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
+   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
+ - **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
+-  its hit flag. Only an all-hit group skips profiling; any miss makes all ranks discard that
++  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
++  selections skips profiling; any miss or disagreement makes all ranks discard that
+   profile's old runner entries and re-profile. Invalidation covers memory and persistence so
+   a different runner can win without an older entry taking precedence after reload. These
+   collectives run only during tuning, outside CUDA Graph capture. The framework must still
+   ensure matching op/profile/candidate order and skip lists across the group.
+-- **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
++- **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
++  tactic shortlists. Independent tuning without a process group can still diverge until
+   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
+   winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
+   published state into memory, and thereby makes shared keys use the store's final tactics
+diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
+index ae319d45596..acfe765d76f 100644
+--- a/flashinfer/autotuner/autotuner.py
++++ b/flashinfer/autotuner/autotuner.py
+@@ -1144,7 +1144,9 @@ def set_autotune_process_group(
+     ranks that requires identical: ``get_valid_tactics`` and shape buckets;
+     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
+     reduces). Cache hits are coordinated per profile: if any rank misses,
+-    every rank profiles again. Set the group from the first ``choose_one``;
++    every rank profiles again. Cached runner/tactic selections must also agree;
++    disagreement triggers the same coordinated re-profile. Set the group from
++    the first ``choose_one``;
+     distributed tuning must run outside CUDA Graph capture. Input
+     synthesis and ``do_preparation`` OOMs are reduced across the group before
+     tactic profiling, giving every rank the same fallback decision.
+@@ -1181,7 +1183,8 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
+     return bool(oom_flag.item())
+ 
+ 
+-def _all_ranks_hit_cache(local_hit: bool) -> bool:
++def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
++    """Reuse cached results only when every rank has the same selection."""
+     if _tune_process_group is None:
+         return local_hit
+     if torch.cuda.is_current_stream_capturing():
+@@ -1194,9 +1197,29 @@ def _all_ranks_hit_cache(local_hit: bool) -> bool:
+ 
+     backend = str(dist.get_backend(_tune_process_group)).lower()
+     device = "cuda" if backend == "nccl" else "cpu"
+-    hit = torch.tensor([int(local_hit)], dtype=torch.int32, device=device)
+-    dist.all_reduce(hit, op=dist.ReduceOp.MIN, group=_tune_process_group)
+-    return bool(hit.item())
++    digest = bytes(32)
++    if local_hit:
++        try:
++            encoded = json.dumps(
++                _tactic_to_json(selection),
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++            ).encode()
++            digest = hashlib.sha256(encoded).digest()
++        except (TypeError, ValueError):
++            # An unrepresentable selection cannot establish agreement. Every
++            # rank still joins the collective and takes the re-profile path.
++            local_hit = False
++    # Packing the digest and its negation checks both min and max using the
++    # existing single collective, including when some ranks miss the cache.
++    agreement = torch.tensor(
++        [int(local_hit), *digest, *(-value for value in digest)],
++        dtype=torch.int32,
++        device=device,
++    )
++    dist.all_reduce(agreement, op=dist.ReduceOp.MIN, group=_tune_process_group)
++    return bool(agreement[0].item()) and torch.equal(agreement[1:33], -agreement[33:])
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2377,7 +2400,12 @@ def choose_one(
+                         inputs=inputs,
+                         require_profiling_policy=True,
+                     )
+-                    if not _all_ranks_hit_cache(is_cache_hit):
++                    selection = (
++                        (runner_id, type(runners[runner_id]).__name__, tactic)
++                        if is_cache_hit
++                        else None
++                    )
++                    if not _all_ranks_hit_cache(is_cache_hit, selection):
+                         if _tune_process_group is not None:
+                             self._discard_profile_cache(
+                                 custom_op,
+@@ -2739,7 +2767,10 @@ def rank_tactics(
+             )
+             policy = self._profiling_policy(tuning_config)
+             cached = self._ranked_tactics_cache.get(cache_key)
+-            if _all_ranks_hit_cache(cached is not None and cached[0] == policy):
++            if _all_ranks_hit_cache(
++                cached is not None and cached[0] == policy,
++                (type(runner).__name__, k, cached[1][:k]) if cached else None,
++            ):
+                 assert cached is not None
+                 return list(cached[1][:k])
+             self._ranked_tactics_cache.pop(cache_key, None)
+diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
+index 9329c6ce6d7..a3f84431573 100644
+--- a/tests/autotuner/test_autotuner_core.py
++++ b/tests/autotuner/test_autotuner_core.py
+@@ -650,7 +650,7 @@ def sync_oom(local_oom):
+     # The sentinel group models OOM handling; real collectives are covered
+     # by test_autotuner_distributed.py.
+     monkeypatch.setattr(
+-        "flashinfer.autotuner.autotuner._all_ranks_hit_cache", lambda hit: hit
++        "flashinfer.autotuner.autotuner._all_ranks_hit_cache", lambda hit, *args: hit
+     )
+     sync = MagicMock(side_effect=sync_oom)
+     monkeypatch.setattr(
+diff --git a/tests/autotuner/test_autotuner_distributed.py b/tests/autotuner/test_autotuner_distributed.py
+index 23a81813fe0..1a5c5b4ead3 100644
+--- a/tests/autotuner/test_autotuner_distributed.py
++++ b/tests/autotuner/test_autotuner_distributed.py
+@@ -497,14 +497,16 @@ def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_pha
+ import torch.distributed as dist
+ from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+ from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload, ManagedAutotuneCache
++from flashinfer.autotuner.autotuner import _all_ranks_hit_cache
+ 
+ rank = int(os.environ["RANK"])
+ case = os.environ["CACHE_CASE"]
++world_size = int(os.environ["WORLD_SIZE"])
+ root = Path(os.environ["CASE_ROOT"])
+ 
+ class RunnerA(TunableRunner):
+     def get_cache_key_extras(self, inputs):
+-        return (0 if case == "concurrent_publish" else rank,)
++        return (0 if case in ("concurrent_publish", "all_hit_stale_memory") else rank,)
+     def get_valid_tactics(self, inputs, profile):
+         return [0, 1]
+     def forward(self, inputs, tactic=-1):
+@@ -527,14 +529,14 @@ def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+     dist.all_reduce(elapsed)
+     if case == "failed_profile":
+         return float("inf")
+-    return elapsed.item() / 2
++    return elapsed.item() / world_size
+ 
+ AutoTuner._profile_single_kernel = profile
+ # CPU tests replace only CUDA measurement/capture queries; cache lookup,
+ # invalidation, publication, choose_one and distributed collectives are real.
+ torch.cuda.is_current_stream_capturing = lambda: False
+ dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+-                        rank=rank, world_size=2, timeout=datetime.timedelta(seconds=30))
++                        rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=30))
+ try:
+     context = (autotune(True) if case in ("partial_memory", "partial_file")
+                else autotune_v2(cache_root=root / "cache"))
+@@ -543,15 +545,25 @@ def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+                                    runners[0].get_cache_key_extras(inputs))
+         policy = tuner._profiling_policy(config)
+         store = tuner._active_managed_store
+-        if case == "all_hit" or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
++        all_hit = case in ("all_hit", "all_hit_different_tactics", "all_hit_different_runners", "all_hit_stale_memory")
++        if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
+             if case == "partial_memory":
+                 tuner._winner_cache()[key] = (0, None)
+             elif case == "partial_file":
+                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
+             else:
+-                store.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
++                if case == "all_hit_different_runners" and rank == 1:
++                    key = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
++                                              runners[1].get_cache_key_extras(inputs))
++                cached_tactic = rank if case == "all_hit_different_tactics" else 0
++                store.publish(key.file_key, key.runner_class_name, cached_tactic, key_fields=key.key_fields,
+                               profiling_policy=policy)
+         dist.barrier()
++        if case == "all_hit_stale_memory":
++            # The shared artifact is identical, but process-local memoized
++            # winners may still differ before the final managed-cache reload.
++            tuner._winner_cache()[key] = (rank % 2, None)
++            tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
+         search = tuner.search_cache
+         first = True
+         def ordered_search(*args, **kwargs):
+@@ -561,7 +573,7 @@ def ordered_search(*args, **kwargs):
+             first = False
+             if case != "concurrent_publish":
+                 result = search(*args, **kwargs)
+-                expected_hit = case == "all_hit" or (rank == 0 and case != "all_miss")
++                expected_hit = all_hit or (rank == 0 and case != "all_miss")
+                 assert result[0] == expected_hit, (rank, case, result)
+                 return result
+             if rank == 0:
+@@ -579,13 +591,28 @@ def ordered_search(*args, **kwargs):
+             return result
+         tuner.search_cache = ordered_search
+         set_autotune_process_group(dist.group.WORLD)
++        if case == "all_hit":
++            # Persistent JSON lists and in-memory tuples describe the same
++            # compound tactic. A bad value on one rank must still participate
++            # in the reduce, and must not poison the following agreement.
++            compound = (16, (32, 64), None) if rank == 0 else [16, [32, 64], None]
++            assert _all_ranks_hit_cache(True, ("RunnerA", compound))
++            for invalid in (object(), float("nan")):
++                assert not _all_ranks_hit_cache(True, invalid if rank == 1 else 0)
++            assert _all_ranks_hit_cache(True, ("RunnerA", 0))
+         # A nested rank_tactics shortlist has its own process-local cache.
+         ranked_key = tuner._get_cache_key("test::ranked", runners[0],
+             (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
+         if rank == 0:
+             tuner._ranked_tactics_cache[ranked_key] = (policy, (1, 0))
++        elif case in ("ranked_different_order", "ranked_all_hit"):
++            tuner._ranked_tactics_cache[ranked_key] = (
++                policy, (0, 1) if case == "ranked_different_order" else (1, 0))
+         ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
+-        assert ranked == ([-1] if case == "failed_profile" else [0, 1])
++        expected_ranked = ([-1] if case == "failed_profile" else
++                           [1, 0] if case == "ranked_all_hit" else [0, 1])
++        assert ranked == expected_ranked
++        assert bool(calls) == (case != "ranked_all_hit")
+         calls.clear()
+         expected = ("RunnerA", 0) if case == "all_hit" else (
+             ("RunnerA", -1) if case == "failed_profile" else ("RunnerB", 1))
+@@ -635,6 +662,11 @@ def unexpected_reduce(*args, **kwargs):
+     "case",
+     [
+         "all_hit",
++        "all_hit_different_tactics",
++        "all_hit_different_runners",
++        "all_hit_stale_memory",
++        "ranked_different_order",
++        "ranked_all_hit",
+         "all_miss",
+         "partial_memory",
+         "partial_file",
+@@ -643,16 +675,18 @@ def unexpected_reduce(*args, **kwargs):
+         "failed_profile",
+     ],
+ )
+-def test_cache_hit_disagreement_reprofiles_together(tmp_path, case):
+-    """Real two-rank lookup/collectives converge despite partial or racing caches."""
++@pytest.mark.parametrize("world_size", [2, 4])
++def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
++    """Group lookups converge despite partial, racing, or divergent caches."""
+     processes = []
+     deadline = time.monotonic() + 120
+     try:
+-        for rank in range(2):
++        for rank in range(world_size):
+             env = dict(
+                 os.environ,
+                 RANK=str(rank),
+                 CACHE_CASE=case,
++                WORLD_SIZE=str(world_size),
+                 CASE_ROOT=str(tmp_path),
+                 TORCH_DISTRIBUTED_DEBUG="DETAIL",
+             )

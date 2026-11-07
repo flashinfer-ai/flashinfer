@@ -1,0 +1,275 @@
+diff --git a/flashinfer/__main__.py b/flashinfer/__main__.py
+index 5b61760f102..6160db6481d 100644
+--- a/flashinfer/__main__.py
++++ b/flashinfer/__main__.py
+@@ -24,7 +24,6 @@
+ import subprocess
+ import sys
+ import tempfile
+-import zipfile
+ 
+ import click
+ from packaging.requirements import InvalidRequirement, Requirement
+@@ -191,21 +190,14 @@ def _detect_jit_cache_target_tags() -> tuple[str, ...]:
+ 
+ 
+ def _read_jit_cache_provider_tags(
+-    shim_wheel: Path, expected_version: str
++    shim_dir: Path, expected_version: str
+ ) -> tuple[str, ...]:
+-    """Read the provider inventory from an exact shim wheel."""
++    """Read the provider inventory from an exact shim installed into shim_dir."""
+     try:
+-        with zipfile.ZipFile(shim_wheel) as archive:
+-            metadata_paths = [
+-                path
+-                for path in archive.namelist()
+-                if path.endswith(".dist-info/METADATA")
+-            ]
+-            if len(metadata_paths) != 1:
+-                raise ValueError(
+-                    f"expected one METADATA file, found {len(metadata_paths)}"
+-                )
+-            metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
++        metadata_paths = sorted(shim_dir.glob("*.dist-info/METADATA"))
++        if len(metadata_paths) != 1:
++            raise ValueError(f"expected one METADATA file, found {len(metadata_paths)}")
++        metadata = BytesParser().parsebytes(metadata_paths[0].read_bytes())
+ 
+         if canonicalize_name(metadata["Name"] or "") != "flashinfer-jit-cache":
+             raise ValueError(f"unexpected distribution {metadata['Name']!r}")
+@@ -232,10 +224,10 @@ def _read_jit_cache_provider_tags(
+         InvalidVersion,
+         OSError,
+         ValueError,
+-        zipfile.BadZipFile,
+     ) as error:
+         raise click.ClickException(
+-            f"Could not read provider inventory from {shim_wheel.name}: {error}"
++            f"Could not read the flashinfer-jit-cache {expected_version} provider "
++            f"inventory: {error}"
+         ) from error
+ 
+     if not provider_tags:
+@@ -251,36 +243,28 @@ def _get_available_jit_cache_provider_tags(
+     index_url: str,
+     nightly: bool,
+ ) -> tuple[str, ...]:
+-    """Download the small shim wheel and return its published provider set."""
++    """Install the small shim into a temporary directory and return its published
++    provider set."""
+     with tempfile.TemporaryDirectory(prefix="flashinfer-jit-cache-shim-") as temp_dir:
+         cmd = [
+-            sys.executable,
+-            "-m",
+-            "pip",
+-            "download",
+-            "--disable-pip-version-check",
++            *_get_pip_install_cmd(),
++            "--target",
++            temp_dir,
+             "--no-deps",
+             "--only-binary=:all:",
+-            "--dest",
+-            temp_dir,
+         ]
+         if nightly:
+             cmd.append("--pre")
+         cmd.extend(["--index-url", index_url, shim_requirement])
+         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+         if result.returncode != 0:
++            output = (result.stderr or result.stdout).strip()
+             raise click.ClickException(
+                 "Could not resolve the flashinfer-jit-cache shim needed to select "
+-                f"a minimal provider (pip download exited with {result.returncode})."
++                f"a minimal provider ({cmd[0]} exited with {result.returncode})"
++                + (f":\n{output}" if output else ".")
+             )
+-
+-        shim_wheels = sorted(Path(temp_dir).glob("*.whl"))
+-        if len(shim_wheels) != 1:
+-            raise click.ClickException(
+-                f"Expected one downloaded flashinfer-jit-cache shim, found "
+-                f"{len(shim_wheels)}."
+-            )
+-        return _read_jit_cache_provider_tags(shim_wheels[0], expected_version)
++        return _read_jit_cache_provider_tags(Path(temp_dir), expected_version)
+ 
+ 
+ def _select_jit_cache_provider_tags(
+@@ -335,6 +319,11 @@ def _get_pip_install_cmd() -> list[str]:
+         )
+         if created_by_uv or find_spec("pip") is None:
+             return [uv, "pip", "install", "--python", sys.executable]
++    elif find_spec("pip") is None:
++        raise click.ClickException(
++            f"Neither pip nor uv is available to install packages into "
++            f"{sys.prefix}. Install pip into this environment or put uv on PATH."
++        )
+     return [sys.executable, "-m", "pip", "install"]
+ 
+ 
+diff --git a/tests/cli/test_cli_cmds.py b/tests/cli/test_cli_cmds.py
+index 3c657baa5f7..ab11877fab9 100644
+--- a/tests/cli/test_cli_cmds.py
++++ b/tests/cli/test_cli_cmds.py
+@@ -13,12 +13,12 @@
+ the other logging/replay functionality tests, since it's tightly coupled with that feature.
+ """
+ 
++import importlib.util
+ import json
+ import os
+ from pathlib import Path
+ import subprocess
+ import sys
+-import zipfile
+ 
+ from packaging.version import Version
+ import pytest
+@@ -41,9 +41,26 @@ def _mock_jit_cache_provider_inventory(monkeypatch, *provider_tags):
+     )
+ 
+ 
++_SHIM_METADATA = """\
++Metadata-Version: 2.4
++Name: flashinfer-jit-cache
++Version: 0.4.1+cu134
++Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
++Requires-Dist: flashinfer-jit-cache-sm107f==0.4.1+cu134
++
++"""
++
++
++def _write_shim_metadata(target_dir, metadata=_SHIM_METADATA):
++    dist_info = Path(target_dir) / "flashinfer_jit_cache-0.4.1+cu134.dist-info"
++    dist_info.mkdir(parents=True)
++    (dist_info / "METADATA").write_text(metadata)
++
++
+ @pytest.fixture(autouse=True)
+ def _default_pip_installer(monkeypatch):
+     monkeypatch.setattr("flashinfer.__main__.which", lambda _name: None)
++    monkeypatch.setattr("flashinfer.__main__.find_spec", lambda _name: object())
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -99,6 +116,52 @@ def fail_run(*_args, **_kwargs):
+     ]
+ 
+ 
++def test_pip_install_cmd_requires_pip_or_uv(monkeypatch):
++    import click
++
++    import flashinfer.__main__ as main
++
++    monkeypatch.setattr(main, "find_spec", lambda _name: None)
++
++    with pytest.raises(click.ClickException, match="Neither pip nor uv"):
++        main._get_pip_install_cmd()
++
++
++@pytest.mark.parametrize(
++    "args",
++    [
++        ["install-cubin-wheel"],
++        ["install-jit-cache-wheel", "--cuda-version", "13.4"],
++        ["install-jit-cache-wheel", "--cuda-version", "13.4", "--sm", "sm80"],
++        ["download-kernels", "--cuda-version", "13.4"],
++        ["download-kernels", "--cuda-version", "13.4", "--sm", "sm80"],
++    ],
++)
++def test_installer_commands_use_uv_without_pip(monkeypatch, args):
++    """Every install subprocess must go through the selected installer, so uv
++    environments without pip keep working."""
++    import flashinfer.__main__ as main
++
++    monkeypatch.setattr(main, "__version__", "0.4.1")
++    monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
++    monkeypatch.setattr(main, "find_spec", lambda _name: None)
++    recorded = []
++
++    def mock_run(cmd, **_kwargs):
++        recorded.append(cmd)
++        if "--target" in cmd:
++            _write_shim_metadata(cmd[cmd.index("--target") + 1])
++        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
++
++    monkeypatch.setattr(main.subprocess, "run", mock_run)
++
++    _test_cmd_helper(args)
++
++    assert recorded
++    for cmd in recorded:
++        assert cmd[:5] == ["/tools/uv", "pip", "install", "--python", sys.executable]
++
++
+ def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
+     import flashinfer.__main__ as main
+ 
+@@ -107,6 +170,7 @@ def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
+     )
+     monkeypatch.syspath_prepend(str(tmp_path))
+     monkeypatch.delitem(sys.modules, "pip", raising=False)
++    monkeypatch.setattr(main, "find_spec", importlib.util.find_spec)
+     monkeypatch.setattr(main.sys, "prefix", str(tmp_path))
+     monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
+ 
+@@ -421,25 +485,15 @@ def test_select_jit_cache_provider_tags_keeps_heterogeneous_targets():
+ def test_read_jit_cache_provider_tags_from_shim_metadata(tmp_path):
+     from flashinfer.__main__ import _read_jit_cache_provider_tags
+ 
+-    wheel = tmp_path / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
+-    metadata = """\
+-Metadata-Version: 2.4
+-Name: flashinfer-jit-cache
+-Version: 0.4.1+cu134
+-Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
+-Requires-Dist: flashinfer-jit-cache-sm107f==0.4.1+cu134
+-
+-"""
+-    with zipfile.ZipFile(wheel, "w") as archive:
+-        archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
++    _write_shim_metadata(tmp_path)
+ 
+-    assert _read_jit_cache_provider_tags(wheel, "0.4.1+cu134") == (
++    assert _read_jit_cache_provider_tags(tmp_path, "0.4.1+cu134") == (
+         "sm107f",
+         "sm80",
+     )
+ 
+ 
+-def test_get_available_jit_cache_provider_tags_downloads_only_shim(monkeypatch):
++def test_get_available_jit_cache_provider_tags_installs_only_shim(monkeypatch):
+     import flashinfer.__main__ as flashinfer_main
+ 
+     recorded = {}
+@@ -447,17 +501,7 @@ def test_get_available_jit_cache_provider_tags_downloads_only_shim(monkeypatch):
+     def mock_run(cmd, **kwargs):
+         recorded["cmd"] = cmd
+         recorded["kwargs"] = kwargs
+-        destination = Path(cmd[cmd.index("--dest") + 1])
+-        wheel = destination / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
+-        metadata = """\
+-Metadata-Version: 2.4
+-Name: flashinfer-jit-cache
+-Version: 0.4.1+cu134
+-Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
+-
+-"""
+-        with zipfile.ZipFile(wheel, "w") as archive:
+-            archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
++        _write_shim_metadata(cmd[cmd.index("--target") + 1])
+         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+ 
+     monkeypatch.setattr(flashinfer_main.subprocess, "run", mock_run)
+@@ -467,7 +511,8 @@ def mock_run(cmd, **kwargs):
+         "0.4.1+cu134",
+         "https://example.invalid/cu134",
+         nightly=False,
+-    ) == ("sm80",)
++    ) == ("sm107f", "sm80")
++    assert recorded["cmd"][:4] == [sys.executable, "-m", "pip", "install"]
+     assert "--no-deps" in recorded["cmd"]
+     assert "--only-binary=:all:" in recorded["cmd"]
+     assert recorded["cmd"][-2:] == [

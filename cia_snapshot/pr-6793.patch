@@ -1,0 +1,1251 @@
+diff --git a/benchmarks/routines/unified_moe.py b/benchmarks/routines/unified_moe.py
+index a161ccd8ef2..3f69f5fdfa6 100644
+--- a/benchmarks/routines/unified_moe.py
++++ b/benchmarks/routines/unified_moe.py
+@@ -1,4 +1,4 @@
+-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x and cuDNN grouped-GEMM MoE runners."""
++"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
+ 
+ from __future__ import annotations
+ 
+@@ -29,6 +29,7 @@
+     CutlassMxfp8Mxfp4Config,
+     CutlassNvfp4Config,
+     CutlassW4A16Config,
++    CuteDslConfig,
+     CuTileBf16Config,
+     CuTileFp8PerTensorBf16Config,
+     CuTileFp8PerTensorConfig,
+@@ -61,6 +62,7 @@
+     SiTU,
+     SwiGLU,
+     SwiGLUStep,
++    TrtllmFp8BlockConfig,
+ )
+ from flashinfer.fused_moe.prepare import (
+     _quantize_mxfp4_linear,
+@@ -104,6 +106,8 @@
+     ("mxfp8", "cutile"): CuTileMxfp8Config,
+     ("mxfp8", "cutlass"): CutlassMxfp8Config,
+     ("mxfp8", "cudnn"): CudnnGroupedGemmMxfp8Config,
++    ("mxfp8", "trtllm"): TrtllmFp8BlockConfig,
++    ("mxfp8", "cute_dsl"): CuteDslConfig,
+     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
+     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
+     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
+@@ -118,7 +122,11 @@
+     CutlassMxfp8Config,
+     CudnnGroupedGemmMxfp8Config,
+     CudnnGroupedGemmNvfp4Config,
++    TrtllmFp8BlockConfig,
++    CuteDslConfig,
+ )
++# Backends whose weight and activation preparers take the layer's ``quant``.
++_QUANT_AWARE_PREPARERS = (TrtllmFp8BlockConfig, CuteDslConfig)
+ # Backends taking pre-quantized activations whose BF16 conversion is timed, to
+ # match the API boundary of the backends that quantize in-kernel.
+ _TIMED_INPUT_QUANTIZATION = (
+@@ -165,7 +173,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
+     parser.add_argument(
+         "--backends",
+         nargs="+",
+-        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn"),
++        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
+         default=["cutlass", "cutile"],
+         help="Unified MoE backends to benchmark with the same inputs.",
+     )
+@@ -351,6 +359,8 @@ def _prepare_weight_view(
+         common.update(fp8_static_scales)
+     if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
+         return config_type.prepare_weights(w1, w2, **common)
++    if config_type in _QUANT_AWARE_PREPARERS:
++        return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
+ 
+     if quant_variant.startswith(("fp8", "mxfp8")):
+         block_scaled = quant_variant.startswith("mxfp8")
+@@ -493,7 +503,7 @@ def _reference_activation(
+     return result.to(torch.bfloat16)
+ 
+ 
+-def _config_for_backend(args, activation, backend_config) -> MoEConfig:
++def _quant_config(args) -> QuantConfig:
+     weight_format, activation_format = {
+         "bf16": (QuantFormat.BF16, QuantFormat.BF16),
+         "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
+@@ -506,9 +516,13 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
+         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
+         "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
+     }[args.quant_variant]
++    return QuantConfig(weight=weight_format, activation=activation_format)
++
++
++def _config_for_backend(args, activation, backend_config) -> MoEConfig:
+     return MoEConfig(
+         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
+-        quant=QuantConfig(weight=weight_format, activation=activation_format),
++        quant=_quant_config(args),
+         experts=ExpertConfig(intermediate_size=args.intermediate_size),
+         activation=activation,
+         backend=BackendOptions((backend_config,)),
+@@ -529,6 +543,9 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
+             runners=[runner],
+             tuning_config=runner.tuning_config_for(inputs),
+             inputs=inputs,
++            # Profiling builds plain input lists; stateful runners (TRTLLM)
++            # take their launch state from the packed call instead.
++            **runner.launch_kwargs_for(inputs),
+         )
+     return tactic
+ 
+@@ -543,7 +560,9 @@ def _measure_runner(
+     bf16_input=None,
+     hidden_index: int = 1,
+ ):
+-    runner.forward(inputs, tactic=tactic, do_preparation=True)
++    # Rebuilt input lists below drop the packed call's launch state.
++    launch_kwargs = runner.launch_kwargs_for(inputs)
++    runner.forward(inputs, tactic=tactic, do_preparation=True, **launch_kwargs)
+     torch.cuda.synchronize()
+ 
+     def run(*profile_inputs):
+@@ -557,7 +576,7 @@ def run(*profile_inputs):
+             packed[hidden_index] = quantized
+             if scale is not None:  # per-tensor FP8 keeps its scale in the view
+                 packed[-1] = scale
+-        return runner.forward(packed, tactic=tactic)
++        return runner.forward(packed, tactic=tactic, **launch_kwargs)
+ 
+     profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
+     output = run(*profile_inputs).detach().clone()
+@@ -637,6 +656,10 @@ def run_unified_moe_test(args):
+                         "hidden_states_scale_global"
+                     ],
+                 )
++            if config_type in _QUANT_AWARE_PREPARERS:
++                prepare_activations = functools.partial(
++                    prepare_activations, quant=config.quant
++                )
+             if config_type in _PREQUANTIZED_ACTIVATIONS:
+                 # Inside the guard so an unaligned hidden_size skips this
+                 # backend like any other unsupported configuration.
+@@ -683,7 +706,12 @@ def run_unified_moe_test(args):
+                 )
+             # Like mm_fp4, execute the fallback once to reject configurations
+             # that pass the coarse architecture check but fail at runtime.
+-            runner.forward(inputs, tactic=-1, do_preparation=True)
++            runner.forward(
++                inputs,
++                tactic=-1,
++                do_preparation=True,
++                **runner.launch_kwargs_for(inputs),
++            )
+             torch.cuda.synchronize()
+         except (NotImplementedError, RuntimeError, TypeError, ValueError) as error:
+             print(
+diff --git a/docs/design_docs/flashinfer_moe_api.md b/docs/design_docs/flashinfer_moe_api.md
+index a41055d4178..9da352df1ae 100644
+--- a/docs/design_docs/flashinfer_moe_api.md
++++ b/docs/design_docs/flashinfer_moe_api.md
+@@ -887,7 +887,8 @@ python scripts/generate_moe_activation_matrix.py --write
+ | `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+ | `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+ | `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+-| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
++| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
++| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+ | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+ | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+ | `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+diff --git a/flashinfer/cute_dsl/utils.py b/flashinfer/cute_dsl/utils.py
+index ef707b09126..ed0eb3d2855 100644
+--- a/flashinfer/cute_dsl/utils.py
++++ b/flashinfer/cute_dsl/utils.py
+@@ -440,6 +440,47 @@ def convert_sf_to_mma_layout(
+     return sf_6d  # Return strided view, NOT contiguous
+ 
+ 
++def convert_row_major_sf_to_mma_layout(
++    sf: torch.Tensor,
++    m: int,
++    k: int,
++    num_groups: int = 1,
++    sf_vec_size: int = 32,
++) -> torch.Tensor:
++    """Convert row-major (unswizzled) block scales to the 6D MMA layout.
++
++    Checkpoints store block scales row-major, one ``uint8`` (E8M0) per
++    ``sf_vec_size`` elements along K, e.g. ``[num_groups, m, k // sf_vec_size]`` for
++    stacked expert weights. This swizzles them (``block_scale_interleave``) and
++    returns the same view as :func:`convert_sf_to_mma_layout`, so it matches
++    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` followed by that function.
++
++    Args:
++        sf: ``uint8`` (or ``float8_e8m0fnu``) scales of shape
++            ``(num_groups, m, ceil(k / sf_vec_size))``, or ``(m, ceil(k / sf_vec_size))``
++            when ``num_groups == 1``.
++        m: Rows of the quantized matrix.
++        k: Columns (the quantized dimension) of the matrix before block scaling.
++        num_groups: Number of stacked matrices (e.g. experts).
++        sf_vec_size: Elements per scale (32 for MXFP8).
++
++    Returns:
++        Scales in the 6D MMA layout ``(32, 4, m_tiles, 4, k_tiles, num_groups)``.
++    """
++    from ..quantization.fp4_quantization import block_scale_interleave
++
++    sf_k = ceil_div(k, sf_vec_size)
++    if sf.dtype != torch.uint8:
++        sf = sf.view(torch.uint8)
++    if tuple(sf.shape) not in ((num_groups, m, sf_k), (m, sf_k)):
++        raise ValueError(
++            f"Row-major scales must have shape ({num_groups}, {m}, {sf_k}), "
++            f"got {tuple(sf.shape)}"
++        )
++    swizzled = block_scale_interleave(sf.reshape(num_groups, m, sf_k).contiguous())
++    return convert_sf_to_mma_layout(swizzled, m, k, num_groups, sf_vec_size)
++
++
+ def convert_sf_from_mma_layout(
+     sf_6d: torch.Tensor,
+     m: int,
+diff --git a/flashinfer/fused_moe/api.py b/flashinfer/fused_moe/api.py
+index df2a2c8b67a..427be472af7 100644
+--- a/flashinfer/fused_moe/api.py
++++ b/flashinfer/fused_moe/api.py
+@@ -2406,7 +2406,7 @@ def __repr__(self) -> str:
+ 
+ @dataclass(frozen=True)
+ class CuteDslConfig:
+-    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
++    """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
+ 
+     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+     """
+@@ -2432,8 +2432,8 @@ def prepare_weights(
+         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
+ 
+         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
+-        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
+-        Defaults to NVFP4×NVFP4.
++        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
++        (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
+ 
+         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
+         (see that field): it selects the NVFP4×NVFP4 pack's
+@@ -2454,6 +2454,24 @@ def prepare_weights(
+             nvfp4_4over6=nvfp4_4over6,
+         )
+ 
++    @staticmethod
++    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
++        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
++
++        Returns the canonical linear pack shared with
++        ``TrtllmFp8BlockConfig.prepare_activations``: E4M3 ``[M, H]`` and
++        row-major E8M0 scales ``[M, H // 32]``.
++        """
++        from .prepare import prepare_trtllm_fp8_block_activations
++
++        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
++        quant = _mxfp8_activation_quant(quant, pair, "CuteDslConfig")
++        if quant.swizzled_scale_factors is True:
++            raise ValueError(
++                "CuteDslConfig consumes only the linear activation scale layout."
++            )
++        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
++
+     def __repr__(self) -> str:
+         return "CuteDslConfig()"
+ 
+diff --git a/flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py b/flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+index d8f8b408dc0..357b136da04 100644
+--- a/flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
++++ b/flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+@@ -3778,6 +3778,7 @@ def is_valid_layouts(
+     def is_valid_mma_tiler_and_cluster_shape(
+         mma_tiler_mn: Tuple[int, int],
+         cluster_shape_mn: Tuple[int, int],
++        gated: bool = True,
+     ) -> bool:
+         """
+         Check if the mma tiler and cluster shape are valid
+@@ -3788,6 +3789,9 @@ def is_valid_mma_tiler_and_cluster_shape(
+         :type mma_tiler_mn: Tuple[int, int]
+         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
+         :type cluster_shape_mn: Tuple[int, int]
++        :param gated: Whether the fused activation is gated (SwiGLU family).
++            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
++        :type gated: bool
+ 
+         :return: True if the mma tiler and cluster shape are valid, False otherwise
+         :rtype: bool
+@@ -3799,8 +3803,10 @@ def is_valid_mma_tiler_and_cluster_shape(
+             is_valid = False
+         # Skip invalid mma tile n
+         # SwiGlu Fusion requires even epi_tile counts,
+-        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported
+-        if mma_tiler_mn[1] not in (128, 256):
++        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported.
++        # Non-gated activations have no gate/up pairing, so 192 (three epi tiles)
++        # also works.
++        if mma_tiler_mn[1] not in ((128, 256) if gated else (128, 192, 256)):
+             is_valid = False
+ 
+         # Skip illegal cluster shape
+@@ -3916,6 +3922,7 @@ def can_implement(
+         a_major: str,
+         b_major: str,
+         c_major: str,
++        gated: bool = True,
+     ) -> bool:
+         """
+         Check if the gemm can be implemented
+@@ -3948,6 +3955,9 @@ def can_implement(
+         :type b_major: str
+         :param c_major: The major axis of the C tensor
+         :type c_major: str
++        :param gated: Whether the fused activation is gated (SwiGLU family).
++            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
++        :type gated: bool
+ 
+         :return: True if the gemm can be implemented, False otherwise
+         :rtype: bool
+@@ -3966,7 +3976,9 @@ def can_implement(
+             can_implement = False
+ 
+         # Skip invalid mma tile shape and cluster shape
+-        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
++        if not cls.is_valid_mma_tiler_and_cluster_shape(
++            mma_tiler_mn, cluster_shape_mn, gated
++        ):
+             can_implement = False
+         # Skip illegal problem shape for load/store alignment
+         if not cls.is_valid_tensor_alignment(
+diff --git a/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py b/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+index 162ffee11a7..467f2d791f6 100644
+--- a/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
++++ b/flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+@@ -789,6 +789,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+             a_major="k",
+             b_major="k",
+             c_major="n",
++            gated=gated,
+         )
+     if not can_impl:
+         raise ValueError(
+diff --git a/flashinfer/fused_moe/cute_dsl/fused_moe.py b/flashinfer/fused_moe/cute_dsl/fused_moe.py
+index 404d1a54f2e..8cb99f36bc1 100644
+--- a/flashinfer/fused_moe/cute_dsl/fused_moe.py
++++ b/flashinfer/fused_moe/cute_dsl/fused_moe.py
+@@ -278,8 +278,12 @@ def validate_w4a8_inputs(
+     w1_weight_sf: torch.Tensor,
+     w2_weight: torch.Tensor,
+     w2_weight_sf: torch.Tensor,
++    weight_elems_per_byte: int = 2,
+ ) -> None:
+-    """Validate mixed-format contracts not checked by the GEMM entry points."""
++    """Validate mixed-format contracts not checked by the GEMM entry points.
++
++    ``weight_elems_per_byte`` is 2 for packed FP4 weights and 1 for 8-bit weights.
++    """
+     expected_x_sf = (x.shape[0], x.shape[1] // 32)
+     if tuple(x_sf.shape) != expected_x_sf:
+         raise ValueError(f"x_sf must have shape {expected_x_sf}")
+@@ -295,7 +299,7 @@ def validate_w4a8_inputs(
+     ):
+         if scale.dtype is not torch.uint8:
+             raise TypeError(f"W4A8 {name} must have dtype torch.uint8")
+-        rows, columns = weight.shape[1], weight.shape[2] * 2
++        rows, columns = weight.shape[1], weight.shape[2] * weight_elems_per_byte
+         m_tiles, k_tiles = (rows + 127) // 128, (columns + 127) // 128
+         shape = (32, 4, m_tiles, 4, k_tiles, weight.shape[0])
+         strides = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
+@@ -368,9 +372,15 @@ def _moe_core_impl(
+     situ_beta: Optional[float] = None,
+     situ_linear_beta: Optional[float] = None,
+     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
++    weight_dtype: Optional[str] = None,
+ ) -> torch.Tensor:
+     """Core MoE implementation shared by functional and wrapper APIs.
+ 
++    ``weight_dtype`` is the element type of ``w1_weight``/``w2_weight``:
++    ``"float4_e2m1fn"`` (packed FP4, the W4A4/W4A8 modes) or ``"float8_e4m3fn"``
++    (the ``mxfp8`` mode; only valid with MXFP8 activations). When ``None`` it is
++    inferred from ``w1_weight.dtype`` (``float8_e4m3fn`` selects FP8 weights).
++
+     This function handles:
+     1. moe_sort: Token routing computation
+     2. GEMM1 + activation
+@@ -446,6 +456,18 @@ def _moe_core_impl(
+     """
+     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+     is_mxfp8 = x.dtype == torch.float8_e4m3fn
++    if weight_dtype is None:
++        # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
++        weight_dtype = (
++            "float8_e4m3fn"
++            if w1_weight is not None and w1_weight.dtype == torch.float8_e4m3fn
++            else "float4_e2m1fn"
++        )
++    if weight_dtype not in ("float4_e2m1fn", "float8_e4m3fn"):
++        raise ValueError(f"Unsupported weight_dtype {weight_dtype!r}")
++    if weight_dtype == "float8_e4m3fn" and not is_mxfp8:
++        raise ValueError("MXFP8 weights require MXFP8 (float8_e4m3fn) activations")
++    weight_elems_per_byte = 2 if weight_dtype == "float4_e2m1fn" else 1
+     if not is_mxfp8 and x.dtype != torch.uint8:
+         raise TypeError(
+             "CuTe-DSL block-scaled MoE requires packed NVFP4 (torch.uint8) "
+@@ -475,6 +497,7 @@ def _moe_core_impl(
+             w1_weight_sf,
+             w2_weight,
+             w2_weight_sf,
++            weight_elems_per_byte=weight_elems_per_byte,
+         )
+ 
+     num_tokens = token_selected_experts.size(0)
+@@ -740,7 +763,7 @@ def _fc1_die(i, _ctx=None):
+                 a_per_token_scale=per_token_scale,
+                 c_dtype=c_dtype,
+                 a_dtype=a_dtype,
+-                b_dtype="float4_e2m1fn",
++                b_dtype=weight_dtype,
+                 sf_dtype=sf_dtype,
+                 sf_vec_size=sf_vec_size,
+                 quantize_output=not use_per_token_activation,
+@@ -857,7 +880,7 @@ def _fc2_die(i, _ctx=None):
+             out=gemm2_output,
+             a_per_token_scale=intermediate_per_token_scale,
+             a_dtype=a_dtype,
+-            b_dtype="float4_e2m1fn",
++            b_dtype=weight_dtype,
+             sf_dtype=sf_dtype,
+             sf_vec_size=sf_vec_size,
+             out_dtype=_intermediate_c_dtype(output_dtype),
+@@ -1609,8 +1632,12 @@ def cute_dsl_fused_moe(
+     swiglu_alpha, swiglu_beta, swiglu_limit : float
+         SwiGLU parameters.
+     quant_mode : str
+-        Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``. Defaults to
+-        ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for ``"w4a4"``.
++        Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, or ``"mxfp8"``.
++        Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
++        ``"w4a4"``. ``"mxfp8"`` runs MXFP8 weights (``float8_e4m3fn`` with E8M0
++        block-32 scales in the MMA layout) against MXFP8 activations
++        (``x`` is ``float8_e4m3fn`` and ``x_sf`` the row-major E8M0 scales as
++        ``uint8``), with ``fc2_input_scale=None`` and BF16 output.
+     situ_beta : Optional[float]
+         When set with ``ActivationType.Swiglu``, use the SiTU gate
+         ``beta * tanh(gate / beta) * sigmoid(gate)``.
+@@ -1699,6 +1726,13 @@ def cute_dsl_fused_moe(
+             raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
+         if torch.cuda.get_device_capability(x.device) == (10, 7):
+             raise ValueError("quant_mode='w4a8' is not supported on SM107")
++    elif quant_mode == "mxfp8":
++        if x.dtype is not torch.float8_e4m3fn:
++            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn input")
++        if w1_weight.dtype is not torch.float8_e4m3fn:
++            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn weights")
++        if torch.cuda.get_device_capability(x.device) == (10, 7):
++            raise ValueError("quant_mode='mxfp8' is not supported on SM107")
+     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
+         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+ 
+@@ -1724,7 +1758,7 @@ def cute_dsl_fused_moe(
+             f"only, got quant_mode={quant_mode!r}."
+         )
+ 
+-    if quant_mode in ("w4a4", "w4a8"):
++    if quant_mode in ("w4a4", "w4a8", "mxfp8"):
+         use_per_token_activation = per_token_scale is not None
+         if localized_weights is not None and use_per_token_activation:
+             raise NotImplementedError(
+@@ -1792,7 +1826,7 @@ def cute_dsl_fused_moe(
+         inputs.append(moe_output)
+ 
+         activation_name = "Situ" if situ_beta is not None else activation.name
+-        format_name = "w4a8" if quant_mode == "w4a8" else "w4a4"
++        format_name = quant_mode
+         op_name = f"CuteDslFusedMoE::run_moe_{format_name}::{activation_name}"
+         if localized_weights is not None:
+             policy = (
+@@ -1841,7 +1875,8 @@ def cute_dsl_fused_moe(
+         op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation_name}"
+     else:
+         raise ValueError(
+-            f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
++            "quant_mode must be 'w4a4', 'w4a8', 'w4a16', or 'mxfp8' "
++            f"(got {quant_mode!r})."
+         )
+ 
+     if tactic is not None:
+diff --git a/flashinfer/fused_moe/cute_dsl/tuner.py b/flashinfer/fused_moe/cute_dsl/tuner.py
+index b96260f3584..e666a6a0abf 100644
+--- a/flashinfer/fused_moe/cute_dsl/tuner.py
++++ b/flashinfer/fused_moe/cute_dsl/tuner.py
+@@ -149,6 +149,9 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
+ 
+     The mixed finalize kernel also supports N tiles 64 and 192. Keep its
+     tactic space distinct so W4A8 does not change W4A4 tuning results.
++    GEMM1 N=192 is valid for non-gated activations whose intermediate size is a
++    multiple of 192 (GEMM1 has no partial-N-tile store); ``get_valid_tactics``
++    filters other configs out through ``can_implement``.
+     """
+     return [
+         (
+@@ -157,7 +160,7 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
+             ((tile, gemm2_n), (tile // 128, cluster_n), False),
+         )
+         for tile, gemm1_n, gemm2_n, cluster_n in itertools.product(
+-            VALID_TILE_SIZES, (128, 256), (64, 128, 192, 256), (1, 2)
++            VALID_TILE_SIZES, (128, 192, 256), (64, 128, 192, 256), (1, 2)
+         )
+     ]
+ 
+@@ -519,10 +522,12 @@ def __init__(
+         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+         quant_mode = quant_mode.lower()
+-        if quant_mode not in ("w4a4", "w4a8"):
++        if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
+             raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
+-        if quant_mode == "w4a8" and use_per_token_activation:
+-            raise ValueError("per-token activation scaling is not supported for W4A8")
++        if quant_mode in ("w4a8", "mxfp8") and use_per_token_activation:
++            raise ValueError(
++                f"per-token activation scaling is not supported for {quant_mode}"
++            )
+         if localized_weights is not None and quant_mode != "w4a4":
+             raise ValueError("localized runner supports quant_mode='w4a4' only")
+         self.forward_impl = forward_impl
+@@ -758,7 +763,8 @@ def get_valid_tactics(  # type: ignore[override]
+ 
+         gated = self.gated
+         num_tokens = x.shape[0]
+-        is_mxfp8 = self.quant_mode == "w4a8"
++        # MXFP8 activations (E4M3 + E8M0, block 32) in both the W4A8 and MXFP8 modes.
++        is_mxfp8 = self.quant_mode in ("w4a8", "mxfp8")
+         hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
+         num_local_experts = w1_weight.shape[0]
+         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
+@@ -766,10 +772,13 @@ def get_valid_tactics(  # type: ignore[override]
+         gemm1_n = w1_weight.shape[1]
+         intermediate_size = gemm1_n // 2 if gated else gemm1_n
+         gemm2_n = w2_weight.shape[1]
+-        gemm2_k = w2_weight.shape[2] * 2
++        # Packed FP4 weights hold two elements per byte; MXFP8 weights one.
++        gemm2_k = w2_weight.shape[2] * (1 if self.quant_mode == "mxfp8" else 2)
+ 
+         a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
+-        b_dtype = cutlass.Float4E2M1FN
++        b_dtype = (
++            cutlass.Float8E4M3FN if self.quant_mode == "mxfp8" else cutlass.Float4E2M1FN
++        )
+         sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
+         sf_vec_size = 32 if is_mxfp8 else 16
+ 
+@@ -895,6 +904,7 @@ def _tactic_ok(tactic):
+                     a_major="k",
+                     b_major="k",
+                     c_major="n",
++                    gated=gated,
+                 )
+                 gemm2_ok = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+                     a_dtype=a_dtype,
+@@ -963,10 +973,10 @@ def forward(  # type: ignore[override]
+         if tactic is None or tactic == -1:
+             tactic = (
+                 DEFAULT_BLACKWELL_MOE_TACTIC
+-                if self.quant_mode == "w4a8"
++                if self.quant_mode in ("w4a8", "mxfp8")
+                 else _get_default_tactic()
+             )
+-        elif self.quant_mode == "w4a8":
++        elif self.quant_mode in ("w4a8", "mxfp8"):
+             tactic = canonicalize_w4a8_tactic(tactic)
+ 
+         params = _extract_tactic_params(tactic)
+diff --git a/flashinfer/fused_moe/prepare.py b/flashinfer/fused_moe/prepare.py
+index 197e5e99489..59698fb9a3c 100644
+--- a/flashinfer/fused_moe/prepare.py
++++ b/flashinfer/fused_moe/prepare.py
+@@ -2518,12 +2518,12 @@ def prepare_cute_dsl_weights(
+     device: Optional[torch.device] = None,
+     nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+ ) -> Dict[str, torch.Tensor]:
+-    """Build the CuteDSL FP4 ``cute_dsl`` weight view.
++    """Build the CuteDSL ``cute_dsl`` weight view.
+ 
+     Gemm1 weights get the linear/gate interleave only for gated activations;
+     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
+-    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
+-    Starts from the same canonical bf16 expert weights as
++    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
++    (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
+     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
+     backends and a shared reference.
+ 
+@@ -2551,15 +2551,17 @@ def prepare_cute_dsl_weights(
+     """
+     from ..cute_dsl.utils import convert_sf_to_mma_layout
+     from ..fp4_quantization import fp4_quantize
++    from ..quantization.fp8_quantization import mxfp8_quantize
+     from .api import QuantFormat
+ 
+     allowed = {
+         (QuantFormat.NVFP4, QuantFormat.NVFP4),
+         (QuantFormat.MXFP4, QuantFormat.MXFP8),
++        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+         (QuantFormat.NVFP4, QuantFormat.BF16),
+     }
+     if quant.pair not in allowed:
+-        raise ValueError(f"CuTe-DSL FP4 weight preparation does not support {quant!r}")
++        raise ValueError(f"CuTe-DSL weight preparation does not support {quant!r}")
+ 
+     if device is None:
+         device = w1_bf16.device
+@@ -2569,11 +2571,27 @@ def prepare_cute_dsl_weights(
+     w2_bf16 = w2_bf16.to(device)
+ 
+     is_mxfp4 = quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+-    if is_mxfp4 and (hidden_size % 128 or intermediate_size % 128):
++    is_mxfp8 = quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
++    if (is_mxfp4 or is_mxfp8) and (hidden_size % 128 or intermediate_size % 128):
+         raise ValueError(
+-            "CuTe-DSL MXFP4 requires hidden and intermediate sizes divisible by 128"
++            f"CuTe-DSL {quant.weight.name} requires hidden and intermediate sizes "
++            "divisible by 128"
+         )
+-    sf_vec_size = 32 if is_mxfp4 else 16
++    sf_vec_size = 32 if is_mxfp4 or is_mxfp8 else 16
++    # FP4 packs two elements per byte; MXFP8 weights are one E4M3 byte each.
++    elems_per_byte = 1 if is_mxfp8 else 2
++
++    def quantize(flat: torch.Tensor):
++        if is_mxfp8:
++            return mxfp8_quantize(flat, is_sf_swizzled_layout=True)
++        return fp4_quantize(
++            flat,
++            global_scale=gs,
++            sf_vec_size=sf_vec_size,
++            sf_use_ue8m0=is_mxfp4,
++            is_sf_swizzled_layout=True,
++        )
++
+     gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+ 
+     activation = _normalize_activation(activation)
+@@ -2584,14 +2602,10 @@ def prepare_cute_dsl_weights(
+         else w1_bf16
+     )
+     w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
+-    w1_q_flat, w1_sf_flat = fp4_quantize(
+-        w1_flat,
+-        global_scale=gs,
+-        sf_vec_size=sf_vec_size,
+-        sf_use_ue8m0=is_mxfp4,
+-        is_sf_swizzled_layout=True,
++    w1_q_flat, w1_sf_flat = quantize(w1_flat)
++    w1_weight = w1_q_flat.view(
++        num_local_experts, gemm1_rows, hidden_size // elems_per_byte
+     )
+-    w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
+     w1_weight_sf = convert_sf_to_mma_layout(
+         w1_sf_flat,
+         m=gemm1_rows,
+@@ -2601,14 +2615,10 @@ def prepare_cute_dsl_weights(
+     )
+ 
+     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+-    w2_q_flat, w2_sf_flat = fp4_quantize(
+-        w2_flat,
+-        global_scale=gs,
+-        sf_vec_size=sf_vec_size,
+-        sf_use_ue8m0=is_mxfp4,
+-        is_sf_swizzled_layout=True,
++    w2_q_flat, w2_sf_flat = quantize(w2_flat)
++    w2_weight = w2_q_flat.view(
++        num_local_experts, hidden_size, intermediate_size // elems_per_byte
+     )
+-    w2_weight = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
+     w2_weight_sf = convert_sf_to_mma_layout(
+         w2_sf_flat,
+         m=hidden_size,
+@@ -2626,7 +2636,7 @@ def prepare_cute_dsl_weights(
+         "w2_weight_sf": w2_weight_sf,
+         "w2_alpha": ones,
+     }
+-    if not is_mxfp4:
++    if not (is_mxfp4 or is_mxfp8):
+         # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
+         # w2_bf16 is passed for its device only.
+         nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+diff --git a/flashinfer/fused_moe/runners.py b/flashinfer/fused_moe/runners.py
+index b79980bcc23..9e861aa9ae7 100644
+--- a/flashinfer/fused_moe/runners.py
++++ b/flashinfer/fused_moe/runners.py
+@@ -4929,9 +4929,18 @@ class CuteDslRunner(MoERunner):
+     supported_quant_variants = (
+         (QuantFormat.NVFP4, QuantFormat.NVFP4),
+         (QuantFormat.MXFP4, QuantFormat.MXFP8),
++        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+         (QuantFormat.NVFP4, QuantFormat.BF16),
+     )
+-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
++    supported_activation_classes_by_quant: ClassVar[
++        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
++    ] = {
++        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
++        # MXFP8 activations: _check_support() rejects SiTU.
++        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
++        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
++        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
++    }
+     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
+     # takes the recipe as an argument; _check_support() below narrows this to
+     # the per-token path, the only one that runs that quantizer.
+@@ -4964,16 +4973,26 @@ def _check_support(self) -> None:
+                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
+                 "activation scales."
+             )
+-        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+-        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
+-            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
+-        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
+-            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
+-        if mxfp4_mxfp8 and hasattr(self, "device"):
++        # W4A8 (MXFP4 weights) and MXFP8 (MXFP8 weights) share the MXFP8
++        # activation path and its limits.
++        mxfp8_act = self.config.quant.pair in (
++            (QuantFormat.MXFP4, QuantFormat.MXFP8),
++            (QuantFormat.MXFP8, QuantFormat.MXFP8),
++        )
++        mode = (
++            "MXFP8"
++            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
++            else "W4A8"
++        )
++        if mxfp8_act and isinstance(self.config.activation, SiTU):
++            raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
++        if mxfp8_act and not self.config.finalize.use_fused_finalize:
++            raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
++        if mxfp8_act and hasattr(self, "device"):
+             from ..utils import get_compute_capability
+ 
+             if get_compute_capability(self.device) == (10, 7):
+-                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
++                raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
+         if (
+             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+             and not self.config.quant.per_token_scale
+@@ -5077,6 +5096,7 @@ def _build(self) -> None:
+         if self.config.quant.pair in (
+             (QuantFormat.NVFP4, QuantFormat.NVFP4),
+             (QuantFormat.MXFP4, QuantFormat.MXFP8),
++            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+         ):
+             self._inner = CuteDslFusedMoERunner(
+                 forward_impl=_cute_dsl_fused_moe_impl,
+@@ -5087,11 +5107,11 @@ def _build(self) -> None:
+                 use_fused_finalize=self.config.finalize.use_fused_finalize,
+                 enable_pdl=enable_pdl,
+                 use_per_token_activation=bool(self.config.quant.per_token_scale),
+-                quant_mode=(
+-                    "w4a8"
+-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+-                    else "w4a4"
+-                ),
++                quant_mode={
++                    (QuantFormat.NVFP4, QuantFormat.NVFP4): "w4a4",
++                    (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
++                    (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
++                }[self.config.quant.pair],
+                 **_cute_dsl_activation_kwargs(self.config.activation),
+             )
+         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+@@ -5187,13 +5207,16 @@ def pack_inputs(
+             in (
+                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
++                (QuantFormat.MXFP8, QuantFormat.MXFP8),
+             )
+             and not use_per_token_activation
+             and act.hidden_states_scale is not None
+             and act.per_token_scale is None
+         ):
+-            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+-            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
++            # MXFP8 activations (W4A8 and MXFP8): one E4M3 byte per element and
++            # row-major E8M0 scales, no GEMM2 input scale.
++            mxfp8_act = pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
++            hidden_size = act.hidden_states_q.shape[1] * (1 if mxfp8_act else 2)
+             moe_output = act.hidden_states_q.new_empty(
+                 (num_tokens, hidden_size), dtype=torch.bfloat16
+             )
+@@ -5201,15 +5224,15 @@ def pack_inputs(
+                 act.hidden_states_q,
+                 (
+                     act.hidden_states_scale
+-                    if is_mxfp4
++                    if mxfp8_act
+                     else act.hidden_states_scale.unsqueeze(-1)
+-                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
++                ).view(torch.uint8 if mxfp8_act else act.hidden_states_scale.dtype),
+                 act.topk_ids,
+                 act.topk_weights,
+                 v["w1_weight"],
+                 v["w1_weight_sf"],
+                 v["w1_alpha"],
+-                None if is_mxfp4 else v["fc2_input_scale"],
++                None if mxfp8_act else v["fc2_input_scale"],
+                 v["w2_weight"],
+                 v["w2_weight_sf"],
+                 v["w2_alpha"],
+diff --git a/flashinfer/trace/templates/moe.py b/flashinfer/trace/templates/moe.py
+index b45da9c817b..5632058ad9d 100644
+--- a/flashinfer/trace/templates/moe.py
++++ b/flashinfer/trace/templates/moe.py
+@@ -4148,7 +4148,7 @@ def dispatch(**kwargs):
+         ),
+         "w1_weight": Tensor(
+             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+-            description="Packed FP4 FC1 weights.",
++            description="Packed FP4 FC1 weights (float8_e4m3fn for mxfp8).",
+         ),
+         "w1_weight_sf": Tensor(
+             [
+@@ -4174,12 +4174,13 @@ def dispatch(**kwargs):
+             dtype="float32",
+             optional=True,
+             description=(
+-                "Global scale for W4A4 FC2 input quantization; omitted for W4A8/W4A16."
++                "Global scale for W4A4 FC2 input quantization; omitted for "
++                "W4A8/W4A16/MXFP8."
+             ),
+         ),
+         "w2_weight": Tensor(
+             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+-            description="Packed FP4 FC2 weights.",
++            description="Packed FP4 FC2 weights (float8_e4m3fn for mxfp8).",
+         ),
+         "w2_weight_sf": Tensor(
+             [
+@@ -4209,7 +4210,7 @@ def dispatch(**kwargs):
+         "quant_mode": Scalar(
+             "string",
+             optional=True,
+-            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
++            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
+         ),
+         "num_experts": Scalar("int32", description="Total number of experts."),
+         "top_k": Scalar("int32", description="Number of experts per token."),
+@@ -4970,9 +4971,9 @@ def _cute_dsl_fused_moe_reference(
+         if x_sf is None:
+             raise ValueError("x_sf is required when quant_mode='w4a4'")
+         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+-    elif quant_mode == "w4a8":
++    elif quant_mode in ("w4a8", "mxfp8"):
+         if x_sf is None:
+-            raise ValueError("x_sf is required when quant_mode='w4a8'")
++            raise ValueError(f"x_sf is required when quant_mode={quant_mode!r}")
+         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
+     elif quant_mode == "w4a16":
+         if x_sf is not None:
+@@ -4981,7 +4982,8 @@ def _cute_dsl_fused_moe_reference(
+     else:
+         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
+     is_mxfp4 = quant_mode == "w4a8"
+-    if is_mxfp4:
++    is_mxfp8 = quant_mode == "mxfp8"
++    if is_mxfp4 or is_mxfp8:
+ 
+         def mma_scales_to_logical(scales, rows, columns):
+             groups = scales.shape[5]
+@@ -4991,14 +4993,24 @@ def mma_scales_to_logical(scales, rows, columns):
+                 .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
+             )
+ 
++        # FP4 weights pack two values per byte; FP8 weights are unpacked.
++        k_per_byte = 2 if is_mxfp4 else 1
+         w1_weight_sf = mma_scales_to_logical(
+-            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * 2
++            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * k_per_byte
+         )
+         w2_weight_sf = mma_scales_to_logical(
+-            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
++            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * k_per_byte
+         )
+-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
+-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
++    if is_mxfp8:
++        W1 = _dequantize_fp4_hidden_states(
++            w1_weight, w1_weight_sf, is_weights_mxfp4=True
++        )
++        W2 = _dequantize_fp4_hidden_states(
++            w2_weight, w2_weight_sf, is_weights_mxfp4=True
++        )
++    else:
++        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
++        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+     if per_token_scale is not None:
+         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
+     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
+diff --git a/tests/moe/test_cute_dsl_fused_moe.py b/tests/moe/test_cute_dsl_fused_moe.py
+index d8d8c8cde2b..218b233be89 100644
+--- a/tests/moe/test_cute_dsl_fused_moe.py
++++ b/tests/moe/test_cute_dsl_fused_moe.py
+@@ -867,7 +867,8 @@ def test_w4a8_retains_mixed_finalize_tactics(self):
+         )
+ 
+         tactics = get_w4a8_moe_valid_tactics()
+-        assert len(tactics) == 32
++        assert len(tactics) == 48
++        assert {gemm1[0][1] for _, gemm1, _ in tactics} == {128, 192, 256}
+         assert {gemm2[0][1] for _, _, gemm2 in tactics} == {64, 128, 192, 256}
+         assert canonicalize_w4a8_tactic(list(tactics[0])) == tactics[0]
+         with pytest.raises(ValueError, match="unsupported W4A8 MoE tactic"):
+diff --git a/tests/moe/test_cute_dsl_mxfp8_moe.py b/tests/moe/test_cute_dsl_mxfp8_moe.py
+new file mode 100644
+index 00000000000..54911cd2790
+--- /dev/null
++++ b/tests/moe/test_cute_dsl_mxfp8_moe.py
+@@ -0,0 +1,315 @@
++"""Tests for the CuTe-DSL MXFP8 x MXFP8 (E4M3 + E8M0 block-32 scales) MoE path.
++
++Two oracles, as in the other FlashInfer MXFP8 tests:
++
++* tier 1 -- cosine similarity against the unquantized BF16 MoE (catches layout,
++  routing and activation bugs; tolerance covers quantization noise);
++* tier 2 -- a PyTorch reference that applies the same E8M0 quantize/dequantize
++  to the weights, the input and the GEMM1->GEMM2 intermediate (tight tolerance;
++  catches scale-layout and ordering errors that cosine similarity hides).
++
++The MoE is a non-gated ReLU^2 MoE: out = sum_k w_k * (relu(x @ W1[e].T)^2 @ W2[e].T).
++"""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
++from flashinfer.tllm_enums import ActivationType
++
++_requires_dsl_arch = pytest.mark.skipif(
++    torch.cuda.is_available()
++    and not is_cute_dsl_arch_supported(
++        *torch.cuda.get_device_capability(0), native_only=True
++    ),
++    reason="installed CuTe DSL does not support this GPU architecture",
++)
++
++mxfp8_required = pytest.mark.skipif(
++    not (
++        torch.cuda.is_available()
++        and torch.cuda.get_device_capability(0) in ((10, 0), (10, 3))
++    ),
++    reason="MXFP8 CuTe-DSL MoE requires SM100 or SM103",
++)
++
++pytestmark = [_requires_dsl_arch, mxfp8_required]
++
++MXFP8_BLOCK = 32
++FP8_MAX = 448.0
++MIN_COS_SIM_VS_BF16 = 0.98
++
++
++def _qdq_mxfp8(t: torch.Tensor) -> torch.Tensor:
++    """Quantize + dequantize along the last dim with E8M0 scales of block 32."""
++    shape = t.shape
++    blocks = t.float().reshape(-1, shape[-1] // MXFP8_BLOCK, MXFP8_BLOCK)
++    amax = blocks.abs().amax(dim=-1, keepdim=True)
++    exp = torch.ceil(torch.log2(torch.clamp(amax, min=1e-30) / FP8_MAX))
++    exp = torch.clamp(exp, -127, 127)
++    scale = torch.exp2(exp)
++    q = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
++    return (q.float() * scale).reshape(shape)
++
++
++def _quantize_weights(w: torch.Tensor):
++    """[E, rows, cols] BF16 -> (fp8 [E, rows, cols], MMA-layout E8M0 scales)."""
++    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
++    from flashinfer.fp8_quantization import mxfp8_quantize
++
++    num_experts, rows, cols = w.shape
++    if rows % 128 == 0:
++        q, sf = mxfp8_quantize(w.reshape(num_experts * rows, cols), True)
++    else:
++        # Scales are padded to 128 rows per expert, so quantize expert by expert.
++        parts = [mxfp8_quantize(w[e], True) for e in range(num_experts)]
++        q = torch.cat([p[0] for p in parts])
++        sf = torch.cat([p[1].reshape(-1) for p in parts])
++    sf_mma = convert_sf_to_mma_layout(
++        sf, m=rows, k=cols, num_groups=num_experts, sf_vec_size=MXFP8_BLOCK
++    )
++    return q.view(num_experts, rows, cols), sf_mma
++
++
++def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool):
++    """Non-gated ReLU^2 MoE in FP32. ``quantized`` applies MXFP8 qdq everywhere."""
++    qdq = _qdq_mxfp8 if quantized else (lambda t: t.float())
++    xf, w1f, w2f = qdq(x), qdq(w1), qdq(w2)
++    out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
++    for e in range(w1.shape[0]):
++        tok, slot = (topk_ids == e).nonzero(as_tuple=True)
++        if tok.numel() == 0:
++            continue
++        z = xf[tok] @ w1f[e].T
++        h = torch.relu(z) ** 2
++        y = qdq(h) @ w2f[e].T
++        out.index_add_(0, tok, y * topk_w[tok, slot].unsqueeze(1))
++    return out
++
++
++def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
++    from flashinfer import cute_dsl_fused_moe
++    from flashinfer.fp8_quantization import mxfp8_quantize
++
++    num_tokens, hidden = x.shape
++    w1_q, w1_sf = _quantize_weights(w1)
++    w2_q, w2_sf = _quantize_weights(w2)
++    x_q, x_sf = mxfp8_quantize(x, is_sf_swizzled_layout=False, alignment=128)
++    x_sf = x_sf.view(torch.uint8).reshape(num_tokens, hidden // MXFP8_BLOCK)
++    ones = torch.ones(num_experts, dtype=torch.float32, device=x.device)
++    return cute_dsl_fused_moe(
++        x=x_q,
++        x_sf=x_sf,
++        token_selected_experts=topk_ids,
++        token_final_scales=topk_w,
++        w1_weight=w1_q,
++        w1_weight_sf=w1_sf,
++        w1_alpha=ones,
++        fc2_input_scale=None,
++        w2_weight=w2_q,
++        w2_weight_sf=w2_sf,
++        w2_alpha=ones,
++        num_experts=num_experts,
++        top_k=topk_ids.shape[1],
++        num_local_experts=num_experts,
++        output_dtype=torch.bfloat16,
++        activation_type=ActivationType.Relu2.value,
++        quant_mode="mxfp8",
++        tactic=tactic,
++    )
++
++
++def _gemm1_n192_tactic(tile):
++    return (
++        tile,
++        ((tile, 192), (tile // 128, 1), False),
++        ((tile, 128), (tile // 128, 1), False),
++    )
++
++
++def _make_case(num_tokens, hidden, inter, num_experts, top_k, seed=0):
++    torch.manual_seed(seed)
++    dev = "cuda"
++    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=dev) / 2
++    w1 = torch.randn(num_experts, inter, hidden, dtype=torch.bfloat16, device=dev) / 8
++    w2 = torch.randn(num_experts, hidden, inter, dtype=torch.bfloat16, device=dev) / 8
++    scores = torch.rand(num_tokens, num_experts, device=dev)
++    topk_ids = scores.topk(top_k, dim=-1).indices.to(torch.int32)
++    topk_w = torch.softmax(torch.randn(num_tokens, top_k, device=dev), dim=-1)
++    return x, w1, w2, topk_ids, topk_w.float()
++
++
++def _cos(a, b):
++    return F.cosine_similarity(a.reshape(-1).float(), b.reshape(-1).float(), dim=0)
++
++
++@pytest.mark.parametrize(
++    "num_tokens,hidden,inter,num_experts,top_k",
++    [
++        (33, 896, 1024, 16, 4),
++        # Many-expert latent-MoE shape
++        (64, 640, 3584, 384, 8),
++    ],
++)
++def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k):
++    x, w1, w2, topk_ids, topk_w = _make_case(
++        num_tokens, hidden, inter, num_experts, top_k
++    )
++    out = _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts).float()
++
++    ref_bf16 = _reference(x, w1, w2, topk_ids, topk_w, quantized=False)
++    cos = _cos(out, ref_bf16)
++    assert cos > MIN_COS_SIM_VS_BF16, f"cos vs BF16 {cos:.4f}"
++
++    ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
++    cos_q = _cos(out, ref_q)
++    assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
++    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
++
++
++@pytest.mark.parametrize("tile", [128, 256])
++def test_mxfp8_relu2_gemm1_n192(tile):
++    """Non-gated GEMM1 may use N=192 tiles; check them against the MXFP8 reference."""
++    # intermediate = 14 x 192, not a multiple of 256
++    num_tokens, hidden, inter, num_experts, top_k = 256, 1024, 2688, 64, 8
++    x, w1, w2, topk_ids, topk_w = _make_case(
++        num_tokens, hidden, inter, num_experts, top_k
++    )
++    out = _run_kernel(
++        x, w1, w2, topk_ids, topk_w, num_experts, tactic=_gemm1_n192_tactic(tile)
++    ).float()
++    ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
++    cos_q = _cos(out, ref_q)
++    assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
++    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
++
++
++def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile():
++    """GEMM1 has no partial-N-tile predicate, so N=192 needs inter % 192 == 0."""
++    x, w1, w2, topk_ids, topk_w = _make_case(33, 512, 512, 8, 2)
++    with pytest.raises(ValueError, match="Unsupported configuration"):
++        _run_kernel(x, w1, w2, topk_ids, topk_w, 8, tactic=_gemm1_n192_tactic(128))
++
++
++@pytest.mark.parametrize("tile", [128, 256])
++def test_w4a8_relu2_gemm1_n192_matches_default(tile):
++    """W4A8 (MXFP4 weights) with GEMM1 N=192 matches the default tactic."""
++    from flashinfer import cute_dsl_fused_moe
++    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat, ReLU2
++
++    num_tokens, hidden, inter, num_experts, top_k = 64, 512, 384, 8, 2
++    x, w1, w2, topk_ids, topk_w = _make_case(
++        num_tokens, hidden, inter, num_experts, top_k
++    )
++    quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
++    view = CuteDslConfig.prepare_weights(
++        w1,
++        w2,
++        quant=quant,
++        num_local_experts=num_experts,
++        hidden_size=hidden,
++        intermediate_size=inter,
++        activation=ReLU2(),
++    )
++    x_q, x_sf = CuteDslConfig.prepare_activations(
++        x, quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
++    )
++
++    def run(tactic):
++        return cute_dsl_fused_moe(
++            x=x_q,
++            x_sf=x_sf,
++            token_selected_experts=topk_ids,
++            token_final_scales=topk_w,
++            w1_weight=view["w1_weight"],
++            w1_weight_sf=view["w1_weight_sf"],
++            w1_alpha=view["w1_alpha"],
++            fc2_input_scale=None,
++            w2_weight=view["w2_weight"],
++            w2_weight_sf=view["w2_weight_sf"],
++            w2_alpha=view["w2_alpha"],
++            num_experts=num_experts,
++            top_k=top_k,
++            activation_type=ActivationType.Relu2.value,
++            quant_mode="w4a8",
++            tactic=tactic,
++        ).float()
++
++    default = run(-1)
++    out = run(_gemm1_n192_tactic(tile))
++    assert _cos(out, default) > 0.999
++    torch.testing.assert_close(out, default, rtol=2e-2, atol=2e-2 * default.abs().max())
++
++
++def test_gemm1_n192_is_non_gated_only():
++    from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
++        BlockScaledContiguousGatherGroupedGemmKernel as Kernel,
++    )
++
++    for tile in (128, 256):
++        cluster = (tile // 128, 1)
++        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
++            (tile, 192), cluster, gated=False
++        )
++        assert not Kernel.is_valid_mma_tiler_and_cluster_shape(
++            (tile, 192), cluster, gated=True
++        )
++        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
++            (tile, 128), cluster, gated=True
++        )
++
++
++def test_mxfp8_mode_rejects_invalid_inputs():
++    from flashinfer import cute_dsl_fused_moe
++
++    x, w1, w2, topk_ids, topk_w = _make_case(8, 256, 256, 4, 2)
++    w1_q, w1_sf = _quantize_weights(w1)
++    w2_q, w2_sf = _quantize_weights(w2)
++    ones = torch.ones(4, dtype=torch.float32, device="cuda")
++    kwargs = dict(
++        token_selected_experts=topk_ids,
++        token_final_scales=topk_w,
++        w1_weight=w1_q,
++        w1_weight_sf=w1_sf,
++        w1_alpha=ones,
++        fc2_input_scale=None,
++        w2_weight=w2_q,
++        w2_weight_sf=w2_sf,
++        w2_alpha=ones,
++        num_experts=4,
++        top_k=2,
++        activation_type=ActivationType.Relu2.value,
++        quant_mode="mxfp8",
++    )
++    # activations must be E4M3 (the BF16 input is not pre-quantized)
++    with pytest.raises(TypeError, match="float8_e4m3fn input"):
++        cute_dsl_fused_moe(x=x, x_sf=None, **kwargs)
++    x_q = x.to(torch.float8_e4m3fn)
++    x_sf = torch.zeros(8, 256 // MXFP8_BLOCK, dtype=torch.uint8, device="cuda")
++    # MXFP8 mode needs E4M3 weights, not BF16
++    with pytest.raises(TypeError, match="float8_e4m3fn weights"):
++        cute_dsl_fused_moe(x=x_q, x_sf=x_sf, **{**kwargs, "w1_weight": w1})
++
++
++def test_row_major_scales_match_swizzled_quantizer_layout():
++    """Checkpoint (row-major) scales convert to the layout mxfp8_quantize emits."""
++    from flashinfer.cute_dsl.utils import convert_row_major_sf_to_mma_layout
++    from flashinfer.fp8_quantization import mxfp8_quantize
++
++    # 192 rows also exercises the padding of each expert's scales to 128 rows.
++    num_experts, rows, cols = 2, 192, 384
++    torch.manual_seed(1)
++    w = torch.randn(num_experts, rows, cols, dtype=torch.bfloat16, device="cuda")
++    flat = w.reshape(num_experts * rows, cols)
++    _, sf_swizzled = mxfp8_quantize(flat, True)
++    _, sf_row_major = mxfp8_quantize(flat, False)
++    expected = _quantize_weights(w)[1]
++    sf_row_major = sf_row_major.view(torch.uint8).reshape(
++        num_experts, rows, cols // MXFP8_BLOCK
++    )
++    got = convert_row_major_sf_to_mma_layout(
++        sf_row_major, m=rows, k=cols, num_groups=num_experts
++    )
++    assert got.shape == expected.shape
++    assert torch.equal(got, expected)
+diff --git a/tests/moe/test_unified_moe.py b/tests/moe/test_unified_moe.py
+index 62b3a3aebdb..fd024c80e54 100644
+--- a/tests/moe/test_unified_moe.py
++++ b/tests/moe/test_unified_moe.py
+@@ -1419,12 +1419,14 @@ def test_declarative_activation_capabilities(self):
+         )
+         assert CutlassBf16Runner.supported_activation_classes == cutlass
+         assert CutlassW4A16Runner.supported_activation_classes == cutlass
+-        assert CuteDslRunner.supported_activation_classes == (
+-            SwiGLU,
+-            GeGLUTanh,
+-            ReLU2,
+-            SiTU,
+-        )
++        cute_dsl = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
++        cute_dsl_mxfp8_act = (SwiGLU, GeGLUTanh, ReLU2)
++        assert CuteDslRunner.supported_activation_classes_by_quant == {
++            (QuantFormat.NVFP4, QuantFormat.NVFP4): cute_dsl,
++            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
++            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
++            (QuantFormat.NVFP4, QuantFormat.BF16): cute_dsl,
++        }
+         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
+             (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+                 SwiGLU,

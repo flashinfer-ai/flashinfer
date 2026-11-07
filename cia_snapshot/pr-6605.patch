@@ -1,0 +1,397 @@
+diff --git a/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py b/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py
+index 5ea23ffb423..028cc3be5ef 100644
+--- a/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py
++++ b/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_2cta/kernel.py
+@@ -1725,6 +1725,11 @@ def split_kv_kernel(
+             )
+             named_res["gmem_o"].split_kv = max_split_kv
+ 
++            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
++                # The one-wave split-KV launch is a PDL dependent of the
++                # preceding grid. Acquire it after barrier and TMEM setup, but
++                # before any task reads Q, KV, page offsets or sequence lengths.
++                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+             task_manager.run()
+ 
+         # TMEM deallocation (MMA warp)
+diff --git a/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py b/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py
+index cab0923d595..c974eb8f09f 100644
+--- a/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py
++++ b/flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py
+@@ -2059,31 +2059,6 @@ def dense_kernel(
+         has_runtime_activity_guard = tile_sched_params is None and (
+             cu_seqlens_q is not None or enable_runtime_split_pruning
+         )
+-        if cutlass.const_expr(has_runtime_activity_guard):
+-            # Decode launch coordinates against the configured maximum grid,
+-            # then independently drop compact-Q padding and profitable split
+-            # suffixes. S2/S3 retain configured split work: too few mainloop
+-            # CTAs can retire to amortize the activity branch plus mandatory
+-            # neutral publication/reduction. Q padding remains prunable.
+-            if cutlass.const_expr(cu_seqlens_q is not None):
+-                query_tile_is_active = runtime_query_tile_is_active(
+-                    cfg,
+-                    cu_seqlens_q,
+-                    batch_idx,
+-                    cta_idx_q,
+-                )
+-                query_tile_is_active = cute.arch.make_warp_uniform(query_tile_is_active)
+-            if cutlass.const_expr(enable_runtime_split_pruning):
+-                split_tile_is_active = runtime_split_tile_is_active(
+-                    cfg,
+-                    cache_seqs,
+-                    cu_seqlens_q,
+-                    batch_idx,
+-                    cta_idx_q,
+-                    cta_idx_kv,
+-                )
+-                split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
+-            run_task_graph = query_tile_is_active and split_tile_is_active
+         if cutlass.const_expr(tile_sched_params is not None):
+             cta_idx_q = None
+             batch_idx = None
+@@ -2174,7 +2149,37 @@ def dense_kernel(
+             barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
+             thread_count=cfg.threads_per_cta,
+         )
++        if cutlass.const_expr(acc_o is not None):
++            # The split-KV launch is a PDL dependent of the preceding grid.
++            # Acquire it after CTA-local barrier and TMEM setup, but before the
++            # first read of Q, KV, page offsets or sequence lengths and before
++            # any write to the split workspace.
++            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+         if cutlass.const_expr(has_runtime_activity_guard):
++            # Decode launch coordinates against the configured maximum grid,
++            # then independently drop compact-Q padding and profitable split
++            # suffixes. S2/S3 retain configured split work: too few mainloop
++            # CTAs can retire to amortize the activity branch plus mandatory
++            # neutral publication/reduction. Q padding remains prunable.
++            if cutlass.const_expr(cu_seqlens_q is not None):
++                query_tile_is_active = runtime_query_tile_is_active(
++                    cfg,
++                    cu_seqlens_q,
++                    batch_idx,
++                    cta_idx_q,
++                )
++                query_tile_is_active = cute.arch.make_warp_uniform(query_tile_is_active)
++            if cutlass.const_expr(enable_runtime_split_pruning):
++                split_tile_is_active = runtime_split_tile_is_active(
++                    cfg,
++                    cache_seqs,
++                    cu_seqlens_q,
++                    batch_idx,
++                    cta_idx_q,
++                    cta_idx_kv,
++                )
++                split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
++            run_task_graph = query_tile_is_active and split_tile_is_active
+             if run_task_graph:
+                 task_manager.run()
+             elif query_tile_is_active:
+diff --git a/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.py b/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.py
+index 35efc60b7ff..5c0b03b5a15 100644
+--- a/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.py
++++ b/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.py
+@@ -307,8 +307,6 @@ class _PrimsTSQTokenKvBlockSparsePlan:
+     """
+ 
+     _metadata_plan: _PrimsTSQTokenKvBlockSparseMetadataPlan
+-    _bmm1_scale: float
+-    _bmm2_scale: float
+     _attention_plan: Any
+     _query: _QTokenKvBlockSparseTensorDescriptor
+     _block_indices: _QTokenKvBlockSparseTensorDescriptor
+@@ -379,14 +377,10 @@ def run(
+         )
+         from .decode import _validate_scale
+ 
+-        scale_qk = (
+-            self._bmm1_scale
+-            if sm_scale is None
+-            else _validate_scale(sm_scale, "sm_scale")
+-        )
+-        scale_v = (
+-            self._bmm2_scale if v_scale is None else _validate_scale(v_scale, "v_scale")
++        scale_qk = _validate_scale(
++            query.shape[-1] ** -0.5 if sm_scale is None else sm_scale, "sm_scale"
+         )
++        scale_v = 1.0 if v_scale is None else _validate_scale(v_scale, "v_scale")
+         self._attention_plan._run_unchecked(
+             attention_query,
+             attention_out,
+@@ -815,7 +809,6 @@ def run(
+                         config.workspace_buffer,
+                         out=out,
+                         max_seq_len_kv=config.max_seq_len_kv,
+-                        bmm1_scale=sm_scale,
+                         qo_indptr=qo_indptr,
+                         max_seq_len_q=(
+                             config.seq_len_q if config.use_packed_q else None
+@@ -1560,8 +1553,6 @@ def _prepare_q_token_kv_block_sparse_attention(
+     *,
+     out: torch.Tensor,
+     max_seq_len_kv: int,
+-    bmm1_scale: Optional[float] = None,
+-    bmm2_scale: float = 1.0,
+     qo_indptr: Optional[torch.Tensor] = None,
+     max_seq_len_q: Optional[int] = None,
+     sparse_block_size: int = 4,
+@@ -1626,10 +1617,6 @@ def _prepare_q_token_kv_block_sparse_attention(
+         Static maximum visible logical K/V length in tokens, including current
+         query or MTP tokens. It must fit within each dense block-table row and
+         remain unchanged across CUDA graph replay.
+-    bmm1_scale : float, optional
+-        Scale applied to QK scores. It defaults to ``head_dim**-0.5``.
+-    bmm2_scale : float
+-        Scale applied to the attention output.
+     qo_indptr : torch.Tensor, optional
+         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
+         mode.
+@@ -1743,13 +1730,8 @@ def _prepare_q_token_kv_block_sparse_attention(
+         sparse_block_size=sparse_block_size,
+         qo_indptr=qo_indptr,
+     )
+-    from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
++    from .decode import _prepare_prims_ts_batch_decode_plan
+ 
+-    scale_qk = _validate_scale(
+-        query.shape[-1] ** -0.5 if bmm1_scale is None else bmm1_scale,
+-        "bmm1_scale",
+-    )
+-    scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+     attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
+         attention_query,
+         paged_kv_cache,
+@@ -1783,8 +1765,6 @@ def _prepare_q_token_kv_block_sparse_attention(
+     )
+     return _PrimsTSQTokenKvBlockSparsePlan(
+         _metadata_plan=metadata_plan,
+-        _bmm1_scale=scale_qk,
+-        _bmm2_scale=scale_v,
+         _attention_plan=attention_plan,
+         _query=_describe_q_token_kv_block_sparse_tensor(query),
+         _block_indices=_describe_q_token_kv_block_sparse_tensor(block_indices),
+diff --git a/tests/attention/test_attention_ts_mla_decode.py b/tests/attention/test_attention_ts_mla_decode.py
+index e40e29858bb..8e7844eefa3 100644
+--- a/tests/attention/test_attention_ts_mla_decode.py
++++ b/tests/attention/test_attention_ts_mla_decode.py
+@@ -2926,3 +2926,116 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
+         case,
+         expected_b200={"kernel": expected_kernel},
+     )
++
++
++# Triggers its dependents first, spins, and only then copies the real query into
++# the buffer MLA decode reads, so a decode kernel that reads Q before the
++# preceding grid has completed sees the NaN left in the buffer.
++_PDL_EARLY_TRIGGER_PRIMARY_CUDA = r"""
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAException.h>
++#include <torch/extension.h>
++
++#include <cstdint>
++
++__global__ void trigger_then_copy_kernel(uint8_t* dst, const uint8_t* src, int64_t n,
++                                         int64_t spin_cycles) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++  asm volatile("griddepcontrol.launch_dependents;");
++#endif
++  int64_t start = clock64();
++  while (clock64() - start < spin_cycles) {
++  }
++  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
++  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
++       i += stride) {
++    dst[i] = src[i];
++  }
++}
++
++void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, int64_t spin_cycles) {
++  TORCH_CHECK(dst.numel() * dst.element_size() == src.numel() * src.element_size());
++  trigger_then_copy_kernel<<<132, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
++      static_cast<uint8_t*>(dst.data_ptr()), static_cast<const uint8_t*>(src.data_ptr()),
++      dst.numel() * dst.element_size(), spin_cycles);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++"""
++
++
++@pytest.mark.parametrize(
++    ("num_qo_heads", "expected_kernel"),
++    (
++        pytest.param(16, "throughput_latency_1cta", id="1cta"),
++        pytest.param(128, "throughput_2cta", id="2cta"),
++    ),
++)
++@_REQUIRES_PRIMTS_GPU
++def test_attention_ts_mla_split_kv_waits_for_early_triggering_predecessor(
++    num_qo_heads: int,
++    expected_kernel: str,
++):
++    """A split-KV call must not read Q before the preceding grid has completed,
++    even when that grid executes griddepcontrol.launch_dependents early."""
++
++    from torch.utils.cpp_extension import load_inline
++
++    major, minor = torch.cuda.get_device_capability()
++    primary = load_inline(
++        name="test_attention_ts_mla_pdl_early_trigger_primary",
++        cpp_sources=[
++            "void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, "
++            "int64_t spin_cycles);"
++        ],
++        cuda_sources=[_PDL_EARLY_TRIGGER_PRIMARY_CUDA],
++        extra_cuda_cflags=[
++            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
++        ],
++        functions=["pdl_early_trigger_copy"],
++        verbose=False,
++    )
++
++    case = _make_mla_case(
++        batch_size=1,
++        num_qo_heads=num_qo_heads,
++        max_seq_len=32768,
++        qkv_dtype=torch.bfloat16,
++        page_size=64,
++        device="cuda",
++        seed=41000 + num_qo_heads,
++    )
++    wrapper = _plan_case(case)
++    policy = _policy_dict(wrapper)
++    _assert_auto_policy(
++        policy,
++        {"kernel": expected_kernel},
++        device=case.query.device,
++    )
++    assert int(policy["split_kv"]) > 1
++    assert policy["separate_reducer_impl"] != "none"
++
++    real_query = case.query
++    query_buffer = torch.empty_like(real_query)
++    staged = replace(case, query=query_buffer)
++    output = torch.empty(
++        (*real_query.shape[:3], _LATENT_DIM),
++        dtype=case.output_dtype,
++        device=real_query.device,
++    )
++    # Warm up so compilation does not run between the primary and the decode.
++    query_buffer.copy_(real_query)
++    _run_case(wrapper, staged, out=output, validate=False)
++    torch.cuda.synchronize()
++    _assert_case_correct(output, case, policy)
++
++    for _ in range(5):
++        query_buffer.fill_(float("nan"))
++        output.fill_(float("nan"))
++        torch.cuda.synchronize()
++        primary.pdl_early_trigger_copy(query_buffer, real_query, 20_000_000)
++        _run_case(wrapper, staged, out=output, validate=False)
++        torch.cuda.synchronize()
++        assert torch.isfinite(output).all(), (
++            "MLA decode read Q before the preceding kernel wrote it"
++        )
++        _assert_case_correct(output, case, policy)
+diff --git a/tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py b/tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py
+index e084b98a878..6dcb018984a 100644
+--- a/tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py
++++ b/tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py
+@@ -2104,6 +2104,98 @@ def fake_prepare(
+     assert torch.all(output == 4)
+ 
+ 
++@_REQUIRES_PRIMS_TS_ATTENTION
++@pytest.mark.parametrize("group_size", (1, 4))
++def test_q_token_kv_block_sparse_wrapper_default_sm_scale_ignores_earlier_runs(
++    group_size: int,
++) -> None:
++    """``run()`` without ``sm_scale`` uses ``head_dim**-0.5`` after any earlier run."""
++
++    torch.manual_seed(2028)
++    blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
++    num_routes, num_qo_heads, head_dim = 2, 12, 256
++    max_seq_len_kv = table.shape[1] * storage_page_size
++    query = torch.randn(
++        num_routes,
++        1,
++        group_size,
++        num_qo_heads,
++        head_dim,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    k_cache = torch.randn(
++        int(table.max().item()) + 1,
++        1,
++        storage_page_size,
++        head_dim,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    v_cache = torch.randn_like(k_cache)
++
++    def make_wrapper() -> QTokenKvBlockSparsePagedTSWrapper:
++        workspace = torch.empty(
++            get_prims_ts_q_token_kv_block_sparse_workspace_size(
++                query,
++                k_cache,
++                table,
++                block_topk=blocks.shape[1],
++                max_seq_len_kv=max_seq_len_kv,
++                out_dtype=query.dtype,
++            ),
++            dtype=torch.uint8,
++            device="cuda",
++        )
++        wrapper = QTokenKvBlockSparsePagedTSWrapper()
++        wrapper.plan(
++            num_routes,
++            group_size,
++            num_qo_heads,
++            1,
++            head_dim,
++            4,
++            storage_page_size,
++            blocks.shape[1],
++            max_seq_len_kv,
++            device=query.device,
++            workspace_buffer=workspace,
++            q_data_type=query.dtype,
++        )
++        return wrapper
++
++    def run(
++        wrapper: QTokenKvBlockSparsePagedTSWrapper, sm_scale: float | None = None
++    ) -> torch.Tensor:
++        out = torch.empty_like(query)
++        wrapper.run(
++            query,
++            (k_cache, v_cache),
++            table,
++            blocks,
++            requests,
++            positions,
++            sm_scale=sm_scale,
++            out=out,
++        )
++        torch.cuda.synchronize()
++        return out
++
++    expected_default = run(make_wrapper())
++    expected_default_again = run(make_wrapper(), sm_scale=head_dim**-0.5)
++    torch.testing.assert_close(
++        expected_default, expected_default_again, rtol=1e-2, atol=1e-2
++    )
++
++    wrapper = make_wrapper()
++    explicit = run(wrapper, sm_scale=0.5)
++    assert not torch.allclose(explicit, expected_default, rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(run(wrapper), expected_default, rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(
++        run(wrapper, sm_scale=0.5), explicit, rtol=1e-2, atol=1e-2
++    )
++
++
+ @_REQUIRES_PRIMS_TS_ATTENTION
+ @pytest.mark.parametrize("group_size", (1, 3, 8))
+ def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(

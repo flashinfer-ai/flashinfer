@@ -1,0 +1,88 @@
+diff --git a/flashinfer/cute_dsl/availability.py b/flashinfer/cute_dsl/availability.py
+index aa4340fec0e..0eb0406afb6 100644
+--- a/flashinfer/cute_dsl/availability.py
++++ b/flashinfer/cute_dsl/availability.py
+@@ -225,12 +225,31 @@ def cute_dsl_compile_arch(major: int, minor: int) -> str:
+     )
+ 
+ 
++@functools.cache
++def _device_capability(device_index: int) -> tuple[int, int]:
++    r"""Return the compute capability of one CUDA device, queried once per process."""
++    import torch
++
++    return torch.cuda.get_device_capability(device_index)
++
++
+ def require_cute_dsl_arch(device, native_only: bool = False) -> None:
+     r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
+     target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
+     import torch
+ 
+-    major, minor = torch.cuda.get_device_capability(device)
++    # Several CuTe-DSL ops run this check on every launch, so a CUDA device
++    # with an index reuses its cached capability. Other forms, such as a bare
++    # "cuda" device (the current device, which can change), are resolved on
++    # each call.
++    if (
++        isinstance(device, torch.device)
++        and device.type == "cuda"
++        and device.index is not None
++    ):
++        major, minor = _device_capability(device.index)
++    else:
++        major, minor = torch.cuda.get_device_capability(device)
+     if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
+         hint = ""
+         if not native_only:
+diff --git a/tests/utils/test_cute_dsl_availability.py b/tests/utils/test_cute_dsl_availability.py
+new file mode 100644
+index 00000000000..8cb35c9de49
+--- /dev/null
++++ b/tests/utils/test_cute_dsl_availability.py
+@@ -0,0 +1,45 @@
++import pytest
++import torch
++
++import flashinfer.cute_dsl.availability as availability
++
++
++@pytest.fixture
++def capability_queries(monkeypatch):
++    """Fake two devices: index 1 is sm_120, which the DSL does not support, and
++    every other device is sm_100, which it does. Yields the device argument of
++    each capability query."""
++    queries = []
++
++    def fake_get_device_capability(device=None):
++        queries.append(device)
++        return (12, 0) if device == 1 else (10, 0)
++
++    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
++    monkeypatch.setattr(
++        availability,
++        "is_cute_dsl_arch_supported",
++        lambda major, minor, native_only=False: (major, minor) == (10, 0),
++    )
++    availability._device_capability.cache_clear()
++    yield queries
++    availability._device_capability.cache_clear()
++
++
++def test_require_cute_dsl_arch_queries_each_device_index_once(capability_queries):
++    for _ in range(2):
++        availability.require_cute_dsl_arch(torch.device("cuda", 0))
++        with pytest.raises(NotImplementedError, match="sm_120"):
++            availability.require_cute_dsl_arch(torch.device("cuda", 1))
++
++    assert capability_queries == [0, 1]
++
++
++@pytest.mark.parametrize("device", [torch.device("cuda"), None, torch.device("cpu", 0)])
++def test_require_cute_dsl_arch_queries_devices_without_a_cuda_index_on_every_call(
++    capability_queries, device
++):
++    availability.require_cute_dsl_arch(device)
++    availability.require_cute_dsl_arch(device)
++
++    assert capability_queries == [device, device]

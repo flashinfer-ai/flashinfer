@@ -1,0 +1,58 @@
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index 94f57b2dec..ab93063bec 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -9953,6 +9953,12 @@ def _trtllm_gemm_fp8_nt_groupwise_requirement(
+         raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
+     if a.shape[1] < 256:
+         raise ValueError("a.shape[1] must be >= 256 in TRTLLM")
++    # The block-scaled FP8 trtllm-gen kernels use TileK=128 with
++    # UnrollLoop2xForMma, so K must be a multiple of 2 * TileK = 256.
++    if a.shape[1] % 256 != 0:
++        raise ValueError(
++            f"a.shape[1] must be a multiple of 256 in TRTLLM, got {a.shape[1]}"
++        )
+ 
+     return True
+ 
+diff --git a/tests/gemm/test_groupwise_scaled_gemm_fp8.py b/tests/gemm/test_groupwise_scaled_gemm_fp8.py
+index 4c7ddf2f2b..554ffba90d 100755
+--- a/tests/gemm/test_groupwise_scaled_gemm_fp8.py
++++ b/tests/gemm/test_groupwise_scaled_gemm_fp8.py
+@@ -116,8 +116,8 @@ def test_fp8_groupwise_gemm(
+     if backend == "trtllm":
+         if scale_major_mode != "MN":
+             pytest.skip("trtllm only supports MN scale_major_mode")
+-        if k < 256:
+-            pytest.skip("k < 256")
++        if k % 256 != 0:
++            pytest.skip("trtllm requires k % 256 == 0")
+     if backend == "cute-dsl":
+         if not is_rubin_cute_dsl_available():
+             pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
+@@ -172,6 +172,25 @@ def test_fp8_groupwise_gemm(
+     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+ 
+ 
++@pytest.mark.parametrize(
++    "k,supported", [(256, True), (384, False), (512, True), (640, False)]
++)
++def test_fp8_groupwise_gemm_trtllm_k_requirement(k, supported):
++    """The trtllm requirement accepts K % 256 == 0 and rejects other K; runs on CPU."""
++    from flashinfer.gemm.gemm_base import _trtllm_gemm_fp8_nt_groupwise_requirement
++
++    m, n = 64, 7168
++    a = torch.empty((m, k), dtype=torch.float8_e4m3fn)
++    b = torch.empty((n, k), dtype=torch.float8_e4m3fn)
++    a_scale = torch.empty((k // 128, m), dtype=torch.float32)
++    b_scale = torch.empty((n // 128, k // 128), dtype=torch.float32)
++    if supported:
++        assert _trtllm_gemm_fp8_nt_groupwise_requirement(a, b, a_scale, b_scale, "MN")
++    else:
++        with pytest.raises(ValueError, match="multiple of 256"):
++            _trtllm_gemm_fp8_nt_groupwise_requirement(a, b, a_scale, b_scale, "MN")
++
++
+ @pytest.mark.parametrize(
+     "m,n,k", [(4, 896, 5120), (32, 8192, 28672), (512, 8192, 28672), (300, 1280, 8192)]
+ )

@@ -1,0 +1,215 @@
+diff --git a/flashinfer/mamba/cake_ssd_combined.py b/flashinfer/mamba/cake_ssd_combined.py
+index 2985798709f..fb25a98df6f 100644
+--- a/flashinfer/mamba/cake_ssd_combined.py
++++ b/flashinfer/mamba/cake_ssd_combined.py
+@@ -1030,7 +1030,13 @@ def chunk_parallel_workspace_cap_bytes(capability) -> int:
+ # the item-major tile range is split into ``vcount`` virtual CTA ranges (V =
+ # the SM count the program balances against per capability; the B200 value
+ # for an unmeasured capability; every floating-point result depends on
+-# (inputs, V) only, never on the launch grid).  ``grid_barrier`` is u32
++# (inputs, V) only, never on the launch grid).  The host passes the table
++# value capped at the device's SM count (``_chunk_parallel_vcount``): every
++# CTA claims ranges until none is left, so a board with fewer SMs than V
++# runs a second round of ranges on some CTAs -- the 208-SM R200 board
++# variant against 212 took 1.35-1.52x the 216-SM boards' time; capped at
++# 208 it measures 0.93-0.98x of those boards' times, and a board with at
++# least V SMs keeps the table value.  ``grid_barrier`` is u32
+ # ``[TICKET, EPOCH, pad, pad, FLAG[0..SEGMENT_CAP)]`` (zeroed once per device;
+ # the kernel's claim counter wraps itself, the epoch free-runs and the flags
+ # carry the epoch).  ``agg_work`` holds V f32 [64, 128] range aggregates
+@@ -1048,13 +1054,25 @@ def chunk_parallel_workspace_cap_bytes(capability) -> int:
+ _CHUNKPAR3_GRID_BARRIER_WORDS = 2
+ 
+ 
+-def _chunk_parallel_vcount(capability: tuple[int, int]) -> int:
+-    """The look-back program's virtual CTA count V of a compute capability."""
++def _chunk_parallel_vcount(
++    capability: tuple[int, int], sm_count: Optional[int] = None
++) -> int:
++    """The look-back program's virtual CTA count V: the compute capability's
++    table value (the SM count of the part the program balances its tiles
++    against), capped at ``sm_count`` when the device's SM count is given.
++    The cap keeps one range per CTA on a board with fewer SMs than the table
++    value and leaves a board with at least that many SMs unchanged.  The
++    result depends on (inputs, V) only, so every board of one SM count
++    computes the same values; board variants of one capability differ within
++    the precision gate.  Mirrors the Cake kernel-tests host rule
++    ``chunk_parallel_vcount``."""
+ 
+     key = (int(capability[0]), int(capability[1]))
+     vcount = _CHUNK_PARALLEL_VCOUNT_BY_ARCH.get(
+         key, _CHUNK_PARALLEL_VCOUNT_BY_ARCH[_CHUNK_PARALLEL_VCOUNT_DEFAULT]
+     )
++    if sm_count is not None:
++        vcount = min(int(vcount), int(sm_count))
+     return max(1, min(int(vcount), _CHUNK_PARALLEL_SEGMENT_CAP))
+ 
+ 
+@@ -2600,7 +2618,7 @@ def _materialize_workspace(
+             )
+         if chunk_parallel:
+             self._chunk_parallel_workspace(
+-                device, tile_count, _chunk_parallel_vcount(capability)
++                device, tile_count, _chunk_parallel_vcount(capability, sm_count)
+             )
+         return workspace
+ 
+@@ -2621,8 +2639,10 @@ def _chunk_parallel_workspace(
+         allocated zeroed once per device and never re-zeroed: the kernel's
+         claim counter wraps itself, its epoch word is free-running and the
+         flags carry the epoch.  ``agg_work`` (f32, ``vcount`` range aggregates
+-        plus ``vcount`` scalars) is per device too; the kernel writes every
+-        slot it reads within one launch, so it needs no initial value.  A
++        plus ``vcount`` scalars) is per device too and grows only; the kernel
++        writes every slot it reads within one launch, so it needs no initial
++        value, and it indexes at most the bound ``vcount`` ranges, so a buffer
++        sized for a larger V (the uncapped table value) stays in bounds.  A
+         workspace captured into a CUDA graph pins the buffers its graph
+         recorded (``workspace["chunk_parallel"]``, see ``run``), so a later
+         growth replaces the device's current buffers without freeing them; a
+@@ -3545,8 +3565,10 @@ def packed(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+             # [tiles, 64, 128] tensor) and as the u32 word view the phase-2
+             # chains store through.  A captured workspace binds the buffers
+             # its graph recorded (pinned by ``run``); every other call binds
+-            # the device's current grow-only buffers.
+-            vcount = _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch])
++            # the device's current grow-only buffers.  V is the capability's
++            # table value capped at this device's SM count (``_sm_count`` is
++            # fixed per device index, so a captured call replays its V).
++            vcount = _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch], sm_count)
+             chunk_parallel = workspace.get("chunk_parallel")
+             if chunk_parallel is None:
+                 chunk_parallel = self._chunk_parallel_workspace(
+@@ -3569,7 +3591,7 @@ def packed(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                 chunk_parallel = self._chunk_parallel_workspace(
+                     x.device,
+                     num_segments * self.nheads,
+-                    _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch]),
++                    _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch], sm_count),
+                 )
+             main_values.update(
+                 h_map=chunk_parallel["h_work"],
+diff --git a/tests/mamba/test_cake_ssd_combined.py b/tests/mamba/test_cake_ssd_combined.py
+index 4e0e91bb85e..50537544a8a 100644
+--- a/tests/mamba/test_cake_ssd_combined.py
++++ b/tests/mamba/test_cake_ssd_combined.py
+@@ -5834,8 +5834,9 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
+     the fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
+     seq_idx triple form deriving its table routes SM107 like SM103 (the
+     one-launch ``exactone`` render), the look-back program
+-    balances against Rubin's 212 SMs and the cost model has no Rubin row yet
+-    (the B200 constants until a calibration on Rubin fills it)."""
++    balances against Rubin's 212 SMs capped at the device's SM count and the
++    cost model has no Rubin row yet (the B200 constants until a calibration on
++    Rubin fills it)."""
+ 
+     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+     assert module._TARGET_ARCHS == {
+@@ -5853,6 +5854,14 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
+         (10, 7): 212,
+     }
+     assert module._chunk_parallel_vcount((10, 7)) == 212
++    # The cap at the device's SM count: the 208-SM R200 board variant gets 208,
++    # a 216-SM board keeps 212, no SM count keeps the table value, and the cap
++    # only lowers.
++    assert module._chunk_parallel_vcount((10, 7), 208) == 208
++    assert module._chunk_parallel_vcount((10, 7), 216) == 212
++    assert module._chunk_parallel_vcount((10, 7), None) == 212
++    assert module._chunk_parallel_vcount((10, 3), 148) == 148
++    assert module._chunk_parallel_vcount((10, 0), 1024) == 148
+     assert (10, 7) in module._CHUNK_PARALLEL_COST_MODEL_US
+     assert (10, 7) in module._THREE_PHASE_COST_MODEL_US
+     for name, program in module._PROGRAMS.items():
+@@ -5970,9 +5979,9 @@ def load_inline(*args, **kwargs):
+ 
+ def test_source_sm107_forward_binds_the_rubin_vcount_without_gpu(monkeypatch):
+     """Forced chunk-parallel on an sm_107a device, the look-back program
+-    balances its item-major tile range against Rubin's 212 SMs (V = 212
+-    virtual CTA ranges, one aggregate per range) and caps the main grid at
+-    the device's SM count."""
++    balances its item-major tile range against min(212, the device's SM
++    count) (V = 212 virtual CTA ranges on a 212-SM device, one aggregate per
++    range) and caps the main grid at the device's SM count."""
+ 
+     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+     calls = []
+@@ -5997,6 +6006,62 @@ def test_source_sm107_forward_binds_the_rubin_vcount_without_gpu(monkeypatch):
+     assert tuple(main["agg_work"].shape) == (212 * (64 * 128 + 1),)
+ 
+ 
++@pytest.mark.parametrize(
++    "arch, capability, sm_count, expected",
++    (
++        ("sm_107a", (10, 7), 216, 212),
++        ("sm_107a", (10, 7), 212, 212),
++        ("sm_107a", (10, 7), 208, 208),
++        ("sm_100a", (10, 0), 1024, 148),
++    ),
++)
++def test_source_chunk_parallel_vcount_is_capped_at_the_device_sm_count_without_gpu(
++    monkeypatch, arch, capability, sm_count, expected
++):
++    """Forced chunk-parallel, the bound ``vcount`` is the capability's table
++    value capped at the device's SM count: a 208-SM R200 board variant gets
++    208 ranges (one per CTA, no second round), 212- and 216-SM boards keep
++    212, and a board with more SMs than the table value keeps the table value.
++    The workspace's ``agg_work`` is sized for the same V on the first call and
++    a smaller later call reuses it: V depends on the device, not the shape."""
++
++    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
++    calls = []
++    runner = _cpu_forwarding_runner(
++        module, monkeypatch, calls, nheads=8, ngroups=8, arch=arch
++    )
++    monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
++    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
++
++    def inputs(seqlen):
++        x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
++        dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
++        A = torch.empty((8,), dtype=torch.float32)
++        B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
++        return x, dt, A, B, torch.empty_like(B)
++
++    runner.run(*inputs(32768))  # 256 chunks x 8 heads = 2048 tiles
++    name, launch = calls[-1]
++    assert name == runner.last_program_name == "chunkpar_bf16_batched"
++    assert launch["main_grid"] == (min(2048, sm_count), 1, 1)
++    main = launch["main"]
++    assert (
++        main["vcount"]
++        == expected
++        == module._chunk_parallel_vcount(capability, sm_count)
++    )
++    assert main["vcount"] <= launch["main_grid"][0]
++    agg_work = main["agg_work"]
++    assert tuple(agg_work.shape) == (expected * (64 * 128 + 1),)
++
++    runner.run(*inputs(2048))  # 16 chunks x 8 heads = 128 tiles
++    name, launch = calls[-1]
++    assert name == "chunkpar_bf16_batched"
++    assert launch["main_grid"] == (128, 1, 1)
++    assert launch["main"]["vcount"] == expected
++    assert launch["main"]["agg_work"] is agg_work
++
++
+ def test_source_chunk_parallel_program_builds_from_its_own_template(
+     monkeypatch, tmp_path
+ ):
+@@ -6205,9 +6270,13 @@ def inputs(seqlen):
+     assert tuple(s_work.shape) == (128, 64, 128) and s_work.dtype == torch.float32
+     assert tuple(h_words.shape) == (128, 64, 64) and h_words.dtype == torch.uint32
+     assert h_words.data_ptr() == h_map.data_ptr()
+-    # sm_103a (the forwarding runner's device): V = 152 ranges.
+-    assert main["vcount"] == 152 == module._CHUNK_PARALLEL_VCOUNT_BY_ARCH[(10, 3)]
+-    assert tuple(agg_work.shape) == (152 * (64 * 128 + 1),)
++    # sm_103a on a 148-SM fake device: V = min(152, 148) = 148 ranges.
++    assert (
++        main["vcount"]
++        == 148
++        == min(module._CHUNK_PARALLEL_VCOUNT_BY_ARCH[(10, 3)], 148)
++    )
++    assert tuple(agg_work.shape) == (148 * (64 * 128 + 1),)
+     assert agg_work.dtype == torch.float32
+     assert tuple(barrier.shape) == (1028,) and barrier.dtype == torch.uint32
+     assert not barrier.view(torch.int32).any()

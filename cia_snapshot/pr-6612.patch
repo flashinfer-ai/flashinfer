@@ -1,0 +1,2798 @@
+diff --git a/benchmarks/moe_ep/backends/mega/kernel/sm100/bench_genphase_schedule.py b/benchmarks/moe_ep/backends/mega/kernel/sm100/bench_genphase_schedule.py
+new file mode 100644
+index 00000000000..e97bd6b71fb
+--- /dev/null
++++ b/benchmarks/moe_ep/backends/mega/kernel/sm100/bench_genphase_schedule.py
+@@ -0,0 +1,429 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Compare explicit, heuristic and cached GenPhase configs with graph replay.
++
++Run each policy on every EP rank, for example from the repository root::
++
++    torchrun --standalone --nproc_per_node=2 \
++      benchmarks/moe_ep/backends/mega/kernel/sm100/bench_genphase_schedule.py \
++      --policy heuristic --tile-n 128 --cluster-m 4 --output results/heuristic
++
++Repeat with --policy original, then run both policies in reverse order to
++control drift. --policy explicit --schedule-hint N overrides both defaults.
++--auto-config --live-tokens N selects geometry from the host workload bucket.
++--policy heuristic disables the cache; --policy auto requires an exact cache
++hit from a prior tuning run and --weight-placement early (the public backend).
++The defaults are H4096/I1024/E256/top-k8, capacity1024, MXFP8/BF16. Input
++staging, quantization and host submission are outside the timed graphs.
++CUDA events measure the full dispatch/main/reducer replay, with the maximum
++rank time per sample. This is not a serving benchmark or an autotuner.
++"""
++
++import argparse
++import dataclasses
++import hashlib
++import json
++import os
++from pathlib import Path
++import statistics
++import subprocess
++import sys
++
++SOURCE_ROOT = Path(__file__).resolve().parents[6]
++
++
++def collective_action(action, gather):
++    """Propagate rank-local action failures so every EP rank exits the phase."""
++    error = None
++    try:
++        action()
++    except Exception as exc:
++        error = repr(exc)
++    errors = gather(error)
++    if any(errors):
++        raise RuntimeError(errors)
++
++
++def atomic_json(path, data):
++    """Publish a complete report by replacing its temporary file atomically."""
++    temporary = path.with_suffix(".tmp")
++    temporary.write_text(json.dumps(data, indent=2) + "\n")
++    temporary.replace(path)
++
++
++p = argparse.ArgumentParser()
++p.add_argument("--source", type=Path, default=SOURCE_ROOT)
++p.add_argument("--output", required=True, type=Path)
++p.add_argument("--hidden", type=int, default=4096)
++p.add_argument("--intermediate", type=int, default=1024)
++p.add_argument("--experts", type=int, default=256)
++p.add_argument("--topk", type=int, default=8)
++p.add_argument("--capacity", type=int, default=1024)
++p.add_argument("--active", default="0,17,65,1024")
++p.add_argument("--calls", type=int, default=8)
++p.add_argument("--samples", type=int, default=64)
++p.add_argument("--schedule-hint", type=int)
++p.add_argument(
++    "--policy",
++    choices=("original", "heuristic", "explicit", "auto"),
++    default="heuristic",
++)
++p.add_argument("--tile-n", type=int, choices=(64, 128), default=128)
++p.add_argument("--cluster-m", type=int, choices=(2, 4), default=4)
++p.add_argument(
++    "--auto-config", action="store_true", help="Leave tile and cluster to the backend"
++)
++p.add_argument(
++    "--live-tokens",
++    type=int,
++    help="Host workload bucket used for configuration selection",
++)
++p.add_argument("--weight-placement", choices=("early", "late", "both"), default="both")
++args = p.parse_args()
++try:
++    active_counts = tuple(int(value) for value in args.active.split(","))
++except ValueError:
++    p.error("--active must be a comma-separated list of integers")
++if any(value < 0 or value > args.capacity for value in active_counts):
++    p.error("--active values must be between zero and --capacity")
++if args.policy == "heuristic":
++    os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] = "off"
++if args.policy == "auto":
++    assert args.auto_config and args.live_tokens is not None
++    assert args.weight_placement == "early", "Public backend uses early routing weights"
++
++if args.policy == "explicit":
++    assert args.schedule_hint is not None and args.schedule_hint > 0
++else:
++    assert args.schedule_hint is None, "--schedule-hint requires --policy explicit"
++assert args.calls > 0 and args.samples > 0
++policy = {
++    "original": ("grouped", None),
++    "heuristic": None,
++    "auto": None,
++    "explicit": ("grouped", args.schedule_hint),
++}[args.policy]
++assert (args.tile_n, args.cluster_m) in ((128, 4), (64, 4), (64, 2))
++source = args.source.resolve()
++sys.path.insert(0, str(source))
++import torch
++import torch.distributed as dist
++from cuda.bindings import driver as cuda
++import flashinfer
++from flashinfer.moe_ep import (
++    BootstrapConfig,
++    FleetParams,
++    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
++    bootstrap_moe_ep_runtime,
++    ensure_moe_ep_cuda_device,
++    finalize_moe_ep_runtime,
++)
++from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
++from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
++
++assert Path(flashinfer.__file__).resolve().is_relative_to(source)
++rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
++assert world in (1, 2, 4) and args.experts % world == 0
++bootstrap = BootstrapConfig(rank=rank, world_size=world)
++ensure_moe_ep_cuda_device(bootstrap)
++assert torch.cuda.get_device_capability() in ((10, 0), (10, 3))
++backend = create_mega_kernel(
++    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
++        intermediate_size=args.intermediate,
++        top_k=args.topk,
++        kernel_variant="genphase",
++        mma_tiler_mnk=None if args.auto_config else (256, args.tile_n, 128),
++        cluster_shape_mn=None if args.auto_config else (args.cluster_m, 1),
++        schedule_policy=policy,
++    )
++)
++backend.bind_ep_bootstrap(bootstrap)
++runtime = bootstrap_moe_ep_runtime(bootstrap, backend.runtime_requirements(bootstrap))
++stream = torch.cuda.Stream()
++stream.wait_stream(torch.cuda.current_stream())
++torch.cuda.set_stream(stream)
++
++
++def gather_errors(error):
++    """Collect each EP rank's error before deciding whether to continue."""
++    errors = [None] * world
++    dist.all_gather_object(errors, error)
++    return errors
++
++
++def barrier():
++    """Drain the benchmark stream before synchronizing EP ranks."""
++    stream.synchronize()
++    dist.barrier()
++
++
++def assert_all(condition, context):
++    """Fail on every EP rank if any rank's local correctness check fails."""
++    failed = torch.tensor(not condition, device="cuda", dtype=torch.int32)
++    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
++    assert failed.item() == 0, context
++
++
++def digest(tensor):
++    """Hash contiguous tensor bytes for exact output comparisons between runs."""
++    return hashlib.sha256(
++        tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
++    ).hexdigest()
++
++
++def save_report():
++    """Write per-rank progress reports and propagate filesystem failures."""
++    collective_action(
++        lambda: atomic_json(args.output / f"rank-{rank}.json", report), gather_errors
++    )
++
++
++args.output.mkdir(parents=True, exist_ok=True)
++report = dict(
++    status="running",
++    source=str(source),
++    commit=subprocess.check_output(
++        ["git", "rev-parse", "HEAD"], cwd=source, text=True
++    ).strip(),
++    harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
++    hardware=str(torch.cuda.get_device_properties(torch.cuda.current_device())),
++    rank=rank,
++    world=world,
++    torch=torch.__version__,
++    cuda=torch.version.cuda,
++    geometry={
++        k: getattr(args, k)
++        for k in ("hidden", "intermediate", "experts", "topk", "capacity")
++    },
++    scope=f"EP{world} pre-staged MXFP8/BF16 native GenPhase dispatch+FC1/FC2+reducer graph replay. Native mirrored performance experiment after separate qualification. Excludes staging, quantization and host submission; no serving E2E claim.",
++    correctness="Sampled independent native reference for dense GEMMs, then full-capacity ordered FP32 route oracle from dense native terms; exact bytes before/after replay. Cross-source snapshots require a separate comparison.",
++    calls=args.calls,
++    samples=args.samples,
++    policy=args.policy,
++    schedule_hint=args.schedule_hint,
++    requested_tile_n=None if args.auto_config else args.tile_n,
++    requested_cluster_m=None if args.auto_config else args.cluster_m,
++    native_kernels_per_call=3,
++    cases=[],
++)
++ws = graph = None
++try:
++    gen = torch.Generator(device="cuda").manual_seed(9187 + rank)
++    e = args.experts // world
++    w13 = (
++        torch.randn(e, 2 * args.intermediate, args.hidden, generator=gen, device="cuda")
++        / args.hidden**0.5
++    ).bfloat16()
++    w2 = (
++        torch.randn(e, args.hidden, args.intermediate, generator=gen, device="cuda")
++        / args.intermediate**0.5
++    ).bfloat16()
++    x = torch.randn(args.capacity, args.hidden, generator=gen, device="cuda").bfloat16()
++    weights = pkg.preprocess_genphase_weights(
++        w13, w2, quant_kind="mxfp8_e4m3", intermediate_size=args.intermediate
++    )
++    qx, sx = pkg.quantize_genphase_mxfp8(x, torch.float8_e4m3fn)
++    ids = torch.stack(
++        [
++            torch.randperm(args.experts, generator=gen, device="cuda")[: args.topk]
++            for _ in range(args.capacity)
++        ]
++    ).to(torch.int32)
++    scores = torch.linspace(
++        0.125, 0.875, args.capacity * args.topk, device="cuda"
++    ).reshape_as(ids)
++    report["input_sha256"] = {
++        name: digest(value)
++        for name, value in dict(w13=w13, w2=w2, x=x, ids=ids, scores=scores).items()
++    }
++    del w13, w2, x
++    save_report()
++    for early in (
++        (True, False)
++        if args.weight_placement == "both"
++        else (args.weight_placement == "early",)
++    ):
++        fleet = FleetParams(
++            num_experts=args.experts,
++            max_tokens_per_rank=args.capacity,
++            token_hidden_size=args.hidden,
++            tuning_live_tokens=args.live_tokens,
++        )
++        cfg = dataclasses.replace(
++            backend._genphase_config(fleet), apply_topk_at_fc1=early
++        )
++        report["resolved_schedule_policy"] = cfg.schedule_policy
++        report["resolved_tile"] = cfg.resolved_mma_tiler_mnk
++        report["resolved_cluster"] = cfg.cluster_shape_mn
++        report["selection_live_tokens"] = args.live_tokens
++        if args.policy == "auto":
++            selected, selection_source = pkg.resolve_genphase_knobs(
++                backend._genphase_base_config(fleet),
++                sm_count=torch.cuda.get_device_properties(
++                    torch.cuda.current_device()
++                ).multi_processor_count,
++                live_tokens=args.live_tokens,
++            )
++            assert selection_source == "cache", (
++                "auto benchmark requires a previously tuned exact cache entry"
++            )
++            assert all(getattr(cfg, key) == value for key, value in selected.items())
++            report["selection_source"] = selection_source
++        elif args.auto_config:
++            report["selection_source"] = "heuristic"
++
++        ws = pkg.Sm100GenphaseSymmBuffer(cfg)
++        plan = ws.kernel._mainloop
++        report.setdefault("stage_plans", []).append(
++            dict(
++                early=early,
++                weight_stages=plan.num_weight_ab_stages,
++                token_stages=plan.num_token_ab_stages,
++                asymmetric=plan.uses_asymmetric_ab_stages,
++                mainloop_budget_bytes=plan.mainloop_smem_budget_bytes,
++                accumulator_stages=plan.num_accumulator_pipeline_stages,
++            )
++        )
++        ws.x[: args.capacity].copy_(qx)
++        ws.x_sf[: args.capacity, : sx.shape[1]].copy_(sx)
++        ws.topk_idx[: args.capacity].copy_(ids)
++        ws.topk_weights[: args.capacity].copy_(scores)
++        thunk = pkg.sm100_genphase_mega_launch_thunk(*weights, ws)
++        thunk()
++        barrier()
++        names = list(ws._compiled.kernel_info)
++        assert_all(
++            len(names) == 3
++            and sum("GenphaseTokenComm" in n for n in names) == 1
++            and sum("BlockScaledSwapAbGenphaseMoeKernel" in n for n in names) == 1
++            and sum("_reduce_bf16" in n for n in names) == 1,
++            ("native kernel roles", names),
++        )
++        indices, expected = pkg.sampled_reference(
++            ws, *weights, args.capacity, sample_size=32
++        )
++        error = pkg.output_error(ws.output_activation, indices, expected)
++        assert_all(
++            bool(torch.isfinite(torch.tensor(error))) and error < 0.02,
++            ("dense reference", early, error),
++        )
++        terms = (
++            ws._pre_reduced_activation.view(torch.bfloat16)[: args.capacity]
++            .float()
++            .clone()
++        )
++        graph = torch.cuda.CUDAGraph(keep_graph=True)
++        with torch.cuda.graph(graph, stream=stream):
++            for _ in range(args.calls):
++                thunk()
++        status, _, count = cuda.cuGraphGetNodes(cuda.CUgraph(graph.raw_cuda_graph()), 0)
++        assert_all(
++            status == cuda.CUresult.CUDA_SUCCESS and count == 3 * args.calls,
++            ("graph nodes", status, count),
++        )
++        for active in active_counts:
++            for holes in (False, True):
++                keep = torch.zeros(args.capacity, device="cuda", dtype=torch.bool)
++                keep[
++                    torch.arange(active, device="cuda")
++                    * args.capacity
++                    // max(active, 1)
++                ] = True
++                valid = keep[:, None].expand_as(ids).clone()
++                if holes:
++                    valid[:, 1::3] = False
++                ws.topk_idx[: args.capacity].copy_(ids).masked_fill_(~valid, -1)
++                ws.topk_weights[: args.capacity].copy_(scores).masked_fill_(
++                    ~valid, float("nan")
++                )
++                control = None
++                for k in range(args.topk):
++                    value = torch.where(valid[:, k, None], terms[:, k], 0.0)
++                    weight = (
++                        torch.where(valid[:, k, None], scores[:, k, None], 0.0)
++                        if not early
++                        else torch.ones_like(value)
++                    )
++                    if control is None:
++                        control = (
++                            (value.double() * weight.double()).float()
++                            if not early
++                            else value
++                        )
++                    else:
++                        control = (
++                            control.double() + value.double() * weight.double()
++                        ).float()
++                expected = control.bfloat16()
++                ws._pre_reduced_activation.fill_(255)
++                ws.output_activation.fill_(float("nan"))
++                barrier()
++                for _ in range(16):
++                    graph.replay()
++                barrier()
++                assert_all(
++                    torch.equal(
++                        ws.output_activation[: args.capacity].view(torch.uint8),
++                        expected.view(torch.uint8),
++                    ),
++                    ("pre timing", early, active, holes),
++                )
++                events = [
++                    (
++                        torch.cuda.Event(enable_timing=True),
++                        torch.cuda.Event(enable_timing=True),
++                    )
++                    for _ in range(args.samples)
++                ]
++                for begin, end in events:
++                    begin.record(stream)
++                    graph.replay()
++                    end.record(stream)
++                stream.synchronize()
++                timings = torch.tensor(
++                    [a.elapsed_time(b) * 1000 / args.calls for a, b in events],
++                    device="cuda",
++                    dtype=torch.float64,
++                )
++                dist.all_reduce(timings, op=dist.ReduceOp.MAX)
++                assert_all(
++                    torch.equal(
++                        ws.output_activation[: args.capacity].view(torch.uint8),
++                        expected.view(torch.uint8),
++                    ),
++                    ("post timing", early, active, holes),
++                )
++                payload = dict(
++                    output=ws.output_activation[: args.capacity].cpu(),
++                    reference=expected.cpu(),
++                )
++                values = timings.cpu().tolist()
++                report["cases"].append(
++                    dict(
++                        early=early,
++                        active=active,
++                        holes=holes,
++                        graph_nodes=count,
++                        dense_sample_error=error,
++                        status="pass",
++                        median_us=statistics.median(values),
++                        samples_us=values,
++                        output_sha256=digest(payload["output"]),
++                        reference_sha256=digest(payload["reference"]),
++                    )
++                )
++                save_report()
++                print(rank, early, active, holes, statistics.median(values), flush=True)
++        graph.reset()
++        graph = None
++        barrier()
++        ws.destroy()
++        ws = None
++    report["status"] = "pass"
++    save_report()
++finally:
++    if graph is not None:
++        graph.reset()
++    if ws is not None:
++        ws.destroy()
++    finalize_moe_ep_runtime(runtime)
+diff --git a/docs/design_docs/moe_ep_runbook.md b/docs/design_docs/moe_ep_runbook.md
+index 065aceba34e..ace9d6f9e62 100644
+--- a/docs/design_docs/moe_ep_runbook.md
++++ b/docs/design_docs/moe_ep_runbook.md
+@@ -631,8 +631,7 @@ backend = MegaConfig(
+         top_k=6,
+         gate_up_clamp=10.0,
+         kernel_variant="genphase",
+-        mma_tiler_mnk=(256, 64, 128),
+-        cluster_shape_mn=(2, 1),
++        knobs=None,  # cached winner, otherwise geometry-based heuristics
+     ),
+     quantize_input=True,
+     preprocess_weights=True,
+@@ -644,10 +643,71 @@ output = layer.forward(tensors)
+ 
+ GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
+ capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
+-intermediate size must be a multiple of 64. Leaving both geometry fields unset
+-selects N128/CGA4; N64 supports CGA2 or CGA4. Pipeline selection happens at
+-construction and does not change with the live token count. GenPhase rejects
+-legacy `knobs` (including online `"auto"`) and in-kernel FC2 reduction.
++intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
++CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
++
++With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
++host-side estimate based on EP size, expert count, top-k, intermediate width,
++SM count and the planned live-token bucket (capacity when no bucket is known).
++The estimate favors N64 for sparse expert batches and CGA2 when estimated FC1
++work underfills a CGA4 wave; the grouped hint starts at four resident-cluster
++waves. This is a starting estimate that assumes spread routing. Skew and masked
++routes can favor other candidates. No device routing readback occurs during
++selection, and a prepared workspace keeps its configuration for replay.
++
++Set `knobs="auto"` to collectively tune on the first `layer.warmup(tensors)`.
++All EP ranks must enter warmup together before CUDA graph capture. The sweep
++checks a sampled Torch oracle before and after timing warm CUDA graphs, selects
++by median of per-sample maximum-rank duration, and caches the winner. It covers
++the three admitted geometries and original/two/four/eight-wave grouped hints.
++The timed scope is dispatch + FC1/FC2 + reduction; input staging and weight
++preparation are outside it. Tuning creates temporary workspaces and compiles
++candidates; subsequent forward calls reuse the chosen configuration. Tuning
++preserves input/output pointers, and auto workspaces are excluded from pooling.
++
++An auto layer supports only its default capacity: `create_workspace()` rejects
++`knobs="auto"` even after warmup. For additional capacity or live-token profiles,
++construct a layer with fixed or offline-tuned knobs before creating handles.
++
++For serving, tune offline and use `knobs=None` when constructing layers:
++
++```bash
++torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
++  --arch sm100 --dtype mxfp8_e4m3 --kernel-variant genphase \
++  --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
++  --max-tokens 1024 --live-tokens 65
++```
++
++Prepare the matching profile before capture on every EP rank. For the bucket
++above, construct a layer with `knobs=None` and use its handle explicitly:
++
++```python
++workspace = layer.create_workspace(1024, live_tokens=65)
++layer.warmup(tensors, workspace=workspace)
++output = layer.forward(tensors, workspace=workspace)
++```
++
++Repeat for representative live-token buckets; use `--skew` for skewed routing.
++`layer.live_token_buckets(1024)` lists the cached buckets. Calls without a
++workspace handle use the layer's default capacity profile; they do not select
++a live-token profile from the incoming batch automatically.
++`FLASHINFER_MOE_EP_KNOB_CACHE` controls the cache path (`off` disables it).
++Entries require matching GPU/SM count, CUDA/Torch/DSL compiler stack, compiler
++options, implementation
++revision, operation attributes, EP geometry, capacity and live-token bucket.
++The native compiler target has the same cache identity before and after the
++first workspace configures CuTe DSL, including its bare architecture alias.
++Collective tuning waits for rank 0 to finish the cache write before returning.
++Distribute the same cache to every EP rank. Construction checks that ranks
++agree on the selected configuration before allocating collective storage.
++A warmup result is also available through `layer.get_tuned_knobs()`.
++
++Explicit `mma_tiler_mnk`, `cluster_shape_mn`, and `schedule_policy` fields or
++a GenPhase `knobs` dictionary constrain both heuristics and the tuning sweep.
++Conflicting explicit fields are rejected. `schedule_policy=("grouped", None)`
++retains the original grouped hint; a positive integer supplies a fixed hint.
++Legacy inference knob names are not accepted by GenPhase. The low-level
++`Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
+ 
+ `quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
+ `False` accepts E4M3 activations and per-32 typed E8M0 scales in
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/backend.py b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/backend.py
+index 2b1b4acb843..5cb2a71d3ec 100644
+--- a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/backend.py
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/backend.py
+@@ -9,6 +9,7 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ from typing import TYPE_CHECKING, Any
+ 
+ import torch
+@@ -56,6 +57,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+     supports_output_view = True
+ 
+     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
++        """Validate pipeline options and initialize deferred tuning state."""
+         super().__init__(config)
+         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+         if config.kernel_variant not in ("inference", "genphase"):
+@@ -63,19 +65,42 @@ def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None
+                 f"unsupported kernel_variant {config.kernel_variant!r}"
+             )
+         if config.kernel_variant == "genphase":
+-            if config.knobs is not None:
++            if (
++                config.knobs is not None
++                and config.knobs != "auto"
++                and not isinstance(config.knobs, dict)
++            ):
+                 raise MoEEpConfigError(
+-                    "Blackwell GenPhase uses explicit mma_tiler_mnk/cluster_shape_mn; "
+-                    "legacy knobs and autotuning are not supported."
++                    "GenPhase knobs must be None, 'auto', or a knob dictionary"
+                 )
++            self._genphase_configs: dict[tuple, Any] = {}
++            self._genphase_constraints()
+             if config.enable_in_kernel_fc2_reduce:
+                 raise MoEEpConfigError(
+                     "Blackwell GenPhase requires separate reduction."
+                 )
+-            self.supports_live_token_tuning = False
+-        elif config.mma_tiler_mnk is not None or config.cluster_shape_mn is not None:
++            policy = config.schedule_policy
++            if policy is not None and (
++                not isinstance(policy, tuple)
++                or len(policy) != 2
++                or policy[0] != "grouped"
++                or (
++                    policy[1] is not None
++                    and (type(policy[1]) is not int or policy[1] <= 0)
++                )
++            ):
++                raise MoEEpConfigError(
++                    "GenPhase schedule_policy must be ('grouped', None) "
++                    "or ('grouped', a positive integer)."
++                )
++        elif (
++            config.mma_tiler_mnk is not None
++            or config.cluster_shape_mn is not None
++            or config.schedule_policy is not None
++        ):
+             raise MoEEpConfigError(
+-                "mma_tiler_mnk/cluster_shape_mn require kernel_variant='genphase'; "
++                "mma_tiler_mnk/cluster_shape_mn/schedule_policy require "
++                "kernel_variant='genphase'; "
+                 "use knobs for the inference pipeline."
+             )
+         # knobs="auto": tune at the first compute() (weights + staged inputs
+@@ -101,34 +126,126 @@ def kernel_name(cls) -> str:
+     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
+         return mxfp8_cutedsl_runtime_requirements(bootstrap)
+ 
+-    def _genphase_config(self, fleet_params: FleetParams):
++    def _genphase_constraints(self):
++        """Merge explicit fields and knob overrides, rejecting conflicting values."""
++        k = self._kernel_config
++        names = ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
++        knobs = dict(k.knobs) if isinstance(k.knobs, dict) else {}
++        unknown = set(knobs) - set(names)
++        if unknown:
++            raise MoEEpConfigError(
++                f"unknown Blackwell GenPhase knobs: {sorted(unknown)}"
++            )
++        for name in names:
++            explicit = getattr(k, name)
++            if explicit is not None:
++                if name in knobs and knobs[name] != explicit:
++                    raise MoEEpConfigError(f"conflicting explicit GenPhase {name}")
++                knobs[name] = explicit
++        return knobs
++
++    def _genphase_base_config(self, fleet_params):
++        """Describe the EP workload before selecting performance knobs."""
+         from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
+ 
+         k = self._kernel_config
+-        geometry: dict[str, Any] = {
+-            "mma_tiler_mnk": (256, 128, 128),
+-            "cluster_shape_mn": (4, 1),
+-        }
+-        for name in ("mma_tiler_mnk", "cluster_shape_mn"):
+-            value = getattr(k, name)
+-            if value is not None:
+-                geometry[name] = value
++        return Sm100GenphaseMoeConfig(
++            num_total_experts=fleet_params.num_experts,
++            max_tokens_per_rank=fleet_params.max_tokens_per_rank,
++            num_topk=k.top_k,
++            hidden=fleet_params.token_hidden_size,
++            intermediate=k.intermediate_size,
++            rank=self.ep_rank,
++            world_size=self.ep_world_size,
++            quant_kind=k.kind,
++            gate_up_clamp=_resolve_gate_up_clamp(k),
++        )
++
++    def _genphase_config(self, fleet_params: FleetParams):
++        """Memoize cache or heuristic selection for one workload and device.
++
++        Auto tuning bypasses the disk cache here and retunes its default
++        workspace during warmup. Public auto layers cannot create additional
++        capacity profiles through ``create_workspace()``.
++        """
++        from ......kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
++
+         try:
+-            return Sm100GenphaseMoeConfig(
+-                num_total_experts=fleet_params.num_experts,
+-                max_tokens_per_rank=fleet_params.max_tokens_per_rank,
+-                num_topk=k.top_k,
+-                hidden=fleet_params.token_hidden_size,
+-                intermediate=k.intermediate_size,
+-                rank=self.ep_rank,
+-                world_size=self.ep_world_size,
+-                quant_kind=k.kind,
+-                gate_up_clamp=_resolve_gate_up_clamp(k),
+-                **geometry,
++            base = self._genphase_base_config(fleet_params)
++            constraints = self._genphase_constraints()
++            gpu = torch.cuda.is_available()
++            device = torch.cuda.current_device() if gpu else None
++            props = torch.cuda.get_device_properties(device) if gpu else None
++            sms = props.multi_processor_count if props is not None else 4
++            hardware = (
++                (device, props.major, props.minor, props.name, sms)
++                if props is not None
++                else None
+             )
++            key = (base, repr(constraints), fleet_params.tuning_live_tokens, hardware)
++            if key not in self._genphase_configs:
++                knobs, _ = resolve_genphase_knobs(
++                    base,
++                    sm_count=sms,
++                    live_tokens=fleet_params.tuning_live_tokens,
++                    constraints=constraints,
++                    use_cache=gpu and self._kernel_config.knobs != "auto",
++                )
++                self._genphase_configs[key] = dataclasses.replace(base, **knobs)
++            return self._genphase_configs[key]
+         except (TypeError, ValueError) as exc:
+             raise MoEEpConfigError(str(exc)) from exc
+ 
++    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
++        """List cached GenPhase profiles when no explicit knob constraints apply."""
++        if self._kernel_config.kernel_variant != "genphase":
++            return super().live_token_buckets(fleet_params)
++        if (
++            self._kernel_config.knobs is not None
++            or self._genphase_constraints()
++            or not torch.cuda.is_available()
++        ):
++            return []
++        from ......kernel_src.sm100.next_cutedsl_megamoe import (
++            genphase_live_token_buckets,
++        )
++
++        return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
++
++    def _check_genphase_selection(self, config):
++        """Require identical configuration selection across EP ranks at allocation."""
++        # Selection is construction-time work; never inspect live routing on forward.
++        if self.ep_world_size > 1:
++            import torch.distributed as dist
++
++            proposal = dataclasses.asdict(config)
++            proposal.pop("rank")
++            proposals = [None] * self.ep_world_size
++            dist.all_gather_object(proposals, proposal, group=self.ep_comm_group)
++            if any(p != proposal for p in proposals):
++                raise MoEEpConfigError(
++                    "GenPhase configuration/cache selection differs across EP ranks"
++                )
++
++    def _workspace_pool_request(self, fleet_params):
++        """Return a pool key and allocator; mutable auto workspaces stay unpooled."""
++        if self._kernel_config.kernel_variant != "genphase":
++            return super()._workspace_pool_request(fleet_params)
++        if self._kernel_config.knobs == "auto":
++            return None
++        from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseSymmBuffer
++
++        config = self._genphase_config(fleet_params)
++        self._check_genphase_selection(config)
++        key = (
++            self.kernel_name(),
++            torch.cuda.current_device(),
++            id(self._ep_comm_group),
++            "genphase",
++            config,
++        )
++        return key, lambda: Sm100GenphaseSymmBuffer(config)
++
+     def validate_init(
+         self,
+         bootstrap: BootstrapConfig,
+@@ -223,12 +340,15 @@ def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+         )
+ 
+     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
++        """Allocate the selected pipeline's workspace collectively on the EP group."""
+         if self._kernel_config.kernel_variant == "genphase":
+             from ......kernel_src.sm100.next_cutedsl_megamoe import (
+                 Sm100GenphaseSymmBuffer,
+             )
+ 
+-            return Sm100GenphaseSymmBuffer(self._genphase_config(fleet_params))
++            config = self._genphase_config(fleet_params)
++            self._check_genphase_selection(config)
++            return Sm100GenphaseSymmBuffer(config)
+         from ......kernel_src.sm100.cutedsl_megamoe import (
+             get_symm_buffer_for_mxfp8_mega_moe,
+         )
+@@ -250,6 +370,13 @@ def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
+             knobs=self._workspace_knobs(fleet_params),
+         )
+ 
++    def validate_capture_ready(self, workspace, transformed_weights):
++        """Reject GenPhase capture until collective auto warmup has completed."""
++        if self._kernel_config.kernel_variant == "genphase" and self._autotune_pending:
++            raise MoEEpConfigError(
++                "GenPhase knobs='auto' requires collective warmup before CUDA graph capture"
++            )
++
+     def validate_forward(
+         self,
+         t: "MoEEpTensors",
+@@ -338,6 +465,11 @@ def compute(
+         *,
+         output: torch.Tensor | None,
+     ) -> torch.Tensor:
++        """Launch staged inputs, tuning once first when explicitly requested.
++
++        All EP ranks must enter the initial auto sweep together outside graph
++        capture. With ``output=None``, the result borrows workspace storage.
++        """
+         if self._kernel_config.kernel_variant == "genphase":
+             from ......kernel_src.sm100.next_cutedsl_megamoe import (
+                 sm100_genphase_mega_moe,
+@@ -346,6 +478,23 @@ def compute(
+             num_tokens = (
+                 output.shape[0] if output is not None else workspace.staged_tokens()
+             )
++            if self._autotune_pending:
++                from ......kernel_src.sm100.next_cutedsl_megamoe import (
++                    autotune_sm100_genphase_mega_moe,
++                )
++
++                winner = autotune_sm100_genphase_mega_moe(
++                    output,
++                    transformed_weights[0],
++                    transformed_weights[1],
++                    workspace,
++                    num_tokens=num_tokens,
++                    constraints=self._genphase_constraints(),
++                    process_group=self._ep_comm_group,
++                )
++                workspace.retune(winner)
++                self._autotune_winner = winner
++                self._autotune_pending = False
+             view = sm100_genphase_mega_moe(
+                 output,
+                 transformed_weights[0],
+@@ -407,8 +556,11 @@ def compute(
+         return output if output is not None else view
+ 
+     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
++        """Key immutable workspace configurations; return None for auto tuning."""
+         k = self._kernel_config
+         if k.kernel_variant == "genphase":
++            if k.knobs == "auto":
++                return None
+             return (
+                 self.kernel_name(),
+                 torch.cuda.current_device(),
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/config.py b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/config.py
+index b76df1483ad..68341b92e74 100644
+--- a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/config.py
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/config.py
+@@ -17,6 +17,13 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
+     Expert weights must be MXFP8 at kernel launch; supply bf16 ``MoEWeightPack``
+     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
+     fp8 weights with ``w13_scale`` / ``w2_scale``.
++
++    ``kernel_variant="genphase"`` opts into the Blackwell decoding pipeline.
++    Its ``knobs=None`` selects an exact cached profile or a host heuristic;
++    dictionaries and explicit tile/cluster/schedule fields constrain selection.
++    ``knobs="auto"`` tunes collectively during warmup before graph capture.
++    Auto layers own a single capacity and cannot call ``create_workspace()``;
++    use fixed or offline-tuned knobs for additional capacity profiles.
+     """
+ 
+     intermediate_size: int
+@@ -28,7 +35,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
+     fast_math: bool = True
+     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
+     enable_in_kernel_fc2_reduce: bool = False
+-    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
++    # GenPhase: None resolves the cache or geometry heuristic; dictionaries
++    # constrain tile/cluster/schedule_policy; "auto" tunes at collective warmup.
++    # Inference tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
+     # the token-count default heuristic entirely when set, e.g. a winner from the
+     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
+     # "auto" -> online autotune at the first forward: collectively time the
+@@ -38,6 +47,11 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
+     # Opt-in decoding pipeline. Existing callers keep the legacy inference
+     # path, including its knob cache and online autotuner.
+     kernel_variant: Literal["inference", "genphase"] = "inference"
+-    # GenPhase only: None selects N128/CGA4. N64 admits CGA2 or CGA4.
++    # GenPhase only: None selects cached knobs or geometry-based heuristics.
++    # Explicit fields constrain the heuristic and automatic candidate sweep.
+     mma_tiler_mnk: tuple[int, int, int] | None = None
+     cluster_shape_mn: tuple[int, int] | None = None
++    # GenPhase only: None uses the geometry-based scheduling heuristic. An explicit
++    # ("grouped", None) preserves the kernel's original launch-cluster hint;
++    # ("grouped", positive_int) overrides it for offline tuning.
++    schedule_policy: tuple[str, int | None] | None = None
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/genphase_tuner.py b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/genphase_tuner.py
+new file mode 100644
+index 00000000000..b89c05a0bc7
+--- /dev/null
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/genphase_tuner.py
+@@ -0,0 +1,185 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Offline CLI adapter for Blackwell GenPhase's collective tuner."""
++
++from __future__ import annotations
++
++import dataclasses
++import json
++import os
++
++from ...tuning import finish_sweep
++
++
++def tune_one(args, rank, world_size, max_tokens):
++    """Stage synthetic inputs and tune one capacity on every EP rank.
++
++    ``args.live_tokens`` selects the workload bucket without shrinking the
++    workspace. Schedule-only sweeps preserve the selected tile and cluster.
++    """
++    import torch
++
++    from ......kernel_src.sm100 import next_cutedsl_megamoe as pkg
++    from ......weights import MoEWeightPack
++    from ......tensors import MoEEpTensors
++    from .staging import stage_genphase_inputs
++    from .weights import preprocess_mega_weights
++
++    live = args.live_tokens if args.live_tokens is not None else max_tokens
++    if not 0 <= live <= max_tokens:
++        raise ValueError("--live-tokens must be between zero and --max-tokens")
++    cfg = pkg.Sm100GenphaseMoeConfig(
++        num_total_experts=args.num_experts,
++        max_tokens_per_rank=max_tokens,
++        num_topk=args.topk,
++        hidden=args.hidden,
++        intermediate=args.intermediate,
++        rank=rank,
++        world_size=world_size,
++        gate_up_clamp=args.gate_up_clamp,
++    )
++    sms = torch.cuda.get_device_properties(
++        torch.cuda.current_device()
++    ).multi_processor_count
++    constraints = None
++    if args.sweep == "schedule":
++        base = (
++            json.loads(args.base_knobs)
++            if args.base_knobs
++            else pkg.resolve_genphase_knobs(cfg, sm_count=sms, live_tokens=live)[0]
++        )
++        constraints = {
++            k: tuple(v) if isinstance(v, list) else v
++            for k, v in base.items()
++            if k != "schedule_policy"
++        }
++    candidates = pkg.sm100_genphase_candidates(
++        cfg, sm_count=sms, live_tokens=live, constraints=constraints
++    )
++    workspace = pkg.Sm100GenphaseSymmBuffer(dataclasses.replace(cfg, **candidates[0]))
++    try:
++        generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
++        legs = ([], [])
++        local_experts = args.num_experts // world_size
++        for begin in range(0, local_experts, 8):
++            count = min(8, local_experts - begin)
++            w13 = (
++                torch.randn(
++                    count,
++                    2 * args.intermediate,
++                    args.hidden,
++                    device="cuda",
++                    generator=generator,
++                )
++                * args.hidden**-0.5
++            ).to(torch.bfloat16)
++            w2 = (
++                torch.randn(
++                    count,
++                    args.hidden,
++                    args.intermediate,
++                    device="cuda",
++                    generator=generator,
++                )
++                * args.intermediate**-0.5
++            ).to(torch.bfloat16)
++            transformed = preprocess_mega_weights(
++                MoEWeightPack(w13=w13, w2=w2),
++                intermediate_size=args.intermediate,
++                hidden_size=args.hidden,
++                kind=args.dtype,
++                kernel_variant="genphase",
++            )
++            for parts, (weight, scale) in zip(legs, transformed, strict=True):
++                parts.append((weight, scale.reshape(count, -1)))
++            del w13, w2
++        l1, l2 = (pkg.concatenate_genphase_weights(parts) for parts in legs)
++        del legs, transformed, parts, weight, scale
++        x = torch.randn(live, args.hidden, device="cuda", generator=generator).to(
++            torch.bfloat16
++        )
++        ids = (
++            torch.rand(live, args.num_experts, device="cuda", generator=generator)
++            .topk(args.topk, dim=-1)
++            .indices.to(torch.int32)
++        )
++        weights = torch.rand(live, args.topk, device="cuda", generator=generator) + 0.5
++        tensors = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
++        stage_genphase_inputs(tensors, workspace, quantize_input=True)
++        return finish_sweep(
++            args,
++            rank,
++            max_tokens,
++            live,
++            workspace,
++            None,
++            l1,
++            l2,
++            candidates,
++            pkg.autotune_sm100_genphase_mega_moe,
++        )
++    except BaseException:
++        # A failed GPU rank cannot safely enter collective free with its peers.
++        workspace = None
++        raise
++    finally:
++        if workspace is not None:
++            workspace.destroy()
++
++
++def run_tuning(args):
++    """Bootstrap an EP job, tune requested GenPhase capacities, and return zero.
++
++    Requires MXFP8 E4M3, BF16 combine and deterministic reduction. A failed GPU
++    worker relies on job teardown rather than entering collective cleanup.
++    """
++    import torch
++
++    from ......config import BootstrapConfig
++    from ......core.runtime import (
++        bootstrap_moe_ep_runtime,
++        ensure_moe_ep_cuda_device,
++        finalize_moe_ep_runtime,
++        mxfp8_cutedsl_runtime_requirements,
++    )
++    from ......kernel_src.sm100.next_cutedsl_megamoe import knob_cache_path
++
++    if (
++        args.dtype != "mxfp8_e4m3"
++        or args.combine_dtype != "bf16"
++        or args.allow_nondeterministic
++    ):
++        raise ValueError(
++            "Blackwell GenPhase requires MXFP8 E4M3, BF16 combine and deterministic reduction"
++        )
++    rank, world_size = (
++        int(os.environ.get("RANK", "0")),
++        int(os.environ.get("WORLD_SIZE", "1")),
++    )
++    if os.environ.get("MEGA_NO_DIST") == "1" and world_size != 1:
++        raise ValueError("MEGA_NO_DIST=1 requires a single-rank job")
++    runtime = None
++    if world_size == 1:
++        os.environ.setdefault("MEGA_NO_DIST", "1")
++        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
++    else:
++        bootstrap = BootstrapConfig(rank=rank, world_size=world_size)
++        ensure_moe_ep_cuda_device(bootstrap)
++        runtime = bootstrap_moe_ep_runtime(
++            bootstrap, mxfp8_cutedsl_runtime_requirements(bootstrap)
++        )
++    try:
++        for capacity in args.max_tokens:
++            tune_one(args, rank, world_size, capacity)
++        torch.cuda.synchronize()
++    except BaseException:
++        runtime = None
++        raise
++    finally:
++        if runtime is not None:
++            finalize_moe_ep_runtime(runtime)
++    if rank == 0:
++        print(
++            f"[moe_ep-tune] done; cache: {knob_cache_path() or 'DISABLED'}", flush=True
++        )
++    return 0
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/tuner.py b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/tuner.py
+index 31ccc82bfb3..8499215a2d6 100644
+--- a/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/tuner.py
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/tuner.py
+@@ -88,4 +88,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
+ 
+ 
+ def run_tuning(args) -> int:
++    """Dispatch offline MXFP8 tuning to the requested inference or GenPhase path."""
++    if args.kernel_variant == "genphase":
++        from .genphase_tuner import run_tuning as run_genphase_tuning
++
++        return run_genphase_tuning(args)
+     return _run_tuning(args, tune_one)
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/SKILL.md b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/SKILL.md
+index a23cf632670..3e309d2a66e 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/SKILL.md
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/SKILL.md
+@@ -50,3 +50,21 @@ with `preprocess_genphase_weights`, and construct a relauncher with
+ `sm100_genphase_mega_launch_thunk`. Native checks select `sm_100a` or `sm_103a`
+ before the DSL imports. Do not change default backend selection as part of a
+ source-layout edit.
++
++## Configuration selection
++
++The explicit GenPhase backend resolves tile, cluster and grouped schedule from
++an exact workload cache or host-side heuristics. `knobs="auto"` runs collective
++tuning before capture; explicit fields constrain the candidates. Keep selection
++in the backend and `shim/{tuning,knob_cache,autotune}.py`, without inspecting
++device routing during forward. Bump the cache implementation revision when the
++kernel or tuning behavior changes. Retuning must preserve staging/output
++pointers, and auto workspaces must remain unpooled.
++Caller-supplied candidates must contain exactly all GenPhase knob keys; reject
++incomplete or unknown key sets on all ranks before starting any trial, so cache
++publication cannot fail on rank 0 while peers wait at the final barrier.
++
++Reuse `tests/moe_ep/test_mega_workspace_knobs.py` for candidate, constraint,
++cache and host API contracts, and the existing MXFP8 multirank test for native
++auto/cache/graph validation. See `docs/design_docs/moe_ep_runbook.md` for the
++offline CLI and live-token profile workflow.
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/VENDOR.md b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/VENDOR.md
+index 23fab9c30b5..7e209acff81 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/VENDOR.md
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/VENDOR.md
+@@ -65,9 +65,11 @@ The six existing GenPhase names are also lazily re-exported by
+ 
+ Supported: native SM100/SM103, MXFP8 E4M3, SwiGLU, BF16 combine with separate
+ reduction, grouped N128/CGA4 or N64/CGA2/CGA4, early/late top-k weights and
+-capacity at most 1024 per rank. N128/CGA4 remains the default; N64 requires an
+-explicit tile/cluster selection. Blackwell's default backend heuristics do not
+-select this path. NVFP4, dynamic N and in-kernel reduction are outside this port.
++capacity at most 1024 per rank. The low-level config retains N128/CGA4 defaults.
++The explicit GenPhase backend resolves performance knobs from an exact workload
++cache or geometry estimate and supports collective warmup tuning. Blackwell's
++default backend selection does not select this path. NVFP4, dynamic N and
++in-kernel reduction are outside this port.
+ 
+ Native correctness is covered in the existing Blackwell workspace, oracle and
+ multirank graph test files; no new test file is required. Host construction
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/__init__.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/__init__.py
+index b9de0274c0c..04c496dec2f 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/__init__.py
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/__init__.py
+@@ -3,6 +3,16 @@
+ """Independent SM100/103 GenPhase package; native checks and DSL imports are lazy."""
+ 
+ from .shim import (
++    autotune_sm100_genphase_mega_moe,
++    bootstrap_paths,
++    concatenate_genphase_weights,
++    default_sm100_genphase_knobs,
++    genphase_live_token_buckets,
++    knob_cache_path,
++    output_error,
++    resolve_genphase_knobs,
++    sampled_reference,
++    sm100_genphase_candidates,
+     Sm100GenphaseMoeConfig,
+     Sm100GenphaseSymmBuffer,
+     preprocess_genphase_weights,
+@@ -12,9 +22,9 @@
+     sm100_genphase_mega_launch_thunk,
+     sm100_genphase_mega_moe,
+ )
+-from .shim import bootstrap_paths, output_error, sampled_reference
+ 
+ __all__ = [
++    "concatenate_genphase_weights",
+     "Sm100GenphaseMoeConfig",
+     "Sm100GenphaseSymmBuffer",
+     "preprocess_genphase_weights",
+@@ -26,4 +36,10 @@
+     "output_error",
+     "sampled_reference",
+     "bootstrap_paths",
++    "autotune_sm100_genphase_mega_moe",
++    "sm100_genphase_candidates",
++    "default_sm100_genphase_knobs",
++    "resolve_genphase_knobs",
++    "genphase_live_token_buckets",
++    "knob_cache_path",
+ ]
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/__init__.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/__init__.py
+index c225d999687..2d2a7098cd2 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/__init__.py
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/__init__.py
+@@ -7,6 +7,7 @@
+ bootstrap_paths()
+ 
+ from .genphase import (
++    concatenate_genphase_weights,
+     Sm100GenphaseMoeConfig,
+     Sm100GenphaseSymmBuffer,
+     preprocess_genphase_weights,
+@@ -17,8 +18,16 @@
+     sm100_genphase_mega_moe,
+ )
+ from .correctness import output_error, sampled_reference
++from .autotune import autotune_sm100_genphase_mega_moe
++from .tuning import sm100_genphase_candidates, default_sm100_genphase_knobs
++from .knob_cache import (
++    resolve_knobs as resolve_genphase_knobs,
++    live_token_buckets as genphase_live_token_buckets,
++    knob_cache_path,
++)
+ 
+ __all__ = [
++    "concatenate_genphase_weights",
+     "Sm100GenphaseMoeConfig",
+     "Sm100GenphaseSymmBuffer",
+     "preprocess_genphase_weights",
+@@ -30,4 +39,10 @@
+     "output_error",
+     "sampled_reference",
+     "bootstrap_paths",
++    "autotune_sm100_genphase_mega_moe",
++    "sm100_genphase_candidates",
++    "default_sm100_genphase_knobs",
++    "resolve_genphase_knobs",
++    "genphase_live_token_buckets",
++    "knob_cache_path",
+ ]
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/autotune.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/autotune.py
+new file mode 100644
+index 00000000000..05dfce2b685
+--- /dev/null
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/autotune.py
+@@ -0,0 +1,216 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Collective warm CUDA-graph tuning for Blackwell GenPhase.
++
++Each trial owns a separate workspace. The caller's workspace is unchanged;
++its backend may apply the returned knobs before its first captured launch.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import math
++import statistics
++
++from .tuning import KNOB_KEYS, is_valid_sm100_genphase_knobs, sm100_genphase_candidates
++
++
++def autotune_sm100_genphase_mega_moe(
++    y,
++    transformed_l1,
++    transformed_l2,
++    symm_buffer,
++    *,
++    num_tokens=None,
++    candidates=None,
++    constraints=None,
++    warmup_iters=8,
++    timed_iters=32,
++    calls_per_sample=8,
++    process_group=None,
++):
++    """Check sampled Torch correctness, minimize median(max EP rank), and cache.
++
++    All EP ranks must enter together outside capture. A CUDA/compile failure
++    aborts the supervised worker job; collective cleanup after a rank-local
++    GPU failure could deadlock peers. Timing excludes staging and weight prep.
++    """
++    import torch
++    import torch.distributed as dist
++
++    from flashinfer.moe_ep.core.tuning import tuning_live_tokens
++    from .comm import ensure_not_capturing
++    from .correctness import output_error, sampled_reference
++    from .genphase import Sm100GenphaseSymmBuffer
++    from .knob_cache import device_identity, record_knobs
++
++    ensure_not_capturing("Blackwell GenPhase collective autotune")
++    cfg = symm_buffer.config
++    collective = cfg.world_size > 1
++    if collective and (
++        not dist.is_initialized()
++        or dist.get_world_size(process_group) != cfg.world_size
++        or dist.get_rank(process_group) != cfg.rank
++    ):
++        raise ValueError("autotune process_group must match the workspace EP group")
++    num_tokens = symm_buffer.staged_tokens() if num_tokens is None else num_tokens
++    valid = (
++        type(num_tokens) is int
++        and 0 <= num_tokens <= cfg.max_tokens_per_rank
++        and all(
++            type(n) is int and n > 0
++            for n in (warmup_iters, timed_iters, calls_per_sample)
++        )
++    )
++    hardware = device_identity()
++    spec = dataclasses.asdict(cfg)
++    spec.pop("rank")
++    proposal = (
++        spec,
++        candidates,
++        constraints,
++        warmup_iters,
++        timed_iters,
++        calls_per_sample,
++        hardware,
++        valid,
++    )
++    proposals = [proposal]
++    if collective:
++        proposals = [None] * cfg.world_size
++        dist.all_gather_object(proposals, proposal, group=process_group)
++    if not valid or any(p != proposal for p in proposals):
++        raise ValueError(
++            "all EP ranks need matching autotune specifications and valid token/iteration counts"
++        )
++    live_tokens = tuning_live_tokens(num_tokens, cfg.max_tokens_per_rank, process_group)
++    sm_count = torch.cuda.get_device_properties(
++        torch.cuda.current_device()
++    ).multi_processor_count
++    candidates = (
++        sm100_genphase_candidates(
++            cfg, sm_count=sm_count, live_tokens=live_tokens, constraints=constraints
++        )
++        if candidates is None
++        else candidates
++    )
++    if not candidates:
++        raise ValueError("autotune needs at least one candidate")
++    # Partial overrides are valid constraints, but a recorded winner must be
++    # complete. Reject on every rank before rank 0 can fail during publication.
++    if any(set(knobs) != set(KNOB_KEYS) for knobs in candidates):
++        raise ValueError("autotune candidates must set every GenPhase knob")
++
++    def barrier():
++        """Keep candidate lifetimes and cache publication ordered across EP ranks."""
++        if collective:
++            dist.barrier(group=process_group)
++
++    indices, expected = sampled_reference(
++        symm_buffer,
++        transformed_l1,
++        transformed_l2,
++        num_tokens,
++        process_group=process_group,
++    )
++
++    def error(trial):
++        """Return the maximum sampled output error across the EP group."""
++        value = torch.tensor(
++            output_error(trial.output_activation[:num_tokens], indices, expected),
++            dtype=torch.float64,
++            device="cuda",
++        )
++        if collective:
++            dist.all_reduce(value, op=dist.ReduceOp.MAX, group=process_group)
++        return float(value)
++
++    scores, errors = [], []
++    for knobs in candidates:
++        if not is_valid_sm100_genphase_knobs(knobs, cfg):
++            scores.append(math.inf)
++            errors.append(math.inf)
++            continue
++        trial_cfg = dataclasses.replace(cfg, **knobs)
++        reason = None
++        try:
++            Sm100GenphaseSymmBuffer._build_kernel(trial_cfg)
++        except (ValueError, NotImplementedError) as exc:
++            reason = str(exc)
++        reasons = [reason]
++        if collective:
++            reasons = [None] * cfg.world_size
++            dist.all_gather_object(reasons, reason, group=process_group)
++        if any(reasons):
++            if cfg.rank == 0:
++                print(f"[genphase-autotune] rejected {knobs}: {reasons}", flush=True)
++            scores.append(math.inf)
++            errors.append(math.inf)
++            continue
++        trial = Sm100GenphaseSymmBuffer(trial_cfg)
++        for name in ("x", "x_sf", "topk_idx", "topk_weights"):
++            getattr(trial, name).view(torch.uint8).copy_(
++                getattr(symm_buffer, name).view(torch.uint8)
++            )
++        trial.note_staged_tokens(num_tokens)
++        barrier()
++        trial.launch(transformed_l1, transformed_l2)
++        torch.cuda.synchronize()
++        measured_error = error(trial)
++        score = math.inf
++        if measured_error <= 0.02:
++            graph = torch.cuda.CUDAGraph()
++            barrier()
++            with torch.cuda.graph(graph):
++                for _ in range(calls_per_sample):
++                    trial.launch(transformed_l1, transformed_l2)
++            for _ in range(warmup_iters):
++                graph.replay()
++            torch.cuda.synchronize()
++            samples = []
++            start, end = (
++                torch.cuda.Event(enable_timing=True),
++                torch.cuda.Event(enable_timing=True),
++            )
++            for _ in range(timed_iters):
++                barrier()
++                start.record()
++                graph.replay()
++                end.record()
++                end.synchronize()
++                samples.append(start.elapsed_time(end) * 1000 / calls_per_sample)
++            # A bad clock sample on one rank must invalidate the candidate,
++            # even if another rank has a positive elapsed duration.
++            samples = [t if math.isfinite(t) and t > 0 else math.inf for t in samples]
++            times = torch.tensor(samples, dtype=torch.float64, device="cuda")
++            if collective:
++                dist.all_reduce(times, op=dist.ReduceOp.MAX, group=process_group)
++            measured_error = error(trial)
++            values = times.tolist()
++            if measured_error <= 0.02 and all(math.isfinite(t) for t in values):
++                score = statistics.median(values)
++            # Drop captured pointer ownership before releasing symmetric storage.
++            del graph
++        scores.append(score)
++        errors.append(measured_error)
++        trial.destroy()
++        barrier()
++        if cfg.rank == 0:
++            print(
++                f"[genphase-autotune] {score:.3f} us p50(max rank), rel_l2={measured_error:.5f}: {knobs}",
++                flush=True,
++            )
++    best = min(range(len(scores)), key=scores.__getitem__)
++    if not math.isfinite(scores[best]):
++        raise RuntimeError(
++            "no Blackwell GenPhase candidate passed correctness and admission"
++        )
++    winner = dict(candidates[best])
++    if cfg.rank == 0:
++        record_knobs(
++            winner, cfg, live_tokens=live_tokens, p50_us=scores[best], device=hardware
++        )
++        print(f"[genphase-autotune] winner {winner}", flush=True)
++    # Every rank may construct a cache-backed layer immediately after warmup.
++    barrier()
++    return winner
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/block_scaled.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/block_scaled.py
+index f2b2caeceb4..59855f02463 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/block_scaled.py
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/block_scaled.py
+@@ -449,6 +449,7 @@ def _configure_dsl() -> None:
+         )
+ 
+     def __init__(self, config: BlockScaledMoeConfig) -> None:
++        """Allocate staging, output and kernel storage collectively before capture."""
+         comm.ensure_not_capturing("block-scaled mega workspace allocation")
+         self._require_device()
+         self._configure_dsl()
+@@ -505,6 +506,21 @@ def __init__(self, config: BlockScaledMoeConfig) -> None:
+                 (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
+             )
+ 
++        self._allocate_kernel_workspace(kernel)
++
++        self._compiled: Optional[Any] = None
++        self._launch_key: Optional[tuple] = None
++        self._launch_kwargs: Optional[dict] = None
++        self._launch_weights: Optional[
++            Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
++        ] = None
++        self._staged_tokens: Optional[int] = None
++        self._destroyed = False
++
++    def _allocate_kernel_workspace(self, kernel) -> None:
++        """Allocate kernel-owned storage; staging and output pointers stay stable."""
++        cfg = self.config
++        tokens = cfg.padded_tokens_per_rank
+         workspace = kernel._device_workspace
+         local_bytes = int(workspace.total_bytes("local"))
+         shared_bytes = int(workspace.total_bytes("shared"))
+@@ -547,15 +563,6 @@ def __init__(self, config: BlockScaledMoeConfig) -> None:
+         self._symmetric_base = base
+         self._peer_offsets = peer_offsets
+ 
+-        self._compiled: Optional[Any] = None
+-        self._launch_key: Optional[tuple] = None
+-        self._launch_kwargs: Optional[dict] = None
+-        self._launch_weights: Optional[
+-            Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
+-        ] = None
+-        self._staged_tokens: Optional[int] = None
+-        self._destroyed = False
+-
+     @classmethod
+     def _build_kernel(cls, cfg: BlockScaledMoeConfig):
+         import cutlass
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/genphase.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/genphase.py
+index c620265757a..77e698fc881 100644
+--- a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/genphase.py
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/genphase.py
+@@ -24,6 +24,7 @@
+ )
+ 
+ from .kernel_helpers import (
++    concatenate_block_scaled_weights as concatenate_genphase_weights,
+     preprocess_block_scaled_weights as preprocess_genphase_weights,
+     preprocess_prequantized_block_scaled_weights as preprocess_genphase_prequantized_weights,
+     quantize_mxfp8_block32 as quantize_genphase_mxfp8,
+@@ -108,6 +109,33 @@ def __init__(self, config: Sm100GenphaseMoeConfig) -> None:
+             raise TypeError("Blackwell GenPhase requires Sm100GenphaseMoeConfig.")
+         super().__init__(config)
+ 
++    def retune(self, knobs) -> None:
++        """Collectively replace kernel storage before capture, preserving I/O views.
++
++        Only performance knobs may change. The backend calls this once after
++        its explicit warmup sweep, on an unpooled workspace.
++        """
++        from . import comm
++        from .tuning import is_valid_sm100_genphase_knobs
++
++        comm.ensure_not_capturing("Blackwell GenPhase retune")
++        if self._destroyed:
++            raise RuntimeError("cannot retune a destroyed workspace")
++        if not is_valid_sm100_genphase_knobs(knobs, self.config):
++            raise ValueError("invalid Blackwell GenPhase tuning knobs")
++        config = dataclasses.replace(self.config, **knobs)
++        if config == self.config:
++            return
++        kernel = self._build_kernel(config)
++        torch.cuda.synchronize()
++        self._compiled = self._launch_key = self._launch_kwargs = None
++        self._launch_weights = None
++        self._pre_reduced_activation = self._pre_reduced_activation_sf = None
++        comm.free_sym_tensor(self.shared_workspace)
++        self.shared_workspace = self.local_workspace = None
++        self.config, self.kernel = config, kernel
++        self._allocate_kernel_workspace(kernel)
++
+ 
+ def validate_genphase_weights(transformed, config, device: torch.device) -> None:
+     """Validate external GenPhase weights without allocating a workspace.
+@@ -126,6 +154,7 @@ def validate_genphase_weights(transformed, config, device: torch.device) -> None
+ 
+ 
+ __all__ = [
++    "concatenate_genphase_weights",
+     "Sm100GenphaseMoeConfig",
+     "Sm100GenphaseSymmBuffer",
+     "preprocess_genphase_weights",
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/knob_cache.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/knob_cache.py
+new file mode 100644
+index 00000000000..3c9d3834800
+--- /dev/null
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/knob_cache.py
+@@ -0,0 +1,229 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Exact-workload cache for Blackwell GenPhase performance knobs.
++
++Entries share the MoE EP cache file but use a distinct device namespace.
++Capacity, live-token bucket, operation attributes, hardware and compiler must
++match. Missing or invalid entries fall back to the geometry estimate.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import json
++import math
++import os
++import tempfile
++import warnings
++from pathlib import Path
++from typing import Any
++
++from .tuning import KNOB_KEYS, is_valid_sm100_genphase_knobs, sm100_genphase_candidates
++
++_REVISION = "sm100-genphase-3c1d1c2f-auto-v3"
++
++
++def knob_cache_path() -> str | None:
++    """Resolve the shared knob-cache path, or None when disabled by environment."""
++    value = os.environ.get("FLASHINFER_MOE_EP_KNOB_CACHE", "")
++    if value.strip().lower() in ("0", "off", "none", "disable", "disabled"):
++        return None
++    return os.path.expanduser(value or "~/.cache/flashinfer/moe_ep_knob_cache.json")
++
++
++def device_identity() -> str:
++    """Identify the current GPU and compiler stack for exact cache matching.
++
++    Native target aliases normalize before DSL initialization so a fresh
++    process can reuse prior tuning. Compiler options remain part of the key.
++    """
++    import torch
++    from flashinfer.jit.cute_dsl_core import _get_cute_dsl_version
++
++    props = torch.cuda.get_device_properties(torch.cuda.current_device())
++    native_arch = f"sm_{props.major}{props.minor}a"
++    compile_arch = os.environ.get("CUTE_DSL_ARCH", native_arch)
++    if compile_arch == native_arch.removesuffix("a"):
++        compile_arch = native_arch
++    return json.dumps(
++        dict(
++            name=props.name,
++            cc=[props.major, props.minor],
++            sms=props.multi_processor_count,
++            cuda=torch.version.cuda,
++            torch=torch.__version__,
++            dsl_stack=_get_cute_dsl_version(),
++            compile_arch=compile_arch,
++            compiler_options=os.environ.get("CUTE_DSL_COMPILER_OPT", ""),
++            instrumentation=os.environ.get("DKG_IKET_INSTRUMENTATION_METHOD", ""),
++        ),
++        sort_keys=True,
++    )
++
++
++def _key(config, device: str | None = None) -> dict:
++    """Key operation attributes and capacity independently of rank and knobs."""
++    spec = dataclasses.asdict(config)
++    for name in ("rank", *KNOB_KEYS):
++        spec.pop(name)
++    return dict(
++        backend_revision=_REVISION,
++        device="sm100-genphase:" + (device_identity() if device is None else device),
++        problem=json.loads(json.dumps(spec)),
++    )
++
++
++def _read(path: str) -> dict:
++    """Read a supported cache document, treating a missing file as an empty cache."""
++    try:
++        data = json.loads(Path(path).read_text())
++    except FileNotFoundError:
++        return dict(version=1, entries=[])
++    if (
++        not isinstance(data, dict)
++        or data.get("version") != 1
++        or not isinstance(data.get("entries"), list)
++    ):
++        raise ValueError("unsupported MoE EP knob-cache format")
++    return data
++
++
++def _entries(config, device=None) -> list[dict]:
++    """Find exact workload entries; warn and ignore unreadable cache files."""
++    path = knob_cache_path()
++    if path is None:
++        return []
++    try:
++        data = _read(path)
++    except (ValueError, OSError) as exc:
++        warnings.warn(
++            f"Ignoring Blackwell GenPhase knob cache: {exc}",
++            RuntimeWarning,
++            stacklevel=3,
++        )
++        return []
++    key = _key(config, device)
++    return [
++        e
++        for e in data["entries"]
++        if isinstance(e, dict) and all(e.get(k) == v for k, v in key.items())
++    ]
++
++
++def _decode(entry, config):
++    """Restore knob tuples and reject malformed or inadmissible cached values."""
++    raw = entry.get("knobs")
++    if not isinstance(raw, dict) or set(raw) != set(KNOB_KEYS):
++        return None
++    knobs = {k: tuple(v) if isinstance(v, list) else v for k, v in raw.items()}
++    try:
++        return knobs if is_valid_sm100_genphase_knobs(knobs, config) else None
++    except (TypeError, ValueError):
++        return None
++
++
++def live_token_buckets(config, *, device=None) -> list[int]:
++    """List valid cached live-token counts for this capacity and device identity."""
++    return sorted(
++        {
++            e["live_tokens"]
++            for e in _entries(config, device)
++            if type(e.get("live_tokens")) is int
++            and 0 <= e["live_tokens"] <= config.max_tokens_per_rank
++            and _decode(e, config) is not None
++        }
++    )
++
++
++def resolve_knobs(
++    config,
++    *,
++    sm_count: int,
++    live_tokens=None,
++    constraints=None,
++    device=None,
++    use_cache=True,
++) -> tuple[dict[str, Any], str]:
++    """Return exact cached knobs or a heuristic, together with their source.
++
++    Cache hits must match the live-token count and explicit constraints.
++    ``use_cache=False`` starts from the heuristic for a fresh tuning sweep.
++    """
++    candidates = sm100_genphase_candidates(
++        config, sm_count=sm_count, live_tokens=live_tokens, constraints=constraints
++    )
++    tokens = config.max_tokens_per_rank if live_tokens is None else live_tokens
++    if use_cache:
++        for entry in reversed(_entries(config, device)):
++            if (
++                type(entry.get("live_tokens")) is not int
++                or entry["live_tokens"] != tokens
++            ):
++                continue
++            knobs = _decode(entry, config)
++            if knobs is not None and all(
++                knobs[k] == v for k, v in (constraints or {}).items()
++            ):
++                return knobs, "cache"
++    return candidates[0], "heuristic"
++
++
++def record_knobs(
++    knobs, config, *, live_tokens: int, p50_us: float, device=None
++) -> bool:
++    """Atomically preserve unrelated entries; cache I/O failure is nonfatal."""
++    if set(knobs) != set(KNOB_KEYS) or not is_valid_sm100_genphase_knobs(knobs, config):
++        raise ValueError("cannot cache invalid Blackwell GenPhase knobs")
++    if (
++        type(live_tokens) is not int
++        or not 0 <= live_tokens <= config.max_tokens_per_rank
++    ):
++        raise ValueError("live_tokens must be within workspace capacity")
++    if not math.isfinite(p50_us) or p50_us <= 0:
++        raise ValueError("p50_us must be finite and positive")
++    path = knob_cache_path()
++    if path is None:
++        return False
++    entry = dict(
++        **_key(config, device),
++        live_tokens=live_tokens,
++        knobs=knobs,
++        p50_us=p50_us,
++        source="cuda-graph-max-rank-sampled-oracle",
++    )
++    identity = ("backend_revision", "device", "problem", "live_tokens")
++    temporary = None
++    try:
++        import fcntl
++
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        with open(path + ".lock", "a") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX)
++            data = _read(path)
++            data["entries"] = [
++                e
++                for e in data["entries"]
++                if not isinstance(e, dict)
++                or not all(e.get(k) == entry[k] for k in identity)
++            ]
++            data["entries"].append(entry)
++            with tempfile.NamedTemporaryFile(
++                mode="w", dir=Path(path).parent, prefix=".genphase-knobs-", delete=False
++            ) as stream:
++                temporary = stream.name
++                json.dump(data, stream, indent=2, allow_nan=False)
++                stream.flush()
++                os.fsync(stream.fileno())
++            os.replace(temporary, path)
++            temporary = None
++        return True
++    except (ValueError, OSError) as exc:
++        warnings.warn(
++            f"Could not persist Blackwell GenPhase knobs: {exc}",
++            RuntimeWarning,
++            stacklevel=2,
++        )
++        return False
++    finally:
++        if temporary is not None:
++            Path(temporary).unlink(missing_ok=True)
+diff --git a/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/tuning.py b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/tuning.py
+new file mode 100644
+index 00000000000..048b4ce4900
+--- /dev/null
++++ b/flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/shim/tuning.py
+@@ -0,0 +1,148 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: BSD-3-Clause
++"""Host-only candidate generation for Blackwell GenPhase configuration tuning.
++
++The estimate ranks the first candidate; it is not a measured performance
++guarantee. Collective tuning must validate and time candidates on the actual
++workload before recording a winner. No routing tensors are inspected here.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++from typing import Any
++
++KNOB_KEYS = ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
++_GEOMETRIES = (
++    ((256, 128, 128), (4, 1)),
++    ((256, 64, 128), (4, 1)),
++    ((256, 64, 128), (2, 1)),
++)
++
++
++def _effective_sms(config: Any, sm_count: int) -> int:
++    """Validate the device SM count and apply the optional workspace SM limit."""
++    if type(sm_count) is not int or sm_count < 2:
++        raise ValueError("GenPhase tuning requires at least two SMs")
++    return min(sm_count, config.max_sm_count or sm_count)
++
++
++def _live_tokens(config: Any, live_tokens: int | None) -> int:
++    """Validate the host workload count, defaulting to workspace capacity."""
++    count = config.max_tokens_per_rank if live_tokens is None else live_tokens
++    if type(count) is not int or not 0 <= count <= config.max_tokens_per_rank:
++        raise ValueError("live_tokens must be an integer between zero and capacity")
++    return count
++
++
++def is_valid_sm100_genphase_knobs(knobs: dict[str, Any], config: Any) -> bool:
++    """Validate the tuning dialect without allocating or compiling a kernel."""
++    unknown = set(knobs) - set(KNOB_KEYS)
++    if unknown:
++        raise ValueError(f"unknown Blackwell GenPhase knob keys: {sorted(unknown)}")
++    if "schedule_policy" in knobs:
++        policy = knobs["schedule_policy"]
++        if (
++            not isinstance(policy, tuple)
++            or len(policy) != 2
++            or policy[0] != "grouped"
++            or (
++                policy[1] is not None and (type(policy[1]) is not int or policy[1] <= 0)
++            )
++        ):
++            return False
++    try:
++        dataclasses.replace(config, **knobs)
++    except (TypeError, ValueError):
++        return False
++    return True
++
++
++def default_sm100_genphase_knobs(
++    config: Any, *, sm_count: int, live_tokens: int | None = None
++) -> dict[str, Any]:
++    """Estimate a starting tile/cluster/hint from geometry and host token count.
++
++    Sparse expert batches favor N64; dense batches amortize N128's wider
++    token tile. CGA2 supplies more independent workers when the estimated
++    FC1 work cannot fill one CGA4 wave. These estimates assume spread routing;
++    skew and masked routes can change the best choice and should be tuned.
++    """
++    sms = _effective_sms(config, sm_count)
++    tokens = _live_tokens(config, live_tokens)
++    if tokens == 0:
++        n, cluster = (128, 4) if sms >= 4 else (64, 2)
++        hint = None
++    else:
++        expert_rows = (
++            tokens * config.world_size * config.num_topk / config.num_total_experts
++        )
++        n = 64 if expert_rows < 64 or sms < 4 else 128
++        active_experts = min(
++            config.num_total_experts // config.world_size, tokens * config.num_topk
++        )
++        # A four-CTA cluster covers 512 FC1 output columns with two-CTA MMA.
++        cga4_tiles = active_experts * ((2 * config.intermediate + 511) // 512)
++        cluster = 2 if n == 64 and (sms < 4 or cga4_tiles < sms // 4) else 4
++        hint = 4 * (sms // cluster)
++    return {
++        "mma_tiler_mnk": (256, n, 128),
++        "cluster_shape_mn": (cluster, 1),
++        "schedule_policy": ("grouped", hint),
++    }
++
++
++def sm100_genphase_candidates(
++    config: Any,
++    *,
++    sm_count: int,
++    live_tokens: int | None = None,
++    constraints: dict[str, Any] | None = None,
++) -> list[dict[str, Any]]:
++    """Enumerate all three admitted geometries and original/two/four/eight-wave hints.
++
++    The estimate is first; the original N128/CGA4 configuration
++    remains in the candidate set. Explicit caller constraints are respected;
++    they can introduce a hint outside the standard grid. Numerical operation
++    attributes are never tuning axes.
++    """
++    sms = _effective_sms(config, sm_count)
++    preferred = default_sm100_genphase_knobs(
++        config, sm_count=sms, live_tokens=live_tokens
++    )
++    constraints = {} if constraints is None else dict(constraints)
++    unknown = set(constraints) - set(KNOB_KEYS)
++    if unknown:
++        raise ValueError(f"unknown Blackwell GenPhase knob keys: {sorted(unknown)}")
++    proposed = [preferred]
++    for tile, cluster in _GEOMETRIES:
++        if sms < cluster[0]:
++            continue
++        for hint in (
++            4 * (sms // cluster[0]),
++            None,
++            2 * (sms // cluster[0]),
++            8 * (sms // cluster[0]),
++        ):
++            proposed.append(
++                dict(
++                    mma_tiler_mnk=tile,
++                    cluster_shape_mn=cluster,
++                    schedule_policy=("grouped", hint),
++                )
++            )
++    candidates = []
++    for knobs in proposed:
++        # Filter geometry constraints; overlaying one dimension can silently
++        # turn an admitted pair into an invalid N128/CGA2 pair.
++        if any(knobs[k] != v for k, v in constraints.items() if k != "schedule_policy"):
++            continue
++        if "schedule_policy" in constraints:
++            knobs = {**knobs, "schedule_policy": constraints["schedule_policy"]}
++        if knobs not in candidates and is_valid_sm100_genphase_knobs(knobs, config):
++            candidates.append(knobs)
++    if not candidates:
++        raise ValueError(
++            "no admitted Blackwell GenPhase candidates satisfy the constraints"
++        )
++    return candidates
+diff --git a/flashinfer/moe_ep/tune.py b/flashinfer/moe_ep/tune.py
+index 5780a24feb4..17021fd19da 100644
+--- a/flashinfer/moe_ep/tune.py
++++ b/flashinfer/moe_ep/tune.py
+@@ -47,6 +47,7 @@
+ 
+ 
+ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
++    """Parse offline workload, pipeline and sweep options without starting CUDA."""
+     parser = argparse.ArgumentParser(
+         prog="python -m flashinfer.moe_ep.tune",
+         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
+@@ -126,7 +127,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+         "--kernel-variant",
+         choices=("inference", "genphase"),
+         default="inference",
+-        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
++        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
+     )
+     parser.add_argument(
+         "--gate-up-clamp",
+@@ -307,6 +308,11 @@ def _resolve_arch(arch: str) -> str:
+ 
+ 
+ def main(argv: Optional[List[str]] = None) -> int:
++    """Validate CLI options and run the architecture-specific offline tuner.
++
++    Invalid argument combinations return 2 before importing a backend tuner;
++    valid requests return the selected tuner's exit code.
++    """
+     args = _parse_args(argv)
+     error = _argument_error(args)
+     if error is not None:
+@@ -380,8 +386,19 @@ def main(argv: Optional[List[str]] = None) -> int:
+         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
+         return 2
+ 
+-    if args.kernel_variant != "inference" and family != "sm107":
+-        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
++    if (
++        args.kernel_variant == "genphase"
++        and family != "sm107"
++        and not (
++            family == "sm100"
++            and args.dtype == "mxfp8_e4m3"
++            and not args.allow_nondeterministic
++        )
++    ):
++        print(
++            "GenPhase requires SM107 or SM100 MXFP8 E4M3 with deterministic reduction",
++            file=sys.stderr,
++        )
+         return 2
+ 
+     activation_requested = (
+diff --git a/tests/moe_ep/test_mega_workspace_knobs.py b/tests/moe_ep/test_mega_workspace_knobs.py
+index 8ba29bcd280..635fe5a2e74 100644
+--- a/tests/moe_ep/test_mega_workspace_knobs.py
++++ b/tests/moe_ep/test_mega_workspace_knobs.py
+@@ -2,11 +2,21 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ from unittest import mock
+ 
+ import pytest
+ import torch
+ 
++from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
++    Sm100GenphaseMoeConfig,
++)
++from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
++    default_sm100_genphase_knobs,
++    is_valid_sm100_genphase_knobs,
++    sm100_genphase_candidates,
++)
++
+ from .test_mega_workspace_api import _inputs
+ 
+ 
+@@ -105,6 +115,7 @@ def test_blackwell_mxfp8_legacy_config_and_dispatch(monkeypatch, dist_not_initia
+ def test_blackwell_genphase_backend_selects_own_workspace(
+     tile, cluster, monkeypatch, dist_not_initialized
+ ):
++    """GenPhase allocation and pool identity stay separate from legacy inference."""
+     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+ 
+     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+@@ -123,7 +134,7 @@ def test_blackwell_genphase_backend_selects_own_workspace(
+     monkeypatch.setattr(pkg, "Sm100GenphaseSymmBuffer", allocator)
+     assert kernel._allocate_workspace(fleet) is mock.sentinel.workspace
+     config = allocator.call_args.args[0]
+-    assert config.resolved_mma_tiler_mnk == (tile or (256, 128, 128))
++    assert config.resolved_mma_tiler_mnk == (tile or (256, 64, 128))
+     assert config.cluster_shape_mn == (cluster or (4, 1))
+     assert config.fc2_use_bulk and not config.reduce_topk_in_kernel
+     assert kernel._workspace_pool_key(fleet)[-1] == config
+@@ -144,17 +155,103 @@ def test_blackwell_genphase_backend_selects_own_workspace(
+     assert kernel._workspace_pool_key(fleet) != other._workspace_pool_key(fleet)
+ 
+ 
++@pytest.mark.parametrize(
++    "tile,cluster,hint",
++    [
++        (None, None, 148),
++        ((256, 128, 128), (4, 1), 148),
++        ((256, 64, 128), (4, 1), 148),
++        ((256, 64, 128), (2, 1), 296),
++    ],
++)
++def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch):
++    """Explicit geometry constrains schedule estimation and workspace pooling."""
++    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
++    from flashinfer.moe_ep import (
++        BootstrapConfig,
++        FleetParams,
++        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
++    )
++    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
++
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda _: mock.Mock(major=10, minor=3, multi_processor_count=148),
++    )
++
++    def make(**overrides):
++        """Bind a GenPhase backend with selected geometry and optional overrides."""
++        params = dict(
++            intermediate_size=1024,
++            top_k=8,
++            kernel_variant="genphase",
++            mma_tiler_mnk=tile,
++            cluster_shape_mn=cluster,
++        )
++        params.update(overrides)
++        backend = create_mega_kernel(
++            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(**params)
++        )
++        backend.bind_ep_bootstrap(
++            BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
++        )
++        return backend
++
++    fleet = FleetParams(
++        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
++    )
++    kernel = make()
++    resolved = kernel._genphase_config(fleet)
++    assert resolved.schedule_policy == ("grouped", hint)
++    explicit = make(schedule_policy=("grouped", hint))
++    original = make(schedule_policy=("grouped", None))
++    assert kernel._workspace_pool_key(fleet) == explicit._workspace_pool_key(fleet)
++    assert kernel._workspace_pool_key(fleet) != original._workspace_pool_key(fleet)
++
++    assert original._genphase_config(fleet).schedule_policy == ("grouped", None)
++    # The rule depends on geometry and hardware, not one benchmark shape.
++    for kwargs in (
++        dict(top_k=6),
++        dict(intermediate_size=2048),
++        dict(gate_up_clamp=10.0),
++    ):
++        assert make(**kwargs)._genphase_config(fleet).schedule_policy == (
++            "grouped",
++            hint,
++        )
++
++
+ @pytest.mark.parametrize(
+     "overrides",
+     [
+         {"kernel_variant": "unknown"},
+         {"kernel_variant": "genphase", "capacity": 1025},
+         {"kernel_variant": "genphase", "kind": "mxfp8_e5m2"},
+-        {"kernel_variant": "genphase", "knobs": "auto"},
+-        {"kernel_variant": "genphase", "knobs": {}},
++        {"kernel_variant": "genphase", "knobs": "bad"},
++        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 0)},
++        {"kernel_variant": "genphase", "schedule_policy": ("grouped", -1)},
++        {"kernel_variant": "genphase", "schedule_policy": ("grouped", True)},
++        {"kernel_variant": "genphase", "schedule_policy": ("grouped", 1.5)},
++        {"kernel_variant": "genphase", "schedule_policy": ("phase_interleave", None)},
++        {"kernel_variant": "genphase", "schedule_policy": ("grouped",)},
++        {"kernel_variant": "genphase", "schedule_policy": ["grouped", 148]},
++        {"schedule_policy": ("grouped", None)},
++        {"kernel_variant": "genphase", "knobs": {"group_hint": 4}},
++        {
++            "kernel_variant": "genphase",
++            "mma_tiler_mnk": (256, 64, 128),
++            "knobs": {"mma_tiler_mnk": (256, 128, 128)},
++        },
+         {"kernel_variant": "genphase", "enable_in_kernel_fc2_reduce": True},
+         {"kernel_variant": "genphase", "hidden": 192},
+-        {"kernel_variant": "genphase", "cluster_shape_mn": (2, 1)},
++        {
++            "kernel_variant": "genphase",
++            "mma_tiler_mnk": (256, 128, 128),
++            "cluster_shape_mn": (2, 1),
++        },
+         {"mma_tiler_mnk": (256, 64, 128)},
+     ],
+ )
+@@ -503,3 +600,479 @@ def test_blackwell_genphase_admission(override):
+     )
+     with pytest.raises(ValueError):
+         pkg.Sm100GenphaseMoeConfig(**(values | override))
++
++
++def _genphase_tuning_config(**overrides):
++    """Build a valid EP2 tuning workload with per-test field overrides."""
++    values = dict(
++        num_total_experts=256,
++        max_tokens_per_rank=1024,
++        num_topk=8,
++        hidden=4096,
++        intermediate=1024,
++        rank=0,
++        world_size=2,
++    )
++    return Sm100GenphaseMoeConfig(**(values | overrides))
++
++
++@pytest.mark.parametrize(
++    "tokens,n,cluster,hint",
++    [
++        (0, 128, 4, None),
++        (1, 64, 2, 296),
++        (4, 64, 4, 148),
++        (17, 64, 4, 148),
++        (65, 64, 4, 148),
++        (1024, 128, 4, 148),
++    ],
++)
++def test_blackwell_genphase_tuning_estimate_spans_latency_regimes(
++    tokens, n, cluster, hint
++):
++    """Host estimates cover empty, sparse and dense workloads at fixed capacity."""
++    cfg = _genphase_tuning_config()
++    knobs = default_sm100_genphase_knobs(cfg, sm_count=148, live_tokens=tokens)
++    assert knobs == dict(
++        mma_tiler_mnk=(256, n, 128),
++        cluster_shape_mn=(cluster, 1),
++        schedule_policy=("grouped", hint),
++    )
++    assert is_valid_sm100_genphase_knobs(knobs, cfg)
++
++
++@pytest.mark.parametrize("sms", [132, 148, 152])
++@pytest.mark.parametrize("world", [1, 2, 4])
++@pytest.mark.parametrize(
++    "hidden,intermediate,experts,topk", [(4096, 1024, 256, 8), (7168, 3072, 384, 6)]
++)
++def test_blackwell_genphase_tuning_candidate_domain_and_original_fallback(
++    sms, world, hidden, intermediate, experts, topk
++):
++    """All ranks enumerate twelve valid candidates including the original config."""
++    cfg = _genphase_tuning_config(
++        world_size=world,
++        hidden=hidden,
++        intermediate=intermediate,
++        num_total_experts=experts,
++        num_topk=topk,
++    )
++    candidates = sm100_genphase_candidates(cfg, sm_count=sms, live_tokens=16)
++    assert len(candidates) == 12
++    assert len({repr(x) for x in candidates}) == 12
++    assert all(is_valid_sm100_genphase_knobs(x, cfg) for x in candidates)
++    assert (
++        dict(
++            mma_tiler_mnk=(256, 128, 128),
++            cluster_shape_mn=(4, 1),
++            schedule_policy=("grouped", None),
++        )
++        in candidates
++    )
++    assert candidates[0] == default_sm100_genphase_knobs(
++        cfg, sm_count=sms, live_tokens=16
++    )
++    assert candidates == sm100_genphase_candidates(
++        dataclasses.replace(cfg, rank=world - 1), sm_count=sms, live_tokens=16
++    )
++
++
++def test_blackwell_genphase_tuning_constraints_and_resource_budget():
++    """Candidate filtering respects explicit geometry, hints and limited SMs."""
++    cfg = _genphase_tuning_config()
++    rows = sm100_genphase_candidates(
++        cfg,
++        sm_count=148,
++        constraints=dict(
++            mma_tiler_mnk=(256, 64, 128), schedule_policy=("grouped", 333)
++        ),
++    )
++    assert len(rows) == 2
++    assert all(
++        x["schedule_policy"] == ("grouped", 333)
++        and x["mma_tiler_mnk"] == (256, 64, 128)
++        for x in rows
++    )
++    limited = dataclasses.replace(
++        cfg, max_sm_count=2, mma_tiler_mnk=(256, 64, 128), cluster_shape_mn=(2, 1)
++    )
++    rows = sm100_genphase_candidates(limited, sm_count=148, live_tokens=0)
++    assert len(rows) == 4 and all(x["cluster_shape_mn"] == (2, 1) for x in rows)
++    for constraints in [
++        dict(mma_tiler_mnk=(256, 128, 128), cluster_shape_mn=(2, 1)),
++        dict(schedule_policy=("grouped", 0)),
++        dict(schedule_policy=("grouped", True)),
++        dict(apply_topk_at_fc1=False),
++    ]:
++        with pytest.raises(ValueError):
++            sm100_genphase_candidates(cfg, sm_count=148, constraints=constraints)
++
++
++@pytest.mark.parametrize("tokens", [-1, 1025, 1.5, True])
++def test_blackwell_genphase_tuning_invalid_live_count(tokens):
++    """Reject noninteger and out-of-capacity workload counts before tuning."""
++    with pytest.raises(ValueError):
++        sm100_genphase_candidates(
++            _genphase_tuning_config(), sm_count=148, live_tokens=tokens
++        )
++
++
++@pytest.mark.parametrize("sms", [0, 1, 1.5, True])
++def test_blackwell_genphase_tuning_invalid_hardware_count(sms):
++    """Reject noninteger SM counts and devices too small for an admitted cluster."""
++    with pytest.raises(ValueError):
++        sm100_genphase_candidates(_genphase_tuning_config(), sm_count=sms)
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++@pytest.mark.parametrize("malformed", ["partial", "empty", "extra"])
++def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials(
++    monkeypatch, rank, malformed
++):
++    """Reject malformed shared candidates on every rank before trial collectives."""
++    from flashinfer.moe_ep.core import tuning as core_tuning
++    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
++        autotune,
++        correctness,
++        knob_cache,
++    )
++
++    cfg = _genphase_tuning_config(rank=rank)
++    valid = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[0]
++    invalid = {
++        "partial": {"schedule_policy": ("grouped", 296)},
++        "empty": {},
++        "extra": {**valid, "apply_topk_at_fc1": False},
++    }[malformed]
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda _: mock.Mock(multi_processor_count=148),
++    )
++    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
++    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
++    monkeypatch.setattr(torch.distributed, "get_rank", lambda _: rank)
++
++    def gather(proposals, proposal, *, group):
++        proposals[:] = [proposal, proposal]
++
++    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
++    monkeypatch.setattr(core_tuning, "tuning_live_tokens", lambda *args: 16)
++    monkeypatch.setattr(knob_cache, "device_identity", lambda: "B200")
++    reference = mock.Mock(side_effect=AssertionError("entered candidate trials"))
++    record = mock.Mock()
++    monkeypatch.setattr(correctness, "sampled_reference", reference)
++    monkeypatch.setattr(knob_cache, "record_knobs", record)
++    with pytest.raises(ValueError, match="candidates must set every GenPhase knob"):
++        autotune.autotune_sm100_genphase_mega_moe(
++            None,
++            None,
++            None,
++            mock.Mock(config=cfg),
++            num_tokens=16,
++            candidates=[valid, invalid],
++        )
++    reference.assert_not_called()
++    record.assert_not_called()
++
++
++def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_record(
++    tmp_path, monkeypatch
++):
++    """Cache reuse requires exact profiles and preserves unrelated or invalid data."""
++    import json
++    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
++        knob_cache as cache,
++    )
++
++    path = tmp_path / "knobs.json"
++    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
++    cfg = _genphase_tuning_config()
++    winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
++    path.write_text(
++        json.dumps(dict(version=1, entries=[dict(device="legacy", knobs={})]))
++    )
++    assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200, device="B300")
++    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300") == (
++        winner,
++        "cache",
++    )
++    assert cache.live_token_buckets(cfg, device="B300") == [16]
++    assert (
++        cache.resolve_knobs(
++            dataclasses.replace(cfg, rank=1),
++            sm_count=148,
++            live_tokens=16,
++            device="B300",
++        )[1]
++        == "cache"
++    )
++    for changes in [
++        dict(max_tokens_per_rank=512),
++        dict(world_size=4),
++        dict(gate_up_clamp=10),
++        dict(apply_topk_at_fc1=False),
++    ]:
++        assert (
++            cache.resolve_knobs(
++                dataclasses.replace(cfg, **changes),
++                sm_count=148,
++                live_tokens=16,
++                device="B300",
++            )[1]
++            == "heuristic"
++        )
++    assert (
++        cache.resolve_knobs(cfg, sm_count=148, live_tokens=17, device="B300")[1]
++        == "heuristic"
++    )
++    assert (
++        cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B200")[1]
++        == "heuristic"
++    )
++    assert cache.resolve_knobs(
++        cfg,
++        sm_count=148,
++        live_tokens=16,
++        device="B300",
++        constraints=dict(schedule_policy=("grouped", 333)),
++    )[0]["schedule_policy"] == ("grouped", 333)
++    data = json.loads(path.read_text())
++    assert data["entries"][0]["device"] == "legacy"
++    current_revision = data["entries"][-1]["backend_revision"]
++    for revision in (
++        "sm100-genphase-c8c67ae7-auto-v1",
++        "sm100-genphase-6b9a6e2e-auto-v2",
++    ):
++        data["entries"][-1]["backend_revision"] = revision
++        path.write_text(json.dumps(data))
++        assert (
++            cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]
++            == "heuristic"
++        )
++        assert cache.live_token_buckets(cfg, device="B300") == []
++    data["entries"][-1]["backend_revision"] = current_revision
++    data["entries"][-1]["knobs"]["apply_topk_at_fc1"] = False
++    path.write_text(json.dumps(data))
++    assert (
++        cache.resolve_knobs(cfg, sm_count=148, live_tokens=16, device="B300")[1]
++        == "heuristic"
++    )
++    assert cache.live_token_buckets(cfg, device="B300") == []
++    path.write_text("invalid json")
++    with pytest.warns(RuntimeWarning):
++        assert not cache.record_knobs(
++            winner, cfg, live_tokens=16, p50_us=200, device="B300"
++        )
++    assert path.read_text() == "invalid json"
++    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
++    assert not cache.record_knobs(
++        winner, cfg, live_tokens=16, p50_us=200, device="B300"
++    )
++
++
++def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
++    monkeypatch,
++):
++    """Auto tuning retunes an unpooled workspace once and blocks early capture."""
++    from unittest import mock
++    import torch
++    from flashinfer.moe_ep import (
++        BootstrapConfig,
++        FleetParams,
++        MoEEpConfigError,
++        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
++    )
++    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
++    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
++
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
++    with pytest.warns(UserWarning, match="COLLECTIVE"):
++        backend = create_mega_kernel(
++            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
++                1024, 8, kernel_variant="genphase", knobs="auto"
++            )
++        )
++    backend.bind_ep_bootstrap(
++        BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
++    )
++    fleet = FleetParams(
++        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
++    )
++    assert backend._workspace_pool_request(fleet) is None
++    assert backend._workspace_pool_key(fleet) is None
++    with pytest.raises(MoEEpConfigError, match="warmup"):
++        backend.validate_capture_ready(None, None)
++    winner = sm100_genphase_candidates(_genphase_tuning_config(), sm_count=148)[-1]
++    tune = mock.Mock(return_value=winner)
++    launch = mock.Mock(return_value=mock.sentinel.output)
++    monkeypatch.setattr(pkg, "autotune_sm100_genphase_mega_moe", tune)
++    monkeypatch.setattr(pkg, "sm100_genphase_mega_moe", launch)
++    workspace = mock.Mock()
++    workspace.staged_tokens.return_value = 16
++    for _ in range(2):
++        assert backend.compute(workspace, (1, 2), output=None) is mock.sentinel.output
++    tune.assert_called_once()
++    workspace.retune.assert_called_once_with(winner)
++    assert backend.get_tuned_knobs() == winner
++    backend.validate_capture_ready(workspace, (1, 2))
++
++
++def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatch):
++    """The offline CLI dispatches GenPhase and rejects unsupported reduction modes."""
++    from unittest import mock
++    from flashinfer.moe_ep import tune
++
++    module = mock.Mock()
++    module.run_tuning.return_value = 0
++    loader = mock.Mock(return_value=module)
++    monkeypatch.setattr(tune.importlib, "import_module", loader)
++    args = [
++        "--arch",
++        "sm100",
++        "--dtype",
++        "mxfp8_e4m3",
++        "--kernel-variant",
++        "genphase",
++        "--hidden",
++        "4096",
++        "--intermediate",
++        "1024",
++        "--num-experts",
++        "256",
++        "--topk",
++        "8",
++        "--max-tokens",
++        "1024",
++        "--live-tokens",
++        "65",
++    ]
++    assert tune.main(args) == 0
++    assert "sm100.mxfp8_mxfp8_bf16_cutedsl.tuner" in loader.call_args.args[0]
++    assert module.run_tuning.call_args.args[0].kernel_variant == "genphase"
++    loader.reset_mock()
++    assert tune.main(args + ["--allow-nondeterministic"]) == 2
++    loader.assert_not_called()
++
++
++def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
++    monkeypatch,
++):
++    """Memoized knob resolution never crosses device identities."""
++    from types import SimpleNamespace
++    from unittest import mock
++    import torch
++    from flashinfer.moe_ep import (
++        BootstrapConfig,
++        FleetParams,
++        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
++    )
++    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
++    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
++
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda device: SimpleNamespace(
++            major=10, minor=3, name="B300", multi_processor_count=148
++        ),
++    )
++    selected = sm100_genphase_candidates(_genphase_tuning_config(), sm_count=148)[0]
++    resolve = mock.Mock(return_value=(selected, "heuristic"))
++    monkeypatch.setattr(pkg, "resolve_genphase_knobs", resolve)
++    backend = create_mega_kernel(
++        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(1024, 8, kernel_variant="genphase")
++    )
++    backend.bind_ep_bootstrap(
++        BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
++    )
++    fleet = FleetParams(
++        num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
++    )
++    first = backend._genphase_config(fleet)
++    assert backend._genphase_config(fleet) is first
++    resolve.assert_called_once()
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
++    backend._genphase_config(fleet)
++    assert resolve.call_count == 2
++
++
++def test_blackwell_genphase_tuning_device_identity_separates_compiler_stacks_and_options(
++    monkeypatch,
++):
++    """Compiler library versions and options isolate tuning cache identities."""
++    from types import SimpleNamespace
++    import torch
++    from flashinfer.jit import cute_dsl_core
++    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import knob_cache
++
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda device: SimpleNamespace(
++            name="B300", major=10, minor=3, multi_processor_count=148
++        ),
++    )
++    monkeypatch.setattr(
++        cute_dsl_core, "_get_cute_dsl_version", lambda: "dsl==4.7.1;libs-cu13==4.7.1"
++    )
++    monkeypatch.delenv("CUTE_DSL_COMPILER_OPT", raising=False)
++    original = knob_cache.device_identity()
++    monkeypatch.setattr(
++        cute_dsl_core, "_get_cute_dsl_version", lambda: "dsl==4.7.1;libs-cu13==4.7.2"
++    )
++    updated = knob_cache.device_identity()
++    assert updated != original
++    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "iket")
++    assert knob_cache.device_identity() not in (original, updated)
++
++
++@pytest.mark.parametrize("minor", [0, 3])
++@pytest.mark.parametrize("initial_arch", ["unset", "bare", "native"])
++def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
++    tmp_path, monkeypatch, minor, initial_arch
++):
++    """Native target aliases reuse cached winners before DSL initialization."""
++    from types import SimpleNamespace
++    import json
++    import torch
++    from flashinfer.jit import cute_dsl_core
++    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
++        knob_cache as cache,
++    )
++
++    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
++    monkeypatch.setattr(
++        torch.cuda,
++        "get_device_properties",
++        lambda device: SimpleNamespace(
++            name="Blackwell", major=10, minor=minor, multi_processor_count=148
++        ),
++    )
++    monkeypatch.setattr(
++        cute_dsl_core, "_get_cute_dsl_version", lambda: "test-dsl-stack"
++    )
++    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
++    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "preserve-options")
++    native = f"sm_10{minor}a"
++    cfg = _genphase_tuning_config()
++    winner = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[-1]
++    # A previous workspace configured the native compiler target before tuning.
++    monkeypatch.setenv("CUTE_DSL_ARCH", native)
++    assert cache.record_knobs(winner, cfg, live_tokens=16, p50_us=200)
++    # A fresh caller resolves the cache before creating its first workspace.
++    if initial_arch == "unset":
++        monkeypatch.delenv("CUTE_DSL_ARCH")
++    elif initial_arch == "bare":
++        monkeypatch.setenv("CUTE_DSL_ARCH", native.removesuffix("a"))
++    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16) == (winner, "cache")
++    identity = json.loads(cache.device_identity())
++    assert identity["compile_arch"] == native
++    assert identity["compiler_options"] == "preserve-options"
++    monkeypatch.setenv("CUTE_DSL_COMPILER_OPT", "different-options")
++    assert cache.resolve_knobs(cfg, sm_count=148, live_tokens=16)[1] == "heuristic"
+diff --git a/tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py b/tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py
+index ab20a3c18cf..2c2dbb7860a 100644
+--- a/tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py
++++ b/tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py
+@@ -1187,3 +1187,198 @@ def test_mxfp8_cutedsl_mega_kernel_is_registered():
+         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+     )
+     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
++
++
++@pytest.mark.gpu_4
++@pytest.mark.arch_blackwell
++def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
++    """Real collective sweep, stable I/O, persisted selection and changing routes."""
++    import dataclasses
++    import tempfile
++    from pathlib import Path
++
++    import torch
++    import torch.distributed as dist
++
++    from flashinfer.moe_ep import (
++        BootstrapConfig,
++        FleetParams,
++        MegaConfig,
++        MoEEpLayer,
++        MoEEpTensors,
++        MoEWeightPack,
++        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
++    )
++    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
++
++    _require_cuda()
++    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
++    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
++        pytest.skip("requires SM100/103")
++    rank, world = _launcher_ranks()
++    if world not in (1, 2, 4):
++        pytest.skip("EP1/2/4")
++    if world == 1:
++        monkeypatch.setenv("MEGA_NO_DIST", "1")
++    # Multi-rank CI runs on one node; every process reads the same cache file.
++    path = (
++        Path(tempfile.gettempdir())
++        / f"genphase-auto-{os.environ.get('MASTER_PORT', os.getpid())}-{world}.json"
++    )
++    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
++    capacity, tokens, hidden, intermediate, topk = 129, 17, 384, 192, 3
++    experts = 8 * world
++    fleet = FleetParams(
++        num_experts=experts,
++        max_tokens_per_rank=capacity,
++        token_hidden_size=hidden,
++    )
++    generator = torch.Generator(device="cuda").manual_seed(717 + rank)
++    weights = MoEWeightPack(
++        (
++            torch.randn(8, 2 * intermediate, hidden, generator=generator, device="cuda")
++            / hidden**0.5
++        ).bfloat16(),
++        (
++            torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
++            / intermediate**0.5
++        ).bfloat16(),
++    )
++    x = torch.randn(tokens, hidden, generator=generator, device="cuda").bfloat16()
++    ids = (
++        torch.arange(tokens * topk, device="cuda").reshape(tokens, topk) + 7 * rank
++    ) % experts
++    inputs = MoEEpTensors(
++        hidden_states=x,
++        topk_ids=ids.clone(),
++        topk_weights=torch.full((tokens, topk), 1 / topk, device="cuda"),
++    )
++    layers = []
++    try:
++
++        def create(knobs):
++            """Build a public layer sharing test weights with the requested knobs."""
++            layer = MoEEpLayer(
++                BootstrapConfig(rank=rank, world_size=world),
++                fleet,
++                weights,
++                backend=MegaConfig(
++                    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
++                        intermediate, topk, kernel_variant="genphase", knobs=knobs
++                    )
++                ),
++            )
++            layers.append(layer)
++            return layer
++
++        with pytest.warns(UserWarning, match="COLLECTIVE"):
++            layer = create("auto")
++        if rank == 0:
++            path.unlink(missing_ok=True)
++        if world > 1:
++            dist.barrier()
++        ws = layer._ensure_workspace()
++        pointers = [
++            getattr(ws, n).data_ptr()
++            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
++        ]
++        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
++            knob_cache,
++        )
++        import time
++
++        record_knobs = knob_cache.record_knobs
++        tune = pkg.autotune_sm100_genphase_mega_moe
++
++        def delayed_record(*args, **kwargs):
++            """Delay rank zero's cache write to expose premature peer returns."""
++            # Expose peers returning before a slow shared-cache write completes.
++            if world > 1:
++                time.sleep(0.25)
++            return record_knobs(*args, **kwargs)
++
++        def tune_and_check_publication(*args, **kwargs):
++            """Require all ranks to observe the cached winner when tuning returns."""
++            winner = tune(*args, **kwargs)
++            resolved = knob_cache.resolve_knobs(
++                ws.config,
++                sm_count=torch.cuda.get_device_properties(
++                    torch.cuda.current_device()
++                ).multi_processor_count,
++                live_tokens=tokens,
++            )
++            observed = [resolved]
++            if world > 1:
++                observed = [None] * world
++                dist.all_gather_object(observed, resolved)
++            assert all(value == (winner, "cache") for value in observed), (
++                "cache publication incomplete at autotune return",
++                observed,
++            )
++            return winner
++
++        monkeypatch.setattr(knob_cache, "record_knobs", delayed_record)
++        monkeypatch.setattr(
++            pkg, "autotune_sm100_genphase_mega_moe", tune_and_check_publication
++        )
++        layer.warmup(inputs)
++        winner = {
++            k: getattr(ws.config, k)
++            for k in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
++        }
++        assert pointers == [
++            getattr(ws, n).data_ptr()
++            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
++        ]
++        selected = layer.forward(inputs, return_workspace_view=True).clone()
++        cached = create(None)
++        assert cached.live_token_buckets(capacity) == [tokens]
++        handle = cached.create_workspace(capacity, live_tokens=tokens)
++        cached.warmup(inputs, workspace=handle)
++        cached_ws = handle._backend_workspace
++        assert all(getattr(cached_ws.config, k) == v for k, v in winner.items())
++        assert torch.equal(
++            selected,
++            cached.forward(inputs, workspace=handle, return_workspace_view=True),
++        )
++        # Force the other geometry before capture to exercise workspace resizing
++        # even when the heuristic happened to win the empirical sweep.
++        alternative = dict(
++            mma_tiler_mnk=(256, 128, 128),
++            cluster_shape_mn=(4, 1),
++            schedule_policy=("grouped", None),
++        )
++        if ws.config.resolved_mma_tiler_mnk[1] == 128:
++            alternative.update(mma_tiler_mnk=(256, 64, 128), cluster_shape_mn=(2, 1))
++        ws.retune(alternative)
++        assert dataclasses.replace(ws.config, **alternative) == ws.config
++        assert pointers == [
++            getattr(ws, n).data_ptr()
++            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
++        ]
++        assert torch.equal(selected, layer.forward(inputs, return_workspace_view=True))
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            output = layer.forward(inputs, return_workspace_view=True)
++        for state in ("empty", "holes", "restored"):
++            inputs.topk_ids.copy_(ids)
++            if state == "empty":
++                inputs.topk_ids.fill_(-1)
++            elif state == "holes":
++                inputs.topk_ids[::2, 1:] = -1
++            for _ in range(65):
++                graph.replay()
++            torch.cuda.synchronize()
++            indices, expected = pkg.sampled_reference(ws, *layer._transformed, tokens)
++            error = torch.tensor(
++                pkg.output_error(output, indices, expected), device="cuda"
++            )
++            if world > 1:
++                dist.all_reduce(error, op=dist.ReduceOp.MAX)
++            assert error.item() < 0.02
++        del graph
++    finally:
++        for layer in reversed(layers):
++            layer.destroy()
++        if rank == 0:
++            path.unlink(missing_ok=True)

@@ -1,0 +1,168 @@
+diff --git a/flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py b/flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
+index d471b5f8ca8..7a0a5b31bf0 100644
+--- a/flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
++++ b/flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
+@@ -1621,32 +1621,50 @@ def kernel(
+                     is_valid_row = permuted_row < tile_info[4]
+ 
+                     if is_valid_row:
+-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+-                        token_idx = expanded_idx // self.topK
+                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
++                        # flashinfer: clip the reduction to the output width.
++                        # The persistent scheduler rounds the N tile count up to
++                        # a multiple of cluster_shape_n, so with an odd N tile
++                        # count a cluster_shape_n=2 padding CTA has
++                        # coord_n == n; unclipped, it reduces a full CTA-tile row
++                        # past the end of every token row it handles (into the
++                        # next token's row, and past the allocation for the last
++                        # token). The values are zeros (TMA zero-fills B rows
++                        # >= n), so only the out-of-bounds address is visible.
++                        # Mirrors valid_columns in the Blackwell finalize kernel.
++                        valid_columns = cutlass.min(
++                            cutlass.Int64(c.shape[1]) - cutlass.Int64(coord_n),
++                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
++                        )
++                        if valid_columns > 0:
++                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
++                            token_idx = expanded_idx // self.topK
++                            scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
++                            valid_copy_size = cutlass.Int32(
++                                valid_columns * (self.c_dtype.width // 8)
++                            )
+ 
+-                        # sC row index: m_iter_idx * 128 + epi_tidx
+-                        sC_row = m_iter_idx * 128 + epi_tidx
++                            # sC row index: m_iter_idx * 128 + epi_tidx
++                            sC_row = m_iter_idx * 128 + epi_tidx
+ 
+-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+-                            blk_reduce_bf16(
+-                                scatter_out_offset,
+-                                sC[sC_row, None, 0],
+-                                cutlass.Int32(self.copy_size),
+-                            )
+-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+-                            blk_reduce_fp32(
+-                                scatter_out_offset,
+-                                sC[sC_row, None, 0],
+-                                cutlass.Int32(self.copy_size),
+-                            )
+-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+-                            blk_reduce_fp16(
+-                                scatter_out_offset,
+-                                sC[sC_row, None, 0],
+-                                cutlass.Int32(self.copy_size),
+-                            )
++                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
++                                blk_reduce_bf16(
++                                    scatter_out_offset,
++                                    sC[sC_row, None, 0],
++                                    valid_copy_size,
++                                )
++                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
++                                blk_reduce_fp32(
++                                    scatter_out_offset,
++                                    sC[sC_row, None, 0],
++                                    valid_copy_size,
++                                )
++                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
++                                blk_reduce_fp16(
++                                    scatter_out_offset,
++                                    sC[sC_row, None, 0],
++                                    valid_copy_size,
++                                )
+                 self.epilog_sync_barrier.arrive_and_wait()
+                 # ============================================================
+                 # END OF NEW CODE
+diff --git a/tests/moe/test_cute_dsl_fused_moe.py b/tests/moe/test_cute_dsl_fused_moe.py
+index d8d8c8cde2b..5d3481ffa0f 100644
+--- a/tests/moe/test_cute_dsl_fused_moe.py
++++ b/tests/moe/test_cute_dsl_fused_moe.py
+@@ -2152,6 +2152,85 @@ def choose_tail_config(
+                 use_fused_finalize=use_fused_finalize,
+             )
+ 
++    @pytest.mark.parametrize("hidden_size", [256, 768, 512])
++    def test_rubin_finalize_cluster_n_stays_in_output(self, hidden_size: int):
++        """Rubin finalize with cluster_shape_n=2 must not reduce past each row.
++
++        With an odd N tile count (hidden 256 and 768 at mma N 256) the
++        persistent scheduler adds a padding CTA at coord_n == hidden. The
++        output is the head of a larger buffer whose tail holds a NaN payload;
++        a reduction past the last token row changes it (the added values are
++        zeros, so the result itself would not show the overrun).
++        """
++        if not is_sm107():
++            pytest.skip("Rubin (SM107) finalize kernel")
++        from flashinfer import cute_dsl_fused_moe
++
++        num_tokens, top_k, num_experts, intermediate_size = 97, 2, 8, 512
++        tensors = create_moe_tensors(
++            num_tokens=num_tokens,
++            hidden_size=hidden_size,
++            intermediate_size=intermediate_size,
++            num_experts=num_experts,
++            num_local_experts=num_experts,
++            top_k=top_k,
++        )
++        tactic = (
++            128,
++            ((128, 128, 256), (128, 128, 128), (1, 1), False),
++            ((128, 256, 256), (128, 256, 128), (1, 2), False),
++        )
++        canary = 4096
++        payload = 0x7FC1  # bf16 quiet NaN with a payload an add would canonicalize
++        buf = torch.empty(
++            num_tokens * hidden_size + canary, dtype=torch.bfloat16, device="cuda"
++        )
++        buf[num_tokens * hidden_size :].view(torch.int16).fill_(payload)
++        out = buf[: num_tokens * hidden_size].view(num_tokens, hidden_size)
++        result = cute_dsl_fused_moe(
++            x=tensors["x"],
++            x_sf=tensors["x_sf"],
++            token_selected_experts=tensors["token_selected_experts"],
++            token_final_scales=tensors["token_final_scales"],
++            w1_weight=tensors["w1_weight"],
++            w1_weight_sf=tensors["w1_weight_sf"],
++            w1_alpha=tensors["w1_alpha"],
++            fc2_input_scale=tensors["fc2_input_scale"],
++            w2_weight=tensors["w2_weight"],
++            w2_weight_sf=tensors["w2_weight_sf"],
++            w2_alpha=tensors["w2_alpha"],
++            num_experts=num_experts,
++            top_k=top_k,
++            num_local_experts=num_experts,
++            moe_output=out,
++            tactic=tactic,
++        )
++        torch.cuda.synchronize()
++        tail = buf[num_tokens * hidden_size :].view(torch.int16)
++        assert (tail == payload).all(), (
++            f"finalize wrote {(tail != payload).sum().item()} elements past the "
++            f"output (hidden={hidden_size}, cluster_shape_n=2)"
++        )
++        ref_output = compute_reference_moe_fp4(
++            hidden_states=tensors["x_ref"].float(),
++            gemm1_weights=tensors["w1_weight_bf16"].float(),
++            gemm2_weights=tensors["w2_weight_bf16"].float(),
++            gemm1_alpha=tensors["w1_alpha"],
++            gemm2_alpha=tensors["w2_alpha"],
++            token_selected_experts=tensors["token_selected_experts"],
++            token_final_scales=tensors["token_final_scales"],
++            num_tokens=num_tokens,
++            num_experts=num_experts,
++            top_k=top_k,
++            hidden_size=hidden_size,
++            intermediate_size=intermediate_size,
++            fc2_input_scale=tensors["fc2_input_scale"],
++        )
++        passed, percent_within, atol = check_accuracy(result, ref_output)
++        assert passed, (
++            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
++        )
++
+     def _run_numerical_accuracy(
+         self,
+         activation_type: ActivationType,

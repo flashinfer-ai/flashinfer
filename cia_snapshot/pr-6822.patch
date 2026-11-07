@@ -1,0 +1,168 @@
+diff --git a/csrc/cake_minimax_h3_fc1_swiglu_sm10x.cu b/csrc/cake_minimax_h3_fc1_swiglu_sm10x.cu
+index 3e620fad53..30ffe03c84 100644
+--- a/csrc/cake_minimax_h3_fc1_swiglu_sm10x.cu
++++ b/csrc/cake_minimax_h3_fc1_swiglu_sm10x.cu
+@@ -673,6 +673,12 @@ kernel_minimax_h3_fc1_swiglu_bf16(const __grid_constant__ CUtensorMap A, const _
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait_hint(mma_done_addr + (load_stage) * 8, _phase_mma_done, 10000000);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -1557,6 +1563,12 @@ kernel_minimax_h3_fc1_swiglu_e4m3(const __grid_constant__ CUtensorMap A, const _
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 4; _++) {
++                    mbarrier_wait_hint(mma_done_addr + (load_stage) * 8, _phase_mma_done, 10000000);
++                    load_stage += 1;
++                    if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -2608,6 +2620,12 @@ kernel_minimax_h3_fc1_swiglu_e2m1(const __grid_constant__ CUtensorMap A, const _
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 4; _++) {
++                    mbarrier_wait_hint(mma_done_addr + (load_stage) * 8, _phase_mma_done, 10000000);
++                    load_stage += 1;
++                    if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/csrc/cake_minimax_h3_mlp_sm10x.cu b/csrc/cake_minimax_h3_mlp_sm10x.cu
+index 011088e4cb..9c6bb45ce5 100644
+--- a/csrc/cake_minimax_h3_mlp_sm10x.cu
++++ b/csrc/cake_minimax_h3_mlp_sm10x.cu
+@@ -689,6 +689,12 @@ kernel_minimax_h3_mlp_fc1_bf16(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -1232,6 +1238,12 @@ kernel_minimax_h3_mlp_fc2_bf16(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -2691,6 +2703,12 @@ kernel_minimax_h3_mlp_fc1_e4m3(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 3; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -3470,6 +3488,12 @@ kernel_minimax_h3_mlp_fc2_e4m3(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 3; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -4554,6 +4578,12 @@ kernel_minimax_h3_mlp_fc1_e2m1(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 4; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -5637,6 +5667,12 @@ kernel_minimax_h3_mlp_fc2_e2m1(const __grid_constant__ CUtensorMap A, const __gr
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 5; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/csrc/cake_minimax_h3_out_proj_sm10x.cu b/csrc/cake_minimax_h3_out_proj_sm10x.cu
+index fa4ab6bff1..14a3ffc612 100644
+--- a/csrc/cake_minimax_h3_out_proj_sm10x.cu
++++ b/csrc/cake_minimax_h3_out_proj_sm10x.cu
+@@ -477,6 +477,12 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -1303,6 +1309,12 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 3; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+@@ -2177,6 +2189,12 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 5; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }

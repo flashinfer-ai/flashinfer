@@ -1,0 +1,1762 @@
+diff --git a/benchmarks/bench_grouped_mxfp8_quantize_backend_comparison.py b/benchmarks/bench_grouped_mxfp8_quantize_backend_comparison.py
+index 5dd5c581e67..babaeac8ef4 100644
+--- a/benchmarks/bench_grouped_mxfp8_quantize_backend_comparison.py
++++ b/benchmarks/bench_grouped_mxfp8_quantize_backend_comparison.py
+@@ -19,8 +19,8 @@
+ 
+ import flashinfer.testing.utils as timing_utils
+ from flashinfer.cutile import is_cuda_tile_available
+-from flashinfer.jit.cake_grouped_mxfp8_quantize import (
+-    get_cake_grouped_mxfp8_quantize_module,
++from flashinfer.quantization.fp8_quantization import (
++    cake_grouped_mxfp8_quantize_launch,
+     is_cake_grouped_mxfp8_quantize_available,
+ )
+ from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
+@@ -150,9 +150,6 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
+     cake_q = torch.empty_like(cutile_q)
+     cake_sf = torch.empty_like(cutile_sf)
+ 
+-    cake_module = get_cake_grouped_mxfp8_quantize_module(x.dtype, x.device)
+-    stream = int(torch.cuda.current_stream(x.device).cuda_stream)
+-
+     def run_cutile_kernel():
+         mxfp8_grouped_quantize_cutile_with_prefix_schedule(
+             input_tensor.view(batch * rows, padded_k),
+@@ -165,7 +162,10 @@ def run_cutile_kernel():
+         )
+ 
+     def run_cake_kernel():
+-        cake_module.run(input_tensor, mask, cake_q, cake_sf, stream)
++        # The Cake program pads K to 128-column tiles itself: it reads the
++        # unpadded input and writes the preallocated padded outputs in exactly
++        # one kernel launch on the current stream.
++        cake_grouped_mxfp8_quantize_launch(x, mask, cake_q, cake_sf)
+ 
+     run_cutile_kernel()
+     run_cake_kernel()
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_ffi_checks.h b/csrc/cake_grouped_mxfp8_quantize/cake_ffi_checks.h
+new file mode 100644
+index 00000000000..129288f9432
+--- /dev/null
++++ b/csrc/cake_grouped_mxfp8_quantize/cake_ffi_checks.h
+@@ -0,0 +1,89 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Host surface of the generated Cake launchers (``*_binding.cu``) for a package built without
++// FlashInfer's csrc: the TVM-FFI / DLPack headers the launchers use, the named tensor-argument
++// checks and the CUDA runtime version the library was compiled against.
++#pragma once
++
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++#include <tvm/ffi/container/shape.h>
++#include <tvm/ffi/dtype.h>
++#include <tvm/ffi/error.h>
++#include <tvm/ffi/extra/c_env_api.h>
++#include <tvm/ffi/extra/cuda/base.h>
++#include <tvm/ffi/extra/cuda/device_guard.h>
++#include <tvm/ffi/function.h>
++#include <cuda_runtime_api.h>
++
++inline void check_cuda_tensor(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
++      << name << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
++}
++
++inline void check_dtype(const tvm::ffi::TensorView& t, DLDataType expected, const char* name) {
++  DLDataType d = t.dtype();
++  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes, TypeError)
++      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
++      << ", bits=" << static_cast<int>(expected.bits) << ", lanes=" << static_cast<int>(expected.lanes)
++      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
++      << ", lanes=" << static_cast<int>(d.lanes) << ")";
++}
++
++inline void check_contiguous(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++
++inline void check_same_device(const tvm::ffi::TensorView& t, const tvm::ffi::TensorView& reference,
++                              const char* name, const char* reference_name) {
++  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
++                    t.device().device_id == reference.device().device_id,
++                ValueError)
++      << name << " must be on the same device as " << reference_name << ": got device_type="
++      << static_cast<int>(t.device().device_type) << " id=" << t.device().device_id
++      << " versus device_type=" << static_cast<int>(reference.device().device_type)
++      << " id=" << reference.device().device_id;
++}
++
++// Require the dimensions above the last `trailing` dimensions to form one dense
++// row-major chain, so they can be folded into a single logical dimension whose
++// step is stride(-(trailing + 1)). Shape products are stride-independent, so
++// this verifies the physical layout instead of inventing a folded stride.
++inline void check_dense_leading_dims(const tvm::ffi::TensorView& t, int trailing, const char* name) {
++  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
++      << name << " cannot fold leading dimensions above " << trailing << " trailing dims from ndim=" << t.ndim();
++  int outer_last = t.ndim() - trailing - 1;
++  if (outer_last <= 0) {
++    return;
++  }
++  int64_t step = t.stride(outer_last);
++  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
++  int64_t expected = step;
++  for (int axis = outer_last - 1; axis >= 0; --axis) {
++    expected *= t.size(axis + 1);
++    if (t.size(axis) > 1) {
++      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
++          << name << " leading dims are not physically foldable above " << trailing
++          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected " << expected;
++    }
++  }
++}
++
++// The CUDA runtime this library was compiled against (``CUDART_VERSION``, e.g. 13000 for 13.0); every
++// binding exports it as ``build_cuda_version`` so the package loader can compare it with the prebuilt
++// sidecar before the first launch.
++inline int64_t cake_ffi_build_cuda_version() { return CUDART_VERSION; }
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_binding.cu b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_binding.cu
+deleted file mode 100644
+index e8d01e18855..00000000000
+--- a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_binding.cu
++++ /dev/null
+@@ -1,195 +0,0 @@
+-/*
+- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-// Generated by Cake for FlashInfer. Exporter output, hand-edited here pending exporter support:
+-// one launcher for the BF16 and FP16 grouped MXFP8 quantize programs. CAKE_PROGRAM_KERNEL names
+-// the kernel symbol and CAKE_PROGRAM_SHIM the host-shim namespace; the float16 program's compile
+-// flags define both, the guarded defaults below name the BF16 program.
+-// tvm-ffi direct-source launcher for the Cake kernel named by CAKE_PROGRAM_KERNEL.
+-#include <cuda.h>
+-#include <cuda_bf16.h>
+-#include <cuda_fp16.h>
+-#include <cuda_runtime.h>
+-
+-#include "tvm_ffi_utils.h"
+-
+-#include <cstdint>
+-
+-#include "cake_grouped_mxfp8_quantize_host_common.cuh"
+-
+-#ifndef CAKE_PROGRAM_KERNEL
+-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375
+-#endif
+-#ifndef CAKE_PROGRAM_SHIM
+-#define CAKE_PROGRAM_SHIM cake_host_shim_e64e5c31937b712c
+-#endif
+-// Stringise the expansion of a macro argument (the launch error message names the kernel symbol).
+-#ifndef CAKE_STRINGIZE
+-#define CAKE_STRINGIZE_(x) #x
+-#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
+-#endif
+-
+-extern "C" __global__ void CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, int BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS);
+-
+-
+-namespace CAKE_PROGRAM_SHIM {
+-
+-using namespace cake_host_shim_common;
+-using tvm::ffi::TensorView;
+-
+-void Run(TensorView arg_x, TensorView arg_mask, TensorView arg_quantized, TensorView arg_scales, int64_t arg_M, int64_t arg_K, int64_t arg_PADDED_K, int64_t arg_PM_TILES, int64_t arg_PK_TILES, int64_t arg_BLOCKS_PER_ROW, int64_t arg_TOTAL_TASKS, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+-  DLDevice dev = arg_x.device();
+-  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+-  check_cuda_tensor(arg_x, "x");
+-  check_dtype(arg_x, DLDataType{kDLBfloat, 16, 1}, "x");
+-  check_cuda_tensor(arg_mask, "mask");
+-  check_dtype(arg_mask, DLDataType{kDLInt, 32, 1}, "mask");
+-  check_cuda_tensor(arg_quantized, "quantized");
+-  check_dtype(arg_quantized, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "quantized");
+-  check_cuda_tensor(arg_scales, "scales");
+-  check_dtype(arg_scales, DLDataType{kDLUInt, 8, 1}, "scales");
+-  TVM_FFI_CHECK(arg_M >= -2147483648LL && arg_M <= 2147483647LL, ValueError)
+-      << "scalar 'M' value " << arg_M
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_K >= -2147483648LL && arg_K <= 2147483647LL, ValueError)
+-      << "scalar 'K' value " << arg_K
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_PADDED_K >= -2147483648LL && arg_PADDED_K <= 2147483647LL, ValueError)
+-      << "scalar 'PADDED_K' value " << arg_PADDED_K
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_PM_TILES >= -2147483648LL && arg_PM_TILES <= 2147483647LL, ValueError)
+-      << "scalar 'PM_TILES' value " << arg_PM_TILES
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_PK_TILES >= -2147483648LL && arg_PK_TILES <= 2147483647LL, ValueError)
+-      << "scalar 'PK_TILES' value " << arg_PK_TILES
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_BLOCKS_PER_ROW >= -2147483648LL && arg_BLOCKS_PER_ROW <= 2147483647LL, ValueError)
+-      << "scalar 'BLOCKS_PER_ROW' value " << arg_BLOCKS_PER_ROW
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_TOTAL_TASKS >= 0LL && arg_TOTAL_TASKS <= 9223372036854775807LL, ValueError)
+-      << "scalar 'TOTAL_TASKS' value " << arg_TOTAL_TASKS
+-      << " is outside u64 range [0, 9223372036854775807]";
+-  check_same_device(arg_mask, arg_x, "mask", "x");
+-  check_same_device(arg_quantized, arg_x, "quantized", "x");
+-  check_same_device(arg_scales, arg_x, "scales", "x");
+-  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+-      << ", " << grid_z << ")";
+-  TVM_FFI_CHECK(arg_x.ndim() == 3, ValueError)
+-      << "x must have rank 3, got " << arg_x.ndim();
+-  TVM_FFI_CHECK(arg_x.size(0) == grid_z, ValueError)
+-      << "x dimension 0 must equal " << (grid_z)      << ", got " << arg_x.size(0);
+-  TVM_FFI_CHECK(arg_x.size(1) == arg_M, ValueError)
+-      << "x dimension 1 must equal " << (arg_M)      << ", got " << arg_x.size(1);
+-  TVM_FFI_CHECK(arg_x.size(2) == arg_K, ValueError)
+-      << "x dimension 2 must equal " << (arg_K)      << ", got " << arg_x.size(2);
+-  TVM_FFI_CHECK(arg_x.stride(0) == arg_M * arg_K, ValueError)
+-      << "x stride 0 must equal " << (arg_M * arg_K)      << ", got " << arg_x.stride(0);
+-  TVM_FFI_CHECK(arg_x.stride(1) == arg_K, ValueError)
+-      << "x stride 1 must equal " << (arg_K)      << ", got " << arg_x.stride(1);
+-  TVM_FFI_CHECK(arg_x.stride(2) == 1, ValueError)
+-      << "x stride 2 must equal " << (1)      << ", got " << arg_x.stride(2);
+-  TVM_FFI_CHECK(arg_mask.ndim() == 1, ValueError)
+-      << "mask must have rank 1, got " << arg_mask.ndim();
+-  TVM_FFI_CHECK(arg_mask.size(0) == grid_z, ValueError)
+-      << "mask dimension 0 must equal " << (grid_z)      << ", got " << arg_mask.size(0);
+-  TVM_FFI_CHECK(arg_mask.stride(0) == 1, ValueError)
+-      << "mask stride 0 must equal " << (1)      << ", got " << arg_mask.stride(0);
+-  TVM_FFI_CHECK(arg_quantized.ndim() == 3, ValueError)
+-      << "quantized must have rank 3, got " << arg_quantized.ndim();
+-  TVM_FFI_CHECK(arg_quantized.size(0) == grid_z, ValueError)
+-      << "quantized dimension 0 must equal " << (grid_z)      << ", got " << arg_quantized.size(0);
+-  TVM_FFI_CHECK(arg_quantized.size(1) == arg_M, ValueError)
+-      << "quantized dimension 1 must equal " << (arg_M)      << ", got " << arg_quantized.size(1);
+-  TVM_FFI_CHECK(arg_quantized.size(2) == arg_PADDED_K, ValueError)
+-      << "quantized dimension 2 must equal " << (arg_PADDED_K)      << ", got " << arg_quantized.size(2);
+-  TVM_FFI_CHECK(arg_quantized.stride(0) == arg_M * arg_PADDED_K, ValueError)
+-      << "quantized stride 0 must equal " << (arg_M * arg_PADDED_K)      << ", got " << arg_quantized.stride(0);
+-  TVM_FFI_CHECK(arg_quantized.stride(1) == arg_PADDED_K, ValueError)
+-      << "quantized stride 1 must equal " << (arg_PADDED_K)      << ", got " << arg_quantized.stride(1);
+-  TVM_FFI_CHECK(arg_quantized.stride(2) == 1, ValueError)
+-      << "quantized stride 2 must equal " << (1)      << ", got " << arg_quantized.stride(2);
+-  TVM_FFI_CHECK(arg_scales.ndim() == 6, ValueError)
+-      << "scales must have rank 6, got " << arg_scales.ndim();
+-  TVM_FFI_CHECK(arg_scales.size(0) == grid_z, ValueError)
+-      << "scales dimension 0 must equal " << (grid_z)      << ", got " << arg_scales.size(0);
+-  TVM_FFI_CHECK(arg_scales.size(1) == arg_PM_TILES, ValueError)
+-      << "scales dimension 1 must equal " << (arg_PM_TILES)      << ", got " << arg_scales.size(1);
+-  TVM_FFI_CHECK(arg_scales.size(2) == arg_PK_TILES, ValueError)
+-      << "scales dimension 2 must equal " << (arg_PK_TILES)      << ", got " << arg_scales.size(2);
+-  TVM_FFI_CHECK(arg_scales.size(3) == 32, ValueError)
+-      << "scales dimension 3 must equal " << (32)      << ", got " << arg_scales.size(3);
+-  TVM_FFI_CHECK(arg_scales.size(4) == 4, ValueError)
+-      << "scales dimension 4 must equal " << (4)      << ", got " << arg_scales.size(4);
+-  TVM_FFI_CHECK(arg_scales.size(5) == 4, ValueError)
+-      << "scales dimension 5 must equal " << (4)      << ", got " << arg_scales.size(5);
+-  TVM_FFI_CHECK(arg_scales.stride(0) == 512 * arg_PM_TILES * arg_PK_TILES, ValueError)
+-      << "scales stride 0 must equal " << (512 * arg_PM_TILES * arg_PK_TILES)      << ", got " << arg_scales.stride(0);
+-  TVM_FFI_CHECK(arg_scales.stride(1) == 512 * arg_PK_TILES, ValueError)
+-      << "scales stride 1 must equal " << (512 * arg_PK_TILES)      << ", got " << arg_scales.stride(1);
+-  TVM_FFI_CHECK(arg_scales.stride(2) == 512, ValueError)
+-      << "scales stride 2 must equal " << (512)      << ", got " << arg_scales.stride(2);
+-  TVM_FFI_CHECK(arg_scales.stride(3) == 16, ValueError)
+-      << "scales stride 3 must equal " << (16)      << ", got " << arg_scales.stride(3);
+-  TVM_FFI_CHECK(arg_scales.stride(4) == 4, ValueError)
+-      << "scales stride 4 must equal " << (4)      << ", got " << arg_scales.stride(4);
+-  TVM_FFI_CHECK(arg_scales.stride(5) == 1, ValueError)
+-      << "scales stride 5 must equal " << (1)      << ", got " << arg_scales.stride(5);
+-  TVM_FFI_CHECK(arg_M >= 1, ValueError)
+-      << "M must be >= 1, got " << arg_M;
+-  TVM_FFI_CHECK(arg_K >= 32, ValueError)
+-      << "K must be >= 32, got " << arg_K;
+-  TVM_FFI_CHECK(arg_PADDED_K == 128 * arg_PK_TILES, ValueError)
+-      << "PADDED_K must equal " << (128 * arg_PK_TILES)      << ", got " << arg_PADDED_K;
+-  TVM_FFI_CHECK(arg_PM_TILES >= 1, ValueError)
+-      << "PM_TILES must be >= 1, got " << arg_PM_TILES;
+-  TVM_FFI_CHECK(arg_PK_TILES >= 1, ValueError)
+-      << "PK_TILES must be >= 1, got " << arg_PK_TILES;
+-  TVM_FFI_CHECK(arg_BLOCKS_PER_ROW == 4 * arg_PK_TILES, ValueError)
+-      << "BLOCKS_PER_ROW must equal " << (4 * arg_PK_TILES)      << ", got " << arg_BLOCKS_PER_ROW;
+-  TVM_FFI_CHECK(arg_TOTAL_TASKS == grid_z * arg_M * arg_BLOCKS_PER_ROW, ValueError)
+-      << "TOTAL_TASKS must equal " << (grid_z * arg_M * arg_BLOCKS_PER_ROW)      << ", got " << arg_TOTAL_TASKS;
+-  TVM_FFI_CHECK(grid_y == arg_M, ValueError)
+-      << "grid_y must equal " << (arg_M)      << ", got " << grid_y;
+-
+-  cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
+-  __nv_bfloat16* p_x = static_cast<__nv_bfloat16*>(arg_x.data_ptr());
+-  int* p_mask = static_cast<int*>(arg_mask.data_ptr());
+-  uint8_t* p_quantized = static_cast<uint8_t*>(arg_quantized.data_ptr());
+-  uint8_t* p_scales = static_cast<uint8_t*>(arg_scales.data_ptr());
+-  int32_t v_M = (int32_t)arg_M;
+-  int32_t v_K = (int32_t)arg_K;
+-  int32_t v_PADDED_K = (int32_t)arg_PADDED_K;
+-  int32_t v_PM_TILES = (int32_t)arg_PM_TILES;
+-  int32_t v_PK_TILES = (int32_t)arg_PK_TILES;
+-  int32_t v_BLOCKS_PER_ROW = (int32_t)arg_BLOCKS_PER_ROW;
+-  uint64_t v_TOTAL_TASKS = (uint64_t)arg_TOTAL_TASKS;
+-  void* kargs[] = {&p_x, &p_mask, &p_quantized, &p_scales, &v_M, &v_K, &v_PADDED_K, &v_PM_TILES, &v_PK_TILES, &v_BLOCKS_PER_ROW, &v_TOTAL_TASKS};
+-
+-
+-  dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+-  dim3 block(128u, 1u, 1u);
+-
+-  cudaError_t launch_status = cudaLaunchKernel(
+-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), grid, block, kargs, 0u, stream);
+-  TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
+-      << "cudaLaunchKernel for " CAKE_STRINGIZE(CAKE_PROGRAM_KERNEL) " failed: "
+-      << cudaGetErrorString(launch_status);
+-}
+-
+-}  // namespace CAKE_PROGRAM_SHIM
+-
+-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu
+new file mode 100644
+index 00000000000..c0aa01f0959
+--- /dev/null
++++ b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu
+@@ -0,0 +1,124 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by Cake: the tvm-ffi host binding of CAKE_PROGRAM_KERNEL, for the device source that defines it. Do not edit.
++// This unit serves two programs: cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd (the default) and
++// cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2.  CAKE_PROGRAM_KERNEL names the kernel it launches and CAKE_PROGRAM_SHIM its
++// namespace.  A build selects the second program with the compile definitions
++// -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2
++// -DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2.
++#ifndef CAKE_PROGRAM_KERNEL
++#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd
++#endif
++#ifndef CAKE_PROGRAM_SHIM
++#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd
++#endif
++#ifndef CAKE_STRINGIZE
++#define CAKE_STRINGIZE_(x) #x
++#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
++#endif
++
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++
++#include "cake_ffi_checks.h"
++
++#include <cstdint>
++
++extern "C" __global__ void CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, int BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS);
++
++namespace CAKE_PROGRAM_SHIM {
++
++using tvm::ffi::TensorView;
++
++constexpr const char* KERNEL_NAME = CAKE_STRINGIZE(CAKE_PROGRAM_KERNEL);
++
++void CheckCuda(cudaError_t status, const char* what) {
++  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
++      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
++}
++
++void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
++
++void Run(TensorView a_x, TensorView a_mask, TensorView a_quantized, TensorView a_scales, int64_t a_M, int64_t a_K, int64_t a_PADDED_K, int64_t a_PM_TILES, int64_t a_PK_TILES, int64_t a_BLOCKS_PER_ROW, int64_t a_TOTAL_TASKS, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++  DLDevice dev = a_x.device();
++  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
++  check_cuda_tensor(a_x, "x");
++  check_dtype(a_x, DLDataType{kDLBfloat, 16, 1}, "x");
++  check_cuda_tensor(a_mask, "mask");
++  check_dtype(a_mask, DLDataType{kDLInt, 32, 1}, "mask");
++  check_cuda_tensor(a_quantized, "quantized");
++  check_dtype(a_quantized, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "quantized");
++  check_cuda_tensor(a_scales, "scales");
++  check_dtype(a_scales, DLDataType{kDLUInt, 8, 1}, "scales");
++  TVM_FFI_CHECK(a_M >= -2147483648LL && a_M <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'M' = " << a_M
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_K >= -2147483648LL && a_K <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'K' = " << a_K
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_PADDED_K >= -2147483648LL && a_PADDED_K <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'PADDED_K' = " << a_PADDED_K
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_PM_TILES >= -2147483648LL && a_PM_TILES <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'PM_TILES' = " << a_PM_TILES
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_PK_TILES >= -2147483648LL && a_PK_TILES <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'PK_TILES' = " << a_PK_TILES
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_BLOCKS_PER_ROW >= -2147483648LL && a_BLOCKS_PER_ROW <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'BLOCKS_PER_ROW' = " << a_BLOCKS_PER_ROW
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_TOTAL_TASKS >= 0LL && a_TOTAL_TASKS <= 9223372036854775807LL, ValueError)
++      << KERNEL_NAME << ": 'TOTAL_TASKS' = " << a_TOTAL_TASKS
++      << " is outside the u64 range [0, 9223372036854775807]";
++  check_contiguous(a_x, "x");
++  check_contiguous(a_mask, "mask");
++  check_same_device(a_mask, a_x, "mask", "x");
++  check_contiguous(a_quantized, "quantized");
++  check_same_device(a_quantized, a_x, "quantized", "x");
++  check_contiguous(a_scales, "scales");
++  check_same_device(a_scales, a_x, "scales", "x");
++  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
++  TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
++  void* v_x = DataPtr(a_x);
++  void* v_mask = DataPtr(a_mask);
++  void* v_quantized = DataPtr(a_quantized);
++  void* v_scales = DataPtr(a_scales);
++  int32_t v_M = static_cast<int32_t>(a_M);
++  int32_t v_K = static_cast<int32_t>(a_K);
++  int32_t v_PADDED_K = static_cast<int32_t>(a_PADDED_K);
++  int32_t v_PM_TILES = static_cast<int32_t>(a_PM_TILES);
++  int32_t v_PK_TILES = static_cast<int32_t>(a_PK_TILES);
++  int32_t v_BLOCKS_PER_ROW = static_cast<int32_t>(a_BLOCKS_PER_ROW);
++  uint64_t v_TOTAL_TASKS = static_cast<uint64_t>(a_TOTAL_TASKS);
++  void* kernel_args[] = {&v_x, &v_mask, &v_quantized, &v_scales, &v_M, &v_K, &v_PADDED_K, &v_PM_TILES, &v_PK_TILES, &v_BLOCKS_PER_ROW, &v_TOTAL_TASKS};
++  cudaLaunchConfig_t config{};
++  config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
++  config.blockDim = dim3(128, 1, 1);
++  config.dynamicSmemBytes = 0;
++  config.stream = stream;
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kernel_args),
++            "cudaLaunchKernelExC");
++}
++
++}  // namespace CAKE_PROGRAM_SHIM
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_kernel.cu b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu
+similarity index 79%
+rename from csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_kernel.cu
+rename to csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu
+index 762a3b7f62a..b34afbca3ac 100644
+--- a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_kernel.cu
++++ b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++ * Copyright (c) 2026 by FlashInfer team.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,23 +14,83 @@
+  * limitations under the License.
+  */
+ 
+-// Generated by Cake for FlashInfer. Exporter output, hand-edited here pending exporter support:
+-// one source for the BF16 and FP16 grouped MXFP8 quantize programs. IS_BF16 selects the input
+-// widening sequence (1 = BF16 program, the default; 0 = FP16 program) and CAKE_PROGRAM_KERNEL
+-// names the kernel symbol; the float16 program's compile flags define both, the guarded defaults
+-// below name the BF16 program.
+-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+-#include "cake_grouped_mxfp8_quantize_device_common.cuh"
++// This unit serves two programs: cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd (CAKE_PROGRAM_VARIANT 0, the default) and
++// cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
++// selects the second program with the compile definitions
++// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2.
++#ifndef CAKE_PROGRAM_VARIANT
++#define CAKE_PROGRAM_VARIANT 0
++#endif
++#ifndef CAKE_PROGRAM_KERNEL
++#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd
++#endif
++
++typedef signed char        int8_t;
++typedef unsigned char      uint8_t;
++typedef unsigned short     uint16_t;
++typedef unsigned int       uint32_t;
++#if defined(__CUDACC_RTC__)
++typedef unsigned long long uint64_t;
++#else
++typedef unsigned long      uint64_t;
++#endif
++static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
++typedef signed int         int32_t;
++typedef short int          int16_t;
++struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
++static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
++static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
++
++#if defined(__CUDACC_RTC__)
++typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
++#else
++#include <cuda.h>
++#endif
++
++static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ int make_warp_uniform(int x) {
++    int result;
++    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
++                 : "=r"(result) : "r"(x));
++    return result;
++}
+ 
+ #define CAKE_INF CUDART_INF_F
+ #define NUM_MAIN_STAGES 1
+ #define THREADS 128
+-#ifndef IS_BF16
++#if CAKE_PROGRAM_VARIANT == 1
++#define IS_BF16 0
++#else
+ #define IS_BF16 1
+ #endif
+-#ifndef CAKE_PROGRAM_KERNEL
+-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375
+-#endif
++
++#include <math_constants.h>
++
++__device__ __forceinline__ float max_noftz(float a, float b) {
++    float c;
++    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++    return c;
++}
++
++
++
++
++__device__ __forceinline__ float row_max_reduce(float2 acc) {
++    return max_noftz(acc.x, acc.y);
++}
++
++
++
++__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
++    asm("mul.rn.f32x2 %0, %0, %1;"
++        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
++}
++
++
++// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+ 
+ 
+ __device__ __forceinline__ unsigned int __as_u32(float v) {
+@@ -86,14 +146,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                         asm volatile(
+                             "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                             : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
++#if CAKE_PROGRAM_VARIANT == 1
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 0])[0]), "=f"((&values[0 + 0])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -102,16 +157,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 0]))
+-#endif
+                             : "r"(_v8_0_0[0]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 2])[0]), "=f"((&values[0 + 2])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -120,16 +168,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 2]))
+-#endif
+                             : "r"(_v8_0_0[1]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 4])[0]), "=f"((&values[0 + 4])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -138,16 +179,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 4]))
+-#endif
+                             : "r"(_v8_0_0[2]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 6])[0]), "=f"((&values[0 + 6])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -156,16 +190,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 6]))
+-#endif
+                             : "r"(_v8_0_0[3]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 8])[0]), "=f"((&values[0 + 8])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -174,16 +201,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 8]))
+-#endif
+                             : "r"(_v8_0_0[4]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 10])[0]), "=f"((&values[0 + 10])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -192,16 +212,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 10]))
+-#endif
+                             : "r"(_v8_0_0[5]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 12])[0]), "=f"((&values[0 + 12])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -210,16 +223,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 12]))
+-#endif
+                             : "r"(_v8_0_0[6]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 14])[0]), "=f"((&values[0 + 14])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -228,20 +234,32 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 14]))
+-#endif
+                             : "r"(_v8_0_0[7]));
++#else
++                        (&values[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
++                        (&values[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
++                        (&values[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
++                        (&values[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
++                        (&values[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
++                        (&values[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
++                        (&values[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
++                        (&values[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
++                        (&values[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
++                        (&values[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
++                        (&values[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
++                        (&values[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
++                        (&values[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
++                        (&values[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
++                        (&values[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
++                        (&values[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
++#endif
+                         uint32_t _v8_0_1[8];
+                         asm volatile(
+                             "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                             : "=r"(_v8_0_1[0]), "=r"(_v8_0_1[1]), "=r"(_v8_0_1[2]), "=r"(_v8_0_1[3]), "=r"(_v8_0_1[4]), "=r"(_v8_0_1[5]), "=r"(_v8_0_1[6]), "=r"(_v8_0_1[7]) : "l"((const char*)_v8p_0 + 32) : "memory");
++#if CAKE_PROGRAM_VARIANT == 1
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 16])[0]), "=f"((&values[0 + 16])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -250,16 +268,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 16]))
+-#endif
+                             : "r"(_v8_0_1[0]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 18])[0]), "=f"((&values[0 + 18])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -268,16 +279,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 18]))
+-#endif
+                             : "r"(_v8_0_1[1]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 20])[0]), "=f"((&values[0 + 20])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -286,16 +290,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 20]))
+-#endif
+                             : "r"(_v8_0_1[2]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 22])[0]), "=f"((&values[0 + 22])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -304,16 +301,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 22]))
+-#endif
+                             : "r"(_v8_0_1[3]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 24])[0]), "=f"((&values[0 + 24])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -322,16 +312,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 24]))
+-#endif
+                             : "r"(_v8_0_1[4]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 26])[0]), "=f"((&values[0 + 26])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -340,16 +323,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 26]))
+-#endif
+                             : "r"(_v8_0_1[5]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 28])[0]), "=f"((&values[0 + 28])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -358,16 +334,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 28]))
+-#endif
+                             : "r"(_v8_0_1[6]));
+                         asm volatile(
+                             "{\n\t"
+-#if IS_BF16
+-                            "shl.b32 %0, %2, 16;\n\t"
+-                            "and.b32 %1, %2, 0xffff0000;\n\t"
+-                            "}\n"
+-                            : "=f"((&values[0 + 30])[0]), "=f"((&values[0 + 30])[1])
+-#else
+                             ".reg .b16 h_lo, h_hi;\n\t"
+                             ".reg .b32 f_lo, f_hi;\n\t"
+                             "mov.b32 {h_lo, h_hi}, %1;\n\t"
+@@ -376,8 +345,25 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+                             "mov.b64 %0, {f_lo, f_hi};\n\t"
+                             "}\n"
+                             : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 30]))
+-#endif
+                             : "r"(_v8_0_1[7]));
++#else
++                        (&values[0 + 16])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) << 16);
++                        (&values[0 + 16])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) & 0xffff0000u);
++                        (&values[0 + 18])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[1]) << 16);
++                        (&values[0 + 18])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[1]) & 0xffff0000u);
++                        (&values[0 + 20])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[2]) << 16);
++                        (&values[0 + 20])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[2]) & 0xffff0000u);
++                        (&values[0 + 22])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[3]) << 16);
++                        (&values[0 + 22])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[3]) & 0xffff0000u);
++                        (&values[0 + 24])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[4]) << 16);
++                        (&values[0 + 24])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[4]) & 0xffff0000u);
++                        (&values[0 + 26])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[5]) << 16);
++                        (&values[0 + 26])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[5]) & 0xffff0000u);
++                        (&values[0 + 28])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[6]) << 16);
++                        (&values[0 + 28])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[6]) & 0xffff0000u);
++                        (&values[0 + 30])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) << 16);
++                        (&values[0 + 30])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) & 0xffff0000u);
++#endif
+                     }
+                 }
+             } else {
+@@ -488,10 +474,17 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
+             unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
+             float inverse = 0.0f;
+             inverse = reinterpret_cast<float*>(&inverse_bits)[0];
++            #if __CUDA_ARCH__ >= 1000
+             const float2 _scale2_2 = {inverse, inverse};
+             #pragma unroll
+             for (int _ls = 0; _ls < 16; _ls++)
+-                mul_f32x2_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_2);
++                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_2);
++            #else
++            #pragma unroll
++            for (int _ls = 0; _ls < 32; _ls++) {
++                values[_ls] = values[_ls] * inverse;
++            }
++            #endif
+             unsigned long long task = global_row * (unsigned long long)BLOCKS_PER_ROW + (unsigned long long)block_col;
+             unsigned long long q_offset = task * 32;
+             {
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_device_common.cuh b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_device_common.cuh
+deleted file mode 100644
+index 076493f674c..00000000000
+--- a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_device_common.cuh
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/*
+- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-// Generated by cake.codegen — do not edit.
+-// Shared device preamble of the sm_100a, sm_103a generated kernels: typedefs, tensor-map ABI
+-// and the union of their compiler helper libraries (4 modules).
+-#pragma once
+-
+-typedef signed char        int8_t;
+-typedef unsigned char      uint8_t;
+-typedef unsigned short     uint16_t;
+-typedef unsigned int       uint32_t;
+-#if defined(__CUDACC_RTC__)
+-typedef unsigned long long uint64_t;
+-#else
+-typedef unsigned long      uint64_t;
+-#endif
+-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+-typedef signed int         int32_t;
+-typedef short int          int16_t;
+-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+-
+-#if defined(__CUDACC_RTC__)
+-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+-#else
+-#include <cuda.h>
+-#endif
+-
+-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+-#include <cuda_bf16.h>
+-#include <cuda_fp8.h>
+-
+-__device__ __forceinline__ int make_warp_uniform(int x) {
+-    int result;
+-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+-                 : "=r"(result) : "r"(x));
+-    return result;
+-}
+-
+-#include <math_constants.h>
+-
+-__device__ __forceinline__ float max_noftz(float a, float b) {
+-    float c;
+-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+-    return c;
+-}
+-
+-__device__ __forceinline__ float row_max_reduce(float2 acc) {
+-    return max_noftz(acc.x, acc.y);
+-}
+-
+-__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
+-    asm("mul.rn.f32x2 %0, %0, %1;"
+-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
+-}
+-
+-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+diff --git a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_host_common.cuh b/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_host_common.cuh
+deleted file mode 100644
+index 41fadca3b24..00000000000
+--- a/csrc/cake_grouped_mxfp8_quantize/cake_grouped_mxfp8_quantize_host_common.cuh
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*
+- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-// Generated by the Cake source exporter — do not edit.
+-// Shared tvm-ffi launch helpers for the generated Cake kernels of one export.
+-#pragma once
+-#include <cuda.h>
+-#include <cuda_bf16.h>
+-#include <cuda_fp16.h>
+-#include <cuda_runtime.h>
+-
+-#include "tvm_ffi_utils.h"
+-
+-namespace cake_host_shim_common {
+-
+-}  // namespace cake_host_shim_common
+diff --git a/flashinfer/aot.py b/flashinfer/aot.py
+index 4e9d9f7f13d..0f3dabfc12b 100644
+--- a/flashinfer/aot.py
++++ b/flashinfer/aot.py
+@@ -197,6 +197,9 @@
+     # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
+     aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
+ )
++from .jit.cake_grouped_mxfp8_quantize import (
++    aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
++)
+ from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
+ from .jit.api_log_stats import gen_api_log_stats_module
+ from .jit.norm import gen_norm_module
+@@ -784,6 +787,14 @@ def gen_all_modules(
+     if has_sm103a_exact:
+         jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_103a"))
+ 
++    # Cake grouped MXFP8 quantize (backend="cake" of mxfp8_grouped_quantize):
++    # the bfloat16 and float16 programs, one library each per exact Blackwell
++    # target; the loader spells the targets "sm_100a" / "sm_103a".
++    if has_sm100a_exact:
++        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_100a"))
++    if has_sm103a_exact:
++        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_103a"))
++
+     # Register the physical source-closed portfolio independently for each
+     # exact Blackwell target. Each JitSpec contains one generated selector TU.
+     # The checkpoint route remains as the only legacy fallback because it is
+diff --git a/flashinfer/jit/cake_grouped_mxfp8_quantize.py b/flashinfer/jit/cake_grouped_mxfp8_quantize.py
+index 7ec9efd2764..64bc78aebe4 100644
+--- a/flashinfer/jit/cake_grouped_mxfp8_quantize.py
++++ b/flashinfer/jit/cake_grouped_mxfp8_quantize.py
+@@ -1,308 +1,124 @@
+-"""JIT loader for the generated Blackwell grouped MXFP8 quantization kernels.
+-
+-Generated by Cake for FlashInfer. Exporter output, hand-edited here pending
+-exporter support: the BF16 and FP16 programs share one kernel source and one
+-launcher source (the ``8d0f000c`` pair). The float16 record selects the FP16
+-text with ``IS_BF16=0`` and names its own kernel symbol and host-shim
+-namespace with ``CAKE_PROGRAM_KERNEL`` / ``CAKE_PROGRAM_SHIM`` through its
+-compile flags; the bfloat16 record builds the sources with their defaults.
++# Copyright (c) 2026 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Generated programs of the Blackwell grouped MXFP8 quantization kernel: one program per
++input dtype (bfloat16, float16), each shipped for sm_100a and sm_103a. The host module
++``flashinfer.quantization.fp8_quantization`` computes the grid and launches them.
++
++Generated file: every value below is derived from the exported sources and checked
++against them; do not edit.
+ """
+ 
+-import functools
+-from pathlib import Path
+-from typing import Any, Literal
+-
+-import torch
+-import tvm_ffi
+-
+-from . import env as jit_env
+-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
+-
+-CakeGroupedMXFP8Target = Literal["sm100a", "sm103a"]
+-CakeGroupedMXFP8Input = Literal["bfloat16", "float16"]
+-
+-# Generated programs of the grouped MXFP8 quantizer (one per input dtype; the
+-# BF16 and FP16 programs differ in their widening sequence).  ``MODULES`` holds
+-# one record per program: the kernel and launcher translation units under
+-# ``csrc/cake_grouped_mxfp8_quantize``, the architectures the source compiles
+-# for, compile flags, FFI entry, argument plan and kernel symbol.  ``KERNELS``
+-# maps the input dtype to its program.  Both literals are exporter output,
+-# hand-edited here pending exporter support: the float16 record lists the
+-# BF16 program's sources and selects the FP16 text, kernel symbol and
+-# host-shim namespace through its compile flags.
+-MODULES: dict[str, dict[str, Any]] = {
+-    "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375": {
+-        "sources": [
+-            "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_kernel.cu",
+-            "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_binding.cu",
+-        ],
+-        "arches": ["sm_100a", "sm_103a"],
+-        "compile_flags": [],
+-        "ffi_entry": "run",
+-        "arg_plan": [
+-            ["buffer", "x"],
+-            ["buffer", "mask"],
+-            ["buffer", "quantized"],
+-            ["buffer", "scales"],
+-            ["parameter", "M"],
+-            ["parameter", "K"],
+-            ["parameter", "PADDED_K"],
+-            ["parameter", "PM_TILES"],
+-            ["parameter", "PK_TILES"],
+-            ["parameter", "BLOCKS_PER_ROW"],
+-            ["parameter", "TOTAL_TASKS"],
+-            ["grid", "grid_x"],
+-            ["grid", "grid_y"],
+-            ["grid", "grid_z"],
+-        ],
+-        "kernel": "kernel_cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375",
+-    },
+-    "cake_grouped_mxfp8_quantize_e5d70aeb234fb379ed05": {
+-        "sources": [
+-            "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_kernel.cu",
+-            "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375_binding.cu",
+-        ],
+-        "arches": ["sm_100a", "sm_103a"],
+-        "compile_flags": [
+-            "-DIS_BF16=0",
+-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_e5d70aeb234fb379ed05",
+-            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2702ef486ba21fb2",
+-        ],
+-        "ffi_entry": "run",
+-        "arg_plan": [
+-            ["buffer", "x"],
+-            ["buffer", "mask"],
+-            ["buffer", "quantized"],
+-            ["buffer", "scales"],
+-            ["parameter", "M"],
+-            ["parameter", "K"],
+-            ["parameter", "PADDED_K"],
+-            ["parameter", "PM_TILES"],
+-            ["parameter", "PK_TILES"],
+-            ["parameter", "BLOCKS_PER_ROW"],
+-            ["parameter", "TOTAL_TASKS"],
+-            ["grid", "grid_x"],
+-            ["grid", "grid_y"],
+-            ["grid", "grid_z"],
+-        ],
+-        "kernel": "kernel_cake_grouped_mxfp8_quantize_e5d70aeb234fb379ed05",
+-    },
+-}
+-KERNELS: dict[str, str] = {
+-    "bfloat16": "cake_grouped_mxfp8_quantize_8d0f000cf214bc5e1375",
+-    "float16": "cake_grouped_mxfp8_quantize_e5d70aeb234fb379ed05",
+-}
+-
+-_TARGET_FLAGS = {"sm100a": sm100a_nvcc_flags, "sm103a": sm103a_nvcc_flags}
+-_TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+-_INPUT_NAMES: dict[torch.dtype, CakeGroupedMXFP8Input] = {
+-    torch.bfloat16: "bfloat16",
+-    torch.float16: "float16",
+-}
+-_QUANT_BLOCK = 32
+-# One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
+-_MAX_GRID_YZ = 65535
+-_SCALE_TILE = 128
+-_THREADS = 128
+-
+-
+-def _get_csrc_dir() -> Path:
+-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_grouped_mxfp8_quantize"
+-    if installed.exists():
+-        return installed
+-    checkout = (
+-        Path(__file__).resolve().parents[2] / "csrc" / "cake_grouped_mxfp8_quantize"
+-    )
+-    if checkout.exists():
+-        return checkout
+-    raise FileNotFoundError(
+-        f"Cake grouped MXFP8 sources were not found. Checked:\n  - {installed}\n  - {checkout}"
+-    )
+-
+-
+-def _get_include_dir() -> Path:
+-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+-        return jit_env.FLASHINFER_INCLUDE_DIR
+-    checkout = Path(__file__).resolve().parents[2] / "include"
+-    if checkout.exists():
+-        return checkout
+-    raise FileNotFoundError(
+-        f"FlashInfer headers were not found. Checked:\n  - {jit_env.FLASHINFER_INCLUDE_DIR}\n  - {checkout}"
+-    )
+-
+-
+-def _device_index(device: torch.device) -> int:
+-    if device.type != "cuda":
+-        raise RuntimeError(
+-            f"the Cake grouped MXFP8 backend requires a CUDA device, got {device}"
+-        )
+-    return torch.cuda.current_device() if device.index is None else device.index
+-
+-
+-@functools.cache
+-def _target_for_device(device_index: int) -> CakeGroupedMXFP8Target:
+-    major, minor = torch.cuda.get_device_capability(device_index)
+-    if (major, minor) == (10, 0):
+-        return "sm100a"
+-    if (major, minor) == (10, 3):
+-        return "sm103a"
+-    raise RuntimeError(
+-        f"the Cake grouped MXFP8 backend requires exact compute capability 10.0 or 10.3, got {major}.{minor}"
+-    )
+-
+-
+-def cake_grouped_mxfp8_target(device: torch.device) -> CakeGroupedMXFP8Target:
+-    """The exact compile target of ``device`` (cached per device index)."""
+-    return _target_for_device(_device_index(device))
+-
+-
+-def _input_name(dtype: torch.dtype) -> CakeGroupedMXFP8Input:
+-    name = _INPUT_NAMES.get(dtype)
+-    if name is None:
+-        raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {dtype}")
+-    return name
+-
+-
+-@functools.cache
+-def _available(input_name: str, device_index: int) -> bool:
+-    if input_name not in KERNELS:
+-        return False
+-    try:
+-        _target_for_device(device_index)
+-    except RuntimeError:
+-        return False
+-    return True
+-
+-
+-def is_cake_grouped_mxfp8_quantize_available(
+-    dtype: torch.dtype, device: torch.device
+-) -> bool:
+-    """Whether a generated program serves ``dtype`` on ``device`` (no I/O; cached)."""
+-    name = _INPUT_NAMES.get(dtype)
+-    if name is None or device.type != "cuda":
+-        return False
+-    return _available(name, _device_index(device))
+-
+-
+-@functools.cache
+-def gen_cake_grouped_mxfp8_quantize_module(
+-    input_name: CakeGroupedMXFP8Input,
+-    target: CakeGroupedMXFP8Target,
+-) -> JitSpec:
+-    if input_name not in KERNELS:
+-        raise ValueError(f"unsupported Cake grouped MXFP8 input: {input_name}")
+-    if target not in _TARGET_FLAGS:
+-        raise ValueError(f"unsupported Cake grouped MXFP8 target: {target}")
+-    record = MODULES[KERNELS[input_name]]
+-    if _TARGET_ARCH[target] not in record["arches"]:
+-        raise ValueError(
+-            f"the {input_name} program is not built for {target} ({record['arches']})"
+-        )
+-    csrc_dir = _get_csrc_dir()
+-    # gen_jit_spec's default use_fast_math (True) is left unchanged here,
+-    # matching the recipe the previously shipped binding used. The scale
+-    # divide (absmax / 448) in the generated source stays the bare `/`
+-    # operator rather than an explicit round-to-nearest intrinsic, so it
+-    # compiles to the same approximate-reciprocal sequence as the kernel
+-    # already shipped under this flag; a provably exact divide here is a
+-    # numerics change outside this delivery's scope and is tracked as a
+-    # maintainer decision item on the tracking issue.
+-    spec = gen_jit_spec(
+-        name=f"cake_grouped_mxfp8_quantize_{input_name}_{target}",
+-        sources=[csrc_dir / relative for relative in record["sources"]],
+-        extra_cuda_cflags=[*_TARGET_FLAGS[target], *record["compile_flags"]],
+-        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
+-    )
+-    logger.info(
+-        "Generated Cake grouped MXFP8 %s %s JIT spec: %s", input_name, target, spec.name
+-    )
+-    return spec
+-
+-
+-@functools.cache
+-def load_cake_grouped_mxfp8_quantize_module(
+-    input_name: CakeGroupedMXFP8Input,
+-    target: CakeGroupedMXFP8Target,
+-):
+-    module = gen_cake_grouped_mxfp8_quantize_module(input_name, target).build_and_load()
+-    logger.info("Loaded Cake grouped MXFP8 %s %s module", input_name, target)
+-    return module
+-
+-
+-def get_cake_grouped_mxfp8_quantize_module(dtype: torch.dtype, device: torch.device):
+-    return load_cake_grouped_mxfp8_quantize_module(
+-        _input_name(dtype), cake_grouped_mxfp8_target(device)
+-    )
+-
+-
+-@functools.cache
+-def _entry(input_name: str, target: str):
+-    module = load_cake_grouped_mxfp8_quantize_module(input_name, target)
+-    record = MODULES[KERNELS[input_name]]
+-    return getattr(module, record["ffi_entry"]), tuple(
+-        (kind, argument) for kind, argument in record["arg_plan"]
+-    )
+-
+-
+-def cake_grouped_mxfp8_quantize_launch(
+-    a: torch.Tensor,
+-    mask: torch.Tensor,
+-    quantized: torch.Tensor,
+-    scales: torch.Tensor,
+-) -> None:
+-    """Quantize ``a`` ``[B, M, K]`` into the caller-owned ``quantized``
+-    ``[B, M, padded_K]`` (E4M3) and ``scales`` ``[B, padded_M, padded_K / 32]``
+-    (UE8M0 bytes in the 128x4 grouped-GEMM layout) on the current stream.
+-
+-    No allocation, no synchronization; the generated launcher rejects
+-    non-dense views, so callers pass contiguous tensors.  Empty problems
+-    (``B == 0`` or ``M == 0``) write nothing.
+-    """
+-    b, m, k = a.shape
+-    if b == 0 or m == 0:
+-        return
+-    if k % _QUANT_BLOCK != 0:
+-        raise ValueError(f"K must be divisible by {_QUANT_BLOCK}, got {k}")
+-    if m > _MAX_GRID_YZ or b > _MAX_GRID_YZ:
+-        raise ValueError(
+-            f"B and M must not exceed the CUDA grid limit {_MAX_GRID_YZ}, got B={b}, M={m}"
+-        )
+-    padded_k = quantized.shape[2]
+-    padded_m = scales.shape[1]
+-    blocks_per_row = padded_k // _QUANT_BLOCK
+-    pm_tiles = padded_m // _SCALE_TILE
+-    pk_tiles = padded_k // _SCALE_TILE
+-    entry, arg_plan = _entry(_input_name(a.dtype), cake_grouped_mxfp8_target(a.device))
+-    # The programs read two-byte elements through one pointer type; the FP16
+-    # program widens with cvt.f32.f16, so its storage is passed as-is (a view).
+-    values = dict(
+-        x=a if a.dtype == torch.bfloat16 else a.view(torch.bfloat16),
+-        mask=mask,
+-        quantized=quantized,
+-        scales=scales.view(b, pm_tiles, pk_tiles, 32, 4, 4),
+-        M=m,
+-        K=k,
+-        PADDED_K=padded_k,
+-        PM_TILES=pm_tiles,
+-        PK_TILES=pk_tiles,
+-        BLOCKS_PER_ROW=blocks_per_row,
+-        TOTAL_TASKS=b * m * blocks_per_row,
+-        grid_x=(blocks_per_row + _THREADS - 1) // _THREADS,
+-        grid_y=m,
+-        grid_z=b,
+-    )
+-    arguments = [values[argument] for _kind, argument in arg_plan]
+-    with tvm_ffi.use_torch_stream():
+-        entry(*arguments)
+-
+-
+-__all__ = [
+-    "CakeGroupedMXFP8Input",
+-    "CakeGroupedMXFP8Target",
+-    "cake_grouped_mxfp8_quantize_launch",
+-    "cake_grouped_mxfp8_target",
+-    "gen_cake_grouped_mxfp8_quantize_module",
+-    "get_cake_grouped_mxfp8_quantize_module",
+-    "is_cake_grouped_mxfp8_quantize_available",
+-    "load_cake_grouped_mxfp8_quantize_module",
+-]
++from __future__ import annotations
++
++from . import cake_program
++from .core import JitSpec
++
++BF16 = cake_program.CakeProgram(
++    name="cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd",
++    operator_dir="cake_grouped_mxfp8_quantize",
++    kernel="kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd",
++    sources=(
++        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu",
++        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu",
++    ),
++    targets=("sm_100a", "sm_103a"),
++    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
++    args=(
++        "x",
++        "mask",
++        "quantized",
++        "scales",
++        "M",
++        "K",
++        "PADDED_K",
++        "PM_TILES",
++        "PK_TILES",
++        "BLOCKS_PER_ROW",
++        "TOTAL_TASKS",
++        "grid_x",
++        "grid_y",
++        "grid_z",
++    ),
++    tensors=("x", "mask", "quantized", "scales"),
++    block=(128, 1, 1),
++    cluster=(1, 1, 1),
++    dynamic_smem_bytes=0,
++    use_pdl=False,
++    cooperative=False,
++    needs_device_linking=False,
++)
++
++F16 = cake_program.CakeProgram(
++    name="cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++    operator_dir="cake_grouped_mxfp8_quantize",
++    kernel="kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++    sources=(
++        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu",
++        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu",
++    ),
++    targets=("sm_100a", "sm_103a"),
++    compile_options=(
++        (
++            "sm_100a",
++            (
++                "--fmad=true",
++                "-DCAKE_PROGRAM_VARIANT=1",
++                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++            ),
++        ),
++        (
++            "sm_103a",
++            (
++                "--fmad=true",
++                "-DCAKE_PROGRAM_VARIANT=1",
++                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
++            ),
++        ),
++    ),
++    args=(
++        "x",
++        "mask",
++        "quantized",
++        "scales",
++        "M",
++        "K",
++        "PADDED_K",
++        "PM_TILES",
++        "PK_TILES",
++        "BLOCKS_PER_ROW",
++        "TOTAL_TASKS",
++        "grid_x",
++        "grid_y",
++        "grid_z",
++    ),
++    tensors=("x", "mask", "quantized", "scales"),
++    block=(128, 1, 1),
++    cluster=(1, 1, 1),
++    dynamic_smem_bytes=0,
++    use_pdl=False,
++    cooperative=False,
++    needs_device_linking=False,
++)
++
++PROGRAMS: tuple[cake_program.CakeProgram, ...] = (BF16, F16)
++
++
++def aot_specs(target: str) -> tuple[JitSpec, ...]:
++    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
++    return cake_program.aot_specs(PROGRAMS, target)
++
++
++__all__ = ["BF16", "F16", "PROGRAMS", "aot_specs"]
+diff --git a/flashinfer/quantization/fp8_quantization.py b/flashinfer/quantization/fp8_quantization.py
+index ab78b8e1c32..95688a19395 100644
+--- a/flashinfer/quantization/fp8_quantization.py
++++ b/flashinfer/quantization/fp8_quantization.py
+@@ -1,8 +1,9 @@
+ import functools
+ from types import SimpleNamespace
+-from typing import Literal, Optional, Tuple
++from typing import Dict, Literal, Optional, Tuple
+ 
+ import torch
++import tvm_ffi
+ 
+ from ..api_logging import flashinfer_api
+ from ..cutile import is_cuda_tile_available
+@@ -10,6 +11,11 @@
+     mxfp8_grouped_quantize_trace,
+     mxfp8_quantize_trace,
+ )
++from ..jit.cake_grouped_mxfp8_quantize import (
++    BF16 as _CAKE_GROUPED_MXFP8_BF16,
++    F16 as _CAKE_GROUPED_MXFP8_F16,
++)
++from ..jit.cake_program import CakeProgram
+ from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+ from ..utils import (
+     device_support_pdl,
+@@ -379,6 +385,158 @@ def _fake_mxfp8_grouped_quantize(
+     )
+ 
+ 
++# Generated Cake programs of the grouped MXFP8 quantizer, one per input dtype.
++# Both read two-byte elements through one bfloat16 pointer (the float16
++# program widens with its own conversion), so the host selects the program by
++# dtype and passes float16 storage as a bfloat16 view.  Each program ships for
++# exact compute capability 10.0 (sm_100a) and 10.3 (sm_103a) only.
++_CAKE_GROUPED_MXFP8_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
++    torch.bfloat16: _CAKE_GROUPED_MXFP8_BF16,
++    torch.float16: _CAKE_GROUPED_MXFP8_F16,
++}
++_CAKE_QUANT_BLOCK = 32
++# One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
++_CAKE_MAX_GRID_YZ = 65535
++_CAKE_SCALE_TILE = 128
++
++
++def _cake_grouped_mxfp8_device_index(device: torch.device) -> int:
++    if device.type != "cuda":
++        raise RuntimeError(
++            f"the Cake grouped MXFP8 backend requires a CUDA device, got {device}"
++        )
++    return torch.cuda.current_device() if device.index is None else device.index
++
++
++@functools.cache
++def _cake_grouped_mxfp8_capability(device_index: int) -> Tuple[int, int]:
++    major, minor = torch.cuda.get_device_capability(device_index)
++    return int(major), int(minor)
++
++
++def _cake_grouped_mxfp8_target(program: CakeProgram, device: torch.device) -> str:
++    """The exact compile target of ``program`` on ``device`` (capability cached per device index)."""
++    major, minor = _cake_grouped_mxfp8_capability(
++        _cake_grouped_mxfp8_device_index(device)
++    )
++    target = program.target_for((major, minor))
++    if target is None:
++        raise RuntimeError(
++            f"the Cake grouped MXFP8 backend requires exact compute capability 10.0 or 10.3, got {major}.{minor}"
++        )
++    return target
++
++
++def is_cake_grouped_mxfp8_quantize_available(
++    dtype: torch.dtype, device: torch.device
++) -> bool:
++    """Whether a generated program serves ``dtype`` on ``device`` (no I/O; the capability query is cached)."""
++    program = _CAKE_GROUPED_MXFP8_PROGRAMS.get(dtype)
++    if program is None or device.type != "cuda":
++        return False
++    try:
++        _cake_grouped_mxfp8_target(program, device)
++    except RuntimeError:
++        return False
++    return True
++
++
++def cake_grouped_mxfp8_quantize_grid(
++    program: CakeProgram, b: int, m: int, blocks_per_row: int
++) -> Tuple[int, int, int]:
++    """Launch grid ``(grid_x, grid_y, grid_z)`` of ``program`` for ``b`` groups of
++    ``m`` rows with ``blocks_per_row`` quantization blocks per row.
++
++    One thread per block along x in CTAs of ``program.block[0]`` threads (the
++    last CTA of a row is partial when ``blocks_per_row`` is not a multiple of
++    the CTA width), one CTA row per M and one grid slice per group.
++    """
++    threads = program.block[0]
++    return ((blocks_per_row + threads - 1) // threads, m, b)
++
++
++def cake_grouped_mxfp8_quantize_launch(
++    a: torch.Tensor,
++    mask: torch.Tensor,
++    quantized: torch.Tensor,
++    scales: torch.Tensor,
++) -> None:
++    """Quantize ``a`` ``[B, M, K]`` into the caller-owned ``quantized``
++    ``[B, M, padded_K]`` (E4M3) and ``scales`` ``[B, padded_M, padded_K / 32]``
++    (UE8M0 bytes in the 128x4 grouped-GEMM layout) on the current stream.
++
++    No allocation, no synchronization; the generated binding checks the tensor
++    dtypes, devices and contiguity and the host checks the shapes here, so
++    callers pass contiguous tensors of exactly these shapes.  Empty problems
++    (``B == 0`` or ``M == 0``) write nothing.
++    """
++    b, m, k = a.shape
++    if b == 0 or m == 0:
++        return
++    if k % _CAKE_QUANT_BLOCK != 0:
++        raise ValueError(f"K must be divisible by {_CAKE_QUANT_BLOCK}, got {k}")
++    if m > _CAKE_MAX_GRID_YZ or b > _CAKE_MAX_GRID_YZ:
++        raise ValueError(
++            f"B and M must not exceed the CUDA grid limit {_CAKE_MAX_GRID_YZ}, got B={b}, M={m}"
++        )
++    program = _CAKE_GROUPED_MXFP8_PROGRAMS.get(a.dtype)
++    if program is None:
++        raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {a.dtype}")
++    target = _cake_grouped_mxfp8_target(program, a.device)
++    # The binding validates dtype, device, contiguity and scalar ranges; the
++    # shapes the kernel's scalars are derived from are validated here.
++    quantized_shape = tuple(quantized.shape)
++    scales_shape = tuple(scales.shape)
++    padded_k = quantized_shape[2] if len(quantized_shape) == 3 else 0
++    padded_m = scales_shape[1] if len(scales_shape) == 3 else 0
++    if tuple(mask.shape) != (b,):
++        raise ValueError(f"mask must have shape [B] = [{b}], got {list(mask.shape)}")
++    if (
++        quantized_shape != (b, m, padded_k)
++        or padded_k % _CAKE_SCALE_TILE
++        or padded_k < max(k, _CAKE_SCALE_TILE)
++    ):
++        raise ValueError(
++            "quantized must have shape [B, M, padded_K] with padded_K a positive "
++            f"multiple of {_CAKE_SCALE_TILE} and >= K={k}, got {list(quantized_shape)}"
++        )
++    blocks_per_row = padded_k // _CAKE_QUANT_BLOCK
++    if (
++        scales_shape != (b, padded_m, blocks_per_row)
++        or padded_m % _CAKE_SCALE_TILE
++        or padded_m < m
++    ):
++        raise ValueError(
++            "scales must have shape [B, padded_M, padded_K / 32] with padded_M a "
++            f"multiple of {_CAKE_SCALE_TILE} and >= M={m}, got {list(scales_shape)}"
++        )
++    pm_tiles = padded_m // _CAKE_SCALE_TILE
++    pk_tiles = padded_k // _CAKE_SCALE_TILE
++    grid_x, grid_y, grid_z = cake_grouped_mxfp8_quantize_grid(
++        program, b, m, blocks_per_row
++    )
++    values = dict(
++        x=a if a.dtype == torch.bfloat16 else a.view(torch.bfloat16),
++        mask=mask,
++        quantized=quantized,
++        scales=scales.view(b, pm_tiles, pk_tiles, 32, 4, 4),
++        M=m,
++        K=k,
++        PADDED_K=padded_k,
++        PM_TILES=pm_tiles,
++        PK_TILES=pk_tiles,
++        BLOCKS_PER_ROW=blocks_per_row,
++        TOTAL_TASKS=b * m * blocks_per_row,
++        grid_x=grid_x,
++        grid_y=grid_y,
++        grid_z=grid_z,
++    )
++    entry = program.entry(target)
++    arguments = [values[name] for name in program.args]
++    with tvm_ffi.use_torch_stream():
++        entry(*arguments)
++
++
+ @functools.cache
+ def get_cake_mxfp8_grouped_quantization_module():
+     """Register the generated Cake grouped MXFP8 op and fake metadata twin."""
+@@ -391,10 +549,6 @@ def cake_mxfp8_grouped_quantize_impl(
+         a: torch.Tensor,
+         mask: torch.Tensor,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        from ..jit.cake_grouped_mxfp8_quantize import (
+-            cake_grouped_mxfp8_quantize_launch,
+-        )
+-
+         b, m, k = a.shape
+         padded_k = _round_up(k, 128)
+         padded_m = _round_up(m, 128)
+@@ -441,10 +595,6 @@ def _mxfp8_grouped_quantize_cake(
+ 
+     if backend != "cake":
+         raise ValueError(f"internal Cake dispatch received backend={backend!r}")
+-    from ..jit.cake_grouped_mxfp8_quantize import (
+-        is_cake_grouped_mxfp8_quantize_available,
+-    )
+-
+     if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
+         raise RuntimeError(
+             "backend='cake' requires float16 or bfloat16 input on a device of "
+diff --git a/tests/utils/test_fp8_quantize.py b/tests/utils/test_fp8_quantize.py
+index 6815485de26..59dab0cf948 100644
+--- a/tests/utils/test_fp8_quantize.py
++++ b/tests/utils/test_fp8_quantize.py
+@@ -1,3 +1,4 @@
++import dataclasses
+ import gc
+ 
+ import pytest
+@@ -44,7 +45,7 @@ def is_cake_grouped_mxfp8_available(dtype):
+     if not torch.cuda.is_available():
+         return False
+     try:
+-        from flashinfer.jit.cake_grouped_mxfp8_quantize import (
++        from flashinfer.quantization.fp8_quantization import (
+             is_cake_grouped_mxfp8_quantize_available,
+         )
+ 
+@@ -614,6 +615,46 @@ def test_mxfp8_grouped_quantize_cake_fake_op_metadata(batch_shape):
+     assert sf.dtype == torch.uint8
+ 
+ 
++@pytest.mark.parametrize(
++    ("b", "m", "blocks_per_row", "expected_x"),
++    [
++        (1, 1, 4, 1),  # K = 128: four blocks fill one partial CTA
++        (2, 120, 128, 1),  # exactly one CTA per row
++        (3, 200, 129, 2),  # one block past the CTA width
++        (4, 128, 255, 2),  # one block short of two full CTAs
++        (2, 256, 1000, 8),  # 1000 / 128 = 7.8125 rounds up
++        (65535, 65535, 4, 1),  # the CUDA grid.y / grid.z limits
++    ],
++)
++def test_cake_grouped_mxfp8_quantize_grid_formula(b, m, blocks_per_row, expected_x):
++    """The public grid helper spells the launch: ceil(blocks / CTA width) CTAs per
++    row, one CTA row per M and one grid slice per group, for both programs."""
++    from flashinfer.jit.cake_grouped_mxfp8_quantize import PROGRAMS
++    from flashinfer.quantization.fp8_quantization import (
++        cake_grouped_mxfp8_quantize_grid,
++    )
++
++    assert len(PROGRAMS) == 2
++    for program in PROGRAMS:
++        threads = program.block[0]
++        assert threads == 128
++        grid = cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row)
++        assert grid == (expected_x, m, b)
++        assert (grid[0] - 1) * threads < blocks_per_row <= grid[0] * threads
++
++
++def test_cake_grouped_mxfp8_quantize_grid_reads_the_program_block():
++    """The CTA width comes from the program's block, not from a constant."""
++    from flashinfer.jit.cake_grouped_mxfp8_quantize import BF16
++    from flashinfer.quantization.fp8_quantization import (
++        cake_grouped_mxfp8_quantize_grid,
++    )
++
++    narrow = dataclasses.replace(BF16, block=(64, 1, 1))
++    assert cake_grouped_mxfp8_quantize_grid(BF16, 2, 3, 129) == (2, 3, 2)
++    assert cake_grouped_mxfp8_quantize_grid(narrow, 2, 3, 129) == (3, 3, 2)
++
++
+ @pytest.mark.parametrize("batch_shape", [(2, 256, 4096), (3, 200, 160)])
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+ @torch.inference_mode()

@@ -1,0 +1,3813 @@
+diff --git a/flashinfer/attention/prims_ts/README.md b/flashinfer/attention/prims_ts/README.md
+index 096c3751a2c..1d43630d1a4 100644
+--- a/flashinfer/attention/prims_ts/README.md
++++ b/flashinfer/attention/prims_ts/README.md
+@@ -302,11 +302,24 @@ the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
+ owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
+ Sage plan.
+ 
++A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
++`query_paired=True`: each CTA then processes two consecutive Q128 tiles of one
++sequence and KV head over a single K/V stream, with each K/V instance of the
++kernel owning one Q tile for the whole sequence instead of alternating K/V
++tiles of one Q tile. Every K/V tile is loaded once for both tiles, which
++helps when K/V loads bound the kernel (16-bit K/V on long sequences). Pairing
++halves the CTA count, so it suits grids that still fill the GPU; a sequence
++with an odd number of Q tiles leaves the second instance of its last CTA idle.
++Causal plans pair too: the CTA streams the K/V range of its later Q tile, and
++the earlier tile masks the extra K/V tile that range can add. Paged decode
++plans pair the same way; see
++[Query pairing](kernels/fmha_decode/README.md#query-pairing).
++
+ Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
+-Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
+-plans, a row keeps its softmax exponent anchor while a tile raises the row
+-maximum by at most that many binades, so the accumulated output is not
+-rescaled; 0 rescales on every new maximum.
++Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
++softmax exponent anchor while a tile raises the row maximum by at most that
++many binades, so the accumulated output is not rescaled; 0 rescales on every
++new maximum.
+ 
+ ## Sage attention
+ 
+@@ -322,8 +335,7 @@ P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
+ O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
+ ```
+ 
+-`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
+-tiles and block-sparse plans, and 0 elsewhere.
++`h` is the plan's `softmax_rescale_threshold_log2` (default 8).
+ 
+ FlashInfer does not quantize: the 8-bit tensors and scales come from the
+ caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
+@@ -491,5 +503,6 @@ pytest -q \
+   tests/attention/test_attention_ts_block_sparse.py \
+   tests/attention/test_attention_ts_features.py \
+   tests/attention/test_attention_ts_mla_decode.py \
++  tests/attention/test_attention_ts_query_paired.py \
+   tests/attention/test_attention_ts_sage.py
+ ```
+diff --git a/flashinfer/attention/prims_ts/_block_sparse/config.py b/flashinfer/attention/prims_ts/_block_sparse/config.py
+index e8234961ffb..d7a3a73b163 100644
+--- a/flashinfer/attention/prims_ts/_block_sparse/config.py
++++ b/flashinfer/attention/prims_ts/_block_sparse/config.py
+@@ -95,6 +95,7 @@ class _BlockSparseCompileKey:
+     use_block_sparse: bool = True
+     sage: SageAttentionConfig | None = None
+     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
++    query_paired: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+@@ -144,6 +145,9 @@ class _BlockSparseStaticProfile:
+     sage: SageAttentionConfig | None = None
+     use_block_sparse: bool = True
+     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
++    # One CTA processes two consecutive Q128 tiles over one K/V stream
++    # (dense plans only).
++    query_paired: bool = False
+ 
+ 
+ def _select_block_sparse_kv_route_size(
+@@ -410,6 +414,25 @@ def _resolve_plan_dtypes(
+     return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
+ 
+ 
++def _validate_query_paired_profile(
++    *,
++    use_block_sparse: bool,
++    q_tile_size: int,
++) -> None:
++    """Reject a query-paired plan outside the dense Q128 path."""
++
++    if use_block_sparse:
++        raise NotImplementedError(
++            "query_paired requires a dense, contiguous K/V plan "
++            "(use_block_sparse=False)"
++        )
++    if q_tile_size != 128:
++        raise NotImplementedError(
++            "query_paired requires a Q128 tile: q_block_size * Hq/Hkv of at "
++            f"least 128; got Q{q_tile_size}"
++        )
++
++
+ def _validate_block_sparse_static_profile(
+     *,
+     batch_size: int,
+@@ -432,11 +455,14 @@ def _validate_block_sparse_static_profile(
+     sage: SageAttentionConfig | None = None,
+     use_block_sparse: bool = True,
+     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
++    query_paired: bool = False,
+ ) -> _BlockSparseStaticProfile:
+     """Validate static policy before any device work or BSR inspection."""
+ 
+     if not isinstance(share_pattern_across_kv_heads, bool):
+         raise TypeError("share_pattern_across_kv_heads must be a bool")
++    if not isinstance(query_paired, bool):
++        raise TypeError("query_paired must be a bool")
+     batch_size = _validate_positive_int(batch_size, "batch_size")
+     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
+     seq_len_kv = _validate_positive_int(seq_len_kv, "seq_len_kv")
+@@ -501,6 +527,11 @@ def _validate_block_sparse_static_profile(
+             route_metadata_capacity=0,
+             num_rows=1,
+         )
++    if query_paired:
++        _validate_query_paired_profile(
++            use_block_sparse=use_block_sparse,
++            q_tile_size=q_tile_size,
++        )
+     return _BlockSparseStaticProfile(
+         batch_size=batch_size,
+         seq_len_q=seq_len_q,
+@@ -527,6 +558,7 @@ def _validate_block_sparse_static_profile(
+         sage=sage,
+         use_block_sparse=use_block_sparse,
+         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
++        query_paired=query_paired,
+     )
+ 
+ 
+@@ -555,6 +587,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
+         "groups_tokens_heads_q": True,
+         "use_block_sparse": key.use_block_sparse,
+         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
++        "query_paired": key.query_paired,
+     }
+     if key.use_block_sparse:
+         config_args.update(
+@@ -638,6 +671,7 @@ def _resolve_block_sparse_launch_spec(
+     v_dtype_key: str,
+     sage: SageAttentionConfig | None = None,
+     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
++    query_paired: bool = False,
+ ) -> _BlockSparseLaunchSpec:
+     """Resolve and cache one validated static or CLC launch.
+ 
+@@ -703,6 +737,7 @@ def parallel_loads(persistent: bool) -> bool:
+         v_dtype_key=v_dtype_key,
+         sage=sage,
+         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
++        query_paired=query_paired,
+     )
+     try:
+         config = _make_block_sparse_config(compile_key)
+diff --git a/flashinfer/attention/prims_ts/_block_sparse/plan.py b/flashinfer/attention/prims_ts/_block_sparse/plan.py
+index 24b508e5b23..25b5830e920 100644
+--- a/flashinfer/attention/prims_ts/_block_sparse/plan.py
++++ b/flashinfer/attention/prims_ts/_block_sparse/plan.py
+@@ -304,6 +304,7 @@ def _build_block_sparse_plan_state(
+             v_dtype_key=static.v_dtype_key,
+             sage=static.sage,
+             softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
++            query_paired=static.query_paired,
+         )
+         policy = (
+             *spec.policy,
+diff --git a/flashinfer/attention/prims_ts/block_sparse.py b/flashinfer/attention/prims_ts/block_sparse.py
+index fa055618705..43c4332bbb2 100644
+--- a/flashinfer/attention/prims_ts/block_sparse.py
++++ b/flashinfer/attention/prims_ts/block_sparse.py
+@@ -173,6 +173,7 @@ def plan(
+         o_data_type: torch.dtype | None = None,
+         sage_config: SageAttentionConfig | None = None,
+         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
++        query_paired: bool = False,
+     ) -> None:
+         """Choose a legal profile and allocate reusable routing capacity.
+ 
+@@ -191,7 +192,9 @@ def plan(
+         ``use_block_sparse=False`` plans dense attention over the whole K/V
+         sequence with the same Q-tile selection. Its route arguments must keep
+         their defaults, and :meth:`run` takes Q/K/V only, plus the scales of a
+-        Sage plan.
++        Sage plan. ``query_paired=True`` makes each CTA of such a dense plan
++        process two consecutive Q128 tiles over one K/V stream; it requires
++        ``head_dim=128`` and a Q128 tile (``q_block_size * Hq / Hkv >= 128``).
+ 
+         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
+         patterns. True uses a singleton head axis in BSR/bitmask inputs and
+@@ -240,16 +243,16 @@ def plan(
+         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
+         :class:`SageAttentionParams`.
+ 
+-        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to
+-        block-sparse plans on the Q64/KV256 and Q128/KV128 profiles and to
+-        dense Q64/KV256 plans: a row keeps its softmax exponent anchor while a
+-        tile raises the row maximum by at most this many binades, which skips
+-        the rescale of the accumulated output. Probabilities then reach
+-        ``2**threshold``, so Sage FP8 P is quantized at ``448 * 2**-threshold``
+-        and probabilities far below the anchor lose E4M3 precision; rows whose
+-        largest scores come first, such as attention sinks in the first
+-        blocks, are the most exposed. 0 rescales on every new row maximum and
+-        quantizes FP8 P at 448.
++        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to the
++        Q64/KV256 and Q128/KV128 profiles of dense and block-sparse plans: a
++        row keeps its softmax exponent anchor while a tile raises the row
++        maximum by at most this many binades, which skips the rescale of the
++        accumulated output. Probabilities then reach ``2**threshold``, so Sage
++        FP8 P is quantized at ``448 * 2**-threshold`` and probabilities far
++        below the anchor lose E4M3 precision; rows whose largest scores come
++        first, such as attention sinks in the first blocks, are the most
++        exposed. 0 rescales on every new row maximum and quantizes FP8 P at
++        448.
+         """
+ 
+         if use_block_sparse:
+@@ -297,6 +300,7 @@ def plan(
+             sage=sage_config,
+             use_block_sparse=use_block_sparse,
+             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
++            query_paired=query_paired,
+         )
+         if use_proxy_routes and static.mask_type != "dense":
+             raise ValueError("block-sparse proxy routes require mask_type='dense'")
+diff --git a/flashinfer/attention/prims_ts/decode.py b/flashinfer/attention/prims_ts/decode.py
+index 4fb096f3984..b46aefdb405 100644
+--- a/flashinfer/attention/prims_ts/decode.py
++++ b/flashinfer/attention/prims_ts/decode.py
+@@ -238,6 +238,7 @@ def _decode_policy_from_config(
+         ("use_cluster_smem_reduction", bool(config.use_cluster_smem_reduction)),
+         ("use_persistent_scheduler", bool(config.use_persistent_scheduler)),
+         ("groups_tokens_heads_q", bool(config.groups_tokens_heads_q)),
++        ("query_paired", bool(config.query_paired)),
+     )
+ 
+ 
+@@ -325,9 +326,8 @@ def _planned_kv_domain_has_unpaired_tail(
+     """Return whether the planned K domain ends with one inactive KV instance."""
+ 
+     tile_size_kv = int(config.tile_size_kv)
+-    num_insts_kv = int(config.num_insts_kv)
+     total_kv_tiles = (max_kv_len + tile_size_kv - 1) // tile_size_kv
+-    return total_kv_tiles % num_insts_kv != 0
++    return total_kv_tiles % int(config.kv_tiles_per_loop) != 0
+ 
+ 
+ def _align_up(value: int, alignment: int = _WORKSPACE_ALIGNMENT) -> int:
+@@ -1228,6 +1228,45 @@ def _decode_launch_spec_from_config(
+     )
+ 
+ 
++# Two consecutive grouped Keeps Q128 tiles of one request and KV head per CTA.
++_QUERY_PAIRED_DECODE_PROFILE = {
++    "use_keeps_mma_ab": True,
++    "tile_size_q": 128,
++    "tile_size_kv": 128,
++    "groups_tokens_heads_q": True,
++    "query_paired": True,
++}
++
++
++def _query_paired_decode_config(
++    make_config: Callable[..., "FmhaDecodeConfig"],
++    config_overrides: dict[str, object],
++    *,
++    batch_size: int,
++    num_kv_heads: int,
++    max_active_clusters: int,
++) -> Optional["FmhaDecodeConfig"]:
++    """Return the query-paired config of a launch, or None to plan it unpaired.
++
++    A launch stays unpaired when the paired profile does not support it, when
++    no request holds two Q tiles, or when its unpaired Q tiles would not fill
++    one wave of CTAs: such a grid splits K/V to fill the GPU, while pairing
++    halves its CTAs.
++    """
++    try:
++        cfg = make_config(
++            {**config_overrides, **_QUERY_PAIRED_DECODE_PROFILE}, split_kv=False
++        )
++    except ValueError:
++        return None
++    if (
++        cfg.num_q_tiles < 2
++        or batch_size * num_kv_heads * cfg.num_q_tiles < max_active_clusters
++    ):
++        return None
++    return cfg
++
++
+ @functools.cache
+ def _resolve_decode_launch_spec(
+     device_index: int,
+@@ -1251,9 +1290,12 @@ def _resolve_decode_launch_spec(
+     use_pdl: bool = False,
+     split_kv: bool = True,
+     share_pattern_across_kv_heads: bool = True,
++    query_paired: Optional[bool] = None,
+ ) -> _DecodeLaunchSpec:
+     """Resolve automatic policy and workspace geometry without compiling."""
+ 
++    if query_paired is not None and not isinstance(query_paired, bool):
++        raise TypeError("query_paired must be a bool or None")
+     seq_len_q = _validate_seq_len_q(seq_len_q)
+     _validate_head_geometry(num_qo_heads, num_kv_heads)
+     _validate_decode_query_head_extent(
+@@ -1291,6 +1333,7 @@ def make_config(
+         splits_kv: int = -1,
+         max_splits_kv: int | None = None,
+         min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
++        split_kv: bool = split_kv,
+     ) -> "FmhaDecodeConfig":
+         return make_decode_config(
+             headdim=head_dim,
+@@ -1365,9 +1408,12 @@ def fits_one_service_wave(config: "FmhaDecodeConfig", num_q_ctas: int) -> bool:
+                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
+             )
+         else:
+-            config_overrides = {"use_pdl": use_pdl}
++            config_overrides: dict[str, object] = {"use_pdl": use_pdl}
+             if use_packed_q:
+                 config_overrides["use_variable_seqlens_q"] = True
++            if query_paired is False:
++                # The grouped-Q cost model may pair Q tiles unless told not to.
++                config_overrides["query_paired"] = False
+             cfg = make_config(config_overrides)
+ 
+             # A grouped fixed-Q launch can leave most of the first service wave
+@@ -1451,6 +1497,17 @@ def fits_one_service_wave(config: "FmhaDecodeConfig", num_q_ctas: int) -> bool:
+                     max_splits_kv=safe_splits,
+                 )
+ 
++            if query_paired:
++                paired_cfg = _query_paired_decode_config(
++                    make_config,
++                    config_overrides,
++                    batch_size=batch_size,
++                    num_kv_heads=num_kv_heads,
++                    max_active_clusters=max_active_clusters,
++                )
++                if paired_cfg is not None:
++                    cfg = paired_cfg
++
+     _validate_decode_policy_kv_tile_size(cfg)
+     return _decode_launch_spec_from_config(
+         cfg,
+@@ -2001,6 +2058,7 @@ def get_prims_ts_batch_decode_workspace_size(
+     storage_page_size: Optional[int] = None,
+     device: Optional[Union[int, str, torch.device]] = None,
+     split_kv: bool = True,
++    query_paired: Optional[bool] = None,
+ ) -> int:
+     """Return caller-workspace bytes for one automatic FMHA policy.
+ 
+@@ -2027,7 +2085,8 @@ def get_prims_ts_batch_decode_workspace_size(
+ 
+     ``split_kv`` permits automatic split fanout when True (default), or forces
+     nonsplit execution when False. It is independent of Q layout and must
+-    match the value supplied to attention planning/launch.
++    match the value supplied to attention planning/launch, as must
++    ``query_paired``.
+     """
+ 
+     batch_size = _validate_positive_int(batch_size, "batch_size")
+@@ -2095,6 +2154,7 @@ def get_prims_ts_batch_decode_workspace_size(
+         storage_page_size,
+         resolved_device,
+         split_kv=split_kv,
++        query_paired=query_paired,
+     ).total_bytes
+ 
+ 
+@@ -2613,6 +2673,7 @@ def _resolve_decode_workspace_layout(
+     use_pdl: bool = False,
+     split_kv: bool = True,
+     share_pattern_across_kv_heads: bool = True,
++    query_paired: Optional[bool] = None,
+ ) -> _DecodeWorkspaceLayout:
+     """Resolve the byte layout for one already-validated semantic key."""
+ 
+@@ -2640,6 +2701,7 @@ def _resolve_decode_workspace_layout(
+         use_pdl,
+         split_kv,
+         share_pattern_across_kv_heads,
++        query_paired,
+     )
+     return _make_decode_workspace_layout(
+         spec.scratch_shapes,
+@@ -3370,6 +3432,7 @@ def _prepare_prims_ts_batch_decode_plan(
+     direct_q1_sparse_block_size: int = 4,
+     share_pattern_across_kv_heads: bool = True,
+     allow_head_aware_locators: bool = False,
++    query_paired: Optional[bool] = None,
+ ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
+     """Validate and freeze one dense-block-table PrimTS launch contract."""
+ 
+@@ -3477,7 +3540,7 @@ def _prepare_prims_ts_batch_decode_plan(
+         split_kv,
+         share_pattern_across_kv_heads,
+     )
+-    spec = _resolve_decode_launch_spec(*policy_args)
++    spec = _resolve_decode_launch_spec(*policy_args, query_paired)
+     if query_major_memberships:
+         if not spec.config.supports_query_major_memberships:
+             raise ValueError(
+@@ -3626,6 +3689,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
+     kv_layout: Literal["HND"] = "HND",
+     page_size: Optional[int] = None,
+     split_kv: bool = True,
++    query_paired: Optional[bool] = None,
+ ) -> PrimsTSBatchDecodePlan:
+     """Validate and prepare a reusable dense-block-table PrimTS launch.
+ 
+@@ -3678,6 +3742,11 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
+     split_kv : bool
+         Permit automatic split fanout (True, default), or force S1 (False).
+         Independent of packed/fixed Q. Match workspace sizing's value.
++    query_paired : bool, optional
++        Run two consecutive grouped Keeps Q128 tiles of one request and KV
++        head per CTA over one K/V stream when the launch supports it (True),
++        never (False), or when the automatic tile selection prefers it
++        (``None``, default). Match workspace sizing's value.
+ 
+     Returns
+     -------
+@@ -3707,6 +3776,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
+         kv_scale_factors=kv_scale_factors,
+         split_kv=split_kv,
+         use_q_token_kv_block_sparse_route=False,
++        query_paired=query_paired,
+     )
+     return plan
+ 
+@@ -3774,6 +3844,7 @@ def plan(
+         workspace_buffer: Optional[torch.Tensor] = None,
+         storage_page_size: Optional[int] = None,
+         split_kv: bool = True,
++        query_paired: Optional[bool] = None,
+         validate: bool = True,
+         initialize_workspace: bool = True,
+     ) -> None:
+@@ -3859,6 +3930,16 @@ def plan(
+             unsplit execution (False), independently of ``packed_query``.
+             Typically False for prefill and True for decode. This choice is
+             frozen for the lifetime of the plan.
++        query_paired : bool, optional
++            Run two consecutive grouped Keeps Q128 tiles of one request and KV
++            head per CTA over one K/V stream. True pairs when the launch
++            supports it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or
++            128 for FP8, which pairs only fixed-Q page-32 launches) and no
++            sliding window, two Q tiles in a request, and enough Q tiles to
++            fill one wave of CTAs. ``None`` (default) pairs when the automatic
++            tile selection for fixed multi-token page-32 launches scores the
++            paired tile cheapest; False never pairs. The plan's policy records
++            the outcome.
+         validate : bool
+             Validate static geometry and caller scratch. Defaults to ``True``.
+             Disable only for previously validated inputs and warmed topology.
+@@ -3949,7 +4030,9 @@ def plan(
+             window_left,
+             storage_page_size,
+         )
+-        spec = _resolve_decode_launch_spec(*policy_args, split_kv=split_kv)
++        spec = _resolve_decode_launch_spec(
++            *policy_args, split_kv=split_kv, query_paired=query_paired
++        )
+         if specialization_seq_lens is None:
+             kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
+             kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
+@@ -4277,6 +4360,7 @@ def batch_decode_with_paged_kv_cache(
+     out_dtype: Optional[torch.dtype] = None,
+     page_size: Optional[int] = None,
+     split_kv: bool = True,
++    query_paired: Optional[bool] = None,
+     workspace_buffer: Optional[torch.Tensor] = None,
+     max_kv_len: Optional[int] = None,
+     validate: bool = True,
+@@ -4339,6 +4423,10 @@ def batch_decode_with_paged_kv_cache(
+     split_kv : bool
+         Allow automatic split fanout (True, default), or force S1 (False),
+         independently of packed/fixed query storage.
++    query_paired : bool, optional
++        Run two consecutive grouped Keeps Q128 tiles of one request and KV
++        head per CTA when the launch supports it (True), never (False), or
++        when the automatic tile selection prefers it (``None``, default).
+     workspace_buffer : torch.Tensor, optional
+         Zero-initialized caller-owned byte scratch; re-zero when layout inputs
+         (including batch size) change. Exclusive to one in-flight launch/graph.
+@@ -4498,6 +4586,7 @@ def batch_decode_with_paged_kv_cache(
+             storage_page_size=storage_page_size,
+             device=q.device,
+             split_kv=split_kv,
++            query_paired=query_paired,
+         )
+         workspace_buffer = torch.empty(
+             workspace_bytes, dtype=torch.int8, device=q.device
+@@ -4515,6 +4604,7 @@ def batch_decode_with_paged_kv_cache(
+         max_seq_len_q=resolved_seq_len_q,
+         storage_page_size=storage_page_size,
+         split_kv=split_kv,
++        query_paired=query_paired,
+         packed_query=use_packed_q,
+         q_data_type=q.dtype,
+         k_data_type=k_cache.dtype,
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/README.md b/flashinfer/attention/prims_ts/kernels/fmha_decode/README.md
+index 7424211855a..e911f7c6371 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/README.md
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/README.md
+@@ -9,8 +9,10 @@ The public API describes attention semantics and cache metadata. Tile shapes
+ and launch policy are selected internally for the problem and GPU. Fixed-Q
+ and packed-Q plans may use direct, persistent, or split-KV execution according
+ to the caller's split permission. Sliding-window plans remain nonsplit, but
+-may use direct or CLC-persistent execution. There is no public scheduler or
+-tuning knob and no fallback to another attention backend.
++may use direct or CLC-persistent execution. Apart from the `query_paired`
++choice described under [Query pairing](#query-pairing), there is no public
++scheduler or tuning knob, and there is no fallback to another attention
++backend.
+ 
+ For eligible nonsplit grids with more than one resident wave, cluster launch
+ control (CLC) assigns work to resident CTAs. Underfilled fixed- or packed-Q grids may
+@@ -139,7 +141,7 @@ supported. Rows may have padding between them; each row must be contiguous.
+ | Head dimension | 64, 128, or 256 |
+ | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
+ | Packed Q | Positive per-request lengths no greater than a positive static maximum |
+-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
++| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. FP16/BF16 D128 plans add grouped Keeps Q128 on direct launches without a sliding window; automatic selection takes it for fixed multi-token page-32 launches. |
+ | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+ | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
+ | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
+@@ -149,6 +151,7 @@ supported. Rows may have padding between them; each row must be contiguous.
+ | Mask | Dense or bottom-right causal |
+ | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
+ | Scheduling | Automatic direct or CLC-persistent launch; `split_kv=True` permits eligible underfilled fixed/packed-Q grids to split. False disables splitting. Automatic sliding-window splits remain unqualified. |
++| Query pairing | `query_paired`: automatic (`None`), forced when supported (`True`), or off (`False`); see [Query pairing](#query-pairing) |
+ | Accumulation | FP32 QK/PV and softmax state |
+ 
+ FP8-E4M3 Q with FP8-E4M3 or NVFP4 K/V can write BF16 directly. Set
+@@ -177,6 +180,33 @@ maps still span the complete physical page pool and use each cache tensor's
+ runtime outer page stride, so page IDs may be arbitrary and physical pages may
+ have padded storage.
+ 
++## Query pairing
++
++A query-paired plan runs two consecutive grouped Keeps Q128 tiles of one
++request and KV head in each CTA, over a single K/V stream. Each of the
++kernel's two K/V instances owns one of the Q tiles for the whole sequence
++instead of alternating K/V tiles of one Q tile, and each K/V tile is loaded
++once for both. Pairing halves the CTA count, so it pays off when K/V loads
++bound the kernel and the paired grid needs fewer CTA waves.
++
++`plan()`, the one-shot and prepared launches, and workspace sizing take
++`query_paired`; pass the same value to workspace sizing as to the launch:
++
++- `None` (default): the automatic tile selection of fixed multi-token
++  page-32 launches scores the paired tile with the unpaired ones and pairs
++  FP16/BF16 plans when that saves CTA waves. FP8 plans do not pair
++  automatically.
++- `True`: pair whenever the launch supports it: an FP16, BF16, or FP8
++  recipe with head dim 128 (64 or 128 for FP8, which pairs only fixed-Q
++  page-32 launches), no sliding window, at least two Q tiles in a request,
++  and enough unpaired Q tiles to fill one wave of CTAs. Other launches plan
++  unpaired.
++- `False`: never pair.
++
++The plan's policy records the outcome. Paired plans do not split K/V. In a
++causal plan the CTA streams the K/V range of its later Q tile, and the
++earlier tile masks the extra K/V tile that range can add.
++
+ ## Tensor and metadata layouts
+ 
+ - SQ=1 fixed Q/O: `[B, Hq, D]`.
+@@ -226,9 +256,10 @@ Q + paged K/V
+     -> direct O, or split-KV partials -> reduction -> O
+ ```
+ 
+-Profiles that stream score fragments (KV256 tiles, block-sparse routes and
+-8-bit Q128/KV128) choose their softmax arithmetic per architecture. SM100
+-evaluates a quarter of each fragment's exponentials as FMA polynomials to
++Profiles that stream score fragments (KV256 tiles, block-sparse routes, and
++Q128/KV128 tiles whose K and V are both 16-bit or both 8-bit) choose their
++softmax arithmetic per architecture. SM100 evaluates three eighths of each
++fragment's exponentials (a quarter on KV256 tiles) as FMA polynomials to
+ offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
+ MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
+ maxima) from LDTM.STAT instead of a register reduction.
+@@ -405,5 +436,6 @@ split-KV, and resource-safety coverage lives in:
+ 
+ ```bash
+ pytest -q tests/attention/test_attention_ts_decode.py
++pytest -q tests/attention/test_attention_ts_query_paired.py
+ pytest -q tests/trace/test_fi_trace_template_consistency.py
+ ```
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py
+index 42ba3d0e971..6194a2757c2 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_config.py
+@@ -42,6 +42,7 @@
+     E4M3_MAX,
+     SOFTMAX_RESCALE_THRESHOLD_LOG2,
+     AUTO_LAUNCH_TILE_SIZE_KV,
++    KV_TILE_256_MAX_EX2_EMULATED_PAIRS,
+     BITS_PER_BYTE,
+     BYTES_PER_KIB,
+     FALLBACK_SM_COUNT_B200,
+@@ -385,6 +386,18 @@ class GroupedQMmaCandidate:
+     tile_size_q: int
+     q_tokens_per_cta: int
+     q_tiles: int
++    # Each CTA runs two consecutive Q tiles over one K/V stream.
++    query_paired: bool = False
++
++    @property
++    def q_groups_per_cta(self) -> int:
++        """Return the Q tiles one CTA owns: two when query-paired, else one."""
++        return 2 if self.query_paired else 1
++
++    @property
++    def ctas_per_kv_head(self) -> int:
++        """Return the CTAs that cover ``q_tiles`` for one batch and KV head."""
++        return (self.q_tiles + self.q_groups_per_cta - 1) // self.q_groups_per_cta
+ 
+ 
+ @dataclass(frozen=True)
+@@ -428,10 +441,23 @@ class GroupedQLaunchCandidate:
+     128: 1.32,
+ }
+ _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
++# A 16-bit Keeps Q128 CTA costs 1.88x (B200) and 1.93x (GB300) the Q64/KV256
++# CTA that the Q64 factor stands for after the KV256 promotion, so its factor
++# is that ratio of the Q64 factor rather than the shared TileQ128 factor.
++_GROUPED_Q_16BIT_KEEPS_Q128_MAINLOOP_COST = 3.2
++# A query-paired CTA loads each 16-bit K/V tile once for its two Q128 tiles;
++# per Q tile it costs this fraction of an unpaired CTA (0.94 to 0.95 on B200
++# and GB300 with long K/V). 8-bit K/V, whose loads cost less, saves 2% on B200
++# and nothing on GB300, so automatic selection pairs only the 16-bit recipe.
++_QUERY_PAIRED_16BIT_MAINLOOP_SCALE = 0.95
+ 
+ 
+ def enumerate_grouped_q_mma_candidates(
+-    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
++    *,
++    heads_q_per_kv: int,
++    seq_len_q: int,
++    swaps_only: bool = False,
++    query_paired: bool = False,
+ ) -> tuple[GroupedQMmaCandidate, ...]:
+     """Return grouped-Q candidates without applying launch policy.
+ 
+@@ -441,6 +467,8 @@ def enumerate_grouped_q_mma_candidates(
+     cases.  This helper deliberately does not inspect dtypes, reduction modes,
+     scheduler state, or mutate ``FmhaDecodeConfig``. ``swaps_only`` excludes
+     KeepsMmaAb tiles for profiles such as transformed mixed-precision K/V.
++    ``query_paired`` adds the Keeps Q128 tile paired two per CTA when a
++    sequence holds at least two of them.
+     """
+     if heads_q_per_kv <= 0:
+         raise ValueError("heads_q_per_kv must be positive")
+@@ -462,6 +490,14 @@ def enumerate_grouped_q_mma_candidates(
+                 q_tiles=(seq_len_q + q_tokens_per_cta - 1) // q_tokens_per_cta,
+             )
+         )
++    if query_paired:
++        candidates += [
++            replace(candidate, query_paired=True)
++            for candidate in candidates
++            if candidate.variant == "keeps_mma_ab"
++            and candidate.tile_size_q == 128
++            and candidate.q_tiles >= 2
++        ]
+     return tuple(candidates)
+ 
+ 
+@@ -475,17 +511,19 @@ def make_grouped_q_launch_candidate(
+     batch_size: int,
+     num_heads_kv: int,
+     service_capacity: int,
++    mainloop_cost: float,
+ ) -> GroupedQLaunchCandidate:
+     """Build one empirical grouped-Q launch-cost record.
+ 
+     The model follows the measured GQA-generation cost structure:
+ 
+-    ``(mainloop_factor[TileQ] * seq_len_per_cta_kv +``
++    ``(mainloop_cost * seq_len_per_cta_kv +``
+     `` reduction_factor[TileQ] * 128 * splits_kv) * waves``.
+ 
+-    This is a small deterministic default heuristic. It deliberately uses the
+-    same factors for every dtype; the production profile validator still
+-    determines which actual-dtype recipes are legal.
++    This is a small deterministic default heuristic. ``mainloop_cost`` is the
++    TileQ factor, shared by every dtype except recipes measured separately;
++    the production profile validator still determines which actual-dtype
++    recipes are legal.
+     """
+     if splits_kv <= 0:
+         raise ValueError("splits_kv must be positive")
+@@ -503,11 +541,11 @@ def make_grouped_q_launch_candidate(
+         raise ValueError("service_capacity must be positive")
+     kv_tiles = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
+     seq_len_per_cta_kv = ((kv_tiles + splits_kv - 1) // splits_kv) * tile_size_kv
+-    base_ctas = batch_size * num_heads_kv * candidate.q_tiles
++    base_ctas = batch_size * num_heads_kv * candidate.ctas_per_kv_head
+     launched_ctas = base_ctas * splits_kv
+     waves = (launched_ctas + service_capacity - 1) // service_capacity
+     modeled_time = (
+-        _GROUPED_Q_MAINLOOP_COST[candidate.tile_size_q] * seq_len_per_cta_kv
++        mainloop_cost * seq_len_per_cta_kv
+         + _GROUPED_Q_REDUCTION_COST[candidate.tile_size_q]
+         * _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR
+         * splits_kv
+@@ -672,6 +710,11 @@ class FmhaDecodeConfig:
+     # (K0/V0 and K1/V1) let two parallel SoftmaxTask groups consume alternating
+     # tiles, improving SM utilization when tile_size_q is tiny.
+     num_insts_kv: int = 2  # K/V instances per loop step
++    # Query-paired topology: the two instances are two consecutive Q tiles of
++    # one KV head that share every K/V tile (one K and one V load per tile,
++    # QK0/QK1 and PV0/PV1 from the same stages, one output tile each) instead
++    # of two halves of one Q tile's KV range. Dense Keeps Q128/KV128 only.
++    query_paired: bool = False
+ 
+     # ------------------------------------------------------------------
+     # Data types
+@@ -1036,8 +1079,8 @@ def q_tma_tokens_per_cta(self) -> int:
+         return self.q_tokens_per_cta
+ 
+     @property
+-    def num_q_ctas(self) -> int:
+-        """Return Q-CTA groups per ``(batch, KV head)`` launch tile.
++    def num_q_tiles(self) -> int:
++        """Return Q tiles per ``(batch, KV head)`` launch tile.
+ 
+         Shape-aware decode configs always carry a positive head ratio. Keep
+         raw shape-less configs conservative so this scheduling predicate can
+@@ -1052,6 +1095,34 @@ def num_q_ctas(self) -> int:
+         )
+         return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
+ 
++    @property
++    def q_groups_per_cta(self) -> int:
++        """Return the Q tiles one CTA owns: two when query-paired, else one."""
++        return 2 if self.query_paired else 1
++
++    @property
++    def num_q_ctas(self) -> int:
++        """Return Q CTAs per ``(batch, KV head)`` launch tile."""
++        return (self.num_q_tiles + self.q_groups_per_cta - 1) // self.q_groups_per_cta
++
++    @property
++    def kv_tiles_per_loop(self) -> int:
++        """Return the K/V tiles one loop iteration advances.
++
++        Each instance takes its own tile per iteration, except in the
++        query-paired topology, where both instances read the same tile.
++        """
++        return 1 if self.query_paired else self.num_insts_kv
++
++    def kv_inst_tile_offset(self, inst_id: int) -> int:
++        """Return instance ``inst_id``'s tile offset within a loop iteration."""
++        return 0 if self.query_paired else inst_id
++
++    @property
++    def merges_kv_instances(self) -> bool:
++        """Whether two K/V instances' partial O tiles merge into one output tile."""
++        return self.num_insts_kv != 1 and not self.query_paired
++
+     @property
+     def has_single_q_cta(self) -> bool:
+         """Whether every physical split maps to one logical Q CTA."""
+@@ -1507,8 +1578,9 @@ def use_fp8_kv(self) -> bool:
+     softmax_order_barrier_threads: int = 256
+     # Score pairs per streamed K32 fragment whose exponentials run as FMA
+     # polynomials instead of MUFU. The best value depends on the GPU's MUFU
+-    # rate; ``arch_config_args`` supplies it for the launch device.
+-    ex2_emulated_pairs: int = 4
++    # rate; ``arch_config_args`` supplies it for the launch device, and
++    # ``fragment_ex2_emulated_pairs`` caps it on KV256 tiles.
++    ex2_emulated_pairs: int = 6
+     # Reduce streamed score-fragment maxima inside the TMEM load
+     # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+     uses_ldtm_stat: bool = False
+@@ -1526,6 +1598,16 @@ def smem_q_tile_elements(self) -> int:
+         """Return Q elements in one staged SMEM tile."""
+         return self.smem_q_tile_bytes // self.q_dtype_bytes
+ 
++    @property
++    def smem_q_stage_bytes(self) -> int:
++        """Return the bytes of one Q pipeline stage: the CTA's Q tiles."""
++        return self.smem_q_tile_bytes * self.q_groups_per_cta
++
++    @property
++    def smem_q_stage_elements(self) -> int:
++        """Return Q elements in one Q pipeline stage."""
++        return self.smem_q_stage_bytes // self.q_dtype_bytes
++
+     @property
+     def use_parallel_separate_reduction(self) -> bool:
+         """Use the production standalone reducer for separate-GMEM modes."""
+@@ -1654,6 +1736,17 @@ def softmax_score_fragment_regs(self) -> int:
+             return 32
+         return self.num_s_regs_per_thread
+ 
++    @property
++    def fragment_ex2_emulated_pairs(self) -> int:
++        """Return a streamed fragment's score pairs exponentiated on the FMA pipe.
++
++        KV128 tiles take ``ex2_emulated_pairs``; KV256 tiles take at most
++        ``KV_TILE_256_MAX_EX2_EMULATED_PAIRS``.
++        """
++        if self.tile_size_kv == 256:
++            return min(self.ex2_emulated_pairs, KV_TILE_256_MAX_EX2_EMULATED_PAIRS)
++        return self.ex2_emulated_pairs
++
+     @property
+     def num_softmax_score_fragments(self) -> int:
+         """Return score fragments used to cover one logical KV tile."""
+@@ -1874,11 +1967,12 @@ def static_local_kv_tiles(self) -> int:
+         """Return static KV tiles assigned to one split CTA."""
+         if not self.use_split_kv:
+             return self.total_kv_tiles
+-        tiles_per_cta_group = self.splits_kv * self.num_insts_kv
++        tiles_per_loop = self.kv_tiles_per_loop
++        tiles_per_cta_group = self.splits_kv * tiles_per_loop
+         num_groups = (
+             self.total_kv_tiles + tiles_per_cta_group - 1
+         ) // tiles_per_cta_group
+-        return max(self.num_insts_kv, num_groups * self.num_insts_kv)
++        return max(tiles_per_loop, num_groups * tiles_per_loop)
+ 
+     @property
+     def inferred_kv_stages(self) -> int:
+@@ -1889,7 +1983,7 @@ def inferred_kv_stages(self) -> int:
+             // Q_ROW_ALIGNMENT_BYTES
+         ) * Q_ROW_ALIGNMENT_BYTES
+         fixed_bytes = (
+-            q_row_bytes * self.tile_size_q * self.q_stages
++            q_row_bytes * self.tile_size_q * self.q_groups_per_cta * self.q_stages
+             + self.correction_sum_scratch_entries * FP32_BYTES
+         )
+         if not self.uses_tmem_p:
+@@ -2253,7 +2347,7 @@ def uses_q_desc_ref(self) -> bool:
+     @property
+     def has_odd_kv_tail(self) -> bool:
+         """Whether the K/V tile count leaves an unpaired tail instance."""
+-        return (self.total_kv_tiles % self.num_insts_kv) != 0
++        return (self.total_kv_tiles % self.kv_tiles_per_loop) != 0
+ 
+     @property
+     def uses_uniform_causal_mask(self) -> bool:
+@@ -2298,6 +2392,38 @@ def _uses_contiguous_grouped_keeps_recipe(self) -> bool:
+         )
+         return self._grouped_keeps_profile_key in profiles
+ 
++    @property
++    def _uses_paged_16bit_keeps_q128_recipe(self) -> bool:
++        """Whether a paged Keeps Q128 config uses an FP16/BF16 recipe.
++
++        These recipes run the contiguous FP16/BF16 resources with the paged
++        FP8 Q128 K/V loads.
++        """
++        return (
++            self.use_paged_kv
++            and self.use_keeps_mma_ab
++            and self.tile_size_q == 128
++            and self._grouped_keeps_profile_key in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
++        )
++
++    @property
++    def _in_grouped_q_selection_scope(self) -> bool:
++        """Whether the grouped-Q cost model may select this launch's Q tile.
++
++        It covers fixed multi-token grouped launches over page-32 K/V without
++        sliding windows or attention sinks; the selector also requires the
++        caller to leave the MMA and launch fields unpinned.
++        """
++        return (
++            self.groups_tokens_heads_q
++            and self.use_paged_kv
++            and self.num_tokens_per_page == 32
++            and not self.use_variable_seqlens_q
++            and self.max_seq_len_q > 1
++            and not self.use_sliding_window_causal
++            and not self.use_attention_sinks
++        )
++
+     @property
+     def _kv256_dtypes_qualified(self) -> bool:
+         """Whether the Q64/KV256 profile is qualified for this dtype combination."""
+@@ -2308,6 +2434,9 @@ def _kv256_dtypes_qualified(self) -> bool:
+     @property
+     def supports_auto_grouped_keeps(self) -> bool:
+         """Whether grouped Keeps is also qualified for automatic selection."""
++        if self._uses_paged_16bit_keeps_q128_recipe:
++            # Only the grouped-Q cost model compares this tile with the others.
++            return self._in_grouped_q_selection_scope and self.supports_grouped_keeps
+         if (
+             self.use_paged_kv
+             and self.tile_size_kv == 128
+@@ -2509,11 +2638,11 @@ def uses_staged_one_inst_tmem_p(self) -> bool:
+     def uses_two_inst_tmem_p(self) -> bool:
+         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
+ 
+-        Dense 16-bit Q128/KV128 and the other unstreamed profiles publish a
+-        complete packed-P row per pipeline token. Streamed profiles use the
+-        same S-to-P aliasing contract but stream four independently ready K32
+-        fragments (see ``streams_tmem_p_fragments``). Q64/KV128 keeps the base
+-        kernel's faster SMEM-P cadence.
++        Unstreamed profiles publish a complete packed-P row per pipeline
++        token. Streamed profiles use the same S-to-P aliasing contract but
++        stream four independently ready K32 fragments (see
++        ``streams_tmem_p_fragments``). Q64/KV128 keeps the base kernel's
++        faster SMEM-P cadence.
+         """
+         # Two-instance Keeps keeps stats outside S, so both static and persistent
+         # work tiles can overlay P on the consumed S instance. The split K/V
+@@ -2544,12 +2673,14 @@ def streams_tmem_p_fragments(self) -> bool:
+ 
+         A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
+         routes, whose loops wait on K/V loads that the earlier PV start hides.
+-        It also streams with 8-bit K and V and SMEM softmax stats (the 8-bit
+-        Q/K/V and Sage recipes) unless Q-token page membership applies: a
+-        dense fragment's keep word is one visible token range and cannot
+-        express per-page membership. Dense 16-bit Q128/KV128 (not load-bound),
+-        FP8 D64 (softmax stats in TMEM) and QK-BF16/PV-FP8 keep the complete
+-        row.
++        Dense KV128 tiles stream too when K and V share a width and the
++        softmax stats travel through SMEM (the 16-bit and 8-bit Q/K/V recipes,
++        including Sage): the PV MMA starts on the first fragment instead of
++        the complete row, and the exponentials share the FMA pipe
++        (``fragment_ex2_emulated_pairs``). Q-token page membership keeps the
++        complete row, since a dense fragment's keep word is one visible token
++        range and cannot express per-page membership; so do FP8 D64 (softmax
++        stats in TMEM) and QK-BF16/PV-FP8.
+         """
+         if not self.uses_two_inst_tmem_p:
+             return False
+@@ -2557,8 +2688,7 @@ def streams_tmem_p_fragments(self) -> bool:
+             self.tile_size_kv == 256
+             or self.use_block_sparse
+             or (
+-                self.k_dtype.width == 8
+-                and self.v_dtype.width == 8
++                self.k_dtype.width == self.v_dtype.width
+                 and self.keeps_stats_via_smem
+                 and not self.uses_q_token_kv_block_sparse_page_membership
+             )
+@@ -2571,16 +2701,11 @@ def defers_softmax_anchor_updates(self) -> bool:
+         Keeps correction skips the in-place O rescale whenever the anchor is
+         unchanged, so keeping the prior anchor within
+         ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
+-        fewer TMEM rescales. The profiles listed here are the ones where that
+-        trade was measured to pay: KV256 tiles and block-sparse routes, whose
+-        row maximum moves often but rarely by much. A zero headroom anchors on
+-        the exact row maximum.
++        fewer TMEM rescales. A row maximum moves often but rarely by much, so
++        every Keeps profile takes the trade. A zero headroom anchors on the
++        exact row maximum.
+         """
+-        return (
+-            self.use_keeps_mma_ab
+-            and (self.tile_size_kv == 256 or self.use_block_sparse)
+-            and self.softmax_anchor_headroom_log2 > 0
+-        )
++        return self.use_keeps_mma_ab and self.softmax_anchor_headroom_log2 > 0
+ 
+     @property
+     def softmax_anchor_headroom_log2(self) -> float:
+@@ -2684,7 +2809,7 @@ def sage_scale_layout(self, seq_len_kv: int) -> _SageScaleLayout:
+         )
+         q_rows = layout.q_rows
+         assert q_rows.tokens_per_tile == self.q_tokens_per_cta
+-        assert q_rows.tiles == self.num_q_ctas
++        assert q_rows.tiles == self.num_q_tiles
+         return layout
+ 
+     def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
+@@ -3033,6 +3158,19 @@ def supports_grouped_keeps(self) -> bool:
+                 )
+             )
+ 
++        if self._uses_paged_16bit_keeps_q128_recipe:
++            return (
++                direct
++                and self.mask_type in (DENSE, CAUSAL)
++                and not any(
++                    (
++                        self.use_persistent_scheduler,
++                        self.use_sliding_window_causal,
++                        self.use_attention_sinks,
++                    )
++                )
++            )
++
+         if profile in _GROUPED_KEEPS_STATIC_ONLY_PROFILES:
+             return (
+                 self.tile_size_q == 64
+@@ -3438,7 +3576,7 @@ def _require_python_int(field_name: str) -> int:
+             f"kv_stages={cfg.kv_stages}"
+         )
+     pipeline_smem_bytes = (
+-        cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
++        cfg.q_stages * cfg.smem_q_stage_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
+     )
+     pipeline_smem_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
+     if pipeline_smem_bytes > pipeline_smem_budget_bytes:
+@@ -4234,6 +4372,7 @@ def _apply_grouped_q_mma_candidate(
+     """Apply one internally selected grouped-Q MMA tile to ``cfg``."""
+     cfg.use_keeps_mma_ab = candidate.variant == "keeps_mma_ab"
+     cfg.tile_size_q = candidate.tile_size_q
++    cfg.query_paired = candidate.query_paired
+     if cfg.use_keeps_mma_ab:
+         return
+     cfg.tmem_s_cols = candidate.tile_size_q
+@@ -4301,6 +4440,14 @@ def _resolve_grouped_q_launch_candidates(
+         )
+     except ValueError:
+         return ()
++    mainloop_cost = _GROUPED_Q_MAINLOOP_COST[candidate.tile_size_q]
++    if probe._uses_paged_16bit_keeps_q128_recipe:
++        mainloop_cost = _GROUPED_Q_16BIT_KEEPS_Q128_MAINLOOP_COST
++    if candidate.query_paired:
++        if not probe._uses_paged_16bit_keeps_q128_recipe:
++            return ()
++        # A paired CTA runs its Q tiles over one K/V stream and never splits it.
++        mainloop_cost *= candidate.q_groups_per_cta * _QUERY_PAIRED_16BIT_MAINLOOP_SCALE
+ 
+     split_candidates = enumerate_auto_splits_kv(
+         seq_len_kv=seq_len_kv,
+@@ -4310,7 +4457,7 @@ def _resolve_grouped_q_launch_candidates(
+         num_insts_kv=cost_num_insts_kv,
+         num_q_tiles=candidate.q_tiles,
+         service_capacity=service_capacity,
+-        split_kv=split_kv,
++        split_kv=split_kv and not candidate.query_paired,
+     )
+     recipes = []
+     for candidate_splits_kv in split_candidates:
+@@ -4339,6 +4486,7 @@ def _resolve_grouped_q_launch_candidates(
+                 batch_size=batch_size,
+                 num_heads_kv=num_heads_kv,
+                 service_capacity=service_capacity,
++                mainloop_cost=mainloop_cost,
+             )
+         )
+     return tuple(recipes)
+@@ -4369,14 +4517,7 @@ def _apply_auto_grouped_q_mma_config(
+     if (
+         not auto_tuner
+         or split_kv_mode != "disabled"
+-        or seq_len_q <= 1
+-        or cfg.use_variable_seqlens_q
+-        or not cfg.groups_tokens_heads_q
+-        or not cfg.use_paged_kv
+-        or cfg.num_tokens_per_page != 32
+-        or cfg.mask_type != CAUSAL
+-        or cfg.use_sliding_window_causal
+-        or cfg.use_attention_sinks
++        or not cfg._in_grouped_q_selection_scope
+         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
+         or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
+         or splits_kv != -1
+@@ -4388,6 +4529,9 @@ def _apply_auto_grouped_q_mma_config(
+         heads_q_per_kv=num_heads_q // num_heads_kv,
+         seq_len_q=seq_len_q,
+         swaps_only=cfg.use_transform_kv,
++        # A caller that sets query_paired keeps that choice, and only 16-bit
++        # K/V pairs automatically.
++        query_paired="query_paired" not in explicit_fields and cfg.k_dtype_bytes == 2,
+     )
+     if not candidates:
+         return None
+@@ -4584,16 +4728,6 @@ def _should_auto_select_launch_mode(
+     )
+ 
+ 
+-def _num_q_tiles_for_launch(cfg: FmhaDecodeConfig) -> int:
+-    """Return the physical Q-CTA multiplicity for launch occupancy."""
+-    q_geometry = make_q_tile_geometry(
+-        rows_per_cta=cfg.tile_size_q,
+-        heads_q_per_kv=cfg.heads_q_per_kv,
+-        groups_tokens_heads_q=cfg.groups_tokens_heads_q,
+-    )
+-    return max(q_geometry.num_q_ctas(cfg.max_seq_len_q), 1)
+-
+-
+ def _apply_auto_launch_mode(
+     cfg: FmhaDecodeConfig,
+     *,
+@@ -4619,7 +4753,7 @@ def _apply_auto_launch_mode(
+         batch_size=batch_size,
+         num_heads_kv=num_heads_kv,
+         seq_len_kv=seq_len_kv,
+-        num_q_tiles=_num_q_tiles_for_launch(cfg),
++        num_q_tiles=cfg.num_q_ctas,
+         tile_size_kv=cfg.tile_size_kv,
+         split_kv=split_kv,
+     )
+@@ -4699,7 +4833,7 @@ def _apply_split_kv_config(
+         num_heads_kv=num_heads_kv,
+         tile_size_kv=cfg.tile_size_kv,
+         num_insts_kv=cfg.num_insts_kv,
+-        num_q_tiles=_num_q_tiles_for_launch(cfg),
++        num_q_tiles=cfg.num_q_ctas,
+         requested_splits_kv=splits_kv,
+         max_splits_kv=max_splits_kv,
+         min_loop_iters_per_split=min_loop_iters_per_split,
+@@ -4826,6 +4960,42 @@ def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
+         )
+ 
+ 
++def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> None:
++    """Reject a query-paired config outside the grouped Keeps Q128/KV128 schedule."""
++    if (
++        not cfg.use_keeps_mma_ab
++        or not cfg.groups_tokens_heads_q
++        or cfg.tile_size_q != 128
++        or cfg.tile_size_kv != 128
++        or cfg.num_insts_kv != 2
++        or cfg.headdim not in (64, 128)
++        or cfg.head_dim_per_stage_kv != 0
++    ):
++        raise ValueError(
++            "query_paired requires the grouped Keeps Q128/KV128 profile with "
++            "two instances and head dim 64 or 128"
++        )
++    if not (
++        cfg._uses_contiguous_grouped_keeps_recipe
++        or (
++            cfg.use_paged_kv
++            and cfg._grouped_keeps_profile_key in _GROUPED_KEEPS_PAGED_FP8_PROFILES
++        )
++    ):
++        raise ValueError("query_paired supports FP16, BF16, Sage and paged FP8 recipes")
++    if (
++        cfg.use_block_sparse
++        or cfg.use_split_kv
++        or split_kv_mode != "disabled"
++        or cfg.use_transform_kv
++        or cfg.use_sliding_window_causal
++    ):
++        raise ValueError(
++            "query_paired supports no block-sparse routes, sliding windows, "
++            "split-KV or transform-KV"
++        )
++
++
+ def _validate_profile_support(
+     *,
+     cfg: FmhaDecodeConfig,
+@@ -4845,6 +5015,8 @@ def _validate_profile_support(
+     _validate_mixed_kv_dtype_profile(cfg)
+     if cfg.o_stages != cfg.num_insts_kv:
+         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
++    if cfg.query_paired:
++        _validate_query_paired_config(cfg, split_kv_mode)
+     _validate_kv256_static_config(cfg)
+     if cfg.mask_type not in (DENSE, CAUSAL):
+         raise ValueError("mask_type must be DENSE or CAUSAL")
+@@ -5254,10 +5426,11 @@ def validate_storage_page_size(
+ def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+     """Return the config fields whose value depends on the GPU architecture.
+ 
+-    SM100 runs a quarter of the streamed exponentials as FMA polynomials
+-    because the MUFU issue rate bounds its P pass while the FMA pipe is nearly
+-    idle; larger shares grow the fragment body until the softmax warps become
+-    instruction-fetch bound. SM103 doubles the MUFU ex2 rate (32 results per
++    SM100 runs three eighths of the streamed exponentials of KV128 tiles (a
++    quarter on KV256 tiles) as FMA polynomials because the MUFU issue rate
++    bounds its P pass while the FMA pipe has room; larger shares grow the
++    fragment body until the softmax warps become instruction-fetch bound.
++    SM103 doubles the MUFU ex2 rate (32 results per
+     SM clock), so the polynomials only add instructions there and every
+     exponential stays on MUFU. GPUs whose TMEM loads return score maxima
+     (LDTM.STAT) take them from the load, which replaces the max pass's
+@@ -5265,7 +5438,7 @@ def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+     """
+     is_sm103 = tuple(compute_capability) == (10, 3)
+     return {
+-        "ex2_emulated_pairs": 0 if is_sm103 else 4,
++        "ex2_emulated_pairs": 0 if is_sm103 else 6,
+         "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
+     }
+ 
+@@ -5317,10 +5490,10 @@ def make_decode_config(
+     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
+        dense/causal mask, sliding-window flags, attention-sink flags, default
+        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
+-       KV stage count. For an unpinned fixed multi-Q paged-causal page-32
+-       launch, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
+-       tiles and every useful direct/split recipe through the first
+-       capacity-crossing fanout.
++       KV stage count. For an unpinned fixed multi-Q paged page-32 launch
++       with a dense or causal mask, the Q selector first enumerates
++       Swaps8/16/32 and Keeps64/128 tiles and every useful direct/split
++       recipe through the first capacity-crossing fanout.
+        Production-valid recipes minimize the empirical TileQ
+        mainloop-plus-reduction proxy using their actual Q-grid CTA waves.
+        Only a selected Q64 Keeps recipe may then promote a qualified FP16/BF16
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_constants.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_constants.py
+index f120a13f02c..a59f1d78471 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_constants.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_constants.py
+@@ -56,13 +56,18 @@
+ # letting an intermediate probability exceed 2**8; the softmax identity is
+ # unchanged apart from normal finite-precision rounding. As in the
+ # FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
+-# adversarial values outside the qualified probability bound. Streamed KV256
+-# and block-sparse Keeps profiles apply it; see
+-# ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
++# adversarial values outside the qualified probability bound. Keeps profiles
++# apply it; see ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+ # ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
+ # and is the block-sparse plans' default for every P dtype.
+ SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
+ 
++# KV256 tiles run at most this many score pairs of a streamed K32 fragment as
++# FMA polynomials, below the share that KV128 tiles take on SM100: their
++# 16-bit fragment loops slow down with a larger share. See
++# ``FmhaDecodeConfig.fragment_ex2_emulated_pairs``.
++KV_TILE_256_MAX_EX2_EMULATED_PAIRS = 4
++
+ # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
+ # the resulting register hand-off has a fixed cost. Paired B200 measurements
+ # show that it is amortized once a Q64/KV256 CTA processes at least 32 tiles
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py
+index 7a2235d8bc2..6d4d184d45c 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_kernel.py
+@@ -74,7 +74,6 @@
+     KV_KIND_K,
+     KV_KIND_V,
+     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
+-    MAX_KV_STAGE_SMEM_KIB,
+     SMEM_CAPACITY_KIB,
+ )
+ from .fmha_decode_resources import (
+@@ -96,7 +95,8 @@
+     TmemTransformedKvResource,
+ )
+ from .fmha_decode_resources.helpers_common import (
+-    _q_group_token_base,
++    _q_cta_first_token,
++    _q_cta_kv_domain_token_base,
+     _q_seq_bounds,
+ )
+ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
+@@ -233,15 +233,16 @@ def _stages_page_ids_per_tile(uses_paired_page_offset_resources: bool) -> bool:
+     return uses_paired_page_offset_resources
+ 
+ 
+-def _compute_decode_gen_loop_domain(total_kv_tiles: int, num_insts_kv: int) -> int:
++def _compute_decode_gen_loop_domain(total_kv_tiles: int, kv_tiles_per_loop: int) -> int:
+     """Number of post-head steady-state iterations.
+ 
+-    HEAD consumes the first `num_insts_kv` K tiles. The remaining tiles are
+-    processed in staggered groups of `num_insts_kv`, so odd tail groups still
+-    need one final loop iteration, matching the schedule's pull-down behavior.
++    HEAD consumes the first `kv_tiles_per_loop` K tiles. The remaining tiles
++    are processed in staggered groups of `kv_tiles_per_loop`, so odd tail
++    groups still need one final loop iteration, matching the schedule's
++    pull-down behavior.
+     """
+-    remaining_kv_tiles = max(total_kv_tiles - num_insts_kv, 0)
+-    return (remaining_kv_tiles + num_insts_kv - 1) // num_insts_kv
++    remaining_kv_tiles = max(total_kv_tiles - kv_tiles_per_loop, 0)
++    return (remaining_kv_tiles + kv_tiles_per_loop - 1) // kv_tiles_per_loop
+ 
+ 
+ def _compute_total_kv_tiles(seq_len_kv: int, tile_size_kv: int) -> int:
+@@ -312,12 +313,10 @@ def _compute_local_kv_tiles(cfg: FmhaDecodeConfig, total_kv_tiles: int) -> int:
+     """KV tiles covered by each CtaKv in split-KV mode."""
+     if not cfg.use_split_kv:
+         return total_kv_tiles
+-    tiles_per_cta_group = cfg.splits_kv * cfg.num_insts_kv
++    tiles_per_loop = cfg.kv_tiles_per_loop
++    tiles_per_cta_group = cfg.splits_kv * tiles_per_loop
+     num_groups = (total_kv_tiles + tiles_per_cta_group - 1) // tiles_per_cta_group
+-    return max(
+-        cfg.num_insts_kv,
+-        num_groups * cfg.num_insts_kv,
+-    )
++    return max(tiles_per_loop, num_groups * tiles_per_loop)
+ 
+ 
+ def _build_decode_gen_schedule(
+@@ -514,7 +513,7 @@ def _build_decode_gen_schedule(
+         else SignalingThreads.All
+     )
+     q_bytes_per_load_warp = (
+-        cfg.smem_q_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
++        cfg.smem_q_stage_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+     )
+ 
+     # ------------------------------------------------------------------
+@@ -528,10 +527,11 @@ def _build_decode_gen_schedule(
+     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
+     # K and V of different byte widths take the split-resource paths with one
+     # K ring and one V ring, each shared by both K/V instances; equal widths
+-    # (including Int8 K with E4M3 V) share one ring.
++    # (including Int8 K with E4M3 V) share one ring. Paired Q tiles read the
++    # same K/V tiles, so their two instances share the rings as well.
+     use_shared_inst_kv_rings = (
+         cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
+-    )
++    ) or cfg.query_paired
+     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
+     # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
+     # smaller stage tiles can prefetch farther without increasing the budget.
+@@ -589,12 +589,9 @@ def _build_decode_gen_schedule(
+         else max((split_total_v_stages + cfg.num_insts_kv - 2) // cfg.num_insts_kv, 1)
+     )
+     if use_shared_inst_kv_rings and not use_one_inst_qkv:
+-        # One K and one V stage per unit of depth.
+-        shared_inst_kv_stages = max(
+-            (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
+-            // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
+-            1,
+-        )
++        # The K ring and the V ring each take half of ``kv_stages``, whose
++        # budget already holds every Q tile of the CTA.
++        shared_inst_kv_stages = max(cfg.kv_stages // 2, 1)
+         split_k0_stages = shared_inst_kv_stages
+         split_v0_stages = shared_inst_kv_stages
+     use_ordered_softmax_barrier = (
+@@ -654,7 +651,7 @@ def _build_decode_gen_schedule(
+ 
+     smem_q_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+         num_stages=cfg.q_stages,
+-        num_bytes=cfg.smem_q_tile_bytes,
++        num_bytes=cfg.smem_q_stage_bytes,
+         producer_group=tma_producer,
+         consumer_group=umma_hw,
+         cta_layout_vmnk=cta_layout,
+@@ -1603,7 +1600,7 @@ def smem_bytes(allocator: SmemAllocator) -> int:
+     # counts, the final wave still requires one additional loop iteration so
+     # that inst0 can process the last K/V tile.
+     local_kv_tiles = _compute_local_kv_tiles(cfg, total_kv_tiles)
+-    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.num_insts_kv)
++    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.kv_tiles_per_loop)
+ 
+     load_domain = loop_domain
+     mma_domain = loop_domain
+@@ -2821,7 +2818,7 @@ def _run_decode_gen_active(
+             cfg,
+             runtime_seq_len_kv,
+             seq_len_q,
+-            _q_group_token_base(cfg, q_group_idx),
++            _q_cta_kv_domain_token_base(cfg, q_group_idx),
+         )
+         split_idx = cute.arch.block_idx()[0] % Int32(cfg.splits_kv)
+         run_task_graph = cute.arch.make_warp_uniform(
+@@ -3151,8 +3148,8 @@ def decode_gen_kernel(
+     if cutlass.const_expr(not cfg.use_persistent_scheduler):
+         if cutlass.const_expr(cfg.use_variable_seqlens_q):
+             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
+-        q_token_base = _q_group_token_base(cfg, q_group_idx)
+-        q_tile_is_active = q_token_base < seq_len_q
++        q_token_base = _q_cta_kv_domain_token_base(cfg, q_group_idx)
++        q_tile_is_active = _q_cta_first_token(cfg, q_group_idx) < seq_len_q
+ 
+     # Persistent block coordinates identify physical workers rather than
+     # logical tiles; their WorkQueue owns the equivalent Q predicate. Split-KV
+@@ -3550,15 +3547,13 @@ def fmha_decode_launch(
+                 cfg.heads_q_per_kv,
+                 cfg.q_tma_tokens_per_cta,
+             )
+-            q_groups = Int32(
+-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
+-            )
++            q_tiles = Int32(cfg.num_q_tiles)
+         else:
+             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1)
+             head_ctas_per_token = Int32(
+                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
+             )
+-            q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
++            q_tiles = Int32(cfg.max_seq_len_q) * head_ctas_per_token
+         if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
+             # A partial group may read the next sequence into inactive Q rows.
+             # QK/softmax/PV rows are independent; row masks and guarded stores
+@@ -3593,12 +3588,10 @@ def fmha_decode_launch(
+                 cfg.q_tokens_per_cta,
+                 1,
+             )
+-            q_groups = Int32(
+-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
+-            )
++            q_tiles = Int32(cfg.num_q_tiles)
+         else:
+             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1, 1, 1)
+-            q_groups = (
++            q_tiles = (
+                 (h_r + Int32(cfg.tile_size_q - 1)) // Int32(cfg.tile_size_q)
+             ) * q_seq
+         tma_desc_q = create_tensor_map_tiled_from_view(
+@@ -3687,6 +3680,10 @@ def fmha_decode_launch(
+             swizzle=cuda.TensorMapSwizzle.none,
+         )
+ 
++    # One CTA owns ``q_groups_per_cta`` consecutive Q tiles.
++    q_groups = q_tiles
++    if cutlass.const_expr(cfg.q_groups_per_cta > 1):
++        q_groups = cute.ceil_div(q_tiles, cfg.q_groups_per_cta)
+     grid_x = q_groups
+     if cutlass.const_expr(cfg.use_split_kv):
+         grid_x = q_groups * Int32(cfg.splits_kv)
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py
+index 23fc82d712d..acb2ac0637b 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py
+@@ -492,7 +492,9 @@ def _softmax_tile_idx(
+     cfg: FmhaDecodeConfig, stage_info: StageInfo, inst_id: int
+ ) -> Int32:
+     """Tile index consumed by the softmax-side MMA loop (inst_id ∈ {0, 1})."""
+-    return stage_info.loop_offset * Int32(cfg.num_insts_kv) + Int32(inst_id)
++    return stage_info.loop_offset * Int32(cfg.kv_tiles_per_loop) + Int32(
++        cfg.kv_inst_tile_offset(inst_id)
++    )
+ 
+ 
+ @cute.jit
+@@ -555,23 +557,56 @@ def _logical_head_batch(
+ 
+ 
+ @cute.jit
+-def _logical_q_group_idx(
++def _logical_cta_q_group_idx(
+     cfg: Constexpr[FmhaDecodeConfig],
+     stage_info: StageInfo,
+     fallback_q_group_idx: Int32,
+ ) -> Int32:
+-    """Resolve the q-group from the persistent work tile or static launch."""
++    """Resolve the CTA's logical Q group from the work tile or static launch."""
++    q_group_idx = fallback_q_group_idx
+     if cutlass.const_expr(cfg.has_single_q_cta):
+         # A split coordinate may still vary in grid X, but every physical CTA
+         # maps to logical Q group zero. State this explicitly because the
+         # release compiler does not infer the range from the launch geometry.
+-        return Int32(0)
+-    if cutlass.const_expr(stage_info.work_tile is not None):
+-        q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
++        q_group_idx = Int32(0)
++    elif cutlass.const_expr(stage_info.work_tile is not None):
++        q_group_idx = Int32(stage_info.work_tile.tile_idx[0])
+         if cutlass.const_expr(cfg.use_split_kv):
+-            return q_group_cta_idx // Int32(cfg.splits_kv)
+-        return q_group_cta_idx
+-    return fallback_q_group_idx
++            q_group_idx = q_group_idx // Int32(cfg.splits_kv)
++    return q_group_idx
++
++
++@cute.jit
++def _logical_q_group_idx(
++    cfg: Constexpr[FmhaDecodeConfig],
++    stage_info: StageInfo,
++    fallback_q_group_idx: Int32,
++    inst_id: Constexpr[int],
++) -> Int32:
++    """Resolve the Q tile of instance ``inst_id`` from the work tile or static launch.
++
++    ``_instance_q_group_idx`` turns the CTA's logical Q group into the
++    instance's Q tile, which is the group itself unless the CTA pairs Q
++    tiles. State shared by the CTA's Q tiles derives from the group through
++    ``_q_cta_first_token`` and ``_q_cta_kv_domain_token_base`` instead.
++    """
++    return _instance_q_group_idx(
++        cfg, _logical_cta_q_group_idx(cfg, stage_info, fallback_q_group_idx), inst_id
++    )
++
++
++@cute.jit
++def _instance_q_group_idx(
++    cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32, inst_id: Constexpr[int]
++) -> Int32:
++    """Return the Q tile of instance ``inst_id`` of the CTA's logical Q group.
++
++    A CTA owns ``q_groups_per_cta`` consecutive Q tiles; without query
++    pairing that is the group itself.
++    """
++    if cutlass.const_expr(cfg.q_groups_per_cta == 1):
++        return q_group_idx
++    return q_group_idx * Int32(cfg.q_groups_per_cta) + Int32(inst_id)
+ 
+ 
+ @cute.jit
+@@ -620,6 +655,45 @@ def _q_group_token_base(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) ->
+     return Int32(0)
+ 
+ 
++@cute.jit
++def _q_cta_first_token(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) -> Int32:
++    """Return the first Q token of a CTA's logical Q group.
++
++    The group's first Q tile holds it, so the CTA has valid rows exactly when
++    this token is inside the sequence.
++    """
++    return _q_group_token_base(cfg, _instance_q_group_idx(cfg, q_group_idx, 0))
++
++
++@cute.jit
++def _q_cta_kv_domain_token_base(
++    cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32
++) -> Int32:
++    """Return the Q token base whose K/V domain covers a CTA's logical Q group.
++
++    The CTA's Q tiles read one K/V stream. A causal K/V range grows with the
++    Q token, so the union of the group's ranges is the range of its last Q
++    tile; a tile past the end of the sequence takes the sequence's last
++    token, which the group's last valid tile holds. Query-paired plans have
++    no sliding window, whose left bound would follow the first tile instead.
++    """
++    return _q_group_token_base(
++        cfg, _instance_q_group_idx(cfg, q_group_idx, cfg.q_groups_per_cta - 1)
++    )
++
++
++@cute.jit
++def _logical_cta_kv_domain_token_base(
++    cfg: Constexpr[FmhaDecodeConfig],
++    stage_info: StageInfo,
++    fallback_q_group_idx: Int32,
++) -> Int32:
++    """Return the K/V-domain Q token base of the CTA's logical Q group."""
++    return _q_cta_kv_domain_token_base(
++        cfg, _logical_cta_q_group_idx(cfg, stage_info, fallback_q_group_idx)
++    )
++
++
+ @cute.jit
+ def _q_tile_valid_rows_for_seq(
+     cfg: Constexpr[FmhaDecodeConfig],
+@@ -645,10 +719,15 @@ def _q_tile_valid_rows_for_seq(
+         token_idx = q_group_idx // head_ctas_per_token
+         head_cta_idx = q_group_idx - token_idx * head_ctas_per_token
+         head_base = head_cta_idx * Int32(cfg.tile_size_q)
+-        return cute.math.min(
++        valid_rows = cute.math.min(
+             cute.math.max(Int32(cfg.heads_q_per_kv) - head_base, Int32(0)),
+             Int32(cfg.tile_size_q),
+         )
++        if cutlass.const_expr(cfg.q_groups_per_cta > 1):
++            # The last CTA's later Q tiles can start past the sequence.
++            if token_idx >= seq_len_q:
++                valid_rows = Int32(0)
++        return valid_rows
+     return cute.math.min(
+         cute.math.max(
+             h_r - q_group_idx * Int32(cfg.tile_size_q),
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py
+index 896780914d1..1b6aea781b4 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py
+@@ -366,16 +366,22 @@ def _local_kv_tile_idx_for_section(
+     - HEAD produces only initial K tiles.
+     - LOOP produces V for the current MMA iteration and K for the next one.
+     - TAIL drains the final V tiles after the last loop iteration.
++
++    Each iteration advances ``kv_tiles_per_loop`` tiles and instance
++    ``inst_id`` takes the tile at ``kv_inst_tile_offset`` within the step:
++    its own tile, or the step's single tile when the instances are paired
++    Q tiles.
+     """
+-    num_insts_kv = Int32(cfg.num_insts_kv)
++    tiles_per_loop = Int32(cfg.kv_tiles_per_loop)
++    inst_offset = Int32(cfg.kv_inst_tile_offset(inst_id))
+     if cutlass.const_expr(section == FmhaStage.Head):
+-        return Int32(inst_id)
++        return inst_offset
+     if cutlass.const_expr(section == FmhaStage.Loop):
+-        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
++        base = stage_info.loop_offset * tiles_per_loop + inst_offset
+         if cutlass.const_expr(kv_kind == KV_KIND_V):
+             return base
+-        return base + num_insts_kv
+-    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
++        return base + tiles_per_loop
++    return stage_info.loop_end * tiles_per_loop + inst_offset
+ 
+ 
+ @cute.jit
+@@ -411,7 +417,7 @@ def resolve_keeps_tile_context(
+             Int32(0),
+         )
+ 
+-    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx)
++    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx, inst_id)
+     q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
+     element_mask_end_idx = seq_len_kv
+     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py
+index bb3448d4035..f1c180fd7b1 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_p.py
+@@ -744,7 +744,7 @@ def _exponentiate_fragment_pairs(
+             p1 = Float32(s_arr[value_idx + 1])
+             if cutlass.const_expr(
+                 _pair_uses_ex2_emulation(
+-                    pair_idx, pairs_per_fragment, self.cfg.ex2_emulated_pairs
++                    pair_idx, pairs_per_fragment, self.cfg.fragment_ex2_emulated_pairs
+                 )
+             ):
+                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py
+index 3e2031504ef..c6cccafa7a7 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/smem_resources.py
+@@ -73,10 +73,10 @@
+     _clamp_valid_tile_idx,
+     _decode_gen_task_cache,
+     _kv_smem_swizzle,
++    _logical_cta_kv_domain_token_base,
+     _logical_head_batch,
+     _logical_q_group_idx,
+     _major_k_stride_bytes,
+-    _q_group_token_base,
+     _qkv_smem_swizzle,
+ )
+ from .helpers_kv_tile_idx import (
+@@ -368,7 +368,11 @@ def _issue_sparse_page_copies(
+ 
+ @dataclass(kw_only=True)
+ class SmemQResource(DecodeGenResourceBase):
+-    """Q tile in SMEM. Loaded once in HEAD."""
++    """The CTA's Q tiles in SMEM, loaded once in HEAD.
++
++    A stage holds ``q_groups_per_cta`` consecutive tiles, each with its own
++    TMA load; the stage descriptor names the first tile.
++    """
+ 
+     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+         (
+@@ -394,7 +398,7 @@ def _init_placeholder_state(self) -> None:
+         """Create placeholder Q SMEM and descriptor state for static analysis."""
+         self._smem_base_q = _placeholder_smem_array(
+             self.cfg.q_dtype,
+-            self.cfg.smem_q_tile_elements * self.cfg.q_stages,
++            self.cfg.smem_q_stage_elements * self.cfg.q_stages,
+         )
+         self._q_descs = _placeholder_local_array(
+             cutlass.Int64, self.cfg.q_stages, alignment=8
+@@ -405,7 +409,7 @@ def get_smem_requirements(self) -> list[SmemAllocation]:
+         if self._alloc is None:
+             self._alloc = SmemAllocation(
+                 name=f"{self.name}",
+-                size_bytes=self.cfg.smem_q_tile_bytes * self.cfg.q_stages,
++                size_bytes=self.cfg.smem_q_stage_bytes * self.cfg.q_stages,
+                 alignment=self.cfg.stensor_align,
+             )
+         return [self._alloc]
+@@ -425,7 +429,7 @@ def _create_initial_task_locals(
+             self._smem_base_q = cutlass.Array(
+                 context.smem_base.data_ptr() + self._alloc.offset,
+                 dtype=self.cfg.q_dtype,
+-                shape=(self.cfg.smem_q_tile_elements * self.cfg.q_stages,),
++                shape=(self.cfg.smem_q_stage_elements * self.cfg.q_stages,),
+                 addrspace=3,
+             )
+             self._q_descs = cutlass.Array(
+@@ -434,7 +438,7 @@ def _create_initial_task_locals(
+                 space=cutlass.AddressSpace.rmem,
+                 alignment=8,
+             )
+-            stage_elems = self.cfg.smem_q_tile_elements
++            stage_elems = self.cfg.smem_q_stage_elements
+             q_head_dim_partition = min(self.cfg.headdim, 64)
+             # 16-bit Q uses two 64-column TMA loads for headDim=128. FP8 Q
+             # uses a descriptor stride based on the actual MMA K-major swizzle.
+@@ -582,7 +586,7 @@ def _complete_grouped_q_padding(self, stage_info: StageInfo) -> None:
+     @producer_work
+     @cute.jit
+     def tma_load(self, stage_info: StageInfo) -> None:
+-        """TMA load the current staged Q tile from GMEM to SMEM."""
++        """TMA load the current stage's Q tiles from GMEM to SMEM."""
+         cfg = self.cfg
+         # ProdWork: issue the Q TMA copies for the current pipeline stage. The
+         # pipeline barrier in stage_info is the handoff to the MMA consumer.
+@@ -591,11 +595,32 @@ def tma_load(self, stage_info: StageInfo) -> None:
+         logical_h_k_idx, logical_b_idx = _logical_head_batch(
+             stage_info, self.h_k_idx, self.b_idx
+         )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
+         # Select the SMEM stage owned by this producer fire. The TS pipeline
+         # barrier attached to stage_info protects this stage until QK consumes it.
+-        stage_elems = cfg.smem_q_tile_elements
+-        stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
++        stage_base = self._smem_base_q.subview(
++            stage_info.stage_idx * cfg.smem_q_stage_elements
++        )
++        first_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx, 0)
++        for tile_idx in cutlass.range_constexpr(cfg.q_groups_per_cta):
++            self._tma_load_tile(
++                stage_info,
++                stage_base.subview(tile_idx * cfg.smem_q_tile_elements),
++                first_q_group_idx + Int32(tile_idx),
++                logical_h_k_idx,
++                logical_b_idx,
++            )
++
++    @cute.jit
++    def _tma_load_tile(
++        self,
++        stage_info: StageInfo,
++        stage_base: cutlass.Array,
++        logical_q_group_idx: Int32,
++        logical_h_k_idx: Int32,
++        logical_b_idx: Int32,
++    ) -> None:
++        """Issue the TMA copies of one Q tile into ``stage_base``."""
++        cfg = self.cfg
+         if cutlass.const_expr(cfg.q_dtype_bytes == 1):
+             if _is_load_task_warp_leader(cfg):
+                 if cutlass.const_expr(cfg.headdim <= 128):
+@@ -678,14 +703,17 @@ def tma_load(self, stage_info: StageInfo) -> None:
+     @consumer_work(returns=q_desc_slot)
+     @cute.jit
+     def q_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+-        """Build Q SMEM descriptor for tcgen05 MMA B operand."""
++        """Build the stage's first Q tile descriptor for the tcgen05 MMA B operand.
++
++        A paired instance advances it by its tile inside the QK MMA.
++        """
+         # ConsWork: return the descriptor for the stage LoadTask committed.
+         q_desc = prims.Tcgen05SmemDesc(self._q_descs[Int32(stage_info.stage_idx)])
+         return q_desc
+ 
+     @cute.jit
+     def current_consumer_q_desc(self) -> prims.Tcgen05SmemDesc:
+-        """Return Q's just-waited stage without creating a routed task local.
++        """Return the just-waited stage's first Q tile without a routed task local.
+ 
+         Packed persistent skipping guards the complete data path. Routing a Q
+         descriptor from guarded HEAD into LOOP would make that descriptor a
+@@ -954,10 +982,10 @@ def _maybe_runtime_tile_idx(self, stage_info: StageInfo, tile_idx: Int32) -> Int
+             self.h_k_idx,
+             self.b_idx,
+         )
+-        logical_q_group_idx = _logical_q_group_idx(
++        # The ring's tiles serve every Q tile of the CTA.
++        q_token_base = _logical_cta_kv_domain_token_base(
+             self.cfg, stage_info, self.q_group_idx
+         )
+-        q_token_base = _q_group_token_base(self.cfg, logical_q_group_idx)
+         tile_idx = _runtime_split_kv_global_tile_idx(
+             self.cfg,
+             stage_info,
+@@ -1652,11 +1680,8 @@ def encoded_locator_window_tiles(self) -> int:
+         # inert partner in odd-tail direct launches so lane-partitioned locator
+         # reads remain in bounds; the producer fills that partner with -1.
+         local_tiles = self.cfg.static_local_kv_tiles
+-        return (
+-            (local_tiles + self.cfg.num_insts_kv - 1)
+-            // self.cfg.num_insts_kv
+-            * self.cfg.num_insts_kv
+-        )
++        tiles_per_loop = self.cfg.kv_tiles_per_loop
++        return (local_tiles + tiles_per_loop - 1) // tiles_per_loop * tiles_per_loop
+ 
+     def _init_placeholder_state(self) -> None:
+         """Create placeholder storage for per-stage page-offset windows."""
+@@ -2199,14 +2224,13 @@ def _producer_load_page_offsets(
+                 # The allocation covers the planned maximum, but a shorter
+                 # runtime split may consume fewer tiles. Do not map a
+                 # neighboring CTA's candidates just to fill unused SMEM.
+-                runtime_q_group = _logical_q_group_idx(
+-                    cfg, stage_info, self.q_group_idx
+-                )
+                 local_tiles = _runtime_local_kv_tiles(
+                     cfg,
+                     Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
+                     self.seq_len_q,
+-                    _q_group_token_base(cfg, runtime_q_group),
++                    _logical_cta_kv_domain_token_base(
++                        cfg, stage_info, self.q_group_idx
++                    ),
+                 )
+                 local_page_end = (
+                     Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tiles
+@@ -2796,10 +2820,10 @@ def _maybe_runtime_tile_idx(self, stage_info: StageInfo, tile_idx: Int32) -> Int
+             self.h_k_idx,
+             self.b_idx,
+         )
+-        logical_q_group_idx = _logical_q_group_idx(
++        # The ring's tiles serve every Q tile of the CTA.
++        q_token_base = _logical_cta_kv_domain_token_base(
+             self.cfg, stage_info, self.q_group_idx
+         )
+-        q_token_base = _q_group_token_base(self.cfg, logical_q_group_idx)
+         tile_idx = _runtime_split_kv_global_tile_idx(
+             self.cfg,
+             stage_info,
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py
+index 9e46fae39bc..7fff1f2471b 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_corr.py
+@@ -221,11 +221,22 @@ def _init_placeholder_state(self) -> None:
+         )
+ 
+     def _owns_final_epilogue(self) -> bool:
+-        """Whether this correction instance owns final normalization/output."""
++        """Whether this correction instance owns final normalization/output.
++
++        Paired Q tiles finalize per instance; KV instances merge into the
++        second instance's epilogue.
++        """
++        if self.cfg.query_paired:
++            return True
+         return (self.cfg.num_insts_kv == 1 and self.inst_id == 0) or (
+             self.cfg.num_insts_kv != 1 and self.inst_id == 1
+         )
+ 
++    @property
++    def _merges_kv_instances(self) -> bool:
++        """Whether the tail epilogue combines two KV instances' partial O tiles."""
++        return self.cfg.merges_kv_instances
++
+     @cute.jit
+     def _runtime_splits_kv(self, stage_info: StageInfo) -> Int32:
+         """Return the useful producer/reducer fanout for this logical tile."""
+@@ -245,7 +256,9 @@ def _runtime_splits_kv(self, stage_info: StageInfo) -> Int32:
+             self.h_k_idx,
+             self.b_idx,
+         )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
++        logical_q_group_idx = _logical_q_group_idx(
++            cfg, stage_info, self.q_group_idx, self.inst_id
++        )
+         return _runtime_execution_splits_kv(
+             cfg,
+             seq_len_kv,
+@@ -2907,7 +2920,9 @@ def _kv_tile_256_tail_epilogue(
+         logical_h_k_idx, logical_b_idx = _logical_head_batch(
+             stage_info, self.h_k_idx, self.b_idx
+         )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
++        logical_q_group_idx = _logical_q_group_idx(
++            cfg, stage_info, self.q_group_idx, self.inst_id
++        )
+         q_row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+         logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
+         splits_kv = Int32(1)
+@@ -3116,7 +3131,9 @@ def _keeps_tail_epilogue(
+         cfg = self.cfg
+         # Tail stats are already final per-instance sums and maxima. Combine
+         # inst0/inst1 first, then either publish split-KV partials or normalize
+-        # directly to the output tensor.
++        # directly to the output tensor. An instance that does not merge
++        # receives its own stats and O stage in the first slots.
++        merges_kv_instances = self._merges_kv_instances
+         inst0_sum_0 = inst0_sum_arr[0]
+         inst0_new_max_0 = inst0_new_max_arr[0]
+         inst1_sum_0 = inst1_sum_arr[0]
+@@ -3136,7 +3153,7 @@ def _keeps_tail_epilogue(
+                     kind=prims.Shfl.BFLY,
+                 )
+             )
+-            if cutlass.const_expr(cfg.num_insts_kv != 1):
++            if cutlass.const_expr(merges_kv_instances):
+                 inst1_sum_0 += Float32(
+                     prims.shfl_sync(
+                         thread_mask=0xFFFFFFFF,
+@@ -3152,7 +3169,7 @@ def _keeps_tail_epilogue(
+             and cfg.use_fp8_output
+             and cfg.tile_size_q == 128
+             and cfg.headdim == 128
+-            and cfg.num_insts_kv == 2
++            and merges_kv_instances
+             and cfg.max_seq_len_q == 1
+             and cfg.has_static_dense_full_kv_tiles
+         ):
+@@ -3169,7 +3186,7 @@ def _keeps_tail_epilogue(
+         else:
+             uses_inst0 = inst0_new_max_0 != _neg_max_f32()
+             uses_inst1 = False
+-            if cutlass.const_expr(cfg.num_insts_kv != 1):
++            if cutlass.const_expr(merges_kv_instances):
+                 uses_inst1 = inst1_new_max_0 != _neg_max_f32()
+             final_max_0 = _neg_max_f32()
+             if uses_inst0:
+@@ -3196,7 +3213,9 @@ def _keeps_tail_epilogue(
+         logical_h_k_idx, logical_b_idx = _logical_head_batch(
+             stage_info, self.h_k_idx, self.b_idx
+         )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
++        logical_q_group_idx = _logical_q_group_idx(
++            cfg, stage_info, self.q_group_idx, self.inst_id
++        )
+         # The physical MMA tile may end with structural padding. Scratch rows
+         # omit that padding, so advance Q groups by the complete token/head rows
+         # represented by the Q tensor map rather than by ``tile_size_q``.
+@@ -3219,7 +3238,7 @@ def _keeps_tail_epilogue(
+             base_addr1 = tmem_row_base + Int32(
+                 o_base_col + tail_o_stage_idx_1 * cfg.tmem_o_stage_cols
+             )
+-            if cutlass.const_expr(cfg.num_insts_kv == 1):
++            if cutlass.const_expr(not merges_kv_instances):
+                 base_addr1 = base_addr0
+             partial_dst_col_offset = col_base * Int32(2)
+             partial_norm_scale = self._split_partial_scale(reduced_sum_0)
+@@ -3240,7 +3259,7 @@ def _keeps_tail_epilogue(
+                     num=8,
+                     offset=keeps_o_ldst_offset,
+                 )
+-                if cutlass.const_expr(cfg.num_insts_kv != 1):
++                if cutlass.const_expr(merges_kv_instances):
+                     o1_vals = _keeps_tcgen05_ld(
+                         cfg,
+                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
+@@ -3250,7 +3269,7 @@ def _keeps_tail_epilogue(
+                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                 for chunk_idx in cutlass.range_constexpr(4):
+                     reg_base = chunk_idx * 2
+-                    if cutlass.const_expr(cfg.num_insts_kv == 1):
++                    if cutlass.const_expr(not merges_kv_instances):
+                         partial_pair = fmul2(
+                             (exp_scale0_0, exp_scale0_0),
+                             (
+@@ -3388,7 +3407,7 @@ def _keeps_tail_epilogue(
+         base_addr1 = tmem_row_base + Int32(
+             o_base_col + tail_o_stage_idx_1 * cfg.tmem_o_stage_cols
+         )
+-        if cutlass.const_expr(cfg.num_insts_kv == 1):
++        if cutlass.const_expr(not merges_kv_instances):
+             base_addr1 = base_addr0
+         physical_dst_row_idx = _q_physical_output_row(
+             cfg,
+@@ -3418,7 +3437,7 @@ def _keeps_tail_epilogue(
+                     num=16,
+                     offset=keeps_o_ldst_offset,
+                 )
+-                if cutlass.const_expr(cfg.num_insts_kv != 1):
++                if cutlass.const_expr(merges_kv_instances):
+                     o1_vals = _keeps_tcgen05_ld(
+                         cfg,
+                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
+@@ -3428,7 +3447,7 @@ def _keeps_tail_epilogue(
+                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                 for packed_idx in cutlass.range_constexpr(4):
+                     reg_base = packed_idx * 4
+-                    if cutlass.const_expr(cfg.num_insts_kv == 1):
++                    if cutlass.const_expr(not merges_kv_instances):
+                         final_pair0 = fmul2(
+                             (final_scale0_0, final_scale0_0),
+                             (o0_vals[reg_base], o0_vals[reg_base + 1]),
+@@ -3508,7 +3527,7 @@ def _keeps_tail_epilogue(
+                 num=chunk_cols,
+                 offset=keeps_o_ldst_offset,
+             )
+-            if cutlass.const_expr(cfg.num_insts_kv != 1):
++            if cutlass.const_expr(merges_kv_instances):
+                 o1_vals = _keeps_tcgen05_ld(
+                     cfg,
+                     prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
+@@ -3519,7 +3538,7 @@ def _keeps_tail_epilogue(
+             if cutlass.const_expr(cfg.use_fp8_output):
+                 for packed_idx in cutlass.range_constexpr(2):
+                     reg_base = packed_idx * 4
+-                    if cutlass.const_expr(cfg.num_insts_kv == 1):
++                    if cutlass.const_expr(not merges_kv_instances):
+                         final_pair0 = fmul2(
+                             (final_scale0_0, final_scale0_0),
+                             (o0_vals[reg_base], o0_vals[reg_base + 1]),
+@@ -3566,7 +3585,7 @@ def _keeps_tail_epilogue(
+                 )
+                 for chunk_idx in cutlass.range_constexpr(chunk_cols // 2):
+                     reg_base = chunk_idx * 2
+-                    if cutlass.const_expr(cfg.num_insts_kv == 1):
++                    if cutlass.const_expr(not merges_kv_instances):
+                         final_pair = fmul2(
+                             (final_scale0_0, final_scale0_0),
+                             (o0_vals[reg_base], o0_vals[reg_base + 1]),
+@@ -3783,7 +3802,7 @@ def _swaps_wide_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                 # Attention sinks add to the denominator before the
+@@ -3834,7 +3853,7 @@ def _swaps_wide_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             q_row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+             logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
+@@ -4100,7 +4119,7 @@ def _swaps_wide_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             _copy_transposed_smem8b_to_gmem(
+                 self._smem_base_o_i32,
+@@ -4126,7 +4145,9 @@ def _swaps_wide_tail_epilogue(
+         logical_h_k_idx, logical_b_idx = _logical_head_batch(
+             stage_info, self.h_k_idx, self.b_idx
+         )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
++        logical_q_group_idx = _logical_q_group_idx(
++            cfg, stage_info, self.q_group_idx, self.inst_id
++        )
+         self._stage_fp16_o_regs_to_smem(
+             cfg,
+             regs_o,
+@@ -4288,7 +4309,7 @@ def _swaps_q8_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                 reduced_sum[scale_idx] += _attention_sink_for_scale_idx(
+@@ -4340,7 +4361,7 @@ def _swaps_q8_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             q_row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+             logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
+@@ -4584,7 +4605,7 @@ def _swaps_q8_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             _copy_transposed_smem8b_to_gmem(
+                 self._smem_base_o_i32,
+@@ -4612,7 +4633,7 @@ def _swaps_q8_tail_epilogue(
+                 stage_info, self.h_k_idx, self.b_idx
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             self._stage_fp16_o_regs_to_smem(
+                 cfg,
+@@ -4899,38 +4920,21 @@ def _correction_tail_epilogue_impl(
+         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+ 
+         if cutlass.const_expr(not self._owns_final_epilogue()):
++            # The last active K/V instance finalizes a merged tile; earlier
++            # instances publish stats but do not write the final output.
+             return
+ 
+         if cutlass.const_expr(cfg.use_keeps_mma_ab):
+-            # KeepsMmaAb finalization is owned by the last active K/V instance.
+-            # Earlier instances publish stats but do not write the final output.
+-            if cutlass.const_expr(
+-                (cfg.num_insts_kv == 1 and self.inst_id == 0)
+-                or (cfg.num_insts_kv != 1 and self.inst_id == 1)
+-            ):
+-                # Derive the per-lane output row/column ownership before
+-                # entering the common Keeps tail helper.
+-                output_f32_regs = cfg.keeps_output_f32_regs
+-                output_pair_regs = output_f32_regs // 2
+-                keeps_o_ldst_offset = cfg.headdim // 2
+-                lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+-                row_idx = _keeps_row_idx(cfg, warp_grp_thread_idx)
+-                col_base = _keeps_col_base(cfg, lane_idx, cfg.headdim // 2)
+-                if cutlass.const_expr(cfg.tile_size_kv == 256):
+-                    self._kv_tile_256_tail_epilogue(
+-                        stage_info,
+-                        tail_o_stage_idx_0=tail_o_stage_idx_0,
+-                        tail_o_stage_idx_1=tail_o_stage_idx_1,
+-                        inst0_new_max_arr=inst0_new_max_arr,
+-                        inst0_sum_arr=inst0_sum_arr,
+-                        inst1_new_max_arr=inst1_new_max_arr,
+-                        inst1_sum_arr=inst1_sum_arr,
+-                        tmem_row_base=tmem_row_base,
+-                        o_base_col=o_base_col,
+-                        warp_grp_thread_idx=warp_grp_thread_idx,
+-                    )
+-                    return
+-                self._keeps_tail_epilogue(
++            # Derive the per-lane output row/column ownership before
++            # entering the common Keeps tail helper.
++            output_f32_regs = cfg.keeps_output_f32_regs
++            output_pair_regs = output_f32_regs // 2
++            keeps_o_ldst_offset = cfg.headdim // 2
++            lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
++            row_idx = _keeps_row_idx(cfg, warp_grp_thread_idx)
++            col_base = _keeps_col_base(cfg, lane_idx, cfg.headdim // 2)
++            if cutlass.const_expr(cfg.tile_size_kv == 256):
++                self._kv_tile_256_tail_epilogue(
+                     stage_info,
+                     tail_o_stage_idx_0=tail_o_stage_idx_0,
+                     tail_o_stage_idx_1=tail_o_stage_idx_1,
+@@ -4940,17 +4944,25 @@ def _correction_tail_epilogue_impl(
+                     inst1_sum_arr=inst1_sum_arr,
+                     tmem_row_base=tmem_row_base,
+                     o_base_col=o_base_col,
+-                    output_pair_regs=output_pair_regs,
+-                    keeps_o_ldst_offset=keeps_o_ldst_offset,
+-                    row_idx=row_idx,
+-                    col_base=col_base,
+                     warp_grp_thread_idx=warp_grp_thread_idx,
+                 )
+-            return
+-
+-        if cutlass.const_expr(not self._owns_final_epilogue()):
+-            # Two-inst Swaps uses instance 1 for the final merge; one-inst
+-            # Swaps is finalized directly by its sole correction instance.
++                return
++            self._keeps_tail_epilogue(
++                stage_info,
++                tail_o_stage_idx_0=tail_o_stage_idx_0,
++                tail_o_stage_idx_1=tail_o_stage_idx_1,
++                inst0_new_max_arr=inst0_new_max_arr,
++                inst0_sum_arr=inst0_sum_arr,
++                inst1_new_max_arr=inst1_new_max_arr,
++                inst1_sum_arr=inst1_sum_arr,
++                tmem_row_base=tmem_row_base,
++                o_base_col=o_base_col,
++                output_pair_regs=output_pair_regs,
++                keeps_o_ldst_offset=keeps_o_ldst_offset,
++                row_idx=row_idx,
++                col_base=col_base,
++                warp_grp_thread_idx=warp_grp_thread_idx,
++            )
+             return
+ 
+         if cutlass.const_expr(cfg.tile_size_q in (16, 32)):
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py
+index 73982aa0a91..14c6b0153bd 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/tmem_s.py
+@@ -803,6 +803,10 @@ def _qk_mma(
+         else:
+             k_desc = _freeze_smem_descriptor(kv_desc)
+         q_desc = _freeze_smem_descriptor(q_desc)
++        if cutlass.const_expr(cfg.q_groups_per_cta > 1 and self.inst_id > 0):
++            # Q descriptors name the stage's first Q tile; a paired instance
++            # reads its own tile, ``inst_id`` tiles further into the stage.
++            q_desc = q_desc + Int32((cfg.smem_q_tile_bytes * self.inst_id) >> 4)
+         q_desc, head_dim_stage_idx = self._q_desc_for_head_dim_stage(
+             q_desc, head_dim_stage_idx
+         )
+@@ -1414,8 +1418,13 @@ def _compute_softmax_loop_keeps(
+             and not cfg.use_sliding_window_causal
+             and cfg.tile_size_q in (64, 128)
+         )
++        # Query-paired instances take their mask bounds from different Q tiles,
++        # which keeps the compiler from splitting the post-load mask pass off
++        # fully visible tiles, so they select the loader before LDTM as well.
+         use_preload_mask_split = (
+-            use_runtime_paged_dense_load or cfg.uses_per_row_causal_mask
++            use_runtime_paged_dense_load
++            or cfg.uses_per_row_causal_mask
++            or cfg.q_groups_per_cta > 1
+         )
+         if cutlass.const_expr(not use_preload_mask_split):
+             for reg_idx in cutlass.range_constexpr(num_s_regs):
+@@ -1678,7 +1687,9 @@ def _compute_softmax_loop_swaps(
+                 Int32(0),
+                 Int32(0),
+             )
+-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
++        logical_q_group_idx = _logical_q_group_idx(
++            cfg, stage_info, self.q_group_idx, self.inst_id
++        )
+         q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
+         element_mask_end_idx = seq_len_kv
+         if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+@@ -2277,7 +2288,9 @@ def load_sage_q_scale(self, stage_info: StageInfo) -> Float32:
+                 kv_head_idx=kv_head_idx,
+                 num_heads_kv=self.num_heads_kv,
+             ),
+-            q_group_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
++            q_group_idx=_logical_q_group_idx(
++                cfg, stage_info, self.q_group_idx, self.inst_id
++            ),
+             row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
+         )
+ 
+@@ -2458,7 +2471,7 @@ def _compute_softmax_loop_keeps_fragments(
+                 sparse_token_word3,
+             )
+             logical_q_group_idx = _logical_q_group_idx(
+-                cfg, stage_info, self.q_group_idx
++                cfg, stage_info, self.q_group_idx, self.inst_id
+             )
+             q_token_idx, _ = _q_row_token_and_local_head(
+                 cfg,
+diff --git a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py
+index 7d2393db28f..2ca99d0fd9a 100644
+--- a/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py
++++ b/flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_tasks.py
+@@ -63,6 +63,8 @@
+ )
+ from .fmha_decode_resources.helpers_common import (
+     _assume_nonnegative_i32,
++    _q_cta_first_token,
++    _q_cta_kv_domain_token_base,
+     _q_group_token_base,
+     _q_seq_bounds,
+     _warp_broadcast_i32,
+@@ -131,18 +133,18 @@ def restore_slots(*resource_proxies: object) -> None:
+ def _loop_domain_after_head(
+     total_kv_tiles: cutlass.Int32,
+     *,
+-    num_insts_kv: int,
++    kv_tiles_per_loop: int,
+ ) -> cutlass.Int32:
+-    """Return LOOP iterations after HEAD reserves one KV tile per instance.
++    """Return LOOP iterations after HEAD reserves one loop step of KV tiles.
+ 
+     Dense tiles and block-sparse routes share this recurrence; only the tile
+     count's source differs.
+     """
+ 
+-    remaining = total_kv_tiles - cutlass.Int32(num_insts_kv)
++    remaining = total_kv_tiles - cutlass.Int32(kv_tiles_per_loop)
+     remaining = cute.math.max(remaining, cutlass.Int32(0))
+-    insts = cutlass.Int32(num_insts_kv)
+-    return (remaining + insts - cutlass.Int32(1)) // insts
++    tiles_per_loop = cutlass.Int32(kv_tiles_per_loop)
++    return (remaining + tiles_per_loop - cutlass.Int32(1)) // tiles_per_loop
+ 
+ 
+ @dataclass(kw_only=True)
+@@ -197,7 +199,7 @@ def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
+             self.cu_seqlens_q,
+             cutlass.Int32(b_idx),
+         )
+-        return _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
++        return _q_cta_first_token(self.cfg, q_group_idx) >= seq_len_q
+ 
+ 
+ def _page_offsets_consume(
+@@ -254,14 +256,14 @@ def _can_hold_native_page_window(
+     if not cfg.use_split_kv:
+         return False
+     # Runtime ragged lengths can reduce the split-local span in
+-    # ``num_insts_kv`` increments and therefore change every split rank's
++    # ``kv_tiles_per_loop`` increments and therefore change every split rank's
+     # aligned starting page. Hold one stage only when every possible span
+     # both fits and evenly partitions a 32-ID window; otherwise a shorter row
+     # could straddle the next window even when the static maximum does not.
+     for local_tiles in range(
+-        cfg.num_insts_kv,
++        cfg.kv_tiles_per_loop,
+         cfg.static_local_kv_tiles + 1,
+-        cfg.num_insts_kv,
++        cfg.kv_tiles_per_loop,
+     ):
+         window_pages = local_tiles * pages_per_tile
+         if window_pages <= 0 or window_pages > 32 or 32 % window_pages != 0:
+@@ -400,6 +402,9 @@ def _consume_streamed_pv_fragments(
+     v_desc_label: str,
+     vp_mma_label: str,
+     cfg: FmhaDecodeConfig,
++    *,
++    wait_kv: bool = True,
++    release_kv: bool = True,
+ ) -> None:
+     """Issue one PV wave as its K32 P fragments become ready.
+ 
+@@ -407,13 +412,15 @@ def _consume_streamed_pv_fragments(
+     correction credit before holding the V stage. Later fragments may become
+     ready while the previous PV fragment is already executing; every slot
+     stays live through the complete async UMMA wave so the producer cannot
+-    overwrite an operand prematurely.
++    overwrite an operand prematurely. ``wait_kv`` and ``release_kv`` let two
++    waves share one V stage: the first waits for it, the last releases it.
+     """
+     assert cfg.num_head_dim_stages_kv == 1
+     fragment_label = f"{vp_mma_label}_fragment"
+     p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=0)
+     tmem_o.acquire()
+-    smem_kv.wait()
++    if wait_kv:
++        smem_kv.wait()
+     v_desc = getattr(smem_kv, v_desc_label)()
+     getattr(tmem_o, fragment_label)(
+         v_desc=v_desc,
+@@ -427,7 +434,8 @@ def _consume_streamed_pv_fragments(
+             p_tmem_addr=p_tmem_addr,
+             fragment_idx=fragment_idx,
+         )
+-    smem_kv.release()
++    if release_kv:
++        smem_kv.release()
+     tmem_o.commit()
+ 
+ 
+@@ -440,22 +448,38 @@ def _consume_staged_pv_mma(
+     p_desc_idx: int,
+     section: FmhaStage,
+     cfg: FmhaDecodeConfig,
++    *,
++    wait_kv: bool = True,
++    release_kv: bool = True,
+ ) -> None:
+-    """Consume all V head-dim stages for one PV MMA wave."""
++    """Consume all V head-dim stages for one PV MMA wave.
++
++    ``wait_kv`` and ``release_kv`` let two waves share one V stage: the
++    first waits for it, the last releases it.
++    """
+     _ = section
+     if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+         _consume_streamed_pv_fragments(
+-            smem_kv, tmem_p, tmem_o, v_desc_label, vp_mma_label, cfg
++            smem_kv,
++            tmem_p,
++            tmem_o,
++            v_desc_label,
++            vp_mma_label,
++            cfg,
++            wait_kv=wait_kv,
++            release_kv=release_kv,
+         )
+         return
+ 
++    assert (wait_kv and release_kv) or cfg.num_head_dim_stages_kv == 1
+     tmem_p.wait()
+     p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1 = tmem_p.p_operands()
+     p_desc = p_desc_0 if p_desc_idx == KV_INST0 else p_desc_1
+     p_tmem_addr = p_tmem_addr_0 if p_desc_idx == KV_INST0 else p_tmem_addr_1
+     tmem_o.acquire()
+     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+-        smem_kv.wait()
++        if wait_kv:
++            smem_kv.wait()
+         v_desc = getattr(smem_kv, v_desc_label)()
+         getattr(tmem_o, vp_mma_label)(
+             v_desc_0=v_desc,
+@@ -467,7 +491,8 @@ def _consume_staged_pv_mma(
+             inst_idx=p_desc_idx,
+             head_dim_stage_idx=head_dim_stage_idx,
+         )
+-        smem_kv.release()
++        if release_kv:
++            smem_kv.release()
+     tmem_o.commit()
+     tmem_p.release()
+ 
+@@ -822,7 +847,7 @@ def _run_task_body_impl(
+                     cutlass.Int32(b_idx),
+                 )
+                 q_group_idx = cutlass.Int32(q_group_cta_idx)
+-                if _q_group_token_base(self.cfg, q_group_idx) < seq_len_q:
++                if _q_cta_first_token(self.cfg, q_group_idx) < seq_len_q:
+                     prims.barrier_cta_sync(12, thread_count=16 * 32)
+             else:
+                 prims.barrier_cta_sync(12, thread_count=16 * 32)
+@@ -957,7 +982,7 @@ def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
+ 
+             loop_domain = _loop_domain_after_head(
+                 route_count,
+-                num_insts_kv=self.cfg.num_insts_kv,
++                kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
+             )
+             return loop_domain + cutlass.Int32(self.domain_bias)
+ 
+@@ -1014,17 +1039,17 @@ def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
+             self._kv_raw_tile_base = cutlass.Int32(0)
+             loop_domain = _loop_domain_after_head(
+                 total_kv_tiles,
+-                num_insts_kv=self.cfg.num_insts_kv,
++                kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
+             )
+             return loop_domain + cutlass.Int32(self.domain_bias)
+ 
+-        # Decode the logical Q tile with the configured physical split fanout,
++        # Decode the logical Q group with the configured physical split fanout,
+         # then derive its causal/window K union and useful runtime split prefix.
+         q_group_cta_idx = cutlass.Int32(tile_coord[0])
+         q_group_idx = q_group_cta_idx
+         if self.cfg.use_split_kv:
+             q_group_idx = q_group_cta_idx // cutlass.Int32(self.cfg.splits_kv)
+-        q_token_base = _q_group_token_base(self.cfg, q_group_idx)
++        q_token_base = _q_cta_kv_domain_token_base(self.cfg, q_group_idx)
+         seq_len_q = (
+             cutlass.Int32(self.cfg.max_seq_len_q)
+             if self.seq_len_q is None
+@@ -1053,14 +1078,14 @@ def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
+             # task produces the same span but adds a runtime integer division
+             # to each task warp.
+             splits_kv = cutlass.Int32(self.cfg.splits_kv)
+-            num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
+-            tiles_per_cta_group = splits_kv * num_insts_kv
++            tiles_per_loop = cutlass.Int32(self.cfg.kv_tiles_per_loop)
++            tiles_per_cta_group = splits_kv * tiles_per_loop
+             num_groups = (
+                 total_kv_tiles + tiles_per_cta_group - cutlass.Int32(1)
+             ) // tiles_per_cta_group
+             total_kv_tiles = cute.math.max(
+-                num_groups * num_insts_kv,
+-                num_insts_kv,
++                num_groups * tiles_per_loop,
++                tiles_per_loop,
+             )
+             # Physical split coordinates and page-cache strides are laid out with
+             # the configured launch fanout.  Runtime pruning only shortens the
+@@ -1071,7 +1096,7 @@ def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
+             self._kv_raw_tile_base = skipped_tiles
+         loop_domain = _loop_domain_after_head(
+             total_kv_tiles,
+-            num_insts_kv=self.cfg.num_insts_kv,
++            kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
+         )
+         # All tasks share the MMA-loop domain; tail-only tasks add a bias.
+         return loop_domain + cutlass.Int32(self.domain_bias)
+@@ -1169,6 +1194,21 @@ def _publish_sparse_softmax_route(
+     sparse_softmax_metadata.commit()
+ 
+ 
++def _sage_rings_by_label(
++    cfg: FmhaDecodeConfig,
++    sage_k_scales0: MemoryResource | None,
++    sage_k_scales1: MemoryResource | None,
++) -> dict[str, tuple[MemoryResource | None, ...]]:
++    """Map each K load label to the ``sfK`` rings its tile fills.
++
++    A query-paired plan loads each K/V tile once for both instances, so the
++    first instance's tile also fills the second instance's ring.
++    """
++    if cfg.query_paired:
++        return {"load_k0": (sage_k_scales0, sage_k_scales1), "load_k1": ()}
++    return {"load_k0": (sage_k_scales0,), "load_k1": (sage_k_scales1,)}
++
++
+ def _publish_k_scales(
+     sage_k_scales: MemoryResource | None,
+     route: tuple[Any, Any, Any, Any] | None,
+@@ -1554,33 +1594,38 @@ def create_page_offsets_task_split_kv(
+ ) -> Task:
+     """Prefetch split-KV K/V page windows with independent consumer state."""
+ 
++    # One K and one V label per K/V tile of a loop step: both instances' tiles,
++    # or the single tile a query-paired CTA loads for both of its Q tiles.
++    kv_labels = (("load_k0", "load_v0"), ("load_k1", "load_v1"))[
++        : cfg.kv_tiles_per_loop
++    ]
++
+     def page_offsets_schedule_body(
+         smem_page_offsets_k: MemoryResource,
+         smem_page_offsets_v: MemoryResource,
+         membership_lifetime: MemoryResource | None,
+     ) -> None:
+-        """Publish one page-offset stage for every paired K/V tile."""
++        """Publish one page-offset stage for every K/V tile the loads issue."""
+         if membership_lifetime is not None:
+             membership_lifetime.acquire()
+         smem_page_offsets_k.init_load_state()
+         smem_page_offsets_v.init_load_state()
+ 
+-        # HEAD: publish the initial K0/K1 pair as two independent stages.
+-        _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
+-        if membership_lifetime is not None:
+-            membership_lifetime.commit()
+-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
++        # HEAD: publish the initial K tiles as independent stages.
++        for tile_idx, (load_k, _) in enumerate(kv_labels):
++            _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Head)
++            if tile_idx == 0 and membership_lifetime is not None:
++                membership_lifetime.commit()
+ 
+         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
+         with domain_loop(0, domain, 1, unroll=1):
+-            _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+-            _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
+-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
+-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
++            for load_k, load_v in kv_labels:
++                _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Loop)
++                _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Loop)
+ 
+-        # TAIL: drain V0/V1 through distinct page-offset stages.
+-        _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
+-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
++        # TAIL: drain the V tiles through distinct page-offset stages.
++        for _, load_v in kv_labels:
++            _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Tail)
+ 
+     @_schedule_with_optional_resources
+     def page_offsets_schedule(
+@@ -1764,7 +1809,11 @@ def load_schedule_body(
+         """Build the split-resource K/V load cadence for all schedule phases."""
+         if smem_q is not None:
+             smem_q.init_load_state()
+-        sage_k_scales_by_label = {"load_k0": sage_k_scales0, "load_k1": sage_k_scales1}
++        sage_rings_by_label = _sage_rings_by_label(cfg, sage_k_scales0, sage_k_scales1)
++        # A dense second instance without its own ring loads through the
++        # first ring; a query-paired plan has no second load at all.
++        if smem_k1 is None and not cfg.use_block_sparse and not cfg.query_paired:
++            smem_k1, smem_v1 = smem_k0, smem_v0
+         active_instances = (
+             (
+                 smem_k0,
+@@ -1775,8 +1824,8 @@ def load_schedule_body(
+                 "load_v0",
+             ),
+             (
+-                smem_k0 if smem_k1 is None and not cfg.use_block_sparse else smem_k1,
+-                smem_v0 if smem_v1 is None and not cfg.use_block_sparse else smem_v1,
++                smem_k1,
++                smem_v1,
+                 sparse_kv_metadata1,
+                 sparse_softmax_metadata1,
+                 "load_k1",
+@@ -1858,13 +1907,14 @@ def load_tile(
+             )
+             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
+             head_routes.append(
+-                (sparse_softmax_metadata, route, sage_k_scales_by_label[load_k])
++                (sparse_softmax_metadata, route, sage_rings_by_label[load_k])
+             )
+         # In the combined task, preserve both K issues ahead of Softmax
+         # backpressure. A per-instance task naturally stages its sole route.
+-        for sparse_softmax_metadata, route, sage_k_scales in head_routes:
++        for sparse_softmax_metadata, route, sage_rings in head_routes:
+             _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+-            _publish_k_scales(sage_k_scales, route, FmhaStage.Head)
++            for sage_k_scales in sage_rings:
++                _publish_k_scales(sage_k_scales, route, FmhaStage.Head)
+         # Successor record loads go out after the K copies and the route
+         # publish, here and in the loop. Queued ahead of the copies, a record
+         # load delays the shared-memory reads of the route origins that feed
+@@ -1902,7 +1952,8 @@ def load_tile(
+                 )
+                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
+                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+-                _publish_k_scales(sage_k_scales_by_label[load_k], route, FmhaStage.Loop)
++                for sage_k_scales in sage_rings_by_label[load_k]:
++                    _publish_k_scales(sage_k_scales, route, FmhaStage.Loop)
+                 prefetch_by_label[load_k] = _prefetch_sparse_route(
+                     sparse_kv_metadata, "next_loop"
+                 )
+@@ -1959,9 +2010,23 @@ def load_schedule(
+             lambda: _schedule_token_throttle_head(schedule_token_throttle),
+         )
+ 
+-    for smem_k, sparse_kv_metadata, sparse_softmax_metadata, sage_k_scales in (
+-        (smem_k0, sparse_kv_metadata0, sparse_softmax_metadata0, sage_k_scales0),
+-        (smem_k1, sparse_kv_metadata1, sparse_softmax_metadata1, sage_k_scales1),
++    # A dense second instance without its own ring loads through the first
++    # ring, as ``load_schedule_body`` resolves it.
++    shares_first_k_ring = smem_k1 is None and not cfg.use_block_sparse
++    sage_rings_by_label = _sage_rings_by_label(cfg, sage_k_scales0, sage_k_scales1)
++    for smem_k, sparse_kv_metadata, sparse_softmax_metadata, sage_rings in (
++        (
++            smem_k0,
++            sparse_kv_metadata0,
++            sparse_softmax_metadata0,
++            sage_rings_by_label["load_k0"],
++        ),
++        (
++            smem_k0 if shares_first_k_ring else smem_k1,
++            sparse_kv_metadata1,
++            sparse_softmax_metadata1,
++            sage_rings_by_label["load_k1"],
++        ),
+     ):
+         if smem_k is None and (
+             sparse_kv_metadata is not None or sparse_softmax_metadata is not None
+@@ -1969,8 +2034,8 @@ def load_schedule(
+             raise ValueError("inactive K/V instances cannot own sparse metadata")
+         if sparse_softmax_metadata is not None and sparse_kv_metadata is None:
+             raise ValueError("Softmax sparse metadata requires retained KV metadata")
+-        if sage_k_scales is not None and smem_k is None:
+-            raise ValueError("a Sage K scale ring follows its instance's K tiles")
++        if smem_k is None and any(ring is not None for ring in sage_rings):
++            raise ValueError("a Sage K scale ring follows the K tiles that fill it")
+     if sparse_kv_metadata0 is not None or sparse_kv_metadata1 is not None:
+         if smem_page_offsets is not None or smem_page_offsets_v is not None:
+             raise ValueError(
+@@ -2307,7 +2372,13 @@ def mma_schedule_body(
+         tmem_stats_done1: MemoryResource | None,
+         q_desc: Any,
+     ) -> None:
+-        """Schedule split-resource QK and PV waves across HEAD/LOOP/TAIL."""
++        """Schedule split-resource QK and PV waves across HEAD/LOOP/TAIL.
++
++        A query-paired plan feeds both instances' waves from one K/V stage:
++        the first instance waits for the stage, the second releases it, and
++        the tcgen05 commit of that release covers both MMAs.
++        """
++        shares_kv_stage = cfg.query_paired
+ 
+         def qk_mma(
+             smem_kv: MemoryResource,
+@@ -2316,6 +2387,9 @@ def qk_mma(
+             q_desc,
+             qk_mma_label: str,
+             section: FmhaStage,
++            *,
++            wait_kv: bool,
++            release_kv: bool,
+         ) -> None:
+             """Issue one scheduled QK wave using the selected phase work."""
+             if tmem_stats_done is not None:
+@@ -2323,7 +2397,8 @@ def qk_mma(
+             tmem_s.acquire()
+             _issue_score_seed(tmem_s, section, cfg)
+             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+-                smem_kv.wait()
++                if wait_kv:
++                    smem_kv.wait()
+                 kv_desc = smem_kv.kv_desc()
+                 if cfg.uses_q_desc_ref:
+                     getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
+@@ -2336,7 +2411,8 @@ def qk_mma(
+                         kv_desc=kv_desc,
+                         head_dim_stage_idx=head_dim_stage_idx,
+                     )
+-                smem_kv.release()
++                if release_kv:
++                    smem_kv.release()
+             tmem_s.commit()
+             if tmem_stats_done is not None:
+                 tmem_stats_done.commit()
+@@ -2347,56 +2423,75 @@ def pv_mma(
+             vp_mma_label: str,
+             inst_idx: int,
+             section: FmhaStage,
++            *,
++            wait_kv: bool,
++            release_kv: bool,
+         ) -> None:
+             """Issue one scheduled PV wave using the selected phase work."""
+             _consume_staged_pv_mma(
+-                smem_kv, tmem_p, tmem_o, "v_desc", vp_mma_label, inst_idx, section, cfg
++                smem_kv,
++                tmem_p,
++                tmem_o,
++                "v_desc",
++                vp_mma_label,
++                inst_idx,
++                section,
++                cfg,
++                wait_kv=wait_kv,
++                release_kv=release_kv,
+             )
+ 
+-        qk_mma(
+-            smem_k0,
+-            tmem_s0,
+-            tmem_stats_done0,
+-            q_desc,
+-            "qk_mma_head",
+-            FmhaStage.Head,
+-        )
+-        qk_mma(
+-            smem_k1,
+-            tmem_s1,
+-            tmem_stats_done1,
+-            q_desc,
+-            "qk_mma_head",
+-            FmhaStage.Head,
++        # Each instance's resources, and the stage protocol of its waves.
++        instances = (
++            (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
++            (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
+         )
++        kv_stage_protocol = {
++            KV_INST0: dict(wait_kv=True, release_kv=not shares_kv_stage),
++            KV_INST1: dict(wait_kv=not shares_kv_stage, release_kv=True),
++        }
+ 
+-        with domain_loop(0, domain, 1, unroll=1):
+-            pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
++        for inst_idx, smem_k, _, tmem_s, tmem_stats_done, _ in instances:
+             qk_mma(
+-                smem_k0,
+-                tmem_s0,
+-                tmem_stats_done0,
+-                q_desc,
+-                "qk_mma_loop",
+-                FmhaStage.Loop,
+-            )
+-            pv_mma(smem_v1, smem_p1, "vp_mma_loop", KV_INST1, FmhaStage.Loop)
+-            qk_mma(
+-                smem_k1,
+-                tmem_s1,
+-                tmem_stats_done1,
++                smem_k,
++                tmem_s,
++                tmem_stats_done,
+                 q_desc,
+-                "qk_mma_loop",
+-                FmhaStage.Loop,
++                "qk_mma_head",
++                FmhaStage.Head,
++                **kv_stage_protocol[inst_idx],
+             )
+ 
++        with domain_loop(0, domain, 1, unroll=1):
++            for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in instances:
++                protocol = kv_stage_protocol[inst_idx]
++                pv_mma(
++                    smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop, **protocol
++                )
++                qk_mma(
++                    smem_k,
++                    tmem_s,
++                    tmem_stats_done,
++                    q_desc,
++                    "qk_mma_loop",
++                    FmhaStage.Loop,
++                    **protocol,
++                )
++
+         # The last BMM1 has been issued once the loop ends, and BMM2 never reads
+         # Q. Releasing it here lets a persistent CTA load the next work tile's
+         # Q while the final softmax and BMM2 waves run, as the KV256 MMA does.
+         smem_q.release()
+ 
+-        pv_mma(smem_v0, smem_p0, "vp_mma_tail", KV_INST0, FmhaStage.Tail)
+-        pv_mma(smem_v1, smem_p1, "vp_mma_tail", KV_INST1, FmhaStage.Tail)
++        for inst_idx, _, smem_v, _, _, smem_p in instances:
++            pv_mma(
++                smem_v,
++                smem_p,
++                "vp_mma_tail",
++                inst_idx,
++                FmhaStage.Tail,
++                **kv_stage_protocol[inst_idx],
++            )
+ 
+     def mma_schedule_prelude(
+         smem_q: MemoryResource,
+@@ -3732,6 +3827,9 @@ def correct_o(
+             tail_o_stage_idx_1=tail_1,
+             inst_idx=KV_INST0,
+         )
++        if sage_v_scales is not None and not cfg.merges_kv_instances:
++            # ConsWait: every lane reads the scales the other lanes staged.
++            sage_v_scales.wait()
+         tmem_corr0.correction_tail_epilogue(
+             o_stage_idx=o_stage_idx,
+             tail_o_stage_idx_0=tail_0,
+@@ -3761,9 +3859,14 @@ def correct_o(
+             tail_o_stage_idx_1=tail_1,
+             inst_idx=KV_INST1,
+         )
+-        if sage_v_scales is not None:
++        if sage_v_scales is not None and cfg.merges_kv_instances:
+             # ConsWait: every lane reads the scales the other lanes staged.
+             sage_v_scales.wait()
++        if not cfg.merges_kv_instances:
++            # The instance finalizes its own stats and O stage, in the slots
++            # the epilogue reads first.
++            inst0_new_max_arr, inst0_sum_arr = inst1_new_max_arr, inst1_sum_arr
++            tail_0 = tail_1
+         tmem_corr1.correction_tail_epilogue(
+             o_stage_idx=o_stage_idx,
+             tail_o_stage_idx_0=tail_0,
+diff --git a/tests/attention/test_attention_ts_decode.py b/tests/attention/test_attention_ts_decode.py
+index 7c05d0b0e38..e60acde2698 100644
+--- a/tests/attention/test_attention_ts_decode.py
++++ b/tests/attention/test_attention_ts_decode.py
+@@ -1587,6 +1587,7 @@ def _plan_case(
+     max_kv_len: int,
+     qo_indptr: Optional[torch.Tensor] = None,
+     max_seq_len_q: Optional[int] = None,
++    query_paired: Optional[bool] = None,
+ ):
+     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
+     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
+@@ -1612,6 +1613,7 @@ def _plan_case(
+         mask_type=case.mask_type,
+         window_left=case.window_left,
+         seq_lens=seq_lens.cpu(),
++        query_paired=query_paired,
+     )
+     return wrapper
+ 
+@@ -1689,6 +1691,7 @@ def _run_standalone(
+     page_size: Optional[int] = None,
+     storage_page_size: Optional[int] = None,
+     validate: bool = True,
++    query_paired: Optional[bool] = None,
+ ):
+     """Run the caller-workspace public entry point for wrapper parity."""
+ 
+@@ -1714,6 +1717,7 @@ def _run_standalone(
+             kv_layout="HND",
+             storage_page_size=storage_page_size,
+             device=case.q.device,
++            query_paired=query_paired,
+         )
+         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
+     else:
+@@ -1740,6 +1744,7 @@ def _run_standalone(
+         kv_layout="HND",
+         page_size=page_size,
+         validate=validate,
++        query_paired=query_paired,
+     )
+     assert result is output
+     return output
+@@ -1790,13 +1795,15 @@ def _exercise_public_paths(
+ ):
+     """Always check eager; reserve standalone/graph parity for anchor rows."""
+ 
++    policy = dict(wrapper._policy)
+     if case.q.dtype == _FP8:
+-        policy = dict(wrapper._policy)
++        # FP8 probabilities round per online-softmax stream; a query-paired
++        # instance folds every K/V tile of its rows into one stream.
+         case = _with_reference(
+             case,
+             qo_indptr=qo_indptr,
+             splits_kv=int(policy["splits_kv"]),
+-            num_insts_kv=int(policy["num_insts_kv"]),
++            num_insts_kv=1 if policy["query_paired"] else int(policy["num_insts_kv"]),
+         )
+     eager = _run_case(
+         wrapper,
+@@ -1813,6 +1820,7 @@ def _exercise_public_paths(
+         max_kv_len=max_kv_len,
+         qo_indptr=qo_indptr,
+         max_seq_len_q=max_seq_len_q,
++        query_paired=policy["query_paired"],
+     )
+     _assert_case_correct(standalone, case)
+     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
+@@ -1940,26 +1948,23 @@ def _exercise_auto_case(
+     return policy
+ 
+ 
+-def _exercise_explicit_kv256_case(
++def _exercise_explicit_profile_case(
+     monkeypatch: pytest.MonkeyPatch,
+     case: _DecodeCase,
++    explicit_profile: dict[str, object],
+     *,
++    qo_indptr: Optional[torch.Tensor] = None,
++    max_seq_len_q: Optional[int] = None,
+     exercise_all_paths: bool = False,
+ ) -> dict[str, object]:
+-    """Run a public path with the qualified logical KV256 profile pinned."""
++    """Run a public path with ``explicit_profile`` pinned over automatic selection."""
+ 
+     from flashinfer.attention.prims_ts import decode as decode_module
+     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+ 
+     original_make_decode_config = fmha_decode_config.make_decode_config
+-    explicit_profile = {
+-        "use_keeps_mma_ab": True,
+-        "tile_size_q": 64,
+-        "tile_size_kv": 256,
+-        "groups_tokens_heads_q": True,
+-    }
+ 
+-    def _make_explicit_kv256_config(*args, **kwargs):
++    def _make_explicit_config(*args, **kwargs):
+         source = kwargs.get("args")
+         kwargs["args"] = (
+             explicit_profile if source is None else (source, explicit_profile)
+@@ -1969,13 +1974,15 @@ def _make_explicit_kv256_config(*args, **kwargs):
+     monkeypatch.setattr(
+         fmha_decode_config,
+         "make_decode_config",
+-        _make_explicit_kv256_config,
++        _make_explicit_config,
+     )
+     decode_module._resolve_decode_launch_spec.cache_clear()
+     decode_module._get_compiled_decode.cache_clear()
+     try:
+         return _exercise_auto_case(
+             case,
++            qo_indptr=qo_indptr,
++            max_seq_len_q=max_seq_len_q,
+             exercise_all_paths=exercise_all_paths,
+         )
+     finally:
+@@ -1983,6 +1990,27 @@ def _make_explicit_kv256_config(*args, **kwargs):
+         decode_module._get_compiled_decode.cache_clear()
+ 
+ 
++def _exercise_explicit_kv256_case(
++    monkeypatch: pytest.MonkeyPatch,
++    case: _DecodeCase,
++    *,
++    exercise_all_paths: bool = False,
++) -> dict[str, object]:
++    """Run a public path with the qualified logical KV256 profile pinned."""
++
++    return _exercise_explicit_profile_case(
++        monkeypatch,
++        case,
++        {
++            "use_keeps_mma_ab": True,
++            "tile_size_q": 64,
++            "tile_size_kv": 256,
++            "groups_tokens_heads_q": True,
++        },
++        exercise_all_paths=exercise_all_paths,
++    )
++
++
+ @torch.no_grad()
+ def _apply_decode_correction_pattern(case, pattern: str):
+     query = case.q.unsqueeze(1) if case.q.ndim == 3 else case.q
+@@ -2589,6 +2617,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
+         "out_dtype",
+         "page_size",
+         "split_kv",
++        "query_paired",
+         "workspace_buffer",
+         "max_kv_len",
+         "validate",
+@@ -2619,6 +2648,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
+         "workspace_buffer",
+         "storage_page_size",
+         "split_kv",
++        "query_paired",
+         "validate",
+         "initialize_workspace",
+     )
+@@ -3869,14 +3899,15 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
+ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
+     persistent: bool,
+ ) -> None:
+-    """KV256 and FP8 Q128 stream score fragments; dense 16-bit Q128 does not.
++    """KV256 and BF16/FP8 Q128 stream score fragments; FP8 D64 Q128 does not.
+ 
+     Streamed profiles share one rolled fragment loop whose geometry follows
+     the fragment register count, so the profile property and the fragment
+     count are pinned together. They also run their two softmax groups
+-    unordered. KV256 tiles and block-sparse routes stream, as do profiles with
+-    8-bit K and V and SMEM softmax stats such as FP8 Q128/KV128; dense 16-bit
+-    Q128/KV128 keeps the complete P row.
++    unordered. KV256 tiles and block-sparse routes stream, as do Q128/KV128
++    profiles whose K and V share a width and whose softmax stats travel
++    through SMEM, such as BF16 and FP8 at head dim 128; FP8 at head dim 64
++    keeps its stats in TMEM and the complete P row.
+     """
+ 
+     kv256 = _make_contiguous_kv256_config(persistent=persistent)
+@@ -3888,13 +3919,21 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
+ 
+     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
+     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
+-    assert not q128.streams_tmem_p_fragments
+-    assert q128.num_softmax_score_fragments == 1
++    assert q128.streams_tmem_p_fragments
++    assert q128.num_softmax_score_fragments == 4
++    assert not q128.uses_ordered_softmax_barrier
+ 
+     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
+     assert q128_fp8.uses_two_inst_tmem_p
+     assert q128_fp8.streams_tmem_p_fragments
+ 
++    d64_fp8 = _make_contiguous_keeps_config(
++        dtype=Float8E4M3FN, tile_size_q=128, headdim=64
++    )
++    assert d64_fp8.uses_two_inst_tmem_p and not d64_fp8.keeps_stats_via_smem
++    assert not d64_fp8.streams_tmem_p_fragments
++    assert d64_fp8.num_softmax_score_fragments == 1
++
+ 
+ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
+     """SM103 keeps exponentials on MUFU and takes score maxima from LDTM.STAT.
+@@ -3905,13 +3944,16 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
+     """
+ 
+     arch_args = fmha_decode_config.arch_config_args
+-    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 4, "uses_ldtm_stat": False}
++    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 6, "uses_ldtm_stat": False}
+     assert arch_args((10, 3)) == {
+         "ex2_emulated_pairs": 0,
+         "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
+     }
+     cfg = _make_contiguous_kv256_config(persistent=False)
+-    assert cfg.ex2_emulated_pairs == 4 and not cfg.uses_ldtm_stat
++    assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
++    assert cfg.fragment_ex2_emulated_pairs == 4
++    q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
++    assert q128.fragment_ex2_emulated_pairs == 6
+ 
+ 
+ def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
+@@ -7840,6 +7882,135 @@ def test_attention_ts_decode_q64_kv256_boundaries(
+         assert policy["use_split_kv"] is False
+ 
+ 
++# Pins grouped Keeps Q128 on 16-bit paged K/V; automatic selection takes it only
++# for fixed multi-token page-32 launches.
++_EXPLICIT_PAGED_16BIT_Q128_PROFILE = {
++    "use_keeps_mma_ab": True,
++    "tile_size_q": 128,
++    "groups_tokens_heads_q": True,
++    "use_persistent_scheduler": False,
++}
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.parametrize(
++    (
++        "dtype",
++        "heads_q_per_kv",
++        "seq_len_q",
++        "q_lens",
++        "mask_type",
++        "page_size",
++        "kv_lens",
++    ),
++    (
++        pytest.param(
++            torch.bfloat16, 8, 48, None, "causal", 32, (1040, 300), id="bf16-group8"
++        ),
++        pytest.param(
++            torch.float16, 8, 17, None, "dense", 16, (777, 64), id="fp16-page16"
++        ),
++        # 96 heads leave 32 structural padding rows in the tile.
++        pytest.param(
++            torch.float16, 96, 3, None, "dense", 64, (900, 450), id="fp16-group96"
++        ),
++        pytest.param(
++            torch.bfloat16,
++            128,
++            5,
++            None,
++            "causal",
++            128,
++            (1000, 2048),
++            id="bf16-group128-page128",
++        ),
++        pytest.param(
++            torch.bfloat16,
++            8,
++            48,
++            (37, 5),
++            "causal",
++            32,
++            (1000, 300),
++            id="bf16-packed",
++        ),
++    ),
++)
++def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
++    monkeypatch: pytest.MonkeyPatch,
++    dtype: torch.dtype,
++    heads_q_per_kv: int,
++    seq_len_q: int,
++    q_lens: tuple[int, ...] | None,
++    mask_type: str,
++    page_size: int,
++    kv_lens: tuple[int, ...],
++):
++    """A pinned grouped Keeps Q128 tile runs FP16/BF16 paged K/V."""
++
++    case = _make_decode_case(
++        kv_lens=kv_lens,
++        num_qo_heads=2 * heads_q_per_kv,
++        num_kv_heads=2,
++        head_dim=128,
++        seq_len_q=seq_len_q,
++        page_size=page_size,
++        qkv_dtype=dtype,
++        output_dtype=dtype,
++        cache_form="tuple",
++        mask_type=mask_type,
++        device="cuda",
++        seed=20261020 + heads_q_per_kv,
++    )
++    qo_indptr = None
++    if q_lens is not None:
++        case, qo_indptr = _pack_decode_case(case, q_lens)
++
++    policy = _exercise_explicit_profile_case(
++        monkeypatch,
++        case,
++        _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
++        qo_indptr=qo_indptr,
++        max_seq_len_q=None if q_lens is None else seq_len_q,
++    )
++
++    assert policy["mma_variant"] == "keeps_mma_ab"
++    assert policy["tile_size_q"] == 128
++    assert policy["groups_tokens_heads_q"] is True
++
++
++def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
++    monkeypatch,
++) -> None:
++    """The grouped-Q cost model scores 16-bit paged Keeps Q128 for fixed multi-Q page 32."""
++
++    shape = dict(
++        seq_len_q=64,
++        seq_len_kv=8192,
++        batch_size=16,
++        num_heads_q=64,
++        num_heads_kv=8,
++        num_tokens_per_page=32,
++    )
++    pinned = _make_auto_kv_tile_config(
++        monkeypatch, args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE, **shape
++    )
++    assert pinned.supports_auto_grouped_keeps
++    for changes in ({"seq_len_q": 1}, {"num_tokens_per_page": 64}):
++        other = _make_auto_kv_tile_config(
++            monkeypatch,
++            args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE,
++            **{**shape, **changes},
++        )
++        assert other.supports_grouped_keeps
++        assert not other.supports_auto_grouped_keeps
++    # Dense multi-Q launches take the cost model's tile instead of a head band.
++    automatic = _make_auto_kv_tile_config(monkeypatch, **shape)
++    assert automatic.use_keeps_mma_ab
++    assert automatic.tile_size_q == 128
++    assert automatic.groups_tokens_heads_q
++
++
+ @_REQUIRES_PRIMTS_GPU
+ @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
+diff --git a/tests/attention/test_attention_ts_query_paired.py b/tests/attention/test_attention_ts_query_paired.py
+new file mode 100644
+index 00000000000..e020c3e6798
+--- /dev/null
++++ b/tests/attention/test_attention_ts_query_paired.py
+@@ -0,0 +1,556 @@
++"""Query-paired Q128 plans of the PrimTS decode kernel.
++
++A query-paired plan runs two consecutive Q128 tiles of one sequence and KV
++head on one CTA, each K/V instance owning a tile over the whole K/V stream.
++Dense block-sparse wrapper plans pair contiguous K/V; paged decode plans pair
++when ``query_paired=True`` and the launch qualifies, or when the automatic
++selection pairs a ``None`` plan. Sage recipes are covered in
++``test_attention_ts_sage.py``.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import pytest
++import torch
++
++from flashinfer.attention.prims_ts import (
++    _block_sparse,
++    get_prims_ts_batch_decode_workspace_size,
++    prepare_prims_ts_batch_decode_with_kv_cache,
++)
++from flashinfer.attention.prims_ts import decode as decode_module
++from flashinfer.attention.prims_ts.block_sparse import BlockSparseTSWrapper
++from tests.attention.test_attention_ts_block_sparse import (
++    _HEAD_DIM,
++    _REQUIRES_PRIMTS_GPU,
++)
++from tests.attention.test_attention_ts_decode import (
++    _FP8,
++    _assert_case_correct,
++    _exercise_public_paths,
++    _make_decode_case,
++    _pack_decode_case,
++    _plan_case,
++    _run_case,
++    _seq_lens_from_csr,
++)
++
++sparse_config = _block_sparse.config
++
++
++@dataclass(frozen=True)
++class _PairedCase:
++    """One dense Q128 problem: Q tiles of 16 tokens from eight heads per KV head."""
++
++    name: str
++    seq_len_q: int
++    seq_len_kv: int
++    dtype: torch.dtype = torch.bfloat16
++    batch_size: int = 2
++    num_kv_heads: int = 2
++    persistent: bool = False
++    mask_type: str = "dense"
++
++    @property
++    def num_qo_heads(self) -> int:
++        return 8 * self.num_kv_heads
++
++
++_CASES = (
++    # One Q tile leaves the second instance's tile past the end of Q.
++    _PairedCase("one_tile_one_kv_tile", seq_len_q=16, seq_len_kv=128),
++    _PairedCase("two_tiles_ragged_kv", seq_len_q=32, seq_len_kv=1000),
++    _PairedCase("three_tiles_fp16", seq_len_q=48, seq_len_kv=640, dtype=torch.float16),
++    _PairedCase(
++        "three_tiles_persistent", seq_len_q=48, seq_len_kv=1000, persistent=True
++    ),
++    # The first Q tile sees K/V up to 1024, the second one more K/V tile.
++    _PairedCase(
++        "causal_one_cta_extra_kv_tile",
++        seq_len_q=32,
++        seq_len_kv=1040,
++        mask_type="causal",
++    ),
++    # Only the first of the two CTAs streams a K/V tile its first Q tile
++    # cannot see.
++    _PairedCase(
++        "causal_two_ctas_extra_kv_tile",
++        seq_len_q=64,
++        seq_len_kv=1072,
++        mask_type="causal",
++    ),
++    _PairedCase(
++        "causal_three_tiles_fp16",
++        seq_len_q=48,
++        seq_len_kv=640,
++        dtype=torch.float16,
++        mask_type="causal",
++    ),
++    _PairedCase(
++        "causal_two_ctas_persistent",
++        seq_len_q=64,
++        seq_len_kv=1072,
++        mask_type="causal",
++        persistent=True,
++    ),
++)
++
++
++def _plan(case: _PairedCase, *, query_paired: bool) -> BlockSparseTSWrapper:
++    wrapper = BlockSparseTSWrapper()
++    select_scheduler = sparse_config._select_block_sparse_scheduler
++    sparse_config._resolve_block_sparse_launch_spec.cache_clear()
++    try:
++        with pytest.MonkeyPatch.context() as monkeypatch:
++            if case.persistent:
++                # The test shapes are too small for the planner to pick the
++                # persistent scheduler; keep its Q tile and force the choice.
++                monkeypatch.setattr(
++                    sparse_config,
++                    "_select_block_sparse_scheduler",
++                    lambda **kwargs: (select_scheduler(**kwargs)[0], True),
++                )
++            wrapper.plan(
++                case.batch_size,
++                case.seq_len_q,
++                case.seq_len_kv,
++                case.num_qo_heads,
++                case.num_kv_heads,
++                _HEAD_DIM,
++                16,
++                64,
++                device=torch.device("cuda", 0),
++                use_block_sparse=False,
++                mask_type=case.mask_type,
++                q_data_type=case.dtype,
++                query_paired=query_paired,
++            )
++    finally:
++        sparse_config._resolve_block_sparse_launch_spec.cache_clear()
++    policy = dict(wrapper._policy)
++    assert policy["tile_size_q"] == 128
++    assert policy["tile_size_kv"] == 128
++    assert policy["scheduler"] == ("persistent" if case.persistent else "static")
++    return wrapper
++
++
++def _reference(q, k, v, sm_scale: float, mask_type: str) -> torch.Tensor:
++    group = q.shape[2] // k.shape[2]
++    k_heads = k.float().repeat_interleave(group, dim=2)
++    v_heads = v.float().repeat_interleave(group, dim=2)
++    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_heads) * sm_scale
++    if mask_type == "causal":
++        # Query i sees the keys up to its own position at the end of K/V.
++        seq_len_q, seq_len_kv = q.shape[1], k.shape[1]
++        last_keys = torch.arange(seq_len_q, device=q.device) + seq_len_kv - seq_len_q
++        hidden = torch.arange(seq_len_kv, device=q.device) > last_keys[:, None]
++        scores = scores.masked_fill(hidden, float("-inf"))
++    return torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), v_heads)
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.arch_blackwell
++@pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
++@torch.no_grad()
++def test_query_paired_matches_unpaired(case: _PairedCase) -> None:
++    """A paired plan reproduces the unpaired kernel and FP32 attention."""
++
++    torch.manual_seed(20261018)
++    q = torch.randn(
++        (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM),
++        device="cuda",
++    ).to(case.dtype)
++    k = torch.randn(
++        (case.batch_size, case.seq_len_kv, case.num_kv_heads, _HEAD_DIM),
++        device="cuda",
++    ).to(case.dtype)
++    v = torch.randn_like(k)
++    sm_scale = _HEAD_DIM**-0.5
++    outputs = {}
++    for query_paired in (False, True):
++        wrapper = _plan(case, query_paired=query_paired)
++        outputs[query_paired] = wrapper.run(q, k, v, sm_scale=sm_scale)
++        torch.cuda.synchronize()
++    paired, unpaired = outputs[True], outputs[False]
++    assert paired.dtype == case.dtype
++    assert torch.isfinite(paired).all()
++    torch.testing.assert_close(paired.float(), unpaired.float(), rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(
++        paired.float(),
++        _reference(q, k, v, sm_scale, case.mask_type),
++        rtol=2e-2,
++        atol=2e-2,
++    )
++
++
++@pytest.mark.parametrize(
++    ("overrides", "match"),
++    (
++        pytest.param(
++            {"use_block_sparse": True, "max_blocks_per_row": 4},
++            "dense, contiguous",
++            id="sparse",
++        ),
++        pytest.param({"num_qo_heads": 2, "q_block_size": 32}, "Q128", id="q64-tile"),
++    ),
++)
++def test_query_paired_plan_rejects_other_profiles(
++    overrides: dict[str, object], match: str
++) -> None:
++    """Pairing is a dense Q128 plan option only."""
++
++    arguments = dict(
++        batch_size=1,
++        seq_len_q=32,
++        seq_len_kv=256,
++        num_qo_heads=8,
++        num_kv_heads=1,
++        head_dim=_HEAD_DIM,
++        q_block_size=16,
++        kv_block_size=64,
++        device=torch.device("cuda", 0),
++        use_block_sparse=False,
++        q_data_type=torch.bfloat16,
++        query_paired=True,
++    )
++    with pytest.raises(NotImplementedError, match=match):
++        BlockSparseTSWrapper().plan(**{**arguments, **overrides})
++
++
++@dataclass(frozen=True)
++class _PagedPairedCase:
++    """One paged decode problem whose Q tiles fill a wave of CTAs when paired."""
++
++    name: str
++    heads_q_per_kv: int
++    seq_len_q: int
++    num_kv_heads: int = 8
++    batch_size: int = 16
++    page_size: int = 32
++    mask_type: str = "dense"
++    dtype: torch.dtype = torch.bfloat16
++    output_dtype: torch.dtype | None = None
++    head_dim: int = _HEAD_DIM
++    # Per-request Q lengths of a packed batch, cycled over the batch.
++    q_lens: tuple[int, ...] | None = None
++
++    @property
++    def out_dtype(self) -> torch.dtype:
++        return self.dtype if self.output_dtype is None else self.output_dtype
++
++    @property
++    def kv_lens(self) -> tuple[int, ...]:
++        # Ragged lengths; the longest makes the first CTA of a 64-token causal
++        # request stream one K/V tile its first Q tile cannot see.
++        return tuple(1072 - 97 * (i % 7) for i in range(self.batch_size))
++
++
++_PAGED_CASES = (
++    _PagedPairedCase("bf16_group8_three_tiles", heads_q_per_kv=8, seq_len_q=48),
++    _PagedPairedCase(
++        "fp16_group8_causal_page16",
++        heads_q_per_kv=8,
++        seq_len_q=64,
++        page_size=16,
++        mask_type="causal",
++        dtype=torch.float16,
++    ),
++    # One token per Q tile: five tiles leave the last CTA's second tile past
++    # the sequence.
++    _PagedPairedCase(
++        "bf16_group128_causal_page64",
++        heads_q_per_kv=128,
++        seq_len_q=5,
++        num_kv_heads=4,
++        page_size=64,
++        mask_type="causal",
++    ),
++    # 96 heads leave 32 padding rows in each one-token Q tile.
++    _PagedPairedCase(
++        "bf16_group96_page128",
++        heads_q_per_kv=96,
++        seq_len_q=4,
++        num_kv_heads=4,
++        page_size=128,
++    ),
++    _PagedPairedCase(
++        "bf16_group8_packed_causal",
++        heads_q_per_kv=8,
++        seq_len_q=64,
++        mask_type="causal",
++        q_lens=(64, 5, 33, 48, 17),
++    ),
++    # Paged FP8 pairs at page size 32. Paired CTAs beyond one wave run on the
++    # persistent scheduler; eight requests keep them within one static wave.
++    _PagedPairedCase(
++        "fp8_group8_persistent", heads_q_per_kv=8, seq_len_q=48, dtype=_FP8
++    ),
++    _PagedPairedCase(
++        "fp8_group8_static_bf16_output",
++        heads_q_per_kv=8,
++        seq_len_q=48,
++        batch_size=8,
++        dtype=_FP8,
++        output_dtype=torch.bfloat16,
++    ),
++    _PagedPairedCase(
++        "fp8_group32_causal_fp16_output",
++        heads_q_per_kv=32,
++        seq_len_q=12,
++        mask_type="causal",
++        dtype=_FP8,
++        output_dtype=torch.float16,
++    ),
++    _PagedPairedCase(
++        "fp8_group128_causal",
++        heads_q_per_kv=128,
++        seq_len_q=5,
++        num_kv_heads=4,
++        mask_type="causal",
++        dtype=_FP8,
++    ),
++    _PagedPairedCase(
++        "fp8_head_dim64_causal",
++        heads_q_per_kv=8,
++        seq_len_q=48,
++        mask_type="causal",
++        dtype=_FP8,
++        head_dim=64,
++    ),
++    _PagedPairedCase(
++        "fp8_head_dim64_group128_bf16_output",
++        heads_q_per_kv=128,
++        seq_len_q=5,
++        num_kv_heads=4,
++        dtype=_FP8,
++        output_dtype=torch.bfloat16,
++        head_dim=64,
++    ),
++)
++
++
++def _paged_decode_case(case: _PagedPairedCase):
++    """Build ``case``'s inputs and reference; packed cases also return Q offsets."""
++
++    decode_case = _make_decode_case(
++        kv_lens=case.kv_lens,
++        num_qo_heads=case.heads_q_per_kv * case.num_kv_heads,
++        num_kv_heads=case.num_kv_heads,
++        head_dim=case.head_dim,
++        seq_len_q=case.seq_len_q,
++        page_size=case.page_size,
++        qkv_dtype=case.dtype,
++        output_dtype=case.out_dtype,
++        cache_form="tuple",
++        mask_type=case.mask_type,
++        device="cuda",
++        seed=20261020,
++    )
++    if case.q_lens is None:
++        return decode_case, None
++    q_lens = [case.q_lens[i % len(case.q_lens)] for i in range(case.batch_size)]
++    return _pack_decode_case(decode_case, q_lens)
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.arch_blackwell
++@pytest.mark.parametrize("case", _PAGED_CASES, ids=lambda case: case.name)
++@torch.no_grad()
++def test_paged_query_paired_public_paths(case: _PagedPairedCase) -> None:
++    """A paired paged plan matches FP32 attention eagerly, standalone and in a graph."""
++
++    decode_case, qo_indptr = _paged_decode_case(case)
++    seq_lens = _seq_lens_from_csr(
++        decode_case.paged_kv_indptr,
++        decode_case.paged_kv_last_page_len,
++        case.page_size,
++    )
++    wrapper = _plan_case(
++        decode_case,
++        max_kv_len=max(case.kv_lens),
++        qo_indptr=qo_indptr,
++        max_seq_len_q=case.seq_len_q,
++        query_paired=True,
++    )
++    policy = dict(wrapper._policy)
++    assert policy["query_paired"] is True
++    assert policy["tile_size_q"] == 128
++    _exercise_public_paths(
++        wrapper,
++        decode_case,
++        seq_lens,
++        max_kv_len=max(case.kv_lens),
++        exercise_all_paths=True,
++        qo_indptr=qo_indptr,
++        max_seq_len_q=case.seq_len_q,
++    )
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.arch_blackwell
++@torch.no_grad()
++def test_prepared_paged_query_paired_matches_wrapper() -> None:
++    """A prepared paired launch reproduces the paired wrapper, eagerly and in a graph."""
++
++    case = _PagedPairedCase(
++        "bf16_group8_causal", heads_q_per_kv=8, seq_len_q=48, mask_type="causal"
++    )
++    decode_case, _ = _paged_decode_case(case)
++    seq_lens = _seq_lens_from_csr(
++        decode_case.paged_kv_indptr,
++        decode_case.paged_kv_last_page_len,
++        case.page_size,
++    )
++    max_kv_len = max(case.kv_lens)
++    wrapper = _plan_case(decode_case, max_kv_len=max_kv_len, query_paired=True)
++    assert dict(wrapper._policy)["query_paired"] is True
++    expected = _run_case(wrapper, decode_case)
++
++    workspace = torch.zeros(
++        get_prims_ts_batch_decode_workspace_size(
++            case.batch_size,
++            case.heads_q_per_kv * case.num_kv_heads,
++            case.num_kv_heads,
++            case.head_dim,
++            case.page_size,
++            max_kv_len,
++            seq_len_q=case.seq_len_q,
++            q_dtype=case.dtype,
++            out_dtype=case.out_dtype,
++            mask_type=case.mask_type,
++            device="cuda",
++            query_paired=True,
++        ),
++        dtype=torch.int8,
++        device="cuda",
++    )
++    out = torch.empty_like(expected)
++    prepared = prepare_prims_ts_batch_decode_with_kv_cache(
++        decode_case.q,
++        decode_case.paged_kv_cache,
++        workspace,
++        decode_case.block_tables,
++        seq_lens,
++        max_kv_len,
++        out=out,
++        seq_len_q=case.seq_len_q,
++        out_dtype=case.out_dtype,
++        mask_type=case.mask_type,
++        page_size=case.page_size,
++        query_paired=True,
++    )
++    run_args = dict(
++        bmm1_scale=decode_case.bmm1_scale, bmm2_scale=decode_case.bmm2_scale
++    )
++    assert prepared.run(decode_case.q, out=out, **run_args) is out
++    torch.cuda.synchronize()
++    _assert_case_correct(out, decode_case)
++    torch.testing.assert_close(out, expected, rtol=0, atol=0)
++
++    graph_out = torch.full_like(expected, float("nan"))
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        prepared.run(decode_case.q, out=graph_out, **run_args)
++    graph.replay()
++    torch.cuda.synchronize()
++    torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
++
++
++_PAIRED_DECODE_SHAPE = dict(
++    batch_size=16,
++    num_qo_heads=64,
++    num_kv_heads=8,
++    head_dim=_HEAD_DIM,
++    page_size=32,
++    max_kv_len=4096,
++    seq_len_q=48,
++    q_dtype_key="bfloat16",
++    k_dtype_key="bfloat16",
++    v_dtype_key="bfloat16",
++    output_dtype_key="bfloat16",
++    kv_layout="HND",
++    mask_type="causal",
++    use_packed_q=False,
++    window_left=-1,
++)
++
++
++def _paged_policy(query_paired: bool | None, **changes: object) -> dict[str, object]:
++    shape = {**_PAIRED_DECODE_SHAPE, **changes}
++    spec = decode_module._resolve_decode_launch_spec(
++        torch.cuda.current_device(), **shape, query_paired=query_paired
++    )
++    return dict(spec.policy)
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.parametrize(
++    "changes",
++    (
++        pytest.param({"seq_len_q": 16}, id="one-q-tile"),
++        pytest.param({"batch_size": 1, "num_kv_heads": 1}, id="small-grid"),
++        pytest.param({"window_left": 511}, id="sliding-window"),
++        pytest.param({"head_dim": 256}, id="head-dim-256"),
++        # Head dim 64 pairs only the paged FP8 recipe.
++        pytest.param({"head_dim": 64}, id="bf16-head-dim-64"),
++    ),
++)
++def test_paged_query_paired_plans_unpaired_when_unsupported(
++    changes: dict[str, object],
++) -> None:
++    """Pairing falls back to an unpaired plan and records that in the policy."""
++
++    assert _paged_policy(True)["query_paired"] is True
++    assert _paged_policy(True, **changes)["query_paired"] is False
++
++
++def test_paged_query_paired_must_be_a_bool() -> None:
++    with pytest.raises(TypeError, match="query_paired"):
++        decode_module._resolve_decode_launch_spec(
++            0, **_PAIRED_DECODE_SHAPE, query_paired="yes"
++        )
++
++
++@_REQUIRES_PRIMTS_GPU
++@pytest.mark.parametrize(
++    ("changes", "model_pairs"),
++    (
++        # 8192 unpaired CTAs take twice the waves of the 4096 paired ones.
++        pytest.param({"batch_size": 64, "seq_len_q": 256}, True, id="pairs"),
++        # 1024 unpaired CTAs take seven waves; 512 paired ones still take four.
++        pytest.param({"seq_len_q": 128}, False, id="unpaired"),
++    ),
++)
++def test_paged_query_paired_none_follows_the_cost_model(
++    changes: dict[str, object], model_pairs: bool
++) -> None:
++    """None pairs when the grouped-Q cost model scores the paired tile cheapest."""
++
++    shape = {"max_kv_len": 8192, **changes}
++    assert _paged_policy(None, **shape)["query_paired"] is model_pairs
++    assert _paged_policy(True, **shape)["query_paired"] is True
++    assert _paged_policy(False, **shape)["query_paired"] is False
++
++
++def test_grouped_q_candidates_pair_keeps_q128_tiles() -> None:
++    """The paired Keeps Q128 candidate covers two Q tiles per CTA."""
++
++    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
++        enumerate_grouped_q_mma_candidates,
++    )
++
++    candidates = enumerate_grouped_q_mma_candidates(
++        heads_q_per_kv=8, seq_len_q=48, query_paired=True
++    )
++    paired = [candidate for candidate in candidates if candidate.query_paired]
++    assert [(c.variant, c.tile_size_q, c.q_tiles) for c in paired] == [
++        ("keeps_mma_ab", 128, 3)
++    ]
++    assert paired[0].ctas_per_kv_head == 2
++    # One Q tile leaves nothing to pair.
++    single = enumerate_grouped_q_mma_candidates(
++        heads_q_per_kv=8, seq_len_q=16, query_paired=True
++    )
++    assert not any(candidate.query_paired for candidate in single)
+diff --git a/tests/attention/test_attention_ts_sage.py b/tests/attention/test_attention_ts_sage.py
+index a43f76813c8..e14c0b9dfc5 100644
+--- a/tests/attention/test_attention_ts_sage.py
++++ b/tests/attention/test_attention_ts_sage.py
+@@ -107,6 +107,8 @@ class _SageCase:
+     tiny_q_scales: bool = False
+     # One routing pattern serves every KV head.
+     share_pattern_across_kv_heads: bool = False
++    # Each CTA of a dense Q128 plan finalizes two consecutive Q tiles.
++    query_paired: bool = False
+ 
+     @property
+     def num_kv_blocks(self) -> int:
+@@ -171,6 +173,58 @@ def num_pattern_heads(self) -> int:
+         sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
+         persistent=True,
+     ),
++    # Three Q128 tiles per sequence pair the first two and leave the third
++    # instance-1 slot past the end of Q.
++    _SageCase(
++        "q128_fp8_k16_mean_paired",
++        **_Q128,
++        sage=SageAttentionConfig(v_mean=True),
++        query_paired=True,
++    ),
++    _SageCase(
++        "q128_fp8_k4_q4_paired_persistent",
++        **_Q128,
++        sage=SageAttentionConfig(q_block_size=4, k_block_size=4),
++        query_paired=True,
++        persistent=True,
++    ),
++    # INT8 scores of both paired instances seed from one bias tile.
++    _SageCase(
++        "q128_int8_k1_q4_paired",
++        **_Q128,
++        qk_dtype=torch.int8,
++        out_dtype=torch.float16,
++        sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
++        query_paired=True,
++    ),
++    _SageCase(
++        "q128_int8_k16_mean_paired_persistent",
++        **_Q128,
++        qk_dtype=torch.int8,
++        out_dtype=torch.float16,
++        sage=SageAttentionConfig(v_mean=True),
++        query_paired=True,
++        persistent=True,
++    ),
++    # 536 K/V tokens give the first CTA's second Q tile one more K/V tile
++    # than its first.
++    _SageCase(
++        "q128_fp8_k1_causal_paired",
++        **{**_Q128, "seq_len_kv": 536},
++        sage=SageAttentionConfig(k_block_size=1),
++        mask_type="causal",
++        query_paired=True,
++    ),
++    _SageCase(
++        "q128_int8_k16_mean_causal_paired_persistent",
++        **{**_Q128, "seq_len_kv": 536},
++        qk_dtype=torch.int8,
++        out_dtype=torch.float16,
++        sage=SageAttentionConfig(v_mean=True),
++        mask_type="causal",
++        query_paired=True,
++        persistent=True,
++    ),
+     # A zero threshold keeps exact KV256 anchors and P at the full E4M3 range.
+     _SageCase(
+         "kv256_fp8_k16_exact_anchors_persistent",
+@@ -426,6 +480,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
+                 o_data_type=case.out_dtype,
+                 sage_config=case.sage,
+                 softmax_rescale_threshold_log2=case.softmax_rescale_threshold_log2,
++                query_paired=case.query_paired,
+                 **route_kwargs,
+             )
+     finally:
+@@ -484,8 +539,9 @@ def _row_folds(case: _SageCase, exact_blocks):
+ 
+     A route (a dense tile) packs ``kv_tile`` tokens of the exact blocks or
+     ``kv_tile`` summaries, in K64 atoms; exact routes come first. K/V instance
+-    ``route % 2`` owns a route and, on KV256, spatial half ``atom % 2`` splits
+-    it into two streams, each folding its half of the route at once.
++    ``route % 2`` owns a route (a query-paired instance owns every route) and,
++    on KV256, spatial half ``atom % 2`` splits it into two streams, each
++    folding its half of the route at once.
+     """
+ 
+     kv_block, atoms_per_route = case.kv_block_size, case.kv_tile // 64
+@@ -519,21 +575,11 @@ def _row_folds(case: _SageCase, exact_blocks):
+         for half in range(halves):
+             indices = [index for atom in atoms[half::halves] for index in atom]
+             if indices:
+-                stream = route_idx % 2 * halves + half
++                routes_per_step = 1 if case.query_paired else 2
++                stream = route_idx % routes_per_step * halves + half
+                 yield stream, source, torch.tensor(indices, device="cuda")
+ 
+ 
+-def _anchor_headroom_log2(case: _SageCase) -> float:
+-    """Binades the kernel lets a stream's exponent anchor lag its row maximum.
+-
+-    KV256 tiles and block-sparse routes defer anchor updates by the plan's
+-    rescale threshold; other launches anchor on the exact running maximum.
+-    """
+-    if case.kv_tile == 256 or case.routes != "dense":
+-        return case.softmax_rescale_threshold_log2
+-    return 0.0
+-
+-
+ def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
+     """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
+ 
+@@ -574,7 +620,9 @@ def _reference(
+     probability by that mass. Rows without visible mass stay zero.
+     """
+ 
+-    headroom = _anchor_headroom_log2(case)
++    # Every Sage plan runs a Keeps tile, which lets a stream's exponent anchor
++    # lag its row maximum by the plan's rescale threshold.
++    headroom = case.softmax_rescale_threshold_log2
+     q_real = _dequantize(q, params.q_scale, case.sage.q_block_size)
+     k_real = _dequantize(k, params.k_scale, case.sage.k_block_size)
+     if summaries is not None:
