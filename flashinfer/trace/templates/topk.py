@@ -72,36 +72,45 @@ def _top_k_varlen_check(
     next_n=1,
     **_unused,
 ):
-    """Tie-safe value check: every selected value must be >= the row's K-th largest.
+    """Tie-aware top-k check: the selection must be a correct top-k set, not
+    the reference's exact set.
 
-    Exact set equality is not required because ties at the K-th boundary may be
-    broken differently by the kernel vs the reference. Instead we verify that
-    each selected index points to a value no smaller than the true K-th largest
-    (matching the check used in tests/topk_varlen/test_topk_varlen.py::_check_correct).
-    This requires the original logits and seq_lens, which the template passes
-    via **_unused from the check call in the test.
+    Ties at the K-th boundary may be broken differently by the kernel and the
+    reference, so instead of index equality each row must hold top_k distinct
+    in-window indices whose sorted values equal the row's sorted top-k values
+    (both gathered from the same fp32 image, so no tolerance is needed), with
+    pads exactly -1 and only where the window is shorter than top_k. This
+    requires the original logits and seq_lens, which the template passes via
+    **_unused from the check call in the test; without them the check falls
+    back to exact multiset equality with the reference. A NaN inside a window
+    fails the row (NaN compares unequal to itself; the kernels' NaN ordering is
+    implementation-specific).
     """
-    act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]
+    act = (
+        actual_outputs[0]
+        if isinstance(actual_outputs, (list, tuple))
+        else actual_outputs
+    )
     if logits is None or seq_lens is None or top_k is None:
-        # Fallback to exact set equality when logits are unavailable.
+        # Fallback to exact multiset equality (pads included) when logits are
+        # unavailable: the same indices, in any order.
         ref = (
-            reference_outputs
-            if not isinstance(reference_outputs, list)
-            else reference_outputs[0]
+            reference_outputs[0]
+            if isinstance(reference_outputs, (list, tuple))
+            else reference_outputs
         )
         if ref.shape != act.shape:
             return False
         for r in range(ref.shape[0]):
-            ref_set = set(ref[r].cpu().tolist())
-            act_set = set(act[r].cpu().tolist())
-            ref_set.discard(-1)
-            act_set.discard(-1)
-            if ref_set != act_set:
+            if sorted(ref[r].cpu().tolist()) != sorted(act[r].cpu().tolist()):
                 return False
         return True
 
     logits_f32 = logits.to(torch.float32)
     N = logits_f32.shape[1]
+    top_k = int(top_k)
+    if act.shape[1] != top_k:
+        return False
     if page_table is not None:
         ps = 1 if page_size is None else int(page_size)
         pt64 = page_table.to(torch.int64)
@@ -109,6 +118,9 @@ def _top_k_varlen_check(
         s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        pad = sel == -1  # a pad is exactly -1, taken from the raw output
+        if bool((sel < -1).any()):
+            return False  # no other negative value is valid
         if page_table is not None:
             # paged output holds physical KV slots: map every valid slot back to
             # its logits column through the request's page map (one physical
@@ -146,9 +158,14 @@ def _top_k_varlen_check(
             sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
             # short window: every window position exactly once (the identity
-            # set, in any order) and top_k - n pads of -1 -- never skipped
-            valid = sel[sel >= 0]
-            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:
+            # set, in any order) and top_k - n pads of -1 -- never skipped. The
+            # pad count comes from the raw output: after the absolute-frame
+            # shift a raw column below the window start is negative too, and
+            # that is an index outside the window, not a pad.
+            if int(pad.sum()) != top_k - n:
+                return False
+            valid = sel[~pad]
+            if bool((valid < 0).any()) or bool((valid >= n).any()):
                 return False
             if n and not torch.equal(
                 torch.sort(valid).values, torch.arange(n, device=sel.device)
@@ -156,12 +173,17 @@ def _top_k_varlen_check(
                 return False
             continue
         row = logits_f32[r, s : s + n]
-        kth = torch.topk(row, top_k).values[-1].item()
         # a -1 pad in a full row, or any index outside the window, is a
         # failure -- not a wrap-around gather or a device-side index assert
         if bool((sel < 0).any()) or bool((sel >= n).any()):
             return False
-        if (row[sel] < kth - 1e-5).any():
+        # a correct top-k set: top_k distinct indices whose values are exactly
+        # the row's top_k values as a multiset. Ties may fall on any of the
+        # tied indices, but a value strictly above the K-th is never dropped
+        # and nothing below the K-th is ever selected.
+        if sel.unique().numel() != top_k or not torch.equal(
+            torch.sort(row[sel]).values, torch.topk(row, top_k).values.sort().values
+        ):
             return False
     return True
 
