@@ -374,24 +374,26 @@ K1_SPLIT_RULES:dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] =
     ("sm_103a", 1, 5120, 128, "bf16"): (128, 2), ("sm_103a", 1, 5120, 128, "f32"): (128, 2),
     ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
     ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
-    # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
+    # sm_107a (216 SMs): one or two splits (the rows of three or four splits, whose partials were added in the order
+    # they finish, run two splits where the two-split program was not slower than the deterministic plan on 212-SM
+    # parts, else the deterministic program); the one-split rows store whole tiles (deterministic) and win where the
     # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 40960 tokens on
     # 216 SMs, 5120 -> 1024 to 32768, and up to 960 on more SMs: K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at
     # d_in 4096 is not faster than the deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to
     # d_out 4096 FP32 (216 CTAs) need more SMs than a kernel holding 32 SMs leaves free and lose next to it
-    ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-    ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-    ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+    ("sm_107a", 1, 4096, 48, "f32"): None,
+    ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
     ("sm_107a", 1, 4096, 128, "bf16"): None, ("sm_107a", 1, 4096, 128, "f32"): None,
     ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
     ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
     ("sm_107a", 1, 4096, 4096, "f32"): None,
-    ("sm_107a", 1, 5120, 32, "bf16"): (64, 3), ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-    ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-    ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+    ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+    ("sm_107a", 1, 5120, 64, "f32"): None,
     ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
     ("sm_107a", 1, 5120, 1024, "bf16"): (256, 1), ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
-    ("sm_107a", 1, 6144, 32, "bf16"): (64, 3), ("sm_107a", 1, 6144, 32, "f32"): (64, 3),
+    ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
     ("sm_107a", 1, 8192, 128, "bf16"): (128, 2), ("sm_107a", 1, 8192, 128, "f32"): (128, 2),
 }
 # fmt: on
@@ -490,7 +492,8 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: there).  The 217-SM entries keep the four rows on the deterministic program from 961 tokens up on parts of more than
 #: 216 SMs, the route they took before that measurement: the one-split program's time at 961 to 40960 tokens was
 #: measured on 216-SM parts only (where the ranges of :data:`K1_CHAIN_RANGES_BY_SM` come first), and no part of more
-#: SMs was measured.
+#: SMs was measured.  The sm_107a rows that now run the deterministic program at every token count (their three- or
+#: four-split verdicts are gone, :data:`K1_SPLIT_RULES`) have no entries.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -523,40 +526,25 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
     ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
-    ("sm_107a", 1, 4096, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 4096, 32, "f32"): ((216, 16231, 16231),),
-    ("sm_107a", 1, 4096, 48, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
-    ),
-    ("sm_107a", 1, 4096, 64, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
-    ),
     ("sm_107a", 1, 4096, 512, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
         (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 4096, 1024, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
-        (216, 16384, 16384), (216, 40961, None), (217, 961, None),
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
+        (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
-    ("sm_107a", 1, 5120, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 32, "f32"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 512, 512),
         (216, 16231, 16231), (216, 16384, 16384),
-    ),
-    ("sm_107a", 1, 5120, 64, "f32"): (
-        (208, 16231, 16231), (212, 16231, 16231), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
     ),
     ("sm_107a", 1, 5120, 512, "f32"): (
         (212, 16231, 16231), (212, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
     ("sm_107a", 1, 5120, 1024, "f32"): ((216, 32769, None), (217, 961, None)),
-    ("sm_107a", 1, 6144, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 8192, 128, "bf16"): ((216, 512, 512), (216, 65536, 65536)),
     ("sm_107a", 1, 8192, 128, "f32"): ((216, 512, 512), (216, 65536, 65536)),
 }
@@ -588,7 +576,11 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: output missed the BF16 budget for one of 10 seeds at 40961 and at 40962 tokens (``5120 -> 64``: 47105) where the
 #: deterministic program's met it on every seed (``5120 -> 48`` met it at 41985 to 47105 tokens inside its range), and
 #: from 49152 tokens (``5120 -> 64``: 49153) both programs missed it for some seed, so the split program stays there.
-#: Unmeasured token counts keep the verdict.
+#: Unmeasured token counts keep the verdict.  The 152-SM ``sm_103a`` entries keep the FP32 rows ``5120 -> 32 / 48 / 64 /
+#: 128`` on the deterministic program at the token ranges where :data:`K1_DSM_RANGES_BY_SM` ran a cluster of three CTAs
+#: and at 16384 tokens of ``5120 -> 32`` (the accuracy check against the reference implementation described there),
+#: and ``5120 -> 48`` BF16 at 16231 tokens, where its two-split output missed that check on the mirrored-cancellation
+#: inputs with the permuted split (1.104 times the reference's worst error).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -603,6 +595,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
         ("sm_100a", 1, 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 5120, 32, "f32"): ((8192, 12287), (16384, 16384)),
+        ("sm_103a", 1, 5120, 48, "bf16"): ((16231, 16231),),
+        ("sm_103a", 1, 5120, 48, "f32"): ((4096, 8192),),
+        ("sm_103a", 1, 5120, 64, "f32"): ((4096, 6143), (12288, 24576)),
+        ("sm_103a", 1, 5120, 128, "f32"): ((4097, 32768),),
     },
     ("sm_103a", 148): {
         ("sm_103a", 1, 4096, 32, "bf16"): ((65536, None),),
@@ -684,30 +683,30 @@ K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
 ] = {
     ("sm_107a", 208): {
-        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 4096, 48, "f32"): None,
+        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
         ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): None,
-        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 64, "f32"): None,
         ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
         ("sm_107a", 1, 5120, 1024, "bf16"): None, ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
         ("sm_107a", 1, 8192, 128, "bf16"): None, ("sm_107a", 1, 8192, 128, "f32"): None,
     },
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 4096, 48, "f32"): None,
+        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
         ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): None,
-        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 64, "f32"): None,
         ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
         ("sm_107a", 1, 5120, 1024, "bf16"): None, ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
@@ -734,25 +733,21 @@ K1_SPLIT_RULES_BY_SM_TOKENS: tuple[int, int] = (16172, 16384)
 #: the window's first token count, or from the window's last one to such a measured token count, and holds no measured
 #: token count that failed; the token counts between two consecutive measured ones inside it take the verdict too (not
 #: measured).  The token counts below a range's first measured token count, above its last, and those between a
-#: measured token count that passed and one that failed run the deterministic program.  On 212 SMs: the FP32 rows
-#: ``4096 -> 32, 48, 64`` and ``5120 -> 32, 48, 64`` from 1024 to 65536 tokens (at 512 not faster in every run),
+#: measured token count that passed and one that failed run the deterministic program.  On 212 SMs:
 #: ``8192 -> 128`` from 1024 to 32768 tokens (at 512 slower, at 65536 not faster in every run), and
 #: the FP32 rows ``4096 / 5120 -> 512 / 1024`` at 512 tokens only (from 1024 tokens up their one-split program was not
 #: taken for its FP64 error, about twice the deterministic program's, which is reported data and not a rule; there
-#: these rows run the programs of :data:`K1_CHAIN_RANGES_BY_SM` and :data:`K1_TWO_SPLIT_RANGES_BY_SM`).
+#: these rows run the programs of :data:`K1_CHAIN_RANGES_BY_SM` and :data:`K1_TWO_SPLIT_RANGES_BY_SM`).  The FP32 rows
+#: ``4096 -> 32, 48, 64`` and ``5120 -> 32, 48, 64`` held three splits from 1024 to 65536 tokens; three partials added
+#: in the order they finish vary from run to run and missed the accuracy check of :data:`K1_DSM_RANGES_BY_SM`, so these
+#: rows now take their two-split or deterministic verdict in the window only (two splits were timed there alone).
 # fmt: off
 K1_SPLIT_RULES_BY_SM_TOKEN_RANGES: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int], ...]]
 ] = {
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 4096, 48, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 4096, 64, "f32"): ((1024, 16172), (16384, 65536)),
         ("sm_107a", 1, 4096, 512, "f32"): ((512, 512),),
         ("sm_107a", 1, 4096, 1024, "f32"): ((512, 512),),
-        ("sm_107a", 1, 5120, 32, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 5120, 48, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 5120, 64, "f32"): ((1024, 16172), (16384, 65536)),
         ("sm_107a", 1, 5120, 512, "f32"): ((512, 512),),
         ("sm_107a", 1, 5120, 1024, "f32"): ((512, 512),),
         ("sm_107a", 1, 8192, 128, "bf16"): ((1024, 16172), (16384, 32768)),
@@ -928,11 +923,16 @@ K1_CHAIN_RANGES_BY_SM: dict[
 #: 3.54e-6); from 1024 tokens up, where the deterministic program adds the halves of an output's token reduction in two
 #: partials, that error was 2.10 to 2.38 times the deterministic program's (reported, not a rule), and at 256 to 800
 #: tokens the same.  The protocol, the measured token counts and the times are in the 152-SM one-split table of the
-#: README.
+#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs one split of 256-wide tiles at 16172 to 16384 tokens:
+#: on a B200 part 86.3 to 88.1 us against 103.2 to 126.2 us of the deterministic plan (``nn_n256_m256_pro7``), faster in
+#: 5 of 5 paired groups in eager launches and in CUDA graph replays, within the BF16 budget, the same bits on 20 repeats.
 # fmt: off
 K1_ONE_SPLIT_RANGES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, int], ...]]
 ] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, 256),),
+    },
     ("sm_100a", 152): {
         ("sm_100a", 1, 4096, 32, "f32"): ((256, 2048, 64),),
         ("sm_100a", 1, 4096, 128, "f32"): ((256, 3328, 64),),
@@ -984,40 +984,55 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest
 #: reference element) in every one of 20 runs of 10 seeds at every measured token count.  The protocol, the measured
 #: token counts and the times are in the cluster tables of the README.
+#:
+#: Accuracy against the reference implementation (FlashInfer commit ``2e989556``): a cluster of three CTAs sums a
+#: tile's token reduction in three partials in rank order, so it repeats bit for bit, but on the rows whose reference
+#: adds the two halves of that reduction (``4096 -> 32 / 48 / 64 / 128`` and ``5120 -> 32 / 48``) it does not cancel a
+#: mirrored input exactly: its relative error on such an input was 5.8 to 8.7 times the reference's median at 16231
+#: and 16384 tokens on GB200, GB300 and B200 parts.  A cluster of two CTAs (the halves) stayed within 1.1 times the
+#: reference's median error on all six input kinds of that check (random normal, long sums, mirrored and permuted
+#: cancellation, concentrated values, values near the largest magnitude) there, 0.89 to 1.00 times the deterministic
+#: plan's time.  So those rows run two CTAs in every range where they ran three.  On 152-SM ``sm_103a`` parts the
+#: reference cuts the ``5120 -> x`` reduction at 135 / 136 of 256 K blocks, not at the half, and a two-CTA split
+#: failed the check at 16384 tokens (``5120 -> 64``: largest error 1.14 times on random normal inputs; ``5120 -> 32``:
+#: 1.15 times on values near the largest magnitude): their ranges of three CTAs and that token count run the
+#: deterministic program (:data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The 148-SM ``sm_100a`` ranges of three CTAs of
+#: ``5120 -> 64`` and ``5120 -> 128`` stay: there the reference sums the reduction in one chain, and ``5120 -> 128`` on
+#: three CTAs met the check on all six kinds at 16231 and 16384 tokens (0.36 to 0.40 times the reference's error).
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
 ] = {
     ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 16384, (64, 3)), (32768, 32768, (64, 3))),
-        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 16384, (64, 2)), (32768, 32768, (64, 2))),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
         ("sm_100a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
-        ("sm_100a", 1, 5120, 32, "f32"): ((1024, 4095, (32, 2)), (4096, 6143, (32, 3)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 5120, 48, "f32"): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 32768, (64, 2))),
+        ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_100a", 1, 5120, 48, "f32"): ((1024, 32768, (64, 2)),),
         ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2047, (64, 3)), (2048, 32768, (64, 2))),
         ("sm_100a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
     },
     ("sm_100a", 152): {
-        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
-        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 3)),),
-        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 3))),
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16384, 32768, (64, 2))),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 2)),),
+        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 2))),
         ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
         ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         ("sm_100a", 1, 5120, 128, "f32"): ((1024, 6144, (128, 2)),),
     },
     ("sm_103a", 152): {
-        ("sm_103a", 1, 4096, 32, "f32"): ((1024, 2047, (32, 3)), (2048, 4095, (32, 2)), (4096, 8191, (32, 3)), (8192, 12287, (32, 2)), (12288, 16383, (32, 3)), (16384, 24575, (32, 2)), (24576, 32768, (32, 3))),
-        ("sm_103a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 3)), (12288, 32768, (64, 3))),
-        ("sm_103a", 1, 4096, 64, "f32"): ((1024, 2047, (32, 2)), (2048, 8191, (64, 3)), (8192, 12287, (32, 2)), (12288, 32768, (64, 3))),
+        ("sm_103a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_103a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
+        ("sm_103a", 1, 4096, 64, "f32"): ((1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 32768, (64, 2))),
         ("sm_103a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
-        ("sm_103a", 1, 5120, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (8192, 12287, (32, 3)), (12288, 32768, (32, 2))),
-        ("sm_103a", 1, 5120, 48, "f32"): ((1024, 2047, (64, 3)), (2048, 4095, (64, 2)), (4096, 8192, (64, 3))),
-        ("sm_103a", 1, 5120, 64, "f32"): ((1024, 4095, (64, 2)), (4096, 6143, (64, 3)), (6144, 12287, (64, 2)), (12288, 24576, (64, 3))),
-        ("sm_103a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+        ("sm_103a", 1, 5120, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (12288, 16383, (32, 2)), (16385, 32768, (32, 2))),
+        ("sm_103a", 1, 5120, 48, "f32"): ((2048, 4095, (64, 2)),),
+        ("sm_103a", 1, 5120, 64, "f32"): ((1024, 4095, (64, 2)), (6144, 12287, (64, 2))),
+        ("sm_103a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)),),
     },
 }
 # fmt: on
@@ -1442,6 +1457,46 @@ def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> t
         T=T,
         out_f32=out.dtype == torch.float32,
     )
+
+
+#: The K1 weight-gradient rows this package runs on another program of the deterministic package than its own plan of
+#: the row, where :func:`plan_atomic_gemm` keeps the row on the deterministic program, ``(arch, sm_count) -> {(d_in,
+#: d_out, T, out_dtype): program}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_wgrad` of ``G[T, d_out]`` and ``X[T, d_in]`` into an ``out[d_out,
+#: d_in]`` of ``out_dtype`` at exactly these extents and token count, with the default ``sk`` and ``cta_rows``, runs the
+#: deterministic package's program ``program`` (its template without the ``dense_proj_det_gemm_`` prefix) in that
+#: package's orientation of the row, planned with the knobs that name it (:func:`k1_program_knobs`); every other part,
+#: row, token count and knob runs the deterministic plan.  These programs split a tile's token reduction in two ranges
+#: and add the two partials in a fixed order (``_sks_sb2``): the same bits on every run, other bits than the
+#: deterministic plan (one chain over the tokens).  Measured on a 148-SM part at exactly these rows and token counts,
+#: against the deterministic plan in the same process: faster in eager launches and in CUDA graph replays in 5 of 5
+#: paired groups of a screen (1.1 to 3.2 %), within the deterministic package's error budgets against FP64, and the same
+#: bits on 20 repeats.
+# fmt: off
+K1_WGRAD_DET_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (5120, 1024, 16172, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16231, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16384, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16172, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+        (5120, 1024, 16231, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+        (5120, 1024, 16384, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+    },
+}
+# fmt: on
+
+
+def k1_wgrad_det_knobs(
+    *, arch: str, sm_count: int, d_in: int, d_out: int, T: int, out_f32: bool
+) -> tuple:
+    """The deterministic package's planner knobs of this package's deterministic weight gradient ``out[d_out, d_in] =
+    G[T, d_out].T @ X[T, d_in]`` on a device of exactly ``sm_count`` SMs: those of the program of the row's entry in the
+    table of :data:`K1_WGRAD_DET_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens
+    (:func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
+    program = K1_WGRAD_DET_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(d_in), int(d_out), int(T), "f32" if out_f32 else "bf16")
+    )
+    return k1_program_knobs(program) if program else ()
 
 
 def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
@@ -5685,12 +5740,35 @@ def _wgrad_det_args(
     cta_rows: Optional[int],
 ) -> tuple:
     """The deterministic package's convenience call of ``cake_dense_gemm_det_train_projection_wgrad(G, X, out, sk=sk,
-    cta_rows=cta_rows)``: ``(A, B, out, transposed_out, knobs)`` in its orientation (``wgrad_views``)."""
+    cta_rows=cta_rows)``: ``(A, B, out, transposed_out, knobs)`` in its orientation (``wgrad_views``); with the
+    default ``sk`` and ``cta_rows``, a row of :data:`K1_WGRAD_DET_RULES_BY_SM` for the device takes the knobs of the
+    table's program instead (:func:`k1_wgrad_det_knobs`)."""
     det = deterministic_backend()
+    out_f32 = out.dtype == torch.float32
     A, B, transposed = det.wgrad_views(
-        G, X, arch=det.arch_for(out.device), out_f32=out.dtype == torch.float32
+        G, X, arch=det.arch_for(out.device), out_f32=out_f32
     )
-    return A, B, out, transposed, (("cta_rows", cta_rows), ("sk", sk))
+    knobs: tuple = (("cta_rows", cta_rows), ("sk", sk))
+    if sk == "auto" and cta_rows is None and G.dim() == 2 and X.dim() == 2:
+        T, d_out, d_in = int(G.shape[0]), int(G.shape[1]), int(X.shape[1])
+        if any(
+            (d_in, d_out, T, "f32" if out_f32 else "bf16") in rows
+            for rows in K1_WGRAD_DET_RULES_BY_SM.values()
+        ):
+            facts = det.device_facts(out.device)
+            if facts.arch is not None:
+                knobs = (
+                    k1_wgrad_det_knobs(
+                        arch=facts.arch,
+                        sm_count=facts.sm_count,
+                        d_in=d_in,
+                        d_out=d_out,
+                        T=T,
+                        out_f32=out_f32,
+                    )
+                    or knobs
+                )
+    return A, B, out, transposed, knobs
 
 
 def cake_dense_gemm_nondet_train_router_plan(
