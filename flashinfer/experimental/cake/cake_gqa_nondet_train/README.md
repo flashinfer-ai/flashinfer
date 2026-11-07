@@ -133,7 +133,14 @@ A workspace keeps the forward's tile counter and the backward scratch, FP32
 caching allocator on the current stream, its dS^T chunk (32 KiB times the
 chunk's tiles plus one) and, in the row-map form, two FP32 window gradients
 `[T_k, H_kv, 256]`; it frees them when it returns, so nothing beyond the
-scratch stays allocated between calls.
+scratch stays allocated between calls.  The per-call peak is the dS^T chunk
+plus, in the row-map form, 2 KiB of windows per key and KV head.  The chunk
+holds every tile when they fit in the budget and stays within the budget
+otherwise.  With 24 query heads and 4 KV heads, 16461 query and 24693 key
+tokens take 6.9 GB + 0.2 GB in one chunk; 32388 query and 275373 key tokens
+take 17.1 GB + 2.3 GB in 16 chunks under the 16 GiB default.  A smaller
+`budget_bytes` lowers the peak; each extra key-block chunk then re-reads and
+rewrites the FP32 dQ accumulator once.
 `cake_gqa_nondet_train_workspace_bytes(T_q, H_q, B, total_k=, num_heads_kv=,
 max_seqlen_k=, row_map=, budget_bytes=)` returns the scratch plus, when the
 key sizes are given, the per-call buffers.  With torch's deterministic mode
