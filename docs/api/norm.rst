@@ -342,33 +342,39 @@ The non-deterministic package (``nondet`` names; see the mode and dispatch
 rules above). Its entry points run only the standalone non-deterministic
 kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``).
 Every output (``y``, ``dx``, ``dz`` and ``dw``) repeats bit for bit from run to
-run; the outputs are not the deterministic package's bits.  The FP64 error of
+run.  ``y`` is not the deterministic package's bits; ``dx`` and ``dz`` are, and
+``dw`` is except where the exact sum lies within the deterministic FP64 sum's
+error of a rounding boundary.  The FP64 error of
 each output (relative L2 and the largest error relative to the largest
 reference value) is at most 1.1 times the deterministic package's on the same
 inputs, and within the deterministic package's absolute bounds.
 
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
-  of several modules chosen from the row count and the SM count, all with the
-  same row arithmetic: a short forward up to 12 rows per SM on SM100 and SM103
-  (59 on SM107), the plain forward, from 976 rows per SM (800 on SM107) a
-  persistent forward whose CTAs each walk at most 2 row blocks, and from 2400
-  rows per SM on SM100 and SM103 a long forward (on SM103 from 3000 and on
-  SM107 from 1740, an extra-long forward that also prefetches its next block).
+  of several modules chosen from the row count and the SM count: a short
+  forward up to 12 rows per SM on SM100 and SM103 (59 on SM107), the plain
+  forward, from 976 rows per SM (800 on SM107) a persistent forward whose CTAs
+  each walk at most 2 row blocks, and from 2400 rows per SM on SM100 and SM103
+  a long forward (on SM103 from 3000 and on SM107 from 1740, an extra-long
+  forward that also prefetches its next block).  Each module's arithmetic is
+  fixed, but the modules may associate a row's sum of squares differently, so
+  ``y`` repeats bit for bit for the same inputs on the same device.
 * The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
   backward's row arithmetic.  The weight gradient sums the deterministic
   backward's chunk partials exactly in 64-bit integer windows and rounds once,
   so it does not depend on the grid or on the order in which CTAs finish.  Up
   to 64 rows per SM every chunk has its own CTA; past that the CTAs claim runs
   of chunks at run time, so a CTA slowed by a kernel on another stream takes
-  fewer.  Up to 256 rows with a BF16 weight gradient the backward is one
-  thread-block cluster of 16 CTAs that sums on chip and takes no workspace.
+  fewer.  Up to 256 rows with a BF16 weight gradient, or with
+  ``compute_grad_weight=False``, the backward is one thread-block cluster of
+  16 CTAs that sums on chip and takes no workspace.
 * The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
   is a zero-filled ``torch.uint8`` tensor of 29192 bytes whatever the token
   count, zero after every call: zero it once and reuse it, one per
   concurrently running stream.  A buffer that anything else wrote into is
   zeroed with ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.  Calls
-  without a workspace use one per stream and backward module, kept for the
+  without a workspace use one per stream and backward module that takes one,
+  kept for the
   process, and each device keeps a reserve of zero-filled workspaces for CUDA
   Graph captures (about 1.8 MiB per 64 workspaces, at most 1024).
 

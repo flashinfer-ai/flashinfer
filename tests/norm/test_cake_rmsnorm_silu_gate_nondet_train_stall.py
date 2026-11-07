@@ -93,9 +93,9 @@ on SM100 and SM103, 59 on SM107; on SM107 also at 10 and 30 rows per SM) keeps
 its speed beside the one-thread kernel, starts beside the all-SM kernel with
 the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
 item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
-ends no later than the deterministic package's forward (its public forward
-entry point at the same rows) beside the same side kernel: the busy median is
-at most the deterministic forward's busy median times ``1 +
+ends no later than the forward it replaces (this package's plain forward, the
+role's module, at the same rows) beside the same side kernel: the busy median
+is at most the plain forward's busy median times ``1 +
 PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of the
 event timer (about 1 microsecond on SM103) and a half, the calls taking a few
 microseconds.  The two forwards' alone / busy pairs alternate round by round
@@ -137,7 +137,6 @@ from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
-det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
 forward = pkg.cake_rmsnorm_silu_gate_nondet_train_forward
 backward = pkg.cake_rmsnorm_silu_gate_nondet_train_backward
 workspace_for = pkg.cake_rmsnorm_silu_gate_nondet_train_backward_workspace
@@ -897,51 +896,56 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
     tokens = _short_forward_tokens(rows_per_sm)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
-    y_det = torch.empty_like(x)
+    y_plain = torch.empty_like(x)
+    plain = loader.route_module(loader.device_arch(x.device.index), "fwd")
 
     def call():
         return (forward(x, z, w, EPS, out=y),)
 
-    def call_det():
-        # the deterministic package's public forward at the same rows
-        return (
-            det_pkg.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y_det),
-        )
+    def call_plain():
+        # the module the short forward replaces at these rows: this package's
+        # plain forward
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(pkg, "module_for_rows", lambda *_args: plain)
+            return (forward(x, z, w, EPS, out=y_plain),)
 
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
     attempts = 1 + SHORT_EXTRA_ATTEMPTS
     for attempt in range(1, attempts + 1):
-        short_medians, det_medians = _interleaved_paired_medians(
-            (call, call_det), spin, PROPORTIONAL_RUNS
+        short_medians, plain_medians = _interleaved_paired_medians(
+            (call, call_plain), spin, PROPORTIONAL_RUNS
         )
         alone_ms, busy_ms, alone, busy = short_medians
-        det_alone_ms, det_busy_ms, det_alone, det_busy = det_medians
+        plain_alone_ms, plain_busy_ms, plain_alone, plain_busy = plain_medians
         alone_min_ms = min(t for t, _ in alone)
-        det_alone_min_ms = min(t for t, _ in det_alone)
-        spread = max(alone_ms / alone_min_ms, det_alone_ms / det_alone_min_ms)
+        plain_alone_min_ms = min(t for t, _ in plain_alone)
+        spread = max(alone_ms / alone_min_ms, plain_alone_ms / plain_alone_min_ms)
         counts = spread <= SHORT_MAX_ALONE_SPREAD
         print(
             f"HELD stage=short_forward tokens={tokens} heads={H} side={side} "
             f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
-            f"det_alone_ms={det_alone_ms:.4f} det_busy_ms={det_busy_ms:.4f} "
-            f"busy_vs_det={busy_ms / det_busy_ms:.3f} "
-            f"alone_min_ms={alone_min_ms:.4f} det_alone_min_ms={det_alone_min_ms:.4f} "
+            f"plain_alone_ms={plain_alone_ms:.4f} "
+            f"plain_busy_ms={plain_busy_ms:.4f} "
+            f"busy_vs_plain={busy_ms / plain_busy_ms:.3f} "
+            f"alone_min_ms={alone_min_ms:.4f} "
+            f"plain_alone_min_ms={plain_alone_min_ms:.4f} "
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
-        # each package's y repeats its own bits (the two forwards' bits differ)
+        # each module's y repeats its own bits (two programs may associate a
+        # row's sum of squares differently)
         _check_outputs("forward", tokens, alone, busy)
-        _check_outputs("forward", tokens, det_alone, det_busy)
+        _check_outputs("forward", tokens, plain_alone, plain_busy)
         if counts:
             break
     assert (
-        busy_ms <= det_busy_ms * (1 + PROPORTIONAL_SLACK)
-        or busy_ms - det_busy_ms <= SHORT_EXTRA_MS
+        busy_ms <= plain_busy_ms * (1 + PROPORTIONAL_SLACK)
+        or busy_ms - plain_busy_ms <= SHORT_EXTRA_MS
     ), (
         f"tokens={tokens}: beside {ctas} x {threads} side CTAs ({side}) the short "
-        f"forward took {busy_ms:.4f} ms, the deterministic forward "
-        f"{det_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
+        f"forward took {busy_ms:.4f} ms, the plain forward it replaces "
+        f"{plain_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
         f"{SHORT_EXTRA_MS} ms more; measurement {attempt} of at most {attempts}, "
         f"alone spread {spread:.3f}, "
         + ("counted)" if counts else f"none counted: above {SHORT_MAX_ALONE_SPREAD})")

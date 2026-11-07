@@ -18,14 +18,15 @@ Its libraries are JIT-built by FlashInfer from `build.json`.
 
 Every output repeats bit for bit: the same inputs on the same device give the
 same bits on every call, whatever the grid, the order in which CTAs run and the
-work beside the call on other streams.  The outputs are not the deterministic
-package's bits.
+work beside the call on other streams.  `y` is not the deterministic
+package's bits; `dx` and `dz` are, and `dw` is except where the exact sum lies
+within the deterministic FP64 sum's error of a rounding boundary.
 
 | output | how it is computed | run to run | error against an FP64 reference |
 | --- | --- | --- | --- |
 | `y` | `rstd` with `rsqrt.approx`, the sigmoid with `ex2.approx` and `rcp.approx`, FP32 products, one rounding to BF16 | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dx` | the deterministic backward's row arithmetic | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dz` | the deterministic backward's row arithmetic | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
+| `dx` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
+| `dz` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
 | `dw` (BF16 or FP32) | the deterministic backward's FP32 chunk partials, summed exactly in 64-bit integer windows, one rounding | bit for bit | within the deterministic budget `abs(dw64) * 2^-7 + sum(abs(terms)) * 2^-20`; at most 1.1 times the deterministic package's |
 
 "At most 1.1 times the deterministic package's" holds for both error measures
@@ -70,7 +71,10 @@ package.  This package exports the same names.
 ## Programs and routes
 
 `cake_jit.py` routes each call by its row count `rows = T * H` and the
-device's SM count.  Every program of one role has the same row arithmetic.
+device's SM count.  Each program's arithmetic is fixed.  The backward
+programs write `dx` and `dz` with the deterministic backward's row arithmetic.
+The forward programs may associate a row's sum of squares differently, so `y`
+repeats bit for bit for the same inputs on the same device.
 
 | role | program | runs |
 | --- | --- | --- |
@@ -79,7 +83,7 @@ device's SM count.  Every program of one role has the same row arithmetic.
 | `fwd_mid` | persistent forward, at most 6 CTAs per SM, each at most 2 blocks of 16 rows | from 976 rows per SM (800 on `sm_107a`) |
 | `fwd_long` | persistent forward, at most 3 CTAs per SM, each at most 6 blocks of 32 rows | from 2400 rows per SM on `sm_100a` and `sm_103a` |
 | `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | from 3000 rows per SM on `sm_103a`, 1740 on `sm_107a` |
-| `bwd_bf16_short` | one cluster of 16 CTAs, the weight gradient summed on chip, no workspace | up to 256 rows, BF16 weight gradient |
+| `bwd_bf16_short` | one cluster of 16 CTAs, the weight gradient summed on chip, no workspace | up to 256 rows, a BF16 weight gradient or `compute_grad_weight=False` |
 | `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
 | `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time | past 8 chunks per SM |
 
@@ -92,8 +96,10 @@ fewer chunks; the bits do not depend on which CTA runs a chunk.
 
 ## Workspace
 
-The static and the claimed backward need a workspace; the short backward reads
-none.  A workspace is a zero-filled, contiguous `torch.uint8` CUDA tensor of
+The static and the claimed backward need a workspace, also with
+`compute_grad_weight=False`; the short backward reads none, so a call of up to
+256 rows with a BF16 weight gradient or with `compute_grad_weight=False` uses
+no workspace.  A workspace is a zero-filled, contiguous `torch.uint8` CUDA tensor of
 29192 bytes whatever `T * H`, starting at a 16-byte aligned address:
 
 | buffer | dtype | elements | byte offset |
@@ -112,8 +118,8 @@ else wrote into, must be zeroed with
 backward.  The deterministic package's FP32 workspace is refused with a
 `ValueError` that names both workspaces.
 
-Calls without a workspace use one per device, stream and backward program,
-kept for the process.  Each device also keeps a reserve for CUDA Graph
+Calls without a workspace use one per device, stream and backward program
+that takes one, kept for the process.  Each device also keeps a reserve for CUDA Graph
 captures: 64 zero-filled workspaces in one allocation (29440 bytes each with
 256-byte alignment, about 1.8 MiB), refilled outside any capture, at most 1024
 per device.  A captured call without a workspace takes one from the reserve
@@ -145,7 +151,8 @@ import is the JIT fallback of `cake_build.py`.
   Graphs, routing and grids, `torch.use_deterministic_algorithms`.
 * `tests/norm/test_cake_rmsnorm_silu_gate_nondet_train_api.py` -- the public
   module and the comparison with the deterministic package (each output's
-  FP64 error at most 1.1 times the deterministic package's).
+  FP64 error at most 1.1 times the deterministic package's; `dx` and `dz` its
+  bits).
 * `tests/norm/test_cake_rmsnorm_silu_gate_nondet_train_stall.py` -- the speed
   beside kernels resident on other streams.
 * `benchmarks/bench_cake_rmsnorm_silu_gate_nondet_train.py` -- timing.

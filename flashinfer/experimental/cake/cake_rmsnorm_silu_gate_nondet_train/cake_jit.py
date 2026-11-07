@@ -45,25 +45,28 @@ count, or one per architecture of the record) or, for the claimed backward,
 more chunks than ``more_chunks_than_per_sm`` per SM; and a role's short role
 (``<role>_short``, tried first), running in its place up to its rule's
 ``max_rows_per_sm`` rows per SM (:func:`max_rows_per_sm`) or ``max_rows``
-rows.  The forward's routed roles run the persistent forward, the same row
-arithmetic: the short forward (16 threads to a row, one 16-row block per CTA,
-the gate before the sum of squares) up to 12 rows per SM on sm_100a and
-sm_103a and 59 on sm_107a; the mid forward (128-thread CTAs walking 16-row
-blocks, thread 0 warming the CTA's next block and the first block of the CTA
-a wave later in L2) from 976 rows per SM on sm_100a and sm_103a and 800 on
-sm_107a; the long forward (256-thread CTAs walking 32-row blocks) from 2400 on
-sm_100a and sm_103a; and the extra-long forward (the long forward whose
-thread 0 also warms the CTA's next block in L2) from 3000 on sm_103a and 1740
-on sm_107a, which routes no long forward.  The backward's call role is the
-static backward (CTA ``b`` runs the chunks ``b``, ``b + grid``, ... and
-claims nothing); its mid role is the claimed backward (the CTAs claim runs of
-chunks from the workspace's claim counter at run time, so a CTA slowed beside
-another kernel takes fewer), which runs where the rows have more chunks than
-the static backward's grid has CTAs.  The BF16 backward's short role is one
-thread-block cluster of 16 CTAs of 256 threads with the same row arithmetic
-(``dx`` and ``dz`` the same bits) that sums the weight gradient on chip in a
-fixed order (CTA ``r`` adds every CTA's FP32 partial of its eight columns in
-rank order in FP64 and rounds once), up to 256 rows, with no workspace.
+rows.  The forward's routed roles: the short forward (16 threads to a row,
+one 16-row block per CTA, the gate before the sum of squares) up to 12 rows
+per SM on sm_100a and sm_103a and 59 on sm_107a; the mid forward (128-thread
+CTAs walking 16-row blocks, thread 0 warming the CTA's next block and the
+first block of the CTA a wave later in L2) from 976 rows per SM on sm_100a
+and sm_103a and 800 on sm_107a; the long forward (256-thread CTAs walking
+32-row blocks) from 2400 on sm_100a and sm_103a; and the extra-long forward
+(the long forward whose thread 0 also warms the CTA's next block in L2) from
+3000 on sm_103a and 1740 on sm_107a, which routes no long forward.  Each
+forward program's arithmetic is fixed, but the programs may associate a row's
+sum of squares differently, so ``y`` repeats bit for bit for the same inputs
+on the same device.  The backward's call role is the static backward (CTA
+``b`` runs the chunks ``b``, ``b + grid``, ... and claims nothing); its mid
+role is the claimed backward (the CTAs claim runs of chunks from the
+workspace's claim counter at run time, so a CTA slowed beside another kernel
+takes fewer), which runs where the rows have more chunks than the static
+backward's grid has CTAs.  The BF16 backward's short role (which
+a call with ``compute_grad_weight=False`` also takes) is one thread-block
+cluster of 16 CTAs of 256 threads with the backward's row arithmetic (``dx``
+and ``dz`` the same bits) that sums the weight gradient on chip in a fixed
+order (CTA ``r`` adds every CTA's FP32 partial of its eight columns in rank
+order in FP64 and rounds once), up to 256 rows, with no workspace.
 
 Grids (:func:`launch_grid`): the forward and the short forward launch one
 CTA per block of ``rows_per_cta`` rows; the extra-long, long and mid forwards
@@ -600,7 +603,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_win": 3584,
         },
     },
-    # The short backward into a BF16 weight gradient: one cluster of 16 CTAs
+    # The short backward into a BF16 weight gradient (or none, with
+    # compute_grad_weight=False): one cluster of 16 CTAs
     # of 256 threads, the backward's row arithmetic (16 lanes per row, the
     # gate on packed FP32 pairs), CTA r of the cluster finishing the weight-
     # gradient columns 8r to 8r + 7 from every CTA's FP32 partials in rank

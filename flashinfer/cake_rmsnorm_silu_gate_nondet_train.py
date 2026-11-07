@@ -42,11 +42,13 @@ streams.  The kernels are those of the standalone package
 
 - The forward computes ``rstd`` with ``rsqrt.approx`` and the SiLU gate with
   ``ex2.approx`` of ``-|z| log2(e)`` and ``rcp.approx`` (no flush of a nonzero
-  sigmoid of a normal ``z``), every row's arithmetic fixed; its bits are not
-  the deterministic package's.  Up to 12 rows per SM on SM100 and SM103 (59 on
-  SM107) a forward with 16 threads to a row runs, and from 976 rows per SM on
-  SM100 and SM103 (800 on SM107) a forward whose CTAs each walk several row
-  blocks, with the same row arithmetic.
+  sigmoid of a normal ``z``); its bits are not the deterministic package's.
+  Up to 12 rows per SM on SM100 and SM103 (59 on SM107) a forward with 16
+  threads to a row runs, and from 976 rows per SM on SM100 and SM103 (800 on
+  SM107) a forward whose CTAs each walk several row blocks.  Each forward
+  program's arithmetic is fixed, but the programs may associate a row's sum
+  of squares differently (the row count and the SM count pick the program),
+  so ``y`` repeats bit for bit for the same inputs on the same device.
 - The backward is one kernel over the deterministic backward's chunks of rows
   (8-row blocks, ``max(1, ceil(blocks / 8192))`` blocks a chunk): ``dx`` and
   ``dz`` are the deterministic backward's arithmetic, each chunk's FP32
@@ -60,9 +62,10 @@ streams.  The kernels are those of the standalone package
   it.  While every chunk has a CTA of one wave (8 CTAs per SM) CTA ``b`` runs
   chunk ``b``; past that the CTAs claim runs of chunks from the workspace's
   claim counter, so a CTA that starts late takes fewer.  Up to 256 rows a
-  BF16 weight gradient comes from one thread-block cluster of 16 CTAs with
-  the same row arithmetic, which adds the CTAs' FP32 partials of each column
-  in a fixed order in FP64, rounds once and uses no workspace.
+  call with a BF16 weight gradient, or with ``compute_grad_weight=False``,
+  runs one thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same
+  arithmetic, which adds the CTAs' FP32 partials of each weight-gradient
+  column in a fixed order in FP64, rounds once and uses no workspace.
 
 Mode and dispatch rules:
 
@@ -101,8 +104,9 @@ The non-deterministic backward's workspace
 zero-filled ``torch.uint8`` tensor of 29192 bytes whatever ``T * H``) holds the
 integer windows of the exact sum, 128 FP32 class words, the arrival ticket and
 the claim counter; every launch of that backward uses one, also with
-``compute_grad_weight=False``, but the one-cluster backward of up to 256 rows,
-which reads none.  The kernel leaves it zero: allocate it once, reuse it
+``compute_grad_weight=False``, but the one-cluster backward (up to 256 rows
+with a BF16 weight gradient or with ``compute_grad_weight=False``), which
+reads none.  The kernel leaves it zero: allocate it once, reuse it
 across calls, shapes, both weight-gradient dtypes and CUDA Graph replays
 without a reset, and give each stream that may run a backward at the same
 time its own buffer.  A buffer that did not come from that factory, or that
@@ -112,9 +116,9 @@ backward.  It is not interchangeable with the deterministic package's FP32
 buffer: this package's backward refuses that buffer (``ValueError``) in every
 call, and the deterministic backward refuses this one in a call with rows.
 Calls without a workspace use one buffer per device, stream and backward
-kernel (two per weight-gradient dtype: one for the one-wave backward, one for
-the claimed backward), kept for later calls; the autograd node retains nothing
-else.  They also keep a reserve of 64 zero-filled buffers per device (about
+kernel that takes one (two per weight-gradient dtype: one for the one-wave
+backward, one for the claimed backward; none for the one-cluster backward),
+kept for later calls; the autograd node retains nothing else.  They also keep a reserve of 64 zero-filled buffers per device (about
 1.8 MiB, filled outside any capture): a call during CUDA Graph capture takes
 one per capture and capture stream from it and keeps it for the life of the
 process, so a replay launches no fill kernel (with none ready, the graph
@@ -216,13 +220,15 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
     ``silu(z) = z / (1 + exp(-z))`` in FP32; one rounding to BF16 at the end.
     The non-deterministic package's forward program: ``rstd`` from
     ``rsqrt.approx`` and the gate from ``ex2.approx`` and ``rcp.approx``, every
-    row's arithmetic fixed, so ``y`` repeats bit for bit (its bits are not the
-    deterministic package's; that one is
+    program's arithmetic fixed, so ``y`` repeats bit for bit for the same
+    inputs on the same device (its bits are not the deterministic package's;
+    that one is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`).
     Up to 12 rows per SM on SM100 / SM103 (59 on SM107) a forward with 16
     threads to a row runs, and from 976 rows per SM on SM100 / SM103 (800 on
-    SM107) a forward whose CTAs each walk several row blocks, with the same row
-    arithmetic.  The forward does not alert under
+    SM107) a forward whose CTAs each walk several row blocks; the programs may
+    associate a row's sum of squares differently (the row count and the SM
+    count pick the program).  The forward does not alert under
     ``torch.use_deterministic_algorithms(True)``.
 
     Parameters
@@ -379,8 +385,10 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     output repeats bit for bit, whatever the grid and the order in which CTAs
     run; ``dw`` is the deterministic backward's bits except where the exact sum
     lies within that backward's FP64 sum error of a rounding boundary.  Up to
-    256 rows a BF16 ``dw`` comes from one cluster of 16 CTAs that adds the CTAs'
-    FP32 partials of a column in a fixed order in FP64 and uses no workspace.
+    256 rows a call with a BF16 ``dw``, or with ``compute_grad_weight=False``,
+    runs one cluster of 16 CTAs (``dx`` and ``dz`` the same arithmetic) that
+    adds the CTAs' FP32 partials of a ``dw`` column in a fixed order in FP64
+    and uses no workspace.
     The deterministic backward is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`.
     No call alerts under ``torch.use_deterministic_algorithms(True)``.
@@ -405,7 +413,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
         the accumulator as it is.
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
-        it; the kernel then touches neither ``grad_weight`` nor the
+        it.  Up to 256 rows the call runs the one-cluster backward, which uses
+        no workspace (a ``workspace`` passed is checked and left as it is).
+        With more rows the kernel touches neither ``grad_weight`` nor the
         workspace's windows, but its CTAs still take the arrival ticket (and
         past one wave claim their chunks from the claim counter), so it uses a
         workspace too (and leaves it zero).

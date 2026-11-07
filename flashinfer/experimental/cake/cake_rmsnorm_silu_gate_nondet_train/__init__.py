@@ -31,7 +31,10 @@ call on other streams.  The forward computes ``rstd`` with ``rsqrt.approx``
 and the SiLU gate with ``ex2.approx`` and ``rcp.approx`` (no flush of a
 nonzero sigmoid of a normal ``z``), rounding ``y`` to BF16 once; its bits are
 not the deterministic package's, and its error against an FP64 reference
-stays within the family's budget.  The backward writes ``dx`` and ``dz``
+stays within the family's budget.  Each forward program's arithmetic is fixed,
+but the programs may associate a row's sum of squares differently (the row
+count and the SM count pick the program), so ``y`` repeats bit for bit for the
+same inputs on the same device.  The backward writes ``dx`` and ``dz``
 with the deterministic backward's arithmetic and computes the FP32 partial of
 each chunk of rows as the deterministic backward does; it adds the partials
 exactly, as signed 64-bit integer windows of the FP32 values (an addition of
@@ -40,9 +43,10 @@ integers does not depend on its order), and rounds the exact sum once into
 package's bits except where the exact sum lies within its FP64 sum's error of
 a rounding boundary.  An infinite or ``NaN`` partial makes its column's
 ``dw`` infinite or ``NaN`` with the class the FP64 sum gives it (a ``NaN``'s
-sign and payload need not be its).  Up to 256 rows the BF16 backward is one
-thread-block cluster of 16 CTAs with the same row arithmetic that sums the
-weight gradient on chip in a fixed order (CTA ``r`` adds every CTA's FP32
+sign and payload need not be its).  Up to 256 rows the backward of a BF16
+weight gradient, and of a call with ``compute_grad_weight=False``, is one
+thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same arithmetic,
+that sums the weight gradient on chip in a fixed order (CTA ``r`` adds every CTA's FP32
 partial of its eight columns in rank order in FP64 and rounds once), the same
 bits on every call.
 
@@ -66,7 +70,9 @@ Host design (the input layout rules are the deterministic package's):
   arrival ticket and the claim counter.  Every launch of the static and the
   claimed backward takes a ticket (and the claimed one claims its chunks from
   the counter), also one with ``compute_grad_weight=False``, so it uses a
-  workspace.  The short backward takes none: it reads no workspace, and a
+  workspace.  The short backward takes none (up to 256 rows with a BF16
+  weight gradient or with ``compute_grad_weight=False``): it reads no
+  workspace, and a
   caller workspace passed to it is checked as for any backward and left as it
   is.  The kernel leaves all of it zero, so a workspace zeroed once serves
   every later call on its stream, of any shape and either weight-gradient
@@ -81,7 +87,8 @@ Host design (the input layout rules are the deterministic package's):
   checkpointed forward keeps nothing but its output.  A backward without a
   caller workspace that runs a module taking one (every module but the short
   backward; ``compute_grad_weight=False`` included: it runs the BF16
-  weight-gradient module) uses the zero-filled workspace of its (device,
+  weight gradient's modules, the short backward up to 256 rows) uses the
+  zero-filled workspace of its (device,
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 29192 bytes each, at most one per
   backward module (two per weight-gradient dtype: the static and the claimed
@@ -388,11 +395,11 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
 
     ``rstd`` from ``rsqrt.approx`` and the gate from ``ex2.approx`` and
     ``rcp.approx``, ``y`` rounded to BF16 once: the same bits on every call
-    (not the deterministic package's bits).  Up to 12 rows per SM on sm_100a /
-    sm_103a (59 on sm_107a) the short forward runs, from 976 rows per SM on
-    sm_100a / sm_103a (800 on sm_107a) the mid forward and from 2400 (1740)
-    the long forward, all with the same row arithmetic.  The arguments are
-    those of
+    (not the deterministic package's bits) for the same inputs on the same
+    device.  ``cake_jit.module_for_rows`` picks the program from the rows and
+    the SM count (``cake_jit.ROUTES``); each program's arithmetic is fixed, but
+    the programs may associate a row's sum of squares differently.  The
+    arguments are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_forward`.
     """
 
@@ -816,9 +823,10 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     (adding ``grad_weight``'s value first when accumulating; FP32, then BF16
     for a BF16 ``dw``) and zeroes the workspace.  Every output repeats bit for
     bit.  Every call with rows uses a workspace, also with
-    ``compute_grad_weight=False``, but a BF16 weight gradient of up to 256
-    rows: there one cluster of 16 CTAs sums the weight gradient on chip in a
-    fixed order and uses none.  The arguments are those of
+    ``compute_grad_weight=False``, but one of up to 256 rows with a BF16
+    weight gradient or with ``compute_grad_weight=False``: there one cluster
+    of 16 CTAs runs (summing a weight gradient on chip in a fixed order) and
+    uses none.  The arguments are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_backward`;
     ``workspace`` is this package's uint8 buffer
     (:func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`) or ``None`` (the

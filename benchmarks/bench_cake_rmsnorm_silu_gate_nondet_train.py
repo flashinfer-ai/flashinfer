@@ -38,7 +38,7 @@ non-deterministic forward runs its short forward up to 12 rows per SM on
 SM100 and SM103 (59 on SM107), its plain forward above that, and from 976 rows
 per SM on SM100 and SM103 (800 on SM107) a persistent forward (the mid, long
 or extra-long one).  Its backward runs one cluster of 16 CTAs up to 256 rows
-(BF16 weight gradient only), else one kernel of at most 8 CTAs per SM over
+(with a BF16 weight gradient or ``compute_grad_weight=False``), else one kernel of at most 8 CTAs per SM over
 chunks of rows: the static backward while every chunk has a CTA, the claimed
 backward past that.  At ``--heads 48`` the default token counts reach every
 one of these kernels that a 148-SM B200 routes (all but the extra-long
@@ -54,7 +54,7 @@ autograd forward plus backward beyond the inputs (``peak``, outputs included),
 the backward's temporary allocation with preallocated outputs and no caller
 workspace (``temp``; the zero-filled ``torch.uint8`` workspaces that
 non-deterministic calls without a caller workspace keep, one per device,
-stream and kernel and a reserve per device, come from the calls before it) and
+stream and kernel that takes one and a reserve per device, come from the calls before it) and
 the caller workspace of each mode (``workspace``: the non-deterministic one
 29192 bytes whatever the rows).  Output columns check the non-deterministic
 results against the deterministic ones: ``y``, ``dx`` and ``dz`` bitwise (the
