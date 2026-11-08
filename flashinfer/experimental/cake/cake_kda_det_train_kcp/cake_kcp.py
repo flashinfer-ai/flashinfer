@@ -584,8 +584,9 @@ TAIL_COUNTS_ATTR = "_kcp_tail_counts"  # a lean arena's int32 table 0..L-1 (cake
 # arena was sized for (``CakeKDADetWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
 LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
 # The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
-# over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
-# existing backend's output and dA / dv programs had before its fused recurrences took them over).
+# over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program (the forms the existing backend's output and
+# dA / dv programs had before its fused recurrences took them over), launched only where its ``dA_qk`` has a reader
+# (:func:`cake_kcp_plan.kcp_dav_needed`; K2 forms its own ``dv1``).
 KCP_LOCAL_RECORDS = {"fwd_o": "kcp_fwd_o", "dav": "kcp_dav"}
 # The WY records the KCP launches directly where the plan fuses the WY representation into a state recurrence the
 # KCP does not run (its recurrences are the K1 / K2 walks): the forward's program and the replay's.
@@ -971,8 +972,9 @@ class KernelBackend(Backend):
     stages once per chunk range, :func:`_tail_pass_values`)
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
-    rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk
-    ``dv1`` K2 reads) and after K2 the fused gradient, GLM intra and the gate epilogue.  Where the plan fuses the WY
+    rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk``, only where the
+    plan dispatches its ``dav`` stage: :func:`cake_kcp_plan.kcp_dav_needed`; K2 forms ``dv1`` from ``aqk_int``
+    itself) and after K2 the fused gradient, GLM intra and the gate epilogue.  Where the plan fuses the WY
     representation into a state recurrence the KCP does not run, the WY program is launched directly
     (:data:`WY_DIRECT_RECORDS`) on its grid rule.  The intra record that computes the chunk layout from ``cu_seqlens``
     writes its tables into a scratch set on the arena (:data:`SCRATCH_TABLES_ATTR`); every other program reads the
@@ -980,7 +982,7 @@ class KernelBackend(Backend):
     backward recomputes the internal rows in both modes, so the two modes run the same programs on the same operands;
     the one exception is the set of a checkpoint recompute (:data:`INTRA_ROWS`), whose forward keeps the internal rows
     its intra program wrote and whose backward binds them instead of launching its own intra program.
-    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and
+    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``aqk_int``) rows and
     write its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
     SPEC-3 (debug probe, once per backend on the first saved-mode backward whose call's ``spec3_probe`` keyword is
@@ -1188,9 +1190,15 @@ class KernelBackend(Backend):
                     cu_seqlens=call.ctx.cu_seqlens_local, **_scratch_tables(local)
                 )
         elif name in KCP_LOCAL_RECORDS:
-            if name == "dav" and hasattr(views, "dAqk_sink"):
-                # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
-                extra["dAqk"] = views.dAqk_sink
+            if name == "dav":
+                # kcp_dav only where its dAqk has a reader: the plan dispatches its dav stage, so its fused gradient
+                # stores no dAqk (cake_kcp_plan.kcp_dav_needed); the adjoint walks form dv1 themselves.  Elsewhere
+                # nothing launches (counted like a stage the plan fuses away)
+                if not cake_kcp_plan.kcp_dav_needed(p):
+                    return
+                if hasattr(views, "dAqk_sink"):
+                    # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
+                    extra["dAqk"] = views.dAqk_sink
             self.programs().run_record(
                 KCP_LOCAL_RECORDS[name],
                 {**values, **extra},
@@ -1516,7 +1524,7 @@ class KernelBackend(Backend):
             v.qg,
             v.w,
             v.do_int,
-            v.dv1,
+            v.aqk_int,
             v.gk,
             call.H,
             seg_table,
@@ -1638,7 +1646,8 @@ def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
     return None
 
 
-# Kernel parameter names of the frozen ABIs (K1 a217181fa, K2 a217181fa, K3 0637ec9f4, K4 eaa97cf5e): the logical
+# Kernel parameter names of the frozen ABIs (K1 a217181fa, K2 a217181fa with its fuse_dv1 builds' aqk_tma (the
+# internal Aqk rows) at the fifth parameter, where the earlier builds read dv1, K3 0637ec9f4, K4 eaa97cf5e): the logical
 # vocabulary of the registry records when the FI-rendered provider launches by name.
 ABI_PARAMS = {
     "fwdh_offset": (
@@ -1667,7 +1676,7 @@ ABI_PARAMS = {
         "qg_tma",
         "w_tma",
         "do_tma",
-        "dv1",
+        "aqk_tma",
         "gk",
         "num_heads",
         "seq_chunk_start",
@@ -3732,7 +3741,7 @@ class CakeKDADetKcpWorkspace:
     local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
     backward workspace sizes every pool and the existing backend's layouts (``local_arena="replay"``, the default,
     :data:`cake_kcp_plan.LOCAL_ARENAS`) or, under ``local_arena="lean"`` (opt-in), the KCP forward layout and the
-    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3460 B per internal token-head; the tail stages per chunk
+    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3588 B per internal token-head; the tail stages per chunk
     range) with its tail-count table (:data:`TAIL_COUNTS_ATTR`), the existing backend's layouts on the rows the lean
     layout does not serve (H 9-15).  ``lean_passes`` sizes a lean arena for that many tail passes (``None``:
     :data:`cake_kcp_plan.LEAN_PASSES_DEFAULT`, two; fewer passes launch fewer tail kernels for more bytes;
