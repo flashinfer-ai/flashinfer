@@ -719,6 +719,19 @@ def _fused(name: str) -> bool:
     return loader.MODULES[name]["grid_rule"]["kind"] == "claimed_row_blocks"
 
 
+def _det_routes_same_program(name: str) -> bool:
+    """Whether the deterministic package routes, on the current device, a
+    backward program of the same name digest as the module ``name`` (the
+    program this package copied); once that package ships another backward,
+    the bits of the two packages need not agree."""
+    arch, _sms = _device()
+    digest = name.rsplit("_", 1)[1]
+    return any(
+        det_name.rsplit("_", 1)[1] == digest
+        for det_name in det_loader.ROUTES[arch].values()
+    )
+
+
 def _backward_with(module: str, dy, x, z, w, dw, workspace):
     """One backward into ``dw`` that runs the module ``module`` whatever its
     rows (``module_for_rows`` replaced for the call)."""
@@ -769,7 +782,8 @@ def _check_replaced_rows(
     backward (:func:`_fused`), whose row arithmetic is the deterministic
     package's, its first call's ``dx``, ``dz`` and ``dw`` are instead bitwise
     those of the deterministic package's backward of ``inputs`` (``x``,
-    ``z``, ``w``, ``dy``) into a ``dw_dtype`` weight gradient, and the
+    ``z``, ``w``, ``dy``) into a ``dw_dtype`` weight gradient while that
+    package routes the same program (:func:`_det_routes_same_program`), and the
     small-row backward's ``dx`` and ``dz`` bitwise those of the role's own
     static backward (``ROUTES[arch][role]``, the backward the small-row
     backward replaced before the fused band) at the same rows, which leaves
@@ -780,13 +794,19 @@ def _check_replaced_rows(
         assert torch.equal(rep[1], first[1]), f"dz tokens={tokens} (replaced)"
         return
     x, z, w, dy = inputs
-    det = det_pkg.cake_rmsnorm_silu_gate_det_train_backward(
-        dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device)
-    )
-    for what, got, want in zip(("dx", "dz", "dw"), rep, det, strict=True):
-        assert torch.equal(got, want), (
-            f"{what} tokens={tokens}: the fused backward vs the deterministic package"
+    if _det_routes_same_program(replaced):
+        det = det_pkg.cake_rmsnorm_silu_gate_det_train_backward(
+            dy,
+            x,
+            z,
+            w,
+            EPS,
+            grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device),
         )
+        for what, got, want in zip(("dx", "dz", "dw"), rep, det, strict=True):
+            assert torch.equal(got, want), (
+                f"{what} tokens={tokens}: the fused backward vs the deterministic package"
+            )
     arch, _sms = _device()
     static = loader.route_module(arch, _backward_role(dw_dtype))
     assert not _fused(static), (arch, static)

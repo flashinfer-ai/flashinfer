@@ -35,7 +35,8 @@ budgets below instead of the first launch's bits.  The fused bands
 grid kind ``claimed_row_blocks``, :func:`_fused`) run the deterministic
 package's backward program under this package's names, so there ``dx``,
 ``dz`` and ``dw`` (BF16 or FP32, accumulated too) are the deterministic
-package's bits (:func:`assert_det_bits_where_fused`).  In every other band
+package's bits while that package routes the same program (the same name
+digest) on the device (:func:`assert_det_bits_where_fused`).  In every other band
 the backward writes ``dx`` and ``dz`` with this package's one row
 arithmetic; in every band they are held to FP64 (within one BF16 ulp plus
 1/64 ulp of the tensor's largest finite magnitude,
@@ -168,6 +169,9 @@ from flashinfer.cake_rmsnorm_silu_gate_nondet_train import (
     cake_rmsnorm_silu_gate_nondet_train_forward,
     cake_rmsnorm_silu_gate_nondet_train_reset_workspace,
     is_cake_rmsnorm_silu_gate_nondet_train_supported,
+)
+from flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train import (
+    cake_jit as det_loader,
 )
 from flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train import (
     cake_jit as loader,
@@ -446,13 +450,27 @@ def _fused(name: str) -> bool:
     return loader.MODULES[name]["grid_rule"]["kind"] == "claimed_row_blocks"
 
 
+def _det_routes_same_program(name: str) -> bool:
+    """Whether the deterministic package routes, on the current device, a
+    backward program of the same name digest as the module ``name`` (the
+    program this package copied); once that package ships another backward,
+    the bits of the two packages need not agree."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    digest = name.rsplit("_", 1)[1]
+    return any(
+        det_name.rsplit("_", 1)[1] == digest
+        for det_name in det_loader.ROUTES[arch].values()
+    )
+
+
 def assert_det_bits_where_fused(name: str, got, det) -> None:
     """Where the backward module ``name`` is a fused backward
-    (:func:`_fused`), each of ``got`` (``dx``, ``dz`` and, when given,
-    ``dw``) is the bits of the deterministic package's output of the same
-    call in ``det``; the other backwards need not give its bits, so nothing
-    is checked for them."""
-    if not _fused(name):
+    (:func:`_fused`) and the deterministic package routes the same program
+    (:func:`_det_routes_same_program`), each of ``got`` (``dx``, ``dz`` and,
+    when given, ``dw``) is the bits of the deterministic package's output of
+    the same call in ``det``; the other backwards need not give its bits, so
+    nothing is checked for them."""
+    if not _fused(name) or not _det_routes_same_program(name):
         return
     assert len(got) == len(det) <= 3, (len(got), len(det))
     for what, g, d in zip(("dx", "dz", "dw")[: len(got)], got, det, strict=True):
