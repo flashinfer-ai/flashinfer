@@ -2990,7 +2990,7 @@ def test_the_p_k_band_changes_the_forward_workspace_on_sm_103a_alone() -> None:
 @pytest.mark.cpu_only
 def test_route_glue() -> None:
     assert loader.supported_hidden_sizes("sm_100a") == (4096, 5120, 7168)
-    assert loader.supported_hidden_sizes("sm_107a") == (4096,)
+    assert loader.supported_hidden_sizes("sm_107a") == (4096, 5120, 7168)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
     assert loader.arch_for_capability((10, 3)) == "sm_103a"
     assert loader.arch_for_capability((10, 7)) == "sm_107a"

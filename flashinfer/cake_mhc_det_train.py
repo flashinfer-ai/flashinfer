@@ -15,7 +15,7 @@ limitations under the License.
 
 Cake four-stream mHC training forward / backward (4 streams; hidden size
 ``H`` in {4096, 5120, 7168}, taken per call from ``X.shape[2]``; SM100 / SM103
-at all three sizes, SM107 at 4096).
+/ SM107 at all three sizes).
 
 The function (FP32 arithmetic, BF16 activation boundaries)::
 
@@ -154,7 +154,7 @@ def cake_mhc_det_train_forward_workspace_bytes(
     hidden : int
         Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
         default ``4096``): a hidden size the device's architecture exports
-        (4096, 5120 or 7168 on SM100 / SM103, 4096 on SM107), else
+        (4096, 5120 or 7168 on SM100 / SM103 / SM107), else
         ``ValueError``.  The ``fn`` pieces and the partials scale with ``4 H``;
         every call checks the buffer against its own ``H`` and ``T``, so a
         buffer sized for one ``H`` is refused (``ValueError``) by a call of a
@@ -225,7 +225,7 @@ def cake_mhc_det_train_forward_prepare(
         BF16 ``[T, 4, H]`` contiguous residual streams (``T`` is a runtime
         scalar; ``T == 0`` returns empty outputs without launching).  The
         hidden size ``H = X.shape[2]`` is 4096, 5120 or 7168 on SM100 / SM103
-        and 4096 on SM107.
+        / SM107.
     fn : torch.Tensor
         FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
