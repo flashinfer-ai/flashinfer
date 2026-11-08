@@ -3458,7 +3458,10 @@ class CakeGDNDetKcpCall:
             raise ValueError(
                 f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}"
             )
-        ptr = ix.pool.view(-1)[base_tile * TILE :] if base_tile else ix.pool.view(-1)
+        # a flat pool (every workspace pool and per-call stand-in is 1-D) is its own flat view: same storage, offset,
+        # shape and stride, without building another tensor per block
+        pool = ix.pool if ix.pool.dim() == 1 else ix.pool.view(-1)
+        ptr = pool[base_tile * TILE :] if base_tile else pool
         if spec is None:
             index_t = self.dev("index", ix.index)
         else:
