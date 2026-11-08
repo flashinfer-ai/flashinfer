@@ -147,6 +147,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
     #define q_smem_empty_addr (mbar_base + 520)
     #define v_smem_empty_addr (mbar_base + 536)
     #define o_smem_empty_addr (mbar_base + 560)
+    #define kv_state_drained_addr (mbar_base + 576)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -179,7 +180,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
     float* smem_beta = reinterpret_cast<float*>(smem_raw + 224768);
     const int smem_beta_addr = smem + 224768;
 
-    // Mbarrier init (72 barriers at smem_raw[0..576))
+    // Mbarrier init (80 barriers at smem_raw[0..640))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -302,6 +303,16 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
             // o_smem_empty: 2 barriers, init_count=32
             mbarrier_init(smem + 560, 32);
             mbarrier_init(smem + 568, 32);
+            // --- pipeline 'one_stage' ---
+            // kv_state_drained: 8 barriers, init_count=128
+            mbarrier_init(smem + 576, 128);
+            mbarrier_init(smem + 584, 128);
+            mbarrier_init(smem + 592, 128);
+            mbarrier_init(smem + 600, 128);
+            mbarrier_init(smem + 608, 128);
+            mbarrier_init(smem + 616, 128);
+            mbarrier_init(smem + 624, 128);
+            mbarrier_init(smem + 632, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -309,9 +320,9 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 576);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 640);
     if (warp == 4) {
-        int _tmem_hold = smem + 576;
+        int _tmem_hold = smem + 640;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -1222,7 +1233,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                 int num_chunks_b_1 = num_pairs_b_1 * 2;
                 int value_split_idx_cg1 = 0;
                 int state_slot_cg1 = batch_idx_1;
-                long long state_head_offset_cg1 = (long long)head_idx_1 * 16384;
+                long long state_head_offset_cg1 = (long long)head_idx_1 * 16384ll;
                 long long initial_state_head_base_cg1 = (long long)state_slot_cg1 * initial_state_stride_slot + state_head_offset_cg1;
                 long long output_state_head_base_cg1 = (long long)state_slot_cg1 * output_state_stride_slot + state_head_offset_cg1;
                 if (USE_INITIAL_STATE != 0 && num_chunks_b_1 > 0) {
@@ -1233,8 +1244,8 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     #pragma unroll 1
                     for (int state_lane_half_init = 0; state_lane_half_init < 2; state_lane_half_init++) {
                         int state_row_top_init = state_warp_init * 32 + state_lane_half_init * 16 + lane / 4;
-                        long long state_base_top_init = initial_state_head_base_cg1 + (long long)state_row_top_init * 128;
-                        long long state_base_bot_init = state_base_top_init + 1024;
+                        long long state_base_top_init = initial_state_head_base_cg1 + (long long)state_row_top_init * 128ll;
+                        long long state_base_bot_init = state_base_top_init + 1024ll;
                         #pragma unroll
                         for (int state_col_half_init = 0; state_col_half_init < 2; state_col_half_init++) {
                             float state_init_frag[32];
@@ -2027,7 +2038,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     for (int state_lane_half_cg1 = 0; state_lane_half_cg1 < 2; state_lane_half_cg1++) {
                         int warp_id_in_role_6 = warp - 4;
                         int state_row_top_cg1 = warp_id_in_role_6 * 32 + state_lane_half_cg1 * 16 + lane / 4;
-                        long long state_base_idx_top_cg1 = output_state_head_base_cg1 + (long long)state_row_top_cg1 * 128;
+                        long long state_base_idx_top_cg1 = output_state_head_base_cg1 + (long long)state_row_top_cg1 * 128ll;
                         #pragma unroll
                         for (int state_col_half_cg1 = 0; state_col_half_cg1 < 2; state_col_half_cg1++) {
                             int final_state_addr_cg1 = taddr + (unsigned int)(state_tmem_row_base_cg1 + (state_lane_half_cg1 * 16 << 16)) + (unsigned int)(state_col_half_cg1 * 64);
@@ -2056,22 +2067,22 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load + (state_reg_base_cg1 + 2))[_lp*2 + 0], (_tmem_load + (state_reg_base_cg1 + 2))[_lp*2+1 + 0]));
                                         packed_1[_lp] = *(uint32_t*)&_bf2;
                                     }
-                                    reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + 1024 + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
+                                    reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + 1024ll + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
                                 }
                             }
                         }
                     }
-                    mbarrier_arrive(kv_acc_empty_addr);
+                    mbarrier_arrive(kv_state_drained_addr);
                 }
                 if (STORE_FINAL_STATE != 0 && USE_INITIAL_STATE != 0 && num_chunks_b_1 == 0) {
                     int warp_id_in_role_7 = warp - 4;
                     int empty_state_row = warp_id_in_role_7 * 32 + lane;
-                    long long empty_initial_base = initial_state_head_base_cg1 + (long long)empty_state_row * 128;
-                    long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128;
+                    long long empty_initial_base = initial_state_head_base_cg1 + (long long)empty_state_row * 128ll;
+                    long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128ll;
                     float empty_stage[128];
                     {
                         uint2 _vld_16;
-                        _vld_16 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 0);
+                        _vld_16 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 0ll);
                         uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2081,7 +2092,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_17;
-                        _vld_17 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 4);
+                        _vld_17 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 4ll);
                         uint32_t* _vpairs_17 = reinterpret_cast<uint32_t*>(&_vld_17);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2091,7 +2102,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_18;
-                        _vld_18 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 8);
+                        _vld_18 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 8ll);
                         uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2101,7 +2112,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_19;
-                        _vld_19 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 12);
+                        _vld_19 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 12ll);
                         uint32_t* _vpairs_19 = reinterpret_cast<uint32_t*>(&_vld_19);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2111,7 +2122,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_20;
-                        _vld_20 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 16);
+                        _vld_20 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 16ll);
                         uint32_t* _vpairs_20 = reinterpret_cast<uint32_t*>(&_vld_20);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2121,7 +2132,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_21;
-                        _vld_21 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 20);
+                        _vld_21 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 20ll);
                         uint32_t* _vpairs_21 = reinterpret_cast<uint32_t*>(&_vld_21);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2131,7 +2142,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_22;
-                        _vld_22 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 24);
+                        _vld_22 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 24ll);
                         uint32_t* _vpairs_22 = reinterpret_cast<uint32_t*>(&_vld_22);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2141,7 +2152,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_23;
-                        _vld_23 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 28);
+                        _vld_23 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 28ll);
                         uint32_t* _vpairs_23 = reinterpret_cast<uint32_t*>(&_vld_23);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2151,7 +2162,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_24;
-                        _vld_24 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 32);
+                        _vld_24 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 32ll);
                         uint32_t* _vpairs_24 = reinterpret_cast<uint32_t*>(&_vld_24);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2161,7 +2172,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_25;
-                        _vld_25 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 36);
+                        _vld_25 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 36ll);
                         uint32_t* _vpairs_25 = reinterpret_cast<uint32_t*>(&_vld_25);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2171,7 +2182,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_26;
-                        _vld_26 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 40);
+                        _vld_26 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 40ll);
                         uint32_t* _vpairs_26 = reinterpret_cast<uint32_t*>(&_vld_26);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2181,7 +2192,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_27;
-                        _vld_27 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 44);
+                        _vld_27 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 44ll);
                         uint32_t* _vpairs_27 = reinterpret_cast<uint32_t*>(&_vld_27);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2191,7 +2202,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_28;
-                        _vld_28 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 48);
+                        _vld_28 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 48ll);
                         uint32_t* _vpairs_28 = reinterpret_cast<uint32_t*>(&_vld_28);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2201,7 +2212,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_29;
-                        _vld_29 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 52);
+                        _vld_29 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 52ll);
                         uint32_t* _vpairs_29 = reinterpret_cast<uint32_t*>(&_vld_29);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2211,7 +2222,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_30;
-                        _vld_30 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 56);
+                        _vld_30 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 56ll);
                         uint32_t* _vpairs_30 = reinterpret_cast<uint32_t*>(&_vld_30);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2221,7 +2232,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_31;
-                        _vld_31 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 60);
+                        _vld_31 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 60ll);
                         uint32_t* _vpairs_31 = reinterpret_cast<uint32_t*>(&_vld_31);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2231,7 +2242,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_32;
-                        _vld_32 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 64);
+                        _vld_32 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 64ll);
                         uint32_t* _vpairs_32 = reinterpret_cast<uint32_t*>(&_vld_32);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2241,7 +2252,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_33;
-                        _vld_33 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 68);
+                        _vld_33 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 68ll);
                         uint32_t* _vpairs_33 = reinterpret_cast<uint32_t*>(&_vld_33);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2251,7 +2262,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_34;
-                        _vld_34 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 72);
+                        _vld_34 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 72ll);
                         uint32_t* _vpairs_34 = reinterpret_cast<uint32_t*>(&_vld_34);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2261,7 +2272,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_35;
-                        _vld_35 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 76);
+                        _vld_35 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 76ll);
                         uint32_t* _vpairs_35 = reinterpret_cast<uint32_t*>(&_vld_35);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2271,7 +2282,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_36;
-                        _vld_36 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 80);
+                        _vld_36 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 80ll);
                         uint32_t* _vpairs_36 = reinterpret_cast<uint32_t*>(&_vld_36);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2281,7 +2292,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_37;
-                        _vld_37 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 84);
+                        _vld_37 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 84ll);
                         uint32_t* _vpairs_37 = reinterpret_cast<uint32_t*>(&_vld_37);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2291,7 +2302,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_38;
-                        _vld_38 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 88);
+                        _vld_38 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 88ll);
                         uint32_t* _vpairs_38 = reinterpret_cast<uint32_t*>(&_vld_38);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2301,7 +2312,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_39;
-                        _vld_39 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 92);
+                        _vld_39 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 92ll);
                         uint32_t* _vpairs_39 = reinterpret_cast<uint32_t*>(&_vld_39);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2311,7 +2322,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_40;
-                        _vld_40 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 96);
+                        _vld_40 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 96ll);
                         uint32_t* _vpairs_40 = reinterpret_cast<uint32_t*>(&_vld_40);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2321,7 +2332,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_41;
-                        _vld_41 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 100);
+                        _vld_41 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 100ll);
                         uint32_t* _vpairs_41 = reinterpret_cast<uint32_t*>(&_vld_41);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2331,7 +2342,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_42;
-                        _vld_42 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 104);
+                        _vld_42 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 104ll);
                         uint32_t* _vpairs_42 = reinterpret_cast<uint32_t*>(&_vld_42);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2341,7 +2352,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_43;
-                        _vld_43 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 108);
+                        _vld_43 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 108ll);
                         uint32_t* _vpairs_43 = reinterpret_cast<uint32_t*>(&_vld_43);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2351,7 +2362,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_44;
-                        _vld_44 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 112);
+                        _vld_44 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 112ll);
                         uint32_t* _vpairs_44 = reinterpret_cast<uint32_t*>(&_vld_44);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2361,7 +2372,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_45;
-                        _vld_45 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 116);
+                        _vld_45 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 116ll);
                         uint32_t* _vpairs_45 = reinterpret_cast<uint32_t*>(&_vld_45);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2371,7 +2382,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_46;
-                        _vld_46 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 120);
+                        _vld_46 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 120ll);
                         uint32_t* _vpairs_46 = reinterpret_cast<uint32_t*>(&_vld_46);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2381,7 +2392,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     }
                     {
                         uint2 _vld_47;
-                        _vld_47 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 124);
+                        _vld_47 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + 124ll);
                         uint32_t* _vpairs_47 = reinterpret_cast<uint32_t*>(&_vld_47);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -2400,7 +2411,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 2], empty_stage[_lp*2+1 + 2]));
                         empty_packed_0[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 0))[0] = reinterpret_cast<int2*>(empty_packed_0)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 0ll))[0] = reinterpret_cast<int2*>(empty_packed_0)[0];
                     unsigned int empty_packed_1[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2412,7 +2423,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 6], empty_stage[_lp*2+1 + 6]));
                         empty_packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 4))[0] = reinterpret_cast<int2*>(empty_packed_1)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 4ll))[0] = reinterpret_cast<int2*>(empty_packed_1)[0];
                     unsigned int empty_packed_2[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2424,7 +2435,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 10], empty_stage[_lp*2+1 + 10]));
                         empty_packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 8))[0] = reinterpret_cast<int2*>(empty_packed_2)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 8ll))[0] = reinterpret_cast<int2*>(empty_packed_2)[0];
                     unsigned int empty_packed_3[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2436,7 +2447,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 14], empty_stage[_lp*2+1 + 14]));
                         empty_packed_3[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 12))[0] = reinterpret_cast<int2*>(empty_packed_3)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 12ll))[0] = reinterpret_cast<int2*>(empty_packed_3)[0];
                     unsigned int empty_packed_4[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2448,7 +2459,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 18], empty_stage[_lp*2+1 + 18]));
                         empty_packed_4[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 16))[0] = reinterpret_cast<int2*>(empty_packed_4)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 16ll))[0] = reinterpret_cast<int2*>(empty_packed_4)[0];
                     unsigned int empty_packed_5[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2460,7 +2471,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 22], empty_stage[_lp*2+1 + 22]));
                         empty_packed_5[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 20))[0] = reinterpret_cast<int2*>(empty_packed_5)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 20ll))[0] = reinterpret_cast<int2*>(empty_packed_5)[0];
                     unsigned int empty_packed_6[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2472,7 +2483,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 26], empty_stage[_lp*2+1 + 26]));
                         empty_packed_6[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 24))[0] = reinterpret_cast<int2*>(empty_packed_6)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 24ll))[0] = reinterpret_cast<int2*>(empty_packed_6)[0];
                     unsigned int empty_packed_7[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2484,7 +2495,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 30], empty_stage[_lp*2+1 + 30]));
                         empty_packed_7[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 28))[0] = reinterpret_cast<int2*>(empty_packed_7)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 28ll))[0] = reinterpret_cast<int2*>(empty_packed_7)[0];
                     unsigned int empty_packed_8[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2496,7 +2507,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 34], empty_stage[_lp*2+1 + 34]));
                         empty_packed_8[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 32))[0] = reinterpret_cast<int2*>(empty_packed_8)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 32ll))[0] = reinterpret_cast<int2*>(empty_packed_8)[0];
                     unsigned int empty_packed_9[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2508,7 +2519,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 38], empty_stage[_lp*2+1 + 38]));
                         empty_packed_9[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 36))[0] = reinterpret_cast<int2*>(empty_packed_9)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 36ll))[0] = reinterpret_cast<int2*>(empty_packed_9)[0];
                     unsigned int empty_packed_10[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2520,7 +2531,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 42], empty_stage[_lp*2+1 + 42]));
                         empty_packed_10[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 40))[0] = reinterpret_cast<int2*>(empty_packed_10)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 40ll))[0] = reinterpret_cast<int2*>(empty_packed_10)[0];
                     unsigned int empty_packed_11[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2532,7 +2543,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 46], empty_stage[_lp*2+1 + 46]));
                         empty_packed_11[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 44))[0] = reinterpret_cast<int2*>(empty_packed_11)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 44ll))[0] = reinterpret_cast<int2*>(empty_packed_11)[0];
                     unsigned int empty_packed_12[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2544,7 +2555,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 50], empty_stage[_lp*2+1 + 50]));
                         empty_packed_12[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 48))[0] = reinterpret_cast<int2*>(empty_packed_12)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 48ll))[0] = reinterpret_cast<int2*>(empty_packed_12)[0];
                     unsigned int empty_packed_13[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2556,7 +2567,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 54], empty_stage[_lp*2+1 + 54]));
                         empty_packed_13[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 52))[0] = reinterpret_cast<int2*>(empty_packed_13)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 52ll))[0] = reinterpret_cast<int2*>(empty_packed_13)[0];
                     unsigned int empty_packed_14[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2568,7 +2579,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 58], empty_stage[_lp*2+1 + 58]));
                         empty_packed_14[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 56))[0] = reinterpret_cast<int2*>(empty_packed_14)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 56ll))[0] = reinterpret_cast<int2*>(empty_packed_14)[0];
                     unsigned int empty_packed_15[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2580,7 +2591,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 62], empty_stage[_lp*2+1 + 62]));
                         empty_packed_15[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 60))[0] = reinterpret_cast<int2*>(empty_packed_15)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 60ll))[0] = reinterpret_cast<int2*>(empty_packed_15)[0];
                     unsigned int empty_packed_16[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2592,7 +2603,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 66], empty_stage[_lp*2+1 + 66]));
                         empty_packed_16[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 64))[0] = reinterpret_cast<int2*>(empty_packed_16)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 64ll))[0] = reinterpret_cast<int2*>(empty_packed_16)[0];
                     unsigned int empty_packed_17[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2604,7 +2615,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 70], empty_stage[_lp*2+1 + 70]));
                         empty_packed_17[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 68))[0] = reinterpret_cast<int2*>(empty_packed_17)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 68ll))[0] = reinterpret_cast<int2*>(empty_packed_17)[0];
                     unsigned int empty_packed_18[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2616,7 +2627,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 74], empty_stage[_lp*2+1 + 74]));
                         empty_packed_18[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 72))[0] = reinterpret_cast<int2*>(empty_packed_18)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 72ll))[0] = reinterpret_cast<int2*>(empty_packed_18)[0];
                     unsigned int empty_packed_19[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2628,7 +2639,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 78], empty_stage[_lp*2+1 + 78]));
                         empty_packed_19[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 76))[0] = reinterpret_cast<int2*>(empty_packed_19)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 76ll))[0] = reinterpret_cast<int2*>(empty_packed_19)[0];
                     unsigned int empty_packed_20[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2640,7 +2651,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 82], empty_stage[_lp*2+1 + 82]));
                         empty_packed_20[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 80))[0] = reinterpret_cast<int2*>(empty_packed_20)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 80ll))[0] = reinterpret_cast<int2*>(empty_packed_20)[0];
                     unsigned int empty_packed_21[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2652,7 +2663,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 86], empty_stage[_lp*2+1 + 86]));
                         empty_packed_21[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 84))[0] = reinterpret_cast<int2*>(empty_packed_21)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 84ll))[0] = reinterpret_cast<int2*>(empty_packed_21)[0];
                     unsigned int empty_packed_22[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2664,7 +2675,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 90], empty_stage[_lp*2+1 + 90]));
                         empty_packed_22[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 88))[0] = reinterpret_cast<int2*>(empty_packed_22)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 88ll))[0] = reinterpret_cast<int2*>(empty_packed_22)[0];
                     unsigned int empty_packed_23[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2676,7 +2687,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 94], empty_stage[_lp*2+1 + 94]));
                         empty_packed_23[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 92))[0] = reinterpret_cast<int2*>(empty_packed_23)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 92ll))[0] = reinterpret_cast<int2*>(empty_packed_23)[0];
                     unsigned int empty_packed_24[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2688,7 +2699,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 98], empty_stage[_lp*2+1 + 98]));
                         empty_packed_24[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 96))[0] = reinterpret_cast<int2*>(empty_packed_24)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 96ll))[0] = reinterpret_cast<int2*>(empty_packed_24)[0];
                     unsigned int empty_packed_25[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2700,7 +2711,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 102], empty_stage[_lp*2+1 + 102]));
                         empty_packed_25[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 100))[0] = reinterpret_cast<int2*>(empty_packed_25)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 100ll))[0] = reinterpret_cast<int2*>(empty_packed_25)[0];
                     unsigned int empty_packed_26[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2712,7 +2723,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 106], empty_stage[_lp*2+1 + 106]));
                         empty_packed_26[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 104))[0] = reinterpret_cast<int2*>(empty_packed_26)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 104ll))[0] = reinterpret_cast<int2*>(empty_packed_26)[0];
                     unsigned int empty_packed_27[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2724,7 +2735,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 110], empty_stage[_lp*2+1 + 110]));
                         empty_packed_27[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 108))[0] = reinterpret_cast<int2*>(empty_packed_27)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 108ll))[0] = reinterpret_cast<int2*>(empty_packed_27)[0];
                     unsigned int empty_packed_28[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2736,7 +2747,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 114], empty_stage[_lp*2+1 + 114]));
                         empty_packed_28[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 112))[0] = reinterpret_cast<int2*>(empty_packed_28)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 112ll))[0] = reinterpret_cast<int2*>(empty_packed_28)[0];
                     unsigned int empty_packed_29[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2748,7 +2759,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 118], empty_stage[_lp*2+1 + 118]));
                         empty_packed_29[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 116))[0] = reinterpret_cast<int2*>(empty_packed_29)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 116ll))[0] = reinterpret_cast<int2*>(empty_packed_29)[0];
                     unsigned int empty_packed_30[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2760,7 +2771,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 122], empty_stage[_lp*2+1 + 122]));
                         empty_packed_30[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 120))[0] = reinterpret_cast<int2*>(empty_packed_30)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 120ll))[0] = reinterpret_cast<int2*>(empty_packed_30)[0];
                     unsigned int empty_packed_31[2];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
@@ -2772,7 +2783,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(empty_stage[_lp*2 + 126], empty_stage[_lp*2+1 + 126]));
                         empty_packed_31[_lp + 1] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<int2*>(output_state + (empty_output_base + 124))[0] = reinterpret_cast<int2*>(empty_packed_31)[0];
+                    reinterpret_cast<int2*>(output_state + (empty_output_base + 124ll))[0] = reinterpret_cast<int2*>(empty_packed_31)[0];
                 }
             }
         }
@@ -3072,11 +3083,11 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                 int num_chunks_b_3 = num_pairs_b_3 * 2;
                 if (USE_INITIAL_STATE != 0 && (int)tile_3 >= num_bids && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0)) {
                     if (elect_sync()) {
-                        long long pf_state_base = (long long)batch_idx_3 * initial_state_stride_slot + (long long)head_idx_3 * 16384;
-                        int pf_skew = (int)(-((unsigned long long)initial_state + (unsigned long long)pf_state_base * 2) & 15);
+                        long long pf_state_base = (long long)batch_idx_3 * initial_state_stride_slot + (long long)head_idx_3 * 16384ll;
+                        int pf_skew = (int)(-((unsigned long long)initial_state + (unsigned long long)pf_state_base * 2ull) & 15ull);
                         long long pf_first = pf_state_base + (long long)(pf_skew / 2);
                         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + pf_first), "r"((uint32_t)(((1) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + (pf_first + 8192)), "r"((uint32_t)(((0) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + (pf_first + 8192ll)), "r"((uint32_t)(((0) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
                     }
                 }
                 int k_head_idx = ((num_q_heads >= num_v_heads) ? v_head_idx_3 : qk_head_idx_3);
@@ -3150,7 +3161,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
             unsigned int ainv_stage_mma = 0;
             unsigned int qk_stage_mma = 0;
             int kv_acc_release_pending = 1;
-            unsigned int _phase_kv_acc_empty = 1;
+            unsigned int _phase_kv_state_drained = 1;
             unsigned int _phase_load_k_full_1 = 0;
             unsigned int _phase_load_q_full_1 = 0;
             unsigned int _phase_state_inp_ready_0 = 0;
@@ -3181,8 +3192,8 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                 int active_chunks_b_1 = (((SINGLE_CHUNK_NO_STATE & (int)(num_chunks_b_4 > 0)) != 0) ? 1 : num_chunks_b_4);
                 if (active_chunks_b_1 > 0) {
                     if (kv_acc_release_pending == 1) {
-                        mbarrier_wait(kv_acc_empty_addr, _phase_kv_acc_empty);
-                        _phase_kv_acc_empty ^= 1;
+                        mbarrier_wait(kv_state_drained_addr, _phase_kv_state_drained);
+                        _phase_kv_state_drained ^= 1;
                     }
                     {
                     }
@@ -3374,7 +3385,7 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                         qk_stage_mma += 1;
                         if (qk_stage_mma == 2) { qk_stage_mma = 0; _phase_qk_ready ^= 1; }
                         {
-                            mbarrier_wait(kv_acc_empty_addr, _phase_kv_acc_empty);
+                            mbarrier_wait(kv_acc_empty_addr, 0);
                             mbarrier_wait(decay_v_ready_addr, _phase_decay_v_ready_0);
                             _phase_decay_v_ready_0 ^= 1;
                             int mma_b_lo_3 = make_warp_uniform_local(((((smem_k_trans_mma_addr) >> 4) & 0x7FFF) | 0x2000000) + (k_stage_1) * 1024);
@@ -3409,7 +3420,6 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     :: "r"(tmem_tmem_state), "r"(mma_b_lo_3), "r"(tmem_tmem_shared_inp + 32), "r"(1) : "memory");
                             elect_commit(kv_acc_full_addr);
                             elect_commit(load_k_empty_addr + (k_stage_1) * 8);
-                            _phase_kv_acc_empty ^= 1;
                         }
                         k_stage_1 += 1;
                         if (k_stage_1 == 4) { k_stage_1 = 0; _phase_load_k_full_1 ^= 1; }
@@ -3608,7 +3618,8 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     qk_stage_mma += 1;
                     if (qk_stage_mma == 2) { qk_stage_mma = 0; _phase_qk_ready ^= 1; }
                     {
-                        mbarrier_wait(kv_acc_empty_addr, _phase_kv_acc_empty);
+                        int _parity_kv_acc_empty = (int)((unsigned int)chunk_idx_5 % 2);
+                        mbarrier_wait(kv_acc_empty_addr, _parity_kv_acc_empty);
                         mbarrier_wait(decay_v_ready_addr, _phase_decay_v_ready_0);
                         _phase_decay_v_ready_0 ^= 1;
                         int mma_b_lo_3_1 = make_warp_uniform_local(((((smem_k_trans_mma_addr) >> 4) & 0x7FFF) | 0x2000000) + (k_stage_1) * 1024);
@@ -3643,7 +3654,6 @@ kernel_cake_gdn_453069def52efc7aca98_pf(const __grid_constant__ CUtensorMap Q, c
                     :: "r"(tmem_tmem_state), "r"(mma_b_lo_3_1), "r"(tmem_tmem_shared_inp + 32), "r"(1) : "memory");
                         elect_commit(kv_acc_full_addr);
                         elect_commit(load_k_empty_addr + (k_stage_1) * 8);
-                        _phase_kv_acc_empty ^= 1;
                     }
                     k_stage_1 += 1;
                     if (k_stage_1 == 4) { k_stage_1 = 0; _phase_load_k_full_1 ^= 1; }
