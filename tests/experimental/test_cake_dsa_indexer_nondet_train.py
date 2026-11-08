@@ -1102,7 +1102,8 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
 
 def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
     """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
-    inputs) sample ``sample_class_rule[0]`` tiles at its shift, and the long-unit l6 calls (the two-segment 262144-key
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift (a call whose mean unit holds no more tiles keeps the
+    tiny-unit tiles), and the long-unit l6 calls (the two-segment 262144-key
     document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
     of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
     architectures set no long-unit rule."""
@@ -1122,6 +1123,12 @@ def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
         return choice.sample_tiles_max, choice.sample_shift_permille
 
     assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # a packed call whose mean unit holds no more tiles than the rule's keeps the tiny-unit tiles at the rule's shift
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(plan(10624, 43824, 16, top_k=512, ratio=4)) == (
+        policy.sample_tiles_tiny_units,
+        class_rule[1],
+    )
     for top_k in (256, 2048, 4096):
         doc = plan(16384, 270336, 2, top_k=top_k)
         assert doc.physical_kind in long_rule[0], top_k

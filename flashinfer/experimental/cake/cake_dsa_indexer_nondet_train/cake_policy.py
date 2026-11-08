@@ -118,7 +118,7 @@ POLICY_FIELDS = (
     "sample_tiles_tiny_units",  # sample-tile cap of tiny units (lever K3b)
     "sample_dispatch_tiny_tiles_max",  # mean unit tiles up to which the tiny-unit cap applies
     "sample_shift_permille",  # conservative shift of the sampled rank
-    "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
+    "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (shift, and tiles where the mean unit holds more), or None; explicit knobs override it
     "sample_long_rule",  # [physical scan kinds, shift permille] of the long-unit calls of those kinds (more than sample_dispatch_mean_tiles_max mean unit tiles), or None; an explicit shift knob overrides it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
@@ -207,7 +207,8 @@ def sample_class_for(
     """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
     record's ``sample_class_rule`` and ``sample_long_rule``, from the call's ``tiles`` / ``shift``: the wide-unit
     programs take the class rule's shift on packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny
-    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count; a long-unit call
+    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count where the mean
+    unit holds more tiles than that count; a long-unit call
     (more than ``sample_dispatch_mean_tiles_max`` mean unit tiles) of a kind the long rule names takes its shift.  A
     knob the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rules or with sampling off nothing
     changes."""
@@ -238,7 +239,9 @@ def sample_class_for(
         and S >= CLASS_RULE_MIN_SEGMENTS
         and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
     ):
-        tiles = int(class_rule[0])
+        # no more sample tiles than the mean unit holds: a shorter unit would be sampled whole
+        if policy.mean_unit_tiles(T, num_keys, S, ratio) > int(class_rule[0]):
+            tiles = int(class_rule[0])
         if not shift_knob:
             shift = int(class_rule[1])
     return tiles, shift
