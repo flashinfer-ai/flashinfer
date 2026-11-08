@@ -85,7 +85,7 @@ entry takes a `deterministic=` keyword.
 
 | stage | kernel |
 |---|---|
-| `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 256 query rows of one (segment, query head), persistent tile tickets from a self-resetting counter |
+| `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 128 query rows of two query heads of one key head (an even `H_q / H_kv`; an odd one: 256 rows of one query head), persistent tile tickets from a self-resetting counter |
 | `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
 | `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 1024 pairs of 128 query rows) |
 | `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head): S^T, dP^T, dK and dV, dK and dV summed in tensor memory over every query head of the key head and stored once (FP32 window or BF16), dS^T stored to the workspace |
