@@ -451,7 +451,7 @@ keyword.
   `cake_backend_opt_in._AUTO_MIN_CHUNKS` sets the smallest chunk count of
   the rows the fast form chunks over that is planned at all; a shorter call
   keeps the fast form (its step peak is then not bounded by `B`).  The
-  shipped value 1 plans every call with a valid row.  A multi-chunk call fits
+  shipped value 2 plans every call of at least two chunks.  A multi-chunk call fits
   the fast form roughly
   while `T_v * (1.96 V - 4 H) >= 4.04 V H + 2 C V` (the fast form's last
   phase: the `dX` output, the FP32 `dX` and `[V, H]` accumulators, the
@@ -459,9 +459,14 @@ keyword.
   valid rows at `H = 6144`, `V = 154880`, `C = 4096`, about 13 500 at
   `H = 4096`.  A one-chunk call always exceeds `B` in the fast form (its
   deferred chunk holds the logits of every valid row beside both gradient
-  outputs and the FP32 `dX` accumulator), so with the value 1 it runs a
-  budget form; with a larger `_AUTO_MIN_CHUNKS` it keeps the fast form and
-  its step peak exceeds `B`.  Below
+  outputs and the FP32 `dX` accumulator), but it holds no FP32 `[V, H]`
+  accumulator, so its excess is small; with the shipped value 2 it keeps
+  the fast form and its step peak exceeds `B` (measured 1.02-1.12 `B` at
+  `H = 6144` and `H = 4096`, `T` 2048-4097, 5 % of the labels ignored),
+  while a budget form there recomputes most of the vocabulary and costs
+  15-35 % of the step.  A two-chunk call holds the FP32 `[V, H]`
+  accumulator beside a small `B` (measured 1.67-1.71 `B` at `T = 8117`)
+  and runs a budget form.  Below
   the threshold the budget forms run slower: the measured steps of the issue's
   shapes (`T = 16384`, a third of the labels ignored, `C = 4096`) went from
   6.971 to 5.020 GiB at `H = 6144` and from 5.041 to 3.888 GiB at

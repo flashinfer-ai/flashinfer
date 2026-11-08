@@ -226,8 +226,9 @@ KEEP_LOGITS = "keep_logits"
 # :func:`memory_plan`, else a budget form that fits, else the fast form (:func:`auto_memory_plan`)
 MEMORY_AUTO = "auto"
 # The automatic form plans a call only when its fast form runs at least this many chunks (over the rows it chunks
-# over); a shorter call keeps the fast form without planning (:func:`_auto_plans`).  ``1``: every call with a row.
-_AUTO_MIN_CHUNKS = 1
+# over); a shorter call keeps the fast form without planning (:func:`_auto_plans`).  ``2``: a one-chunk call (no FP32
+# ``[V, H]`` accumulator; its fast step peak exceeds the bound only by its outputs and gathered rows) keeps the fast form.
+_AUTO_MIN_CHUNKS = 2
 
 
 # The budget form's margin below the logits-materializing head's bytes (a fraction of them): the peak model of
