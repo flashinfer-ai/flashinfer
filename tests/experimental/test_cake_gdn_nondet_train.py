@@ -5457,9 +5457,10 @@ _ADJOINT_WALK_STAGES = (
 
 
 def _force_m_share(monkeypatch, device) -> str:
-    """Let every layout of FWD_SPLIT_CASES take M-share on the device: the adjoint's one-wave split priced on (its
-    pieces are the forward's: the device's own SM count), the B200 M-share costs under the device's (architecture, SM
-    count) and no least saving; fresh layout and plan caches."""
+    """Let every layout of FWD_SPLIT_CASES take M-share on the device: the split forward's shape class lowered to
+    FWD_SPLIT_TEST_MIN_PIECE (as :func:`fwd_split_test_class`), the adjoint's one-wave split priced on (its pieces are
+    the forward's: the device's own SM count), the B200 M-share costs under the device's (architecture, SM count) and
+    no least saving; fresh layout and plan caches."""
     arch = _fwd_split_or_skip(device)
     if arch not in cake_chain.M_SHARE_ARCHS:
         pytest.skip(f"M-share is not planned on {arch}")
@@ -5482,6 +5483,13 @@ def _force_m_share(monkeypatch, device) -> str:
     m_costs.setdefault((arch, sms), cake_plan.M_SHARE_COSTS[("sm_100a", 148)])
     monkeypatch.setattr(cake_plan, "M_SHARE_COSTS", types.MappingProxyType(m_costs))
     monkeypatch.setattr(cake_plan, "M_SHARE_MIN_SAVING", float("-inf"))
+    monkeypatch.setattr(
+        cake_plan,
+        "FORWARD_SPLIT_MIN_PIECE",
+        types.MappingProxyType(
+            {a: FWD_SPLIT_TEST_MIN_PIECE for a in cake_chain.FWD_SPLIT_ARCHS}
+        ),
+    )
     for cache in ("_META_FRONT", "_DHU_AUTO", "_SDT_AUTO", "_BWD_PLANS"):
         monkeypatch.setattr(cake_chain, cache, {})
     return arch
