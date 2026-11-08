@@ -23,9 +23,18 @@ BACKEND_NAMESPACE = "moe_ep.complete_forward.backends.v1"
 def plain(value):
     """Encode configuration values without process-local object identities."""
     from flashinfer.quantization.nvfp4_quantization_utils import _UNSET
+    from ..algo_knobs import FleetAlgoKnobAllocator, HandleAlgoKnobUserStream
 
     if value is _UNSET:
         return {"nvfp4_4over6": "environment"}
+    if isinstance(value, HandleAlgoKnobUserStream) or (
+        isinstance(value, FleetAlgoKnobAllocator)
+        and (value.alloc_fn or value.free_fn or value.context)
+    ):
+        raise ValueError(
+            "EP automatic selection cannot cache process-local allocator callbacks "
+            "or stream handles"
+        )
     if isinstance(value, enum.Enum):
         return {"enum": type(value).__qualname__, "value": value.value}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -98,13 +107,16 @@ class Collective:
             result = fn()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            unsupported = isinstance(exc, (ValueError, TypeError, NotImplementedError))
+            unsupported = isinstance(
+                exc, (ValueError, TypeError, NotImplementedError, NoEligibleCandidate)
+            )
         errors = self.gather((error, unsupported))
         if any(e[0] for e in errors):
             if optional and all(e[0] is None or e[1] for e in errors):
-                if result is not None:
-                    result.destroy()
-                return None
+                destroy = getattr(result, "destroy", None)
+                if destroy is not None:
+                    destroy()
+                raise NoEligibleCandidate(f"EP candidate is unsupported: {errors}")
             raise RuntimeError(f"EP candidate preparation failed: {errors}")
         return result
 

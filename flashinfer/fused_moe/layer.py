@@ -498,10 +498,7 @@ class MoELayer:
         )
 
         candidates = []
-        try:
-            eligible = self._eligible_runners(act_pack, weight_pack)
-        except (ValueError, NotImplementedError):
-            return candidates
+        eligible = self._eligible_runners(act_pack, weight_pack)
         for index in eligible:
             runner = self.runners[index]
             inputs = runner.pack_inputs(act_pack, weight_pack)

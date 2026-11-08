@@ -36,6 +36,7 @@ def numerical_contract(config, prototype, fleet):
         return contract
 
     from flashinfer.fused_moe.api import QuantFormat, SiTU, SwiGLU
+    from flashinfer.quantization.nvfp4_quantization_utils import resolve_nvfp4_4over6
     from flashinfer.tllm_enums import DEFAULT_SWIGLU_LIMIT
 
     if not hasattr(config.kernel, "moe_config"):
@@ -88,6 +89,13 @@ def numerical_contract(config, prototype, fleet):
         "situ_beta": beta,
         "situ_linear_beta": linear,
         "per_token_activation": bool(cfg.quant.per_token_scale),
+        "nvfp4_4over6": (
+            plain(resolve_nvfp4_4over6(cfg.quant.nvfp4_4over6))
+            if cfg.quant.activation is QuantFormat.NVFP4
+            else None
+        ),
+        "apply_routing_weights_before_fc2": False,
+        "combine_dtype": "bf16",
     }
 
 
@@ -116,7 +124,11 @@ class MegaPlan:
         return self.layer.forward(
             dataclasses.replace(
                 tensors,
-                output=tensors.output if tensors.output is not None else self.output,
+                output=(
+                    tensors.output
+                    if tensors.output is not None
+                    else self.output[: tensors.num_tokens]
+                ),
             )
         )
 
@@ -136,14 +148,20 @@ class MegaPlan:
 
             Collective(self.layer._bootstrap).prepare(prepare_fixed)
             self.layer.compute_staged(
-                output=tensors.output if tensors.output is not None else self.output
+                output=(
+                    tensors.output
+                    if tensors.output is not None
+                    else self.output[: tensors.num_tokens]
+                )
             )
         elif force_tune:
             self.layer._kernel.ep_force_tune(
                 self.layer._ensure_workspace(),
                 tensors,
                 self.layer._get_transformed_weights(),
-                tensors.output if tensors.output is not None else self.output,
+                tensors.output
+                if tensors.output is not None
+                else self.output[: tensors.num_tokens],
             )
         else:
             self.forward(tensors)
@@ -157,7 +175,11 @@ class MegaPlan:
         layer = self.layer
         Collective(layer._bootstrap).prepare(lambda: layer.stage_inputs(tensors))
         return layer.compute_staged(
-            output=tensors.output if tensors.output is not None else self.output
+            output=(
+                tensors.output
+                if tensors.output is not None
+                else self.output[: tensors.num_tokens]
+            )
         )
 
     def destroy(self):
@@ -178,20 +200,66 @@ class SplitPlan:
         self.state = None
         self.context = None
         self.choices = None
+        self._staging = None
+
+    def _stage(self, tensors, *, force=False):
+        if self.layer._uses_communication():
+            return tensors
+        bound = self.output.shape[0]
+        if not force and tensors.num_tokens == bound:
+            return tensors
+        if self._staging is None:
+            from flashinfer.cute_dsl import is_cute_dsl_available
+
+            self._fused_stage = None
+            if is_cute_dsl_available():
+                from ..core.bf16_stage import fused_bf16_stage
+
+                self._fused_stage = fused_bf16_stage
+            self._staging = dataclasses.replace(
+                tensors,
+                hidden_states=torch.empty_like(self.output),
+                topk_ids=torch.empty(
+                    bound,
+                    tensors.topk_ids.shape[1],
+                    dtype=tensors.topk_ids.dtype,
+                    device=tensors.topk_ids.device,
+                ),
+                topk_weights=torch.empty(
+                    bound,
+                    tensors.topk_weights.shape[1],
+                    dtype=tensors.topk_weights.dtype,
+                    device=tensors.topk_weights.device,
+                ),
+                output=None,
+            )
+        # Fleet handles require fixed routing rows. Mask the entire tail on
+        # each call, including after a graph replay with a larger live batch.
+        staged = self._staging
+        if self._fused_stage is None or not self._fused_stage(
+            tensors.hidden_states,
+            tensors.topk_ids,
+            tensors.topk_weights,
+            staged.hidden_states,
+            staged.topk_ids,
+            staged.topk_weights,
+        ):
+            n = tensors.num_tokens
+            staged.hidden_states[:n].copy_(tensors.hidden_states)
+            staged.topk_ids[:n].copy_(tensors.topk_ids)
+            staged.topk_weights[:n].copy_(tensors.topk_weights)
+            staged.topk_ids[n:].fill_(-1)
+        return staged
 
     def discover(self, tensors):
         c = Collective(self.layer._bootstrap)
-        bound = c.prepare(
-            lambda: dataclasses.replace(
-                tensors, topk_weights=tensors.topk_weights.clone()
-            )
-        )
+        bound = c.prepare(lambda: self._stage(tensors, force=True))
         self.state = c.prepare(
-            lambda: self.layer.create_graph_state(bound, out=self.output),
+            lambda: self.layer.create_graph_state(
+                bound, out=self.output[: bound.num_tokens]
+            ),
             optional=True,
         )
-        if self.state is None:
-            raise NoEligibleCandidate("The split transport cannot prepare this profile")
 
         # Complete the transport round trip even though setup only needs its
         # received tensors. Some transports reset their state during combine.
@@ -230,7 +298,15 @@ class SplitPlan:
         previous = self.layer.stage_hook
         self.layer.stage_hook = self._prepare_stage
         try:
-            return self.layer._forward_prepared(tensors, self.state, compute=compute)
+            staged = Collective(self.layer._bootstrap).prepare(
+                lambda: self._stage(tensors)
+            )
+            return self.layer._forward_prepared(
+                staged,
+                self.state,
+                compute=compute,
+                output=self.output[: staged.num_tokens],
+            )
         finally:
             self.layer.stage_hook = previous
 
@@ -260,7 +336,10 @@ class SplitPlan:
         self.layer._kernel.prepare_tactic(self.context, tuples(selection))
 
     def forward(self, tensors):
-        out = self.layer._forward_prepared(tensors, self.state)
+        staged = self._stage(tensors)
+        out = self.layer._forward_prepared(
+            staged, self.state, output=self.output[: staged.num_tokens]
+        )[: tensors.num_tokens]
         if tensors.output is not None and tensors.output.data_ptr() != out.data_ptr():
             tensors.output.copy_(out)
             return tensors.output
@@ -272,6 +351,7 @@ class SplitPlan:
         self.choices = None
         self.layer.destroy()
         self.state = None
+        self._staging = None
 
 
 class SplitProtocol:
@@ -284,7 +364,7 @@ class SplitProtocol:
 
     def run(self, context):
         c, plan = self.collective, self.plan
-        choices = c.prepare(plan.enumerate)
+        choices = c.prepare(plan.enumerate, optional=True)
         all_choices = c.gather(plain(choices))
         # A tactic must be legal on every rank. Runner positions identify
         # distinct configurations of the same backend.

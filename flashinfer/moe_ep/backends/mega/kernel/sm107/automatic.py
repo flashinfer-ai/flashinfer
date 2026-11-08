@@ -217,6 +217,9 @@ def ep_tuning_contract(backend, fleet_params):
         "situ_beta": cfg.situ_beta,
         "situ_linear_beta": cfg.situ_linear_beta,
         "per_token_activation": False,
+        "nvfp4_4over6": None,
+        "apply_routing_weights_before_fc2": cfg.apply_routing_weights_before_fc2,
+        "combine_dtype": cfg.combine_dtype,
     }
 
 

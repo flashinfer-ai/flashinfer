@@ -652,7 +652,7 @@ class MoEEpSplitLayer(nn.Module):
             self._warmed = True
         return out
 
-    def _forward_prepared(self, t, state, *, compute=None):
+    def _forward_prepared(self, t, state, *, compute=None, output=None):
         """Execute on persistent transport storage owned by an EP selection plan."""
         if self._destroyed or state.destroyed:
             raise MoEEpConfigError("The prepared split workspace has been destroyed")
@@ -663,9 +663,10 @@ class MoEEpSplitLayer(nn.Module):
             raise ValueError(
                 "runtime_max_tokens_per_rank changed; prepare another plan"
             )
+        output = state.out if output is None else output
         if self._uses_communication():
             out = self._communication_dispatch_compute_combine(
-                t, state.out, compute=compute
+                t, output, compute=compute
             )
         else:
             # Fleet handles bind weights at creation; refresh their contents
@@ -676,7 +677,7 @@ class MoEEpSplitLayer(nn.Module):
             handle.update(HandleParams(topk_ids=t.topk_ids))
             try:
                 out = self._fleet_dispatch_compute_combine(
-                    handle, t, state.out, out_is_stable=True, compute=compute
+                    handle, t, output, out_is_stable=True, compute=compute
                 )
             finally:
                 handle.complete()

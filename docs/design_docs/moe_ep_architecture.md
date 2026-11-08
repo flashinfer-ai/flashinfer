@@ -322,12 +322,18 @@ activation and expert geometry, using canonical BF16 weights and contiguous
 BF16 inputs with finalized BF16 output. Routing tensors are contiguous, with
 int32/int64 expert IDs and float32 weights. FC1 rows use the unified MoE API's
 `[up, gate]` order.
+Routing-weight placement, the NVFP4 activation recipe and the combine format
+must also agree. In particular, mixing a split candidate with Rubin Mega
+requires `apply_routing_weights_before_fc2=False` and `combine_dtype="bf16"`.
 Candidate preparation converts native weight layouts before tuning. Mega
 candidates currently use the Rubin block-scaled
 adapters. Split candidates use `FusedMoeKernelConfig` and its existing prepared
 weight views. The layer prepares and retains each candidate's weights once;
 workspaces share those views. Each split configuration pins its communication
 backend, including its default; the selector does not enumerate other transports.
+Raw allocator callbacks and CUDA stream handles carry process-local addresses
+and are not supported in automatic-selection cache contracts. The built-in
+`FleetAlgoKnobAllocator(torch_caching=True)` remains serializable.
 
 ```python
 from flashinfer import autotune_v2
@@ -367,11 +373,28 @@ forces that candidate while allowing its inner tuning. `get_selected_plan()`
 returns its index and either a Mega variant/knob dictionary or a split backend
 position and tactic. The backend position indexes the configured `BackendOptions`.
 
-Prepare one workspace for each input shape and capacity. Eager calls may use
-new input buffers with the same layout; changed routing values do not trigger
-selection. Ordinary serving does not run selector collectives. The workspace
-owns the returned output and may overwrite it on its next call; pass
+Prepare workspaces collectively with an agreed `runtime_max_tokens_per_rank`,
+or omit it to use the workspace capacity as the row bound. Live row counts may
+vary independently on each rank within that bound. NCCL-EP and NIXL-EP use
+fixed-row handles, so partial batches stage into bound-sized buffers with
+masked routing tails. A full-bound batch executes directly; NVLink one-sided
+keeps its variable-row path. Dtypes, strides, top-k, output layout and the
+runtime hint stay fixed. Prepare another workspace collectively to change them.
+
+Eager calls may use new input buffers with the same layout. Ordinary serving
+reuses the prepared plan without selector collectives; changed routing values
+do not trigger selection. An enabled tuning context selects for the actual
+rank-local live row counts, which remain distinct in the tuning cache even
+when workloads share a workspace bound. Warm up that workload before capture.
+The workspace owns the returned output and may overwrite it on its next call; pass
 `MoEEpTensors.output` to supply an output buffer. Output must not alias an input.
+Prepared fixed-row transports keep their eager stream binding; run eager
+forwards on the stream used to prepare the plan. Capture uses its capture stream.
+
+Prepared Mega plans own their symmetric scratch instead of using the process
+workspace pool. Scratch usage grows with the number of live layer/profile
+workspaces; transformed weights are shared. Independent storage prevents plans
+and older graph captures from overwriting one another.
 
 Warm up each profile before capture. Selection cannot run inside capture. Later
 warmup can replace a selected plan using fresh execution storage while retaining

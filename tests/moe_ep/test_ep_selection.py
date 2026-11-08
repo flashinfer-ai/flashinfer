@@ -25,7 +25,9 @@ class LocalCollective(Collective):
         self.rank, self.world = 0, 1
         self.measured = []
 
-    def measure(self, fn, device, settings, **kwargs):
+    def measure(self, fn, device, settings, *, warmup=None, warmups=3, repeats=10):
+        for _ in range(warmups):
+            (warmup or fn)()
         result = fn()
         self.measured.append(result[0])
         return result[1]
@@ -35,6 +37,7 @@ class SplitTrial:
     def __init__(self):
         self.selected = None
         self.prepared = []
+        self.log = []
         self.scores = {(0, 10): 8.0, (0, 11): 3.0, (2, 20): 5.0}
 
     def enumerate(self):
@@ -62,7 +65,11 @@ class SplitTrial:
         self.selected = tuple(selection)
         self.prepared.append(self.selected)
 
+    def warmup(self, tensors):
+        self.log.append(("warmup", self.selected))
+
     def forward(self, tensors):
+        self.log.append(("sample", self.selected))
         return self.selected, self.scores[self.selected]
 
 
@@ -89,6 +96,11 @@ def test_full_path_tactics_and_partial_cache_reuse(monkeypatch):
         first = tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
         assert first["selection"] == [0, 11]
         assert c.measured == [(0, 10), (0, 11), (2, 20)]
+        assert plan.log == [
+            event
+            for selection in c.measured
+            for event in [("warmup", selection)] * 3 + [("sample", selection)]
+        ]
         assert len(tuner.get_protocol_records(BACKEND_NAMESPACE)) == 2
         c.measured.clear()
         tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
@@ -181,12 +193,28 @@ def test_teardown_releases_other_plans_and_runtime_after_a_failure(monkeypatch):
         _runtime=runtime,
     )
     release = Mock()
+    order = Mock()
+    for name, item in (
+        ("first", first),
+        ("retained", retained),
+        ("failed", failed),
+        ("prototype", prototype),
+    ):
+        order.attach_mock(item.destroy, name)
+    order.attach_mock(release, "release")
     monkeypatch.setattr(auto_layer, "finalize_moe_ep_runtime", release)
     with pytest.raises(RuntimeError, match="plan teardown failed"):
         auto_layer.MoEEpAutoLayer.destroy(layer)
     for item in (first, retained, failed, prototype):
         item.destroy.assert_called_once()
     release.assert_called_once_with(runtime)
+    assert [call[0] for call in order.mock_calls] == [
+        "first",
+        "retained",
+        "failed",
+        "prototype",
+        "release",
+    ]
     assert workspace._destroyed and layer._destroyed
     workspace.destroy()
     auto_layer.MoEEpAutoLayer.destroy(layer)
@@ -208,36 +236,89 @@ def test_bare_execution_generation_does_not_consult_cache_identity():
 
 
 def test_record_contract_has_no_object_addresses():
+    from flashinfer.moe_ep.algo_knobs import (
+        FleetAlgoKnobAllocator,
+        HandleAlgoKnobUserStream,
+    )
+
     config = AutoConfig((SplitConfig(),))
     assert record_key(config) == record_key(AutoConfig((SplitConfig(),)))
     assert "0x" not in str(plain(config))
+    assert record_key(FleetAlgoKnobAllocator(torch_caching=True)) == record_key(
+        FleetAlgoKnobAllocator(torch_caching=True)
+    )
+    for knob in (
+        FleetAlgoKnobAllocator(alloc_fn=1, free_fn=2),
+        FleetAlgoKnobAllocator(context=3),
+        HandleAlgoKnobUserStream(4),
+    ):
+        with pytest.raises(ValueError, match="process-local"):
+            record_key(knob)
 
 
-def test_numerical_contract_distinguishes_activation_scaling():
+def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     import dataclasses
     from flashinfer.moe_ep import (
         FusedMoeKernelConfig,
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.modes.selection import numerical_contract
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.automatic import (
+        ep_tuning_contract,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+        Sm107BlockScaledMoeConfig,
+    )
+    from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
     from tests.moe_ep.test_fused_moe_weights import _nvfp4_moe_config
 
     cfg = _nvfp4_moe_config(
         num_experts=8, local_num_experts=4, offset=0, intermediate=256
     )
     split = SplitConfig(kernel=FusedMoeKernelConfig(cfg))
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6", raising=False)
     contract = numerical_contract(split, None, None)
+    native = Sm107BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=32,
+        num_topk=4,
+        hidden=256,
+        intermediate=256,
+        rank=0,
+        world_size=2,
+        quant_kind="nvfp4",
+        gate_up_clamp=contract["gate_up_clamp"],
+        apply_routing_weights_before_fc2=False,
+    )
+    backend = SimpleNamespace(_resolved_config=lambda _: native)
     prototype = SimpleNamespace(
         _kernel=SimpleNamespace(
-            ep_tuning_contract=lambda _: {"revision": 1, **contract}
+            ep_tuning_contract=lambda fleet: ep_tuning_contract(backend, fleet)
         )
     )
     mega = MegaConfig(Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 4))
     assert numerical_contract(mega, prototype, None) == contract
+    for overrides in (
+        {"apply_routing_weights_before_fc2": True},
+        {"combine_dtype": "nvfp4"},
+    ):
+        native = dataclasses.replace(native, **overrides)
+        assert numerical_contract(mega, prototype, None) != contract
+        native = dataclasses.replace(
+            native, apply_routing_weights_before_fc2=False, combine_dtype="bf16"
+        )
     split.kernel.moe_config = dataclasses.replace(
         cfg, quant=dataclasses.replace(cfg.quant, per_token_scale=True)
     )
     assert numerical_contract(split, None, None) != contract
+    per_token = numerical_contract(split, None, None)
+    split.kernel.moe_config = dataclasses.replace(
+        split.kernel.moe_config,
+        quant=dataclasses.replace(
+            split.kernel.moe_config.quant, nvfp4_4over6=NVFP44Over6Config()
+        ),
+    )
+    assert numerical_contract(split, None, None) != per_token
 
 
 def test_rank_local_expert_offset_does_not_change_common_configuration():
@@ -312,7 +393,7 @@ def test_split_intersects_tactics_and_backend_eligibility_across_ranks(
 
 
 def test_outer_selects_full_plan_and_replays_without_measurement():
-    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep import FleetParams, MoEEpTensors
     from flashinfer.moe_ep.core.selection import NAMESPACE
     from flashinfer.moe_ep.modes.auto_layer import _OuterProtocol
     from flashinfer.moe_ep.modes.mega_layer import MoEEpMegaLayer
@@ -328,6 +409,8 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
         def forward(self, tensors):
             return self.index, [9.0, 4.0][self.index]
 
+        warmup = forward
+
     tuner, c = AutoTuner.get(), LocalCollective()
     owner = Mock()
     ws = MoEEpAutoWorkspace(owner, FleetParams(8, 32, 256), [])
@@ -340,10 +423,15 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
         _environment=[{}],
         _mega_revisions=[{}],
         _failed_plans=[],
+        rejected_candidates={},
+        _numerical_contract={},
     )
     for prototype in layer._prototypes.values():
         prototype._kernel = Mock()
-    protocol = _OuterProtocol(layer, ws, SimpleNamespace(hidden_states=torch.empty(1)))
+    tensors = MoEEpTensors(
+        torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int64), torch.ones(2, 1)
+    )
+    protocol = _OuterProtocol(layer, ws, tensors)
     calls = []
     force_flags = []
 
@@ -364,8 +452,18 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
         assert result["candidate"] == 1
         assert not c.measured
         assert calls == [(1, {"kernel_variant": "inference", "knobs": {"tile": 1}})]
-        # An invalid record must not be installed as a fixed plan.
         key, record = next(iter(tuner.get_protocol_records(NAMESPACE).items()))
+        # The workspace bound stays fixed, but each live workload needs its
+        # own search. Neither workload may suppress the other's tuning.
+        protocol.tensors = MoEEpTensors(
+            tensors.hidden_states[:1], tensors.topk_ids[:1], tensors.topk_weights[:1]
+        )
+        tuner.choose_with_protocol(NAMESPACE, protocol)
+        assert c.measured == [0, 1]
+        assert len(tuner.get_protocol_records(NAMESPACE)) == 2
+        c.measured.clear()
+        protocol.tensors = tensors
+        # An invalid record must not be installed as a fixed plan.
         record["selected"] = {"wrong": True}
         tuner.publish_protocol_record(NAMESPACE, key, record, persist=False)
         tuner.choose_with_protocol(NAMESPACE, protocol)
@@ -409,6 +507,11 @@ def test_split_enumeration_normalizes_foreign_tactic_arrays():
     assert candidates[0]["runner"] == 3
     assert candidates[0]["tactics"] == [(8, 124)]
     assert plain(candidates)[0]["tactics"] == [[8, 124]]
+    layer._eligible_runners.side_effect = ValueError(
+        "num_tokens=1024 exceeds tune_max_num_tokens=512"
+    )
+    with pytest.raises(ValueError, match="tune_max_num_tokens=512"):
+        layer._tuning_candidates(None, None)
 
 
 def test_compute_op_skip_only_times_its_fallback():
@@ -425,6 +528,8 @@ def test_compute_op_skip_only_times_its_fallback():
 
 
 def test_optional_preparation_does_not_swallow_runtime_failures():
+    from flashinfer.moe_ep.core.selection import NoEligibleCandidate
+
     c = LocalCollective()
 
     def unsupported():
@@ -433,7 +538,8 @@ def test_optional_preparation_does_not_swallow_runtime_failures():
     def failed():
         raise RuntimeError("device failure")
 
-    assert c.prepare(unsupported, optional=True) is None
+    with pytest.raises(NoEligibleCandidate, match="unsupported capacity"):
+        c.prepare(unsupported, optional=True)
     with pytest.raises(RuntimeError, match="device failure"):
         c.prepare(failed, optional=True)
 
@@ -474,22 +580,35 @@ def test_ineligible_split_plan_is_skipped_before_discovery_forward(monkeypatch):
     monkeypatch.setattr(selection, "Collective", lambda _: c)
     plan = object.__new__(selection.SplitPlan)
     plan.output = torch.empty(1)
+    plan.context = None
     plan.layer = SimpleNamespace(
         _bootstrap=object(),
+        _uses_communication=lambda: True,
+        stage_hook=None,
         create_graph_state=Mock(side_effect=ValueError("cannot be captured")),
         _forward_prepared=Mock(),
     )
     monkeypatch.setattr(auto_layer, "SplitPlan", Mock(return_value=plan))
     plan.destroy = Mock()
     layer = SimpleNamespace(
-        _prototypes={0: Mock(spec=MoEEpSplitLayer)}, _failed_plans=[], _collective=c
+        _prototypes={0: Mock(spec=MoEEpSplitLayer)},
+        _failed_plans=[],
+        _collective=c,
+        rejected_candidates={},
     )
     tensors = MoEEpTensors(torch.empty(1, 8), torch.zeros(1, 1), torch.ones(1, 1))
-    protocol = auto_layer._OuterProtocol(layer, SimpleNamespace(fleet=None), tensors)
+    protocol = auto_layer._OuterProtocol(
+        layer, SimpleNamespace(fleet=None, row_bound=1), tensors
+    )
     assert protocol._new_plan(0) is None
+    assert "cannot be captured" in layer.rejected_candidates[0]
     plan.layer._forward_prepared.assert_not_called()
     plan.destroy.assert_called_once()
     assert not layer._failed_plans
+    # A fresh plan can recover from an ineligible cached tactic/profile.
+    plan.layer.create_graph_state = Mock()
+    assert protocol._new_plan(0) is plan
+    assert not layer.rejected_candidates
 
 
 def test_failed_split_initialization_releases_its_runtime(monkeypatch):
@@ -525,6 +644,127 @@ def test_workspace_rejects_inputs_on_another_device():
     )
     with pytest.raises(ValueError, match="layer's CUDA device"):
         MoEEpAutoLayer._validate_device(layer, t)
+
+
+def test_workspace_bound_preserves_live_workload_and_other_layouts():
+    import dataclasses
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.modes.auto_layer import MoEEpAutoLayer, _signature
+
+    t = MoEEpTensors(
+        torch.empty(8, 16, dtype=torch.bfloat16),
+        torch.empty(8, 4, dtype=torch.int64),
+        torch.empty(8, 4),
+        runtime_max_tokens_per_rank=8,
+    )
+    short = dataclasses.replace(
+        t,
+        hidden_states=t.hidden_states[:1],
+        topk_ids=t.topk_ids[:1],
+        topk_weights=t.topk_weights[:1],
+    )
+    assert _signature(t, 8) == _signature(short, 8)
+    assert _signature(t) != _signature(short)
+    assert _signature(t, 8) != _signature(
+        dataclasses.replace(t, topk_ids=t.topk_ids.int()), 8
+    )
+    assert _signature(t, 8) != _signature(
+        dataclasses.replace(t, runtime_max_tokens_per_rank=None), 8
+    )
+
+    class Layer:
+        _destroyed = False
+        _device = torch.device("cpu")
+        _validate_device = MoEEpAutoLayer._validate_device
+
+    layer = Layer()
+    workspace = MoEEpAutoWorkspace(layer, None, _signature(t, 8), row_bound=8)
+    MoEEpAutoLayer._check(layer, short, workspace)
+    with pytest.raises(ValueError, match="profile changed"):
+        MoEEpAutoLayer._check(
+            layer, dataclasses.replace(short, topk_ids=t.topk_ids), workspace
+        )
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dsl_available", [False, True])
+def test_split_fixed_rows_stage_and_mask_each_tail(
+    monkeypatch, ids_dtype, dsl_available
+):
+    from flashinfer import cute_dsl
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.modes.selection import SplitPlan
+    from flashinfer.moe_ep.core import bf16_stage
+
+    monkeypatch.setattr(bf16_stage, "fused_bf16_stage", lambda *a: False)
+    monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", lambda: dsl_available)
+    plan = object.__new__(SplitPlan)
+    plan.output = torch.empty(8, 16, dtype=torch.bfloat16)
+    plan.layer = SimpleNamespace(_uses_communication=lambda: False)
+    plan._staging = None
+    full = MoEEpTensors(
+        torch.arange(128).reshape(8, 16).to(torch.bfloat16),
+        torch.arange(32).reshape(8, 4).to(ids_dtype),
+        torch.ones(8, 4),
+    )
+    assert plan._stage(full) is full
+    staged = plan._stage(full, force=True)
+    for live in (1, 7, 0, 8, 2):
+        short = MoEEpTensors(
+            full.hidden_states[:live], full.topk_ids[:live], full.topk_weights[:live]
+        )
+        result = plan._stage(short)
+        assert result.num_tokens == 8
+        assert result.topk_ids.dtype == ids_dtype
+        torch.testing.assert_close(result.hidden_states[:live], short.hidden_states)
+        torch.testing.assert_close(result.topk_ids[:live], short.topk_ids)
+        torch.testing.assert_close(result.topk_weights[:live], short.topk_weights)
+        if live < 8:
+            assert result is staged
+            assert (result.topk_ids[live:] == -1).all()
+    plan.layer._uses_communication = lambda: True
+    assert plan._stage(short) is short
+
+
+def test_shared_stager_does_not_bootstrap_a_kernel_package():
+    import subprocess
+    import sys
+    import textwrap
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+                import sys
+                import types
+                import torch
+                from flashinfer import cute_dsl, moe_ep
+
+                other = types.ModuleType("common")
+                other.__file__ = "/another_kernel/common.py"
+                sys.modules["common"] = other
+                from flashinfer.moe_ep.modes.selection import SplitPlan
+
+                cute_dsl.is_cute_dsl_available = lambda: True
+                plan = object.__new__(SplitPlan)
+                plan._staging = None
+                plan.output = torch.empty(4, 8, dtype=torch.bfloat16)
+                plan.layer = types.SimpleNamespace(_uses_communication=lambda: False)
+                tensors = moe_ep.MoEEpTensors(
+                    torch.ones(1, 8, dtype=torch.bfloat16),
+                    torch.zeros(1, 1, dtype=torch.int32), torch.ones(1, 1),
+                )
+                staged = plan._stage(tensors)
+                assert (staged.topk_ids[1:] == -1).all()
+                assert "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" not in sys.modules
+                assert sys.modules["common"] is other
+            """),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_direct_split_rejects_zero_runtime_capacity_for_empty_batch(monkeypatch):
@@ -572,7 +812,7 @@ def test_fixed_mega_preparation_is_coordinated_before_launch(monkeypatch, peer_f
     ]
     monkeypatch.setattr(selection, "Collective", lambda bootstrap: collective)
     plan = object.__new__(selection.MegaPlan)
-    plan.output = object()
+    plan.output = torch.empty(8, 4)
     plan.layer = SimpleNamespace(
         _bootstrap=object(),
         _workspace=object(),
@@ -582,7 +822,7 @@ def test_fixed_mega_preparation_is_coordinated_before_launch(monkeypatch, peer_f
         stage_inputs=lambda t: events.append("stage"),
         compute_staged=lambda **kwargs: events.append("launch"),
     )
-    tensors = SimpleNamespace(output=None)
+    tensors = SimpleNamespace(output=None, num_tokens=3)
     if peer_failure:
         with pytest.raises(RuntimeError, match="peer compilation failed"):
             plan.prepare(tensors)

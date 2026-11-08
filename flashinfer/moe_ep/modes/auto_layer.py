@@ -67,12 +67,18 @@ def _aliases_input(t):
     )
 
 
-def _signature(t):
+def _signature(t, row_bound=None):
+    def layout(value):
+        result = tensor_layout(value)
+        if result is not None and row_bound is not None:
+            result[1][0] = row_bound
+        return result
+
     return [
-        tensor_layout(t.hidden_states),
-        tensor_layout(t.topk_ids),
-        tensor_layout(t.topk_weights),
-        tensor_layout(t.output),
+        layout(t.hidden_states),
+        layout(t.topk_ids),
+        layout(t.topk_weights),
+        layout(t.output),
         t.runtime_max_tokens_per_rank,
         _aliases_input(t),
         [
@@ -115,14 +121,16 @@ class MoEEpAutoWorkspace:
     """A prepared input profile and its selected EP plan.
 
     Later selection retains storage referenced by earlier captures. Destroy this
-    handle collectively only after retiring every graph that used it. Handles
-    for different capacities or input shapes have independent lifetimes.
+    handle collectively only after retiring every graph that used it. Live row
+    counts may vary within the prepared bound; other input layouts stay fixed.
     """
 
-    def __init__(self, layer, fleet, signature):
+    def __init__(self, layer, fleet, signature, *, row_bound=None):
         self._owner = weakref.ref(layer)
         self.fleet = fleet
         self.signature = signature
+        self.row_bound = row_bound
+        self._tuned_rows = None
         self._state = AutoTuningState()
         self._plan = None
         self._retained = []
@@ -167,10 +175,11 @@ class MoEEpAutoLayer(nn.Module):
 
     Call ``warmup`` collectively in ``autotune_v2()`` before capture. A disabled
     context loads a compatible plan or prepares the first eligible candidate's
-    fallback. Prepare a separate workspace for each input shape and capacity;
-    ordinary serving performs no selector collectives. Changed routing values
-    do not trigger tuning. Explicit workspaces let the caller release old
-    captures and their storage independently.
+    fallback. A workspace accepts live row counts up to its agreed
+    ``runtime_max_tokens_per_rank``, or capacity when that hint is omitted.
+    Ordinary serving reuses its plan without selector collectives. An enabled
+    tuning context selects again for a changed live workload. Explicit
+    workspaces let the caller release old captures and their storage independently.
     """
 
     def __init__(
@@ -387,7 +396,7 @@ class MoEEpAutoLayer(nn.Module):
     def create_workspace(
         self, tensors: MoEEpTensors, *, max_tokens_per_rank: int | None = None
     ) -> MoEEpAutoWorkspace:
-        """Collectively prepare one shape, using the current v2 tuning controls."""
+        """Collectively prepare a row bound using the current v2 tuning controls."""
         if self._destroyed or torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Create EP workspaces on a live layer before capture")
         fleet = dataclasses.replace(
@@ -400,7 +409,15 @@ class MoEEpAutoLayer(nn.Module):
         )
         self._collective.agree(plain(fleet), "workspace capacity and layout")
         self._collective.prepare(lambda: self._validate(tensors, fleet))
-        workspace = MoEEpAutoWorkspace(self, fleet, _signature(tensors))
+        row_bound = (
+            fleet.max_tokens_per_rank
+            if tensors.runtime_max_tokens_per_rank is None
+            else tensors.runtime_max_tokens_per_rank
+        )
+        self._collective.agree(row_bound, "workspace row bound")
+        workspace = MoEEpAutoWorkspace(
+            self, fleet, _signature(tensors, row_bound), row_bound=row_bound
+        )
         try:
             self._select(tensors, workspace)
         except Exception:
@@ -415,7 +432,15 @@ class MoEEpAutoLayer(nn.Module):
         if self._destroyed or workspace._destroyed or workspace._owner() is not self:
             raise RuntimeError("EP workspace does not belong to this live layer")
         self._validate_device(tensors)
-        if _signature(tensors) != workspace.signature:
+        if (
+            tensors.hidden_states.ndim != 2
+            or tensors.num_tokens > workspace.row_bound
+            or any(
+                value is not None and value.shape[:1] != tensors.hidden_states.shape[:1]
+                for value in (tensors.topk_ids, tensors.topk_weights, tensors.output)
+            )
+            or _signature(tensors, workspace.row_bound) != workspace.signature
+        ):
             raise ValueError(
                 "Input profile changed; collectively prepare another EP workspace"
             )
@@ -431,7 +456,13 @@ class MoEEpAutoLayer(nn.Module):
             if (
                 workspace._plan is None
                 or state.cache_identity != identity
-                or (context.tuning_enabled and state.tuned_identity != identity)
+                or (
+                    context.tuning_enabled
+                    and (
+                        state.tuned_identity != identity
+                        or workspace._tuned_rows != tensors.num_tokens
+                    )
+                )
             ):
                 raise RuntimeError(
                     "Warm up EP selection under these controls before capture"
@@ -441,7 +472,13 @@ class MoEEpAutoLayer(nn.Module):
         pending = (
             workspace._plan is None
             or state.cache_identity != identity
-            or (context.tuning_enabled and state.tuned_identity != identity)
+            or (
+                context.tuning_enabled
+                and (
+                    state.tuned_identity != identity
+                    or workspace._tuned_rows != tensors.num_tokens
+                )
+            )
             or (
                 state.winner is None and state.lookup_scope != (context.scope, identity)
             )
@@ -463,6 +500,10 @@ class MoEEpAutoLayer(nn.Module):
         """Prepare and execute a profile collectively, outside graph capture."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EP warmup must happen before capture")
+        if workspace is not None or self._default is not None:
+            self._collective.prepare(
+                lambda: self._check(tensors, workspace or self._default)
+            )
         self.forward(tensors, workspace=workspace)
         torch.cuda.synchronize()
 
@@ -527,8 +568,26 @@ class _OuterProtocol:
         self.c = layer._collective
 
     def _new_plan(self, index, *, selected=None, fallback=False, force_tune=False):
+        try:
+            plan = self._prepare_plan(
+                index, selected=selected, fallback=fallback, force_tune=force_tune
+            )
+        except NoEligibleCandidate as exc:
+            self.layer.rejected_candidates[index] = str(exc)
+            return None
+        self.layer.rejected_candidates.pop(index, None)
+        return plan
+
+    def _prepare_plan(self, index, *, selected=None, fallback=False, force_tune=False):
         prototype, t = self.layer._prototypes[index], self.tensors
-        output = torch.empty_like(t.hidden_states)
+        output = self.c.prepare(
+            lambda: torch.empty(
+                self.workspace.row_bound,
+                t.hidden_states.shape[1],
+                dtype=t.hidden_states.dtype,
+                device=t.hidden_states.device,
+            )
+        )
         if isinstance(prototype, MoEEpMegaLayer):
             plan = self.c.prepare(
                 lambda: MegaPlan(
@@ -540,8 +599,6 @@ class _OuterProtocol:
                 ),
                 optional=True,
             )
-            if plan is None:
-                return None
             try:
                 plan.prepare(t, force_tune=force_tune)
                 if selected is None:
@@ -566,12 +623,10 @@ class _OuterProtocol:
                 lambda: SplitPlan(prototype, self.workspace.fleet, output, t),
                 optional=True,
             )
-            if plan is None:
-                return None
             try:
                 plan.discover(t)
                 if selected is not None:
-                    choices = self.c.prepare(plan.enumerate)
+                    choices = self.c.prepare(plan.enumerate, optional=True)
                     tuner = AutoTuner.get()
                     valid = any(
                         v["runner"] == selected[0]
@@ -590,13 +645,14 @@ class _OuterProtocol:
                         for v in choices
                     )
                     if not all(self.c.gather(valid)):
-                        plan.destroy()
-                        return None
+                        raise NoEligibleCandidate(
+                            "The cached split runner or tactic is not eligible for this profile"
+                        )
                     self.c.prepare(lambda: plan.prepare(selected))
                     plan.warmup(t)
             except NoEligibleCandidate:
                 plan.destroy()
-                return None
+                raise
             except Exception:
                 self.layer._failed_plans.append(plan)
                 raise
@@ -610,6 +666,11 @@ class _OuterProtocol:
                 "EP selection uses explicit workspace profiles, not tuning_buckets or round_up"
             )
         layer, ws, c = self.layer, self.workspace, self.c
+        layer.rejected_candidates = {
+            index: reason
+            for index, reason in layer.rejected_candidates.items()
+            if index not in layer._prototypes
+        }
         settings = measurement_settings(context)
         c.agree(settings, "measurement policy")
         c.agree(sorted(context.tuner._effective_skip_ops), "skip_ops")
@@ -621,7 +682,9 @@ class _OuterProtocol:
                 "eligible": list(layer._prototypes),
                 "fleet": ws.fleet,
                 "fleet_knobs": layer._fleet_knobs,
-                "inputs": c.gather(ws.signature),
+                "inputs": c.gather(_signature(self.tensors)),
+                "workspace": c.gather(ws.signature),
+                "numerical": layer._numerical_contract,
                 "environment": layer._environment,
                 "implementations": layer._mega_revisions,
                 "measurement": settings,
@@ -708,7 +771,8 @@ class _OuterProtocol:
                                     ),
                                     force_tune=context.force_tune,
                                 )
-                            except NoEligibleCandidate:
+                            except NoEligibleCandidate as exc:
+                                layer.rejected_candidates[index] = str(exc)
                                 continue
                             selected = result["selection"]
                         else:
@@ -728,7 +792,8 @@ class _OuterProtocol:
                                 settings,
                                 warmup=lambda: trial.warmup(self.tensors),
                             )
-                        except CaptureUnsupported:
+                        except CaptureUnsupported as exc:
+                            layer.rejected_candidates[index] = str(exc)
                             continue
                         measured += 1
                         if winner is None or entry["p50_us"] < winner["p50_us"]:
@@ -741,7 +806,9 @@ class _OuterProtocol:
                         if not keep_trial and not failed:
                             trial.destroy()
                 if winner is None:
-                    raise RuntimeError("No EP candidate completed measurement")
+                    raise RuntimeError(
+                        f"No EP candidate completed measurement: {layer.rejected_candidates}"
+                    )
                 if plan is None:
                     plan = self._new_plan(
                         winner["candidate"], selected=winner["selected"]
@@ -766,6 +833,7 @@ class _OuterProtocol:
             identity if context.tuning_enabled else None,
         )
         ws._state.lookup_scope = (context.scope, identity)
+        ws._tuned_rows = self.tensors.num_tokens if context.tuning_enabled else None
         return TuningResult(
             ws._selection,
             cache_hit=cached is not None,

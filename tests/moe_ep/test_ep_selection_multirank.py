@@ -236,8 +236,7 @@ def test_search_replay_and_captured_lifetime(
             topk_ids=t.topk_ids[:-1],
             topk_weights=t.topk_weights[:-1],
         )
-        with pytest.raises(ValueError, match="profile changed"):
-            layer(shorter)
+        assert_output(layer(shorter), shorter, global_weights)
         # Rank-local invalidation is reconciled during the next collective warmup.
         with autotune_v2(mode="replay", **options):
             if bootstrap.rank == 0:
@@ -506,5 +505,168 @@ def test_rank_local_split_preparation_failure(
             layer.warmup(t)
         assert not layer._workspaces
     finally:
+        torch.cuda.synchronize()
+        layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "transport,runtime_bound",
+    [("mega", 16), ("nvlink", 16), ("nccl", 16), ("nccl", None), ("nixl", 16)],
+)
+def test_asymmetric_live_rows_reuse_bound_and_keep_captured_plans(
+    rubin_bootstrap,  # noqa: F811
+    monkeypatch,
+    tmp_path,
+    transport,
+    runtime_bound,
+):
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+
+    bootstrap = rubin_bootstrap
+    monkeypatch.setattr(problem, "INTERMEDIATE", 384)
+    monkeypatch.setattr(problem, "HIDDEN", 4096)
+    if transport in ("nccl", "nixl"):
+        available = moe_ep.have_nccl_ep if transport == "nccl" else moe_ep.have_nixl_ep
+        if not available():
+            pytest.skip(f"requires {transport}-EP")
+    fleet, weights, config, t, global_weights = inputs_and_config(bootstrap)
+    candidate = config.candidates[transport != "mega"]
+    if transport == "mega":
+        candidate = dataclasses.replace(
+            candidate,
+            megakernel=dataclasses.replace(
+                candidate.megakernel, knobs=None, kernel_variant="inference"
+            ),
+        )
+    enumerate_tactics = FusedMoeSplitKernelBackend.tuning_candidates
+
+    def one_tactic_per_backend(backend, context):
+        # This regression checks changing rows and storage lifetime. The
+        # complete search is covered by test_search_replay_and_captured_lifetime.
+        return [
+            {**choice, "tactics": choice["tactics"][:1]}
+            for choice in enumerate_tactics(backend, context)
+        ]
+
+    monkeypatch.setattr(
+        FusedMoeSplitKernelBackend, "tuning_candidates", one_tactic_per_backend
+    )
+    if transport in ("nccl", "nixl"):
+        candidate = dataclasses.replace(
+            candidate,
+            comm=moe_ep.NcclEpConfig() if transport == "nccl" else moe_ep.NvepConfig(),
+        )
+    if transport == "nixl":
+        fleet = dataclasses.replace(fleet, layout=moe_ep.EpLayout.EXPERT_MAJOR)
+        cfg = candidate.kernel.moe_config
+        candidate = dataclasses.replace(
+            candidate,
+            kernel=dataclasses.replace(
+                candidate.kernel,
+                moe_config=dataclasses.replace(
+                    cfg,
+                    execution=dataclasses.replace(
+                        cfg.execution,
+                        tune_max_num_tokens=fleet.max_tokens_per_rank
+                        * bootstrap.world_size
+                        * problem.TOP_K,
+                    ),
+                ),
+            ),
+        )
+    bound = runtime_bound or fleet.max_tokens_per_rank
+    # Start at the bound so a later partial batch must switch from direct
+    # execution to staging without preparing a new transport handle.
+    repeats = (bound + t.num_tokens - 1) // t.num_tokens
+    t = dataclasses.replace(
+        t,
+        hidden_states=t.hidden_states.repeat(repeats, 1)[:bound].contiguous(),
+        topk_ids=t.topk_ids.repeat(repeats, 1)[:bound].contiguous(),
+        topk_weights=t.topk_weights.repeat(repeats, 1)[:bound].contiguous(),
+        runtime_max_tokens_per_rank=runtime_bound,
+    )
+    if transport == "nixl":
+        t.topk_ids = t.topk_ids.int()
+    output = torch.empty(
+        bound, problem.HIDDEN * 2, device="cuda", dtype=torch.bfloat16
+    )[:, ::2]
+    t.output = output
+    config = moe_ep.AutoConfig((candidate,))
+    options = dict(cache_root=str(tmp_path / "rows"))
+    AutoTuner.get().clear_cache()
+    layer = moe_ep.MoEEpLayer(bootstrap, fleet, weights, backend=config)
+    graphs = []
+    try:
+        with autotune_v2(**options):
+            layer.warmup(t)
+        layer.warmup(t)
+        original = layer._default._plan
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            full_output = layer(t)
+        graphs.append(graph)
+        for rows in (1, 0, bound):
+            live = rows if bootstrap.rank == bootstrap.world_size - 1 else bound
+            short = dataclasses.replace(
+                t,
+                hidden_states=t.hidden_states[:live],
+                topk_ids=t.topk_ids[:live],
+                topk_weights=t.topk_weights[:live],
+                output=output[:live],
+            )
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    layer._collective,
+                    "gather",
+                    lambda *a: pytest.fail("serving collective"),
+                )
+                result = layer(short)
+            assert result.shape == short.hidden_states.shape
+            assert_output(result, short, global_weights)
+            short_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(short_graph):
+                captured = layer(short)
+            graphs.append(short_graph)
+            captured.fill_(float("nan"))
+            short_graph.replay()
+            torch.cuda.synchronize()
+            assert_output(captured, short, global_weights)
+        # Only one rank changes its tuning workload. Every rank must reselect,
+        # using a distinct record and fresh storage for the captured plan.
+        live = 1 if bootstrap.rank == bootstrap.world_size - 1 else bound
+        short = dataclasses.replace(
+            t,
+            hidden_states=t.hidden_states[:live],
+            topk_ids=t.topk_ids[:live],
+            topk_weights=t.topk_weights[:live],
+            output=output[:live],
+        )
+        with autotune_v2(**options):
+            layer.warmup(short)
+            assert_output(layer(short), short, global_weights)
+        assert original in layer._default._retained
+        if bootstrap.rank == 0:
+            assert len(AutoTuner.get().get_protocol_records(NAMESPACE)) == 2
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_output(full_output, t, global_weights)
+        invalid = dataclasses.replace(
+            t,
+            topk_ids=(
+                t.topk_ids.float()
+                if bootstrap.rank == bootstrap.world_size - 1
+                else t.topk_ids
+            ),
+        )
+        with pytest.raises(RuntimeError, match="profile changed"):
+            layer.warmup(invalid)
+        assert_output(layer(t), t, global_weights)
+    finally:
+        for graph in graphs:
+            graph.reset()
         torch.cuda.synchronize()
         layer.destroy()
