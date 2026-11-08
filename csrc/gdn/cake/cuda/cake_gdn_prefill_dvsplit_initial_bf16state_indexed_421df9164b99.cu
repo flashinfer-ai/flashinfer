@@ -2883,7 +2883,7 @@ kernel_cake_gdn_ca7d3d8b4ed1ef4fc81c(const __grid_constant__ CUtensorMap Q, cons
                             }
                         }
                     }
-                    mbarrier_arrive(kv_acc_empty_addr);
+                    if (USE_INITIAL_STATE == 0) { mbarrier_arrive(kv_acc_empty_addr); }
                 }
                 if (STORE_FINAL_STATE != 0 && USE_INITIAL_STATE != 0 && num_chunks_b_1 == 0 && ((state_slot_raw_cg1 >= 0 && (long long)state_slot_raw_cg1 < initial_state_size_p0 && (long long)state_slot_raw_cg1 < output_state_size_p0) ? 1 : 0) != 0) {
                     int warp_id_in_role_3 = (warp - 4);
@@ -3330,7 +3330,7 @@ kernel_cake_gdn_ca7d3d8b4ed1ef4fc81c(const __grid_constant__ CUtensorMap Q, cons
             unsigned int q_state_acc_mma_stage = 0;
             unsigned int q_state_acc_mma_phase = 1;
             unsigned int kv_acc_mma_stage = 0;
-            unsigned int kv_acc_mma_phase = 1;
+            unsigned int kv_acc_mma_phase = ((USE_INITIAL_STATE == 0) ? 1 : 0);
             int kv_acc_release_pending = 1;
             unsigned int _phase_state_inp_ready_0 = 0;
             unsigned int _phase_cg1_shared_acc_empty_0 = 1;
@@ -3357,7 +3357,7 @@ kernel_cake_gdn_ca7d3d8b4ed1ef4fc81c(const __grid_constant__ CUtensorMap Q, cons
                 int num_chunks_b_4 = num_pairs_b_4 * 2;
                 int active_chunks_b_1 = (((SINGLE_CHUNK_NO_STATE & (int)(num_chunks_b_4 > 0)) != 0) ? 1 : num_chunks_b_4);
                 if (active_chunks_b_1 > 0) {
-                    if (kv_acc_release_pending == 1) {
+                    if (USE_INITIAL_STATE == 0 && kv_acc_release_pending == 1) {
                         mbarrier_wait(kv_acc_empty_addr + (kv_acc_mma_stage) * 8, kv_acc_mma_phase);
                         kv_acc_mma_phase ^= 1;
                     }
