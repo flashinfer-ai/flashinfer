@@ -37,9 +37,9 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish (no row of the shipped tables: only a caller's explicit
-  ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts, and one 148-SM sm_100a row that
-  runs two splits) add four splits in the fixed mirror order or run two chains of one split, the one-split rows store
-  whole tiles, and the rows of
+  ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts, and one 148-SM sm_100a BF16 row)
+  add four splits in the fixed mirror order or run two or four chains of one split, the one-split rows store whole
+  tiles, and the rows of
   :data:`K1_WGRAD_DET_RULES_BY_SM` run another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
   ``sm_100a``, 152-SM ``sm_103a`` and 212-SM ``sm_107a`` parts, in that table's token ranges; the odd numbers of K
@@ -944,8 +944,8 @@ K1_CHAIN_RANGES_BY_SM: dict[
 #: 3.54e-6); from 1024 tokens up, where the deterministic program adds the halves of an output's token reduction in two
 #: partials, that error was 2.10 to 2.38 times the deterministic program's (reported, not a rule), and at 256 to 800
 #: tokens the same.  The protocol, the measured token counts and the times are in the 152-SM one-split table of the
-#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs two splits of 256-wide tiles there instead
-#: (:data:`K1_ORDERED_RANGES_BY_SM`): one split missed the accuracy check on mirrored cancelling inputs.
+#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs one split of two chains of 256-wide tiles there
+#: instead (:data:`K1_ORDERED_RANGES_BY_SM`): one chain missed the accuracy check on mirrored cancelling inputs.
 # fmt: off
 K1_ONE_SPLIT_RANGES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, int], ...]]
@@ -1156,20 +1156,19 @@ K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
 #: ``4096 -> 1024`` and 0.60 times at ``5120 -> 1024``), the same bits on 200 repeats; four chains took 1.005 to 1.010
 #: times the three-chain program's time, two chains 0.999 to 1.000 times the time of the former route of their row
 #: (three chains, or the deterministic program at ``5120 -> 512``).  On 148-SM sm_100a parts the BF16 weight gradient
-#: ``4096 -> 1024`` runs two splits of 256-wide tiles (one add of two partials, the same bits on every run) from 16172
-#: to 16384 tokens: its former route, one split of one chain, missed the check on mirrored cancelling inputs at every
-#: token count of that window (1.87 to 1.95 times the reference's error, and 1.38 to 1.39 times on the permuted ones).
-#: Measured on a B200 part at 16172, 16231, 16256, 16300 and 16384 tokens: two splits met all six kinds (at most 1.08
-#: times the reference's error; the reference's own error at the even block counts) and repeated bit for bit; they took
-#: 96.5 to 97.5 us, 1.108 to 1.116 times one split's time and 0.80 to 0.93 times the deterministic program's (103.8 to
-#: 122.2 us), which also met the check.
+#: ``4096 -> 1024`` runs one split of two chains of 256-wide tiles from 16172 to 16384 tokens: 64 tiles, one wave of 128
+#: CTAs, and the bits of two splits of one chain (the same two K ranges, one addition), the same on every run.  Its
+#: former route, one split of one chain, missed the check on mirrored cancelling inputs at every token count of that
+#: window (1.87 to 1.95 times the reference's error, and 1.38 to 1.39 times on the permuted ones); two splits met all
+#: six kinds there (at most 1.08 times the reference's error; the reference's own error at the even block counts) but
+#: took 1.108 to 1.116 times one split's time, in a second wave of CTAs.
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int, int, str]], ...]],
 ] = {
     ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 2, 1, "arrival")),),
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 1, 2, "arrival")),),
     },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),

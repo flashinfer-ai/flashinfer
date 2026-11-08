@@ -3136,8 +3136,9 @@ def test_k1_chain_programs_are_registered():
     """The chain programs ship on the architectures of their one-chain programs: the three-chain 128-wide and 256-wide
     FP32 transposed-store programs on sm_100a, sm_103a and sm_107a, the three-chain 192-wide FP32 row-major-store
     program on sm_107a, and for :data:`K1_ORDERED_RANGES_BY_SM` on sm_107a the two- and four-chain 192-wide row-major
-    and 256-wide transposed-store programs and the two-chain 128-wide one; each is the one-chain program's build with
-    ``chains`` set (``split_order`` at its default, "arrival", whether the record names it or not)."""
+    and 256-wide transposed-store FP32 programs and the two-chain 128-wide one, on sm_100a the two-chain 256-wide
+    transposed-store BF16 program; each is the one-chain program's build with ``chains`` set (``split_order`` at its
+    default, "arrival", whether the record names it or not)."""
     want = {
         "dense_proj_gemm_atomic_nn_n128_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
@@ -3147,6 +3148,7 @@ def test_k1_chain_programs_are_registered():
         "dense_proj_gemm_atomic_nn_n256_f32_t_c2": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n192_f32_c4": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c4": ("sm_107a",),
+        "dense_proj_gemm_atomic_nn_n256_t_c2": ("sm_100a",),
     }
     got = {}
     for arch, kernels in cake_jit.KERNELS.items():
@@ -6345,7 +6347,7 @@ _KB_PARITY_RANGES = (
 )
 K1_ORDERED_ROWS = {
     ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 2, 1, "arrival")),),
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 1, 2, "arrival")),),
     },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
@@ -6438,7 +6440,8 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
     """A token count of :data:`K1_ORDERED_RANGES_BY_SM` plans its program (``split_order``, the template's suffix, the
     split and chain counts; the split workspace with more than one split) in place of the split tables' choice, a plan
     that repeats (four splits in the mirror order, or one split of two or four chains, by the parity of the K-block
-    count); one token outside the ranges keeps that choice."""
+    count on 212-SM sm_107a; two chains at either parity on 148-SM sm_100a); one token outside the ranges keeps that
+    choice."""
     arch = "sm_107a"
     _register_k1(monkeypatch, arch)
     kw = dict(transposed_out=True, arch=arch, sm_count=212)
@@ -6484,6 +6487,22 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
             again.chains,
             again.split_order,
         ) == (plan.template, plan.block_n, plan.splits, plan.chains, plan.split_order)
+    # 148-SM sm_100a: BF16 4096 -> 1024 runs one split of two chains at either K-block parity
+    _register_k1(monkeypatch, "sm_100a")
+    kw100 = dict(transposed_out=True, arch="sm_100a", sm_count=148)
+    for T in (16172, 16231, 16300, 16384):
+        X, G, out = operands(T, 4096, 1024)
+        plan, *_, reason = cake_backend.plan_atomic_gemm(
+            X, G, out.to(torch.bfloat16), **kw100
+        )
+        assert plan is not None and reason == "", (T, reason)
+        assert (plan.template, plan.splits, plan.chains, plan.split_order) == (
+            "dense_proj_gemm_atomic_nn_n256_t_c2",
+            1,
+            2,
+            "arrival",
+        )
+        assert plan.reproducible and not plan.workspace
     # outside the ranges: the split tables' choice
     for d_in, d_out, T in (
         (4096, 32, 16171),
@@ -13970,8 +13989,8 @@ K1_WGRAD_CHANGED_ROWS = {
         (4096, 48, "f32", 16231): ("dsm", 32, 2), (4096, 48, "f32", 16384): ("dsm", 32, 2),
         (4096, 64, "f32", 16172): ("dsm", 64, 4),
         (4096, 64, "f32", 16231): ("dsm", 32, 2), (4096, 64, "f32", 16384): ("dsm", 32, 2),
-        (4096, 1024, "bf16", 16172): ("ordered", 256, 2), (4096, 1024, "bf16", 16231): ("ordered", 256, 2),
-        (4096, 1024, "bf16", 16384): ("ordered", 256, 2),
+        (4096, 1024, "bf16", 16172): ("ordered", 256, 1), (4096, 1024, "bf16", 16231): ("ordered", 256, 1),
+        (4096, 1024, "bf16", 16384): ("ordered", 256, 1),
         (5120, 1024, "bf16", 16172): ("sk", 256, None), (5120, 1024, "bf16", 16231): ("sk", 256, None),
         (5120, 1024, "bf16", 16384): ("sk", 256, None), (5120, 1024, "f32", 16172): ("sk", 256, None),
         (5120, 1024, "f32", 16231): ("sk", 256, None), (5120, 1024, "f32", 16384): ("sk", 256, None),
