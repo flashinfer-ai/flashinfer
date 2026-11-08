@@ -462,6 +462,7 @@ def test_context_free_forward_arguments_are_checked_before_device_work(monkeypat
         MoKForward(False, context=1)
     functional = object.__new__(backend.MoKFunctional)
     functional.local_experts = 4
+    functional._validated = {}  # the weight-validation memo __init__ creates
     events = []
     monkeypatch.setattr(
         backend.MoKFunctional, "_inputs", staticmethod(lambda *args: (None, 256))
@@ -1327,7 +1328,8 @@ def test_launcher_geometry_memo_is_pure(tile, local_tokens, capacity, macro, exp
     """The memoised launch geometry of the MXFP8 launchers equals a fresh
     evaluation of the per-call arithmetic at training geometries and both tile
     widths, including the expert-dependent backward cluster and task counts; a
-    bounded memo clears and still serves correct values."""
+    full memo drops its least recently used entry and still serves correct
+    values."""
     hidden, intermediate, mini = 6144, 2048, 4096
     forward = kernels._forward_mxfp8_geometry(
         local_tokens, hidden, intermediate, capacity, macro, mini, tile
@@ -1349,9 +1351,14 @@ def test_launcher_geometry_memo_is_pure(tile, local_tokens, capacity, macro, exp
             assert (tuple(actual) if name.endswith("_div") else actual) == value, name
     cache = {}
     keys = [(i, tile) for i in range(kernels._GEOMETRY_LIMIT + 1)]
-    for key in keys:
+    for key in keys[:-1]:
         kernels._remember(cache, key, key[0])
-    assert len(cache) == 1 and cache[keys[-1]] == keys[-1][0]
+    # A hit refreshes keys[0]; keys[1] becomes the least recently used entry.
+    assert kernels._recall(cache, keys[0]) == 0
+    kernels._remember(cache, keys[-1], keys[-1][0])
+    assert len(cache) == kernels._GEOMETRY_LIMIT and keys[1] not in cache
+    assert all(cache[key] == key[0] for key in (keys[0], *keys[2:]))
+    assert kernels._recall(cache, keys[1]) is None
 
 
 def test_ffi_stream_context_follows_torch_current_stream():
