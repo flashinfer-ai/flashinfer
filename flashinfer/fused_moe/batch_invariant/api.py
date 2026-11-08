@@ -246,102 +246,6 @@ def grouped_gemm(
     return out
 
 
-GATHER_A_PRODUCER = "ldgsts"  # the gathering GEMM1's A producer when selected: 16-byte cp.async chunks, or the TMA's gather4 mode
-
-
-def grouped_gemm_gather(
-    x: torch.Tensor,
-    src: torch.Tensor,
-    k_div: int,
-    w: torch.Tensor,
-    counts: torch.Tensor,
-    config: Knobs,
-    chain: Union[str, GroupedChain] = "plain",
-    out_dtype: torch.dtype = torch.bfloat16,
-    Tk: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    a_producer: Optional[str] = None,
-) -> torch.Tensor:
-    """``out[p] = chain(x[src[p] // k_div] @ w[e(p)].T)`` for the expert segments ``counts``: :func:`grouped_gemm` with the
-    A rows gathered by the kernel from the unpermuted ``x [T, K]`` bf16 -- no permuted activation tensor, no gather launch;
-    ``src [Tk]`` int32 the slot of every expanded row (``permute_plan``); ``a_producer`` the kernel's A producer, ``ldgsts``
-    (16-byte cp.async chunks; the default ``GATHER_A_PRODUCER``) or ``gather4`` (the TMA). The same bits as
-    :func:`grouped_gemm` on the materialised permutation (the stage holds the same bytes; the fold is the same instruction
-    sequence)."""
-    from .blocks.compile import get_compiled_grouped
-
-    if (
-        x.dtype != torch.bfloat16
-        or w.dtype != torch.bfloat16
-        or x.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm_gather takes bf16 x [T, K] and w [E, N, K]")
-    T, K = x.shape
-    E, N, K2 = w.shape
-    src = src.reshape(-1)
-    Tk = src.shape[0] if Tk is None else Tk
-    if (
-        K != K2
-        or x.stride(1) != 1
-        or w.stride(2) != 1
-        or w.stride(1) != K
-        or x.stride(0) % 8
-        or w.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm_gather: K-contiguous, 16-byte-aligned operands of one K "
-            f"(x {tuple(x.shape)} strides {tuple(x.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
-        )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError("grouped_gemm_gather: counts must be a contiguous int32 [E]")
-    if (
-        src.dtype != torch.int32
-        or not src.is_contiguous()
-        or src.shape[0] < Tk
-        or k_div < 1
-    ):
-        raise ValueError(
-            "grouped_gemm_gather: src must be a contiguous int32 [Tk] and k_div >= 1"
-        )
-    if isinstance(chain, str):
-        if chain not in ("plain", "swiglu", "relu2"):
-            raise ValueError(f"unknown chain {chain!r}")
-        chain = GroupedChain.legacy(chain, _OUT[out_dtype])
-    n_out = N // 2 if chain.pair else N
-    out_dtype = _DTYPE_OF[chain.out_fmt]
-    if out is None:
-        out = torch.empty(Tk, n_out, dtype=out_dtype, device=x.device)
-    if (
-        tuple(out.shape) != (Tk, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % 8
-    ):
-        raise ValueError(
-            "grouped_gemm_gather: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
-        )
-    kernel = get_compiled_grouped(
-        config, chain, gather=True, a_producer=a_producer or GATHER_A_PRODUCER
-    )
-    if Tk == 0:
-        return out
-    kernel(
-        x,
-        src,
-        int(k_div),
-        w.permute(1, 2, 0),
-        out,
-        counts,
-        persistent_clusters(x.device, config),
-    )
-    return out
-
-
 def expert_bucket(E: int) -> int:
     return max(32, S.pow2ceil(E))
 
@@ -520,15 +424,11 @@ def fused_moe(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    gather: Union[bool, str] = False,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
     slot order in fp32 and converted once. ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space
-    gives the same bits; the dispatcher's pick by default). ``gather``: ``False`` (the default) materialises the
-    permutation (the gather launch, then :func:`grouped_gemm`); ``True`` or a producer name (``ldgsts`` / ``gather4``) makes
-    GEMM1 gather the tokens' rows itself (:func:`grouped_gemm_gather`: no gather launch, no permuted activation tensor), a
-    placement with the same bits that measured at parity at best."""
+    gives the same bits; the dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -572,26 +472,12 @@ def fused_moe(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    x_perm = None
-    if gather:
-        a = grouped_gemm_gather(
-            x,
-            src,
-            k,
-            w.w1i,
-            counts,
-            config1,
-            w.chain1,
-            Tk=Tk,
-            a_producer=gather if isinstance(gather, str) else None,
-        )  # [Tk, I] bf16 (GEMM1 gathers the tokens' rows)
-    else:
-        x_perm = torch.empty(Tk, H, dtype=torch.bfloat16, device=x.device)
-        if Tk:
-            get_compiled_gather(
-                k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
-            )(x, src, x_perm, Tk, H)
-        a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
+    x_perm = torch.empty(Tk, H, dtype=torch.bfloat16, device=x.device)
+    if Tk:
+        get_compiled_gather(
+            k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
+        )(x, src, x_perm, Tk, H)
+    a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
     y = grouped_gemm(a, w.w2, counts, config2, "plain", torch.bfloat16)  # [Tk, H] bf16
     if T:
         get_compiled_combine(
