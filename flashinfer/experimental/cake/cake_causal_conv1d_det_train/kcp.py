@@ -98,6 +98,10 @@ changes no collective; every rank of a group passes the same ``cooperative``
 value (one launch form per layer of the group, so that the ranks' ``dweight``
 partials come from one reduction order).
 
+The forward launches ``ctas_per_sm x (SM count - FWD_RESERVE_SMS)`` CTAs
+(:func:`_launch_grid`), so it also starts every CTA beside one small-carveout
+kernel of another stream; ``y`` does not depend on the grid.
+
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`CakeCausalConv1dDetKcpRecomputeHandle`, or any object
 with an ``entries`` dict) the original forward exchanges as always and stores
@@ -153,6 +157,11 @@ KCP_BWD_HEAD = "kcp_bwd_head"
 # its reduce program, which starts beside kernels resident on other streams; ``True`` = the cooperative ``kcp_bwd``
 # record, which waits for them (FlashInfer issue #8365).
 COOPERATIVE_DEFAULT = False
+# SMs of co-resident CTAs the forward (``kcp_fwd``) leaves free.  The forward record carries no ``reserve_sms`` (the
+# non-deterministic package's KCP forward runs the same record), so the rule is this host's (:func:`_launch_grid`): with
+# one small-carveout kernel of another stream resident on an SM (a communication kernel), no forward CTA waits for a
+# second wave.  ``y`` is formed per token in a fixed FMA order, so it does not depend on the grid.
+FWD_RESERVE_SMS = 1
 GRAPH_MODES = (
     "off",
     "replay",
@@ -169,9 +178,10 @@ def _launch_grid(
     C: int | None = None,
     S: int | None = None,
 ) -> tuple[int, int, int]:
-    """The record's launch grid (:func:`cake_jit.launch_grid`) less its ``grid_rule.reserve_sms`` SMs of co-resident CTAs.
+    """The record's launch grid (:func:`cake_jit.launch_grid`) less its reserved SMs of co-resident CTAs: the record's
+    ``grid_rule.reserve_sms``, else :data:`FWD_RESERVE_SMS` for the forward record, else none.
 
-    A backward record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
+    A record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
     another stream resident on an SM keeps the whole SM from hosting a CTA of this program (its shared memory needs the
     SM's large carveout), so a grid one SM short of the co-resident count still starts every CTA at once beside it
     (FlashInfer issue #8365).  The grid is a pure function of the device and the record, so the partial rows and the
@@ -181,7 +191,11 @@ def _launch_grid(
     """
 
     grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
-    reserve = int(record["grid_rule"].get("reserve_sms", 0))
+    reserve = int(
+        record["grid_rule"].get(
+            "reserve_sms", FWD_RESERVE_SMS if record.get("role") == KCP_FWD else 0
+        )
+    )
     if reserve:
         reserved = reserve * int(record["grid_rule"]["ctas_per_sm"])
         if grid[0] <= reserved:
@@ -897,7 +911,8 @@ def _kcp_forward(
     device_index = _device_index(device)
     record = _loader.MODULES[name]
     scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    if scalars["n_ch_tiles"] > _launch_grid(record, device_index=device_index)[0]:
+    grid = _launch_grid(record, device_index=device_index)
+    if scalars["n_ch_tiles"] > grid[0]:
         raise ValueError(
             f"C={C} spans more channel tiles than the forward's grid on this device holds"
         )
@@ -914,7 +929,8 @@ def _kcp_forward(
     }
     if work is not None:
         work.wait()
-    run_module(name, values, device_index=device_index)
+    # the grid of :func:`_launch_grid` (less :data:`FWD_RESERVE_SMS`), as on the trimmed host path
+    run_module(name, values, device_index=device_index, grid=grid)
     return y, hist
 
 

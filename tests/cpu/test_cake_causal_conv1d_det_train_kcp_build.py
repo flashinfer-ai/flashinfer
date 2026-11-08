@@ -315,3 +315,28 @@ def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
             1,
             1,
         )
+
+
+@pytest.mark.cpu_only
+def test_forward_launches_one_sm_short(monkeypatch) -> None:
+    """The forward record carries no ``reserve_sms`` (the non-deterministic package runs the same record); the host
+    launches it ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs wide (:func:`kcp._launch_grid`), one SM short of the
+    co-resident count, and the head program's grid is not touched."""
+
+    kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    assert kcp.FWD_RESERVE_SMS == 1
+    seen = set()
+    for name, (_m, _k, _a, role, _p, ctas_per_sm) in PROGRAMS.items():
+        if role != kcp.KCP_FWD:
+            continue
+        record = kcp_jit.MODULES[name]
+        assert "reserve_sms" not in record["grid_rule"]
+        full = (ctas_per_sm * 148, 1, 1)  # the co-resident grid of a 148-SM device
+        monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: full)
+        assert kcp._launch_grid(record, device_index=0) == (
+            ctas_per_sm * (148 - kcp.FWD_RESERVE_SMS),
+            1,
+            1,
+        )
+        seen.add(name)
+    assert seen, "no kcp_fwd program in the table"
