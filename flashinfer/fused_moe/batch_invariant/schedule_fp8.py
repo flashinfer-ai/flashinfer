@@ -14,9 +14,15 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 from ...gemm.batch_invariant.generator import Knobs
-from ...gemm.batch_invariant.schedule import rank_topk
 from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
-from .schedule import TOP_K, _grouped, active_experts, grouped_knobs, rows_per_expert
+from .schedule import (
+    TOP_K,
+    active_experts,
+    grouped_knobs,
+    pair_term,
+    raster_for,
+    rows_per_expert,
+)
 
 IN_FMT = "e4m3"
 
@@ -51,32 +57,54 @@ def rank_grouped_fp8(
     nominal: bool = False,
     n_active: Optional[int] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one fp8 GEMM: the dense fp8 ranking at ``(M = rows, N = n_active * N)`` mapped onto the
-    grouped space, in rank order, de-duplicated, at least ``k`` records when the space has them."""
+    """The ranked grouped records for one fp8 GEMM, as the bf16 backend's ``schedule.rank_grouped``: the grouped space the
+    fp8 body accepts for the weight shape and the chain, ordered by the dense fp8 class's estimate at ``(M = rows,
+    N = n_active * N, K)`` times the pair term, each tile family priced once at the enumeration's raster and the grouped
+    scheduler's structural raster first among its twins; at a decode-sized ``rows`` the dense dispatcher's structural guard
+    selects the candidates; each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
+    list: distinct records, at most ``k``, never empty for an implementable shape."""
+    import dataclasses
+
+    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
     from .blocks.fp8_compile import can_implement_grouped_fp8
 
+    fam = family or "sm_107"
+    dense_n = (n_active or E) * N
+    space = [c for c in grouped_knobs() if can_implement_grouped_fp8(c, N, K, E, chain)]
+    guarded = [c for c in space if decode_sane(c, rows, False)]
+
+    def key(i, c):
+        canon = dataclasses.replace(c, raster_along="m")
+        est = estimate_cycles(
+            canon, rows, dense_n, K, 1, "k", IN_FMT, fam, sm_count, nominal=nominal
+        )
+        return (
+            est * pair_term(c, rows),
+            0 if c.raster_along == raster_for(c, rows) else 1,
+            i,
+        )
+
+    ranked = [
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded or space))
+    ]
+    members = set(space)
     out: List[Knobs] = []
     seen = set()
-    ranked = rank_topk(
-        rows,
-        (n_active or E) * N,
-        K,
-        1,
-        "k",
-        sm_count,
-        max(k, 10),
-        family,
-        IN_FMT,
-        nominal,
-    )
-    for cand in [_grouped(c) for c in ranked] + grouped_knobs():
-        if cand in seen or not can_implement_grouped_fp8(cand, N, K, E, chain):
-            continue
-        seen.add(cand)
-        out.append(cand)
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
+        )
+        for cand in (rec, twin):
+            if cand not in seen and (cand is rec or cand in members):
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
         if len(out) >= k:
             break
-    return out
+        if rec not in seen:
+            out.append(rec)
+            seen.add(rec)
+    return out[:k]
 
 
 def default_configs_fp8(
