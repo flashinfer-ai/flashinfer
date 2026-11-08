@@ -124,8 +124,10 @@ backward (``bwd_bf16_short``: 256-thread CTAs with the row-claims backward's
 row arithmetic, each CTA finishing 8 columns from every CTA's FP32 partials
 in rank order in FP64, up to 256 rows).  The fused backwards are builds of
 the deterministic package's backward kernel file under this package's names
-(its builds ``{"min_blocks": 4, "out": "f32", "threads": 256}`` and, on
-sm_107a, ``"out": "bf16"``), routed where they make the training step faster
+(its builds ``{"math": "ax", "min_blocks": 4, "out": "f32",
+"prefetch_share": None, "threads": 256}`` and, on sm_107a, ``"out": "bf16"``:
+the approximate gate and ``rstd``, the next-block prefetch up to the
+architecture's share), routed where they make the training step faster
 than this package's own backwards: 256-thread CTAs, 16 lanes a row, 16-row
 blocks, at most 4 CTAs per SM claiming the blocks in chunks whose rows are
 fixed by the row count and the grid, each chunk's weight-gradient terms added
@@ -1665,12 +1667,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_f32_t512",
     },
     # The fused backward into a BF16 weight gradient: the deterministic
-    # package's backward program (its build {"min_blocks": 4, "out": "bf16",
-    # "threads": 256}): 16 lanes per row (16-row blocks), at most 4 CTAs per SM
+    # package's backward program (its build {"math": "ax", "min_blocks": 4,
+    # "out": "bf16", "prefetch_share": None, "threads": 256}): 16 lanes per row
+    # (16-row blocks), at most 4 CTAs per SM
     # claiming the blocks, the weight gradient summed exactly in fixed point in
     # the workspace (``acc``, ``flags``, ``done``) and rounded once, so every
     # output repeats bit for bit; BACKWARD_BANDS gives it its rows.
-    "cake_rmsnorm_silu_gate_train_6e19a9f1b7cac40444cb": {
+    "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe": {
         "arches": [
             "sm_107a",
         ],
@@ -1706,8 +1709,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "claimed_row_blocks",
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_6e19a9f1b7cac40444cb",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_6e19a9f1b7cac40444cb",
+        "kernel": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1715,7 +1718,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 26368,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_6e19a9f1b7cac40444cb",
+        "library": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
         "logical": {
             "acc": "acc",
             "accumulate": "accumulate",
@@ -1747,12 +1750,13 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # The fused backward into a FP32 weight gradient: the deterministic
-    # package's backward program (its build {"min_blocks": 4, "out": "f32",
-    # "threads": 256}): 16 lanes per row (16-row blocks), at most 4 CTAs per SM
+    # package's backward program (its build {"math": "ax", "min_blocks": 4,
+    # "out": "f32", "prefetch_share": None, "threads": 256}): 16 lanes per row
+    # (16-row blocks), at most 4 CTAs per SM
     # claiming the blocks, the weight gradient summed exactly in fixed point in
     # the workspace (``acc``, ``flags``, ``done``) and rounded once, so every
     # output repeats bit for bit; BACKWARD_BANDS gives it its rows.
-    "cake_rmsnorm_silu_gate_train_6b4739305d767297d565": {
+    "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1790,8 +1794,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "claimed_row_blocks",
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
+        "kernel": "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1799,7 +1803,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 26368,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
+        "library": "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
         "logical": {
             "acc": "acc",
             "accumulate": "accumulate",
@@ -1849,7 +1853,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
-        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
+        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
     },
     "sm_103a": {
         "fwd": "cake_rmsnorm_silu_gate_train_c7919260b39b69e4e646",
@@ -1865,7 +1869,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
-        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
+        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
     },
     "sm_107a": {
         "fwd": "cake_rmsnorm_silu_gate_train_c7919260b39b69e4e646",
@@ -1878,11 +1882,11 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
-        "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_6e19a9f1b7cac40444cb",
+        "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
-        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_6b4739305d767297d565",
+        "bwd_f32_fused": "cake_rmsnorm_silu_gate_train_ae2073f31d0923e61736",
     },
 }
 
