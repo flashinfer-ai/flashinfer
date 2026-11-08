@@ -52,7 +52,9 @@ BACKEND_TESTS = (
     "test_cake_gdn_nondet_train_host.py",
     "test_cake_gdn_nondet_train_standalone.py",
 )
-VENDORED_NAME = "vendored_cake_gdn_nondet_train"  # the copy's top-level name in the subprocess
+VENDORED_NAME = (
+    "vendored_cake_gdn_nondet_train"  # the copy's top-level name in the subprocess
+)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -178,7 +180,10 @@ def _exception_names(expr) -> list[str]:
 
 def _flashinfer_import(node) -> bool:
     if isinstance(node, ast.Import):
-        return any(a.name == "flashinfer" or a.name.startswith("flashinfer.") for a in node.names)
+        return any(
+            a.name == "flashinfer" or a.name.startswith("flashinfer.")
+            for a in node.names
+        )
     if isinstance(node, ast.ImportFrom) and not node.level and node.module:
         return node.module == "flashinfer" or node.module.startswith("flashinfer.")
     return False
@@ -204,13 +209,17 @@ def test_package_names_flashinfer_only_in_the_jit_fallback() -> None:
                         guarded[sub] = node.lineno
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                assert node.level < 2, f"{path.name}:{node.lineno}: import from outside the package"
+                assert node.level < 2, (
+                    f"{path.name}:{node.lineno}: import from outside the package"
+                )
             if _flashinfer_import(node):
                 assert node in guarded, (
                     f"{path.name}:{node.lineno}: flashinfer import outside a try/except ImportError"
                 )
                 guards.setdefault(path.name, set()).add(guarded[node])
-    assert {name: len(lines) for name, lines in guards.items()} == {"cake_build.py": 1}, guards
+    assert {name: len(lines) for name, lines in guards.items()} == {
+        "cake_build.py": 1
+    }, guards
 
 
 def test_the_package_reads_no_environment_variable() -> None:
@@ -241,11 +250,14 @@ def test_backend_tests_import_the_package_through_the_alias_helper(name: str) ->
     if not path.is_file():
         pytest.skip(f"{name} is not in this tree")
     tree = ast.parse(path.read_text(), filename=str(path))
-    offenders = [f"{name}:{node.lineno}" for node in ast.walk(tree) if _flashinfer_import(node)]
+    offenders = [
+        f"{name}:{node.lineno}" for node in ast.walk(tree) if _flashinfer_import(node)
+    ]
     assert not offenders, offenders
     helper = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "tests.test_helpers.cake_package"
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "tests.test_helpers.cake_package"
     ]
     assert helper, f"{name} does not import tests.test_helpers.cake_package"

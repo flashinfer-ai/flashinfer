@@ -86,14 +86,27 @@ class _Problem:
     """The operands of one route, drawn on the host, and the call: q / k / v leaves (or the packed row leaf), g,
     beta and the initial state as leaves, the output gradient and the final-state gradient."""
 
-    def __init__(self, route: str, device, *, seq_lens=SEQ_LENS, heads=HEADS, seed: int = 0, initial: bool = True):
+    def __init__(
+        self,
+        route: str,
+        device,
+        *,
+        seq_lens=SEQ_LENS,
+        heads=HEADS,
+        seed: int = 0,
+        initial: bool = True,
+    ):
         self.route, self.heads = route, heads
         h, hv = heads
         if route == "equal":
             batch, tokens = EQUAL
             shape, self.seq_lens, num_seqs = (batch, tokens), (tokens,) * batch, batch
         else:
-            shape, self.seq_lens, num_seqs = (1, sum(seq_lens)), tuple(seq_lens), len(seq_lens)
+            shape, self.seq_lens, num_seqs = (
+                (1, sum(seq_lens)),
+                tuple(seq_lens),
+                len(seq_lens),
+            )
         gen = torch.Generator().manual_seed(seed)
 
         def randn(*s):
@@ -105,8 +118,14 @@ class _Problem:
         self.g = (torch.rand(*shape, hv, generator=gen) * -0.5).to(device)
         self.beta = torch.rand(*shape, hv, generator=gen).to(device)
         self.do = randn(*shape, hv, HEAD_DIM).to(torch.bfloat16).to(device)
-        self.h0 = (0.1 * randn(num_seqs, hv, HEAD_DIM, HEAD_DIM)).to(device) if initial else None
-        self.dht = randn(num_seqs, hv, HEAD_DIM, HEAD_DIM).to(device) if initial else None
+        self.h0 = (
+            (0.1 * randn(num_seqs, hv, HEAD_DIM, HEAD_DIM)).to(device)
+            if initial
+            else None
+        )
+        self.dht = (
+            randn(num_seqs, hv, HEAD_DIM, HEAD_DIM).to(device) if initial else None
+        )
         if route == "equal":
             self.cu = self.cu_cpu = None
         else:
@@ -114,9 +133,15 @@ class _Problem:
             for n in self.seq_lens:
                 offsets.append(offsets[-1] + n)
             self.cu = torch.tensor(offsets, dtype=torch.int32, device=device)
-            self.cu_cpu = torch.tensor(offsets, dtype=torch.int32) if route != "device" else None
+            self.cu_cpu = (
+                torch.tensor(offsets, dtype=torch.int32) if route != "device" else None
+            )
         self.widths = (h * HEAD_DIM, h * HEAD_DIM, hv * HEAD_DIM)
-        self.row = torch.cat([t.flatten(-2) for t in self.qkv], -1) if route == "packed" else None
+        self.row = (
+            torch.cat([t.flatten(-2) for t in self.qkv], -1)
+            if route == "packed"
+            else None
+        )
 
     def leaves(self) -> dict:
         out = {
@@ -138,17 +163,26 @@ class _Problem:
         def body(*args):
             if self.route == "packed":
                 row, g, beta, h0 = args
-                q, k, v = (part.unflatten(-1, (-1, HEAD_DIM)) for part in row.split(self.widths, -1))
+                q, k, v = (
+                    part.unflatten(-1, (-1, HEAD_DIM))
+                    for part in row.split(self.widths, -1)
+                )
             else:
                 q, k, v, g, beta, h0 = args
             return cake_gdn_nondet(q, k, v, g, beta, scale=SCALE, initial_state=h0,
                                    output_final_state=h0 is not None, cu_seqlens=self.cu,
                                    cu_seqlens_cpu=self.cu_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
 
-        names = ("row", "g", "beta") if self.route == "packed" else ("q", "k", "v", "g", "beta")
+        names = (
+            ("row", "g", "beta")
+            if self.route == "packed"
+            else ("q", "k", "v", "g", "beta")
+        )
         args = [leaves[n] for n in names] + [leaves.get("h0")]
         if checkpointed:
-            return checkpoint(body, *args, use_reentrant=False, preserve_rng_state=False)
+            return checkpoint(
+                body, *args, use_reentrant=False, preserve_rng_state=False
+            )
         return body(*args)
 
     def step(self, leaves: dict, checkpointed: bool = False):
@@ -167,7 +201,10 @@ class _Problem:
         if "h0" in leaves:
             out["dh0"] = leaves["h0"].grad
         if self.route == "packed":
-            dq, dk, dv = (p.unflatten(-1, (-1, HEAD_DIM)) for p in leaves["row"].grad.split(self.widths, -1))
+            dq, dk, dv = (
+                p.unflatten(-1, (-1, HEAD_DIM))
+                for p in leaves["row"].grad.split(self.widths, -1)
+            )
         else:
             dq, dk, dv = (leaves[n].grad for n in ("q", "k", "v"))
         out.update(dq=dq, dk=dk, dv=dv)
@@ -200,7 +237,10 @@ def _sync_debug_error():
 
 @contextlib.contextmanager
 def _deterministic_algorithms(mode: bool, *, warn_only: bool = False):
-    previous = (torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled())
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     try:
         yield
@@ -241,7 +281,10 @@ def test_gradients_accumulate_bit_for_bit(route, device) -> None:
     o, final = problem.step(leaves)
     torch.cuda.synchronize()
     twice = problem.results(leaves, o, final)
-    _assert_same_bits({n: twice[n] for n in ("o", "final_state")}, {n: once[n] for n in ("o", "final_state")})
+    _assert_same_bits(
+        {n: twice[n] for n in ("o", "final_state")},
+        {n: once[n] for n in ("o", "final_state")},
+    )
     grads = ("dq", "dk", "dv", "dg", "dbeta", "dh0")
     _assert_same_bits({n: twice[n] for n in grads}, {n: once[n] * 2 for n in grads})
 
@@ -253,7 +296,9 @@ def test_gradients_accumulate_bit_for_bit(route, device) -> None:
 @pytest.mark.parametrize("initial", [False, True], ids=["zero-state", "state"])
 @pytest.mark.parametrize("checkpointed", [False, True], ids=["plain", "checkpoint"])
 @pytest.mark.parametrize("route", ROUTES)
-def test_steady_state_calls_do_not_synchronize(route, checkpointed, initial, device) -> None:
+def test_steady_state_calls_do_not_synchronize(
+    route, checkpointed, initial, device
+) -> None:
     # once the layout's libraries, tables and workspaces exist, a forward and backward runs under the error
     # sync-debug mode (a device synchronization, a blocking copy or a read of device memory would raise); without an
     # initial or final state (the backward's recorded plan replays) and with both (the general path)
@@ -281,15 +326,22 @@ def test_checkpointed_forward_retains_no_bytes(route, initial, device) -> None:
     before = _allocator_bytes(device)
     o, final = problem.layer(leaves, checkpointed=True)
     torch.cuda.synchronize()
-    outputs = o.untyped_storage().nbytes() + (0 if final is None else final.untyped_storage().nbytes())
+    outputs = o.untyped_storage().nbytes() + (
+        0 if final is None else final.untyped_storage().nbytes()
+    )
     retained = _allocator_bytes(device) - before - outputs
-    assert retained == 0, f"a checkpointed forward retains {retained} requested bytes beyond its outputs"
+    assert retained == 0, (
+        f"a checkpointed forward retains {retained} requested bytes beyond its outputs"
+    )
     loss = (o.float() * problem.do.float()).sum()
     if final is not None:
         loss = loss + (final * problem.dht).sum()
     loss.backward()
     torch.cuda.synchronize()
-    assert all(bool(torch.isfinite(t.float()).all()) for t in problem.results(leaves, o, final).values())
+    assert all(
+        bool(torch.isfinite(t.float()).all())
+        for t in problem.results(leaves, o, final).values()
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -321,7 +373,13 @@ def test_steady_state_host_time_per_call(route, device) -> None:
         bwd_us.append((t3 - t2) * 1e6)
         del o, loss, leaves
     fwd, bwd = statistics.median(fwd_us), statistics.median(bwd_us)
-    assert fwd <= HOST_CALL_MAX_US and bwd <= HOST_CALL_MAX_US, (route, fwd, bwd, fwd_us, bwd_us)
+    assert fwd <= HOST_CALL_MAX_US and bwd <= HOST_CALL_MAX_US, (
+        route,
+        fwd,
+        bwd,
+        fwd_us,
+        bwd_us,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -329,7 +387,9 @@ def test_steady_state_host_time_per_call(route, device) -> None:
 
 
 @pytest.mark.parametrize("checkpointed", [False, True], ids=["plain", "checkpoint"])
-def test_deterministic_algorithms_change_nothing_on_the_packed_row(checkpointed, device) -> None:
+def test_deterministic_algorithms_change_nothing_on_the_packed_row(
+    checkpointed, device
+) -> None:
     # every launch is fixed-order: under torch.use_deterministic_algorithms(True), strict and warn_only, the packed
     # row (and its checkpoint replay) runs without an alert or a warning, to the bits of the default mode
     problem = _Problem("packed", device, seed=29)
@@ -338,11 +398,16 @@ def test_deterministic_algorithms_change_nothing_on_the_packed_row(checkpointed,
     torch.cuda.synchronize()
     want = problem.results(leaves, o, final)
     for warn_only in (False, True):
-        with _deterministic_algorithms(True, warn_only=warn_only), warnings.catch_warnings(record=True) as caught:
+        with (
+            _deterministic_algorithms(True, warn_only=warn_only),
+            warnings.catch_warnings(record=True) as caught,
+        ):
             warnings.simplefilter("always")
             leaves = problem.leaves()
             o, final = problem.step(leaves, checkpointed)
             torch.cuda.synchronize()
         assert not [w for w in caught if _ALERT in str(w.message)], warn_only
-        assert type(o.grad_fn).__name__ == "CakeGDNNondetPackedFunctionBackward", type(o.grad_fn).__name__
+        assert type(o.grad_fn).__name__ == "CakeGDNNondetPackedFunctionBackward", type(
+            o.grad_fn
+        ).__name__
         _assert_same_bits(problem.results(leaves, o, final), want)
