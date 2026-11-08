@@ -2003,19 +2003,21 @@ def _launch_dgrad_program(
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` on the input-gradient program ``module``: the program's ``M = T`` rows,
     ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
-    stride, and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the program never
-    touches)."""
+    stride (a padded ``out`` as the contiguous 1-D alias of its span, ``flat_alias``: the binding checks the
+    pointer's contiguity), and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the
+    program never touches)."""
     det = deterministic_backend()
     T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
     f32 = out.dtype == torch.float32
     other = torch.bfloat16 if f32 else torch.float32
     spare, flat = det._dummy_map(out.device, other), det._dummy(out.device, other)
+    ptr = out if out.is_contiguous() else det.flat_alias(out)
     items = _ceil_div(T, _DGRAD_ITEM_ROWS) * _ceil_div(K, _DGRAD_ITEM_ROWS)
     values = dict(
         A=G,
         B=W.unsqueeze(0),
-        out=flat if f32 else out,
-        out32=out if f32 else flat,
+        out=flat if f32 else ptr,
+        out32=ptr if f32 else flat,
         C16=spare if f32 else out.unsqueeze(0),
         C32=out.unsqueeze(0) if f32 else spare,
         M=T,
@@ -2140,7 +2142,8 @@ def _launch_wgrad_sk(
     one per 64-token K block of the line), the grid one CTA pair per unit (checked: :func:`_launch_k1_program`), the
     unit length the line's K blocks over the units, rounded up; the units' FP32 partial slots and flag words from the
     arena of the (device, stream) (``k1_slots`` / ``k1_tickets``: the flag words are zero before and after every
-    complete launch)."""
+    complete launch).  ``out`` is stored through its pointer and row stride (a padded ``out`` as the contiguous 1-D
+    alias of its span, ``flat_alias``)."""
     det = deterministic_backend()
     index = _k1_index(out, out, out)
     stream = det._current_raw_stream(index)
@@ -2160,7 +2163,7 @@ def _launch_wgrad_sk(
     values = dict(
         A=X.unsqueeze(0),
         B=G.unsqueeze(0),
-        out=out,
+        out=out if out.is_contiguous() else det.flat_alias(out),
         ws=ws,
         flags=flags,
         M=d_in,
@@ -3842,7 +3845,10 @@ def plan_atomic_router(
     if ksum:
         template = router_ksum_template(arch, sm_count)
         if template is None or template not in cake_jit.KERNELS.get(arch, {}):
-            return None, f"no K-order program is registered for {arch} on {sm_count} SMs"
+            return (
+                None,
+                f"no K-order program is registered for {arch} on {sm_count} SMs",
+            )
     elif head_spans:
         template = router_head_tail_template(arch, sm_count)
         if template not in cake_jit.KERNELS.get(arch, {}):

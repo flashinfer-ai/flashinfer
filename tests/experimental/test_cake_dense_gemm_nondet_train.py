@@ -3139,7 +3139,7 @@ def test_k1_chain_programs_are_registered():
     FP32 transposed-store programs on sm_100a, sm_103a and sm_107a, the three-chain 192-wide FP32 row-major-store
     program on sm_107a, and for :data:`K1_ORDERED_RANGES_BY_SM` on sm_107a the two- and four-chain 192-wide row-major
     and 256-wide transposed-store programs and the two-chain 128-wide one; each is the one-chain program's build with
-    ``chains`` set."""
+    ``chains`` set (``split_order`` at its default, "arrival", whether the record names it or not)."""
     want = {
         "dense_proj_gemm_atomic_nn_n128_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
@@ -3162,7 +3162,9 @@ def test_k1_chain_programs_are_registered():
             chained = cake_jit.MODULES[cake_jit.KERNELS[arch][template]]
             single = cake_jit.MODULES[cake_jit.KERNELS[arch][one]]
             assert chained["build"]["module"] == single["build"]["module"]
-            assert chained["build"]["kwargs"] == {
+            # ``split_order`` defaults to "arrival" in the build; one split per tile makes the order moot
+            assert {"split_order": "arrival", **chained["build"]["kwargs"]} == {
+                "split_order": "arrival",
                 **single["build"]["kwargs"],
                 "chains": chains,
             }
@@ -3656,12 +3658,16 @@ def test_router_units_policy(monkeypatch):
     for hidden in (4096, 5120, 6144):
         assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", hidden, 256)] is None
         for sms in (208, 212, 216):
-            assert (
-                cake_backend.router_partition(
-                    "nn_t", arch="sm_107a", sm_count=sms, M=hidden, N=256, K=16231
-                )
-                is None
-            ), (sms, hidden)
+            part = cake_backend.router_partition(
+                "nn_t", arch="sm_107a", sm_count=sms, M=hidden, N=256, K=16231
+            )
+            if (sms, hidden) == (212, 6144):
+                # the K-order window "ksum_S6" (test_router_ksum_window_plans_the_k_order_program): six spans per
+                # tile, no head/tail spans
+                m_tiles, n_tiles, _ = cake_backend._router_grid(hidden, 256, 16231)
+                assert part == (6 * (m_tiles // 2) * n_tiles, 0, 0), part
+                continue
+            assert part is None, (sms, hidden)
     # the forward of the parts with a table of their own at 16231 tokens: the deterministic plan (the 212-SM forward
     # windows end at 192 tokens)
     for sms in (208, 212):
@@ -3690,13 +3696,24 @@ def test_router_units_policy(monkeypatch):
                 cake_backend.router_units("nn_t", arch=arch, sm_count=sms, **wgrad5120)
                 is None
             )
-    # few tokens at hidden 5120: the "waves" partition (100 tokens, 4 K blocks: three waves of the 76 CTA pairs, at
-    # most one unit per (tile, K block) step -> 160 units) on 153-SM parts (where the SIMT window does not hold); on
+    # few tokens at hidden 5120 on 153-SM parts (where the SIMT window does not hold): the "waves" window's partition
+    # (100 tokens, 4 K blocks: three waves of the 76 CTA pairs, at most one unit per (tile, K block) step -> 160 units
+    # over 40 tiles) gives an element four partials, so the row runs the deterministic program (no partition); on
     # 152-SM sm_100a and sm_103a parts the SIMT program (no partition)
     for arch in ("sm_100a", "sm_103a"):
-        assert cake_backend.router_partition(
-            "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=100
-        ) == (160, 0, 0)
+        assert (
+            cake_backend._router_rule_spec(
+                "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=100
+            )
+            == "waves"
+        )
+        assert not cake_backend.router_at_most_two_partials(20, 2, 160)
+        assert (
+            cake_backend.router_partition(
+                "nn_t", arch=arch, sm_count=153, M=5120, N=256, K=100
+            )
+            is None
+        )
         assert (
             cake_backend.router_partition(
                 "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
@@ -4310,9 +4327,7 @@ def test_router_ksum_window_plans_the_k_order_program(monkeypatch):
             "nn_t", arch=arch, sm_count=sms, M=hidden, N=256, K=T
         ) == (6 * tiles, 0, 0)
     # without the program registered: the deterministic program
-    table = {
-        t: m for t, m in cake_jit.KERNELS[arch].items() if t != template
-    }
+    table = {t: m for t, m in cake_jit.KERNELS[arch].items() if t != template}
     monkeypatch.setitem(cake_jit.KERNELS, arch, table)
     plan, reason = _plan_router_row("nn_t", arch, sms, hidden, 16172)
     assert plan is None and "K-order" in reason
@@ -4368,9 +4383,7 @@ def test_k2_ksum_binding_carves_its_workspace(monkeypatch):
     )
     _same_arguments(
         kernel_args,
-        cake_backend._order_atomic_arguments(
-            module_name, arg_plan, values, plan.grid
-        ),
+        cake_backend._order_atomic_arguments(module_name, arg_plan, values, plan.grid),
     )
 
 
@@ -4867,7 +4880,8 @@ def test_router_no_head_tail_windows():
     missed the accuracy check): no spec of :data:`ROUTER_RULES` or :data:`ROUTER_RULES_BY_SM` starts with "H", and at
     the token counts of the former windows (sm_103a hidden 4096 20480 to 49152 and hidden 6144 16385 to 20480 tokens,
     hidden 5120 10240 to 32768 tokens) no 148- to 153-SM sm_100a / sm_103a part and no sm_107a part partitions the
-    weight gradient."""
+    weight gradient, but for the K-order window of 212-SM parts (hidden 6144, 16172 to 16231 tokens: ``"ksum_S6"``,
+    spans of equal length, no head/tail spans)."""
     tables = [cake_backend.ROUTER_RULES, *cake_backend.ROUTER_RULES_BY_SM.values()]
     assert not [
         spec
@@ -4901,7 +4915,11 @@ def test_router_no_head_tail_windows():
     for sms in (208, 212, 216):
         for hidden in (4096, 5120, 6144):
             for T in (16172, 16231, 16384):
-                assert part("sm_107a", sms, hidden, T) is None, (sms, hidden, T)
+                got = part("sm_107a", sms, hidden, T)
+                if (sms, hidden) == (212, 6144) and T <= 16231:
+                    assert got is not None and got[1:] == (0, 0), (sms, hidden, T, got)
+                    continue
+                assert got is None, (sms, hidden, T)
 
 
 def test_router_wgrad_at_the_deterministic_split_rule_rows():
@@ -5348,12 +5366,28 @@ def test_k2_values_feed_every_registered_router_program():
         and not r["template"].startswith((simt_prefix, dgrad_prefix, fwd_prefix))
         and r["template"] != cake_backend.PARTIALS_SUM_TEMPLATE
     ]
+    ksum_templates = set(cake_backend.ROUTER_KSUM_TEMPLATES_BY_SM.values())
+    assert ksum_templates
+    # the K-order program takes its workspace slots and tickets instead of D (the binding of a K-order plan passes
+    # them: test_k2_ksum_binding_carves_its_workspace)
+    ksum_values = cake_backend._k2_values(
+        dataclasses.replace(plan, ksum=True, head_spans=0, head_steps=0),
+        A="a",
+        parts="b",
+        out=out,
+        ws="ws",
+        counters="tickets",
+    )
     for name in names:
         plan_args = cake_jit.arg_plan_of(cake_jit.MODULES[name])
+        ksum = cake_jit.MODULES[name]["template"] in ksum_templates
         arguments = cake_backend._order_atomic_arguments(
-            name, plan_args, values, plan.grid
+            name, plan_args, ksum_values if ksum else values, plan.grid
         )
         assert len(arguments) == len(plan_args), name
+        names_of = [a for _, a in plan_args]
+        takes_ws = {"ws", "counters"} <= set(names_of) and "D" not in names_of
+        assert takes_ws == ksum, name
         if cake_jit.MODULES[name]["template"].endswith(
             cake_backend.ROUTER_HEAD_TAIL_SUFFIX
         ):
@@ -6210,8 +6244,7 @@ _F512_ROWS = {(K, 512, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
 K1_FORWARD_PROGRAM_ROWS = {
     ("sm_100a", 148): dict.fromkeys(_F512_ROWS, _WAVE_PF2_ST),
     ("sm_100a", 152): dict.fromkeys(
-        _F512_ROWS
-        | {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16384)},
+        _F512_ROWS | {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16384)},
         _WAVE_PF2_ST,
     ),
     ("sm_103a", 152): dict.fromkeys(
@@ -6306,13 +6339,19 @@ K1_WGRAD_SK_ROWS = {
     },
 }
 #: The 64-token K-block counts of 16172 to 16384 tokens: 253 (odd), 254, 255 (odd) and 256.
-_KB_PARITY_RANGES = ((16172, 16192, 4), (16193, 16256, 2), (16257, 16320, 4), (16321, 16384, 2))
+_KB_PARITY_RANGES = (
+    (16172, 16192, 4),
+    (16193, 16256, 2),
+    (16257, 16320, 4),
+    (16321, 16384, 2),
+)
 K1_ORDERED_ROWS = {
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
         **{
             ("sm_107a", 1, d_in, 1024, "f32"): tuple(
-                (lo, hi, (bn, 1, chains, "arrival")) for lo, hi, chains in _KB_PARITY_RANGES
+                (lo, hi, (bn, 1, chains, "arrival"))
+                for lo, hi, chains in _KB_PARITY_RANGES
             )
             for d_in, bn in ((4096, 192), (5120, 256))
         },
@@ -6349,7 +6388,9 @@ def test_k1_program_tables():
                 assert template in cake_jit.KERNELS[arch], (arch, template)
     assert cake_backend.dgrad_program_template(False) == _KD
     assert cake_backend.dgrad_program_template(True) == _KD_TMA
-    assert cake_backend.dgrad_program_template(True, lean_free=True) == _KD_TMA_LEAN_FREE
+    assert (
+        cake_backend.dgrad_program_template(True, lean_free=True) == _KD_TMA_LEAN_FREE
+    )
     assert (
         cake_backend.wgrad_sk_template(256, True) == "dense_proj_gemm_sk_nn_n256_f32_t"
     )
@@ -6990,9 +7031,17 @@ def test_k1_chain_ranges_bind_per_token_count(monkeypatch, sm_count):
                 if lo <= T <= hi:
                     # a range of K1_ORDERED_RANGES_BY_SM comes first (16172 tokens: four chains on 212 SMs)
                     ordered = cake_backend.k1_ordered_plan(
-                        arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=True, sm_count=sm_count
+                        arch=arch,
+                        L=1,
+                        M=d_in,
+                        N=d_out,
+                        K=T,
+                        out_f32=True,
+                        sm_count=sm_count,
                     )
-                    cases.append((T, tuple(ordered[:3]) if ordered else (block_n, 1, chains)))
+                    cases.append(
+                        (T, tuple(ordered[:3]) if ordered else (block_n, 1, chains))
+                    )
         misses = K1_CHAIN_MISSES[sm_count].get((d_in, d_out), ())
         for T in misses:
             ordered = cake_backend.k1_ordered_plan(
@@ -7485,7 +7534,7 @@ def test_router_rule_spec_reads_the_table_of_the_sm_count(monkeypatch):
                 checked += 1
     assert checked > 300
     # the sm_107a hidden-5120 weight gradient: "det_s12" at 16172 to 16384 tokens on 212 SMs only (no window on 208
-    # and 216 SMs); hidden 6144: no window
+    # and 216 SMs); hidden 6144: "ksum_S6" at 16172 to 16231 tokens on 212 SMs only
     for sms in (208, 212, 216):
         for T in (16171, 16172, 16231, 16384, 16385):
             want = "det_s12" if sms == 212 and 16172 <= T <= 16384 else None
@@ -7495,11 +7544,12 @@ def test_router_rule_spec_reads_the_table_of_the_sm_count(monkeypatch):
                 )
                 == want
             ), (sms, T)
+            want = "ksum_S6" if sms == 212 and 16172 <= T <= 16231 else None
             assert (
                 cake_backend._router_rule_spec(
                     "nn_t", arch="sm_107a", sm_count=sms, M=6144, N=256, K=T
                 )
-                is None
+                == want
             ), (sms, T)
     # a head/tail verdict in the 212-SM table only, then in ROUTER_RULES only (216 SMs): the no-verdict check of a
     # binding of the row follows the table of each SM count
@@ -7579,7 +7629,13 @@ def _same_arguments(got: list, want: list) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["wgrad_stream_k", "wgrad_head_tail", "fwd_two_splits", "padded_out", "torch_chain"],
+    [
+        "wgrad_stream_k",
+        "wgrad_head_tail",
+        "fwd_two_splits",
+        "padded_out",
+        "torch_chain",
+    ],
 )
 def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
     """A cached K2 launch orders its arguments once (``_k2_binding``) and binds the arena's BF16x3 stack once per arena
@@ -8850,13 +8906,16 @@ def test_k1_forward_and_input_gradient_alert_only_when_order_varying(
                 (lambda: cake_backend.cake_dense_gemm_nondet_train_projection(G, W, out_d32), (G, W, out_d32)),
             )  # fmt: skip
             # a row of K1_FORWARD_PROGRAM_RULES_BY_SM / K1_DGRAD_PROGRAM_RULES_BY_SM on this part runs this package's
-            # program from the entry point, uncached: the same bits on every run, so never an alert
+            # program from the entry point, uncached: the same bits on every run, so never an alert; the generic entry
+            # point runs it too (_k1_table_call)
+            forward = cake_backend._k1_forward_program_of(X, W, out_f)
+            dgrad32 = cake_backend._k1_dgrad_program_of(G, W, out_d32)
             programs = (
-                cake_backend._k1_forward_program_of(X, W, out_f),
-                None,
+                forward,
+                forward,
                 cake_backend._k1_dgrad_program_of(G, W, out_d),
-                cake_backend._k1_dgrad_program_of(G, W, out_d32),
-                None,
+                dgrad32,
+                dgrad32,
             )
             for (call, views), program in zip(cases, programs, strict=True):
                 cake_backend._drop_convenience_entries()
@@ -9209,7 +9268,10 @@ def test_registered_templates_are_the_ones_the_planners_name():
     for arch, table in cake_jit.KERNELS.items():
         ksum = {
             template
-            for (sm_arch, _), template in cake_backend.ROUTER_KSUM_TEMPLATES_BY_SM.items()
+            for (
+                sm_arch,
+                _,
+            ), template in cake_backend.ROUTER_KSUM_TEMPLATES_BY_SM.items()
             if sm_arch == arch
         }
         assert ksum <= set(table), (arch, sorted(ksum - set(table)))
@@ -11855,9 +11917,10 @@ def test_gpu_k1_dsm_ranges_run_at_their_edges():
     launches into a NaN-poisoned ``out``; the convenience path binds the same program, with no arena, and its output
     has those bits too.  One token below a
     row's first range, one above its last and next to a gap between two of its ranges the row takes the route the
-    planner gives it without the table (another program or the deterministic program), within the same budget; so
-    does an edge with an odd number of 64-token K blocks inside a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, which
-    runs that table's program.  A part of any other SM count or architecture skips."""
+    planner gives it without the table (another program or the deterministic program), within the same budget; an
+    edge with an odd number of 64-token K blocks inside a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` runs that
+    table's program within the same budget: a cluster program of the table's tile and split count (by kernel name),
+    or no cluster program.  A part of any other SM count or architecture skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     rows = cake_backend.K1_DSM_RANGES_BY_SM.get((arch, sm_count), {})
@@ -11895,11 +11958,18 @@ def test_gpu_k1_dsm_ranges_run_at_their_edges():
                 arch=arch, L=L, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
             )
             if not held or odd is not None:
-                # outside the ranges, or an odd number of K blocks inside a range of
-                # K1_DSM_ODD_BLOCK_RANGES_BY_SM (that table's program): no cluster program
+                # outside the ranges: no cluster program; an odd number of K blocks inside a range of
+                # K1_DSM_ODD_BLOCK_RANGES_BY_SM: that table's program (a cluster program of its tile and split count,
+                # or no cluster program)
                 assert (dsm is None) == (not held), what
-                assert not (atomic and prepared.plan.dsm), what
-                prepared.launch()
+                odd_dsm = bool(held) and odd is not None and len(odd) == 2
+                assert bool(atomic and prepared.plan.dsm) == odd_dsm, what
+                if odd_dsm:
+                    assert (prepared.plan.block_n, prepared.plan.splits) == odd, what
+                    assert prepared.template == cake_backend.dsm_k1_template(*odd), what
+                    _assert_ran(prepared.launch, prepared.module_name)
+                else:
+                    prepared.launch()
                 torch.cuda.synchronize()
                 _k1_check(out, ref, what)
                 continue
@@ -14006,7 +14076,8 @@ def test_k1_no_order_varying_plan_on_bench_rows():
     :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` at its odd block counts) hold no such range.  The router
     weight gradient of the bench's ``router`` class plans no stream-K partition with more than two partials per
     element: its row runs the SIMT program, the deterministic program (at the split count of its ``"det_s<n>"``
-    window or the deterministic package's), or a partition of at most two partials."""
+    window or the deterministic package's), the K-order program of a ``"ksum_S<n>"`` window (a tile's partials added
+    in K order), or a partition of at most two partials."""
     bench = _bench()
     rows = [
         spec
@@ -14022,7 +14093,16 @@ def test_k1_no_order_varying_plan_on_bench_rows():
                 part = cake_backend.router_partition(
                     "nn_t", arch=arch, M=H, N=256, K=T, sm_count=sms
                 )
-                if part is not None:
+                rule = cake_backend._router_rule_spec(
+                    "nn_t", arch=arch, sm_count=sms, M=H, N=256, K=T
+                )
+                if (
+                    part is not None
+                    and cake_backend.router_ksum_spec_splits(rule) is not None
+                ):
+                    # the K-order program of the part
+                    assert cake_backend.router_ksum_template(arch, sms), (arch, sms)
+                elif part is not None:
                     m_tiles, n_tiles, _ = cake_backend._router_grid(H, 256, T)
                     assert cake_backend.router_at_most_two_partials(
                         m_tiles // 2, n_tiles, part[0]
@@ -14168,7 +14248,9 @@ def test_no_default_plan_varies_run_to_run(monkeypatch):
         f32 = dt == "f32"
         X = torch.empty(L, Tmax, d_in, dtype=torch.bfloat16)
         G = torch.empty(L, Tmax, d_out, dtype=torch.bfloat16)
-        out = torch.empty(L, d_out, d_in, dtype=torch.float32 if f32 else torch.bfloat16)
+        out = torch.empty(
+            L, d_out, d_in, dtype=torch.float32 if f32 else torch.bfloat16
+        )
         if L == 1:
             X, G, out = X[0], G[0], out[0]
         for part_arch, sms in parts:
@@ -14234,7 +14316,8 @@ def test_k1_forced_arrival_row_alerts_through_the_convenience_wgrad(
     ``torch.use_deterministic_algorithms(True)`` (CPU binding, nothing loaded or launched): the planning call and the
     call from the cached key raise before the program; with ``warn_only=True`` the call warns and launches."""
     entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
-    _register_k1(monkeypatch, "sm_103a")
+    # the 64-wide FP32 transposed-store program is registered on sm_103a (its record's argument plan binds the call)
+    assert cake_backend.atomic_k1_template(64, True) in cake_jit.KERNELS["sm_103a"]
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     monkeypatch.setitem(
         cake_backend.K1_ORDERED_RANGES_BY_SM,
@@ -14977,7 +15060,10 @@ def test_gpu_router_ksum_rows_repeat_and_meet_the_budget(torch_determinism):
             torch.cuda.synchronize()
             exact = G.double().t() @ X.double()
             assert bool(torch.isfinite(out).all()), what
-            assert _rel_fro(out, exact) <= ROUTER_REL_FRO_MAX, (what, _rel_fro(out, exact))
+            assert _rel_fro(out, exact) <= ROUTER_REL_FRO_MAX, (
+                what,
+                _rel_fro(out, exact),
+            )
             prepared = cake_backend.cake_dense_gemm_nondet_train_router_prepare(
                 G.t(), X, torch.full_like(out, float("nan"))
             )
@@ -14986,7 +15072,7 @@ def test_gpu_router_ksum_rows_repeat_and_meet_the_budget(torch_determinism):
             torch.cuda.synchronize()
             assert torch.equal(prepared.out, out), what
             _repeats_into_nan(run, out, what)
-            if T == lo:
+            if lo == T:
                 _assert_ran(lambda: run(out), module)
 
 
