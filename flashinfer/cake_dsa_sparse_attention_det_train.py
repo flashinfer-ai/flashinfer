@@ -362,7 +362,11 @@ def cake_dsa_sparse_attention_det_varlen(
         key after the query's own position (``idx > (seqlen_k[d] -
         seqlen_q[d]) + local_q``) is invalid too, so a top-k selector need not
         enforce causality itself.
-    key_passes, dkv_direct
+    key_passes : Optional[int]
+        As in :func:`cake_dsa_sparse_attention_det`: the key-range passes of
+        the backward's main stage (``None``: the key-pass policy chooses), a
+        scheduling choice only; the gradients are bit for bit those of one pass.
+    dkv_direct : Optional[bool]
         As in :func:`cake_dsa_sparse_attention_det`: accepted for parity,
         validated, without effect.
     check_dst_map : Optional[bool]

@@ -355,6 +355,19 @@ def test_strided_index_slots_are_rejected():
             cake_backend._index_storage_alias(view)
 
 
+def test_misaligned_fold_outputs_are_rejected():
+    """The fold stores a caller's dK / dV output in 16-byte (FP32) or 8-byte (BF16) vectors: a view that starts inside
+    a vector is refused before any launch."""
+    f32 = torch.zeros(4 * 16 + 4, dtype=torch.float32)
+    cake_backend._check_fold_output(f32[4:68].view(4, 16), "dkv")
+    with pytest.raises(ValueError, match="dkv must start 16-byte aligned"):
+        cake_backend._check_fold_output(f32[1:65].view(4, 16), "dkv")
+    bf16 = torch.zeros(4 * 16 + 4, dtype=torch.bfloat16)
+    cake_backend._check_fold_output(bf16[4:68].view(4, 16), "dkv_latent")
+    with pytest.raises(ValueError, match="dkv_latent must start 8-byte aligned"):
+        cake_backend._check_fold_output(bf16[2:66].view(4, 16), "dkv_latent")
+
+
 def test_parity_keywords_are_validated():
     for bad in (0, -1, 1.5, True):
         with pytest.raises(ValueError):
@@ -1198,6 +1211,29 @@ def test_backward_dominant_key_exercises_the_redo():
     )
     assert 0.8 < ref["self_weight"] < 0.999
     _check_rope_accuracy("sink_rope", first, ref, canonical=False, nondet=nondet)
+
+
+def test_nope_runner_rejects_misaligned_dkv_and_workspace():
+    """A prepared NoPE runner refuses a ``dkv`` output (also the fold's integer accumulator) or a ``workspace_buffer``
+    that starts inside a 16-byte vector, before any launch; a 16-byte-aligned ``dkv`` view is admitted."""
+    _require_program(backward=True, program=cake_jit.NOPE_PROGRAM)
+    inp = make_inputs([256], [1024], seed=SEED + 37, topk=256)
+    args = (inp.q_latent, inp.kv_latent, inp.idx_global)
+    kw = dict(topk_length=inp.topk_length, dout=inp.dout)
+    S = inp.total_k
+    spare = torch.empty(S * D_LATENT + 4, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="dkv must start 16-byte aligned"):
+        cake_backend.prepare_dsa_nope_train(
+            *args, dkv=spare[1 : 1 + S * D_LATENT].view(S, D_LATENT), **kw
+        )
+    buf = torch.empty(64 << 20, device="cuda", dtype=torch.uint8)
+    with pytest.raises(
+        ValueError, match="workspace_buffer must start at a 16-byte-aligned"
+    ):
+        cake_backend.prepare_dsa_nope_train(*args, workspace_buffer=buf[4:], **kw)
+    cake_backend.prepare_dsa_nope_train(
+        *args, dkv=spare[4 : 4 + S * D_LATENT].view(S, D_LATENT), **kw
+    )
 
 
 def test_backward_dominant_key_exercises_the_redo_nope():

@@ -709,6 +709,19 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
         )
 
 
+def _check_fold_output(t: Optional[torch.Tensor], name: str) -> None:
+    """A caller's dK / dV output: the fold stores it in 16-byte (FP32) or 8-byte (BF16) vectors, and a fresh NoPE
+    ``dkv`` is also the integer accumulator it reads in 16-byte vectors, so a view that starts inside a vector is
+    refused here instead of faulting in the kernel."""
+    if t is None:
+        return
+    vector = 16 if t.dtype == torch.float32 else 8
+    if t.data_ptr() % vector:
+        raise ValueError(
+            f"{name} must start {vector}-byte aligned (the fold stores it in {vector}-byte vectors)"
+        )
+
+
 def _check_dkv_acc(
     dkv_acc: torch.Tensor,
     dkv_dst_map: Optional[torch.Tensor],
@@ -1831,6 +1844,8 @@ def _plan(
         outputs.get("dkv_latent"), "dkv_latent", (num_kv, D_LATENT), dkv_dtype
     )
     _check_output(outputs.get("dk_rope"), "dk_rope", (num_kv, D_ROPE), dkv_dtype)
+    _check_fold_output(outputs.get("dkv_latent"), "dkv_latent")
+    _check_fold_output(outputs.get("dk_rope"), "dk_rope")
     num_dst = _num_dst(num_kv, dkv_acc, dkv_dst_map) if backward else 0
     # the bound terms and key norms in dQ, the redo lists in the fresh dK/dV output (both dead storage there)
     dq_scratch = (
@@ -2410,6 +2425,12 @@ def _workspace_flat(
     if workspace_buffer is None:
         workspace_buffer = _alloc(layout["total"], torch.uint8, device)
     flat = workspace_buffer.view(-1).view(torch.uint8)
+    if flat.data_ptr() % TMA_ADDRESS_ALIGN:
+        # the regions sit at WORKSPACE_ALIGN offsets from this base and are read in 16-byte vectors / TMA tiles
+        raise ValueError(
+            f"workspace_buffer must start at a {TMA_ADDRESS_ALIGN}-byte-aligned address, "
+            f"got {flat.data_ptr() % TMA_ADDRESS_ALIGN} bytes past an aligned address"
+        )
     if flat.numel() < layout["total"]:
         raise ValueError(
             f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
@@ -2459,7 +2480,9 @@ def prepare_dsa_train(
     ``backward`` defaults to ``dout is not None``.  Missing outputs and the
     workspace are allocated here (the only allocations of a prepared runner).
     Pass ``workspace_buffer`` of :func:`dsa_train_workspace_size` bytes (with
-    the same ``num_dst`` / ``o_lo_scratch``) to reuse storage across steps.
+    the same ``num_dst`` / ``o_lo_scratch``, 16-byte-aligned start) to reuse
+    storage across steps; a given ``dkv_latent`` / ``dk_rope`` must start at a
+    16-byte (FP32) or 8-byte (BF16) aligned address (the fold's store vectors).
     ``dkv_fp32=True`` makes ``backward()`` return natural-layout FP32 dK/dV
     gradients.  ``dkv_acc`` (FP32 ``[S_dst, >= 576]``, see
     :func:`_check_dkv_acc`) makes ``backward()`` ADD the dK/dV gradients into it
@@ -3676,6 +3699,7 @@ def _plan_nope(
         torch.bfloat16,
     )
     _check_output(outputs.get("dkv"), "dkv", (num_kv, D_LATENT), torch.float32)
+    _check_fold_output(outputs.get("dkv"), "dkv")
     num_dst = _num_dst(num_kv, dkv_acc, dkv_dst_map) if backward else 0
     # a fresh dkv is its own integer accumulator: the region holds the per-row words only (the bound terms and
     # key norms in dQ, dead storage there; the redo lists stay in the region)
@@ -3926,7 +3950,8 @@ def prepare_dsa_nope_train(
     ``backward`` defaults to ``dout is not None``; ``dout`` is read in place in any layout
     :func:`validate_dsa_nope_inputs` admits (dense or strided, head-major included).  ``softmax_scale`` defaults to
     ``NOPE_SOFTMAX_SCALE`` (1/16).  Missing outputs and the workspace are allocated here (the only allocations of a
-    prepared runner); pass ``workspace_buffer`` of :func:`dsa_nope_train_workspace_size` bytes to reuse storage.
+    prepared runner); pass ``workspace_buffer`` of :func:`dsa_nope_train_workspace_size` bytes (16-byte-aligned start)
+    to reuse storage; a given ``dkv`` must start 16-byte aligned (it is also the fold's integer accumulator).
     ``backward()`` returns ``(dq, dkv)`` with ``dkv`` the natural-layout FP32 ``[S, 512]`` combined dK + dV (the
     ``dkv`` tensor when given, else a fresh one) -- or, with ``dkv_acc`` (FP32 ``[S_dst, >= 512]``, see
     :func:`_check_dkv_acc`), ADDS the gradient into columns ``0:512`` of row ``dkv_dst_map[s]`` (optional int32
