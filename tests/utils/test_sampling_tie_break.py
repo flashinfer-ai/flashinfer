@@ -122,6 +122,66 @@ def test_large_vocab_sampling_resolves_boundary_ties(vocab_size, mode, determini
         assert (expected[indices, samples.long()] > 0).all()
 
 
+@pytest.mark.parametrize("vocab_size", [8192, 8193, 131072])
+@pytest.mark.parametrize("mode", ["top_k", "top_p", "joint"])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("higher_at_end", [False, True])
+def test_large_vocab_ties_preserve_legal_proposals_and_distribution(
+    vocab_size, mode, deterministic, higher_at_end
+):
+    # Dyadic masses make the first CDF draw identical across the single-CTA
+    # and cluster hierarchies. A legal first proposal must never be redrawn.
+    probs = torch.zeros((1, vocab_size), device="cuda")
+    ties = torch.tensor(
+        [3, vocab_size // 4 - 1, vocab_size // 2 + 1, vocab_size - 1],
+        device="cuda",
+    )
+    higher_index = vocab_size - 2 if higher_at_end else 0
+    probs[0, higher_index] = 0.5
+    probs[0, ties] = 0.125
+    indices = torch.zeros(8192, dtype=torch.int64, device="cuda")
+    support = torch.cat(
+        [torch.tensor([higher_index], dtype=torch.int64, device="cuda"), ties[:2]]
+    )
+    counts = torch.zeros(3, device="cuda")
+    for offset in (0, 65537):
+        kwargs = dict(
+            indices=indices,
+            deterministic=deterministic,
+            seed=42,
+            offset=offset,
+            return_valid=True,
+        )
+        proposal, proposal_valid = flashinfer.sampling.sampling_from_probs(
+            probs, **kwargs
+        )
+        if mode == "top_k":
+            samples, valid = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, 3, **kwargs
+            )
+        elif mode == "top_p":
+            samples, valid = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, 0.75, **kwargs
+            )
+        else:
+            samples, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, 3, 0.9, filter_apply_order="joint", **kwargs
+            )
+        assert proposal_valid.all() and valid.all()
+        legal_proposal = (proposal[:, None] == support).any(-1)
+        torch.testing.assert_close(
+            samples[legal_proposal], proposal[legal_proposal], atol=0, rtol=0
+        )
+        assert (samples[:, None] == support).any(-1).all()
+        counts += (samples[:, None] == support).sum(0)
+    torch.testing.assert_close(
+        counts / counts.sum(),
+        torch.tensor([2 / 3, 1 / 6, 1 / 6], device="cuda"),
+        atol=0.025,
+        rtol=0,
+    )
+
+
 @pytest.mark.parametrize("vocab_size", [4, 257, 131072])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tensor_params", [False, True])

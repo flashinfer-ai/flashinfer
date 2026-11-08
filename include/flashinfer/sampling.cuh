@@ -1266,7 +1266,7 @@ struct SplitRowSamplingTempStorage {
   struct Proposal {
     // Per-warp statistics, replicated in every rank's distributed shared memory.
     ValueCount<float> part[2][SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
-    int equal[SPLIT_ROW_SAMPLING_MAX_CLUSTER * NUM_WARPS];
+    int equal[SPLIT_ROW_SAMPLING_MAX_CLUSTER];
     int2 sample;
     int32_t sel_thread;
     union {
@@ -1274,13 +1274,9 @@ struct SplitRowSamplingTempStorage {
       typename BlockReduce<int, BLOCK_THREADS>::TempStorage reduce_int;
     } block_prim;
   };
-  // The boundary scan runs only on rank 0 after all ranks have read their proposal.
-  // Sharing its scratch avoids reserving another scan buffer beside every staged chunk.
-  union {
-    Proposal proposal;
-    SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGO> boundary;
-  };
-  int resolution;
+  Proposal proposal;
+  double boundary_mass[SPLIT_ROW_SAMPLING_MAX_CLUSTER];
+  uint32_t boundary_limit;
 };
 
 __device__ __forceinline__ ValueCount<float> WarpReduceValueCount(ValueCount<float> v) {
@@ -1289,6 +1285,8 @@ __device__ __forceinline__ ValueCount<float> WarpReduceValueCount(ValueCount<flo
     v.value += __shfl_xor_sync(0xffffffff, v.value, offset);
     v.count += __shfl_xor_sync(0xffffffff, v.count, offset);
   }
+  // Replicate one summation order before DSM stores and cluster-wide decisions.
+  v.value = __shfl_sync(0xffffffff, v.value, 0);
   return v;
 }
 
@@ -1311,6 +1309,182 @@ __device__ __forceinline__ int WarpSelectLane(float lane_mass, float u, float& p
   const int sel = hit != 0 ? __ffs(hit) - 1 : 31 - __clz(nonzero);
   prefix_excl = __shfl_sync(0xffffffff, incl - lane_mass, sel);
   return sel;
+}
+
+// Reuse the same rank/warp/thread CDF for ordinary proposals and the rare final draw.
+// Specializing the predicate keeps original-index comparisons out of the value-only loop.
+template <bool INDEX_TIE_BREAK, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM>
+__device__ __forceinline__ int DrawSplitRowSamplingCandidate(
+    float* chunk, uint32_t chunk_start, uint32_t chunk_len, uint32_t seg, int slot, float low,
+    uint32_t index_limit, float u,
+    SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM>& storage) {
+  constexpr uint32_t NUM_WARPS = BLOCK_THREADS / 32;
+  auto cluster = cooperative_groups::this_cluster();
+  const uint32_t cluster_size = cluster.num_blocks(), rank = cluster.block_rank();
+  const uint32_t tx = threadIdx.x, lane = tx % 32;
+  auto& temp_storage = storage.proposal;
+  // Every warp of every rank selects the owner rank from the same data in the same order.
+  float rank_mass = 0.f;
+  if (lane < cluster_size) {
+#pragma unroll
+    for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+      rank_mass += temp_storage.part[slot][lane * NUM_WARPS + w].value;
+    }
+  }
+  float u_rem = u, excl = 0.f;
+  const int owner = WarpSelectLane(rank_mass, u, excl);
+  u_rem -= excl;
+  if (owner < 0) {
+    // No mass above low anywhere in the row.
+    if (rank == 0 && tx < cluster_size) {
+      *cluster.map_shared_rank(&temp_storage.sample, tx) = make_int2(-1, 0);
+    }
+  } else if (rank == (uint32_t)owner) {
+    const int sel_warp = WarpSelectLane(
+        lane < NUM_WARPS ? temp_storage.part[slot][rank * NUM_WARPS + lane].value : 0.f, u_rem,
+        excl);
+    u_rem -= excl;
+    // Contiguous per-thread pieces of the selected warp segment; an odd length keeps the
+    // sequential per-thread reads free of bank conflicts.
+    const uint32_t seg_begin = min(sel_warp * seg, chunk_len);
+    const uint32_t seg_end = min(seg_begin + seg, chunk_len);
+    uint32_t sub = ceil_div(seg_end - seg_begin, BLOCK_THREADS);
+    sub += (sub % 2 == 0) ? 1 : 0;
+    const uint32_t t_begin = min(seg_begin + tx * sub, seg_end);
+    const uint32_t t_end = min(t_begin + sub, seg_end);
+    float mass = 0.f;
+    for (uint32_t i = t_begin; i < t_end; ++i) {
+      bool keep = chunk[i] > low;
+      if constexpr (INDEX_TIE_BREAK) {
+        keep |= chunk[i] == low && chunk_start + i < index_limit;
+      }
+      mass += keep ? chunk[i] : 0.f;
+    }
+    float incl;
+    BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage.block_prim.scan)
+        .InclusiveSum(mass, incl);
+    if (tx == 0) temp_storage.sel_thread = BLOCK_THREADS;
+    __syncthreads();
+    if (mass > 0.f && incl > u_rem) atomicMin(&temp_storage.sel_thread, (int)tx);
+    __syncthreads();
+    int sel = temp_storage.sel_thread;
+    if (sel == (int)BLOCK_THREADS) {
+      // Rounding left u above the segment total: take the last thread with mass.
+      sel = BlockReduce<int, BLOCK_THREADS>(temp_storage.block_prim.reduce_int)
+                .Reduce(mass > 0.f ? (int)tx : -1, MaxReduceOp{});
+      if (tx == 0) temp_storage.sel_thread = sel;
+      __syncthreads();
+      sel = temp_storage.sel_thread;
+    }
+    if ((int)tx == sel) {
+      float cdf = incl - mass;
+      int local_id = t_begin;
+      for (uint32_t i = t_begin; i < t_end; ++i) {
+        bool keep = chunk[i] > low;
+        if constexpr (INDEX_TIE_BREAK) {
+          keep |= chunk[i] == low && chunk_start + i < index_limit;
+        }
+        if (keep) {
+          local_id = i;
+          cdf += chunk[i];
+          if (cdf > u_rem) break;
+        }
+      }
+      const int2 sample = make_int2(chunk_start + local_id, __float_as_int(chunk[local_id]));
+      for (uint32_t r = 0; r < cluster_size; ++r) {
+        *cluster.map_shared_rank(&temp_storage.sample, r) = sample;
+      }
+    }
+  }
+  cluster.sync();
+  return temp_storage.sample.x;
+}
+
+// Every rank works on its staged chunk. Only the rank containing the last retained tie
+// searches for the index cutoff; legal proposals retain their original RNG history.
+template <bool TOP_K, bool TOP_P, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM>
+__device__ __noinline__ int ResolveSplitRowSamplingBoundary(
+    float* chunk, uint32_t chunk_start, uint32_t chunk_len, uint32_t seg, uint32_t d, float pivot,
+    float above, uint32_t greater_count, uint32_t equal_count, uint32_t k, float p, int sampled_id,
+    curandStatePhilox4_32_10_t& rng,
+    SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM>& storage) {
+  constexpr uint32_t NUM_WARPS = BLOCK_THREADS / 32;
+  auto cluster = cooperative_groups::this_cluster();
+  const uint32_t cluster_size = cluster.num_blocks(), rank = cluster.block_rank();
+  const uint32_t tx = threadIdx.x;
+  auto& proposal = storage.proposal;
+  double mass_above = above;
+  if constexpr (TOP_P) {
+    if (p < 1.f) {
+      if (equal_count == d) {
+        mass_above = 0;
+      } else {
+        const auto mass = GetSamplingBoundaryMass<BLOCK_THREADS>(chunk, chunk_len, pivot);
+        if (tx < cluster_size) {
+          *cluster.map_shared_rank(&storage.boundary_mass[rank], tx) = mass.above;
+        }
+        cluster.sync();
+        mass_above = 0;
+        for (uint32_t r = 0; r < cluster_size; ++r) mass_above += storage.boundary_mass[r];
+      }
+    }
+  }
+  if ((TOP_K && greater_count >= k) || (TOP_P && p < 1.f && mass_above >= double(p))) {
+    return -1;
+  }
+  uint32_t take = equal_count;
+  if constexpr (TOP_K) take = min(take, k - greater_count);
+  if constexpr (TOP_P) {
+    if (p < 1.f) take = min(take, SamplingBoundaryQuota(p, mass_above, pivot, equal_count));
+  }
+  if (take == equal_count) return sampled_id;
+
+  uint32_t prefix = 0;
+  for (uint32_t r = 0; r < rank; ++r) prefix += proposal.equal[r];
+  const uint32_t local_equal = proposal.equal[rank];
+  if (prefix < take && take <= prefix + local_equal) {
+    const uint32_t limit = FindSamplingTieIndexLimit<BLOCK_THREADS, true>(
+        chunk_len, take - prefix, [chunk, pivot](uint32_t i) { return chunk[i] == pivot; },
+        chunk_start);
+    if (tx < cluster_size) {
+      *cluster.map_shared_rank(&storage.boundary_limit, tx) = limit;
+    }
+  }
+  cluster.sync();
+  const uint32_t limit = storage.boundary_limit;
+  if (uint32_t(sampled_id) < limit) return sampled_id;
+
+  // Per-warp tie counts are needed only for an illegal proposal's final draw.
+  // Keep the common equality pass at one replicated count per rank.
+  const uint32_t warp_id = tx / 32, lane = tx % 32;
+  const uint32_t warp_begin = min(warp_id * seg, chunk_len);
+  const uint32_t warp_end = min(warp_begin + seg, chunk_len);
+  int counts[4] = {0, 0, 0, 0};
+#pragma unroll 2
+  for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
+    const float4 v4 = *reinterpret_cast<const float4*>(chunk + i);
+    const float v[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      counts[j] += v[j] == pivot && chunk_start + i + j < limit;
+    }
+  }
+  int kept = (counts[0] + counts[1]) + (counts[2] + counts[3]);
+#pragma unroll
+  for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+    kept += __shfl_xor_sync(0xffffffff, kept, offset);
+  }
+  const uint32_t index = rank * NUM_WARPS + warp_id;
+  // Read the old mass before any lane stores back to its own rank's replica.
+  const float warp_above = __shfl_sync(0xffffffff, proposal.part[0][index].value, 0);
+  if (lane < cluster_size) {
+    *cluster.map_shared_rank(&proposal.part[0][index].value, lane) = warp_above + kept * pivot;
+  }
+  cluster.sync();
+  const float mass = float(mass_above + double(take) * pivot);
+  const int result = DrawSplitRowSamplingCandidate<true>(
+      chunk, chunk_start, chunk_len, seg, 0, pivot, limit, curand_uniform(&rng) * mass, storage);
+  return result < 0 ? -2 : result;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM, uint32_t VEC_SIZE,
@@ -1380,20 +1554,34 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   }
   __syncthreads();
 
+  auto publish_equal = [&](int local_equal) {
+    const int reduced =
+        BlockReduce<int, BLOCK_THREADS>(temp_storage.block_prim.reduce_int).Sum(local_equal);
+    if (tx == 0) temp_storage.sel_thread = reduced;
+    __syncthreads();
+    if (tx < cluster_size) {
+      *cluster.map_shared_rank(&temp_storage.equal[rank], tx) = temp_storage.sel_thread;
+    }
+  };
+  auto sum_equal = [&]() {
+    int total = 0;
+#pragma unroll
+    for (uint32_t r = 0; r < cluster_size; ++r) total += temp_storage.equal[r];
+    return total;
+  };
+
   // One pass over the chunk: per-warp mass (and count) above thr0 and thr1, gathered into
   // temp_storage.part of every rank. Thresholds are never negative, so the zero padding is never
   // counted. Four independent accumulators per lane keep the dependency chains short.
   auto threshold_pass = [&](float thr0, float thr1) {
     float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
     int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
-    int equal = 0;
 #pragma unroll 2
     for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
       const float4 v4 = *reinterpret_cast<const float4*>(chunk + i);
       const float v[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
-        equal += v[j] == thr0;
         s0[j] += v[j] > thr0 ? v[j] : 0.f;
         s1[j] += v[j] > thr1 ? v[j] : 0.f;
         if constexpr (MODE != SplitRowSamplingMode::kTopP) {
@@ -1406,16 +1594,27 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     ValueCount<float> t1{(s1[0] + s1[1]) + (s1[2] + s1[3]), (c1[0] + c1[1]) + (c1[2] + c1[3])};
     t0 = WarpReduceValueCount(t0);
     t1 = WarpReduceValueCount(t1);
-#pragma unroll
-    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
-      equal += __shfl_xor_sync(0xffffffff, equal, offset);
-    }
     if (lane < cluster_size) {
-      *cluster.map_shared_rank(&temp_storage.equal[rank * NUM_WARPS + warp_id], lane) = equal;
       *cluster.map_shared_rank(&temp_storage.part[0][rank * NUM_WARPS + warp_id], lane) = t0;
       *cluster.map_shared_rank(&temp_storage.part[1][rank * NUM_WARPS + warp_id], lane) = t1;
     }
     cluster.sync();
+  };
+
+  // Only proposals that can pass the value test pay for an equality scan.
+  auto equality_pass = [&](float pivot) {
+    int counts[4] = {0, 0, 0, 0};
+#pragma unroll 2
+    for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
+      const float4 v4 = *reinterpret_cast<const float4*>(chunk + i);
+      const float v[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) counts[j] += v[j] == pivot;
+    }
+    const int equal = (counts[0] + counts[1]) + (counts[2] + counts[3]);
+    publish_equal(equal);
+    cluster.sync();
+    return sum_equal();
   };
 
   // Mass above low = 0 (threshold slot 0).
@@ -1428,145 +1627,65 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   bool is_valid = true;
   while (true) {
     const float u = curand_uniform(&state) * q;
-    // Every warp of every rank selects the owner rank from the same data in the same order.
-    float rank_mass = 0.f;
-    if (lane < cluster_size) {
-#pragma unroll
-      for (uint32_t w = 0; w < NUM_WARPS; ++w) {
-        rank_mass += temp_storage.part[slot][lane * NUM_WARPS + w].value;
-      }
-    }
-    float u_rem = u, excl = 0.f;
-    const int owner = WarpSelectLane(rank_mass, u, excl);
-    u_rem -= excl;
-    if (owner < 0) {
-      // No mass above low anywhere in the row.
-      if (rank == 0 && tx < cluster_size) {
-        *cluster.map_shared_rank(&temp_storage.sample, tx) = make_int2(-1, 0);
-      }
-    } else if (rank == (uint32_t)owner) {
-      const int sel_warp = WarpSelectLane(
-          lane < NUM_WARPS ? temp_storage.part[slot][rank * NUM_WARPS + lane].value : 0.f, u_rem,
-          excl);
-      u_rem -= excl;
-      // Contiguous per-thread pieces of the selected warp segment; an odd length keeps the
-      // sequential per-thread reads free of bank conflicts.
-      const uint32_t seg_begin = min(sel_warp * seg, chunk_len);
-      const uint32_t seg_end = min(seg_begin + seg, chunk_len);
-      uint32_t sub = ceil_div(seg_end - seg_begin, BLOCK_THREADS);
-      sub += (sub % 2 == 0) ? 1 : 0;
-      const uint32_t t_begin = min(seg_begin + tx * sub, seg_end);
-      const uint32_t t_end = min(t_begin + sub, seg_end);
-      float mass = 0.f;
-      for (uint32_t i = t_begin; i < t_end; ++i) {
-        mass += chunk[i] > low ? chunk[i] : 0.f;
-      }
-      float incl;
-      BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage.block_prim.scan)
-          .InclusiveSum(mass, incl);
-      if (tx == 0) temp_storage.sel_thread = BLOCK_THREADS;
-      __syncthreads();
-      if (mass > 0.f && incl > u_rem) atomicMin(&temp_storage.sel_thread, (int)tx);
-      __syncthreads();
-      int sel = temp_storage.sel_thread;
-      if (sel == (int)BLOCK_THREADS) {
-        // Rounding left u above the segment total: take the last thread with mass.
-        sel = BlockReduce<int, BLOCK_THREADS>(temp_storage.block_prim.reduce_int)
-                  .Reduce(mass > 0.f ? (int)tx : -1, MaxReduceOp{});
-        if (tx == 0) temp_storage.sel_thread = sel;
-        __syncthreads();
-        sel = temp_storage.sel_thread;
-      }
-      if ((int)tx == sel) {
-        float cdf = incl - mass;
-        int local_id = t_begin;
-        for (uint32_t i = t_begin; i < t_end; ++i) {
-          if (chunk[i] > low) {
-            local_id = i;
-            cdf += chunk[i];
-            if (cdf > u_rem) break;
-          }
-        }
-        const int2 sample = make_int2(chunk_start + local_id, __float_as_int(chunk[local_id]));
-        for (uint32_t r = 0; r < cluster_size; ++r) {
-          *cluster.map_shared_rank(&temp_storage.sample, r) = sample;
-        }
-      }
-    }
-    cluster.sync();
-    sampled_id = temp_storage.sample.x;
+    sampled_id = DrawSplitRowSamplingCandidate<false>(chunk, chunk_start, chunk_len, seg, slot, low,
+                                                      0, u, storage);
     if (sampled_id < 0) {
       is_valid = false;
       break;
+    }
+    if constexpr (!TOP_K) {
+      if (p >= 1.f) break;
     }
     // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
     const float pivot_0 = __int_as_float(temp_storage.sample.y);
     const float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
+    // Keep value-rejected rounds free of equality work in every sampling mode.
     threshold_pass(pivot_0, pivot_1);
     // Row totals: lane r sums rank r over its warps, then one fixed shuffle tree over ranks.
     ValueCount<float> r0{0.f, 0}, r1{0.f, 0};
-    int equal = 0;
     if (lane < cluster_size) {
 #pragma unroll
       for (uint32_t w = 0; w < NUM_WARPS; ++w) {
-        equal += temp_storage.equal[lane * NUM_WARPS + w];
         r0 += temp_storage.part[0][lane * NUM_WARPS + w];
         r1 += temp_storage.part[1][lane * NUM_WARPS + w];
       }
     }
     const ValueCount<float> agg0 = WarpReduceValueCount(r0);
     const ValueCount<float> agg1 = WarpReduceValueCount(r1);
-#pragma unroll
-    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
-      equal += __shfl_xor_sync(0xffffffff, equal, offset);
-    }
     const bool accept_0 = (!TOP_K || agg0.count < k) && (!TOP_P || p >= 1.f || agg0.value < p);
-    const bool accept_1 = (!TOP_K || agg1.count < k) && (!TOP_P || p >= 1.f || agg1.value < p);
-    bool resolve_boundary =
-        TOP_K && equal > 1 && agg0.count < k && uint32_t(agg0.count) + equal > k;
-    bool reject_group = false;
-    if constexpr (TOP_P) {
-      if (p < 1.f) {
-        const float group_mass = pivot_0 * equal;
-        const float error = SamplingMassError<BLOCK_THREADS>(agg0.value + group_mass, d);
-        reject_group = agg0.value - error >= p;
-        resolve_boundary |= agg0.value + group_mass + error >= p;
-      }
-    }
-    if (reject_group) {
-      low = pivot_0;
-      q = agg0.value;
-      slot = 0;
-      continue;
-    }
-    if (resolve_boundary) {
-      // Keep the current proposal and RNG history. Restarting sampling from a new
-      // random draw only on tied proposals would bias the retained distribution.
-      cluster.sync();  // Every peer has finished reading the scratch being reused.
-      if (rank == 0) {
-        const int result = ResolveSamplingBoundary<TOP_K, TOP_P, BLOCK_THREADS, SCAN_ALGORITHM,
-                                                   REDUCE_ALGO, VEC_SIZE, true>(
-            probs + static_cast<size_t>(row_idx) * d, d, pivot_0, agg0.value, agg0.count, equal, k,
-            p, sampled_id, state, storage.boundary);
-        if (tx < cluster_size) {
-          *cluster.map_shared_rank(&storage.resolution, tx) = result;
+    const bool accept_1 =
+        (!TOP_K || agg1.count < k) &&
+        (!TOP_P || p >= 1.f || agg1.value - SamplingMassError<BLOCK_THREADS>(agg1.value, d) < p);
+    // A float sum near p can falsely reject a legal boundary. Such rounds must
+    // still count ties and recheck the mass in double from the staged chunks.
+    const bool may_accept =
+        (!TOP_K || agg0.count < k) &&
+        (!TOP_P || p >= 1.f || agg0.value - SamplingMassError<BLOCK_THREADS>(agg0.value, d) < p);
+    if (may_accept) {
+      const uint32_t equal = equality_pass(pivot_0);
+      bool resolve_boundary = TOP_K && equal > 1 && uint32_t(agg0.count) + equal > k;
+      if constexpr (TOP_P) {
+        if (p < 1.f) {
+          const float mass = agg0.value + pivot_0 * equal;
+          resolve_boundary |= mass + SamplingMassError<BLOCK_THREADS>(mass, d) >= p;
         }
       }
-      cluster.sync();
-      const int result = storage.resolution;
-      if (result != -1) {
-        is_valid = result >= 0;
-        sampled_id = result;
-        break;
+      if (resolve_boundary) {
+        const int result = ResolveSplitRowSamplingBoundary<TOP_K, TOP_P>(
+            chunk, chunk_start, chunk_len, seg, d, pivot_0, agg0.value, agg0.count, equal, k, p,
+            sampled_id, state, storage);
+        if (result != -1) {
+          is_valid = result >= 0;
+          sampled_id = result;
+          break;
+        }
+        // The resolver leaves proposal masses intact when rejecting a group.
+        low = pivot_0;
+        q = agg0.value;
+        slot = 0;
+        continue;
       }
-      // A rejected group consumes no extra RNG draw. Restore the proposal scratch
-      // overwritten by the exact resolver before resuming the same cluster loop.
-      threshold_pass(pivot_0, pivot_1);
-      low = pivot_0;
-      q = agg0.value;
-      slot = 0;
-      continue;
     }
     if (accept_0) {
       // case 1: pivot_0 accepted

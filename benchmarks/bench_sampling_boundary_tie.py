@@ -135,6 +135,13 @@ def main():
                 assert row.numel() == probs[0].unique().numel()
             elif distribution == "uniform":
                 probs = torch.full((batch, args.vocab), 1 / args.vocab, device="cuda")
+            elif distribution == "fp32_softmax":
+                # Ordinary fp32 softmax may contain accidental equal values;
+                # the separate "unique" distribution verifies there are none.
+                logits = torch.randn(
+                    (batch, args.vocab), device="cuda", generator=generator
+                )
+                probs = logits.softmax(-1)
             elif distribution == "bf16_derived":
                 # Keep probabilities rounded to bf16, as in serving pipelines
                 # that promote stored bf16 probabilities back to fp32. Record

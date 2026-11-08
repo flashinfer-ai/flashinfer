@@ -1108,6 +1108,12 @@ boundary quotas, including AIR. Resolve ties only where the requested prefix
 cuts a group or a cumulative comparison is uncertain. Keep the three rejection
 kernels within the 1024-thread register budget on every compiled architecture;
 check compiler register/spill reports as well as real launches.
+On SM90 split-row sampling, keep the initial mass pass and every proposal's
+value pass free of equality counting. Only a proposal that can pass the value
+test (including floating-point-uncertain comparisons) pays for a separate staged
+chunk equality scan. Apply this uniformly to top-k, top-p and joint sampling.
+Resolve exact boundary mass and original-index quotas from the ranks' staged chunks,
+and preserve legal proposals before drawing from the final cluster-wide support.
 
 ## Development Workflow
 
