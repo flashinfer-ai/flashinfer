@@ -2548,6 +2548,23 @@ def _assert_tail_counters_zero() -> None:
                 assert _bits_zero(t), (key, role)
 
 
+def _recorded_tail_counters(monkeypatch, workspaces) -> list[tuple[str, torch.Tensor]]:
+    """The (role, buffer) of every self-cleaning tail counter buffer that ``workspaces`` (the pooled ones of eager
+    calls, the fresh ones of a CUDA graph capture) hands out from here on (the ``tail_ws`` slots are written before
+    they are read)."""
+    counters: list[tuple[str, torch.Tensor]] = []
+    take_zeroed = workspaces.take_zeroed
+
+    def recording(device_index, role, rows, row_shape, dtype, device):
+        buffer = take_zeroed(device_index, role, rows, row_shape, dtype, device)
+        if role != "tail_ws":
+            counters.append((role, buffer))
+        return buffer
+
+    monkeypatch.setattr(workspaces, "take_zeroed", recording)
+    return counters
+
+
 def _record_tail_launches(monkeypatch, device) -> list[tuple[str, tuple]]:
     """The (stage, grid) of every launch from here on; after each launch of the package tail, the counters it was
     given are zero (the launch's self-cleaning contract) and its workspace holds a slot per value head of its tiles."""
@@ -4135,11 +4152,22 @@ def test_concurrent_caller_streams(device) -> None:
     _assert_tail_counters_zero()
 
 
-@pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
-def test_cuda_graph_replay_matches_eager(heads, device) -> None:
+# (H, HV) and the call's keywords: the default tails (one cluster-tail launch, no counters) and the pinned stage
+# "tail", whose launches count their tiles in self-cleaning counters taken from the call's workspaces
+@pytest.mark.parametrize(
+    ("heads", "pins"),
+    [
+        ((2, 4), {}),
+        ((2, 6), {}),
+        ((2, 4), {"tail": "tail"}),
+        ((2, 6), {"tail": "tail"}),
+    ],
+    ids=["g2", "g3", "g2-tail", "g3-tail"],
+)
+def test_cuda_graph_replay_matches_eager(heads, pins, device, monkeypatch) -> None:
     seq_lens = STREAM_LAYOUT
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=269)
-    eager = _run(inputs, seq_lens, streams=1)
+    eager = _run(inputs, seq_lens, streams=1, **pins)
     leaves = {
         name: inputs[name].detach().clone().requires_grad_(True)
         for name in ("q", "k", "v", "g", "beta")
@@ -4154,19 +4182,27 @@ def test_cuda_graph_replay_matches_eager(heads, device) -> None:
         o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                          scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
-                                         streams=1)  # fmt: skip
+                                         streams=1, **pins)  # fmt: skip
         (o.float() * inputs["do"].float()).sum().backward()
         return o
 
     warmup = torch.cuda.Stream(device=device)
     warmup.wait_stream(torch.cuda.current_stream(device))
+    # no backward plan of an earlier call: the warm-up's first backward takes its tails' workspaces itself
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    warm = _recorded_tail_counters(monkeypatch, cake_chain._POOLED)
     with torch.cuda.stream(warmup):
         for _ in range(2):
             step()
     torch.cuda.current_stream(device).wait_stream(warmup)
+    # the capture takes fresh workspaces: the tail counters its kernels use are its own, on the eager calls' route
+    captured = _recorded_tail_counters(monkeypatch, cake_chain._FRESH)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         o = step()
+    assert bool(captured) == bool(warm), (len(warm), len(captured))
+    if pins.get("tail") == "tail":
+        assert captured, "the captured tail took no counters of its own"
     for _ in range(
         3
     ):  # every replay alone: the captured kernels leave their scratch as they found it
@@ -4178,6 +4214,8 @@ def test_cuda_graph_replay_matches_eager(heads, device) -> None:
         }
         _assert_within_budget(got, eager, OUTPUT_NAMES)
         _assert_tail_counters_zero()
+        for role, counter in captured:
+            assert _bits_zero(counter), role
 
 
 # --------------------------------------------------------------------------- round-once cluster tails, one packed row
