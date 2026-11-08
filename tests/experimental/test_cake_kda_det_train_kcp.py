@@ -7821,7 +7821,8 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
     handle are bitwise the same under every form, two rounds each, and the held-workspace backward's peak of
     allocated bytes is the ``"one"`` form's.  The records show each saved-set backward on its form (``"one"`` where
     the call launches ``kcp_dav``), except the table set's first side-stream replay, which runs on the call's stream
-    (it uploads the launches' device tables)."""
+    (it uploads the launches' device tables), and the held-workspace backward's launch record (``sequence``) is the
+    ``"one"`` form's."""
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ctx, ops, _chains = _walk_streams_problem(device, lengths, H, plan_sm)
     P = ctx.heads(H).P
@@ -7844,6 +7845,7 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
         peak = torch.cuda.max_memory_allocated(device) - base
         rec = cake_kcp.LAST_CALL["bwd"]
         recs.append((rec["bwd_tape_stream"], rec["kcp_dav"]))
+        seq = tuple(rec["sequence"])
         out_n, saved_n = cake_kcp.cake_kda_det_train_kcp_forward(*args, ctx, **knobs)
         g_none = cake_kcp.cake_kda_det_train_kcp_backward(
             *args, ctx, ops["dout"], saved=saved_n, **knobs
@@ -7862,16 +7864,16 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
             *g_none,
             *(ck[n] for n in TENSOR_NAMES + ("dw",)),
         )
-        return tuple(t.clone() for t in tensors), recs, peak
+        return tuple(t.clone() for t in tensors), recs, peak, seq
 
     configs = [{}] + ([{"saved_carry": 0}] if P > 1 else [])
     records: dict = {}
     first_side = True
     for extra in configs:
-        ref = ref_peak = None
+        ref = ref_peak = ref_seq = None
         for form in cake_kcp.BWD_TAPE_STREAMS:
             for r in range(2):
-                tensors, recs, peak = one_round(form, extra)
+                tensors, recs, peak, seq = one_round(form, extra)
                 records[f"{extra}:{form}:{r}"] = [list(x) for x in recs] + [peak]
                 for ran, dav in recs:
                     if form == "one" or dav == "launched":
@@ -7883,9 +7885,11 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
                     else:
                         assert ran == form, (extra, form, r, recs)
                 if ref is None:
-                    ref, ref_peak = tensors, peak
+                    ref, ref_peak, ref_seq = tensors, peak, seq
+                    assert "kcp_fwdh_tape" in ref_seq
                     assert all(torch.isfinite(t.float()).all().item() for t in ref)
                     continue
+                assert seq == ref_seq, (extra, form, r)
                 assert peak <= ref_peak, (extra, form, r, peak, ref_peak)
                 for a, b in zip(ref, tensors, strict=True):
                     assert (

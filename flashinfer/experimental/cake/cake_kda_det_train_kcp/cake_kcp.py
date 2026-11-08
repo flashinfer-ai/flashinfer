@@ -1013,7 +1013,9 @@ class _TapeSide:
     replay reads the workspace's pool rather than the saved plane).  ``*_hi``: the call's launches between the fork and
     the join run on a high-priority stream, the replay on the side stream at the default priority.  The fork / join
     are stream-ordered event operations (capturable).  Allocator: neither stream allocates; every operand is owned by
-    the workspace, the saved set, the call or the table set and outlives the join."""
+    the workspace, the saved set, the call or the table set and outlives the join.  The call's launch record
+    (``counters`` / ``sequence``) takes the replay's launches here, at their place in the program (where the one-stream
+    form records them), so the record does not depend on the form."""
 
     def __init__(
         self, call: CakeKDADetKcpCall, launches: list, form: str, index: int
@@ -1029,6 +1031,20 @@ class _TapeSide:
         self.main = torch.cuda.current_stream(call.device)
         self.forked = self.issued = False
         self._crit_ctx: Any = None
+        for walk, _h0 in launches:  # CakeKDADetKcpCall.walk's record, at the program's place
+            if len(walk):
+                call.counters["walks"] += 1
+                call.counters["launches"] += 1
+                call.sequence.append("kcp_fwdh_tape")
+
+    def _launch(self) -> None:
+        """The replay's launches on the current stream (recorded by the constructor)."""
+        for walk, h0 in self.launches:
+            if len(walk):
+                self.call.backend.run(
+                    "kcp_fwdh_tape",
+                    {"walk": walk, "h0": h0, "out": None, "_call": self.call},
+                )
 
     def point(self, where: str) -> None:
         if where == self.fork_at and not self.forked:
@@ -1041,8 +1057,7 @@ class _TapeSide:
             self.forked = True
         if where == self.issue_at and self.forked and not self.issued:
             with torch.cuda.stream(self.side):
-                for walk, h0 in self.launches:
-                    self.call.walk("kcp_fwdh_tape", walk, h0=h0, out=None)
+                self._launch()
             self.issued = True
 
     def join(self, *, complete: bool = True) -> None:
@@ -1056,8 +1071,7 @@ class _TapeSide:
             self.join_ev.record(self.side)
             self.main.wait_event(self.join_ev)
         elif complete:
-            for walk, h0 in self.launches:
-                self.call.walk("kcp_fwdh_tape", walk, h0=h0, out=None)
+            self._launch()
         self.forked = self.issued = False
         self.launches = []
 
