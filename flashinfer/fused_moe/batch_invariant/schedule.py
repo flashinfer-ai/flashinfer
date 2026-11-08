@@ -17,8 +17,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from ...gemm.batch_invariant.generator import CLUSTERS, TILES_N, Knobs, knob_product
-from ...gemm.batch_invariant.schedule import rank_topk
+from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
 
 #: How many ranked records per GEMM the autotuner profiles (the Cartesian product over the two GEMMs is the tactic space).
 TOP_K = 3
@@ -41,19 +40,6 @@ def grouped_knobs(clusters=None) -> List[Knobs]:
     )
 
 
-def _grouped(cfg: Knobs) -> Knobs:
-    """A dense record as a grouped one: swizzle 1, no grid cap, the N tile clamped into the grouped space (the dense
-    dispatcher's narrow decode tiles have no staged-epilogue layout: `blocks.compile.can_implement_grouped`)."""
-    return Knobs(
-        (cfg.mma_tiler_mn[0], max(cfg.mma_tiler_mn[1], TILES_N[0])),
-        cfg.cluster_shape_mn,
-        cfg.use_2cta_instrs,
-        True,
-        cfg.raster_along,
-        1,
-    )
-
-
 def all_valid_configs(
     N: int, K: int, E: int, chain: str = "plain", clusters=None
 ) -> List[Knobs]:
@@ -63,6 +49,23 @@ def all_valid_configs(
     return [
         k for k in grouped_knobs(clusters) if can_implement_grouped(k, N, K, E, chain)
     ]
+
+
+def raster_for(cfg: Knobs, rows: int) -> str:
+    """The grouped scheduler's raster as a structural rule, not an estimate term: along N once an expert's rows fill the
+    record's CTA row tile (its groups then span several m-blocks and consecutive CTAs share the expert's A block while its
+    weight tiles stream), along M below it (the weight tile is the larger operand of a few rows)."""
+    return "n" if rows >= cfg.cta_tile_mn[0] else "m"
+
+
+def pair_term(cfg: Knobs, rows: int) -> float:
+    """The expected dummy share of a cluster of ``cm`` CTA tiles along M: every expert's rows are padded to the record's M
+    extent (``cm`` CTA row tiles), and with the experts' row counts phased uniformly over that extent the expected padding
+    is half an extent, so the cluster's records carry (rows + cm x tile / 2) / (rows + tile / 2) of the single-tile
+    records' rows; the dense estimate at the average rows sees only the average's own tail."""
+    cm = cfg.cluster_shape_mn[0]
+    half = cfg.cta_tile_mn[0] / 2.0
+    return (rows + half * cm) / (rows + half)
 
 
 def rank_grouped(
@@ -77,34 +80,57 @@ def rank_grouped(
     nominal: bool = False,
     n_active: Optional[int] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one GEMM: the dense ranking at ``(M = rows, N = n_active * N)`` (``n_active``
-    the active experts, ``E`` by default) mapped onto the grouped space, in rank order, de-duplicated, at least ``k``
-    records when the space has them (the ranking is extended by the rest of the space in its enumeration order, so
-    the list is never empty for an implementable shape)."""
+    """The ranked grouped records for one GEMM: the grouped space the body accepts for the weight shape and the chain,
+    ordered by the dense class's estimate at ``(M = rows, N = n_active * N, K)`` (``n_active`` the active experts, ``E`` by
+    default) times the pair term (the expected dummy half of the two-tile clusters along M), each tile family priced once
+    (at the enumeration's raster: the dense estimate's tile-order term is the dense scheduler's, not the grouped one's) and
+    the raster the structural rule gives the grouped scheduler (`raster_for`) first among its twins, best first, ties in
+    the space's enumeration order; at a decode-sized ``rows`` the dense dispatcher's structural guard
+    (`heuristic.decode_sane`: 1-CTA tiles in an N-cluster) selects the candidates. As in the dense ``rank_topk``, each of
+    the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct records, at most
+    ``k``, never empty for an implementable shape."""
+    import dataclasses
+
+    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
     from .blocks.compile import can_implement_grouped
 
+    fam = family or "sm_107"
+    dense_n = (n_active or E) * N
+    space = [c for c in grouped_knobs() if can_implement_grouped(c, N, K, E, chain)]
+    guarded = [c for c in space if decode_sane(c, rows, False)]
+
+    def key(i, c):
+        canon = dataclasses.replace(c, raster_along="m")
+        est = estimate_cycles(
+            canon, rows, dense_n, K, 1, "k", "bf16", fam, sm_count, nominal=nominal
+        )
+        return (
+            est * pair_term(c, rows),
+            0 if c.raster_along == raster_for(c, rows) else 1,
+            i,
+        )
+
+    ranked = [
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded or space))
+    ]
+    members = set(space)
     out: List[Knobs] = []
     seen = set()
-    ranked = rank_topk(
-        rows,
-        (n_active or E) * N,
-        K,
-        1,
-        "k",
-        sm_count,
-        max(k, 10),
-        family,
-        "bf16",
-        nominal,
-    )
-    for cand in [_grouped(c) for c in ranked] + grouped_knobs():
-        if cand in seen or not can_implement_grouped(cand, N, K, E, chain):
-            continue
-        seen.add(cand)
-        out.append(cand)
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
+        )
+        for cand in (rec, twin):
+            if cand not in seen and (cand is rec or cand in members):
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
         if len(out) >= k:
             break
-    return out
+        if rec not in seen:
+            out.append(rec)
+            seen.add(rec)
+    return out[:k]
 
 
 def default_configs(
