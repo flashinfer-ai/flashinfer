@@ -192,9 +192,9 @@ def test_program_keys_are_the_deterministic_bf16_scan_keys_and_the_plain_merge()
         det_record = det_jit.PROGRAMS[_det_name(name)]
         for field in ("role", "arches"):
             assert record.get(field) == det_record.get(field), (name, field)
-        assert record.get("ticket_arg_arches") == det_record.get(
-            "ticket_arg_arches"
-        ), name
+        assert record.get("ticket_arg_arches") == det_record.get("ticket_arg_arches"), (
+            name
+        )
         assert record["library"] == name
 
 
