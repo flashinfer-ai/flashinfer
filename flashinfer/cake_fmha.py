@@ -797,7 +797,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SM103A"): (
-        "cake_fmha_context_nvfp4_c916619510183749b162",
+        "cake_fmha_context_nvfp4_7360fe70a945a41c5d0d",
         16,
         False,
     ),
@@ -807,7 +807,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
-        "cake_fmha_context_nvfp4_1b4750660638d644a971",
+        "cake_fmha_context_nvfp4_62a335e01c8f3530d827",
         16,
         False,
     ),
@@ -817,7 +817,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK1_SM103A"): (
-        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+        "cake_fmha_context_nvfp4_a5fcd58886fc76e8f7e0",
         None,
         False,
     ),
@@ -827,7 +827,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK2_SM103A"): (
-        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+        "cake_fmha_context_nvfp4_eba9334f768b4eebd97a",
         None,
         False,
     ),
@@ -837,7 +837,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK4_SM103A"): (
-        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+        "cake_fmha_context_nvfp4_be1af2e307496c73f39f",
         None,
         False,
     ),
@@ -847,7 +847,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK5_SM103A"): (
-        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+        "cake_fmha_context_nvfp4_be52830625b75b09c119",
         None,
         False,
     ),
@@ -857,7 +857,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK6_SM103A"): (
-        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+        "cake_fmha_context_nvfp4_d45ee790f5cd718e5b26",
         None,
         False,
     ),
@@ -867,7 +867,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK7_SM103A"): (
-        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+        "cake_fmha_context_nvfp4_a7b0eecf0e7dfe7fed5c",
         None,
         False,
     ),
@@ -877,7 +877,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK8_SM103A"): (
-        "cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+        "cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3",
         None,
         False,
     ),
@@ -887,7 +887,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK12_SM103A"): (
-        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+        "cake_fmha_context_nvfp4_099089a6787f767da51e",
         None,
         False,
     ),
@@ -897,7 +897,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK16_SM103A"): (
-        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+        "cake_fmha_context_nvfp4_6c4c5131194d8657d641",
         None,
         False,
     ),

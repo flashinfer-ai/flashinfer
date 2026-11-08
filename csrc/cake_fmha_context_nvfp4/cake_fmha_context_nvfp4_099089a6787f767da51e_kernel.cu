@@ -47,8 +47,8 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define NUM_M_BLOCKS 1
 #define NUM_Q_HEADS 8
 #define HEADS_PER_GROUP 1
-#define PACK_G 5
-#define TOK_PER_STAGE 25
+#define PACK_G 12
+#define TOK_PER_STAGE 10
 #define L2_SWIZZLE 8
 #define STATIC_ONE_TILE 1
 #define CHUNK_MAJOR_DEQUANT 0
@@ -65,7 +65,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
-#include <cuda_awbarrier_primitives.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
     uint32_t pred = 0;
@@ -81,9 +80,9 @@ __device__ __forceinline__ uint32_t elect_sync() {
 }
 
 
-__device__ __forceinline__ void mbarrier_init_owner_lane(
-    void* mbar_ptr, uint32_t count) {
-    __mbarrier_init(reinterpret_cast<__mbarrier_t*>(mbar_ptr), count);
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
 
@@ -372,7 +371,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod m_blocks, unsigned int full_sections, CakeFastDivmod bh_units, int q_heads, CakeFastDivmod heads_group)
+kernel_cake_fmha_context_nvfp4_099089a6787f767da51e(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod m_blocks, unsigned int full_sections, CakeFastDivmod bh_units, int q_heads, CakeFastDivmod heads_group)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -392,20 +391,20 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
     #define kv_full_addr (mbar_base + 16)
     #define kv_empty_addr (mbar_base + 40)
     #define pk_full_addr (mbar_base + 64)
-    #define pk_empty_addr (mbar_base + 80)
-    #define s_full_addr (mbar_base + 96)
-    #define p_full_addr (mbar_base + 112)
-    #define p_full_2_addr (mbar_base + 128)
-    #define corr_sig_addr (mbar_base + 144)
-    #define corr_done_addr (mbar_base + 160)
-    #define order_p01_0_addr (mbar_base + 176)
-    #define order_p01_1_addr (mbar_base + 184)
-    #define o_full_addr (mbar_base + 192)
-    #define q_empty_addr (mbar_base + 208)
-    #define page_full_addr (mbar_base + 216)
-    #define page_empty_addr (mbar_base + 264)
-    #define work_id_full_addr (mbar_base + 312)
-    #define work_id_empty_addr (mbar_base + 320)
+    #define pk_empty_addr (mbar_base + 128)
+    #define s_full_addr (mbar_base + 192)
+    #define p_full_addr (mbar_base + 208)
+    #define p_full_2_addr (mbar_base + 224)
+    #define corr_sig_addr (mbar_base + 240)
+    #define corr_done_addr (mbar_base + 256)
+    #define order_p01_0_addr (mbar_base + 272)
+    #define order_p01_1_addr (mbar_base + 280)
+    #define o_full_addr (mbar_base + 288)
+    #define q_empty_addr (mbar_base + 304)
+    #define page_full_addr (mbar_base + 312)
+    #define page_empty_addr (mbar_base + 360)
+    #define work_id_full_addr (mbar_base + 408)
+    #define work_id_empty_addr (mbar_base + 416)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -430,83 +429,57 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
     uint8_t* smem_pk = reinterpret_cast<uint8_t*>(smem_raw + 86528);
     const int smem_pk_addr = smem + 86528;
 
-    // Mbarrier init (41 barriers at smem_raw[0..328))
+    // Mbarrier init (53 barriers at smem_raw[0..424))
 
-    if (tid == 0) {
+    if (warp == 0) {
         // q_full: 2 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 0, 1);
-        mbarrier_init_owner_lane(smem_raw + 8, 1);
         // --- pipeline 'kv' ---
         // kv_full: 3 barriers, init_count=4
-        mbarrier_init_owner_lane(smem_raw + 16, 4);
-        mbarrier_init_owner_lane(smem_raw + 24, 4);
-        mbarrier_init_owner_lane(smem_raw + 32, 4);
         // kv_empty: 3 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 40, 1);
-        mbarrier_init_owner_lane(smem_raw + 48, 1);
-        mbarrier_init_owner_lane(smem_raw + 56, 1);
         // --- pipeline 'pk' ---
-        // pk_full: 2 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 64, 1);
-        mbarrier_init_owner_lane(smem_raw + 72, 1);
-        // pk_empty: 2 barriers, init_count=4
-        mbarrier_init_owner_lane(smem_raw + 80, 4);
-        mbarrier_init_owner_lane(smem_raw + 88, 4);
+        // pk_full: 8 barriers, init_count=1
+        // pk_empty: 8 barriers, init_count=4
         // s_full: 2 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 96, 1);
-        mbarrier_init_owner_lane(smem_raw + 104, 1);
         // p_full: 2 barriers, init_count=256
-        mbarrier_init_owner_lane(smem_raw + 112, 256);
-        mbarrier_init_owner_lane(smem_raw + 120, 256);
         // p_full_2: 2 barriers, init_count=128
-        mbarrier_init_owner_lane(smem_raw + 128, 128);
-        mbarrier_init_owner_lane(smem_raw + 136, 128);
         // corr_sig: 2 barriers, init_count=128
-        mbarrier_init_owner_lane(smem_raw + 144, 128);
-        mbarrier_init_owner_lane(smem_raw + 152, 128);
         // corr_done: 2 barriers, init_count=128
-        mbarrier_init_owner_lane(smem_raw + 160, 128);
-        mbarrier_init_owner_lane(smem_raw + 168, 128);
         // --- pipeline 'order_p01' ---
         // order_p01_0: 1 barriers, init_count=128
-        mbarrier_init_owner_lane(smem_raw + 176, 128);
         // order_p01_1: 1 barriers, init_count=128
-        mbarrier_init_owner_lane(smem_raw + 184, 128);
         // o_full: 2 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 192, 1);
-        mbarrier_init_owner_lane(smem_raw + 200, 1);
         // q_empty: 1 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 208, 1);
         // --- pipeline 'po' ---
         // page_full: 6 barriers, init_count=8
-        mbarrier_init_owner_lane(smem_raw + 216, 8);
-        mbarrier_init_owner_lane(smem_raw + 224, 8);
-        mbarrier_init_owner_lane(smem_raw + 232, 8);
-        mbarrier_init_owner_lane(smem_raw + 240, 8);
-        mbarrier_init_owner_lane(smem_raw + 248, 8);
-        mbarrier_init_owner_lane(smem_raw + 256, 8);
         // page_empty: 6 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 264, 1);
-        mbarrier_init_owner_lane(smem_raw + 272, 1);
-        mbarrier_init_owner_lane(smem_raw + 280, 1);
-        mbarrier_init_owner_lane(smem_raw + 288, 1);
-        mbarrier_init_owner_lane(smem_raw + 296, 1);
-        mbarrier_init_owner_lane(smem_raw + 304, 1);
         // work_id_full: 1 barriers, init_count=1
-        mbarrier_init_owner_lane(smem_raw + 312, 1);
         // work_id_empty: 1 barriers, init_count=480
-        mbarrier_init_owner_lane(smem_raw + 320, 480);
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 128;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(28), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(26), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(24), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(16), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(5), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(2), "r"((uint32_t)(1)));
+        mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+        uint32_t _mbarrier_init_count_0_32 = 480;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(20), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(13), "r"((uint32_t)(8)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(7), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(4), "r"((uint32_t)(128)));
+        if (lane < 21) {
+            mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_0_32);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
-
-    // CUTLASS owner-lane publication sequence
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 
     __syncthreads();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 328);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 424);
     if (warp == 0) {
-        int _tmem_hold = smem + 328;
+        int _tmem_hold = smem + 424;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -2506,7 +2479,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                     }
                     dq_pk_stage += 1;
-                    if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                    if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
@@ -2569,7 +2542,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                     }
                     dq_pk_stage += 1;
-                    if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                    if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                 }
@@ -2628,7 +2601,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                     }
                     dq_pk_stage += 1;
-                    if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                    if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
@@ -2691,7 +2664,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                     }
                     dq_pk_stage += 1;
-                    if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                    if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                 }
@@ -2700,12 +2673,14 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                 mbarrier_arrive(corr_done_addr);
                 mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
                 _phase_corr_sig_1 ^= 1;
+                mbarrier_arrive(corr_done_addr + 8);
                 #pragma unroll 1
                 for (unsigned int n_iter_2 = 1; n_iter_2 < num_n_blocks_1; n_iter_2++) {
                     mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
                     _phase_corr_sig_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float scale = sScale[warp % 4 * 32 + lane];
+                    mbarrier_arrive(corr_done_addr);
                     int _warp_vote_1 = __any_sync(0xFFFFFFFF, scale < 1.0f);
                     if (_warp_vote_1 != 0) {
                         int cr_base = taddr + (unsigned int)256 + (unsigned int)(warp % 4 * 32 << 16);
@@ -2769,7 +2744,6 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(p_full_addr);
-                    mbarrier_arrive(corr_done_addr + 8);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -2825,7 +2799,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                             mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                         }
                         dq_pk_stage += 1;
-                        if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                        if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                         dq_kv_stage += 1;
                         if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     }
@@ -2833,6 +2807,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                     _phase_corr_sig_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float scale1 = sScale[warp % 4 * 32 + lane + BLOCK_M];
+                    mbarrier_arrive(corr_done_addr + 8);
                     int _warp_vote_10 = __any_sync(0xFFFFFFFF, scale1 < 1.0f);
                     if (_warp_vote_10 != 0) {
                         int cr_base_1 = taddr + (unsigned int)384 + (unsigned int)(warp % 4 * 32 << 16);
@@ -2896,7 +2871,6 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(p_full_addr + 8);
-                    mbarrier_arrive(corr_done_addr);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -2958,12 +2932,11 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                             mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                         }
                         dq_pk_stage += 1;
-                        if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                        if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                         dq_kv_stage += 1;
                         if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     }
                 }
-                mbarrier_arrive(corr_done_addr + 8);
                 blocks_before += (int)num_n_blocks_1;
                 mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
                 _phase_corr_sig_0 ^= 1;
@@ -3036,7 +3009,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                                 mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                             }
                             dq_pk_stage += 1;
-                            if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                            if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                             dq_kv_stage += 1;
                             if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                             mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
@@ -3099,7 +3072,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                                 mbarrier_arrive(pk_empty_addr + (dq_pk_stage) * 8);
                             }
                             dq_pk_stage += 1;
-                            if (dq_pk_stage == 2) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
+                            if (dq_pk_stage == 8) { dq_pk_stage = 0; _phase_pk_full ^= 1; }
                             dq_kv_stage += 1;
                             if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                             next_kv0_done = 1;
@@ -3695,8 +3668,8 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                 num_n_blocks_4 = _max_0_4;
                 uint32_t ld_b = (bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_4), bh_units.multiplier) >> bh_units.shift_right) : (uint32_t)(bh_4);
                 uint32_t ld_unit = (uint32_t)(bh_4) - ld_b * (uint32_t)(bh_units.divisor);
-                uint32_t ld_head = (heads_group.divisor != 1) ? (__umulhi((uint32_t)(ld_unit * 5), heads_group.multiplier) >> heads_group.shift_right) : (uint32_t)(ld_unit * 5);
-                uint32_t ld_rank = (uint32_t)(ld_unit * 5) - ld_head * (uint32_t)(heads_group.divisor);
+                uint32_t ld_head = (heads_group.divisor != 1) ? (__umulhi((uint32_t)(ld_unit * 12), heads_group.multiplier) >> heads_group.shift_right) : (uint32_t)(ld_unit * 12);
+                uint32_t ld_rank = (uint32_t)(ld_unit * 12) - ld_head * (uint32_t)(heads_group.divisor);
                 int unit_1 = ld_unit;
                 int kv_head = ld_head;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[ld_b] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
@@ -3765,7 +3738,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         }
                     }
                     load_pk_stage += 1;
-                    if (load_pk_stage == 2) { load_pk_stage = 0; _phase_pk_empty ^= 1; }
+                    if (load_pk_stage == 8) { load_pk_stage = 0; _phase_pk_empty ^= 1; }
                     mbarrier_wait(pk_empty_addr + (load_pk_stage) * 8, _phase_pk_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(pk_full_addr + (load_pk_stage) * 8, 9216);
@@ -3806,7 +3779,7 @@ kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808(const __grid_constant__ CUte
                         }
                     }
                     load_pk_stage += 1;
-                    if (load_pk_stage == 2) { load_pk_stage = 0; _phase_pk_empty ^= 1; }
+                    if (load_pk_stage == 8) { load_pk_stage = 0; _phase_pk_empty ^= 1; }
                     if (elect_sync()) {
                         mbarrier_arrive(page_empty_addr + (load_po_stage) * 8);
                     }
