@@ -3139,17 +3139,18 @@ def _rope_varlen_binding_key(
     kv_latent: torch.Tensor,
     k_rope: torch.Tensor,
     gather_kv_indices: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
     topk_length: Optional[torch.Tensor],
     causal: bool,
     softmax_scale: float,
 ) -> tuple:
     """Cache key of the rope varlen entry's index-preparation route (tag ``"rope_varlen_fwd"``: disjoint from the
-    other keys): the :func:`_geometry` of the four activations, the per-document rows, both prefix sums and a caller
-    ``topk_length`` (``None`` when absent), ``causal`` and the scale.  The rows and lengths the forward reads are
-    fresh contiguous ``[T, K_slots]`` / ``[T]`` int32 buffers on the rows' device, so their geometry follows from
-    the key.  Data pointers are not part of it."""
+    other keys): the :func:`_geometry` of the four activations, the per-document rows and a caller ``topk_length``
+    (``None`` when absent), ``causal`` and the scale.  The route admits only contiguous int32 prefix sums on the
+    rows' device (:func:`_rope_varlen_index_mode`, decided on every call), and their length -- the document count,
+    which changes from step to step in training -- is a launch value of each call (:meth:`_IndexPrepStage.values`),
+    so the prefix sums are not part of the key.  The rows and lengths the forward reads are fresh contiguous
+    ``[T, K_slots]`` / ``[T]`` int32 buffers on the rows' device, so their geometry follows from the key.  Data
+    pointers are not part of it."""
     return (
         "rope_varlen_fwd",
         _geometry(q_latent),
@@ -3157,8 +3158,6 @@ def _rope_varlen_binding_key(
         _geometry(kv_latent),
         _geometry(k_rope),
         _geometry(gather_kv_indices),
-        _geometry(cu_seqlens_q),
-        _geometry(cu_seqlens_k),
         _geometry(topk_length),
         bool(causal),
         float(softmax_scale),
@@ -3301,8 +3300,6 @@ def cake_dsa_sparse_attention_nondet_varlen(
             kv_latent,
             k_rope,
             gather_kv_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
             topk_length,
             causal,
             scale,
@@ -5041,9 +5038,10 @@ def _check_index_rows(
 @dataclass(frozen=True)
 class _IndexPrepStage:
     """One index-preparation stage call less its tensors: the resolved stage entry, every launch value that follows
-    from the index rows' geometry, the prefix sums' length and the mode (:func:`_index_prep_stage`), and the span and
-    element offset of the rows' flat alias (:func:`_index_storage_span`).  It holds no tensor; :meth:`values` binds
-    the tensors of one call."""
+    from the index rows' geometry and the mode (:func:`_index_prep_stage`), and the span and element offset of the
+    rows' flat alias (:func:`_index_storage_span`).  It holds no tensor; :meth:`values` binds the tensors of one
+    call and, in document mode, the document count and its bisection steps, which follow from the prefix sums'
+    length and so may change from call to call."""
 
     entry: _StageEntry
     constants: dict[str, int] = field(repr=False)
@@ -5061,8 +5059,14 @@ class _IndexPrepStage:
     ) -> dict[str, Any]:
         """The launch values over one call's tensors: the flat alias of ``gather_kv_indices`` (of the geometry the
         stage was resolved for), the prefix sums, the outputs and the cut (``topk_length`` as the never-read
-        placeholder without one)."""
+        placeholder without one); in document mode also ``num_docs`` and ``search_iters`` from the prefix sums'
+        length."""
         values: dict[str, Any] = dict(self.constants)
+        if self.constants["has_docs"]:
+            num_docs = int(cu_seqlens_q.numel()) - 1
+            values.update(
+                num_docs=num_docs, search_iters=index_prep_search_iters(num_docs)
+            )
         values.update(
             indices=gather_kv_indices.as_strided(
                 (self.span,), (1,), gather_kv_indices.storage_offset() - self.offset
@@ -5089,7 +5093,8 @@ def _index_prep_stage(
     num_kv: Optional[int] = None,
 ) -> _IndexPrepStage:
     """The :class:`_IndexPrepStage` of :func:`_index_prep_launch`'s call over rows of ``gather_kv_indices``'s
-    geometry, in its mode (document mode reads the prefix sums' length only; flat mode needs ``num_kv``)."""
+    geometry, in its mode (document mode checks that both prefix sums are given and leaves the document count to
+    :meth:`_IndexPrepStage.values`; flat mode needs ``num_kv``)."""
     num_rows, topk = (int(d) for d in gather_kv_indices.shape)
     span, offset, stride = _index_storage_span(gather_kv_indices)
     for name, value in (
@@ -5103,23 +5108,22 @@ def _index_prep_stage(
     if flat:
         if num_kv is None:
             raise ValueError("the flat index-preparation mode needs num_kv")
-        num_docs, search_iters, causal_flag = 1, 1, 0
+        # one document, one bisection step; document mode binds both per call
+        docs, causal_flag = dict(num_docs=1, search_iters=1), 0
         has_docs, flat_bound = 0, _check_int32("S", int(num_kv)) - 1
     else:
         if cu_seqlens_q is None or cu_seqlens_k is None:
             raise ValueError(
                 "the document index-preparation mode needs both prefix sums"
             )
-        num_docs = int(cu_seqlens_q.numel()) - 1
-        search_iters, causal_flag = index_prep_search_iters(num_docs), int(bool(causal))
+        docs, causal_flag = {}, int(bool(causal))
         has_docs, flat_bound = 1, 0
     constants = dict(
         num_rows=num_rows,
         topk=topk,
         idx_stride=stride,
         indices_offset=offset,
-        num_docs=num_docs,
-        search_iters=search_iters,
+        **docs,
         causal=causal_flag,
         has_docs=has_docs,
         flat_bound=flat_bound,

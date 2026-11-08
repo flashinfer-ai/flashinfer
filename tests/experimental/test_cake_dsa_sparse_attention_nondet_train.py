@@ -7655,9 +7655,10 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
     forward plan, the stage's resolved entry and its geometry-derived launch values, and no tensor (no
     ``topk_length`` vector either).  A call of the same geometry with other storage and contents hits it and binds
     its own tensors; the stage's launch values are those of the uncached stage launch and the forward's those of
-    the flat entry over the stage's rows and counts.  ``causal``, a caller cut, a column slice and a misaligned start
-    of the rows are other keys; a strided prefix sum of a cached shape takes the torch twin, since the route is
-    decided on every call."""
+    the flat entry over the stage's rows and counts.  Another document count over the same rows hits it too and
+    binds its own ``num_docs`` / ``search_iters`` (training changes the count from step to step).  ``causal``, a
+    caller cut, a column slice and a misaligned start of the rows are other keys; a strided prefix sum of a cached
+    shape takes the torch twin, since the route is decided on every call."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     _stand_in_rope_program(monkeypatch, calls)
@@ -7745,6 +7746,27 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
             "topk_length",
         ),
     )
+    # another document count over the same rows: a hit with the call's own count and bisection steps
+    cu_q_m, cu_k_m = cu_q[[0, 2, 4]], cu_k[[0, 2, 4]]
+    stages_m, (prep_m, fwd_m) = launched(*acts, local, cu_q_m, cu_k_m, causal=True)
+    assert stages_m == stages and list(cache._entries) == [key]
+    assert cache._entries[key] is binding
+    ref_m = cake_backend._index_prep_launch(
+        cake_backend.arch_for(local.device),
+        local,
+        cu_q_m,
+        cu_k_m,
+        causal=True,
+        out=prep_m["out"],
+        topk_length=prep_m["topk_length"],
+        compact=True,
+    )
+    _assert_launch_values(
+        {name: prep_m[name] for name in ref_m.values}, ref_m.values, fresh=()
+    )
+    assert (prep["num_docs"], prep["search_iters"]) == (4, 3)
+    assert (prep_m["num_docs"], prep_m["search_iters"]) == (2, 2)
+    assert fwd_m["indices"] is prep_m["out"]
     # the forward's values are those of the flat entry over the stage's rows and counts
     del calls[:]
     cake_backend.forward(*acts, prep["out"], topk_length=prep["topk_length"])
