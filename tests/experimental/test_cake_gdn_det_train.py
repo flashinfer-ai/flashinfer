@@ -3016,6 +3016,30 @@ def _cu_tensors(seq_lens, device):
     )
 
 
+def _overlapping_streams(device):
+    """Two streams whose work overlaps: a launch on the second completes while the first sleeps.  Two streams can share
+    one hardware queue, which runs their work in issue order and hides the ordering under test; such a pair is replaced
+    by the next streams of the pool."""
+    current = torch.cuda.current_stream(device)
+    for _ in range(16):
+        s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+        s1.wait_stream(current)
+        s2.wait_stream(current)
+        woke, probe = torch.cuda.Event(), torch.cuda.Event()
+        with torch.cuda.stream(s1):
+            torch.cuda._sleep(100_000_000)
+            woke.record(s1)
+        with torch.cuda.stream(s2):
+            torch.ones(1, device=device).add_(1)
+            probe.record(s2)
+        probe.synchronize()
+        overlap = not woke.query()
+        torch.cuda.synchronize()
+        if overlap:
+            return s1, s2
+    pytest.skip("no two streams of the pool run concurrently on this device")
+
+
 @pytest.mark.parametrize("row", sorted(TABLE_CACHE_ROWS))
 def test_a_cached_table_is_read_after_its_write_on_another_stream(
     row, device, monkeypatch
@@ -3045,12 +3069,11 @@ def test_a_cached_table_is_read_after_its_write_on_another_stream(
     else:
         cake_chain._wavefront_order_tensor.cache_clear()
     cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
-    s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
-    s1.wait_stream(torch.cuda.current_stream(device))
-    s2.wait_stream(torch.cuda.current_stream(device))
-    probe, done = torch.cuda.Event(), torch.cuda.Event()
+    s1, s2 = _overlapping_streams(device)
+    woke, probe, done = torch.cuda.Event(), torch.cuda.Event(), torch.cuda.Event()
     with torch.cuda.stream(s1):
         torch.cuda._sleep(2_000_000_000)
+        woke.record(s1)
         first = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
     assert _table_cache_size(cache) == 1  # s1 rebuilt the table
     with torch.cuda.stream(s2):
@@ -3058,10 +3081,11 @@ def test_a_cached_table_is_read_after_its_write_on_another_stream(
         probe.record(s2)
         second = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
         done.record(s2)
-    time.sleep(0.1)
-    ran, queued = probe.query(), not done.query()
+    probe.synchronize()
+    time.sleep(0.1)  # time for the s2 call to finish if it does not wait for the write
+    asleep, queued = not woke.query(), not done.query()
     torch.cuda.synchronize()
-    assert ran, "s2 did not run while s1 slept (the streams are serialized)"
+    assert asleep, "s1 woke before the check (s2 did not run while s1 slept)"
     assert queued, "the call on s2 ran before the table write on s1"
     _assert_bitwise(first, want, OUTPUT_NAMES)
     _assert_bitwise(second, want, OUTPUT_NAMES)
