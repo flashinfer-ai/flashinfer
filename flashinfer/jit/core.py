@@ -662,6 +662,7 @@ class JitSpecNvcc(JitSpec):
             build_common_cuda_flags,
             build_cflags,
             build_cuda_cflags,
+            is_windows,
         )
 
         cuda_home = get_cuda_path()
@@ -707,9 +708,13 @@ class JitSpecNvcc(JitSpec):
             for source, flags in (self.extra_cuda_cflags_by_source or {}).items()
         }
 
-        # Get compilers
-        cxx = os.environ.get("CXX", "c++")
-        nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
+        # Get compilers. The Windows ninja rules compile C++ with cl.exe (CXX is
+        # not consulted), write the object through /Fo and quote every path.
+        def quote(text: str) -> str:
+            return f'"{text}"' if is_windows else text
+
+        cxx = "cl.exe" if is_windows else os.environ.get("CXX", "c++")
+        nvcc = quote(os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc"))
 
         # Build directory
         build_dir = str(self.build_dir.resolve())
@@ -734,9 +739,12 @@ class JitSpecNvcc(JitSpec):
             output_file = os.path.join(build_dir, obj_name)
 
             # Build the command string
-            command_parts = [compiler, "-c", str(source.resolve())]
+            command_parts = [compiler, "-c", quote(str(source.resolve()))]
             command_parts += flags
-            command_parts += ["-o", output_file]
+            if is_windows and not is_cuda:
+                command_parts.append(f"/Fo{quote(output_file)}")
+            else:
+                command_parts += ["-o", quote(output_file)]
 
             compile_commands.append(
                 {

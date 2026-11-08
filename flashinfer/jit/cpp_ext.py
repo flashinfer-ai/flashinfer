@@ -218,21 +218,7 @@ def _write_if_changed(target: Path, data: bytes) -> None:
 
 
 @functools.cache
-def get_spdlog_include_overlay() -> Optional[Path]:
-    """Create a Windows overlay of spdlog's bundled fmt with the MSVC-safe literal.
-
-    nvcc with the Visual Studio host compiler rejects the char32_t literal in
-    bundled/format.h (fixed in fmt 12.2, not yet in spdlog's bundled copy).  The
-    overlay holds a copy of the bundled directory with the two lines rewritten
-    and is passed with -I ahead of the spdlog include directory, so the quoted
-    sibling includes of format.h resolve inside the overlay as well.
-    """
-    if not is_windows:
-        return None
-    source_dir = jit_env.SPDLOG_INCLUDE_DIR / SPDLOG_FORMAT_HEADER.parent
-    if not source_dir.is_dir():
-        raise RuntimeError(f"spdlog bundled fmt directory not found: {source_dir}")
-    overlay_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "_spdlog_include_overlay"
+def _get_spdlog_include_overlay(source_dir: Path, overlay_dir: Path) -> Path:
     target_dir = overlay_dir / SPDLOG_FORMAT_HEADER.parent
     for source in sorted(source_dir.iterdir()):
         if not source.is_file():
@@ -241,7 +227,31 @@ def get_spdlog_include_overlay() -> Optional[Path]:
         if source.name == SPDLOG_FORMAT_HEADER.name:
             data = patch_bundled_format_h(data.decode("utf-8")).encode("utf-8")
         _write_if_changed(target_dir / source.name, data)
-    return overlay_dir.resolve()
+    return overlay_dir
+
+
+def get_spdlog_include_overlay() -> Optional[Path]:
+    """Create a Windows overlay of spdlog's bundled fmt with the MSVC-safe literal.
+
+    nvcc with the Visual Studio host compiler rejects the char32_t literal in
+    bundled/format.h (fixed in fmt 12.2, not yet in spdlog's bundled copy).  The
+    overlay holds a copy of the bundled directory with the two lines rewritten
+    and is passed with -I ahead of the spdlog include directory, so the quoted
+    sibling includes of format.h resolve inside the overlay as well.
+
+    The overlay lives under the current FLASHINFER_GEN_SRC_DIR: an AOT build that
+    moves to another build directory gets its own copy, and a copy that was
+    deleted is written again.
+    """
+    if not is_windows:
+        return None
+    source_dir = jit_env.SPDLOG_INCLUDE_DIR / SPDLOG_FORMAT_HEADER.parent
+    if not source_dir.is_dir():
+        raise RuntimeError(f"spdlog bundled fmt directory not found: {source_dir}")
+    overlay_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "_spdlog_include_overlay"
+    if not (overlay_dir / SPDLOG_FORMAT_HEADER).is_file():
+        _get_spdlog_include_overlay.cache_clear()
+    return _get_spdlog_include_overlay(source_dir.resolve(), overlay_dir.resolve())
 
 
 def get_nvcc_parallelism_flags() -> List[str]:

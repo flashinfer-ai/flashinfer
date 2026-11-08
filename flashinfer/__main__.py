@@ -525,6 +525,16 @@ def _install_kernel_wheels(
         )
 
 
+def _tolerate_console_encoding() -> None:
+    """Keep status markers from failing on a legacy Windows console code page."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--download-cubin",
@@ -535,6 +545,7 @@ def _install_kernel_wheels(
 @click.pass_context
 def cli(ctx, download_cubin_flag):
     """FlashInfer CLI"""
+    _tolerate_console_encoding()
     if download_cubin_flag:
         _download_cubin()
     elif ctx.invoked_subcommand is None:

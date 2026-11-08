@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from . import env as jit_env
-from .cpp_ext import is_windows
-from .utils import write_if_different
+from .cpp_ext import _write_if_changed, is_windows
 
 _OLD_DECLARATION = "constexpr unsigned long XLargeN = 1UL << 35;"
 _NEW_DECLARATION = "constexpr unsigned long long XLargeN = 1ULL << 35;"
@@ -47,6 +46,9 @@ def get_windows_header_overlay(
             elif old_count != 0 or new_count != 1:
                 raise RuntimeError(f"Unexpected XLargeN declaration in {source}")
         destination = overlay_root.joinpath(*export_subdir, header)
-        write_if_different(destination, content)
+        # A temporary file plus os.replace: a process that compiles the module
+        # while another one regenerates the overlay reads a whole header, never
+        # a truncated one.
+        _write_if_changed(destination, content.encode("utf-8"))
 
     return overlay_root

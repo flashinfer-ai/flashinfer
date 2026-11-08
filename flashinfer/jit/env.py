@@ -18,8 +18,10 @@ limitations under the License.
 # Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
 # This helps AOT script to override envs.
 
+import base64
 import functools
 import getpass
+import hashlib
 import logging
 import os
 import pathlib
@@ -75,13 +77,21 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
 # names leave fewer than 20 characters for the cache root.
 # On Linux/macOS we keep the conventional layout: $HOME/.cache/flashinfer/...
 # On Windows the default is a short per-user root at the drive root,
-# %SYSTEMDRIVE%\_fij_<user> (the user name, lower-case alphanumerics, at most six
-# characters); a tag two accounts share is refused by the owner-only check
+# %SYSTEMDRIVE%\_fij_<tag>: six characters derived from the account SID, so two
+# accounts get distinct roots; the user name stands in when the SID cannot be
+# read, and a root two accounts would share is refused by the owner-only check
 # below, never shared.
 FLASHINFER_CACHE_DIR: pathlib.Path
 
 
 def _windows_user_tag() -> str:
+    """Six characters that identify the account: a hash of its SID, else its name."""
+    from ._windows_acl import current_user_sid
+
+    sid = current_user_sid()
+    if sid:
+        digest = hashlib.sha256(sid.encode("ascii")).digest()
+        return base64.b32encode(digest)[:6].decode("ascii").lower()
     try:
         user = getpass.getuser()
     except (ImportError, OSError, KeyError):
