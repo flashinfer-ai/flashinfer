@@ -799,38 +799,34 @@ def build_chunk_meta_from_cu_seqlens(
     cu32 = (
         cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
     ).contiguous()
-    sizes = [num_chunks_max, num_chunks_max, num_seqs + 1]
-    for n in seg_max:
-        sizes.extend((n + 1, n, num_seqs + 1))
-    table = torch.empty(sum(sizes), dtype=torch.int32, device=cu_seqlens.device)
-    views = []
-    offset = 0
-    for n in sizes:
-        views.append(table[offset : offset + n])
-        offset += n
+    layout = (num_chunks_max, num_seqs,
+              tuple((n, int(plan.segment_len), tuple(plan.config)) for n, plan in zip(seg_max, scan_plans, strict=True)))  # fmt: skip
+    table = torch.empty(sum(_device_table_sizes(layout)), dtype=torch.int32, device=cu_seqlens.device)  # fmt: skip
+    meta, views = _device_meta(table, layout)
     _launch("meta", 1, 1, 1, cu32, *views, num_seqs, num_chunks_max, int(total_tokens),
             int(scan_plans[0].segment_len), int(scan_plans[1].segment_len), seg_max[0], seg_max[1])  # fmt: skip
-    segments = [
-        SegmentTable(
-            views[3 + 3 * i],
-            views[4 + 3 * i],
-            views[5 + 3 * i],
-            seg_max[i],
-            int(scan_plans[i].segment_len),
-            tuple(scan_plans[i].config),
-        )  # fmt: skip
-        for i in range(2)
-    ]
-    return ChunkMeta(
-        views[0],
-        views[1],
-        views[2],
-        num_chunks_max,
-        num_seqs,
-        None,
-        segments[0],
-        segments[1],
-    )
+    return meta
+
+
+def _device_table_sizes(layout) -> list[int]:
+    """The lengths of the device route's table views in the ``meta`` kernel's argument order; ``layout``: (chunk
+    bound, sequences, (segment bound, segment length, scan config) of the forward and the backward scan plans)."""
+    num_chunks_max, num_seqs, segments = layout
+    sizes = [num_chunks_max, num_chunks_max, num_seqs + 1]
+    for n, _, _ in segments:
+        sizes.extend((n + 1, n, num_seqs + 1))
+    return sizes
+
+
+def _device_meta(table: torch.Tensor, layout) -> tuple[ChunkMeta, tuple]:
+    """The device route's ``ChunkMeta`` over its one int32 table (the ``meta`` kernel's output) and the table's
+    views; the backward builds the forward's ``ChunkMeta`` again over the saved table and the same ``layout``."""
+    num_chunks_max, num_seqs, segments = layout
+    views = table.split(_device_table_sizes(layout))
+    tables = [SegmentTable(views[3 + 3 * i], views[4 + 3 * i], views[5 + 3 * i], n, segment_len, config)
+              for i, (n, segment_len, config) in enumerate(segments)]  # fmt: skip
+    meta = ChunkMeta(views[0], views[1], views[2], num_chunks_max, num_seqs, None, tables[0], tables[1])  # fmt: skip
+    return meta, views
 
 
 # --------------------------------------------------------------------------- #
@@ -4410,34 +4406,20 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
         elif plan.ops is not None:
             ctx.plan_key, ctx.plan = key, plan
     if cu_seqlens is not None and cu_seqlens_cpu is None:
-        # the device route's tables are an allocation of this call (the ``meta``
-        # kernel's): the backward builds them again from the caller's
-        # ``cu_seqlens`` (:func:`_backward_meta`), so ``ctx`` holds no tensor
-        # outside the saved list and a checkpointed forward keeps nothing beyond
-        # its outputs (#7039)
+        # the device route's tables are one int32 tensor of this call (the ``meta``
+        # kernel's output): saved after the tape (``_function_backward`` takes it
+        # off and builds the ChunkMeta over it again), so non-reentrant
+        # checkpointing drops it with the tape and its replayed forward builds it
+        # again; ``ctx`` keeps only the host layout (#7039)
+        ctx.meta_layout = (meta.num_chunks, meta.num_seqs,
+                           tuple((s.num_segments, s.segment_len, s.scan_config)
+                                 for s in (meta.fwd_segments, meta.bwd_segments)))  # fmt: skip
+        ctx.save_for_backward(*ctx.to_save, meta.chunk_start._base)
         ctx.meta = None
-        ctx.meta_source = (cu_seqlens, cu_seqlens._version, batch, seq_len, index,
-                           num_v_heads, num_v_heads // num_heads)  # fmt: skip
     output = fwd["output"]
     if output.dtype != q.dtype:
         output = output.to(q.dtype)
     return output, (fwd["final_state"] if output_final_state else None)
-
-
-def _backward_meta(ctx) -> ChunkMeta:
-    """The device route's chunk and segment tables for the backward: the forward's,
-    built again by the ``meta`` kernel from the caller's ``cu_seqlens`` (the same
-    launch on the same values, so the same bits; no host sync).  Like a saved
-    tensor, ``cu_seqlens`` may not change in place between the two calls."""
-    cu_seqlens, version, batch, seq_len, index, num_v_heads, group = ctx.meta_source
-    if cu_seqlens._version != version:
-        raise RuntimeError(
-            "cake_gdn_nondet: cu_seqlens was modified in place between the forward "
-            "and the backward; without cu_seqlens_cpu the backward builds its chunk "
-            "tables from it"
-        )
-    return _chunk_meta(cu_seqlens, None, batch, seq_len, index, num_v_heads,
-                       ctx.options, group)  # fmt: skip
 
 
 def _function_backward(ctx, do, dht, grad_qkv=None):
@@ -4445,11 +4427,18 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
     see :func:`cake_gdn_nondet_train_backward`).  A call with the forward's plan replays it (:func:`_replay`); any
     other runs the general path, which records the plan of the forward's key."""
     saved = ctx.saved_tensors
+    layout = getattr(ctx, "meta_layout", None)
+    if layout is not None:
+        # the device route: its table is the last saved tensor (see _function_forward)
+        saved, table = saved[:-1], saved[-1]
+        ctx.meta = _device_meta(table, layout)[0]
     plan = ctx.plan
     if plan is not None and dht is None and plan.ready(do, grad_qkv):
         dq, dk, dv, dg, dbeta, dh0 = _replay(plan, saved, do, grad_qkv)
     else:
         dq, dk, dv, dg, dbeta, dh0 = _general_backward(ctx, saved, do, dht, grad_qkv)
+    if layout is not None:
+        ctx.meta = None
     g_dtype, beta_dtype = ctx.dtypes
     if dg.dtype != g_dtype:
         dg = dg.to(g_dtype)
@@ -4472,8 +4461,6 @@ def _general_backward(ctx, saved, do, dht, grad_qkv):
         for name, t in zip(cake_plan.STATE_NAMES, state_tensors, strict=True)
         if name in kept
     )
-    if tape["meta"] is None:  # the device route (see _function_forward)
-        tape["meta"] = _backward_meta(ctx)
     do = do.contiguous()
     key = ctx.plan_key
     recorder = None
