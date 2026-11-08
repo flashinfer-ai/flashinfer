@@ -5857,6 +5857,173 @@ def test_fwd_split_a_tape_matches_the_w_form(device, monkeypatch) -> None:
 # --------------------------------------------------------------------------- M-share: the backward on the forward's maps
 # The pricing rule's rows on B200 (sm_100a, 148 SMs): the priced saving (us) of the backward's first wave, M-share where
 # it reaches M_SHARE_MIN_SAVING; a row without a middle piece prices none.
+# --------------------------------------------------------------------------- unaligned rows, deterministic algorithms
+# the forward routes: the prep forward, the forward on wy_a's A (serial table), and the split forward on wy_a's A and
+# on the WY stage's w / u
+ROW_ROUTES = ("prep", "a", "split_a", "split_w")
+
+
+def _route_or_skip(route, device, monkeypatch):
+    """Force ``route`` on the device (skip where it is not routed) and return its layout ``(heads, seq_lens)`` and the
+    stage that marks it among the launches (``prep``: a prep stage)."""
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    if route == "prep":
+        monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
+        monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
+        return FWD_A_CASES["g3"], "prep"
+    if route == "a":
+        _fwd_a_or_skip(device)
+        return FWD_A_CASES["g3"], "fwd_ho_a"
+    _fwd_split_or_skip(device)
+    monkeypatch.setattr(
+        cake_plan,
+        "FORWARD_SPLIT_MIN_PIECE",
+        types.MappingProxyType(
+            {a: FWD_SPLIT_TEST_MIN_PIECE for a in cake_chain.FWD_SPLIT_ARCHS}
+        ),
+    )
+    if route == "split_a":
+        stages = cake_chain.FWD_SPLIT_A_STAGES
+        if not all(cake_chain._available(stage, arch) for stage in stages):
+            pytest.skip(f"the split forward on wy_a's A is not delivered for {arch}")
+        monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", (arch,))
+        return FWD_SPLIT_CASES["g3"], "fwd_summary_a"
+    monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", ())
+    return FWD_SPLIT_CASES["g3"], "fwd_fused"
+
+
+def _unaligned(t: torch.Tensor, offset: int) -> torch.Tensor:
+    """A contiguous copy of ``t`` ``offset`` elements past the base of a fresh allocation (a leaf of its own)."""
+    buf = torch.empty(t.numel() + 16, dtype=t.dtype, device=t.device)
+    out = buf[offset : offset + t.numel()].view(t.shape).detach()
+    out.copy_(t)
+    return out
+
+
+def _run_rows(inputs, seq_lens, h0, dht, offset: int = 0) -> dict:
+    """Forward and backward with v, the initial state, the output gradient and the final state's gradient as fresh
+    copies (``offset`` 0) or as contiguous tensors whose base is not 16-byte aligned: BF16 v and do ``offset``
+    elements, FP32 h0 and dht 1..3 elements past an allocation's base."""
+
+    def place(t, fp32=False):
+        if not offset:
+            return t.detach().clone()
+        got = _unaligned(t, 1 + (offset - 1) % 3 if fp32 else offset)
+        assert got.is_contiguous() and got.data_ptr() % 16, (offset, got.data_ptr())
+        return got
+
+    leaves = {
+        n: inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "g", "beta")
+    }
+    leaves["v"] = place(inputs["v"]).requires_grad_(True)
+    h = place(h0, fp32=True).requires_grad_(True)
+    cu = _cu(seq_lens)
+    o, final = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                               scale=1.0 / math.sqrt(HEAD_DIM), initial_state=h, output_final_state=True,
+                               cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=h0.device),
+                               cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True)  # fmt: skip
+    torch.autograd.backward((o, final), (place(inputs["do"]), place(dht, fp32=True)))
+    torch.cuda.synchronize()
+    return {
+        "o": o.detach(),
+        "final_state": final.detach(),
+        **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+        "dh0": h.grad,
+    }
+
+
+@pytest.mark.parametrize("route", ROW_ROUTES)
+def test_unaligned_rows_give_the_aligned_bits(route, device, monkeypatch) -> None:
+    # a contiguous v (and do, h0, dht) whose base is not 16-byte aligned is copied before a stage reads it with
+    # 16-byte loads: on every forward route and the backward, the bits of the aligned copies at each offset
+    (heads, seq_lens), marker = _route_or_skip(route, device, monkeypatch)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=451)
+    gen = torch.Generator().manual_seed(452)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    stages = _record_launches(monkeypatch)
+    want = _run_rows(inputs, seq_lens, h0, dht)
+    if marker == "prep":
+        assert _preps(stages) and "fwd_ho_a" not in stages, (route, stages)
+    else:
+        assert marker in stages, (route, stages)
+    for offset in range(1, 8):
+        _assert_same_bits(_run_rows(inputs, seq_lens, h0, dht, offset), want, names)
+
+
+@pytest.mark.parametrize("route", ("a", "split"))
+def test_deterministic_algorithms_run_the_a_and_split_routes(
+    route, device, monkeypatch
+) -> None:
+    # every launch is fixed-order and the host ops of the forwards on wy_a's A (index_fill_, index_select,
+    # index_copy_) have deterministic implementations: under torch.use_deterministic_algorithms(True) (uninitialized
+    # memory filled, warnings as errors) the forward, the backward and a checkpointed step run without an alert, with
+    # the bits of the default mode
+    if route == "a":
+        _fwd_a_or_skip(device)
+        heads, seq_lens = FWD_A_CASES["g3"]
+        marker = "fwd_ho_a"
+    else:
+        _fwd_split_or_skip(device)
+        monkeypatch.setattr(
+            cake_plan,
+            "FORWARD_SPLIT_MIN_PIECE",
+            types.MappingProxyType(
+                {a: FWD_SPLIT_TEST_MIN_PIECE for a in cake_chain.FWD_SPLIT_ARCHS}
+            ),
+        )
+        monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+        heads, seq_lens = FWD_SPLIT_CASES["g3"]
+        marker = _split_wave()
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=455)
+    gen = torch.Generator().manual_seed(456)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    want = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
+    plain = _run(inputs, seq_lens)
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+
+    def layer(q, k, v, g, beta):
+        o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+                               cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
+        return o
+
+    leaves = {
+        n: inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    }
+    with _deterministic_algorithms(True), warnings.catch_warnings():
+        warnings.simplefilter("error")
+        stages = _record_launches(monkeypatch)
+        got = _run(
+            inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht
+        )
+        o = checkpoint(layer, *leaves.values(), use_reentrant=False)
+        (o.float() * inputs["do"].float()).sum().backward()
+        torch.cuda.synchronize()
+    assert marker in stages, (route, stages)
+    _assert_same_bits(got, want, names)
+    ckpt = {
+        "o": o.detach(),
+        **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+    }
+    _assert_same_bits(ckpt, plain, OUTPUT_NAMES)
+
+
 M_SHARE_ROWS = {
     "issue": ((2, 6), (131071, 87531, 43385), 55.194),
     "P3": ((2, 6), (128147, 131027), 55.194),

@@ -2541,15 +2541,16 @@ def _tma_rows(t: torch.Tensor) -> bool:
 
 
 def _dense(t: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """``t`` as contiguous rows with the same bits: ``t`` itself when contiguous, else one copy (into ``out``, a
-    contiguous tensor of ``t``'s shape and dtype, when given).  A view with a unit innermost stride whose row length,
-    element offset and other strides are multiples of a word of :data:`_COPY_WORDS` (a head view of a packed row) is
-    copied as the widest such word: the same bytes in an eighth (16-byte words) or a quarter (8-byte words) of the
-    elements of a BF16 copy, which PyTorch's strided copy moves one element per thread step.  The word copy is a plain
-    load and store of each word, so every bit pattern survives."""
-    if t.is_contiguous():
-        return t
+    """``t`` as contiguous rows with the same bits: without ``out``, ``t`` itself when contiguous, else one copy; with
+    ``out`` (a contiguous tensor of ``t``'s shape and dtype) always one copy into ``out``, contiguous ``t`` too (a
+    caller that reads ``out`` instead of ``t``: a contiguous ``t`` whose base is not 16-byte aligned is copied as well).
+    A view with a unit innermost stride whose row length, element offset and other strides are multiples of a word of
+    :data:`_COPY_WORDS` (a head view of a packed row) is copied as the widest such word: the same bytes in an eighth
+    (16-byte words) or a quarter (8-byte words) of the elements of a BF16 copy, which PyTorch's strided copy moves one
+    element per thread step.  The word copy is a plain load and store of each word, so every bit pattern survives."""
     if out is None:
+        if t.is_contiguous():
+            return t
         out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
     size = t.element_size()
     if t.dim() > 0 and t.stride(-1) == 1:
@@ -2565,6 +2566,14 @@ def _dense(t: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
                 return out
     out.copy_(t)
     return out
+
+
+def _aligned_rows(t: torch.Tensor) -> torch.Tensor:
+    """``t`` where it is contiguous at a 16-byte aligned base, else a contiguous copy of it in a fresh allocation: the
+    stages read their row operands (``do``, the state rows) with 16-byte loads."""
+    if t.is_contiguous() and t.data_ptr() % 16 == 0:
+        return t
+    return _dense(t, torch.empty(t.shape, dtype=t.dtype, device=t.device))
 
 
 def _row_stride(t: torch.Tensor) -> int:
@@ -2977,9 +2986,12 @@ def _walk(device, segs: SegmentTable, options: ChainOptions) -> torch.Tensor:
 
 
 def _table_rows(state, meta: ChunkMeta):
-    """Per-sequence state rows (``initial_state``, ``dht``) in the table's sequence order."""
-    if state is None or meta.order_index is None:
-        return state
+    """Per-sequence state rows (``initial_state``, ``dht``) in the table's sequence order, contiguous at a 16-byte
+    aligned base (:func:`_aligned_rows`)."""
+    if state is None:
+        return None
+    if meta.order_index is None:
+        return _aligned_rows(state)
     return state.index_select(0, meta.order_index[0])
 
 
@@ -3659,9 +3671,10 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     f32, bf16 = torch.float32, q.dtype
     if not (_tma_rows(q) and _tma_rows(k)):
         q, k = _dense(q), _dense(k)
-    # wy_tc2 reads v by rows at its token pitch (:func:`_v_rows`); any other layout is copied into contiguous rows
+    # wy_tc2 reads v by rows at its token pitch (:func:`_v_rows`); any other layout, a contiguous v whose base is not
+    # 16-byte aligned among them, is copied into contiguous rows
     v_rows = _v_rows(v)
-    copy_v = v_rows is None and not v.is_contiguous()
+    copy_v = v_rows is None
     if v_rows is None:
         v_rows = num_v_heads
     pieces = [(q.shape, bf16), (k.shape, bf16), ((total_tokens, num_heads), f32), ((total_tokens, num_heads), f32),
@@ -4093,9 +4106,12 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     # of its own, freed when the forward returns, the output as its own (the caller keeps it past the tape)
     f32 = torch.float32
     # v stays a view where the stages that read it by rows take its token pitch (``wy_tc2`` on every architecture
-    # today; :func:`_v_rows`), else it is copied once into contiguous rows
-    v_rows = _v_rows(v) if wy_stage(arch) == "wy_tc2" else None
-    copy_v = v_rows is None and not v.is_contiguous()
+    # today; :func:`_v_rows`; the other WY stage reads contiguous rows only), else it is copied once into contiguous
+    # rows: a contiguous v whose base is not 16-byte aligned too (the 16-byte ``cp.async`` rows)
+    v_rows = _v_rows(v)
+    if wy_stage(arch) != "wy_tc2" and v_rows != num_v_heads:
+        v_rows = None
+    copy_v = v_rows is None
     if v_rows is None:
         v_rows = num_v_heads
     pieces = [(q.shape, q.dtype), (k.shape, k.dtype), ((total_tokens, num_heads), f32), ((total_tokens, num_heads), f32),
@@ -4726,9 +4742,10 @@ def _backward_chain(
     v, beta32 = forward["v"], forward["beta32"]
     num_heads, num_v_heads = qn.shape[-2], v.shape[-2]
     v_rows = _v_rows(v)
-    if v_rows is None:  # a tape whose v is not one the stages read in place
+    if v_rows is None:  # a tape whose v is not one the stages read in place: copied into fresh contiguous rows
         ex.refuse("v is not read in place")
-        v, v_rows = v.contiguous(), num_v_heads
+        v = _dense(v, torch.empty(v.shape, dtype=v.dtype, device=v.device))
+        v_rows = num_v_heads
     form = tail_form(
         num_heads, num_v_heads, options.tail, arch=arch, num_chunks=meta.num_chunks
     )
@@ -4736,7 +4753,7 @@ def _backward_chain(
     device = qn.device
     index = _tensor_index(qn)
     table = workspaces.table(index)
-    do = do.contiguous()
+    do = _aligned_rows(do)
     if initial_state is None:
         initial_state = forward.get("initial_state")
     has_initial_state = initial_state is not None
@@ -5560,7 +5577,7 @@ def _general_backward(ctx, saved, do, dht, grad_qkv):
     )
     if ctx.m_share:
         tape["m_share"] = m_share
-    do = do.contiguous()
+    do = _aligned_rows(do)
     key = ctx.plan_key
     recorder = None
     if key is not None and dht is None:
