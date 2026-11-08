@@ -340,7 +340,7 @@ tail rule show.
 | `warmup_log2` | `-10 / ln 2` | warm-up threshold of the pre-scans |
 | `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits as `"reg"` on `dhu_tc2`, within the budgets on `dhu_tc2_dvl32`) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
-| `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
+| `save_state` | `True` | keep the forward state of the architecture's tape level for the backward (`T_full`: `w`, `h`, `v_new`; `u`, read only to rebuild `h` / `v_new`, is freed when the forward returns); `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order |
 | `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream |

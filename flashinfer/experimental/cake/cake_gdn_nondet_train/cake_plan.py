@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The host plan of one call that the forward and the backward share: the one-wave piece table of the sequences
-(:func:`pieces`), cached with the device's SM count per sequence-length table (:func:`host_plan`), and the
-placeholder that keeps a saved list's arity where a call saves no tensor (:func:`placeholder`).
+(:func:`pieces`), cached with the device's SM count per sequence-length table (:func:`host_plan`), the frozen tape
+level of each architecture (:data:`TAPE_LEVELS`, :func:`tape_state`), and the placeholder that keeps a saved list's
+arity where a call saves no tensor (:func:`placeholder`).
 
 A long sequence's scan splits into pieces of at most ``L`` chunks: the smallest ``L`` whose first wave fits one CTA
 per SM, ``sum_d max(P_d - 1, 1) * HV <= sm_count`` with ``P_d = ceil(n_d / L)`` pieces of sequence ``d`` (``n_d``
@@ -28,15 +29,19 @@ scan is each scan's priced choice; both read the same table.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from types import MappingProxyType
 
 import torch
 
 from . import cake_backend, cake_jit
 
 __all__ = [
+    "LEVEL_STATE",
+    "STATE_NAMES",
+    "TAPE_LEVELS",
     "HostPlan",
     "Pieces",
     "chunk_counts",
@@ -44,9 +49,24 @@ __all__ = [
     "piece_length",
     "pieces",
     "placeholder",
+    "tape_state",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
+
+# The forward state a call can keep for the backward, in the saved list's order.
+STATE_NAMES: tuple[str, ...] = ("w", "u", "h", "v_new")
+# The state each tape level keeps.  ``T_full`` keeps the WY factor ``w`` and the scan's ``h`` / ``v_new``, everything
+# the backward reads: the WY output ``u`` is read only to rebuild ``h`` / ``v_new``, so its bytes are freed when the
+# forward returns.
+LEVEL_STATE: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {"T_full": ("w", "h", "v_new")}
+)
+# The tape level of each architecture, frozen: one level per architecture for every row, so the backward of a call and
+# its accuracy record read the same tape.
+TAPE_LEVELS: Mapping[str, str] = MappingProxyType(
+    {"sm_100a": "T_full", "sm_103a": "T_full", "sm_107a": "T_full"}
+)
 
 
 def chunk_counts(seq_lens: Sequence[int]) -> tuple[int, ...]:
@@ -140,6 +160,13 @@ def host_plan(
         sm_count,
         _pieces(chunks, int(num_v_heads), sm_count),
     )
+
+
+def tape_state(arch: str, save_state: bool) -> tuple[str, ...]:
+    """The state tensors (of :data:`STATE_NAMES`) the saved list of a call on ``arch`` carries: those of the
+    architecture's tape level (:data:`TAPE_LEVELS`) under ``save_state``, none without it (the backward rebuilds the
+    state).  The others stand in the list as placeholders (:func:`placeholder`)."""
+    return LEVEL_STATE[TAPE_LEVELS[arch]] if save_state else ()
 
 
 def placeholder(

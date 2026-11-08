@@ -15,7 +15,8 @@ limitations under the License.
 
 The shared host plan of the Cake non-deterministic GDN chunked-training package (``cake_plan``): the one-wave piece
 table on the gating rows at the SM counts of B200 (148), GB300 / GB200 (152) and R200 (212), its limits, the cached
-host plan entry on the launching device and the storage-free placeholder.  CPU except the host plan entry.
+host plan entry on the launching device, the frozen tape level of each architecture and the storage-free placeholder.
+CPU except the host plan entry.
 """
 
 from __future__ import annotations
@@ -121,6 +122,23 @@ def test_no_split(hv: int, lens: tuple[int, ...], sms: int) -> None:
     assert table.counts == tuple(1 for _ in lens)
     assert table.second_wave == 0
     assert cake_plan.piece_length(cake_plan.chunk_counts(lens), hv, sms) is None
+
+
+def test_the_tape_levels_are_frozen_and_keep_what_the_backward_reads() -> None:
+    assert dict(cake_plan.TAPE_LEVELS) == {
+        "sm_100a": "T_full",
+        "sm_103a": "T_full",
+        "sm_107a": "T_full",
+    }
+    with pytest.raises(TypeError):
+        cake_plan.TAPE_LEVELS["sm_100a"] = "T_full"
+    with pytest.raises(TypeError):
+        cake_plan.LEVEL_STATE["T_full"] = cake_plan.STATE_NAMES
+    assert cake_plan.STATE_NAMES == ("w", "u", "h", "v_new")
+    for arch in cake_plan.TAPE_LEVELS:
+        # u is read only to rebuild h / v_new, which T_full keeps
+        assert cake_plan.tape_state(arch, True) == ("w", "h", "v_new")
+        assert cake_plan.tape_state(arch, False) == ()
 
 
 def test_placeholder() -> None:

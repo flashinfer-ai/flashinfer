@@ -397,7 +397,8 @@ class ChainOptions:
     the budgets on ``dhu_tc2_dvl32``); ``prep``
     forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
     grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule); ``save_state`` keeps the
-    forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
+    forward state of the architecture's tape level for the backward (``T_full``: ``w`` / ``h`` / ``v_new``,
+    :data:`cake_plan.TAPE_LEVELS`; else they are recomputed); ``host_cache`` keeps the
     chunk tables, the selection results and the per-stream workspaces between calls; ``lpt`` dispatches the
     sequences of a host-built table longest first (the same bits; ``False``: the caller's order); ``streams`` is
     ``2`` to let a host-built table's serial scans run as two sequence groups on the caller's stream and a side stream
@@ -2837,8 +2838,9 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     beta = beta.contiguous()
     beta_bf16 = beta.dtype == torch.bfloat16
     # every tensor of the forward is made before its first launch, so the launches follow one another without host
-    # work between them: the tape's tensors (and the state's, which the tape keeps under save_state) as views of one
-    # allocation (:func:`_carve`), the output as its own (the caller keeps it past the tape)
+    # work between them: the tape's tensors (and the state its tape level keeps under save_state,
+    # :func:`cake_plan.tape_state`) as views of one allocation (:func:`_carve`), the rest of the state as views of
+    # another, freed when the forward returns, the output as its own (the caller keeps it past the tape)
     f32 = torch.float32
     # v stays a view where the stages that read it by rows take its token pitch (``wy_tc2`` on every architecture
     # today; :func:`_v_rows`), else it is copied once into contiguous rows
@@ -2854,10 +2856,15 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
         pieces.append(((total_tokens, num_v_heads), f32))
     state = [((total_tokens, num_v_heads, HEAD_DIM), k.dtype), (v.shape, v.dtype),
              ((meta.num_chunks, num_v_heads, HEAD_DIM, HEAD_DIM), k.dtype), (v.shape, v.dtype)]  # fmt: skip
-    if options.save_state:
-        views = _carve(device, pieces + state)
-    else:  # the state is not on the tape: its own allocation, freed when the forward returns
-        views = _carve(device, pieces) + _carve(device, state)
+    kept = cake_plan.tape_state(arch, options.save_state)
+    on_tape = [name in kept for name in cake_plan.STATE_NAMES]
+    kept_state = [s for s, on in zip(state, on_tape, strict=True) if on]
+    off_state = [s for s, on in zip(state, on_tape, strict=True) if not on]
+    views = _carve(device, pieces + kept_state)
+    kept_views = iter(views[len(pieces) :])
+    off_views = iter(_carve(device, off_state) if off_state else ())
+    views = views[: len(pieces)]
+    views += [next(kept_views) if on else next(off_views) for on in on_tape]
     qn, kn, rstd_q, rstd_k, g_cs, A = views[:6]
     rest = views[6:]
     v_dense = rest.pop(0) if copy_v else None
@@ -3013,7 +3020,9 @@ def cake_gdn_nondet_train_backward(
     if initial_state is None:
         initial_state = forward.get("initial_state")
     has_initial_state = initial_state is not None
-    if forward.get("w") is None or forward.get("u") is None:
+    # u is read only to rebuild h / v_new (a T_full tape keeps w, h and v_new without u)
+    rebuild_state = forward.get("h") is None or forward.get("v_new") is None
+    if forward.get("w") is None or (rebuild_state and forward.get("u") is None):
         w, u = _launch_wy(
             arch,
             kn,
@@ -3029,8 +3038,8 @@ def cake_gdn_nondet_train_backward(
             v_rows=v_rows,
         )
     else:
-        w, u = forward["w"], forward["u"]
-    if forward.get("h") is None or forward.get("v_new") is None:
+        w, u = forward["w"], forward.get("u")
+    if rebuild_state:
         h, v_new, _ = _launch_fwd_h(arch, kn, w, u, g_cs, _table_rows(initial_state, meta), meta, num_heads,
                                     num_v_heads,
                                     store_final_state=False, table=table, workspaces=workspaces,
@@ -3613,12 +3622,18 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
     fwd = cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
                                         initial_state=initial_state, output_final_state=output_final_state,
                                         normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
-    state_tensors = (
-        (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
+    # the saved list keeps its arity whatever the tape level keeps (a metadata-equal placeholder stands for the rest
+    # of the state, :func:`cake_plan.placeholder`); the backward reads the kept names from the plan, never a
+    # placeholder
+    kept = cake_plan.tape_state(arch, options.save_state)
+    state_tensors = tuple(
+        fwd[name]
+        if name in kept
+        else cake_plan.placeholder(fwd[name].shape, fwd[name].dtype, fwd[name].device)
+        for name in cake_plan.STATE_NAMES
     )
     ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
                           fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
-    ctx.saved_state_tensors = bool(state_tensors)
     ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
     ctx.grad_shapes = (g.shape, beta.shape)
     ctx.normalize_qk = bool(use_qk_l2norm_in_kernel)
@@ -3644,8 +3659,12 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
     tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
             "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
             "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
-    if ctx.saved_state_tensors:
-        tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
+    kept = cake_plan.tape_state(ctx.arch, ctx.options.save_state)
+    tape.update(
+        (name, t)
+        for name, t in zip(cake_plan.STATE_NAMES, state_tensors, strict=True)
+        if name in kept
+    )
     grads = cake_gdn_nondet_train_backward(
         tape,
         do.contiguous(),

@@ -62,6 +62,7 @@ from tests.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake_gdn_nondet_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
 cake_jit = cake_package("cake_gdn_nondet_train", "cake_jit")
+cake_plan = cake_package("cake_gdn_nondet_train", "cake_plan")
 cake_gdn_nondet_train = cake_package("cake_gdn_nondet_train")
 cake_gdn_nondet = cake_gdn_nondet_train.cake_gdn_nondet
 # The deterministic package: the same-input comparison point (never a source of budgets).
@@ -1725,6 +1726,57 @@ def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
     replaced = [stage for stage in stages if stage.startswith("wy_tc")]
     assert replaced == ["wy_tc"] * len(launched), stages
     _assert_same_bits(ruled, plain, OUTPUT_NAMES)
+
+
+def _saved_list(o) -> tuple:
+    """The saved tensors of the package's autograd node behind ``o``."""
+    node = o.grad_fn
+    while node is not None and not type(node).__name__.startswith("CakeGDNNondet"):
+        node = node.next_functions[0][0]
+    assert node is not None, o.grad_fn
+    return node.saved_tensors
+
+
+def test_the_saved_list_keeps_its_arity(device, monkeypatch) -> None:
+    # the saved list has the same entries, shapes, dtypes and devices whatever the tape keeps: the state of the
+    # device's tape level (T_full: w, h and v_new, never u) under save_state, none without it, and a storage-free
+    # placeholder (every stride 0) for the rest; the backward of the T_full tape gives the bits of the whole state's
+    seq_lens = (300, 77, 640, 17)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=31)
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    cu = _cu(seq_lens)
+    lists = {}
+    for save_state in (True, False):
+        leaves = {
+            name: inputs[name].detach().clone().requires_grad_(True)
+            for name in ("q", "k", "v", "g", "beta")
+        }
+        o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                               scale=1.0 / math.sqrt(HEAD_DIM), use_qk_l2norm_in_kernel=True,
+                               cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                               cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), save_state=save_state)  # fmt: skip
+        saved = _saved_list(o)
+        assert len(saved) == 9 + len(cake_plan.STATE_NAMES)
+        kept = cake_plan.tape_state(arch, save_state)
+        for name, t in zip(cake_plan.STATE_NAMES, saved[9:], strict=True):
+            placeholder = (
+                all(s == 0 for s in t.stride())
+                and t.untyped_storage().nbytes() == t.element_size()
+            )
+            assert placeholder is (name not in kept), (save_state, name, t.stride())
+        lists[save_state] = [
+            None if t is None else (t.shape, t.dtype, t.device) for t in saved
+        ]
+    assert "u" not in cake_plan.tape_state(arch, True)
+    assert lists[True] == lists[False]
+    t_full = _run(inputs, seq_lens)
+    monkeypatch.setattr(
+        cake_plan,
+        "LEVEL_STATE",
+        types.MappingProxyType({"T_full": cake_plan.STATE_NAMES}),
+    )
+    whole = _run(inputs, seq_lens)
+    _assert_same_bits(t_full, whole, OUTPUT_NAMES)
 
 
 def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
