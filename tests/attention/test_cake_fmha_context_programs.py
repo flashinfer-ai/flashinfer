@@ -6563,3 +6563,94 @@ def test_cake_context_power_one_stage_programs_match_the_jit_module_bitwise(
     assert torch.equal(_bits(jit_out), _bits(out)), (
         f"max abs difference {(jit_out.float() - out.float()).abs().max().item()}"
     )
+
+
+def _poison_past_the_length(pools, tables, kv_lens, page_size, poison):
+    """``poison`` (a NaN) in K and V at every slot past each request's length
+    inside its last page: bytes the cache holds there, which no row may read."""
+
+    for b, kv_len in enumerate(kv_lens):
+        if kv_len % page_size:
+            page = int(tables[b, kv_len // page_size])
+            for pool in pools:
+                poison(pool[page, :, kv_len % page_size :])
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        ((8, 8), (1,) * 8, (1000,) * 8, 16),
+        ((32, 4), (32, 1, 300), (1000, 70, 2047), 64),
+        ((32, 8), (64, 33), (1001, 40), 16),
+    ],
+)
+def test_cake_context_fp8_nan_v_past_the_length(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size
+) -> None:
+    """NaN codes in K and V past each request's length in its last page: their
+    probability is 0, but 0 x NaN is NaN in a P V product.  The program and the
+    JIT route keep every output finite and bitwise the clean batch's."""
+
+    case = _jit_route_batch("context_fp8", heads, q_lens, kv_lens, page_size)
+    clean, _ = _run_jit_route_batch(case)
+    assert served_programs
+    _poison_past_the_length(
+        case.cache,
+        case.tables_k,
+        kv_lens,
+        page_size,
+        lambda t: t.view(torch.uint8).fill_(0x7F),
+    )
+    out, _ = _run_jit_route_batch(case)
+    assert bool(torch.isfinite(out.float()).all())
+    assert torch.equal(_bits(out), _bits(clean))
+    served = len(served_programs)
+    for name in (
+        "_CONTEXT_PROGRAM_ROUTES",
+        "_CONTEXT_FP8_RUNTIME_ROUTES",
+        "_CONTEXT_FP8_SPLIT_ROUTES",
+    ):
+        monkeypatch.setattr(cake_api, name, {})
+    jit_out, _ = _run_jit_route_batch(case)
+    assert len(served_programs) == served
+    assert torch.equal(_bits(jit_out), _bits(out))
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size", "return_lse"),
+    [
+        ((8, 8), (1,) * 8, (1000,) * 8, 16, False),
+        ((32, 4), (64, 1, 300), (1000, 70, 2047), 64, True),
+        ((32, 8), (64, 33), (1001, 40), 16, False),
+    ],
+)
+def test_cake_context_bf16_nan_v_past_the_length(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size, return_lse
+) -> None:
+    """NaN in K and V past each request's length in its last page: their
+    probability is 0, but 0 x NaN is NaN in a P V product.  The program and the
+    JIT route keep every output finite and bitwise the clean batch's."""
+
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    clean, clean_lse = _run_bf16_batch(case, return_lse=return_lse)
+    assert served_programs
+    _poison_past_the_length(
+        (case.key, case.value),
+        case.tables_k,
+        kv_lens,
+        page_size,
+        lambda t: t.fill_(float("nan")),
+    )
+    out, lse = _run_bf16_batch(case, return_lse=return_lse)
+    assert bool(torch.isfinite(out.float()).all())
+    assert torch.equal(_bits(out), _bits(clean))
+    if return_lse:
+        assert torch.equal(_bits(lse), _bits(clean_lse))
+    served = len(served_programs)
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
+    jit_out, _ = _run_bf16_batch(case, return_lse=return_lse)
+    assert len(served_programs) == served
+    assert torch.equal(_bits(jit_out), _bits(out))
