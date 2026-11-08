@@ -719,7 +719,9 @@ def dq_scratch_layout(num_queries: int, num_kv: int) -> Optional[dict]:
     layout = _layout_of(
         [("qstat", int(num_queries) * QSTAT_WORDS * 4), ("knorm", int(num_kv) * 4)]
     )
-    return layout if layout["total"] <= int(num_queries) * O_LO_BYTES_PER_TOKEN else None
+    return (
+        layout if layout["total"] <= int(num_queries) * O_LO_BYTES_PER_TOKEN else None
+    )
 
 
 def redo_lists_fit(num_kv: int, num_dst: int, *, dkv_fp32: bool = False) -> bool:
@@ -748,7 +750,12 @@ def carve_fits(
     norms (``knorm=False``) and the redo lists (``redo=False``) drop out when they live elsewhere.  At ``S = R``
     that is ``R <= ~27.7 T`` (RoPE) and ``R <= ~31.2 T`` (NoPE)."""
     region = accumulator_region_layout(
-        num_kv, num_dst, program=program, accumulator=accumulator, knorm=knorm, redo=redo
+        num_kv,
+        num_dst,
+        program=program,
+        accumulator=accumulator,
+        knorm=knorm,
+        redo=redo,
     )
     return region["total"] <= int(num_queries) * O_LO_BYTES_PER_TOKEN
 

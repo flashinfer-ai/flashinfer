@@ -225,10 +225,9 @@ def test_scratch_layouts_in_dead_output_storage():
     assert "qstat" not in moved and moved["region"][1] == region["total"]
     per_call = cake_backend.workspace_layout(T, S, 96, per_call=True)
     assert "topk_length" not in per_call
-    assert (
-        per_call["total"]
-        == cake_backend.workspace_layout(T, S, 96)["total"] - _align(T * 4)
-    )
+    assert per_call["total"] == cake_backend.workspace_layout(T, S, 96)[
+        "total"
+    ] - _align(T * 4)
     # 8350 rows over 300 tokens fit o_lo only without the key norms and redo lists
     assert cake_backend.carve_fits(T, 8350, 8350, knorm=False, redo=False)
     assert not cake_backend.carve_fits(T, 8350, 8350)
@@ -1256,7 +1255,9 @@ def test_backward_skewed_magnitudes(nope):
             *args, n[0], n[2], n[1], dout, topk_length=tl
         )
         ref = reference_fp64_nope(*args, dout=dout, topk_length=tl)
-        _check_nope_accuracy("skewed_nope", dq, dkv, ref, nondet=nondet, dq_bitwise=True)
+        _check_nope_accuracy(
+            "skewed_nope", dq, dkv, ref, nondet=nondet, dq_bitwise=True
+        )
         got_rows, floor_rows = (
             rel_l2_rows(dkv, ref["dkv"]),
             rel_l2_rows(ref["dkv_emu"], ref["dkv"]),
