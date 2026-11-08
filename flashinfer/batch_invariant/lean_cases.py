@@ -563,7 +563,7 @@ def swap_loop_cases(in_fmt: str) -> Tuple[int, int, List[Tuple[int, str]]]:
     from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
 
     low = MainloopBlock(in_fmt).lowering()
-    lowsw = MainloopBlock(in_fmt, SWAP_K_BLOCK[in_fmt]).lowering()
+    lowsw = MainloopBlock(in_fmt, k_block_override=SWAP_K_BLOCK[in_fmt]).lowering()
     ratio = lowsw.inner // low.inner
     assert ratio * low.inner == lowsw.inner, (in_fmt, lowsw.inner, low.inner)
     alg = term.TermAlgebra()

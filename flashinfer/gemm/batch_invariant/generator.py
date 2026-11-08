@@ -476,7 +476,7 @@ class GemmKernelPlan:
 
     @property
     def block(self) -> MainloopBlock:
-        return MainloopBlock(self.in_fmt, self.knobs.k_block)
+        return MainloopBlock(self.in_fmt, k_block_override=self.knobs.k_block)
 
     @property
     def epilogue(self) -> EpilogueChain:

@@ -37,6 +37,7 @@ from flashinfer.gemm.batch_invariant.api import (
     part_of,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
+from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
@@ -1325,3 +1326,28 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert torch.equal(bits(mm(a, b, sfa, sfb)), bits(mm(a, b, sfa, sfb, alpha_t(1.0))))
     out = mm(a[:0], b, swizzle_sf(torch.zeros(0, 128, dtype=torch.uint8)), sfb)
     assert out.shape == (0, 4096)
+
+
+def test_tactic_encoding_round_trips_with_the_k_block():
+    """The autotuner's tactic carries every knob of the mixed classes' records, the k-block included: the sm_107 class's
+    swapped decode records stage 256 elements, and a tactic that dropped the field would name a record outside the
+    enumerated space (it passes the body's acceptance, so nothing else would notice)."""
+    for fmt, shape in (
+        ("mxfp4w8a", (16, 4096, 4096, 1)),
+        ("mxfp4w8a_k64", (16, 4096, 4096, 1)),
+    ):
+        M, N, K, C = shape
+        space = enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
+        assert any(k.swap_ab for k in space)
+        for cfg in space:
+            t = tuning.knobs_to_tactic(cfg)
+            assert len(t) == 13 and t[-1] == cfg.k_block
+            assert (
+                tuning.knobs_from_tactic(t) == cfg
+                and tuning.knobs_from_tactic(list(t)) == cfg
+            )
+            assert tuning.knobs_from_tactic(t) in space
+    # a tactic written before the k-block field existed is a record at the format's default stage
+    assert tuning.knobs_from_tactic(
+        (128, 32, 4, 1, False, True, "m", 1, 0, False, 1, True)
+    ) == Knobs((128, 32), (4, 1), False, True, "m", 1, 0, False, 1, True, 0)

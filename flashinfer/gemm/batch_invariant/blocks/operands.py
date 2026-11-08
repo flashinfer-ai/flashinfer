@@ -351,7 +351,7 @@ def can_implement(
             # the record is not a placement of the shape and the workspace split (the same class) takes over
             from ..generator import MainloopBlock
 
-            k_tile = MainloopBlock(in_fmt, knobs.k_block).k_block
+            k_tile = MainloopBlock(in_fmt, k_block_override=knobs.k_block).k_block
             tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
             return (
                 chunks == knobs.cluster_k
