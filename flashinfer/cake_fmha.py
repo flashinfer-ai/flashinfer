@@ -2152,28 +2152,53 @@ _CONTEXT_BF16_RUNTIME_FLAG_BOUNDS: dict[
 }
 # Per target and mask, per JIT pack: further calls of the other flag forms the
 # runtime-size BF16 programs serve past :data:`_CONTEXT_BF16_RUNTIME_FLAG_BOUNDS`,
-# as boxes ``(batch, keys, query x keys, work)``: a call of at most ``batch``
-# requests, at most ``keys`` cache keys, at most that ``max_q_len *
+# as boxes ``(batch, min queries, queries, keys, query x keys, work)``: a call
+# of at most ``batch`` requests, a ``max_q_len`` from ``min queries`` to
+# ``queries``, at most ``keys`` cache keys, at most that ``max_q_len *
 # max_kv_len`` and at most ``work`` of ``batch_size * num_q_heads * max_q_len *
 # max_kv_len`` takes its form's program (``None``: no bound).  Within each box
 # the programs ran faster than the JIT module beyond the A/A band in every
-# layout timed (10 layouts; 2 for the B200 rows of 1, 64, 1000 and over 8192
-# queries).  B200, causal pack 8, one request: 1 .. 32768 queries x 6145 ..
-# 8192 keys at 8 .. 64 query heads.  GB300, causal pack 1: 1 .. 128 requests
-# x 32 .. 16384 queries x 16384 keys at 8 .. 32 heads; not causal pack 16:
-# 1 .. 16 requests x 512 .. 16384 queries x 4096 .. 16384 keys at 64 and 128
-# query heads.  Sinks and LSE alike.
+# layout timed (10 layouts; 2 for the B200 pack-8 rows of 1, 64, 1000 and over
+# 8192 queries).  B200, causal: one request up to 8192 keys at pack 8 (1 ..
+# 32768 queries x 6145 .. 8192 keys at 8 .. 64 query heads) and pack 16 (1 x
+# 128 .. 32768 x 8192 keys at 16 .. 64 heads); packs 4 and 16 up to 6144 keys
+# and 3 x 2^30 work (1 .. 16 requests x 512 .. 8192 queries; not at 3 x 2^31,
+# 16 x 2048 x 6144 keys at 32 heads and 64 x 256 at 64); packs 2 .. 12 up to
+# 512 queries, 8192 keys and 2^31 work (1 .. 256 requests x 32 .. 512 queries
+# x 8192 keys).
+# GB300, causal pack 1: 1 .. 128 requests x 32 .. 16384 queries x 16384 keys
+# at 8 .. 32 heads; not causal pack 16: 1 .. 16 requests x 512 .. 16384
+# queries x 4096 .. 16384 keys at 64 and 128 query heads.  Sinks and LSE alike.
+_CONTEXT_BF16_FLAG_BOX = tuple[
+    int | None, int | None, int | None, int | None, int | None, int | None
+]
+_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST: _CONTEXT_BF16_FLAG_BOX = (
+    1, None, None, 8192, None, 1 << 32
+)  # fmt: skip
+_CONTEXT_BF16_FLAG_BOX_6144: _CONTEXT_BF16_FLAG_BOX = (
+    None, None, None, 6144, None, 3 << 30
+)  # fmt: skip
+_CONTEXT_BF16_FLAG_BOX_SHORT_Q: _CONTEXT_BF16_FLAG_BOX = (
+    None, None, 512, 8192, None, 1 << 31
+)  # fmt: skip
 _CONTEXT_BF16_RUNTIME_FLAG_BOXES: dict[
-    str,
-    dict[
-        bool,
-        dict[int, tuple[tuple[int | None, int | None, int | None, int | None], ...]],
-    ],
+    str, dict[bool, dict[int, tuple[_CONTEXT_BF16_FLAG_BOX, ...]]]
 ] = {
-    "sm100a": {True: {8: ((1, 8192, None, 1 << 32),)}},
+    "sm100a": {
+        True: {
+            2: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            4: (_CONTEXT_BF16_FLAG_BOX_6144, _CONTEXT_BF16_FLAG_BOX_SHORT_Q),
+            5: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            6: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            7: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            8: (_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST, _CONTEXT_BF16_FLAG_BOX_SHORT_Q),
+            12: (_CONTEXT_BF16_FLAG_BOX_SHORT_Q,),
+            16: (_CONTEXT_BF16_FLAG_BOX_ONE_REQUEST, _CONTEXT_BF16_FLAG_BOX_6144),
+        },
+    },
     "sm103a": {
-        True: {1: ((None, 16384, None, 1 << 32),)},
-        False: {16: ((None, None, 1 << 26, 1 << 33),)},
+        True: {1: ((None, None, None, 16384, None, 1 << 32),)},
+        False: {16: ((None, None, None, None, 1 << 26, 1 << 33),)},
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
@@ -8993,10 +9018,12 @@ def select_cake_fmha_context_route(
             )
             or any(
                 (box_batch is None or batch_size <= box_batch)
+                and (box_min_q is None or max_q_len >= box_min_q)
+                and (box_q is None or max_q_len <= box_q)
                 and (box_keys is None or max_kv_len <= box_keys)
                 and (box_area is None or max_q_len * max_kv_len <= box_area)
                 and (box_work is None or work <= box_work)
-                for box_batch, box_keys, box_area, box_work in boxes
+                for box_batch, box_min_q, box_q, box_keys, box_area, box_work in boxes
             )
         )
     ):

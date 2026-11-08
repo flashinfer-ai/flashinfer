@@ -32,8 +32,12 @@ resets and the router-gradient clone remain part of a complete iteration.
 ## Use
 
 The package includes its caller-owned workspace and metadata layer; no separate
-MoK installation or extension is needed. A CUDA toolkit supporting the selected
-device and PyTorch with symmetric-memory multicast support are required.
+MoK installation or extension is needed. PyTorch with symmetric-memory
+multicast support is required. Minimum CUDA toolkit (nvcc) per target, the
+`min_cuda` of every library in `build.json`: 12.8 for SM100a, 12.9 for SM103a
+and 13.4 for SM107a (checked by compiling every SM100a and SM103a library with
+12.8, 12.9, 13.0 and 13.1: each compiles from its floor up, and 12.8 rejects
+`compute_103a`).
 Distributed ranks must share one peer-accessible NVLink domain (peers may span
 hosts of one NVL72 domain).
 
@@ -186,6 +190,61 @@ launchers memoise their launch-invariant geometry per distinct launch
 arguments (integers and, for MXFP8, the device); the memo holds no tensors
 and does not change the launch sequence.
 
+## Repeatability
+
+Within the scope below, every output repeats bit for bit:
+
+| Output | Repeats bit for bit |
+| --- | --- |
+| `forward`: `y` | yes |
+| `forward`: context | yes |
+| `recompute_forward_context`: context | yes, identical to the forward's |
+| `backward`: `dx` | yes |
+| `backward`: `dscores` | yes |
+| `backward`: six weight gradients | yes |
+
+The context is `x_routed`, `gate_shared`, `gate_routed`, `up_shared`,
+`up_routed`, `hidden_shared` and `hidden_routed` (MXFP8 routed fields as data
+and scales); the recomputed context is bitwise identical to the forward's (see
+Context, memory and recompute). The weight gradients are shared and routed
+gate/up/down, or the six FP32 accumulators with `fp32_wgrad=True`. This holds
+for BF16 and MXFP8 routed experts and for plain and clamped SwiGLU.
+
+Scope: repeated calls with the same inputs (source tokens `x`, expert IDs,
+scores, per-rank source counts, `dy`), the same weights (and the same MXFP8
+prequantized weights), the same `MoKConfig` values other than the
+communication-SM split (minibatch and macrobatch sizes, schedule capacity), the
+same precision, `swiglu_limit` and `fp32_wgrad`, the same EP group (size and
+rank order), the same package build and the same GPU model (compute capability
+and SM count). Results may differ bitwise across GPU architectures, EP sizes,
+minibatch or macrobatch sizes, precisions, package versions and CUDA
+toolkits.
+
+No output bit depends on:
+
+- the communication-SM split: a fixed pair, the `"auto"` rows or the
+  imbalance-aware switch, including ranks running different splits in one
+  step;
+- other kernels resident on other streams that occupy SMs while MoK runs;
+- CUDA Graph replay versus eager launches;
+- on SM107a MXFP8, the choice of the two-macro-batch forward program (see
+  Contract).
+
+Every reduction runs in a fixed order: the top-k combine adds each token's
+slots in slot order, each routed weight-gradient tile has one writer over its
+full reduction, router-score gradient partials are summed in a fixed order and
+later macrobatches are added in macrobatch order. Kernels use atomics only on
+integers, to count rows and claim work, never to add floating-point values.
+
+Checked on GB300 (SM103a) by repeating the checkpointed training step (schedule,
+forward, context recompute, backward) five times and comparing every output
+bitwise on every rank: GLM-5.2 shapes (H 6144, I 2048, 256 experts, top 8) at
+EP4/8/16/64 and GLM-5.3-Flash shapes (H 4096, I 2048, 288 experts, top 8,
+clamped SwiGLU limit 10) at EP8/32; 16,384 tokens per rank, FP32 accumulators,
+BF16 and MXFP8; uniform, ragged (1 to 32,767 tokens, one empty rank) and
+1.5x-hot routing; with a resident side-stream kernel holding up to 16 SMs,
+across communication-SM splits and under CUDA Graph replay.
+
 ## Contract
 
 - Scheduler layouts `(EP, local experts)`: `(1, 4)` and `(4, 4)` diagnostic
@@ -197,11 +256,11 @@ and does not change the launch sequence.
   Scores are already normalized/scaled by the caller.
 - Logical source token counts may differ across ranks and may be zero. Hidden
   and intermediate widths are positive multiples of 256; MXFP8 also requires a
-  hidden width that is a multiple of 512, and its forward and recompute roles
-  need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
-  `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
-  'cvt'"; the backward roles carry a guard and compile with 13.0). Every sm_107a
-  (Rubin) library needs CUDA 13.4, the first nvcc that accepts `compute_107a`.
+  hidden width that is a multiple of 512. Below CUDA 13.1 the MXFP8 forward
+  and recompute roles convert to E4M3 through FP32
+  (`cvt.rn.satfinite.e4m3x2.f32`) instead of `cvt.rn.satfinite.e4m3x2.bf16x2`,
+  which older ptxas rejects. Every sm_107a (Rubin) library needs CUDA 13.4, the
+  first nvcc that accepts `compute_107a`.
   Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
@@ -261,23 +320,46 @@ and does not change the launch sequence.
   outputs, context and gradients for any schedule, so ranks may run different
   builds in one step and a stale choice costs time only. `comm_split_log`
   also prints each change of the choice.
-- Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
-  `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
-  the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
-  group size) and keeps the factory split where there is none. GB300 (152 SMs)
-  MXFP8 EP8 44 / 36 against 40 / 32, two-node EP8 complete training steps (4
-  GPUs per node), two rounds on the same nodes, hottest-rank step time: hottest
-  rank at 3.0x the mean routed load -2.0 / -2.2 % (full step) and -2.0 / -1.8 %
-  (checkpoint step), at 5.6x -3.1 / -3.2 %, at 7.4x -3.2 / -3.3 %; balanced
-  steps +0.7 / +0.5 % (full) and +0.1 / +0.2 % (checkpoint). The balanced full
-  step sits at the edge of the ~0.6 % spread of identical arms, so the row is
-  opt-in. GB300 EP4 on one node measured no unconditional gain (balanced steps
-  +0.7 ... +1.0 % slower) and has no row; B200 uses the imbalance switch above.
-  Rubin (212 SMs) MXFP8 EP8 60 / 60 against the factory 40 / 40, two-node EP8
-  (one NVLink domain), configurations rotated on one workspace, four rounds,
-  hottest-rank medians, balanced routing forward / backward: 8192 tokens per
-  rank -7.4 / -4.6 %, 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 % (round spread
-  at most 1.2 %). Rubin BF16 measured no consistent gain and has no row.
+- Fixed split per device and group size: `fwd_num_comm_sms` / `bwd_num_comm_sms`
+  default to `"auto"` in `create_mok_bf16_workspace` (package and
+  `flashinfer.mok` wrapper): the measured `COMM_SMS` row (compute capability, SM
+  count, precision, EP group size), else the factory 40 / 40. Integers fix the
+  split; `"auto"` for only one of the two is an error. With MXFP8 routed experts
+  pass `precision="mxfp8"` for the MXFP8 row (`precision` only selects rows and
+  thresholds). The split changes time, never bits (see Repeatability). GB300
+  (152 SMs): BF16 20 / 24 at EP4/8/16/32/64; MXFP8 44 / 36 at EP8/32/64, none
+  at EP4/16 (no gain measured). Checkpointed training steps captured in CUDA
+  Graphs, 40 / 40 and the row interleaved in one process on the same nodes,
+  slowest-rank median of 12 steps, 16,384 tokens per rank, FP32 accumulators:
+
+  | EP | shape | precision | routing | 40 / 40 (ms) | row (ms) | change |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 4 | GLM-5.2 | BF16 | uniform | 31.95 | 29.83 | -6.6 % |
+  | 8 | GLM-5.2 | BF16 | uniform | 30.89 | 28.50 | -7.7 % |
+  | 8 | GLM-5.3-Flash | BF16 | uniform | 21.17 | 19.31 | -8.8 % |
+  | 16 | GLM-5.2 | BF16 | uniform | 30.81 | 28.19 | -8.5 % |
+  | 32 | GLM-5.3-Flash | BF16 | uniform | 21.11 | 18.84 | -10.7 % |
+  | 32 | GLM-5.3-Flash | BF16 | ragged | 26.83 | 24.25 | -9.6 % |
+  | 32 | GLM-5.3-Flash | BF16 | 1.5x hot rank | 29.51 | 26.52 | -10.2 % |
+  | 64 | GLM-5.2 | BF16 | uniform | 30.91 | 30.12 | -2.6 % |
+  | 64 | GLM-5.2 | BF16 | ragged | 39.66 | 38.29 | -3.5 % |
+  | 64 | GLM-5.2 | BF16 | 1.5x hot rank | 42.52 | 39.70 | -6.6 % |
+  | 8 | GLM-5.2 | MXFP8 | uniform | 21.38 | 21.46 | +0.4 % |
+  | 8 | GLM-5.3-Flash | MXFP8 | uniform | 15.60 | 15.54 | -0.4 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | uniform | 15.35 | 14.80 | -3.6 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | ragged | 20.42 | 20.13 | -1.4 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | 1.5x hot rank | 20.77 | 20.40 | -1.8 % |
+  | 64 | GLM-5.2 | MXFP8 | uniform | 25.71 | 25.25 | -1.8 % |
+  | 64 | GLM-5.2 | MXFP8 | ragged | 36.58 | 35.99 | -1.6 % |
+  | 64 | GLM-5.2 | MXFP8 | 1.5x hot rank | 32.67 | 32.89 | +0.7 % |
+
+  The MXFP8 EP8 row first measured -3.3 ... -1.8 % against 40 / 32 with the
+  hottest rank at 3.0x-7.4x the mean routed load; on balanced steps it is
+  within -0.4 ... +0.4 % of 40 / 40 (five comparisons, EP8, both shapes).
+  Rubin (212 SMs) MXFP8 EP8 60 / 60 against 40 / 40, balanced routing,
+  hottest-rank medians of four rounds, forward / backward at 8192 / 27116 /
+  32768 tokens per rank: -7.4 / -4.6, -13.3 / -8.7, -18.1 / -2.4 % (round
+  spread at most 1.2 %); Rubin BF16 had no consistent gain at EP8.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the

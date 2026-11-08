@@ -100,8 +100,17 @@ keyword.
   checkpoint.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
-  bits either way; `cake_lm_head_det_train_logprob` forms no gradient in its
-  forward and is unchanged.
+  bits either way.  `cake_lm_head_det_train_logprob` (with or without a
+  temperature; not its budget or kept-logits forms) forms no gradient in its
+  forward; under `"auto"` inside a non-reentrant `torch.utils.checkpoint` its
+  checkpointed forward keeps the call's row results (`logp`, the FP32 `lse`,
+  the valid-row index and the compact temperature: O(T) bytes until the
+  backward), and the recomputation in the backward returns a copy of that
+  `logp` and saves those results instead of running the logits GEMMs again,
+  so a checkpointed step runs them once, as an uncheckpointed one (paired per
+  checkpoint frame and graph by call order; taken only for the same input
+  tensors, unchanged since -- version counters -- and the same options, else
+  the recomputation runs the forward).  The backward reads the same bits.
 * `cake_lm_head_det_train_logprob` returns the differentiable `logp [T]` for
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
