@@ -184,9 +184,9 @@ def test_program_keys_are_the_deterministic_bf16_scan_keys_and_the_plain_merge()
                 assert cake_backend.reads_ticket_word(
                     _nondet_name(det_name), arch
                 ) == det_backend.reads_ticket_word(det_name, arch), (arch, key)
-        assert cake_backend.ticket_tail_skips(
+        assert cake_backend.ticket_tail_skips(arch) == det_backend.ticket_tail_skips(
             arch
-        ) == det_backend.ticket_tail_skips(arch), arch
+        ), arch
     assert set(cake_jit.PROGRAMS) == shipped
     for name, record in cake_jit.PROGRAMS.items():
         det_record = det_jit.PROGRAMS[_det_name(name)]
