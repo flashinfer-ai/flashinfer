@@ -63,7 +63,7 @@ package's public forward and backward only.  This module checks:
   row-claims backward after ``torch.use_deterministic_algorithms(True)`` was
   enabled (exact texts: a ``RuntimeError`` before the launch, or a
   ``UserWarning`` under ``warn_only=True`` and the launch; none for a node
-  whose weight needs no gradient or in the small-row band); no call warns or
+  whose weight needs no gradient or in a small-row band); no call warns or
   raises in the bands whose outputs repeat their bits, strict or with
   ``warn_only=True`` (the forward, the backward into a BF16 and an FP32
   weight gradient, autograd and non-reentrant checkpointing); the
@@ -711,9 +711,11 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
     function, immediately before the launch of the row-claims backward, whose
     weight-gradient sum's order depends on scheduling; under
     ``warn_only=True`` it warns and runs it.  A node there whose weight needs
-    no gradient, and a node in the small-row band ``bwd_bf16_t512`` (the
-    exact tiny backward, summing on chip in a fixed order), does not alert.
-    The launches are recorded and skipped (``run_module`` stubbed)."""
+    no gradient, and a node in each small-row band of a BF16 weight gradient
+    on this device (``BAND_ROLES``: the short backward on sm_100a and
+    sm_103a, the exact tiny backward on sm_100a and sm_107a, each summing on
+    chip in a fixed order), does not alert.  The launches are recorded and
+    skipped (``run_module`` stubbed)."""
     launched: list[str] = []
     monkeypatch.setattr(
         loader, "run_module", lambda name, *a, **k: launched.append(name)
@@ -722,8 +724,13 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
     q = f"{backend.__name__}.CakeRMSNormSiLUGateNondetFunction.backward"
     d = f"{deterministic_facade.__name__}.CakeRMSNormSiLUGateDetFunction"
     row_claims = suite._band_shape("bwd_bf16_rc")
-    small = suite._band_shape("bwd_bf16_t512")
-    assert row_claims is not None and small is not None, arch
+    small_bands = [
+        band
+        for band, _, _ in suite._device_bands("bwd_bf16")
+        if band in loader.BAND_ROLES
+    ]
+    smalls = [suite._band_shape(band) for band in small_bands]
+    assert row_claims is not None and smalls and None not in smalls, arch
 
     def node(shape, weight_grad=True):
         x, z, w, _ = _inputs(*shape, 21)
@@ -742,7 +749,8 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
         )
 
     assert module(row_claims) == loader.route_module(arch, "bwd_bf16_rc")
-    assert module(small) == loader.route_module(arch, "bwd_bf16_t512")
+    for band, small in zip(small_bands, smalls, strict=True):
+        assert module(small) == loader.route_module(arch, band), (band, small)
     y = node(row_claims)
     launched.clear()
     torch.use_deterministic_algorithms(True)
@@ -767,7 +775,7 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
         f"non-deterministic kernels run. {d} is the deterministic one."
     ]
     assert launched == [module(row_claims)]
-    for shape, weight_grad in ((row_claims, False), (small, True)):
+    for shape, weight_grad in ((row_claims, False), *((s, True) for s in smalls)):
         torch.use_deterministic_algorithms(False)
         y = node(shape, weight_grad)
         launched.clear()
@@ -1811,14 +1819,18 @@ def test_forward_gate_edges_keep_the_fp64_classes(
 
 # Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
 # first GATE_EDGE_BACKWARD_COLUMNS columns, so every output keeps finite
-# elements (``dw`` in the other columns): 48 and 240 rows (the small-row
-# band), then 1008, 6192, 49488, 49536 and 245808 rows in the bands past it
-# (the static, the row-claims and the claimed backwards, as the
+# elements (``dw`` in the other columns): 48 and 240 rows (the first
+# small-row band of each role: for a BF16 weight gradient the short backward
+# on sm_100a and sm_103a), 288 rows (the exact tiny backward of a BF16
+# weight gradient on sm_100a and sm_107a, the row-claims backward on
+# sm_103a), then 1008, 6192, 49488, 49536 and 245808 rows in the bands past
+# them (the static, the row-claims and the claimed backwards, as the
 # architecture's ``BACKWARD_BANDS`` and the SM count place them).
 GATE_EDGE_BACKWARD_COLUMNS = 96
 GATE_EDGE_BACKWARD_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(5, 48, id="5x48"),
+    pytest.param(6, 48, id="6x48"),
     pytest.param(21, 48, id="21x48"),
     pytest.param(129, 48, id="129x48"),
     pytest.param(1031, 48, id="1031x48"),
@@ -2054,6 +2066,7 @@ BACKWARD_SHAPES = [
     pytest.param(1, 48, "contiguous", id="1x48"),
     pytest.param(5, 48, "projection", id="5x48-projection"),
     pytest.param(13, 7, "head_major", id="13x7-head_major"),
+    pytest.param(255, 1, "flat", id="255x1"),
     pytest.param(256, 1, "flat", id="256x1"),
     pytest.param(257, 1, "flat", id="257x1"),
     pytest.param(1031, 48, "contiguous", id="1031x48"),
@@ -2231,18 +2244,21 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 
 def _block_rows(name: str) -> int:
     """The rows of one row block of the backward module ``name``, from its
-    grid rule: ``rows_per_block`` for a chunked backward (grid kind
-    ``chunks``: the static and the claimed backwards, 8), ``rows_per_cta``
-    for a row-claims backward (``row_claims``, 16), and 8 for a small-row
-    backward (``cluster``), whose teams (each the deterministic backward's
-    128-thread CTA) take 8 rows each."""
+    record: ``rows_per_block`` of its grid rule for a chunked backward (grid
+    kind ``chunks``: the static and the claimed backwards, 8),
+    ``rows_per_cta`` for a row-claims backward (``row_claims``, 16), and for
+    a small-row backward (``cluster``) its launch block's threads over the
+    teams of its CTA over 16 threads a row (``suite._cluster_block_rows``):
+    16 rows for the short backward (one 256-thread team a CTA), 8 for the
+    exact tiny backwards (4 teams of the deterministic backward's 128-thread
+    CTA in a 512-thread CTA, each team its own 8-row block)."""
     rule = loader.MODULES[name]["grid_rule"]
     if rule["kind"] == "chunks":
         return int(rule["rows_per_block"])
     if rule["kind"] == "row_claims":
         return int(rule["rows_per_cta"])
     assert rule["kind"] == "cluster", (name, rule)
-    return 8
+    return suite._cluster_block_rows(name)
 
 
 def _last_block_rows(block: int, first: int, last: int | None) -> dict[str, int]:

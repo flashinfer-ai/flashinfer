@@ -43,8 +43,11 @@ of the weight gradient's dtype (a call without a weight gradient takes the
 BF16 bands).  A small-row backward, up to a count of rows, is one cluster of
 16 CTAs, scheduled together on the SMs of one GPC, whose CTAs each wait for
 the other CTAs' FP32 partials of their columns and finish them in a fixed
-order, with no workspace.  The chunked backwards cut the rows into blocks of
-8 rows and the blocks into ``C = ceil(blocks / B)`` chunks of
+order, with no workspace: the short backward of a BF16 weight gradient on
+SM100 and SM103 (256-thread CTAs of 16-row blocks, 6144 bytes of dynamic
+shared memory each) and the exact tiny backward (512-thread CTAs of 4 teams
+of 8-row blocks, 19584 bytes each).  The chunked backwards cut the rows into
+blocks of 8 rows and the blocks into ``C = ceil(blocks / B)`` chunks of
 ``B = max(1, ceil(blocks / 8192))`` consecutive blocks, and launch
 ``G = min(C, 8 * SMs)`` CTAs of 128 threads, at most one wave (8 CTAs per
 SM).  A static backward (the call role) runs the rows up to a few row blocks
@@ -86,9 +89,11 @@ gradients) and the forward start beside it and cost at most
 ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
 ``ALL_SM_SPIN_MS`` lifetime; so do the small-row backwards of a BF16 and an
 FP32 weight gradient at 1 and 5 tokens (48 and 240 rows, where a small-row
-band of the role holds them), which on SM100 and SM103 also start beside it
-with the default and the maximum-L1 carveout, and the backward that takes the
-rows past the role's small-row bands, at its first whole tokens
+band of the role holds them) and at the first whole tokens of the role's
+second small-row band (the exact tiny backward of a BF16 weight gradient on
+SM100, past the short backward's band), which on SM100 and SM103 also start
+beside it with the default and the maximum-L1 carveout, and the backward that
+takes the rows past the role's small-row bands, at its first whole tokens
 (``SHORT_BACKWARD_PROBES``).  On SM107 they do not start beside the side
 kernel with such a small carveout until that kernel exits (observed on R200
 for the small-row backwards): there each must end at most
@@ -155,7 +160,7 @@ their speed beside the one-thread kernel and, beside the short forward's side
 kernels, end no later than the backward they replace (the module of the
 role's first band past its small-row bands, at the same rows) by the short
 forward's bound and measurement rule: there a measurement
-counts only when the short backward's and the replaced backward's alone
+counts only when the small-row backward's and the replaced backward's alone
 medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest alone
 sample of that measurement.
 
@@ -700,7 +705,7 @@ def _check_outputs(
 
 
 def _check_replaced_rows(tokens: int, alone, replaced_alone) -> None:
-    """``dx`` and ``dz`` of the short backward's first call alone bitwise
+    """``dx`` and ``dz`` of the small-row backward's first call alone bitwise
     those of the backward it replaces (the same row arithmetic; their weight
     gradients sum different partials and are each checked by
     :func:`_check_outputs`)."""
@@ -1492,15 +1497,21 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 
 
 # The small-row backwards of a BF16 and an FP32 weight gradient: one token and
-# five tokens of H heads (48 and 240 rows, in the BACKWARD_BANDS band of each
-# role on every architecture), beside the short forward's side kernels; their
-# held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD.
-# And "past": the first whole tokens of H heads past the role's last
-# small-row band (11 tokens, 528 rows), where the module of the role's next
-# band takes over from the small-row backward (on SM100 and SM103 for a BF16
-# weight gradient the row-claims backward, else the static backward); it runs
-# in the keeps-speed and the max-shared start tests only.
-SHORT_BACKWARD_PROBES = ("1x48", "5x48", "past")
+# five tokens of H heads (48 and 240 rows, in the role's first small-row
+# BACKWARD_BANDS band on every architecture: for a BF16 weight gradient the
+# short backward on SM100 and SM103), and "second_band": the first whole
+# tokens of H heads in the role's second small-row band (the exact tiny
+# backward of a BF16 weight gradient on SM100, past the short backward's
+# band; skipped where the role has one small-row band), beside the short
+# forward's side kernels; their held test takes the short forward's bound,
+# slack and SHORT_MAX_ALONE_SPREAD.  And "past": the first whole tokens of H
+# heads past the role's last small-row band (by the band ends of
+# BACKWARD_BANDS: 6 tokens past 256 rows, 11 tokens past 512), where the
+# module of the role's next band takes over from the small-row backward (on
+# SM100 and SM103 for a BF16 weight gradient the row-claims backward, else the
+# static backward); it runs in the keeps-speed and the max-shared start tests
+# only.
+SHORT_BACKWARD_PROBES = ("1x48", "5x48", "second_band", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
 )
@@ -1531,6 +1542,19 @@ PAST_PROBE_SKIP = (
 )
 
 
+def _small_row_bands(arch: str, role: str, sms: int) -> list[tuple[int, int, str]]:
+    """``(first, last, module)`` of each small-row ``BACKWARD_BANDS`` band of
+    ``role`` on ``arch`` with ``sms`` SMs (``BAND_ROLES``: a count of rows
+    each) that holds rows, in order (``_band_rows``)."""
+    return [
+        (first, last, name)
+        for first, last, name in _band_rows(arch, role, sms)
+        if loader.MODULES[name]["role"] in loader.BAND_ROLES
+        and last is not None
+        and first <= last
+    ]
+
+
 def _past_small_row_bands(arch: str, role: str, sms: int) -> tuple[int, str]:
     """``(first row, module)`` of the first ``BACKWARD_BANDS`` band of
     ``role`` on ``arch`` with ``sms`` SMs past its small-row bands
@@ -1549,12 +1573,14 @@ def _short_backward(
 ) -> tuple[int, str, str]:
     """``(tokens, the probed backward, the backward it replaces)`` of the
     ``SHORT_BACKWARD_PROBES`` entry ``probe`` for a ``dw_dtype`` weight
-    gradient: the tokens of H heads (for ``past`` the first whole tokens past
-    the role's small-row ``BACKWARD_BANDS`` bands), the module that runs
-    their rows and the module of the role's first band past its small-row
-    bands (``_past_small_row_bands``).  ``past`` probes run that module and
-    skip unless ``past`` is set; the others skip where no small-row band holds
-    their rows."""
+    gradient: the tokens of H heads (for ``second_band`` the first whole
+    tokens in the role's second small-row ``BACKWARD_BANDS`` band, for
+    ``past`` the first whole tokens past the role's small-row bands), the
+    module that runs their rows and the module of the role's first band past
+    its small-row bands (``_past_small_row_bands``).  ``past`` probes run that
+    module and skip unless ``past`` is set; ``second_band`` probes skip where
+    the role has no second small-row band holding whole tokens; the others
+    skip where no small-row band holds their rows."""
     arch, sms = _device()
     role = _backward_role(dw_dtype)
     first, replaced = _past_small_row_bands(arch, role, sms)
@@ -1564,6 +1590,20 @@ def _short_backward(
         tokens = -(-first // H)
         name = loader.module_for_rows(arch, role, tokens * H, sms)
         assert name == replaced, (arch, role, tokens, name)
+        return tokens, name, replaced
+    if probe == "second_band":
+        bands = _small_row_bands(arch, role, sms)
+        if len(bands) < 2:
+            pytest.skip(f"{arch} has {len(bands)} small-row band(s) of {role}")
+        band_first, band_last, name = bands[1]
+        tokens = -(-band_first // H)
+        if tokens * H > band_last:
+            pytest.skip(
+                f"{arch} {role}: the second small-row band ({band_first}-"
+                f"{band_last} rows) holds no whole tokens of {H} heads"
+            )
+        got = loader.module_for_rows(arch, role, tokens * H, sms)
+        assert got == name, (arch, role, tokens, got)
         return tokens, name, replaced
     tokens = int(probe.split("x")[0])
     name = loader.module_for_rows(arch, role, tokens * H, sms)

@@ -45,7 +45,9 @@ prefetch and other layouts with a prefetch per thread),
 near-zero variance, saturated gates, weight-gradient terms that cancel per
 column, FP32 and BF16 weight gradients,
 accumulation, ``compute_grad_weight=False``, the small-row backwards (one
-cluster each, in the rows of their ``BACKWARD_BANDS`` bands: no workspace made
+cluster each, in the rows of their ``BACKWARD_BANDS`` bands: the short
+backward of a BF16 weight gradient on sm_100a and sm_103a and the exact tiny
+backwards; no workspace made
 or touched, a caller workspace checked and left as it is, the first row count
 past them on the backward), empty work, a workspace reused across shapes (zero after every
 call), a workspace with nonzero scratch returned to zero by
@@ -2514,61 +2516,129 @@ SHORT_BACKWARD_GRIDS = [
     (13 * 7, 152),
     (5 * 48, 148),
     (256, 148),
+    (257, 160),
     (512, 152),
     (1024, 160),
     (1024, 212),
 ]
-# role -> (threads a CTA, max_rows, CTAs of the cluster) of the exact tiny
-# backwards (4 teams of the deterministic backward's 128-thread CTA a CTA),
-# shipped and routed on every architecture; any other small-row backward is
-# checked by its record.
+# The threads of one row in every backward program (16 lanes a row).
+ROW_LANES = 16
+# role -> (threads a CTA, teams a CTA, CTAs of the cluster) of each small-row
+# backward (``BAND_ROLES``), one cluster each, whose CTAs each run their
+# teams' row blocks: the short backward of a BF16 weight gradient (on sm_100a
+# and sm_103a; one 256-thread team a CTA, CTA ``r`` running the 16-row blocks
+# ``r``, ``r + 16``, ...) and the exact tiny backwards (``_t512``: 4 teams of
+# the deterministic backward's 128-thread CTA a CTA, team ``q`` of CTA ``r``
+# running the 8-row block ``r + 16 q``).  A row block holds
+# :func:`_cluster_block_rows` rows.
 SMALL_ROW_BACKWARDS = {
-    "bwd_bf16_t512": (512, 512, 16),
-    "bwd_f32_t512": (512, 512, 16),
+    "bwd_bf16_short": (256, 1, 16),
+    "bwd_bf16_t512": (512, 4, 16),
+    "bwd_f32_t512": (512, 4, 16),
 }
+
+
+def _cluster_block_rows(name: str) -> int:
+    """The rows of one row block of the small-row backward module ``name``
+    (grid kind ``cluster``), derived from its record: the threads of its
+    launch block over the teams of its role's CTA (``SMALL_ROW_BACKWARDS``),
+    over ``ROW_LANES`` threads a row: 256 / 1 / 16 = 16 rows for the short
+    backward, 512 / 4 / 16 = 8 rows (a team's block) for the exact tiny
+    backwards."""
+    record = loader.MODULES[name]
+    assert record["grid_rule"]["kind"] == "cluster", (name, record["grid_rule"])
+    threads = int(record["launch"]["block"][0])
+    teams = SMALL_ROW_BACKWARDS[record["role"]][1]
+    assert threads % (teams * ROW_LANES) == 0, (name, threads, teams)
+    return threads // teams // ROW_LANES
 
 
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
 def test_small_row_backwards_are_one_cluster(rows, sm_count):
-    """Every small-row backward (each module a ``BAND_ROLES`` role routes):
-    one cluster of its grid rule's ``cluster`` CTAs whatever the rows and the
-    SMs, up to its rule's ``max_rows``, no workspace and no chunks; the exact
-    tiny backwards as ``SMALL_ROW_BACKWARDS`` gives them."""
-    small = {
-        name
-        for routes in loader.ROUTES.values()
-        for role, name in routes.items()
-        if role in loader.BAND_ROLES
-    }
-    for role, (threads, most, ctas) in SMALL_ROW_BACKWARDS.items():
-        name = loader.ROUTES["sm_100a"][role]
-        for arch in ("sm_100a", "sm_103a", "sm_107a"):
-            assert loader.ROUTES[arch][role] == name
+    """Every small-row backward (the module each ``BAND_ROLES`` role routes,
+    ``SMALL_ROW_BACKWARDS``): one module a role, shipped for exactly the
+    architectures that route it; one cluster of its grid rule's ``cluster``
+    CTAs of its role's threads whatever the rows and the SMs, up to its
+    rule's ``max_rows``, which is one row block (:func:`_cluster_block_rows`)
+    for each team of the cluster, so up to it no team runs more than one
+    block; no workspace and no chunks."""
+    assert set(loader.BAND_ROLES) == set(SMALL_ROW_BACKWARDS), loader.BAND_ROLES
+    for role, (threads, teams, ctas) in SMALL_ROW_BACKWARDS.items():
+        routed_on = [arch for arch in loader.ARCHES if role in loader.ROUTES[arch]]
+        names = {loader.ROUTES[arch][role] for arch in routed_on}
+        assert len(names) == 1, (role, routed_on, names)
+        (name,) = names
         record = loader.MODULES[name]
         assert record["role"] == role
-        assert record["grid_rule"] == {
-            "cluster": ctas,
-            "kind": "cluster",
-            "max_rows": most,
-        }
-        assert record["launch"]["block"] == (threads, 1, 1)
-        assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
-        assert name in small, name
-    for name in sorted(small):
-        record = loader.MODULES[name]
+        assert record["arches"] == routed_on, (name, record["arches"])
         rule = record["grid_rule"]
         assert rule["kind"] == "cluster", name
         assert set(rule) == {"cluster", "kind", "max_rows"}, name
-        cluster = int(rule["cluster"])
-        assert record["launch"]["cluster"] == (cluster, 1, 1), name
+        assert int(rule["cluster"]) == ctas, name
+        assert record["launch"]["block"] == (threads, 1, 1), name
+        assert record["launch"]["cluster"] == (ctas, 1, 1), name
+        block = _cluster_block_rows(name)
+        assert int(rule["max_rows"]) == ctas * teams * block, (name, rule, block)
+        assert loader.workspace_layout(name) == (), name
         assert loader.workspace_bytes(name) == 0, name
         if rows > int(rule["max_rows"]):
             continue
-        assert loader.backward_ctas(name, rows, sm_count) == cluster
-        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=cluster)
-        assert grid == (cluster, 1, 1)
+        assert loader.backward_ctas(name, rows, sm_count) == ctas
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=ctas)
+        assert grid == (ctas, 1, 1)
+        assert -(-rows // block) <= ctas * teams, (name, rows)
         with pytest.raises(ValueError, match="chunks"):
             loader.backward_chunks(name, rows)
+
+
+@pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
+def test_short_backward_is_one_cluster_up_to_its_max_rows(rows, sm_count):
+    """The short backward (``bwd_bf16_short``): one module, routed on the
+    architectures whose BF16 ``BACKWARD_BANDS`` start with its band, a count
+    of rows ``(ROWS, n)`` with ``n`` at most its rule's ``max_rows`` (no FP32
+    band runs it); ``module_for_rows`` runs it for 1 to ``n`` rows whatever
+    the SMs and the next band's module (:func:`_band_module`) from ``n + 1``
+    rows; one cluster of 16 CTAs of 256 threads, 6144 bytes of dynamic shared
+    memory each, so that up to ``max_rows`` no CTA runs more than one 16-row
+    block (:func:`_cluster_block_rows`); no workspace."""
+    role = "bwd_bf16_short"
+    routed_on = [arch for arch in loader.ARCHES if role in loader.ROUTES[arch]]
+    assert routed_on, role
+    (name,) = {loader.ROUTES[arch][role] for arch in routed_on}
+    record = loader.MODULES[name]
+    rule = record["grid_rule"]
+    most = int(rule["max_rows"])
+    assert rule == {"cluster": 16, "kind": "cluster", "max_rows": most}, rule
+    assert record["launch"]["block"] == (256, 1, 1)
+    assert record["launch"]["cluster"] == (16, 1, 1)
+    assert record["launch"]["dynamic_smem_bytes"] == 6144
+    assert record["arches"] == routed_on, record["arches"]
+    block = _cluster_block_rows(name)
+    assert block == 16, block
+    for arch in loader.ARCHES:
+        banded = [band for _, band in loader.BACKWARD_BANDS[arch]["bwd_bf16"]]
+        assert (role in banded) == (arch in routed_on), (arch, banded)
+        assert role not in [band for _, band in loader.BACKWARD_BANDS[arch]["bwd_f32"]]
+    for arch in routed_on:
+        last, band = loader.BACKWARD_BANDS[arch]["bwd_bf16"][0]
+        assert band == role and isinstance(last, tuple), (arch, last, band)
+        assert last[0] == loader.ROWS and 0 < int(last[1]) <= most, (arch, last)
+        end = int(last[1])
+        got = loader.module_for_rows(arch, "bwd_bf16", rows, sm_count)
+        if rows <= end:
+            assert got == name, (arch, rows)
+        else:
+            assert got != name, (arch, rows)
+        after = loader.module_for_rows(arch, "bwd_bf16", end + 1, sm_count)
+        assert after != name, arch
+        assert after == _band_module(arch, "bwd_bf16", end + 1, sm_count), arch
+    if rows > most:
+        return
+    assert loader.backward_ctas(name, rows, sm_count) == 16
+    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=16)
+    assert grid == (16, 1, 1)
+    assert -(-rows // block) <= grid[0]
+    assert loader.workspace_layout(name) == () and loader.workspace_bytes(name) == 0
 
 
 # Small-row backward shapes (T, H, layout): T * H rows in the bands in every
@@ -2647,14 +2717,17 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
     assert pkg._STREAM_WORKSPACES == {}
 
 
-def test_short_backward_accumulates_and_skips_the_weight_gradient():
-    """On the small-row backward of 240 rows (BF16 weight gradient):
-    ``accumulate_grad_weight``
-    adds to the accumulator before the one rounding (within the budget, the
-    same bits on every launch), ``compute_grad_weight=False`` leaves
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_short_backward_accumulates_and_skips_the_weight_gradient(dw_dtype):
+    """On the small-row backward of 240 rows of a ``dw_dtype`` weight
+    gradient (the short backward of a BF16 weight gradient on sm_100a and
+    sm_103a, else the exact tiny backward): ``accumulate_grad_weight`` adds
+    to the accumulator before the one rounding (within the budget, the same
+    bits on every launch), ``compute_grad_weight=False`` leaves
     ``grad_weight`` as it is, and ``dx`` and ``dz`` are the same bits either
     way."""
-    dw_dtype = torch.bfloat16
     x, z, w, dy = make(5, 48, seed=81)
     _name, short = _short_backward(5 * 48, dw_dtype)
     if short is None:
