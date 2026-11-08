@@ -2272,6 +2272,25 @@ _OVERLAP_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
 _OVERLAP_SIBLING_MAX_TOKENS = {"sm_107a": 64}
 _OVERLAP_SIBLING_MEASURED_SMS = {"sm_107a": 216}
 
+# The routes with a V-block sibling ``<route>_vblock`` on SM107: the early-PV
+# sibling's program run with four work items per row instead of two, one
+# 128-column V block of the output each on its own CTA, with the route's
+# arguments and the same output bits.  Each CTA drains one V block instead of
+# two, and the launch takes four CTAs per row.  It takes the launches of at
+# most the row ceiling below; the larger launches keep the early-PV sibling or
+# the route's program (:func:`_vblock_variant`).
+_VBLOCK_SIBLING_ROUTES = frozenset({"fp8_lowhead_prefill"})
+
+# The most query rows a launch may have to take the V-block sibling, per
+# architecture, and the SM count of the part the ceiling is set for: at most
+# half of its SMs busy at four CTAs per row.  A part with fewer SMs scales the
+# ceiling down with its SM count; a part with more SMs keeps the ceiling.
+_VBLOCK_SIBLING_MAX_TOKENS = {"sm_107a": 27}
+_VBLOCK_SIBLING_MEASURED_SMS = {"sm_107a": 216}
+
+# The work items, and CTAs, per query row of a V-block sibling launch.
+_VBLOCK_ITEMS_PER_TOKEN = 4
+
 # The CUDA toolkit and runtime (``cudaRuntimeGetVersion``) version that added
 # the oversized shared-memory mode, and the driver's device attribute for its
 # ceiling (CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK).
@@ -2499,6 +2518,39 @@ def _overlap_variant(
     if programs.get(sibling, programs.get(route)) == programs.get(route):
         return route
     return sibling
+
+
+def _vblock_variant(
+    route: str, *, arch: str, num_query_tokens: int, device: torch.device
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows on
+    ``device`` runs before the early-PV sibling is considered: its V-block
+    sibling when ``route`` is in ``_VBLOCK_SIBLING_ROUTES``, ``arch`` has a
+    ceiling in ``_VBLOCK_SIBLING_MAX_TOKENS``, the launch has at most that many
+    rows scaled by the device's SM count up to ``_VBLOCK_SIBLING_MEASURED_SMS``
+    (27 rows at 216 SMs, 26 at 212 and at 208) and ``arch`` routes the sibling
+    to a program other than the route's and the early-PV sibling's, else
+    ``route``.  The V-block sibling launches ``_VBLOCK_ITEMS_PER_TOKEN`` work
+    items, and CTAs, per row."""
+    if route not in _VBLOCK_SIBLING_ROUTES:
+        return route
+    max_tokens = _VBLOCK_SIBLING_MAX_TOKENS.get(arch)
+    if max_tokens is None:
+        return route
+    measured_sms = _VBLOCK_SIBLING_MEASURED_SMS[arch]
+    sm_count = min(_device_sm_count(device), measured_sms)
+    if num_query_tokens > max_tokens * sm_count // measured_sms:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    program = programs.get(f"{route}_vblock")
+    if program is None or program in (
+        programs.get(route),
+        programs.get(f"{route}_overlap"),
+    ):
+        return route
+    return f"{route}_vblock"
 
 
 def _pdl_variant(
@@ -2937,11 +2989,12 @@ def run_cake_dsv4(
     tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
     :func:`cake_dsv4_workspace_requirement` includes it).
 
-    On SM107 the FP8 low-head prefill route runs launches of at most 64 query
-    rows (fewer on a part with fewer than 216 SMs) on its early-PV sibling and
-    the larger ones on its own program (``_overlap_variant``).  Each program
-    builds and loads its module on its first launch: warm up launches on both
-    sides of that ceiling eagerly before a capture.
+    On SM107 the FP8 low-head prefill route runs launches of at most 27 query
+    rows on its V-block sibling (``_vblock_variant``), launches of at most 64
+    query rows on its early-PV sibling (``_overlap_variant``) and the larger
+    ones on its own program; a part with fewer than 216 SMs lowers both
+    ceilings.  Each program builds and loads its module on its first launch:
+    warm up launches on both sides of each ceiling eagerly before a capture.
 
     On SM107 the four-stage multi-tile M64 program runs the 64-head launches of
     108 query rows up to two per SM over items at most 768 wide, of calls whose
@@ -3468,15 +3521,23 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # prefill producer runs one CTA per work item over two items per
         # token; the decode producers run one two-CTA cluster per token.  SM107
         # runs the prefill producer's launches up to a row ceiling on its
-        # early-PV sibling (_overlap_variant).
+        # early-PV sibling (_overlap_variant), and the smallest ones on its
+        # V-block sibling over four items per token (_vblock_variant).
         work_items = 2 * T if route == "fp8_lowhead_prefill" else T
-        program = _overlap_variant(
+        ctas = 2 * T
+        program = _vblock_variant(
             route, arch=L.arch, num_query_tokens=T, device=v["Q"].device
         )
+        if program != route:
+            ctas = work_items = _VBLOCK_ITEMS_PER_TOKEN * T
+        else:
+            program = _overlap_variant(
+                route, arch=L.arch, num_query_tokens=T, device=v["Q"].device
+            )
         L.run(
             L.variant(
                 program,
-                grid=(2 * T, 1, 1),
+                grid=(ctas, 1, 1),
                 total_work_items=work_items,
                 **L.partials(1),
             )

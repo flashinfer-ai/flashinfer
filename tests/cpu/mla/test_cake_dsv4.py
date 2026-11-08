@@ -1336,6 +1336,7 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_bcl",
         "fp8_lowhead_prefill",
         "fp8_lowhead_prefill_overlap",
+        "fp8_lowhead_prefill_vblock",
     }
     for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
         assert all(source.startswith("sm_107a/") for source in spec["sources"])
@@ -3307,6 +3308,7 @@ def _run_fake_lowhead_swa_fp8(monkeypatch, *, arch, num_heads, batch_size, q_len
         for route in (
             "fp8_lowhead_prefill",
             "fp8_lowhead_prefill_overlap",
+            "fp8_lowhead_prefill_vblock",
             "fp8_h64_prefill_source_persistent_m64",
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
         )
@@ -6594,6 +6596,7 @@ def test_h64_split_fallbacks_launch_the_route_as_main(
 
 _LOWHEAD_PREFILL_ROUTE = "fp8_lowhead_prefill"
 _OVERLAP_SIBLING = f"{_LOWHEAD_PREFILL_ROUTE}_overlap"
+_VBLOCK_SIBLING = f"{_LOWHEAD_PREFILL_ROUTE}_vblock"
 _OVERLAP_TOKENS = (1, 12, 48, 61, 62, 63, 64, 65, 72, 80, 104, 108)
 
 
@@ -6679,15 +6682,15 @@ def test_overlap_variant_needs_a_sibling_program_of_its_own(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
-@pytest.mark.parametrize("tokens", [12, 64, 65, 108])
+@pytest.mark.parametrize("tokens", [12, 27, 28, 64, 65, 108])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 def test_fp8_lowhead_prefill_launch_takes_the_overlap_sibling(
     monkeypatch, arch, tokens, enable_pdl
 ):
     """A low-head prefill launch on 216 SMs runs one CTA per work item over
-    two items per row with ``partials(1)``; SM107 runs it on the early-PV
-    sibling up to 64 rows and on the route's program above, with either PDL
-    switch."""
+    two items per row with ``partials(1)``; SM107 runs it on the V-block
+    sibling over four items per row up to 27 rows, on the early-PV sibling
+    up to 64 rows and on the route's program above, with either PDL switch."""
     monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
     L = _RecordingLauncher(
         arch,
@@ -6704,7 +6707,10 @@ def test_fp8_lowhead_prefill_launch_takes_the_overlap_sibling(
         if arch == "sm_107a" and tokens <= 64
         else _LOWHEAD_PREFILL_ROUTE
     )
-    work = {"grid": (2 * tokens, 1, 1), "total_work_items": 2 * tokens}
+    items = 2 * tokens
+    if arch == "sm_107a" and tokens <= 27:
+        program, items = _VBLOCK_SIBLING, 4 * tokens
+    work = {"grid": (items, 1, 1), "total_work_items": items}
     assert L.calls == [(program, {**work, **L.partials(1)})]
 
 
@@ -7226,3 +7232,124 @@ def test_row_tiled_mtp_decode_chunks_pick_their_program_per_launch(monkeypatch):
     grids = [(c["grid_x"], c["grid_y"], c["grid_z"]) for c in calls]
     assert grids == [(120, 1, 1), (80, 1, 1)]
     assert [c["total_work_items"] for c in calls] == [120, 80]
+
+
+# --------------------------------------------------------------------------- #
+# V-block sibling: SM107's low-head prefill over four items per row           #
+# --------------------------------------------------------------------------- #
+
+_VBLOCK_TOKENS = (1, 8, 12, 24, 25, 26, 27, 28, 48, 64, 65)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize(
+    "sm_count,ceiling", [(216, 27), (212, 26), (208, 26), (264, 27)]
+)
+def test_sm107a_lowhead_launches_take_the_vblock_sibling_up_to_its_ceiling(
+    monkeypatch, arch, sm_count, ceiling
+):
+    """SM107 routes the low-head prefill route's V-block sibling to a program
+    of its own, with the route's arguments, and runs it on launches of at most
+    27 rows on 216 SMs, a ceiling scaled down with a smaller SM count and kept
+    on a larger one; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    assert {_LOWHEAD_PREFILL_ROUTE} == cake._VBLOCK_SIBLING_ROUTES
+    assert cake._VBLOCK_SIBLING_MAX_TOKENS == {"sm_107a": 27}
+    assert cake._VBLOCK_SIBLING_MEASURED_SMS == {"sm_107a": 216}
+    assert cake._VBLOCK_ITEMS_PER_TOKEN == 4
+    route, sibling = _LOWHEAD_PREFILL_ROUTE, _VBLOCK_SIBLING
+    own = arch == "sm_107a"
+    programs = VARIANTS[arch]
+    assert (programs[sibling] != programs[route]) == own
+    assert (programs[sibling] != programs[_OVERLAP_SIBLING]) == own
+    assert (
+        get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+        == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    )
+    for tokens in _VBLOCK_TOKENS:
+        expected = sibling if own and tokens <= ceiling else route
+        variant = cake._vblock_variant(
+            route, arch=arch, num_query_tokens=tokens, device=_DEVICE
+        )
+        assert variant == expected, tokens
+    for other in (
+        _OVERLAP_SIBLING,
+        "fp8_lowhead_one_partition",
+        "fp8_lowhead_h64",
+        "fp8_h64_prefill_source_persistent_m64",
+    ):
+        variant = cake._vblock_variant(
+            other, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == other
+
+
+@pytest.mark.cpu_only
+def test_vblock_variant_needs_a_sibling_program_of_its_own(monkeypatch):
+    """A launch takes the V-block sibling only where its architecture routes
+    the sibling to a program other than the route's and the early-PV
+    sibling's: a table without the sibling, one that routes it to either of
+    those programs and one of another architecture run the route; an
+    architecture without a ceiling never reads the device's SM count."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 216)
+    route, overlap, sibling = (
+        _LOWHEAD_PREFILL_ROUTE,
+        _OVERLAP_SIBLING,
+        _VBLOCK_SIBLING,
+    )
+    low, early, block = "cake_dsv4_low_head", "cake_dsv4_early_pv", "cake_dsv4_v_block"
+    for table, expected in (
+        ({"sm_107a": {route: low, overlap: early, sibling: block}}, sibling),
+        ({"sm_107a": {route: low, overlap: early}}, route),
+        ({"sm_107a": {route: low, overlap: early, sibling: low}}, route),
+        ({"sm_107a": {route: low, overlap: early, sibling: early}}, route),
+        ({"sm_103a": {route: low, overlap: early, sibling: block}}, route),
+    ):
+        monkeypatch.setattr(jit, "VARIANTS", table)
+        variant = cake._vblock_variant(
+            route, arch="sm_107a", num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == expected
+
+    def no_sm_count(device):
+        raise AssertionError("read the SM count")
+
+    monkeypatch.setattr(cake, "_device_sm_count", no_sm_count)
+    for arch in ("sm_100a", "sm_103a"):
+        variant = cake._vblock_variant(
+            route, arch=arch, num_query_tokens=12, device=_DEVICE
+        )
+        assert variant == route
+
+
+@pytest.mark.cpu_only
+def test_sm107a_vblock_sibling_is_a_program_of_its_own():
+    """The V-block sibling's sm_107a program differs from the route's and the
+    early-PV sibling's and launches with the same dynamic shared memory."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import VARIANTS, _get_csrc_dir
+
+    programs = VARIANTS["sm_107a"]
+    route, overlap, sibling = (
+        programs[_LOWHEAD_PREFILL_ROUTE],
+        programs[_OVERLAP_SIBLING],
+        programs[_VBLOCK_SIBLING],
+    )
+    assert len({route, overlap, sibling}) == 3
+    smem = {
+        program: re.findall(
+            r"config\.dynamicSmemBytes = (\d+);",
+            (_get_csrc_dir() / f"sm_107a/{program}_binding.cu").read_text(
+                encoding="utf-8"
+            ),
+        )
+        for program in (route, overlap, sibling)
+    }
+    assert smem[sibling] == smem[overlap] == smem[route] == ["205952"]
