@@ -21,6 +21,9 @@ packed row (q / k / v as head views of one row that requires grad).
 * Every output repeats bit for bit: the output, the final state and every gradient of three identical calls, plain
   and under non-reentrant activation checkpointing, and a second backward into the same leaves adds exactly the
   first one's gradients (gradient accumulation).
+* Reused plans on recycled scratch: a call with new inputs on a layout whose plans and tables are cached, after a
+  call of another layout reused the workspaces, has the bits of the same call in a fresh process (plain and
+  checkpointed; a row the adjoint walk splits and a row it does not).
 * No steady-state host synchronization: once a layout's libraries, tables and workspaces exist, a forward and
   backward (plain or checkpointed) runs under the error sync-debug mode.
 * A checkpointed forward keeps nothing on the device beyond its output (no hidden retention) on every route.
@@ -39,8 +42,11 @@ import contextlib
 import gc
 import math
 import statistics
+import subprocess
+import sys
 import time
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -64,6 +70,12 @@ HEADS = (2, 6)  # the value-head group of three of the source issue (#7074)
 HOST_CALL_MAX_US = 1000.0
 HOST_LAYOUT = (131071, 87531, 43385)
 HOST_SAMPLES = 9
+# The rows of the reuse test, (lengths, heads): one the one-wave split of the adjoint walk takes on every exported
+# architecture's SM count and one it never takes (the (16, 48) group of three stays on the serial walk).
+REUSE_LAYOUTS = {
+    "split": ((11000, 12000, 9768), (4, 12)),
+    "unsplit": ((11000, 12000, 9768), (16, 48)),
+}
 _ALERT = "does not have a deterministic implementation"
 
 
@@ -287,6 +299,56 @@ def test_gradients_accumulate_bit_for_bit(route, device) -> None:
     )
     grads = ("dq", "dk", "dv", "dg", "dbeta", "dh0")
     _assert_same_bits({n: twice[n] for n in grads}, {n: once[n] * 2 for n in grads})
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Reused plans on recycled scratch
+
+
+def _reuse_call(layout: str, seed: int, checkpointed: bool, device) -> dict:
+    """One host-route forward and backward (under non-reentrant checkpointing when ``checkpointed``) of the
+    :data:`REUSE_LAYOUTS` row ``layout`` on the operands of ``seed``: its outputs and gradients, on the host."""
+    seq_lens, heads = REUSE_LAYOUTS[layout]
+    problem = _Problem("host", device, seq_lens=seq_lens, heads=heads, seed=seed)
+    leaves = problem.leaves()
+    o, final = problem.step(leaves, checkpointed)
+    torch.cuda.synchronize()
+    return {name: t.cpu() for name, t in problem.results(leaves, o, final).items()}
+
+
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["plain", "checkpoint"])
+@pytest.mark.parametrize("layout", sorted(REUSE_LAYOUTS))
+def test_reused_plans_on_recycled_scratch_give_the_fresh_process_bits(
+    layout, checkpointed, device, tmp_path
+) -> None:
+    # a layout's call with new inputs, after a call of the same layout (its plans and tables cached) and a call of
+    # another layout in between (the workspaces taken and released at other shapes), has the bits of the same call
+    # as the only call of a fresh process: outputs, final state and every gradient
+    seq_lens, (h, hv) = REUSE_LAYOUTS[layout]
+    index = cake_chain._device_index(device)
+    split = cake_chain._adjoint_split_length(
+        seq_lens, hv, index, cake_chain.make_options(), hv // h
+    )
+    assert (split is not None) is (layout == "split"), (layout, split)
+    other = next(name for name in REUSE_LAYOUTS if name != layout)
+    _reuse_call(layout, 41, checkpointed, device)
+    _reuse_call(other, 43, checkpointed, device)
+    got = _reuse_call(layout, 47, checkpointed, device)
+    path = tmp_path / "fresh.pt"
+    code = (
+        "import importlib.util, sys, torch\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
+        f"spec = importlib.util.spec_from_file_location('reuse_host', {str(Path(__file__).resolve())!r})\n"
+        "suite = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(suite)\n"
+        "device = torch.device('cuda', torch.cuda.current_device())\n"
+        f"torch.save(suite._reuse_call({layout!r}, 47, {checkpointed!r}, device), {str(path)!r})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=900
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    _assert_same_bits(got, torch.load(path))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
