@@ -6163,7 +6163,7 @@ kernel_cake_dsa_h64_det_nope_train_a8f757c468aff1aee239(const __grid_constant__ 
                         #pragma unroll 1
                         for (int i_1 = 0; i_1 < blocks_4; i_1++) {
                             int n = blocks_4 - 1 - i_1;
-                            int slot_2 = tord_5 % 2;
+                            int slot_2 = (tord_5 + i_1) % 2;
                             unsigned int mask = 0;
                             int position = n * 64 + lane_0_3 * 8;
                             int values[8];
@@ -6248,8 +6248,8 @@ kernel_cake_dsa_h64_det_nope_train_a8f757c468aff1aee239(const __grid_constant__ 
                                 }
                                 values[7] = value_2_7;
                             }
-                            int _stage_idx_free = (int)((unsigned int)tord_5 % 2);
-                            int _parity_idx_free = (int)((unsigned int)tord_5 / 2 % 2) ^ 1;
+                            int _stage_idx_free = (int)((unsigned int)(tord_5 + i_1) % 2);
+                            int _parity_idx_free = (int)((unsigned int)(tord_5 + i_1) / 2 % 2) ^ 1;
                             mbarrier_wait(idx_free_addr + (_stage_idx_free) * 8, _parity_idx_free);
                             int ok_7_0 = (int)(values[0] >= 0 && values[0] < num_kv);
                             if (ok_7_0 != 0) {
@@ -6308,10 +6308,12 @@ kernel_cake_dsa_h64_det_nope_train_a8f757c468aff1aee239(const __grid_constant__ 
                             }
                             tile_idx[slot_2 * 80 + lane_0_3 * 8 + 7] = values[7];
                             validity8[slot_2 * 320 + 256 + lane_0_3] = mask;
-                            mbarrier_arrive(idx_full_addr + ((int)((unsigned int)tord_5 % 2)) * 8);
-                            tord_5 += 1;
+                            mbarrier_arrive(idx_full_addr + ((int)((unsigned int)(tord_5 + i_1) % 2)) * 8);
                         }
                     }
+                    __syncwarp();
+                    int nb = blocks_word[bfree_slot];
+                    tord_5 += nb;
                 }
             }
         // ---- Role: spare ----
