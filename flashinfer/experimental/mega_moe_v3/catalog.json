@@ -7194,7 +7194,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "2c86e908f8e80dab48ba2b210014f98e9aeb119c5a81f1fb32d1ad40b29e507c",
+   "closure_sha256": "c8231b59e65772966b2fd95d530f629169581ff2648bcd85557038e31afbf959",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a",
