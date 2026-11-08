@@ -7819,7 +7819,7 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
     the saved-set backward (with a held workspace and with ``workspace=None``; at ``P > 1`` also under
     ``saved_carry=0``, whose replay reads the workspace's carry pool) and of a checkpointed step with a recompute
     handle are bitwise the same under every form, two rounds each, and the held-workspace backward's peak of
-    allocated bytes is the ``"one"`` form's.  The records show each saved-set backward on its form (``"one"`` where
+    requested bytes is at most the ``"one"`` form's.  The records show each saved-set backward on its form (``"one"`` where
     the call launches ``kcp_dav``), except the table set's first side-stream replay, which runs on the call's stream
     (it uploads the launches' device tables), and the held-workspace backward's launch record (``sequence``) is the
     ``"one"`` form's."""
@@ -7837,12 +7837,15 @@ def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm
         )
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-        base = torch.cuda.memory_allocated(device)
+        # requested (tensor) bytes: the allocated-bytes peak also counts the unsplit tails of the cached blocks the
+        # allocator hands out, which follow the cache's history (the workspace=None and checkpointed passes between
+        # the rounds), not the tensors the backward keeps alive
+        base = torch.cuda.memory_stats(device)["requested_bytes.all.current"]
         g_held = cake_kcp.cake_kda_det_train_kcp_backward(
             *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
         )
         torch.cuda.synchronize(device)
-        peak = torch.cuda.max_memory_allocated(device) - base
+        peak = torch.cuda.memory_stats(device)["requested_bytes.all.peak"] - base
         rec = cake_kcp.LAST_CALL["bwd"]
         recs.append((rec["bwd_tape_stream"], rec["kcp_dav"]))
         seq = tuple(rec["sequence"])
