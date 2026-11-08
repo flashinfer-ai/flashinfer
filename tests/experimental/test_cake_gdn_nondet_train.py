@@ -147,6 +147,27 @@ def _inputs(
     return {name: t.to(device).contiguous() for name, t in out.items()}
 
 
+# The forward route sets that take a call off the prep's forward (prep, wy_tc2, fwd_ho), with their off values: a test
+# that holds this package's prep forward to the deterministic package's bits turns them off in both packages.
+PREP_FORWARD_OFF = (
+    ("FWD_A_ARCHS", ()),
+    ("FWD_SPLIT_ARCHS", ()),
+    ("FWD_A_SERIAL_KEEP", {}),
+)
+
+
+def _prep_forward_on_both(monkeypatch) -> None:
+    """Keep both packages on the prep's forward: FWD_A_ARCHS and FWD_SPLIT_ARCHS empty in this package, and each
+    setting of :data:`PREP_FORWARD_OFF` off in the deterministic package where that package has it (a deterministic
+    package that runs the A or the split forward would otherwise compare other forward bits)."""
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
+    monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
+    det_chain = cake_package("cake_gdn_det_train", "cake_chain")
+    for name, off in PREP_FORWARD_OFF:
+        if getattr(det_chain, name, None) is not None:
+            monkeypatch.setattr(det_chain, name, off)
+
+
 def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_state=False, dht=None,
          use_qk_l2norm_in_kernel=True, leaves=None, det=False, sync=True, **pins):  # fmt: skip
     """Forward and backward through the package (``det``: through the deterministic package); returns the outputs and
@@ -1519,8 +1540,7 @@ def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) ->
     # one-wave split prices runs the split beside the group's cluster tail instead of the R form
     # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
     # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
-    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
-    monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
+    _prep_forward_on_both(monkeypatch)
     index = cake_chain._device_index(device)
     arch = cake_backend.device_arch(index)
     seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
@@ -2784,8 +2804,7 @@ def test_the_tail_keeps_the_deterministic_bits_but_dq_dk(
     # fixed-order tails all of the deterministic bits; dq / dk stay within the budgets of both
     # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
     # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
-    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
-    monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
+    _prep_forward_on_both(monkeypatch)
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     seq_lens = TAIL_LAYOUT
     group = heads[1] // heads[0]
