@@ -163,6 +163,10 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     # 1 (shipped) = a forward whose h / v_new tapes have no reader runs the output walk kcp_fwdh_out (#2 with #5 folded
     # in, no tape written) wherever the registry ships its records (cake_kcp._fuse_o); 0 = the tape walk, then #5
     "fused_o": (0, 1),
+    # 1 (shipped) = a forward whose akk / g_cum have no reader (not a replay-mode or hand-off forward, no saved set
+    # that keeps them) runs the forward form of #1_l2n, fwd_prep_l2n_fwd (no akk / g_cum stores), wherever the
+    # registry ships its record (cake_kcp._prep_backward_tapes); 0 = the full fwd_prep_l2n
+    "prep_form": (0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -177,6 +181,7 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "record_qk": False,
     "walk_pair": None,
     "fused_o": 1,
+    "prep_form": 1,
 }
 
 
