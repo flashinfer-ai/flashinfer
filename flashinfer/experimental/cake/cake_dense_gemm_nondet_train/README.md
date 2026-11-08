@@ -308,8 +308,9 @@ benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of 
   (`K1_ORDERED_RANGES_BY_SM`; one wave of 128 CTAs, the bits of two splits of one chain): its former route, one split
   of one chain, missed mirrored cancellation at every token count of that window (1.87 to 1.95 times the reference's
   error, 1.38 to 1.39 times on the permuted inputs).  On a B200 part at 16172, 16231, 16256, 16300 and 16384 tokens
-  two splits met all six kinds (at most 1.08 times the reference's error) and repeated bit for bit, at 1.108 to 1.116
-  times one split's time (a second wave of CTAs) and 0.80 to 0.93 times the deterministic program's.
+  two chains met all six kinds (at most 1.08 times the reference's error), repeated bit for bit and had the bits of
+  two splits, at 1.003 to 1.005 times one chain's time, 0.897 to 0.906 times two splits' (a second wave of CTAs) and
+  0.74 to 0.84 times the deterministic program's.
 - K2 weight gradient: the head/tail windows (`"H0.5x3"`, `"H1x4p44"`, `"H1x5p44"`, `"H0.5x4"`; 3 to 23 % faster than
   the deterministic program) varied run to run and missed the rule (up to 1.94 times); those rows run the
   deterministic program.  Hidden 6144 at 16129 to 16384 tokens runs six splits instead of the deterministic package's

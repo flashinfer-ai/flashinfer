@@ -1161,7 +1161,11 @@ K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
 #: former route, one split of one chain, missed the check on mirrored cancelling inputs at every token count of that
 #: window (1.87 to 1.95 times the reference's error, and 1.38 to 1.39 times on the permuted ones); two splits met all
 #: six kinds there (at most 1.08 times the reference's error; the reference's own error at the even block counts) but
-#: took 1.108 to 1.116 times one split's time, in a second wave of CTAs.
+#: took 1.108 to 1.116 times one split's time, in a second wave of CTAs.  Measured on a B200 part at 16172, 16231,
+#: 16256, 16300 and 16384 tokens in one process: two chains had the bits of two splits on all six kinds and repeated
+#: bit for bit; they took 86.5 to 88.9 us, 1.003 to 1.005 times one chain's time, 0.897 to 0.906 times two splits'
+#: (96.0 to 98.4 us) and 0.74 to 0.84 times the deterministic program's (103.9 to 120.0 us), in eager launches and in
+#: CUDA graph replays.
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
