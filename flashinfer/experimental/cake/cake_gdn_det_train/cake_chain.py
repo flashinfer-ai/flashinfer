@@ -648,7 +648,8 @@ def build_chunk_meta(
 # launches.  A table built inside a CUDA graph capture is written only when the graph replays, so it is not cached.  A
 # capture reads a cached table without waiting (a capturing stream cannot wait for an event recorded outside the
 # capture), so the table's write must be done when the capture starts: torch.cuda.graph synchronizes the device first.
-# The table is then kept for the process, since every replay reads it.
+# That covers only work queued before the capture; a table another thread builds during the capture must have its
+# stream synchronized before the capture reads it.  The table is then kept for the process, since every replay reads it.
 _HOST_META: dict = {}
 _HOST_META_LIMIT = 256
 _GRAPH_TABLES: dict[int, torch.Tensor] = {}

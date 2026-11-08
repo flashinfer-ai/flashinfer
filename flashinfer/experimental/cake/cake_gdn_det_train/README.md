@@ -171,8 +171,12 @@ it) before its launches read the table.  A CUDA graph capture does not cache the
 tables it builds, since they are written only when the graph replays.  It reads
 the cached tables without waiting, so their writes must be done when the
 capture starts (`torch.cuda.graph` synchronizes the device first), and keeps
-them for the life of the process, since every replay reads them.  A capture
-also takes its own workspaces instead of the pooled per-stream ones.
+them for the life of the process, since every replay reads them.  The device
+synchronization covers only work queued before the capture: while one thread
+captures calls of this package, another thread's call on the same device that
+builds a table must have its stream synchronized before the capture reads that
+layout.  A capture also takes its own workspaces instead of the pooled
+per-stream ones.
 
 ## Plan pins (keyword-only)
 
