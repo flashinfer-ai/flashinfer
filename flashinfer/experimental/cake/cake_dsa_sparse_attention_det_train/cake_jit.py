@@ -42,7 +42,17 @@ from . import cake_build
 MODULES: dict[str, dict[str, Any]] = {
     "cake_dsa_h64_det_train": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "stages": ["fwd"],
+        "stages": [
+            "fwd",
+            "bwd_delta",
+            "bwd_norm",
+            "bwd_bound",
+            "bwd_grid",
+            "bwd_main",
+            "bwd_redo_prep",
+            "bwd_redo",
+            "bwd_fold",
+        ],
         "fwd": {
             "library": "cake_dsa_h64_det_train_c949a885132a772bdb53",
             "ffi_entry": "run",
@@ -54,6 +64,94 @@ MODULES: dict[str, dict[str, Any]] = {
                 "use_pdl": True,
             },
         },
+        "bwd_delta": {
+            "library": "cake_dsa_h64_det_train_93ad63698c318aab988f",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_norm": {
+            "library": "cake_dsa_h64_det_train_84376fdd68bed4f727cf",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_bound": {
+            "library": "cake_dsa_h64_det_train_da9947485b6dbd33c4ee",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_grid": {
+            "library": "cake_dsa_h64_det_train_d580918f8e0cbb39f3be",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_main": {
+            "library": "cake_dsa_h64_det_train_4487388f2950ac4f97a5",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_redo_prep": {
+            "library": "cake_dsa_h64_det_train_f4ebce39fc25de804572",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_redo": {
+            "library": "cake_dsa_h64_det_train_f947d21a4e7b4d35d0a5",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_fold": {
+            "library": "cake_dsa_h64_det_train_9a9e7e6b8ea3cd322457",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
     },
     # The native zero-RoPE (NoPE) training program: shared latent K = V of 512
     # dimensions, no rope operands, one combined dK + dV gradient per key row.
@@ -62,7 +160,18 @@ MODULES: dict[str, dict[str, Any]] = {
     # routes and serves the RoPE program's packed entry too.
     "cake_dsa_h64_det_nope_train": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "stages": ["index_prep", "nope_fwd"],
+        "stages": [
+            "index_prep",
+            "nope_fwd",
+            "nope_bwd_delta",
+            "nope_bwd_norm",
+            "nope_bwd_bound",
+            "nope_bwd_grid",
+            "nope_bwd_main",
+            "nope_bwd_redo_prep",
+            "nope_bwd_redo",
+            "nope_bwd_fold",
+        ],
         "index_prep": {
             "library": "cake_dsa_h64_det_nope_train_db791110b21a91be1388",
             "ffi_entry": "run",
@@ -85,6 +194,94 @@ MODULES: dict[str, dict[str, Any]] = {
                 "use_pdl": True,
             },
         },
+        "nope_bwd_delta": {
+            "library": "cake_dsa_h64_det_nope_train_2575bc84fa1e92ec0b69",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_norm": {
+            "library": "cake_dsa_h64_det_nope_train_da63029a854ea164bdbd",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_bound": {
+            "library": "cake_dsa_h64_det_nope_train_aedc5c845a7175b21782",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_grid": {
+            "library": "cake_dsa_h64_det_nope_train_4bb407c884a7703fd17e",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_main": {
+            "library": "cake_dsa_h64_det_nope_train_a8f757c468aff1aee239",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_redo_prep": {
+            "library": "cake_dsa_h64_det_nope_train_9c5305b6ec6841752260",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_redo": {
+            "library": "cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_fold": {
+            "library": "cake_dsa_h64_det_nope_train_02223183ecc7ab5cc5c9",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
     },
 }
 
@@ -93,14 +290,14 @@ NOPE_PROGRAM = "cake_dsa_h64_det_nope_train"
 PROGRAMS = (PROGRAM, NOPE_PROGRAM)
 FORWARD_STAGES = ("fwd",)
 # The backward of the RoPE program, in launch order: the delta and the per-query
-# bound terms, the zero fill of the integer accumulator region, the key norms,
-# the per-row bounds, the per-row grids, the main stage (dQ and the integer dK /
-# dV accumulation with its overflow counters), the preparation and the launch of
-# the recomputation of flagged rows (always launched; it exits when no row is
-# flagged), and the fold of the integers into the floating-point results.
+# bound terms, the key norms (which zero the row-bound words), the per-row bounds
+# and pair counts, the per-row grids (which zero the touched accumulator rows and
+# counters), the main stage (dQ and the integer dK / dV accumulation with its
+# overflow counters), the preparation and the launch of the recomputation of
+# flagged rows (always launched; it exits when no row is flagged), and the fold
+# of the integers into the floating-point results.
 BACKWARD_STAGES = (
     "bwd_delta",
-    "bwd_zero",
     "bwd_norm",
     "bwd_bound",
     "bwd_grid",

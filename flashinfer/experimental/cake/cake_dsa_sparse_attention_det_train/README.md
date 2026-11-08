@@ -61,54 +61,77 @@ The backward launches every registered stage of
 `cake_jit.BACKWARD_STAGES_OF[program]` on every call, in this order (the NoPE
 program prefixes the names with `nope_`); no stage is chosen by a tensor value:
 
-1. `bwd_delta`: `delta = rowsum(dout * (out + o_lo))` `[T, 64]` FP32, the
-   per-query bound terms `qstat [T, 4]` (largest magnitudes and norms of
-   `dout`, `delta` and the query parts, summed over the heads in a fixed
-   order), and the zero fill of the global words.
-2. `bwd_zero`: zeroes the integer accumulator, the overflow counters and the
-   row bounds.
-3. `bwd_norm`: the key norms `||kv_latent[k]||` and their maximum.
-4. `bwd_bound`: per destination row, a fixed-point upper bound `B_row` on the
+1. `bwd_delta`: `delta = rowsum(dout * (out + o_lo))` `[T, 64]` FP32 (the
+   non-deterministic package's bits), the per-query bound terms `qstat [T, 4]`
+   (largest magnitudes and norms of `dout`, `delta` and the query parts,
+   summed over the heads in a fixed order), and the zero fill of the global
+   words.
+2. `bwd_norm`: the key norms `||kv_latent[k]||` and their maximum; it zeroes
+   the row-bound words.
+3. `bwd_bound`: per destination row, a fixed-point upper bound `B_row` on the
    row's `sum |dK|`, `sum |dV|` over every valid (query, key) pair that maps to
-   it (latent and rope parts separately).
-5. `bwd_grid`: the row's grid exponent `e = ceil(log2 B_row) - 30 - L` with
-   `L = 12` (`cake_backend.GRID_SHIFT`).
-6. `bwd_main`: dQ, and each pair's contribution `x` added to the int32
+   it (latent and rope parts separately), and the row's pair count `N`.
+4. `bwd_grid`: the row's grid exponent `e = ceil(log2 B_row) - 30 - L` with
+   `L = 12` (`cake_backend.GRID_SHIFT`) and the overflow counters' skip
+   threshold `2 ** (30 - ceil(log2 N))`; it zeroes the accumulator row and
+   counters of every row a pair touches.
+5. `bwd_main`: dQ, and each pair's contribution `x` added to the int32
    accumulator of its destination row as `n = rni(x * 2 ** -e)`
    (round-to-nearest-even; the scaling by a power of two is exact).  Integer
    addition is associative, so the sum is the same bits in any order.  Per row
-   an overflow counter bounds `sum |n|`; a counter below its limit proves that no
-   element left the int32 range in any order.
-7. `bwd_redo_prep` / `bwd_redo`: rows whose counter does not prove the range
-   are zeroed and recomputed on a coarser grid.  Both stages are launched on
-   every backward and do no work when no row is flagged (no host
-   synchronization).
-8. `bwd_fold`: `v = float(n) * 2 ** e` (one rounding) into the fresh outputs
+   four overflow counters bound `sum |n|`; a row whose counters stay below
+   `2 ** 31` is proven to have left the int32 range in no order.
+6. `bwd_redo_prep` / `bwd_redo`: a row whose counters do not prove the range
+   moves to a grid at least `L + 1` bits coarser
+   (`cake_backend.MIN_BUMP`), is zeroed and is recomputed by the main
+   kernel's redo build, which visits every token and adds only the pairs of the
+   flagged rows (no dQ).  Both stages are launched on every backward; the redo
+   returns at once when no row is flagged (no host synchronization).
+7. `bwd_fold`: `v = float(n) * 2 ** e` (one rounding) into the fresh outputs
    (every row; a row no pair touches is `+0.0`), or `dkv_acc[r] = prev + v`
-   (one FP32 addition; an element whose integer is zero keeps its bits, so a
-   planted `-0.0` stays `-0.0`).
+   (one IEEE FP32 addition with subnormals kept; an element whose integer is
+   zero keeps its bits, so a planted `-0.0` stays `-0.0`; a row no pair touches
+   is not written).
 
 Repeated destination rows of `dkv_dst_map` add into the same integers, so they
 combine exactly before the one FP32 addition.
 
+Non-finite values: a pair whose contribution is NaN or infinite has no integer
+image, so the counters mark its destination row and the fold writes every
+element of that row as NaN (fresh outputs and `dkv_acc` alike); the other rows
+are unaffected.  `dq` follows the main kernel's arithmetic (a NaN input gives
+NaN in the rows it reaches).
+
+Known limitation: the redo does not compact the pairs of the flagged rows.
+When any row is flagged, the redo costs about one more main-kernel pass over
+all pairs (without dQ).
+
 ## Storage and the `o_lo` rule
 
 The accumulator region of one backward holds, per destination row, the int32
-accumulator (576 columns; 512 for NoPE), 32 B of overflow counters, the row
-bounds (16 B; 8 B for NoPE) and the grid exponents (8 B; 4 B for NoPE), plus 4 B
-of key norm per key row.  `delta`, `qstat` and the global words are separate.
+accumulator (576 columns; 512 for NoPE; the row-bound words live in the row
+until the grid stage reads them), 32 B of overflow counters, the grid words
+(8 B; 4 B for NoPE), the pair count, the redo mark and the redo list slot (4 B
+each), plus 4 B of key norm per key row.  `delta`, `qstat` and the global
+words are separate.
 
 * The autograd entries use the storage of their saved `o_lo` (64 KiB per query
   token) for the region when it fits: `bwd_delta` is the only stage that reads
-  `o_lo`, and `bwd_zero` runs after it.  The exact condition
+  `o_lo` (no later kernel reads `out` or `o_lo`).  The exact condition
   (`cake_backend.carve_fits`, 256-byte aligned parts) is
-  `align(R * 2304) + align(R * 32) + align(R * 16) + align(R * 8) + align(S * 4) <= 65536 * T`
+  `align(R * 2304) + align(R * 32) + align(R * 8) + 3 * align(R * 4) + align(S * 4) <= 65536 * T`
   for the rope program (`R` destination rows, `S` keys, `T` query tokens);
-  for NoPE `align(R * 2048) + align(R * 32) + align(R * 8) + align(R * 4) +
+  for NoPE `align(R * 2048) + align(R * 32) + 4 * align(R * 4) +
   align(S * 4) <= 65536 * T`.  At `S = R` this is about `R <= 27.7 T` (rope) and
-  `R <= 31.5 T` (NoPE).  A fresh NoPE `dkv` is its own integer accumulator (the
-  fold rewrites it as FP32 in place), so only 44 B per row and the key norms go
-  to the region.  A larger region is allocated per call.
+  `R <= 31.2 T` (NoPE).  A fresh NoPE `dkv` is its own integer accumulator (the
+  fold rewrites it as FP32 in place), so only 48 B per row and the key norms go
+  to the region.  A larger region is allocated per call.  Rows with more
+  destination rows per query token than that therefore use more memory than
+  the non-deterministic package, which adds into `dkv_acc` directly; for
+  example a 4096-query backward chunk over 268757 keys mapped to 260611
+  destination rows (about 619 MB), a 2123-query segment over 67923 keys (about
+  161 MB) and a NoPE 4096-query chunk over 269564 keys into `dkv_acc` (about
+  568 MB).
 * After such a backward, `o_lo` no longer holds the forward's residual.  A
   second backward through the same graph (`retain_graph=True`) first runs the
   forward again into the saved `out`, `lse` and `o_lo` (same kernel, same
@@ -175,12 +198,6 @@ The package imports only itself, `torch` and `tvm_ffi`; `cake_build.py`
 reaches FlashInfer only for the JIT fallback (flashinfer-ai/flashinfer#6553).
 
 ## Status
-
-The records of this revision register the forward stages only:
-`generated_program_available(device, backward=True)` is `False`, the forward
-entries run, and a backward raises `NotImplementedError` naming the stages
-of `cake_jit.BACKWARD_STAGES` it needs.  The storage plan, the runners and
-the tests of the backward are in place for those stages.
 
 Tests: `tests/experimental/test_cake_dsa_sparse_attention_det_train.py` (the
 backend suite: imports only this package; skips without a registered program

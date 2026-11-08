@@ -21,8 +21,15 @@ Columns.  ``fwd_ms``: the training forward.  ``step_ms``: forward + backward.  `
 of one forward); the deterministic autograd entries run their backward in the storage of ``o_lo`` and so replay the
 forward into the saved tensors first, which this column includes -- the other arms (and a runner prepared without
 ``--o-lo-scratch``) do not.  ``recompute_step_ms``: two forwards + backward (activation checkpointing).
-``peak_above_inputs_gib``: the peak of one step above the inputs.  ``repeat_bitwise`` (deterministic arms): two
-further steps give the same bits for ``out``, ``lse`` and every gradient.
+``peak_above_inputs_gib``: the peak of one step above the memory allocated before the step (a prepared runner's
+workspace and outputs excluded).  ``peak_total_gib``: the peak of one step above the memory allocated before the
+arm was built (the runner's workspace and outputs included; the column the arms are compared by).
+``repeat_bitwise`` (deterministic arms): two further steps give the same bits for ``out``, ``lse`` and every
+gradient.
+
+Rows ``p8949_rope`` / ``p8949_nope``: the flashinfer#8949 repro's problem (T 16384, S 65536, top-k 2048: key 0,
+one key from each of 1023 strata of the older prefix, the 1024 most recent keys; generator seed 0, N(0, 1) BF16)
+in the default layout (RoPE) and through the NoPE arms.
 
 Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and a cold L2 between iterations, medians
 over ``--steps`` iterations.
@@ -36,6 +43,7 @@ Usage::
 """
 
 import argparse
+import dataclasses
 import json
 import sys
 import traceback
@@ -65,14 +73,65 @@ from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import 
 
 DEFAULT_ROWS = (
     "doc_4096",
+    "doc_16384",
     "doc_16231",
     "tail_2123x67923",
     "packed_glm_a",
     "packed_glm_a_dstmap",
     "chunk_4096x268757",
+    "p8949_rope",
     "nope_doc_4096",
     "nope_glm53_a",
+    "nope_chunk_4096x269564",
+    "p8949_nope",
 )
+# The flashinfer#8949 repro rows: name -> NoPE.
+P8949_ROWS = {"p8949_rope": False, "p8949_nope": True}
+
+
+def _p8949_indices(t, s, device, gen):
+    """The #8949 repro's index rows: key 0, one key from each of 1023 strata of the older prefix, the 1024 most
+    recent positions; distinct and causal (query ``i`` sits at position ``s - t + i``)."""
+    pos = torch.arange(s - t, s, device=device)
+    recent = pos[:, None] - torch.arange(1024, device=device)[None, :]
+    older = (pos - 1024).double()
+    u = torch.rand((t, 1023), device=device, dtype=torch.float64, generator=gen)
+    strata = 1 + (
+        (torch.arange(1023, device=device)[None, :] + u) * (older[:, None] - 1) / 1023
+    ).long()
+    sink = torch.zeros((t, 1), device=device, dtype=torch.long)
+    return torch.cat([sink, strata, recent.flip(1)], 1).int().contiguous()
+
+
+def make_p8949_inputs(nope, device, t=16384, s=65536):
+    """The #8949 repro's tensors (generator seed 0, N(0, 1) BF16 in the repro's draw order) in the input types of
+    the non-deterministic script (every slot valid: ``topk_length = 2048``)."""
+    device = torch.device(device)
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(shape, device=device, generator=gen).bfloat16()
+
+    heads = cake_backend.NUM_HEADS
+    q_latent, kv_latent = randn(t, heads, D_LATENT), randn(s, D_LATENT)
+    dout = randn(t, heads, D_LATENT)
+    lengths = torch.full((t,), 2048, dtype=torch.int32, device=device)
+    if nope:
+        idx = _p8949_indices(t, s, device, gen)
+        base = nb.make_nope_inputs(
+            [t], [s], seed=nb.SEED, topk=2048, index="iid", device=device
+        )
+        return dataclasses.replace(
+            base, q=q_latent, kv=kv_latent, dout=dout, idx_local=idx,
+            idx_global=idx, topk_length=lengths, index="p8949_repro",
+        )  # fmt: skip
+    q_rope, k_rope = randn(t, heads, D_ROPE), randn(s, D_ROPE)
+    idx = _p8949_indices(t, s, device, gen)
+    base = nb.make_inputs([t], [s], seed=nb.SEED, topk=2048, device=device)
+    return dataclasses.replace(
+        base, q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope,
+        dout=dout, idx_local=idx, idx_global=idx, topk_length=lengths,
+    )  # fmt: skip
 
 
 class ArmDet(nb.ArmCake):
@@ -270,8 +329,9 @@ def _repeat_bitwise(arm):
     return all(torch.equal(_bits(first[k]), _bits(second[k])) for k in first)
 
 
-def measure(arm, steps):
-    """Median milliseconds of one arm (see the module docstring for the columns) plus its peak memory."""
+def measure(arm, steps, before_arm=None):
+    """Median milliseconds of one arm (see the module docstring for the columns) plus its peak memory
+    (``before_arm``: the bytes allocated before the arm was built)."""
     has_backward = getattr(arm, "backward_available", True)
     st = arm.forward()
     torch.cuda.synchronize()
@@ -298,6 +358,8 @@ def measure(arm, steps):
         arm.backward(s)
     torch.cuda.synchronize()
     perf["peak_above_inputs_gib"] = nb.gib(torch.cuda.max_memory_allocated() - base)
+    if before_arm is not None:
+        perf["peak_total_gib"] = nb.gib(torch.cuda.max_memory_allocated() - before_arm)
     del s
     if getattr(arm, "deterministic", False):
         perf["repeat_bitwise"] = _repeat_bitwise(arm)
@@ -313,13 +375,16 @@ def _print(row, name, perf):
     print(
         f"{row:24s} {name:19s} fwd {fmt(perf['fwd_ms'])}  bwd {fmt(perf.get('bwd_ms'))}  "
         f"step {fmt(perf.get('step_ms'))}  recompute {fmt(perf.get('recompute_step_ms'))}  "
-        f"bwd_again {fmt(perf.get('bwd_again_ms'))} ms  peak {perf['peak_above_inputs_gib']:.2f} GiB"
+        f"bwd_again {fmt(perf.get('bwd_again_ms'))} ms  peak {perf['peak_above_inputs_gib']:.3f} GiB"
+        f"  peak_total {perf.get('peak_total_gib', float('nan')):.3f} GiB"
         + ("" if rep is None else f"  repeat_bitwise {rep}"),
         flush=True,
     )
 
 
 def _run_arm(make, row, name, steps, entry):
+    torch.cuda.synchronize()
+    before_arm = torch.cuda.memory_allocated()
     try:
         arm = make()
     except Exception as exc:  # noqa: BLE001 -- optional dependency missing or arm unavailable here
@@ -332,7 +397,7 @@ def _run_arm(make, row, name, steps, entry):
         _print(row, name, entry["arms"][name])
         return
     try:
-        perf = measure(arm, steps)
+        perf = measure(arm, steps, before_arm)
         perf["versions"] = arm.versions()
     except Exception as exc:  # noqa: BLE001 -- record the failure, continue with the next arm
         perf = dict(
@@ -346,7 +411,31 @@ def _run_arm(make, row, name, steps, entry):
 
 
 def run_row(row, args, results):
-    if row in nb.NOPE_ROWS:
+    if row in P8949_ROWS and P8949_ROWS[row]:
+        inp = make_p8949_inputs(True, args.device)
+        arms = [
+            (a, lambda cls=NOPE_ARMS[a]: cls(inp)) for a in args.arms if a in NOPE_ARMS
+        ]
+        entry = dict(
+            row=row, total_q=inp.total_q, total_k=inp.total_k, K_slots=inp.topk, arms={}
+        )
+    elif row in P8949_ROWS:
+        inp = make_p8949_inputs(False, args.device)
+        layout = nb.Layout(inp, **nb.DEFAULT_LAYOUT)
+        arms = [
+            (a, lambda cls=ROPE_ARMS[a]: cls(inp, layout))
+            for a in args.arms
+            if a in ROPE_ARMS
+        ]
+        entry = dict(
+            row=row,
+            total_q=inp.total_q,
+            total_k=inp.total_k,
+            num_docs=1,
+            layout=layout.describe(),
+            arms={},
+        )
+    elif row in nb.NOPE_ROWS:
         spec = nb.NOPE_ROWS[row]
         inp = nb.make_nope_inputs(
             spec["seq_q"],
@@ -417,7 +506,11 @@ def main():
     args = parser.parse_args()
     args.arms = [a for a in args.arms.split(",") if a]
     unknown = [a for a in args.arms if a not in ROPE_ARMS and a not in NOPE_ARMS]
-    unknown_rows = [r for r in args.rows if r not in nb.ROWS and r not in nb.NOPE_ROWS]
+    unknown_rows = [
+        r
+        for r in args.rows
+        if r not in nb.ROWS and r not in nb.NOPE_ROWS and r not in P8949_ROWS
+    ]
     if unknown or unknown_rows:
         parser.error(f"unknown arms {unknown} / rows {unknown_rows}")
     device = torch.device(args.device)
@@ -430,6 +523,7 @@ def main():
         columns=dict(
             bwd_ms="step_ms - fwd_ms",
             bwd_again_ms="backward over an already-consumed forward (det autograd: includes the forward replay)",
+            peak_total_gib="peak of one step above the memory allocated before the arm was built",
         ),
         rows=[],
     )

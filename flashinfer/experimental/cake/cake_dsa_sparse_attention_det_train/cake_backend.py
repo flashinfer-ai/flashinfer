@@ -62,34 +62,39 @@ limitations under the License.
 # ``cake_jit.BACKWARD_STAGES_OF[program]`` in that order, every one of them on
 # every call (no stage is chosen by a tensor value):
 #
-# * ``bwd_delta``: ``delta = rowsum(dout * (out + o_lo))`` ``[T, 64]`` FP32 and
-#   the per-query bound terms ``qstat [T, 4]`` FP32 (from the largest
-#   magnitudes and the norms of ``dout``, ``delta`` and the query parts, each
-#   summed over the heads in a fixed order); it also zeroes the global words
-#   the later stages reduce into.
-# * ``bwd_zero``: zeroes the front of the accumulator region (the integer
-#   accumulator, the overflow counters and the row bounds).
+# * ``bwd_delta``: ``delta = rowsum(dout * (out + o_lo))`` ``[T, 64]`` FP32 (the
+#   non-deterministic package's bits) and the per-query bound terms ``qstat
+#   [T, 4]`` FP32 (from the largest magnitudes and the norms of ``dout``,
+#   ``delta`` and the query parts, each summed over the heads in a fixed
+#   order); it also zeroes the global words the later stages reduce into.
 # * ``bwd_norm``: the key norms ``||kv_latent[k]||`` ``[S]`` FP32 and their
-#   maximum (an order-free integer maximum).
+#   maximum (an order-free integer maximum); it zeroes the row-bound words.
 # * ``bwd_bound``: per destination row ``r``, the fixed-point sum (u64, rounded
 #   up, at a power-of-two scale set by the maxima) of ``a_q + b_q *
 #   ||kv_latent[k]||`` over every valid pair ``(q, k)`` whose key maps to
 #   ``r`` -- a bound on the row's ``sum |dK|``, ``sum |dV|`` (latent and rope
-#   parts separately).
+#   parts separately) -- and the row's pair count ``N``.
 # * ``bwd_grid``: per destination row the grid exponents ``e = ceil(log2 B_row)
-#   - 30 - L`` (``L`` = :data:`GRID_SHIFT`), latent and rope.
+#   - 30 - L`` (``L`` = :data:`GRID_SHIFT`), latent and rope, and the counter
+#   skip threshold ``2 ** t`` with ``t = 30 - ceil(log2 N)`` (packed into the
+#   latent grid word); it zeroes the accumulator rows and counters of every
+#   touched row (a row no pair touches is never read).
 # * ``bwd_main``: dQ, and every pair's dK / dV contribution ``x`` added as
 #   ``n = rni(x * 2 ** -e)`` with ``red.add.s32`` into the int32 accumulator of
-#   its destination row, plus per row an overflow counter that certifies that
-#   no element's sum leaves the int32 range in any order of the additions.
-# * ``bwd_redo_prep`` / ``bwd_redo``: rows whose counter does not certify the
-#   range are zeroed and recomputed on a tighter grid; both are launched on
-#   every call and exit at once when no row is flagged (no host
-#   synchronization).
+#   its destination row, plus per row overflow counters that certify that no
+#   element's sum leaves the int32 range in any order of the additions.
+# * ``bwd_redo_prep`` / ``bwd_redo``: rows whose counters do not certify the
+#   range move to a coarser grid (at least ``L + 1`` bits, :data:`MIN_BUMP`),
+#   are zeroed and recomputed by the main kernel's redo build, which visits
+#   every token and adds only the pairs of the flagged rows (no dQ).  Both
+#   launch on every call; the redo returns at once when no row is flagged (no
+#   host synchronization).  A flagged row costs a full pass of the main
+#   kernel over the pairs (the redo does not compact them).
 # * ``bwd_fold``: ``v = float(n) * 2 ** e`` (one rounding) into the fresh BF16
 #   / FP32 outputs (every row: an untouched row is zero), or ``dkv_acc[r] =
 #   prev + v`` (one FP32 addition; an element whose integer is zero and a row no
-#   pair touched keep their bits).
+#   pair touched keep their bits).  A row whose counters still flag after the
+#   redo (only a non-finite contribution can) is written as NaN.
 #
 # Integer addition is associative, so the accumulator -- and every output -- is
 # the same bits for any launch grid, SM count, interleaving with other work and
@@ -97,13 +102,15 @@ limitations under the License.
 # contribution, the fold) is fixed per element.
 #
 # Storage.  The accumulator region of one backward -- per destination row the
-# int32 accumulator (576 columns; 512 for NoPE), 32 B of overflow counters, the
-# row bounds (16 B; 8 B for NoPE) and the grid exponents (8 B; 4 B for NoPE),
-# plus 4 B of key norm per key row -- is carved from the storage of ``o_lo``
-# when the call consumes it (``o_lo_scratch``) and the region fits its ``T *
-# 64 KiB`` (:func:`carve_fits`): ``bwd_delta`` is the only stage that reads
-# ``o_lo`` and ``bwd_zero`` runs after it.  ``delta``, ``qstat`` and the
-# global words are never carved (``bwd_delta`` writes them).  Otherwise the
+# int32 accumulator (576 columns; 512 for NoPE; the row-bound words live in the
+# row until the grid stage reads them), 32 B of overflow counters, the grid
+# words (8 B; 4 B for NoPE), the pair count, the redo mark and the redo list
+# slot (4 B each), plus 4 B of key norm per key row -- is carved from the
+# storage of ``o_lo`` when the call consumes it (``o_lo_scratch``) and the
+# region fits its ``T * 64 KiB`` (:func:`carve_fits`): ``bwd_delta`` is the
+# only stage that reads ``o_lo`` (no later kernel reads ``out`` or ``o_lo``).
+# ``delta``, ``qstat`` and the global words are never carved (``bwd_delta``
+# writes them).  Otherwise the
 # region is a workspace region (prepared runner) or one allocation per call
 # (eager entries).  A fresh NoPE ``dkv`` is its own integer accumulator: the
 # fold turns it into FP32 in place.  The autograd entries always consume their
@@ -166,11 +173,16 @@ TMA_ADDRESS_ALIGN = 16  # bytes: the descriptor's global address
 # or below the FP32-order sum's (the bound is loose by orders of magnitude on real rows); a row whose sums would leave
 # the int32 range on this grid is caught by its overflow counter and recomputed (``bwd_redo``).
 GRID_SHIFT = 12
-# Bytes per destination row of the accumulator region besides the accumulator: the overflow counters (4 x u64), the
-# row bounds (u64 per part) and the grid exponents (int32 per part); RoPE has two parts (latent, rope), NoPE one.
+# The redo preparation moves a flagged row's grids up by ``max(bits(N) - 30 + BUMP_MARGIN, MIN_BUMP)`` bits: ``L + 1``
+# bits always suffice for one redo while the main kernel's counters saturate a pair at ``2 ** 31``.
+MIN_BUMP = GRID_SHIFT + 1
+BUMP_MARGIN = 1
+# The overflow counters of a destination row (4 x u64, one per reduce warp of the main kernel).
 COUNTER_BYTES_PER_ROW = 32
 QSTAT_WORDS = 4  # FP32 per-query bound terms of bwd_delta (a_lat, b_lat, a_rope, b_rope; NoPE uses the first two)
 GLOBAL_WORDS = 16  # u32 words of the backward's global state (maxima, the flagged-row count); bwd_delta zeroes them
+REDO_WORD = 8  # the global word that counts the rows the redo preparation flags (the redo's ``redo_count``)
+NONFINITE_WORD = 9  # the global word that counts the rows with a non-finite contribution
 O_LO_BYTES_PER_TOKEN = NUM_HEADS * D_LATENT * 2  # BF16 o_lo: 64 KiB per query token
 
 
@@ -641,6 +653,11 @@ def _layout_of(sizes: list[tuple[str, int]]) -> dict:
     return layout
 
 
+# u64 words between the row-bound words of one accumulator row (latent, rope and the pair count; NoPE latent and the
+# pair count): words in different 128-byte lines spread the row-bound stage's reductions over more of L2.
+BOUND_PART_STRIDE = {cake_jit.PROGRAM: 96, cake_jit.NOPE_PROGRAM: 128}
+
+
 def accumulator_columns(program: str = cake_jit.PROGRAM) -> int:
     """int32 columns of one accumulator row: 576 (latent 0:512, rope 512:576) for the RoPE program, 512 for NoPE."""
     return D_QK if program == cake_jit.PROGRAM else D_LATENT
@@ -654,12 +671,14 @@ def accumulator_region_layout(
     accumulator: bool = True,
 ) -> dict:
     """Byte ``(offset, size)`` of every part of the accumulator region of one backward over ``num_kv`` key rows and
-    ``num_dst`` destination rows, plus ``"total"`` and ``"zero"`` (the bytes at its front that ``bwd_zero`` clears).
+    ``num_dst`` destination rows, plus ``"total"``.
 
     In order: the int32 accumulator ``acc [num_dst, 576 | 512]`` (absent with ``accumulator=False``: a fresh NoPE
-    ``dkv`` is its own accumulator), the overflow counters ``[num_dst, 4]`` u64 and the row bounds ``[num_dst,
-    parts]`` u64 -- the zeroed front -- then the grid exponents ``[parts, num_dst]`` int32 and the key norms
-    ``[num_kv]`` FP32, which their stages write whole (``parts``: 2 for RoPE, latent and rope; 1 for NoPE)."""
+    ``dkv`` is its own accumulator; the row-bound words live in its rows), the overflow counters ``[num_dst, 4]``
+    u64, the grid words ``[parts, num_dst]`` int32 (``parts``: 2 for RoPE, latent and rope; 1 for NoPE), the pair
+    counts, the redo marks and the redo list ``[num_dst]`` (4 bytes each) and the key norms ``[num_kv]`` FP32.
+    Nothing is zero-filled: the key-norm stage zeroes the bound words and the grid stage the accumulator rows and
+    counters of the rows the later stages read."""
     parts = 2 if program == cake_jit.PROGRAM else 1
     R, S = int(num_dst), int(num_kv)
     sizes: list[tuple[str, int]] = []
@@ -667,13 +686,13 @@ def accumulator_region_layout(
         sizes.append(("acc", R * accumulator_columns(program) * 4))
     sizes += [
         ("counters", R * COUNTER_BYTES_PER_ROW),
-        ("bounds", R * 8 * parts),
-        ("exponents", R * 4 * parts),
+        ("grids", R * 4 * parts),
+        ("row_pairs", R * 4),
+        ("redo_mark", R * 4),
+        ("redo_rows", R * 4),
         ("knorm", S * 4),
     ]
-    layout = _layout_of(sizes)
-    layout["zero"] = layout["exponents"][0]
-    return layout
+    return _layout_of(sizes)
 
 
 def carve_fits(
@@ -685,10 +704,10 @@ def carve_fits(
     accumulator: bool = True,
 ) -> bool:
     """Whether the accumulator region (:func:`accumulator_region_layout`) fits the storage of ``o_lo``
-    (``num_queries * 64 KiB``): ``align(R * 2304) + align(R * 32) + align(R * 16) + align(R * 8) + align(S * 4)
-    <= 65536 * T`` for RoPE (with 256-byte alignment), ``align(R * 2048) + align(R * 32) + align(R * 8) + align(R *
-    4) + align(S * 4) <= 65536 * T`` for NoPE; without the accumulator (a fresh NoPE ``dkv``) only the 44 B per row
-    and the key norms count.  At ``S = R`` that is ``R <= ~27.7 T`` (RoPE) and ``R <= ~31.5 T`` (NoPE)."""
+    (``num_queries * 64 KiB``): ``align(R * 2304) + align(R * 32) + align(R * 8) + 3 * align(R * 4) + align(S * 4)
+    <= 65536 * T`` for RoPE (with 256-byte alignment), ``align(R * 2048) + align(R * 32) + 4 * align(R * 4) +
+    align(S * 4) <= 65536 * T`` for NoPE; without the accumulator (a fresh NoPE ``dkv``) only the 48 B per row and
+    the key norms count.  At ``S = R`` that is ``R <= ~27.7 T`` (RoPE) and ``R <= ~31.2 T`` (NoPE)."""
     region = accumulator_region_layout(
         num_kv, num_dst, program=program, accumulator=accumulator
     )
@@ -1296,28 +1315,35 @@ def _det_constants(
     q_latent: Optional[torch.Tensor],
     q_rope: Optional[torch.Tensor],
     kv_latent: torch.Tensor,
-    region: dict,
 ) -> dict[str, Any]:
     """The launch constants the deterministic backward stages read besides the forward's: the query strides of the
-    bound terms, the accumulator geometry of the main stage (one natural ``[num_dst, 576 | 512]`` int32 row per
-    destination row; the rope columns of a RoPE row start at 512), the grid shift, the fold mode and the
-    destination-row count."""
+    bound terms, the accumulator geometry (one natural ``[num_dst, 576 | 512]`` int32 row per destination row; the
+    rope columns of a RoPE row start at 512; the row-bound words at u64 ``row * bound_stride + part * part_stride``
+    of the same rows), the grid shift and redo bump, and the fold's output form."""
     columns = accumulator_columns(program)
+    R = int(num_dst)
     constants: dict[str, Any] = dict(
         num_tokens=int(num_queries),
-        num_dst=int(num_dst),
+        num_dst=R,
+        num_rows=R,
+        zero_rows=R,
+        capacity=R,
         qstat_stride=QSTAT_WORDS,
-        grid_shift=GRID_SHIFT,
+        shift=GRID_SHIFT,
+        min_bump=MIN_BUMP,
+        bump_margin=BUMP_MARGIN,
+        zero_acc=1,  # the grid stage zeroes every touched row's accumulator and counters
         dkv_stride=columns,
         dkr_stride=columns,
         dkr_col0=D_LATENT if program == cake_jit.PROGRAM else 0,
+        bound_stride=columns // 2,
+        part_stride=BOUND_PART_STRIDE[program],
         dkv_has_map=int(bool(has_map)),
-        acc_stride=columns,
         kv_stride=int(kv_latent.stride(0)),
-        zero_words=region["zero"] // 4,
-        fold_mode=int(fold_mode),
-        dst_row_stride=int(dst_row_stride),
-        has_dst_map=int(bool(has_map)),
+        dst_lat_stride=D_LATENT,
+        dst_rope_stride=D_ROPE,
+        dst_row_stride=int(dst_row_stride) or columns,
+        out_f32=int(fold_mode in (FOLD_FP32, FOLD_IN_PLACE)),
         accumulate=int(fold_mode == FOLD_ACCUMULATE),
     )
     if q_latent is not None:
@@ -1460,7 +1486,7 @@ def _plan(
     region = (
         accumulator_region_layout(num_kv, num_dst)
         if backward
-        else {"total": 0, "zero": 0}
+        else {"total": 0}
     )
     if backward:
         _check_accumulator_span(num_dst, D_QK, dst_row_stride)
@@ -1518,7 +1544,6 @@ def _plan(
                 q_latent=q_latent,
                 q_rope=q_rope,
                 kv_latent=kv_latent,
-                region=region,
             )
         )
     entries: dict[str, _StageEntry] = {"fwd": _stage_entry("fwd", arch, scalars)}
@@ -1573,9 +1598,9 @@ def _inert_operand(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
     """The tensors of the accumulator region of ``plan`` over the bytes ``flat`` (the front of ``o_lo``'s storage or
     a workspace region): ``acc`` (int32 ``[R, 576 | 512]``, absent for a fresh NoPE ``dkv``), the overflow counters
-    ``cnt64`` (u64 ``[R, 4]``) with their u32 view ``cnt``, the row bounds ``row_bound`` (u64 ``[R, parts]``), the
-    grid exponents ``e_lat`` / ``e_rope`` (int32 ``[R]``; NoPE ``e_lat`` only, ``e_rope`` aliases it), the key norms
-    ``knorm`` (FP32 ``[S]``) and ``zero_region`` (the u32 words ``bwd_zero`` clears)."""
+    ``cnt64`` (u64 ``[R, 4]``) with their u32 view ``cnt``, the grid words ``e_lat`` / ``e_rope`` (int32 ``[R]``;
+    NoPE ``e_lat`` only, ``e_rope`` aliases it), the pair counts ``row_pairs`` (u32), the redo marks and list
+    ``redo_mark`` / ``redo_rows`` (int32 ``[R]``) and the key norms ``knorm`` (FP32 ``[S]``)."""
     R, S, region = plan.num_dst, plan.num_kv, plan.region
     parts = 2 if plan.program == cake_jit.PROGRAM else 1
     t: dict[str, torch.Tensor] = {}
@@ -1588,14 +1613,15 @@ def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
     )
     t["cnt64"] = counters.view(torch.uint64)
     t["cnt"] = counters.view(torch.int32).view(torch.uint32)
-    t["row_bound"] = _carve(flat, region, "bounds", torch.int64, (R, parts)).view(
-        torch.uint64
+    grids = _carve(flat, region, "grids", torch.int32, (parts, R))
+    t["e_lat"] = grids[0]
+    t["e_rope"] = grids[parts - 1]
+    t["row_pairs"] = _carve(flat, region, "row_pairs", torch.int32, (R,)).view(
+        torch.uint32
     )
-    exponents = _carve(flat, region, "exponents", torch.int32, (parts, R))
-    t["e_lat"] = exponents[0]
-    t["e_rope"] = exponents[parts - 1]
+    t["redo_mark"] = _carve(flat, region, "redo_mark", torch.int32, (R,))
+    t["redo_rows"] = _carve(flat, region, "redo_rows", torch.int32, (R,))
     t["knorm"] = _carve(flat, region, "knorm", torch.float32, (S,))
-    t["zero_region"] = flat[: region["zero"]].view(torch.int32).view(torch.uint32)
     return t
 
 
@@ -1608,7 +1634,8 @@ def _region_bytes(
 ) -> torch.Tensor:
     """The bytes of the accumulator region of one backward: the front of ``o_lo``'s storage when the plan carves it
     and ``o_lo`` starts 16-byte aligned, else the workspace's ``region`` (a prepared runner), else one allocation
-    (an eager call).  Never zeroed here: ``bwd_zero`` clears the front after ``bwd_delta`` has read ``o_lo``."""
+    (an eager call).  Never zeroed here: the stages after ``bwd_delta`` (the only reader of ``o_lo``) zero what
+    they read."""
     if plan.storage == "o_lo" and o_lo is not None and o_lo.data_ptr() % 16 == 0:
         return _o_lo_bytes(o_lo)[: plan.region["total"]]
     if "region" in layout:
@@ -1644,13 +1671,14 @@ def _scratch(
 def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     """Launch values of ``plan`` over the tensors ``t`` (the kernels' own argument names).
 
-    The integer accumulator reaches the main stage as ``dkv_acc`` / ``dkr_acc`` (the same natural rows, rope
-    columns from ``dkr_col0``); the caller's FP32 ``dkv_acc`` reaches the fold as ``dst_packed``.  Every pointer a
-    stage's scalars tell it not to touch is a zero-size placeholder of its dtype."""
+    The integer accumulator reaches the stages as ``dkv_acc`` / ``dkr_acc`` (the same natural rows, rope columns
+    from ``dkr_col0``) and, as u64 words, as the row bounds ``bound``; the caller's FP32 ``dkv_acc`` reaches the
+    fold as ``dst_packed``; the redo reads its flagged-row count from the global words (``redo_count``).  Every
+    pointer a stage's scalars tell it not to touch is a zero-size placeholder of its dtype."""
     indices, _ = _pointer_operand(t["indices"])
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
-    if not plan.backward:
+    if not plan.backward or "det_globals" not in t:  # a forward launch binds no backward scratch
         return values
     device = t["indices"].device
     f32 = _inert_operand(device, torch.float32)
@@ -1661,11 +1689,10 @@ def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     acc = t["acc"] if "acc" in t else t["dkv"].view(torch.int32)
     values.update(
         dkv_dst_map=dst_map,
-        dst_map=dst_map,
         dkv_acc=acc,
         dkr_acc=acc,
-        acc=acc,
-        src_acc=acc,
+        bound=acc.view(torch.int64).view(torch.uint64),
+        redo_count=t["det_globals"].view(torch.int32)[REDO_WORD : REDO_WORD + 1],
         dst_packed=t["dkv_acc"] if plan.accumulate_dkv else f32,
         dst_latent=t.get("dkv_latent", bf16),
         dst_rope=t.get("dk_rope", bf16),
@@ -2242,7 +2269,7 @@ class _Binding:
             dq_rope=fresh((T, NUM_HEADS, D_ROPE), torch.bfloat16),
         )
         # One per-call allocation of the workspace layout (delta, qstat, global words and, unless the plan carves
-        # o_lo, the accumulator region); nothing is filled here: bwd_delta and bwd_zero clear what they need.
+        # o_lo, the accumulator region); nothing is filled here: the stages zero what they read.
         flat = _alloc((plan.layout["total"],), torch.uint8, device)
         t.update(_scratch(plan, flat, o_lo))
         if plan.accumulate_dkv:
@@ -2948,9 +2975,11 @@ def cake_dsa_sparse_attention_det_varlen(
 # natural layout, FP32, ``[S, 512]``, accumulated as integers like the RoPE
 # program's (one grid exponent per destination row).  Two output forms:
 #
-# * fresh (no ``dkv_acc``): the backend allocates the zero-filled ``[S, 512]``
-#   buffer, the main stage adds the integers into it (its int32 view) and the
-#   fold rewrites every element as FP32 in place (``v = float(n) * 2 ** e``);
+# * fresh (no ``dkv_acc``): the backend allocates the ``[S, 512]`` buffer (not
+#   zero-filled: the grid stage zeroes the rows the pairs touch), the main stage
+#   adds the integers into it (its int32 view) and the fold rewrites every
+#   element as FP32 in place (``v = float(n) * 2 ** e``; zero on an untouched
+#   row);
 # * accumulate (``dkv_acc`` FP32 ``[S_dst, >= 512]``, optional ``dkv_dst_map``):
 #   the integers go to the accumulator region and the fold adds ``v`` into the
 #   caller's rows (an element whose integer is zero keeps its bits); the call
@@ -3117,7 +3146,7 @@ def _plan_nope(
             num_kv, num_dst, program=program, accumulator=own_accumulator
         )
         if backward
-        else {"total": 0, "zero": 0}
+        else {"total": 0}
     )
     if backward:
         _check_accumulator_span(num_dst, D_LATENT, dst_row_stride)
@@ -3180,7 +3209,6 @@ def _plan_nope(
                 q_latent=q_latent,
                 q_rope=None,
                 kv_latent=kv_latent,
-                region=region,
             )
         )
     fwd = cake_jit.stage_name("fwd", program)
@@ -3257,7 +3285,7 @@ def _bound_values_nope(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any
         indices if indices.is_contiguous() else _index_storage_alias(t["indices"])[0]
     )
     values.update(indices_out=indices_out, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
-    if plan.backward:
+    if plan.backward and "det_globals" in t:
         values.update(
             e_dkv=t["e_lat"],
             dst_latent_f32=t["dkv"] if plan.fresh_dkv else values["dst_latent_f32"],
@@ -3274,8 +3302,8 @@ class DSANopeTrainRunner(DSATrainRunner):
     """The prepared forward / backward launches of one NoPE tensor binding.
 
     ``forward()`` writes ``out``, ``lse`` and ``o_lo``; ``backward()`` writes ``dq`` and returns ``(dq, dkv)`` --
-    ``dkv`` the natural-layout FP32 ``[S, 512]`` combined dK + dV of this binding (``fresh_dkv``: zero-filled per
-    backward, accumulated as integers and rewritten as FP32 in place), or ``None`` when the binding adds into the
+    ``dkv`` the natural-layout FP32 ``[S, 512]`` combined dK + dV of this binding (``fresh_dkv``: accumulated as
+    integers in its own storage and rewritten as FP32 in place, every row on every backward), or ``None`` when the binding adds into the
     caller's ``dkv_acc`` (``accumulate_dkv``).  ``step()`` runs both.  No launch allocates or synchronizes; capture
     into a CUDA graph belongs to the caller.  ``storage`` as in :class:`DSATrainRunner`.
     """
@@ -3292,9 +3320,8 @@ class DSANopeTrainRunner(DSATrainRunner):
         self._consume_o_lo()
         t = self.tensors
         with _ffi_stream_context(self.device_index):
-            if self.fresh_dkv:
-                # the fresh natural dkv is the integer accumulator the main stage adds into
-                t["dkv"].zero_()
+            # a fresh natural dkv is the integer accumulator the main stage adds into: the grid stage zeroes its
+            # touched rows and the fold writes every row
             for key in self.backward_order:
                 self.launches[key]()
         return t["dq_latent"], (t["dkv"] if self.fresh_dkv else None)
@@ -3404,7 +3431,7 @@ def prepare_dsa_nope_train(
             if dkv_dst_map is not None:
                 t["dkv_dst_map"] = dkv_dst_map
         else:
-            # the natural FP32 combined dK + dV, zero-filled by ``backward()``: the integer accumulator, then the
+            # the natural FP32 combined dK + dV, written whole by every ``backward()``: the integer accumulator, then the
             # fold's FP32 result in place
             t["dkv"] = (
                 dkv if dkv is not None else fresh((num_kv, D_LATENT), torch.float32)
@@ -3612,7 +3639,7 @@ class _NopeBinding(_Binding):
         self, operands: dict[str, torch.Tensor], dout: torch.Tensor
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """``(dq, dkv)`` over the settled ``operands``: the per-call buffers are allocated (one workspace of the
-        plan's layout, the accumulator region from ``o_lo`` or that workspace, a zero-filled fresh ``dkv``) and the
+        plan's layout, the accumulator region from ``o_lo`` or that workspace, a fresh ``dkv``) and the
         launch values bound before the first launch; then the stages follow back to back, with no host work
         between the launches."""
         plan = self.plan
@@ -3623,7 +3650,7 @@ class _NopeBinding(_Binding):
         dkv = None
         if not plan.accumulate_dkv:
             # the fresh natural dkv: the integer accumulator of the main stage, rewritten as FP32 by the fold
-            t["dkv"] = dkv = _alloc((S, D_LATENT), torch.float32, device, zero=True)
+            t["dkv"] = dkv = _alloc((S, D_LATENT), torch.float32, device)
         t.update(_scratch(plan, flat, t["o_lo"]))
         self._run(_bound_values_nope(plan, t), plan.backward_order)
         return dq, dkv
