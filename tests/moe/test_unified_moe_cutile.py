@@ -1743,6 +1743,7 @@ def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch
 
 
 @cutile_nvfp4_required
+@pytest.mark.parametrize("int64", (False, True), ids=("int32", "int64"))
 @pytest.mark.parametrize(
     "a16,tactic",
     (
@@ -1752,7 +1753,7 @@ def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch
     ),
 )
 def test_cutile_nvfp4_persistent_grid_matches_one_cta_per_block(
-    a16, tactic, monkeypatch
+    a16, tactic, int64, monkeypatch
 ):
     """A CTA looping over several M blocks matches one CTA per M block."""
     from flashinfer.fused_moe.cutile import fp4
@@ -1775,13 +1776,21 @@ def test_cutile_nvfp4_persistent_grid_matches_one_cta_per_block(
     runner.check_support()
     runner.build()
     inputs = runner.pack_inputs(activations, weights)
+    if int64:
+        _force_cutile_int64(monkeypatch)
+    # The grouped GEMMs that take the PERSISTENT flag: GEMM1 and GEMM2, or
+    # GEMM2 alone when GEMM1 is the fused kernel.
+    names = ("_grouped_gemm_w4a16", "_grouped_gemm_w4a4")
+    if int64:
+        names = tuple(name + "_i64" for name in names)
+    stages = 1 if tactic[1] else 2
     launches = []
     launch = fp4.ct.launch
 
     def record(stream, grid, kernel, args):
         name = getattr(getattr(kernel, "_pyfunc", None), "__name__", "")
-        if name in ("_grouped_gemm_w4a16", "_grouped_gemm_w4a4"):
-            launches.append((tuple(grid), args[-1]))
+        if name in names:
+            launches.append((name, tuple(grid), args[-1]))
         return launch(stream, grid, kernel, args)
 
     # The persistent grid runs first, so that rows it skipped cannot be left
@@ -1792,11 +1801,16 @@ def test_cutile_nvfp4_persistent_grid_matches_one_cta_per_block(
         patch.setattr(fp4, "_persistent_grid_m", lambda *_args: 1)
         patch.setattr(fp4.ct, "launch", record)
         actual = runner.forward(inputs, tactic=tactic).clone()
-    # The changed grouped GEMMs took the persistent grid with their loop compiled in.
-    assert launches, "no _grouped_gemm_w4a16 / _grouped_gemm_w4a4 launch was recorded"
-    for grid, persistent in launches:
+    assert len(launches) == stages, launches
+    for _, grid, persistent in launches:
         assert grid[0] == 1 and persistent is True, launches
-    expected = runner.forward(inputs, tactic=tactic).clone()
+    launches.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(fp4.ct, "launch", record)
+        expected = runner.forward(inputs, tactic=tactic).clone()
+    assert len(launches) == stages, launches
+    for _, _, persistent in launches:
+        assert persistent is False, launches
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
