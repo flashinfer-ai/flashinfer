@@ -7813,7 +7813,9 @@ BWD_TAPE_IDS = ("w4r1walks-h64", "s300_724_476-h2", "s3000-h64")
 
 
 @pytest.mark.parametrize("lengths,H,plan_sm", BWD_TAPE_ROWS, ids=BWD_TAPE_IDS)
-def test_gpu_bwd_tape_stream_is_bitwise(device, monkeypatch, lengths, H, plan_sm) -> None:
+def test_gpu_bwd_tape_stream_is_bitwise(
+    device, monkeypatch, lengths, H, plan_sm
+) -> None:
     """The saved-set backward's tape replay on the call's stream (knob ``bwd_tape_stream="one"``) and on the side
     stream under every other form of :data:`BWD_TAPE_STREAMS`, one rank: the forward's ``out`` and the gradients of
     the saved-set backward (with a held workspace and with ``workspace=None``; at ``P > 1`` also under

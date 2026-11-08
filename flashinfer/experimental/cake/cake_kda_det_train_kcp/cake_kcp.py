@@ -562,7 +562,8 @@ KCP_DAV_DEFAULT = "auto"
 # the h / v_new tapes or writes an operand of the replay, so the form never changes a bit; _kcp_test_knobs only (the
 # A/B record).
 BWD_TAPE_STREAMS = ("one", "pre", "mid", "post", "pre_hi", "mid_hi", "post_hi")
-BWD_TAPE_STREAM_DEFAULT = "post"  # the A/B record's fastest form (GB200 CP4: ts4 / cust5pad backward)
+# the A/B record's fastest form (GB200 CP4: ts4 / cust5pad backward)
+BWD_TAPE_STREAM_DEFAULT = "post"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
@@ -1031,7 +1032,8 @@ class _TapeSide:
         self.main = torch.cuda.current_stream(call.device)
         self.forked = self.issued = False
         self._crit_ctx: Any = None
-        for walk, _h0 in launches:  # CakeKDADetKcpCall.walk's record, at the program's place
+        # CakeKDADetKcpCall.walk's record, at the program's place
+        for walk, _h0 in launches:
             if len(walk):
                 call.counters["walks"] += 1
                 call.counters["launches"] += 1
@@ -1076,9 +1078,7 @@ class _TapeSide:
         self.launches = []
 
 
-def _tape_side(
-    call: CakeKDADetKcpCall, launches: list
-) -> tuple[_TapeSide | None, Any]:
+def _tape_side(call: CakeKDADetKcpCall, launches: list) -> tuple[_TapeSide | None, Any]:
     """The side-stream form of the backward's tape replay ``launches`` (``[(walk list, initial-state view thunk)]``;
     the side form holds the views, built now), or ``None`` for the call's stream, and the table-set key to mark once
     the replay ran on the call's stream (``None``: nothing to mark).  The side stream runs only for a
@@ -1086,7 +1086,8 @@ def _tape_side(
     and the ``wait_first`` schedule, with the tape launches uncapped (no cache-config bracket: the shipped split form)
     and no ``kcp_dav`` launch (it reads ``v_new`` right after the replay); the first replay of a table set on a device
     runs on the call's stream (it uploads the launches' device tables)."""
-    if not isinstance(call, CakeKDADetKcpCall):  # a test's driver call: the launches in order
+    # a test's driver call: the launches in order
+    if not isinstance(call, CakeKDADetKcpCall):
         return None, None
     form = str(call.opts.bwd_tape_stream)
     if form == "one" or not any(len(w) for w, _ in launches):
