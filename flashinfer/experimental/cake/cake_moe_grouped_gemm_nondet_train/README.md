@@ -174,7 +174,8 @@ adds in `plan["accumulate"]`:
 The route is chosen by a static rule (nothing is compiled, loaded or
 test-built to decide it): an accumulate build is bound when its prebuilt
 library exists under `aot/`, or else when the version of FlashInfer's JIT
-toolkit reaches the build's `build.json` `min_cuda` (the loader's own rule). The fp32 accumulate builds use the PTX ISA 9.4
+toolkit reaches the build's `build.json` `min_cuda`, with `nvcc` under the CUDA
+path and `FLASHINFER_DISABLE_JIT` unset (the loader's own rule). The fp32 accumulate builds use the PTX ISA 9.4
 `red.add.noftz.f32` form, so their `min_cuda` is 13.4 on every architecture;
 an ahead-of-time build with an older toolkit ships no library for them, and
 with a JIT toolkit below 13.4 the call composes (`"min_cuda"`) instead of
