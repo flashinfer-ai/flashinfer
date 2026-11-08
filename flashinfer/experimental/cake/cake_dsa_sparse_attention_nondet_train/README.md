@@ -558,6 +558,13 @@ out = cake_dsa_sparse_attention_nondet_nope_varlen(
   of the FP32 buffers the call owns and the delta / main stages then follow
   back to back, with no allocation, validation or synchronization between the
   launches.  The kernel-level `backward_nope` keeps the same launch order.
+  Forward host order: the NoPE autograd wrappers allocate and bind the
+  forward, then settle what their backward needs (its binding key without
+  `dout`, with the accumulator's geometry when the accumulator is a tensor or
+  absent; the accumulator check; the saved tensors, which PyTorch packs once
+  the forward returns), then launch, so the host work after the forward's
+  launch is the return, and an invalid `dkv_acc` / `dkv_dst_map` is rejected
+  before any launch.
   Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
   contiguous int32 `[num_docs + 1]` of one length) and never synchronizes with
   the device; `check_cu_seqlens=True` also checks their values -- start at 0,

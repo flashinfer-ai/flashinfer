@@ -3679,29 +3679,28 @@ def _plan_nope(
     )
 
 
-_INERT_CU_SEQLENS: dict[str, torch.Tensor] = {}
+# The per-device constants below are keyed by the ``torch.device`` itself (hashed in C): a lookup builds no string.
+_INERT_CU_SEQLENS: dict[torch.device, torch.Tensor] = {}
 
 
 def _inert_cu_seqlens(device: torch.device) -> torch.Tensor:
     """Cached int32 ``[2]`` constant on ``device``: the prefix-sum operands of a forward launch over global rows
     (``convert = 0``), where a converting program needs valid pointers it never reads."""
-    key = str(device)
-    t = _INERT_CU_SEQLENS.get(key)
+    t = _INERT_CU_SEQLENS.get(device)
     if t is None:
-        t = _INERT_CU_SEQLENS[key] = torch.zeros(2, dtype=torch.int32, device=device)
+        t = _INERT_CU_SEQLENS[device] = torch.zeros(2, dtype=torch.int32, device=device)
     return t
 
 
-_INERT_PLACEHOLDERS: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+_INERT_PLACEHOLDERS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _inert_placeholders(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """Cached zero-size ``(FP32, BF16)`` placeholders on ``device``: the cast stage's rope operands
     (``rope_groups = 0``: never dereferenced), shared by every call instead of two allocations per backward."""
-    key = str(device)
-    pair = _INERT_PLACEHOLDERS.get(key)
+    pair = _INERT_PLACEHOLDERS.get(device)
     if pair is None:
-        pair = _INERT_PLACEHOLDERS[key] = (
+        pair = _INERT_PLACEHOLDERS[device] = (
             torch.empty(0, dtype=torch.float32, device=device),
             torch.empty(0, dtype=torch.bfloat16, device=device),
         )
@@ -4260,12 +4259,31 @@ def forward_nope(
     launches over the remembered plan of the input geometry; a call without query rows returns empty outputs
     without launching.  ``topk_length`` / ``derive_topk_length`` as in :func:`forward`.
     """
+    outputs, launch = _prepare_forward_nope(
+        q_latent, kv_latent, indices, topk_length, softmax_scale, derive_topk_length
+    )
+    launch()
+    return outputs
+
+
+def _no_launch() -> None:
+    """The launch of a call without query rows: nothing."""
+
+
+def _prepare_forward_nope(
+    q_latent, kv_latent, indices, topk_length, softmax_scale, derive_topk_length
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], Callable[[], None]]:
+    """:func:`forward_nope` before its launch: ``((out, lse, o_lo), launch)`` with the outputs allocated and the
+    launch values bound (:meth:`_NopeBinding.prepared_forward`); ``launch()`` issues the forward stage."""
     if derive_topk_length and topk_length is None:
         raise ValueError(
             "derive_topk_length=True needs a topk_length [T] int32 tensor for the forward to fill"
         )
     if _no_query_rows(q_latent):
-        return _empty_forward_nope(q_latent, kv_latent, indices, topk_length)
+        return (
+            _empty_forward_nope(q_latent, kv_latent, indices, topk_length),
+            _no_launch,
+        )
     scale = NOPE_SOFTMAX_SCALE if softmax_scale is None else float(softmax_scale)
     key = forward_binding_key_nope(
         q_latent, kv_latent, indices, topk_length, scale, derive_topk_length
@@ -4286,7 +4304,7 @@ def forward_nope(
         ),
         _NopeBinding,
     )
-    return binding.forward(q_latent, kv_latent, indices, topk_length)
+    return binding.prepared_forward(q_latent, kv_latent, indices, topk_length)
 
 
 def backward_nope(
@@ -4442,6 +4460,8 @@ class CakeDSASparseAttentionNondetNopeFunction(torch.autograd.Function):
         check_dst_map=False,
     ):
         num_rows = int(q_latent.shape[0])
+        # every route allocates and binds first and launches last (``issue``): the backward is settled in between,
+        # so the host work after the forward's launch is the return alone
         if derive_topk_length and topk_length is None and num_rows > 0:
             small = (
                 indices.dim() == 2
@@ -4451,26 +4471,23 @@ class CakeDSASparseAttentionNondetNopeFunction(torch.autograd.Function):
                 # the small-table route: one launch over the caller's rows as given; the forward derives each
                 # row's length (last valid slot + 1) into the fresh vector the backward reads with those rows
                 topk_length = _alloc((num_rows,), torch.int32, q_latent.device)
-                out, lse, o_lo = forward_nope(
-                    q_latent,
-                    kv_latent,
-                    indices,
-                    topk_length=topk_length,
-                    softmax_scale=softmax_scale,
-                    derive_topk_length=True,
+                (out, lse, o_lo), issue = _prepare_forward_nope(
+                    q_latent, kv_latent, indices, topk_length, softmax_scale, True
                 )
             else:
-                out, lse, o_lo, indices, topk_length = _flat_forward_nope(
-                    q_latent, kv_latent, indices, softmax_scale
+                (out, lse, o_lo, indices, topk_length), issue = (
+                    _prepare_flat_forward_nope(
+                        q_latent, kv_latent, indices, softmax_scale
+                    )
                 )
         else:
-            out, lse, o_lo = forward_nope(
+            (out, lse, o_lo), issue = _prepare_forward_nope(
                 q_latent,
                 kv_latent,
                 indices,
-                topk_length=topk_length,
-                softmax_scale=softmax_scale,
-                derive_topk_length=derive_topk_length,
+                topk_length,
+                softmax_scale,
+                derive_topk_length,
             )
         ctx.set_materialize_grads(False)
         ctx.nope_prep = _NopeBackwardPrep(
@@ -4490,6 +4507,7 @@ class CakeDSASparseAttentionNondetNopeFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
+        issue()
         return out, lse
 
     @staticmethod
@@ -4506,14 +4524,17 @@ class CakeDSASparseAttentionNondetNopeFunction(torch.autograd.Function):
 class _NopeBackwardPrep:
     """What the NoPE autograd wrappers settle at forward time for their backward, so that the backward's host work
     before its first launch is the completion of the binding key with ``dout``'s geometry, the cache lookup, the
-    two fresh allocations and the binding of the launch values: the options, the geometry key without ``dout`` and
-    without the accumulator, and the presence flag of the lengths.  It holds no produced tensor: the saved outputs,
-    the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order (seven
-    tensors), so that under activation checkpointing nothing of size outlives the forward.  The caller-owned
-    accumulator stays here as before -- a tensor ``dkv_acc`` (validated here, :func:`_check_dkv_acc`;
-    ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map`` in ``operands`` -- or as the
-    zero-argument callable a deferred accumulator comes from, resolved and validated in the backward
-    (:data:`DkvAccSource`)."""
+    two fresh allocations and the binding of the launch values: the options, the geometry key without ``dout``
+    (``key_head``, then ``key_tail``: the rest of the key, the accumulator's geometry included, whenever the
+    accumulator is known at forward time -- none, or a tensor; ``None`` for a callable, whose result is keyed in the
+    backward), the presence flag of the lengths and whether the call has query rows.  The wrappers build it before
+    the forward's launch, so the host work after that launch is the return alone.  It holds no produced tensor: the
+    saved outputs, the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order
+    (seven tensors; PyTorch packs them once the forward returns), so that under activation checkpointing nothing of
+    size outlives the forward.  The caller-owned accumulator stays here as before -- a tensor ``dkv_acc`` (validated
+    here, :func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map``
+    in ``operands`` -- or as the zero-argument callable a deferred accumulator comes from, resolved and validated in
+    the backward (:data:`DkvAccSource`)."""
 
     __slots__ = (
         "softmax_scale",
@@ -4522,12 +4543,14 @@ class _NopeBackwardPrep:
         "dkv_direct",
         "check_dst_map",
         "has_topk_length",
+        "has_rows",
         "dkv_acc",
         "dkv_dst_map",
         "dkv_acc_source",
         "operands",
         "key_head",
         "key_mid",
+        "key_tail",
     )
 
     def __init__(
@@ -4573,8 +4596,9 @@ class _NopeBackwardPrep:
         self.dkv_acc, self.dkv_dst_map = acc_tensor, dkv_dst_map
         self.dkv_acc_source = None if acc_tensor is not None else dkv_acc
         self.has_topk_length = topk_length is not None
-        # the backward key with dout's slot (index 7) and the accumulator's geometry (indices 12, 13) left open:
-        # completed per backward call
+        self.has_rows = not _no_query_rows(q_latent)
+        # the backward key with dout's slot (index 7) left open, completed per backward call; the accumulator's
+        # geometry (indices 12, 13) is part of ``key_tail`` unless a callable produces the accumulator
         key = backward_binding_key_nope(
             q_latent,
             kv_latent,
@@ -4587,11 +4611,12 @@ class _NopeBackwardPrep:
             self.softmax_scale,
             key_passes,
             self.num_segments,
-            None,
-            None,
+            acc_tensor,
+            dkv_dst_map if acc_tensor is not None else None,
             dkv_direct,
         )
         self.key_head, self.key_mid = key[:7], key[8:12]
+        self.key_tail = key[8:] if self.dkv_acc_source is None else None
         ctx.save_for_backward(
             q_latent,
             kv_latent,
@@ -4604,12 +4629,20 @@ class _NopeBackwardPrep:
 
     def backward(self, saved, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         q_latent, kv_latent, out, lse, o_lo, indices, topk_length = saved
-        topk_length = topk_length if self.has_topk_length else None
-        dkv_acc, dst_map = _resolve_dkv_acc(
-            self.dkv_acc if self.dkv_acc is not None else self.dkv_acc_source,
-            self.dkv_dst_map,
-        )
-        if _no_query_rows(q_latent):
+        if not self.has_topk_length:
+            topk_length = None
+        key_tail = self.key_tail
+        if key_tail is not None:
+            # no accumulator, or the tensor one: validated, bound and keyed at forward time
+            dkv_acc, dst_map = self.dkv_acc, self.dkv_dst_map
+        else:
+            dkv_acc, dst_map = _resolve_dkv_acc(self.dkv_acc_source, self.dkv_dst_map)
+            key_tail = self.key_mid + (
+                _geometry(dkv_acc),
+                _geometry(dst_map),
+                self.dkv_direct,
+            )
+        if not self.has_rows:
             return backward_nope(
                 q_latent,
                 kv_latent,
@@ -4626,12 +4659,7 @@ class _NopeBackwardPrep:
                 num_segments=self.num_segments,
                 dkv_direct=self.dkv_direct,
             )
-        key = (
-            self.key_head
-            + (_geometry(dout),)
-            + self.key_mid
-            + (_geometry(dkv_acc), _geometry(dst_map), self.dkv_direct)
-        )
+        key = self.key_head + (_geometry(dout),) + key_tail
         binding = _binding(
             key,
             lambda: _plan_nope(
@@ -5336,6 +5364,36 @@ def _packed_forward_nope(
     (``convert = NOPE_CONVERT_COMPACT``): the scan lanes write the same stable compaction and valid counts as the
     stage (bitwise); no caller cut, never selected by size.  ``indices`` (global key rows in the order the forward
     processed them) and ``lengths`` are what the backward reads on every route."""
+    results, issue = _prepare_packed_forward_nope(
+        q_latent,
+        kv_latent,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal,
+        topk_length,
+        softmax_scale,
+        mode,
+    )
+    issue()
+    return results
+
+
+def _prepare_packed_forward_nope(
+    q_latent,
+    kv_latent,
+    gather_kv_indices,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    causal,
+    topk_length,
+    softmax_scale,
+    mode,
+) -> tuple[tuple[torch.Tensor, ...], Callable[[], None]]:
+    """:func:`_packed_forward_nope` before its first launch: ``((out, lse, o_lo, indices, lengths), issue)`` with
+    every buffer allocated and every launch value bound; ``issue()`` issues the route's launches (the forward, or the
+    index-preparation stage and the pre-bound forward back to back).  The autograd entry settles its backward between
+    the two calls, so the host work after the forward's launch is the return alone."""
     arch = _nope_arch(gather_kv_indices)
     num_rows, topk = int(q_latent.shape[0]), int(gather_kv_indices.shape[1])
     device = q_latent.device
@@ -5402,8 +5460,7 @@ def _packed_forward_nope(
         (out, lse, o_lo), launch = binding.prepared_forward(
             q_latent, kv_latent, plan_indices, lengths, extra
         )
-        launch()
-        return out, lse, o_lo, indices, lengths
+        return (out, lse, o_lo, indices, lengths), launch
     # the preparation route: every allocation, launch value and operand conversion of both launches first, then
     # -- inside one stream context -- the stage launch and the pre-bound forward launch with nothing in between
     # (the forward's binding call is all that separates them, so it hides behind the stage's kernel)
@@ -5421,11 +5478,15 @@ def _packed_forward_nope(
         compact=True,
         length_in=topk_length,
     )
-    with _ffi_stream_context(_device_index(device)):
-        prep()
-        for launch in launches:
-            launch()
-    return out, lse, o_lo, indices, lengths
+    device_index = binding.plan.device_index
+
+    def issue() -> None:
+        with _ffi_stream_context(device_index):
+            prep()
+            for launch in launches:
+                launch()
+
+    return (out, lse, o_lo, indices, lengths), issue
 
 
 def _flat_forward_nope(q_latent, kv_latent, indices, softmax_scale):
@@ -5438,6 +5499,18 @@ def _flat_forward_nope(q_latent, kv_latent, indices, softmax_scale):
     the first launch and nothing synchronizes with the device.  The forward plan is that of a kernel-level call over
     contiguous rows with lengths (``has_topk_length = 1, derive_length = 0``): the same geometry shares the binding,
     since neither the key nor the plan depends on tensor contents."""
+    results, issue = _prepare_flat_forward_nope(
+        q_latent, kv_latent, indices, softmax_scale
+    )
+    issue()
+    return results
+
+
+def _prepare_flat_forward_nope(
+    q_latent, kv_latent, indices, softmax_scale
+) -> tuple[tuple[torch.Tensor, ...], Callable[[], None]]:
+    """:func:`_flat_forward_nope` before its first launch: ``((out, lse, o_lo, indices_c, counts), issue)``;
+    ``issue()`` issues the stage launch and the pre-bound forward back to back."""
     arch = _nope_arch(indices)
     _require_index_prep_stage()
     num_rows, topk = _check_index_rows(indices, "indices")
@@ -5479,11 +5552,15 @@ def _flat_forward_nope(q_latent, kv_latent, indices, softmax_scale):
         flat=True,
         num_kv=int(kv_latent.shape[0]),
     )
-    with _ffi_stream_context(_device_index(device)):
-        prep()
-        for launch in launches:
-            launch()
-    return out, lse, o_lo, indices_c, counts
+    device_index = binding.plan.device_index
+
+    def issue() -> None:
+        with _ffi_stream_context(device_index):
+            prep()
+            for launch in launches:
+                launch()
+
+    return (out, lse, o_lo, indices_c, counts), issue
 
 
 class CakeDSASparseAttentionNondetNopeVarlenFunction(torch.autograd.Function):
@@ -5499,8 +5576,9 @@ class CakeDSASparseAttentionNondetNopeVarlenFunction(torch.autograd.Function):
     every row stably compacted (valid keys first, then ``-1``; the length is the valid count) after the position
     cut of a caller ``topk_length``, then the forward kernel with no host work in between; ``mode == "kernel"``
     (explicit only): the forward kernel writes the same compacted rows and counts as the stage itself.  On every
-    route the plan lookup, the output allocation and the forward's launch values are prepared before the first
-    launch, and nothing on the path synchronizes with the device.  The backward is that of
+    route the plan lookup, the output allocation, the forward's launch values and the backward's settlement
+    (:class:`_NopeBackwardPrep`) are prepared before the first launch, and nothing on the path synchronizes with the
+    device.  The backward is that of
     :class:`CakeDSASparseAttentionNondetNopeFunction` over the saved global rows and lengths -- the rows in the order the
     forward processed them, so forward and backward see the same slots (the stage's rows and counts on the
     ``"index_prep"`` route, also with caller lengths): every produced
@@ -5528,7 +5606,9 @@ class CakeDSASparseAttentionNondetNopeVarlenFunction(torch.autograd.Function):
         check_dst_map=False,
         mode="index_prep",
     ):
-        out, lse, o_lo, indices, lengths = _packed_forward_nope(
+        # allocate and bind first, settle the backward, launch last: the host work after the forward's launch is
+        # the return alone (the backward's key, the accumulator check and the saved list precede the launch)
+        (out, lse, o_lo, indices, lengths), issue = _prepare_packed_forward_nope(
             q_latent,
             kv_latent,
             gather_kv_indices,
@@ -5558,6 +5638,7 @@ class CakeDSASparseAttentionNondetNopeVarlenFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
+        issue()
         return out, lse
 
     @staticmethod
