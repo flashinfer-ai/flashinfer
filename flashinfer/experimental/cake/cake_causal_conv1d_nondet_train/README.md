@@ -112,7 +112,10 @@ deterministic route's head program. Then:
    no fragment had tail rows. Its CTAs take units of tokens from lanes. Through
    Cluster Launch Control, they also take the lanes of CTAs that have not
    started. A kernel resident on another stream therefore leaves no work waiting
-   for the SMs it holds. The FP32 `dweight` runs are added into four FP32
+   for the SMs it holds. Its token loop computes two tokens per packed FP32
+   (`f32x2`) instruction, as the deterministic KCP backward does since
+   FlashInfer PR #9142; `dx` and each run's FP32 `dweight` sum are bitwise
+   those of a one-token loop. The FP32 `dweight` runs are added into four FP32
    accumulator copies in the order the runs end. The copies are summed once per
    channel tile.
 3. After the wait, on a rank that receives tail rows, the tail-row program
