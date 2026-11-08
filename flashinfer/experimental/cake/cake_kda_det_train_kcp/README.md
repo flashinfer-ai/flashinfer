@@ -462,6 +462,19 @@ previous rules stay selectable through the private test knob `p_rule`, as
 does the fused form of the carry merges (`merge_fuse="carry"`: the two carry
 families of a phase in one launch; off by default).
 
+The saved-set backward replays the forward tapes (`kcp_fwdh_tape`, which
+writes `h` / `v_new`) on a per-device side stream: an event recorded after
+the adjoint offset walk forks it, and the call's stream waits for it before
+the adjoint tape walk, whose `dh` shares bytes with `u` in both backward
+layouts.  In between, the b1 / b2 exchange and the merges read no tape and
+write only the call's pools, so the replay runs beside them.  The first
+replay of a table set, a backward that launches `kcp_dav` (it reads
+`v_new`), the ring exchange and the `overlap` schedule keep the call's
+stream.  Placement changes no bit.  The private test knob
+`bwd_tape_stream` keeps the one-stream form (`"one"`) and the other fork,
+issue and priority forms selectable for the A/B record;
+`LAST_CALL["bwd"]["bwd_tape_stream"]` records the form a backward ran.
+
 The files of this package:
 
 * `cake_kcp_jit.py` -- the `MODULES` registry of the sixteen shipped programs (the
