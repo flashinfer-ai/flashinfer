@@ -2861,7 +2861,9 @@ def _forward_state(meta: ChunkMeta, kn, v):
 def _start_state(initial_state, meta: ChunkMeta, output_final_state: bool, num_v_heads: int, table, workspaces,
                  device):  # fmt: skip
     """``(final_state, h0, use_init)`` of a forward on wy_a's A: the final-state output (a zero-row workspace when the
-    call outputs none) and the initial state rows in table order (the final-state buffer and 0 without one)."""
+    call outputs none) and the initial state rows in table order (the final-state buffer and 0 without one), FP32 and
+    contiguous at a 16-byte aligned base: the split forward's stitch reads them with 16-byte loads, so rows the
+    caller passes at another address are copied (the same bits)."""
     f32 = torch.float32
     if output_final_state:
         final_state = torch.empty(
@@ -2877,7 +2879,7 @@ def _start_state(initial_state, meta: ChunkMeta, output_final_state: bool, num_v
     h0 = initial_rows.contiguous()
     if h0.dtype != f32:
         h0 = h0.float()
-    return final_state, h0, 1
+    return final_state, _aligned(h0, ROW_ALIGN_BYTES), 1
 
 
 def _launch_wy_a(q, k, g32, beta32, meta: ChunkMeta, num_heads: int, num_v_heads: int, index: int):  # fmt: skip

@@ -89,7 +89,11 @@ per four chunks); on SM107 it is the per-thread program of SM100 / SM103's
 ``dhu_tc2_wavefront``.
 Every other launch is a
 plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
-two launches of one stage on two streams, each over its own sequences).
+two launches of one stage on two streams, each over its own sequences, and
+runs the split forward's middle-piece maps, ``fwd_summary`` /
+``fwd_summary_a``, on a side stream beside its wave 1, ``fwd_fused`` /
+``fwd_ho_a``: the two write disjoint segments and are joined before the
+stitch).
 """
 
 from __future__ import annotations

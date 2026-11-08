@@ -143,8 +143,11 @@ segments), so they are bitwise run to run with one or two streams.  Their
 bits differ from the prep forward's, so the outputs and gradients of these
 FP32-`beta` host-table calls change from the previous release of this package
 (within its accuracy budgets).  Every other call (a BF16 `beta`, Q/K not
-normalized, the device route, a larger value-head group, a pin) runs the prep
-forward with the same launches and bits as before.
+normalized, the device route, a larger value-head group, a `prep`,
+`scan_config` or `segment_chunks` pin) runs the prep forward with the same
+launches and bits as before.  The other options (`dhu_scan`, `finalize`,
+`warmup_log2`, `lpt`, `streams`, `save_state`, `host_cache`) do not change the
+forward route.
 
 The forward keeps for the backward only the state of the architecture's tape
 level (`T_full`: `w`, `h` and `v_new`; `u` is read only to rebuild `h` and
