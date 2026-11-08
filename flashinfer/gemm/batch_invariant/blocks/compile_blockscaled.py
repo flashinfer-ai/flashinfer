@@ -32,14 +32,20 @@ SF_BUFFER_DIVISIBILITY = (
 
 
 def kernel_name(
-    cfg: Knobs, chunks: int, clusters: int, in_fmt: str, out_fmt: str
+    cfg: Knobs,
+    chunks: int,
+    clusters: int,
+    in_fmt: str,
+    out_fmt: str,
+    enable_pdl: bool = False,
 ) -> str:
     """``clusters`` is the compiled persistent grid in clusters (the knobs' own ``grid_clusters`` when set, else the launch
     device's co-resident count), keyed once as ``_g<clusters>``; the knobs' ``describe()`` carries the in-cluster split
-    factor, the swapped decode record and the in-CTA chunk fold."""
+    factor, the swapped decode record and the in-CTA chunk fold; the dependent-launch variant is keyed ``_pdl``."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"{in_fmt}_{out_fmt}_bk_C{chunks}_{knobs.describe()}_g{clusters}"
+        + ("_pdl" if enable_pdl else "")
     )
 
 
@@ -70,10 +76,12 @@ def compile_blockscaled(
     out_fmt: str,
     module: str,
     plan_cls=None,
+    enable_pdl: bool = False,
 ):
     """The compile closure behind :func:`get_compiled_blockscaled`, in cache module ``module`` with the record's plan class
     (default: the format's in ``PLANS``; the mixed classes pass their own, the swapped records' with the operand formats
-    exchanged). Each operand's fake tensor takes the kernel-side operand's storage: its own dtype for an 8-bit element,
+    exchanged) and, with ``enable_pdl``, the kernel compiled as a programmatic dependent launch (a placement: the same
+    bits). Each operand's fake tensor takes the kernel-side operand's storage: its own dtype for an 8-bit element,
     bytes (two elements each) for a 4-bit one; a row's extent and strides are 16-byte multiples in either."""
     plan_cls = plan_cls or PLANS[in_fmt]
     a_packed, b_packed = plan_cls.A_DT.width == 4, plan_cls.B_DT.width == 4
@@ -104,7 +112,7 @@ def compile_blockscaled(
     Lc = 1 if in_cta else L
     grid = cfg.grid_clusters or clusters
     assert grid > 0, (cfg, clusters)
-    name = kernel_name(cfg, chunks, grid, in_fmt, out_fmt)
+    name = kernel_name(cfg, chunks, grid, in_fmt, out_fmt, enable_pdl)
 
     def compile_fn():
         # K elements per row, a multiple of 16 (K is a multiple of 32: one whole scale block); the row and chunk strides
@@ -160,7 +168,9 @@ def compile_blockscaled(
                 cutlass.Float32, (1,), (1,), assumed_align=4
             )
             return cute.compile(
-                ScaledBlockScaledGemm(cfg, in_fmt, body_out, L, plan_cls=plan_cls),
+                ScaledBlockScaledGemm(
+                    cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl
+                ),
                 a_fake,
                 b_fake,
                 sfa_fake,
@@ -172,7 +182,9 @@ def compile_blockscaled(
                 options="--enable-tvm-ffi",
             )
         return cute.compile(
-            BlockScaledGemm(cfg, in_fmt, body_out, L, plan_cls=plan_cls),
+            BlockScaledGemm(
+                cfg, in_fmt, body_out, L, plan_cls=plan_cls, enable_pdl=enable_pdl
+            ),
             a_fake,
             b_fake,
             sfa_fake,

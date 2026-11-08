@@ -28,10 +28,19 @@ def get_compiled_blockscaled_mixed(
     in_fmt: str,
     out_fmt: str = "bf16",
     family: str = "",
+    enable_pdl: bool = False,
 ):
     """``kernel(a3, b3, sfa, sfb, c3, alpha)`` of the mixed class ``in_fmt`` (the direct stores; the workspace split's
     partials are unscaled and the dense module's fixup applies ``alpha``), with the conventions of
-    :func:`compile_blockscaled.get_compiled_blockscaled`."""
+    :func:`compile_blockscaled.get_compiled_blockscaled`; ``enable_pdl`` compiles the programmatic-dependent-launch
+    variant (its own cache key, the same bits)."""
     return compile_blockscaled(
-        cfg, chunks, clusters, in_fmt, out_fmt, MODULE, plan_for(in_fmt, cfg)
+        cfg,
+        chunks,
+        clusters,
+        in_fmt,
+        out_fmt,
+        MODULE,
+        plan_for(in_fmt, cfg),
+        enable_pdl=enable_pdl,
     )

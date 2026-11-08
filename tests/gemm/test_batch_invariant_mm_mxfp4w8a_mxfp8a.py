@@ -544,6 +544,49 @@ def test_determinism_and_graph_replay(M, N, K):
 
 
 @needs_device
+@pytest.mark.parametrize(
+    "M,N,K", [(1, 4096, 4096), (16, 2048, 16384), (300, 1024, 4096), (16, 128, 8192)]
+)
+def test_pdl_variant_is_a_placement(M, N, K):
+    """Programmatic dependent launch (``enable_pdl``; the default follows the device): the kernel waits for the preceding
+    grid before its first operand load and releases its dependents once its loads are issued -- the same bits as the plain
+    launch (the bf16 output and the fp32 chain input) for the dispatcher's pick, in a stream of back-to-back calls and
+    under graph replay of such a chain."""
+    a, sfa = adv_mx8(M, K, 31)
+    b, sfb = weight(N, K, 32)
+    alpha = alpha_t(0.37)
+    ref = bits(mm(a, b, sfa, sfb, alpha, enable_pdl=False)).clone()
+    acc = bits(
+        mm(a, b, sfa, sfb, alpha, out_dtype=torch.float32, enable_pdl=False)
+    ).clone()
+    outs = [
+        mm(a, b, sfa, sfb, alpha, enable_pdl=True) for _ in range(4)
+    ]  # back to back: the dependent launches chain
+    torch.cuda.synchronize()
+    assert all(torch.equal(bits(o), ref) for o in outs)
+    assert torch.equal(
+        bits(mm(a, b, sfa, sfb, alpha, out_dtype=torch.float32, enable_pdl=True)), acc
+    )
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        mm(
+            a, b, sfa, sfb, alpha, out=out, enable_pdl=True
+        )  # warm-up outside the capture
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(3):
+                mm(a, b, sfa, sfb, alpha, out=out, enable_pdl=True)
+    torch.cuda.current_stream().wait_stream(s)
+    for _ in range(2):
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+
+
+@needs_device
 def test_batch_invariance_along_rows():
     """R2: a row's bits do not depend on the number of rows (the dispatcher's M-dependent picks included: the swapped decode
     records at small M, the dense tiles above), its position or the other rows; the parts' picks agree."""

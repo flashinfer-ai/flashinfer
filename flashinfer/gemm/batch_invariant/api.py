@@ -1101,6 +1101,7 @@ def _run_mx(
     workspace: Optional[torch.Tensor],
     cls: str,
     alpha: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """The launch of the block-scaled classes for one product: ``b_nk`` the (N, K) row-major view of the weight (in bytes
     for the 4-bit formats: (N, K / 2)), the scale buffers flat, ``alpha`` the 4-bit classes' scalar. Four placements of one
@@ -1119,19 +1120,29 @@ def _run_mx(
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks",
             "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
         )
-    compiled = (
-        get_compiled_blockscaled_mixed
-        if in_fmt in MX_MIXED_FMTS
-        else get_compiled_blockscaled
-    )
-    kernel = compiled(
-        config,
-        C,
-        persistent_clusters(a.device, config),
-        in_fmt,
-        out_fmt,
-        family=part_of(a.device)[1],
-    )
+    if in_fmt in MX_MIXED_FMTS:
+        # the mixed classes' kernels compile as a programmatic dependent launch on request (a placement)
+        kernel = get_compiled_blockscaled_mixed(
+            config,
+            C,
+            persistent_clusters(a.device, config),
+            in_fmt,
+            out_fmt,
+            family=part_of(a.device)[1],
+            enable_pdl=enable_pdl,
+        )
+    else:
+        assert not enable_pdl, (
+            "programmatic dependent launch: the mixed classes' kernels"
+        )
+        kernel = get_compiled_blockscaled(
+            config,
+            C,
+            persistent_clusters(a.device, config),
+            in_fmt,
+            out_fmt,
+            family=part_of(a.device)[1],
+        )
     # each operand's K extent in its own units (bytes for a 4-bit operand: the mixed classes' weight, both operands of the
     # 4-bit formats)
     Kb_a = K * A_ELEM_BITS_OF[in_fmt] // 8
@@ -1516,6 +1527,7 @@ def mm_mxfp4w8a_mxfp8a_batch_invariant(
     chunks: Optional[int] = None,
     workspace: Optional[torch.Tensor] = None,
     in_fmt: Optional[str] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``C = cvt(mul.rn(A @ B, alpha))`` for e4m3 activations against e2m1 weights, both with UE8M0 block scales per 32
     elements applied inside the mixed-operand block-scaled instruction, by the mixed class of the device's architecture
@@ -1529,10 +1541,16 @@ def mm_mxfp4w8a_mxfp8a_batch_invariant(
     format over whole 64-byte runs of the row, so that class takes K in multiples of 128 (the row itself, not a padded step);
     the SM107 class takes K in multiples of 32 with the zero-filled tail of the other MX classes (its padded scales are read
     from the buffers' padding, which must be finite, as the quantizers write it). ``config``, ``chunks`` and ``workspace`` as in
-    :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests)."""
+    :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests). ``enable_pdl=None`` follows the device
+    (programmatic dependent launch: the kernel waits for the preceding grid before its first operand load and releases
+    its dependents once its loads are issued -- a placement, the same bits as the plain launch)."""
+    from ...utils import device_support_pdl
+
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_mxfp4w8a_operands(
         a, b, a_descale, b_descale, alpha, out, out_dtype
     )
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(a.device)
     in_fmt = mxfp4w8a_format_for(a.device, in_fmt)
     cls = f"gemm.{in_fmt}"
     gran = k_granule(in_fmt)
@@ -1572,4 +1590,5 @@ def mm_mxfp4w8a_mxfp8a_batch_invariant(
         workspace,
         cls,
         alpha=alpha,
+        enable_pdl=bool(enable_pdl),
     )

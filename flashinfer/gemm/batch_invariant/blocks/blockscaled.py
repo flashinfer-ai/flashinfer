@@ -1261,13 +1261,22 @@ class BlockScaledGemm:
     scaled = False
 
     def __init__(
-        self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1, plan_cls=None
+        self,
+        knobs: Knobs,
+        in_fmt: str,
+        out_fmt: str,
+        chunks: int = 1,
+        plan_cls=None,
+        enable_pdl: bool = False,
     ):
         """``chunks``: the operands' batch extent L (1, or the split class's chunk count: the K chunk is the batch index of
         the workspace split AND of the in-CTA chunk fold, whose C has L = 1 and whose CTA folds the chunks itself).
         ``plan_cls``: the record's plan (default: the format's in :data:`PLANS`; the mixed classes hand over their own,
-        the swapped decode records' with the operand formats exchanged: ``blocks/blockscaled_mx_mixed.py``)."""
+        the swapped decode records' with the operand formats exchanged: ``blocks/blockscaled_mx_mixed.py``).
+        ``enable_pdl``: programmatic dependent launch -- the kernel waits for the preceding grid before its first operand
+        load and releases its dependents once its loads are issued; the arithmetic is untouched (a placement)."""
         self.knobs = knobs
+        self.enable_pdl = enable_pdl
         self.in_fmt = in_fmt
         self.plan_cls = plan_cls or PLANS[in_fmt]
         assert in_fmt == self.plan_cls.IN_FMT, (in_fmt, self.plan_cls.IN_FMT)
@@ -1352,7 +1361,13 @@ class BlockScaledGemm:
             alpha,
             st.tiled_mma_bkeep,
             st.tiled_mma_breuse,
-        ).launch(grid=grid, block=[THREADS, 1, 1], cluster=cluster, stream=stream)
+        ).launch(
+            grid=grid,
+            block=[THREADS, 1, 1],
+            cluster=cluster,
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
 
     # device side
     @cute.kernel
@@ -1498,6 +1513,9 @@ class BlockScaledGemm:
             arch=st.TMEM_ALLOC_ARCH,
         )
         pipeline_init_arrive(cluster_shape_mn=sync_shape, is_relaxed=True)
+        if cutlass.const_expr(self.enable_pdl):
+            # the preceding grid's writes (the operands) are complete and visible
+            cute.arch.griddepcontrol_wait()
 
         # --- operand staging: smem rings (A, B swizzled; SFA, SFB plain), multicast masks, global tiles, partitions
         sA = smem.allocate_tensor(
@@ -1657,6 +1675,9 @@ class BlockScaledGemm:
                 sfb_full_mcast_mask,
                 st.cta_chunks,
             )
+            if cutlass.const_expr(self.enable_pdl):
+                # every load issued: the next grid's prologue may start
+                cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
