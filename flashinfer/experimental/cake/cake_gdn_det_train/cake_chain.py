@@ -1984,6 +1984,18 @@ def _v_rows(v: torch.Tensor) -> int | None:
     return pitch // HEAD_DIM
 
 
+# The plain prep loads q / k 4 elements (8 bytes) at a time; the stages that read v and do load 16-byte rows.
+PREP_ALIGN_BYTES = 8
+ROW_ALIGN_BYTES = 16
+
+
+def _aligned(t: torch.Tensor, align: int) -> torch.Tensor:
+    """``t`` contiguous at an address that is a multiple of ``align`` bytes.  ``.contiguous()`` returns a contiguous
+    view unchanged wherever it starts (a view a few elements into its storage), so such a view is copied."""
+    t = t.contiguous()
+    return t.clone() if t.data_ptr() % align else t
+
+
 @cache
 def _prep_tma_constants(arch: str) -> tuple[int, float] | None:
     """The ``prep_tma`` record's ``select`` window for ``arch`` (``None`` when the record carries none)."""
@@ -2568,16 +2580,17 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
     # q and k stay views when prep_tma reads them in place (a packed row's head views); v stays a view when the
-    # stages that read it take its row pitch (wy_tc reads contiguous rows only)
+    # stages that read it take its row pitch (wy_tc reads contiguous rows only); an operand whose address the loads
+    # cannot take is copied
     in_place = _tma_rows(q) and _tma_rows(k)
     if not in_place:
-        q, k = q.contiguous(), k.contiguous()
+        q, k = _aligned(q, PREP_ALIGN_BYTES), _aligned(k, PREP_ALIGN_BYTES)
     prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
     if prep != "prep_tma" and in_place:
         q, k = q.contiguous(), k.contiguous()
     v_rows = _v_rows(v) if wy_stage(arch) == "wy_tc2" else None
     if v_rows is None:
-        v = v.contiguous()
+        v = _aligned(v, ROW_ALIGN_BYTES)
         v_rows = num_v_heads
     g32 = g.contiguous()
     if g32.dtype != torch.float32:
@@ -2662,8 +2675,8 @@ def cake_gdn_det_train_backward(
     table = workspaces.table(index)
     v_rows = _v_rows(v)
     if v_rows is None:  # a tape whose v is not one the stages read in place
-        v, v_rows = v.contiguous(), num_v_heads
-    do = do.contiguous()
+        v, v_rows = _aligned(v, ROW_ALIGN_BYTES), num_v_heads
+    do = _aligned(do, ROW_ALIGN_BYTES)
     if initial_state is None:
         initial_state = forward.get("initial_state")
     has_initial_state = initial_state is not None

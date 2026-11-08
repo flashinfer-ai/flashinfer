@@ -712,7 +712,8 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     """A T7 / critique #3: a loop that builds a new context per step and runs the conv halo and the KDA step with
     ``workspace=None`` keeps nothing once the conv module's host cache is cleared: the context, its table sets and
     its blobs are freed by reference counting alone (the cycle collector disabled; the table set holds its context
-    through a weak proxy) and ``memory_allocated`` returns to its level after the first step."""
+    through a weak proxy; the workspaces the package keeps for the ``workspace=None`` calls hold neither) and
+    ``memory_allocated`` returns to its level after the first step."""
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
@@ -773,6 +774,8 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
             conv.cake_causal_conv1d_det_train_kcp_host_cache_clear()
             torch.cuda.synchronize(device)
             assert all(r() is None for r in refs), (i, _holders(refs))
+            # the workspace=None calls ran on workspaces the package keeps, which hold neither a context nor a table set
+            assert cake_kcp._DEFAULT_WS, i
     finally:
         if enabled:
             gc.enable()

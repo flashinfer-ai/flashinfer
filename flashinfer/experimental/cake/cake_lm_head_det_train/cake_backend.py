@@ -10059,6 +10059,8 @@ def backward_logprob(
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
+    # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
+    del runner
     return finish_dx(dx), dw
 
 
@@ -10556,6 +10558,8 @@ def backward_logprob_temperature(
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _TemperatureBinding.from_runner(runner))
+    # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
+    del runner
     return finish_dx(dx), dw
 
 
@@ -11574,28 +11578,35 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
     def backward(ctx, dlogp):
         if dlogp is None:
             return (None,) * 13
-        X, W, labels, lse, row_index = ctx.saved_tensors
-        need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-        dx, dw = backward_logprob(
-            X,
-            W,
-            labels,
-            lse,
-            dlogp,
-            chunk_size=ctx.chunk_size,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            backend=ctx.backend,
-            compact_rows=ctx.compact,
-            fuse_dw_cast=ctx.fuse_dw_cast,
-            dx_finalize=ctx.dx_finalize,
-            dw_stream=ctx.dw_stream,
-            hidden_count=ctx.hidden_count,
-            gemm_tuning=ctx.gemm_tuning,
-            logprob_dz=ctx.logprob_dz,
-            row_index=row_index,
-        )
+        dx, dw = _logprob_backward(ctx, dlogp, ctx.saved_tensors)
         return (dx, dw) + (None,) * 11
+
+
+def _logprob_backward(ctx, dlogp, saved) -> tuple:
+    """``(dX, dW)`` of :class:`CakeLMHeadDetLogprobFunction`'s backward from its saved tensors ``saved`` (``X``,
+    ``W``, ``labels``, ``lse``, ``row_index``), unpacked once by the caller (a subclass that reads them first, the
+    package's opt-in automatic form among them; a second unpack inside a non-reentrant checkpoint raises)."""
+    X, W, labels, lse, row_index = saved
+    need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+    return backward_logprob(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=ctx.chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        backend=ctx.backend,
+        compact_rows=ctx.compact,
+        fuse_dw_cast=ctx.fuse_dw_cast,
+        dx_finalize=ctx.dx_finalize,
+        dw_stream=ctx.dw_stream,
+        hidden_count=ctx.hidden_count,
+        gemm_tuning=ctx.gemm_tuning,
+        logprob_dz=ctx.logprob_dz,
+        row_index=row_index,
+    )
 
 
 class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
@@ -11731,38 +11742,45 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
     def backward(ctx, dlogp):
         if dlogp is None:
             return (None,) * 15
-        X, W, labels, lse, row_index, tau_rows, tau_tokens = ctx.saved_tensors
-        # the forward's resolved temperature (None: the forward ran without one)
-        tau = (
-            _Temperature("tensor", tau_tokens)
-            if tau_tokens is not None
-            else _Temperature("scalar", ctx.temperature_scalar)
-            if ctx.temperature_scalar is not None
-            else None
-        )
-        need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-        dx, dw = backward_logprob_temperature(
-            X,
-            W,
-            labels,
-            lse,
-            dlogp,
-            chunk_size=ctx.chunk_size,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            backend=ctx.backend,
-            compact_rows=ctx.compact,
-            fuse_dw_cast=ctx.fuse_dw_cast,
-            dx_finalize=ctx.dx_finalize,
-            dw_stream=ctx.dw_stream,
-            hidden_count=ctx.hidden_count,
-            gemm_tuning=ctx.gemm_tuning,
-            logprob_dz=ctx.logprob_dz,
-            row_index=row_index,
-            temperature=tau if tau_rows is not None else None,
-            temperature_rows=tau_rows,
-        )
+        dx, dw = _logprob_temperature_backward(ctx, dlogp, ctx.saved_tensors)
         return (dx, dw) + (None,) * 13
+
+
+def _logprob_temperature_backward(ctx, dlogp, saved) -> tuple:
+    """``(dX, dW)`` of :class:`CakeLMHeadDetLogprobTemperatureFunction`'s backward from its saved tensors ``saved``
+    (``X``, ``W``, ``labels``, ``lse``, ``row_index``, ``tau_rows``, ``tau_tokens``), unpacked once by the caller (as
+    :func:`_logprob_backward`)."""
+    X, W, labels, lse, row_index, tau_rows, tau_tokens = saved
+    # the forward's resolved temperature (None: the forward ran without one)
+    tau = (
+        _Temperature("tensor", tau_tokens)
+        if tau_tokens is not None
+        else _Temperature("scalar", ctx.temperature_scalar)
+        if ctx.temperature_scalar is not None
+        else None
+    )
+    need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+    return backward_logprob_temperature(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=ctx.chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        backend=ctx.backend,
+        compact_rows=ctx.compact,
+        fuse_dw_cast=ctx.fuse_dw_cast,
+        dx_finalize=ctx.dx_finalize,
+        dw_stream=ctx.dw_stream,
+        hidden_count=ctx.hidden_count,
+        gemm_tuning=ctx.gemm_tuning,
+        logprob_dz=ctx.logprob_dz,
+        row_index=row_index,
+        temperature=tau if tau_rows is not None else None,
+        temperature_rows=tau_rows,
+    )
 
 
 class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):

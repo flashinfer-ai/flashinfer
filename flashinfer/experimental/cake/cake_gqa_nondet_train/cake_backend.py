@@ -744,36 +744,42 @@ def cake_gqa_nondet_train_backward(
         "softmax_scale": scale,
     }
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
-        # The tile tables and the fold order read cu_seqlens and row_map only.  Their buffers come from the current
-        # stream; a side stream fills them while the current stream runs bwd_pre (and, for the fold order, the main
-        # kernels), and the current stream waits for it before their first read: the same kernels write the same
-        # integers, off the critical path.
+        # The tile tables, the host-boundary checks and the fold order read cu_seqlens and row_map only.  Their buffers
+        # come from the current stream; side streams fill them while the current stream runs bwd_pre, and the current
+        # stream waits for them before their first read: the same kernels write the same integers, off the critical
+        # path.  One side stream runs the plan kernel and then the fold order, which only bwd_fold reads.  With host
+        # boundaries the checks join: the range check follows the plan kernel, and a second side stream runs the key
+        # check and then the fold order.  Both checks are short chains of small kernels that run while bwd_pre does,
+        # and the main kernels start after both.  The host queues the work in the order the current stream needs it
+        # (its time before the first main kernel is on the critical path): the plan kernel, bwd_pre, the checks, the
+        # main kernels, and last the fold order.  Past PLAN_MAX_PAIRS there is no plan kernel: the PyTorch ops of
+        # _tile_plan and then the checks run on the current stream after bwd_pre, and the fold order alone on the
+        # first side stream.
         stream = torch.cuda.current_stream(device_index)
         tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
         fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
-        planned = side = None
+        checked = tables is not None and seqlens is not None
+        planned = keyed = side = side_keys = None
         try:
             if tables is not None or fold is not None:
-                side = _side_stream(device_index, stream.stream_id)
+                side = _side_stream(device_index, stream.stream_id, 0)
                 side.wait_stream(stream)
+            if tables is not None:
                 with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
-                    if tables is not None:
-                        _launch_plan(
-                            cu_seqlens_q,
-                            cu_seqlens_k,
-                            plan["key_blocks"],
-                            total_q,
-                            tables,
-                            dims,
-                            device_index,
-                        )
-                        if seqlens is not None:
-                            _check_ranges(
-                                tables[0], cu_seqlens_k, plan, segments, total_q
-                            )
+                    _launch_plan(
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        plan["key_blocks"],
+                        total_q,
+                        tables,
+                        dims,
+                        device_index,
+                    )
+                    if seqlens is None:
                         planned = side.record_event()
-                    if fold is not None:
-                        _fold_index(row_map, *fold)
+            if checked:
+                side_keys = _side_stream(device_index, stream.stream_id, 1)
+                side_keys.wait_stream(stream)
             _launch(
                 "bwd_pre",
                 {
@@ -788,12 +794,20 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
+            if checked:
+                with torch.cuda.stream(side):
+                    _check_ranges(tables[0], plan, segments, total_q)
+                    planned = side.record_event()
+                with torch.cuda.stream(side_keys):
+                    _check_keys(cu_seqlens_k, plan)
+                    keyed = side_keys.record_event()
             if tables is None:
                 tables = _tile_plan(
                     cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
                 )
                 if seqlens is not None:
-                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
+                    _check_ranges(tables[0], plan, segments, total_q)
+                    _check_keys(cu_seqlens_k, plan)
             tile_base, pair_base, pair_order = tables
             # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
             # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
@@ -827,8 +841,9 @@ def cake_gqa_nondet_train_backward(
                 "zero_tile": plan["zero_tile"],
             }
             h_chunk = plan["h_chunk"]
-            if planned is not None:
-                stream.wait_event(planned)
+            for event in (planned, keyed):
+                if event is not None:
+                    stream.wait_event(event)
             for h0 in range(0, heads_kv, h_chunk):
                 hc = min(h_chunk, heads_kv - h0)
                 for index, (n0, n1) in enumerate(plan["ranges"]):
@@ -843,10 +858,14 @@ def cake_gqa_nondet_train_backward(
                     }
                     _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
                     _launch("bwd_dq", at, dims, device_index, **chunk)
+            if fold is not None:
+                with torch.cuda.stream(side if side_keys is None else side_keys):
+                    _fold_index(row_map, *fold)
         finally:
-            # Joined on every path (an exception included): the side stream reads and writes buffers of this call.
-            if side is not None:
-                stream.wait_stream(side)
+            # Joined on every path (an exception included): the side streams read and write buffers of this call.
+            for other in (side, side_keys):
+                if other is not None:
+                    stream.wait_stream(other)
         if fold is not None:
             dst_rows, _order, perm, run_end = fold
             _launch(
@@ -920,28 +939,37 @@ def _launch_plan(
 
 def _check_ranges(
     tile_base: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
     plan: Mapping[str, Any],
     segments: int,
     total_q: int,
 ) -> None:
-    """Queue a device-side assert, on the current stream, that a host-boundary plan covers the device boundaries:
-    every device segment's keys within the plan's ``key_blocks`` and every key-block range holding at most
-    ``tile_stride`` dS^T tiles of one head pair in the device tile table (``tile_base[n * B]`` is the count before key
-    block ``n``).  The kernels read the device boundaries; host boundaries within both bounds give the device
-    boundaries' gradients (only the chunks, and with them the dQ rounding, may differ).  Past them the main kernel
-    would leave key blocks out or write beyond its chunk: the assert fires first, and the process's CUDA context is
-    unusable after it (PyTorch reports it at the next synchronization).  The counts come from :func:`_range_marks`,
-    exact past 2^31 tiles: a range past ``tile_stride`` fails the check instead of wrapping into it."""
+    """Queue a device-side assert, on the current stream, that every key-block range of a host-boundary plan holds at
+    most ``tile_stride`` dS^T tiles of one head pair in the device tile table (``tile_base[n * B]`` is the count before
+    key block ``n``).  Past it the main kernel would write beyond its chunk: the assert fires first, and the process's
+    CUDA context is unusable after it (PyTorch reports it at the next synchronization).  The counts come from
+    :func:`_range_marks`, exact past 2^31 tiles: a range past ``tile_stride`` fails the check instead of wrapping
+    into it.  With :func:`_check_keys`, host boundaries within both bounds give the device boundaries' gradients (only
+    the chunks, and with them the dQ rounding, may differ)."""
     ranges = plan["ranges"]
     marks = _range_marks(tile_base, segments, total_q, plan["key_blocks"])
-    edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
-    fits = torch.diff(edges).max() <= plan["tile_stride"]
+    if len(ranges) == 1:  # one range: one subtraction (fewer kernels in the chain)
+        fits = marks[ranges[0][1]] - marks[ranges[0][0]] <= plan["tile_stride"]
+    else:
+        edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
+        fits = torch.diff(edges).max() <= plan["tile_stride"]
+    torch._assert_async(fits, _DISAGREE)
+
+
+def _check_keys(cu_seqlens_k: torch.Tensor, plan: Mapping[str, Any]) -> None:
+    """Queue a device-side assert, on the current stream, that every device segment's keys lie within a host-boundary
+    plan's ``key_blocks``.  Past them the main kernels would leave key blocks out and the dQ GEMM would read tile
+    counts past the table; the assert fires first.  It reads ``cu_seqlens_k`` only, so with the plan kernel's tables
+    it runs on its own side stream, beside the plan kernel and :func:`_check_ranges`."""
     keys = torch.diff(cu_seqlens_k).max() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
-    torch._assert_async(
-        fits & keys,
-        "cake_gqa_nondet_train: cu_seqlens_q_host / cu_seqlens_k_host disagree with the device boundaries",
-    )
+    torch._assert_async(keys, _DISAGREE)
+
+
+_DISAGREE = "cake_gqa_nondet_train: cu_seqlens_q_host / cu_seqlens_k_host disagree with the device boundaries"
 
 
 def _range_marks(
@@ -1008,10 +1036,13 @@ def _fold_index(
 
 
 @functools.cache
-def _side_stream(device_index: int, stream_id: int) -> torch.cuda.Stream:
-    """The high-priority side stream that builds the backward's tile tables and fold order for the caller stream
-    ``stream_id`` of device ``device_index`` (one per caller stream: two caller streams, or two graph captures, never
-    share one; high priority: its one-CTA kernels take the first SMs the main kernels free)."""
+def _side_stream(device_index: int, stream_id: int, slot: int) -> torch.cuda.Stream:
+    """High-priority side stream ``slot`` of the caller stream ``stream_id`` of device ``device_index``: slot 0 runs
+    the backward's tile tables (the one-CTA ``bwd_plan``) and, with host boundaries, the range check; slot 1 the
+    host-boundary key check.  The row-map fold order runs on slot 1 when it exists (host boundaries with the plan
+    kernel's tables), else on slot 0.  One cached stream per caller stream and slot, from PyTorch's high-priority
+    stream pool (a pool that cycles, so two caller streams may share one stream past its size: their work then queues
+    on it in order); high priority: their small kernels take the first SMs bwd_pre and the main kernels free."""
     return torch.cuda.Stream(device_index, priority=-1)
 
 

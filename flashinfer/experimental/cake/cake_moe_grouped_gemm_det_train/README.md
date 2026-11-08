@@ -228,7 +228,8 @@ how it adds, and every other plan key is the overwrite's:
 
 A build can load when its prebuilt library is under `aot/` or FlashInfer's
 JIT toolkit reaches its `build.json` `min_cuda` (13.4 for the main stages'
-accumulate builds, which use the PTX ISA 9.4 `red.global.add.noftz.f32`);
+accumulate builds, which use the PTX ISA 9.4 `red.global.add.noftz.f32`), with
+`nvcc` under the CUDA path and `FLASHINFER_DISABLE_JIT` unset;
 `cake_backend.acc_library_loadable` applies that rule without building or
 loading anything, and
 `generated_program_available(device, "wgrad", out_dtype, accumulate=True)` tells

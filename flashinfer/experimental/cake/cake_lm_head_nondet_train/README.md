@@ -319,7 +319,13 @@ row out of the gradient path:
   + `row_finalize`, chunk-bounded buffers) and goes into the same `[T]`
   output.  Without `return_logp` that pass does not run.
 * A call whose valid rows all have zero weight launches no gradient GEMM: the
-  loss is 0 and both gradients are zeros.
+  loss is 0 and both gradients are zeros.  It holds no FP32 `[V, H]`
+  weight-gradient accumulator from the forward to the backward (nor does a
+  call without rows, `T == 0`, or with every row ignored): the memory report
+  counts the accumulator's one FP32 element, and the backward allocates the
+  zero `dW` in its output dtype only, as the FP32 product `0 * g` of the
+  upstream scalar `g` cast once (as for a launched call: `-0` for a negative
+  `g`, NaN for a non-finite one).
 * The work left out depends on the data: it grows with the share of
   zero-weight rows and is nil without them (the split itself adds a few small
   kernels to the count).  The logits GEMM of a zero-weight row runs once
@@ -392,7 +398,12 @@ it handles these rows on the device, without a host synchronization:
   vocabulary of one K step, and a plan whose two-slice forms would have no
   counted form (it keeps the slice rule's counts).
 * The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
-  for an ignored row); `dX` of a live row is the same mathematics as without
+  for an ignored row), except when every valid row's `dlogp` is zero: the
+  first valid row (the partition's `order[0]`; the first chunk counts at least
+  one live row) then still runs one GEMM tile as a live row, and its `dX` row
+  is `+0` for finite inputs but can be NaN when that row's `X`, logits or `lse`
+  (or `W`) are non-finite (a `-inf` logit with a finite `lse` and `W` still
+  gives `+0`).  `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
   row order (FP32 accumulation; bits may differ within the accuracy budgets).
 * The skip applies to a compacted backward that reuses the forward's row index
@@ -436,8 +447,10 @@ Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
 makes `dW` NaN without the skip (`0 * inf`); with the skip it still does when
 the row falls within the 63 rows after a chunk's live rows (the weight-gradient
-GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
-either way.
+GEMM's last 64-row K step), or is the first valid row that runs as a live row
+when every `dlogp` is zero (above), and not elsewhere.  With the skip its `dX`
+row is exact `+0` (except the first valid row when every `dlogp` is zero,
+above); without the skip a zero-gradient row's `dX` row can be NaN (`0 * NaN`).
 
 Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
 

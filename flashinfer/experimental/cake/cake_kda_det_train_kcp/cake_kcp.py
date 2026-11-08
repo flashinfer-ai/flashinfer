@@ -115,6 +115,21 @@ previous host path (``host_trim=0``) keeps one stream.  The test knob
 ``LAST_CALL[kind]["walk_streams"]`` records ``(decided form, form run,
 n_walk)`` per pair.
 
+Backward tape stream (``BWD_TAPE_STREAM_DEFAULT = "post"``): the saved-set
+backward's tape replay (``kcp_fwdh_tape``: ``w`` / ``kg`` / ``u`` / ``gk`` and
+the initial states in, the ``h`` / ``v_new`` tapes out) runs on a per-device
+side stream (:class:`_TapeSide`), forked after the adjoint offset walk and
+issued after the b1 exchange, beside the exchange and the adjoint merge, which
+read neither tape and write only the call's pools; the call's stream waits for
+it before the adjoint tape walk (its ``dh`` shares bytes with ``u`` in both
+backward layouts).  The first replay of a table set
+on a device, a backward that launches ``kcp_dav``, the ring exchange, the
+``overlap`` schedule, the previous host path and capped (full-width) tape
+launches keep the call's stream.  Placement never changes a bit; the test
+knob ``bwd_tape_stream`` keeps ``"one"`` and the other forms of
+:data:`BWD_TAPE_STREAMS` selectable for the A/B record, and
+``LAST_CALL["bwd"]["bwd_tape_stream"]`` records the form run.
+
 The bracket is host-side runtime state, so it is never issued inside a CUDA
 stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
 see below).  Under ``graph="replay"`` the captured call carries the tape
@@ -538,6 +553,17 @@ WALK_STREAMS_DEFAULT = "auto"
 # and gradient bit is the same).
 KCP_DAV_MODES = ("auto", "always")
 KCP_DAV_DEFAULT = "auto"
+# Stream of the saved-set backward's tape replay (``kcp_fwdh_tape``, :class:`_TapeSide`): "one" = on the call's stream
+# right after the WY program (the previous form); the other forms run it on a per-device side stream between a fork
+# (an event recorded on the call's stream, after the WY program or, for "post", after the adjoint offset walk) and a
+# join before the adjoint tape walk (before the dcarry merges where the replay reads the workspace's carry pool).
+# "pre" issues the replay before the adjoint offset walk, "mid" right after it, "post" after the b1 exchange is
+# issued; "*_hi" also run the call's launches of the window on a high-priority stream.  No launch of the window reads
+# the h / v_new tapes or writes an operand of the replay, so the form never changes a bit; _kcp_test_knobs only (the
+# A/B record).
+BWD_TAPE_STREAMS = ("one", "pre", "mid", "post", "pre_hi", "mid_hi", "post_hi")
+# the A/B record's fastest form (GB200 CP4: ts4 / cust5pad backward)
+BWD_TAPE_STREAM_DEFAULT = "post"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
@@ -554,6 +580,7 @@ P2_KNOBS = {  # knob -> admitted values
     "intra_rows": INTRA_ROWS,
     "rows_probe": ROWS_PROBES,
     "kcp_dav": KCP_DAV_MODES,
+    "bwd_tape_stream": BWD_TAPE_STREAMS,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
@@ -953,6 +980,140 @@ def _pair_streams(device_index: int) -> tuple[Any, Any, Any]:
     return hit
 
 
+_TAPE_STREAMS: dict[
+    int, tuple[Any, ...]
+] = {}  # device index -> (side stream, high-priority stream, fork event, join event, high-priority join event)
+
+
+def _tape_streams(device_index: int) -> tuple[Any, ...]:
+    """The streams and events of the backward's tape replay on device ``device_index`` (:class:`_TapeSide`): created
+    once per device and process and reused by every later backward."""
+    hit = _TAPE_STREAMS.get(device_index)
+    if hit is None:
+        hit = _TAPE_STREAMS[device_index] = (
+            torch.cuda.Stream(device=device_index),
+            torch.cuda.Stream(device=device_index, priority=-1),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        )
+    return hit
+
+
+class _TapeSide:
+    """The saved-set backward's tape replay (``kcp_fwdh_tape``) on a side stream (:data:`BWD_TAPE_STREAMS`).
+
+    The replay reads ``w`` / ``kg`` / ``u`` / ``gk`` and its initial states (``S_in``, or the carry plane / pool) and
+    writes the ``h`` / ``v_new`` tapes.  The launches between the WY program and the adjoint tape walk -- the adjoint
+    offset walk (``w`` / ``kg`` / ``qg`` / ``do_int`` / ``aqk_int`` / ``gk`` in, its pool out), the map transfers, the
+    merges and the b1 / b2 exchange -- read neither tape and write only the call's pools, so the replay may run beside
+    them: :meth:`point` records the fork on the call's stream (``"pre"`` / ``"mid"``: after the WY program; ``"post"``:
+    after the adjoint offset walk) and issues the replay on the side stream, :meth:`join` makes the call's stream wait
+    for it before the first launch that writes an arena slot the replay uses (the adjoint tape walk writes ``dh``,
+    which shares bytes with ``u`` in both backward layouts) or the carry pool it reads (the dcarry merges, where the
+    replay reads the workspace's pool rather than the saved plane).  ``*_hi``: the call's launches between the fork and
+    the join run on a high-priority stream, the replay on the side stream at the default priority.  The fork / join
+    are stream-ordered event operations (capturable).  Allocator: neither stream allocates; every operand is owned by
+    the workspace, the saved set, the call or the table set and outlives the join.  The call's launch record
+    (``counters`` / ``sequence``) takes the replay's launches here, at their place in the program (where the one-stream
+    form records them), so the record does not depend on the form."""
+
+    def __init__(
+        self, call: CakeKDADetKcpCall, launches: list, form: str, index: int
+    ) -> None:
+        self.call, self.launches, self.form = call, launches, form
+        where = form.split("_")[0]
+        self.fork_at = "post" if where == "post" else "pre"
+        self.issue_at = where
+        self.hi = form.endswith("_hi")
+        self.side, self.crit, self.fork_ev, self.join_ev, self.crit_ev = _tape_streams(
+            index
+        )
+        self.main = torch.cuda.current_stream(call.device)
+        self.forked = self.issued = False
+        self._crit_ctx: Any = None
+        # CakeKDADetKcpCall.walk's record, at the program's place
+        for walk, _h0 in launches:
+            if len(walk):
+                call.counters["walks"] += 1
+                call.counters["launches"] += 1
+                call.sequence.append("kcp_fwdh_tape")
+
+    def _launch(self) -> None:
+        """The replay's launches on the current stream (recorded by the constructor)."""
+        for walk, h0 in self.launches:
+            if len(walk):
+                self.call.backend.run(
+                    "kcp_fwdh_tape",
+                    {"walk": walk, "h0": h0, "out": None, "_call": self.call},
+                )
+
+    def point(self, where: str) -> None:
+        if where == self.fork_at and not self.forked:
+            self.fork_ev.record(self.main)
+            self.side.wait_event(self.fork_ev)
+            if self.hi:
+                self.crit.wait_event(self.fork_ev)
+                self._crit_ctx = torch.cuda.stream(self.crit)
+                self._crit_ctx.__enter__()
+            self.forked = True
+        if where == self.issue_at and self.forked and not self.issued:
+            with torch.cuda.stream(self.side):
+                self._launch()
+            self.issued = True
+
+    def join(self, *, complete: bool = True) -> None:
+        """Back on the call's stream, ordered after both streams; ``complete``: a replay not yet issued runs there."""
+        if self._crit_ctx is not None:
+            self._crit_ctx.__exit__(None, None, None)
+            self._crit_ctx = None
+            self.crit_ev.record(self.crit)
+            self.main.wait_event(self.crit_ev)
+        if self.issued:
+            self.join_ev.record(self.side)
+            self.main.wait_event(self.join_ev)
+        elif complete:
+            self._launch()
+        self.forked = self.issued = False
+        self.launches = []
+
+
+def _tape_side(call: CakeKDADetKcpCall, launches: list) -> tuple[_TapeSide | None, Any]:
+    """The side-stream form of the backward's tape replay ``launches`` (``[(walk list, initial-state view thunk)]``;
+    the side form holds the views, built now), or ``None`` for the call's stream, and the table-set key to mark once
+    the replay ran on the call's stream (``None``: nothing to mark).  The side stream runs only for a
+    :class:`CakeKDADetKcpCall` on the trimmed host path of the kernel backend on a CUDA device, under the a2a exchange
+    and the ``wait_first`` schedule, with the tape launches uncapped (no cache-config bracket: the shipped split form)
+    and no ``kcp_dav`` launch (it reads ``v_new`` right after the replay); the first replay of a table set on a device
+    runs on the call's stream (it uploads the launches' device tables)."""
+    # a test's driver call: the launches in order
+    if not isinstance(call, CakeKDADetKcpCall):
+        return None, None
+    form = str(call.opts.bwd_tape_stream)
+    if form == "one" or not any(len(w) for w, _ in launches):
+        return None, None
+    if not (
+        call.device.type == "cuda"
+        and isinstance(call.backend, KernelBackend)
+        and call.host_trim
+        and call.exchange != "ring"
+        and call.schedule == "wait_first"
+        and call.walk_form != "full"
+        and not _kcp_dav_launch(call)
+    ):
+        return None, None
+    index = (
+        call.device.index
+        if call.device.index is not None
+        else torch.cuda.current_device()
+    )
+    seen = call.tb.__dict__.setdefault("_tape_seen", set())
+    key = (tuple(id(w) for w, _ in launches), index)
+    if key not in seen:
+        return None, (seen, key)
+    return _TapeSide(call, [(w, h0()) for w, h0 in launches], form, index), None
+
+
 class KcpPreconditionError(RuntimeError):
     """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
     on a real token row and the call's ``spec3_probe="assert"`` asked for an error (the design note §6.4).  The requirement of
@@ -1221,9 +1382,7 @@ class KernelBackend(Backend):
                 # nothing launches (counted like a stage the plan fuses away; the knob kcp_dav="always" launches it
                 # anyway on the replay layout: its outputs have no reader there; the lean layout serves no plan that
                 # dispatches dav)
-                launch = cake_kcp_plan.kcp_dav_needed(p) or (
-                    call.opts.kcp_dav == "always" and not _lean_passes(local)
-                )
+                launch = _kcp_dav_launch(call)
                 call.scratch["kcp_dav"] = "launched" if launch else "skipped"
                 if not launch:
                     return
@@ -2192,6 +2351,19 @@ def _lean_passes(local: Any) -> int | None:
     """The tail passes of the lean layout on a local arena or plan view (its ``layout_passes`` entry), ``None`` where
     it runs the replay layout."""
     return getattr(local, "layout_passes", {}).get(LOCAL_LAYOUT_BWD_LEAN)
+
+
+def _kcp_dav_launch(call: Any) -> bool:
+    """Whether the backward's ``dav`` stage launches ``kcp_dav`` on this call (the kernel backend's rule): where its
+    ``dAqk`` has a reader (:func:`cake_kcp_plan.kcp_dav_needed`) or under the knob ``kcp_dav="always"`` on the replay
+    layout; never on a rank without local stages or tokens."""
+    local = call.local
+    if local is None or call.T_r == 0:
+        return False
+    return bool(
+        cake_kcp_plan.kcp_dav_needed(local.plan)
+        or (call.opts.kcp_dav == "always" and not _lean_passes(local))
+    )
 
 
 def _lean_tail(local: Any) -> tuple[int, torch.Tensor] | None:
@@ -4539,7 +4711,10 @@ class CakeKDADetKcpOptions:
     the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
     remaining launches, bitwise; ``_kcp_test_knobs`` only), ``kcp_dav`` (``"auto"`` shipped: the backward launches
     ``kcp_dav`` only where :func:`cake_kcp_plan.kcp_dav_needed`; ``"always"`` = on every backward of the replay
-    layout, the same bits; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
+    layout, the same bits; ``_kcp_test_knobs`` only), ``bwd_tape_stream`` (the saved-set backward's tape replay:
+    ``"post"`` shipped, on a side stream forked after the adjoint offset walk, beside the b1 / b2 exchange; ``"one"`` =
+    the call's stream; the other :data:`BWD_TAPE_STREAMS` forms move the fork / issue point or add a high-priority
+    stream; the same bits; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
     ``_kcp_test_knobs``)."""
 
     save_transfer: bool | None = (
@@ -4571,6 +4746,7 @@ class CakeKDADetKcpOptions:
     intra_rows: str = INTRA_ROWS_DEFAULT  # shipped "ckpt" = a checkpoint recompute keeps its intra rows for its backward; "always" / "never" via _kcp_test_knobs only
     rows_probe: int = 0  # 1 = a backward that binds kept intra rows also launches its intra program and records the bitwise comparison (host sync); _kcp_test_knobs only
     kcp_dav: str = KCP_DAV_DEFAULT  # the backward's kcp_dav: "auto" (shipped) only where cake_kcp_plan.kcp_dav_needed; "always" on every backward of the replay layout (the same bits), via _kcp_test_knobs only
+    bwd_tape_stream: str = BWD_TAPE_STREAM_DEFAULT  # the saved-set backward's tape replay: a side-stream form of BWD_TAPE_STREAMS (shipped "post") or "one" (the call's stream; the same bits), via _kcp_test_knobs only
 
     def check(self) -> CakeKDADetKcpOptions:
         if self.exchange not in EXCHANGES:
@@ -5144,6 +5320,9 @@ def _record(kind: str, call: CakeKDADetKcpCall) -> None:
         # a backward's kcp_dav: "launched" / "skipped" (cake_kcp_plan.kcp_dav_needed or the knob kcp_dav="always");
         # None on a forward or a backward without a local stage
         "kcp_dav": call.scratch.get("kcp_dav"),
+        # a saved-set backward's tape replay: "one" (the call's stream) or the side-stream form run (BWD_TAPE_STREAMS);
+        # None on a forward or a replay-mode backward
+        "bwd_tape_stream": call.scratch.get("bwd_tape_stream"),
         "graph": call.opts.graph,
         "graph_event": "eager",
         "graph_key": None,
@@ -6051,10 +6230,12 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
     adjoint tape walk(s)`` (the R7 overlap of the document-last walk under b2 is dropped)."""
     tb = call.tb
     wait_first = call.schedule == "wait_first"
-    replay = saved is None
-    if replay:
+    side: _TapeSide | None = None
+    join_carry = False
+    if saved is None:
         _forward(call, save=False, replay=True)
         m_source = "c1"
+        call.scratch["bwd_tape_stream"] = None  # the replay forward wrote the tapes
     else:
         call.bufs["S_in"] = saved.S_in
         m_source = "b1"
@@ -6101,42 +6282,72 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
             call.bufs["carry"] = (
                 plane  # the tape replay below reads the saved plane; the adjoint carries go to the workspace pool
             )
+        # the tape replay's launches (walk list, initial-state view thunk), issued here on the call's stream or on the
+        # side stream (:class:`_TapeSide`, the knob bwd_tape_stream; its views are built here, while the saved plane
+        # stands in for the carry pool)
         if (
             tb.fused_walks and tb.P > 1
         ):  # fused walks: the whole tape replay from the carry plane in one launch
-            call.walk(
-                "kcp_fwdh_tape",
-                tb.walk_live,
-                h0=call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
-                out=None,
-            )
+            tapes = [
+                (
+                    tb.walk_live,
+                    lambda: call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
+                )
+            ]
         else:
             # the trimmed arm passes the table set's own sublists (a fresh comprehension per call would miss the
             # identity-keyed device-table cache on every call: one blocking host-to-device copy per backward)
             trim = bool(call.host_trim)
             p0 = tb.walk_all_p0 if trim else [s for s in tb.walk_all if s % tb.P == 0]
-            call.walk(
-                "kcp_fwdh_tape",
-                p0,
-                h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles),
-                out=None,
-            )
+            tapes = [(p0, lambda: call.indexed("S_in", tb.h0_index, tb.s_in_tiles))]
             if tb.P > 1:
                 rest = (
                     tb.walk_all_rest
                     if trim
                     else [s for s in tb.walk_all if s % tb.P != 0]
                 )
-                call.walk(
-                    "kcp_fwdh_tape",
-                    rest,
-                    h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
-                    out=None,
+                tapes.append(
+                    (
+                        rest,
+                        lambda: call.indexed("carry", tb.carry_index, tb.carry_tiles),
+                    )
                 )
+        side, mark = _tape_side(call, tapes)
+        if side is None:
+            for walk, h0 in tapes:
+                call.walk("kcp_fwdh_tape", walk, h0=h0(), out=None)
+            if mark is not None:
+                mark[0].add(mark[1])  # the replay's device tables are resident
+        # where the replay reads the workspace's carry pool (no saved plane), the dcarry merges (which write that
+        # pool) wait for it
+        join_carry = plane is None and tb.P > 1
+        call.scratch["bwd_tape_stream"] = "one" if side is None else side.form
         if plane is not None:
             del call.bufs[
                 "carry"
             ]  # the saved plane is never written: dcarry_* publish into the workspace pool
+    if side is None:
+        _backward_window(call, wait_first, m_source, None, False)
+        return
+    try:
+        side.point("pre")
+        _backward_window(call, wait_first, m_source, side, join_carry)
+    except BaseException:
+        side.join(complete=False)
+        raise
+
+
+def _backward_window(
+    call: CakeKDADetKcpCall,
+    wait_first: bool,
+    m_source: str,
+    side: _TapeSide | None,
+    join_carry: bool,
+) -> None:
+    """The backward after its tape replay was issued (or forked: ``side``, :class:`_TapeSide`): ``dav``, the adjoint
+    offset walk and its exchange, the adjoint carries and tape walks, then the tail stages.  ``side.join()`` runs before
+    the dcarry merges (``join_carry``) or else before the adjoint tape walk."""
+    tb = call.tb
     call.stage("dav")
     ring = call.exchange == "ring"
     form = (
@@ -6174,6 +6385,8 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
             call.merge(
                 "tmap_m"
             )  # M_f of the fragments whose map travels (forward family)
+    if side is not None:
+        side.point("mid")
     dcarry = (
         call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
     )
@@ -6183,6 +6396,8 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
         )  # dcarry_end + the document-end tape walk run under hop 1 (overlap schedule only)
     else:
         wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
+        if side is not None:
+            side.point("post")
         call.wait(wb1)
         call.merge(
             "adj_b1" if m_source == "b1" else "adj_c1"
@@ -6195,6 +6410,8 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
                 "kcp_dhu_tape", tb.walk_end, dht=dcarry
             )  # document ends: under b2 (R7)
         call.wait(wb2)
+    if side is not None and join_carry:
+        side.join()
     if tb.P > 1:
         if wait_first and call.merge_fuse == "carry":
             call.merge("dcarry_both")  # dcarry_end + dcarry_cross in one launch
@@ -6204,6 +6421,8 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
             call.merge(
                 "dcarry_cross"
             )  # with fused_walks also the dS_out copies into the extra carry slots
+    if side is not None:
+        side.join()  # the adjoint tape walk writes dh over u (both backward layouts)
     _adj_tapes(call, dcarry=dcarry, wait_first=wait_first)
     tail = (call.local_values or {}).get("_kcp_tail") if call.T_r else None
     # raw gate mode: the raw GLM intra program writes d raw and the per-chunk (hi, lo) partials of dA_log / ddt_bias
