@@ -3212,8 +3212,11 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
                 use_qk_l2norm_in_kernel=True,
             )
             assert {k for k, v in rep.items() if v} <= {"hist"}, (save_mode, rep)
+    # qn / kn (the full set's normalized rows) sit in their own row, not in the save_mode row's ten tapes
     assert set(FULL_TAPE_TERMS) == {
-        k for k in keys if k not in ("S_in", "c1_recv", "M_seg", "hist", "qk_rstd")
+        k
+        for k in keys
+        if k not in ("S_in", "c1_recv", "M_seg", "hist", "qk_rstd", "qn", "kn")
     }
     tapes = sum(lay[k] for k in FULL_TAPE_TERMS)
     assert tapes % ctx.R == 0
