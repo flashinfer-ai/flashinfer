@@ -27,18 +27,26 @@ the deterministic package ``flashinfer.cake_rmsnorm_silu_gate_det_train``.
 
 Every output of the package repeats bit for bit, except a BF16 weight
 gradient in the row-claims bands of ``BACKWARD_BANDS`` (``bwd_bf16_rc``,
-``bwd_bf16_rc_mid``), whose CTAs claim row blocks at run time and add FP64
-atomics, so its last bits may vary from run to run; there every launch's
-``dw`` is checked against the budgets below instead of the first launch's
-bits.  The backward writes ``dx`` and ``dz`` with one row arithmetic in
-every band, held to FP64 (within one BF16 ulp plus 1/64 ulp of the tensor's
-largest finite magnitude, :func:`assert_dx_dz_within_fp64`) on every path
-checked here; they need not be the deterministic package's bits.  Nor is
+``bwd_bf16_rc_mid``, on sm_100a and sm_103a; sm_107a routes none), whose
+CTAs claim row blocks at run time and add FP64 atomics, so its last bits may
+vary from run to run; there every launch's ``dw`` is checked against the
+budgets below instead of the first launch's bits.  The fused bands
+(``bwd_bf16_fused`` on sm_107a, ``bwd_f32_fused`` on every architecture;
+grid kind ``claimed_row_blocks``, :func:`_fused`) run the deterministic
+package's backward program under this package's names, so there ``dx``,
+``dz`` and ``dw`` (BF16 or FP32, accumulated too) are the deterministic
+package's bits (:func:`assert_det_bits_where_fused`).  In every other band
+the backward writes ``dx`` and ``dz`` with this package's one row
+arithmetic; in every band they are held to FP64 (within one BF16 ulp plus
+1/64 ulp of the tensor's largest finite magnitude,
+:func:`assert_dx_dz_within_fp64`) on every path checked here, and outside the
+fused bands they need not be the deterministic package's bits.  Nor is
 ``y``: the forward computes ``rstd`` and the SiLU gate with approximate FP32
-intrinsics.  Nor, near rounding boundaries, is ``dw``: the chunked backwards
-add the chunk partials of the weight gradient of the deterministic package
-at FlashInfer ``2e989556`` exactly, as integers, and the row-claims
-backwards add FP32 runs of rows in FP64.  So every output is also
+intrinsics.  Nor, near rounding boundaries, is ``dw`` outside the fused
+bands: the chunked backwards add the chunk partials of the weight gradient
+of the deterministic package at FlashInfer ``2e989556`` exactly, as
+integers, and the row-claims backwards add FP32 runs of rows in FP64.  So
+every output is also
 compared with the deterministic package through an error budget against the
 backend suite's FP64 reference (:func:`assert_error_within_det`):
 on the same inputs, the relative L2 error of an output and its largest error
@@ -47,10 +55,11 @@ relative to the reference's largest magnitude are each at most
 deterministic package's is 0; an FP32 weight gradient is held instead to the
 deterministic package's within the backend suite's weight-gradient budget
 (its 1.1x bound is against the deterministic package of FlashInfer
-``2e989556``, whose FP32 ``dw`` this package's repeats bit for bit; the
-in-tree deterministic package sums FP32 runs of rows exactly, so its FP32
-``dw`` is the more accurate).  The deterministic outputs come from that
-package's public forward and backward only.  This module checks:
+``2e989556``, whose FP32 ``dw`` the static and the claimed backwards of this
+package repeat bit for bit; the in-tree deterministic package sums FP32 runs
+of rows exactly, so its FP32 ``dw`` is the more accurate, and the fused
+backwards' FP32 ``dw`` is its bits).  The deterministic outputs come from
+that package's public forward and backward only.  This module checks:
 
 * the surface without a device: the exports (one autograd function, the
   backend's class), the facade's sources (no import of the deterministic
@@ -70,7 +79,9 @@ package's public forward and backward only.  This module checks:
   row-claims backward after ``torch.use_deterministic_algorithms(True)`` was
   enabled (exact texts: a ``RuntimeError`` before the launch, or a
   ``UserWarning`` under ``warn_only=True`` and the launch; none for a node
-  whose weight needs no gradient or in a small-row band); no call warns or
+  whose weight needs no gradient or in any other band, the small-row and the
+  fused bands among them; on sm_107a, which routes no row-claims band, no
+  node alerts); no call warns or
   raises in the bands whose outputs repeat their bits, strict or with
   ``warn_only=True`` (the forward, the backward into a BF16 and an FP32
   weight gradient, autograd and non-reentrant checkpointing); the
@@ -90,25 +101,30 @@ package's public forward and backward only.  This module checks:
   within one BF16 ulp of FP64, ``y``, ``dx``, ``dz`` and ``dw`` lie
   within the error budget (``y`` also within one BF16 ulp of FP64,
   :func:`assert_y_within_fp64`), and ``dw`` within the weight-gradient budget of
-  the deterministic ``dw`` (in the row-claims bands on every launch); so do
+  the deterministic ``dw`` (in the row-claims bands on every launch); in the
+  fused bands (the accumulation and ``compute_grad_weight=False`` paths also
+  at the first rows of a fused band) ``dx``, ``dz`` and ``dw`` are the
+  deterministic package's bits; so do
   they around the ends of the forward's ``FORWARD_BANDS`` bands (packed rows)
   and ``STRIDED_FORWARD_BANDS`` bands (other layouts) and at the first and
   the last rows of each ``BACKWARD_BANDS`` band of this device (the
-  small-row backwards, one cluster each, the static backwards, the row-claims
-  backwards and the claimed backward), each call launching
-  ``module_for_rows``' module, and where a chunked backward's chunks grow by
-  a block; so do strided inputs (``dy``, ``x`` and ``z`` not of one packed row
-  stride) in the bands of the row-claims and the claimed backwards
-  (``suite.BULK_BAND_CASES``), launching the strides of their
+  small-row backwards, one cluster each, the fused backwards, the static
+  backwards, the row-claims backwards and the claimed backward), each call
+  launching ``module_for_rows``' module, and where a chunked backward's
+  chunks grow by a block; so do strided inputs (``dy``, ``x`` and ``z`` not
+  of one packed row stride) in the bands of the row-claims, the claimed and
+  the fused backwards (``LAYOUT_BAND_CASES``), launching the strides of their
   layout; gate inputs at and past the packed
   gate's range (around FP32 ``expf``'s overflow too), in the forward and the
   backward, and infinite upstream gradients (in the last row too, with one
   row, half a block and one row short of a whole block in the last row block
   of the band's program) give the FP64 reference's
   ``NaN``, ``+inf`` and ``-inf`` positions in every band and finite elements
-  within the error budget (``dx`` and ``dz`` have the deterministic package's
-  ``NaN`` positions and bits elsewhere); one-head inputs of several layouts one row past the start of
-  each module that warms rows in L2 give the same bits for every layout (a
+  within the error budget (in the fused bands ``dx``, ``dz`` and ``dw`` the
+  deterministic package's bits, ``NaN`` payloads included); one-head inputs
+  of several layouts one row past the start of
+  each module that warms rows in L2 and of the fused backwards give the same
+  bits for every layout (a
   BF16 ``dw`` of the row-claims mid backward within the budgets instead),
   passing the packed-rows test exactly when their rows follow one another;
   and weight gradients in the subnormal range (identical rows whose FP32 terms
@@ -417,6 +433,32 @@ def assert_dw_repeats_within_det(what, dw, first, det, ref, mag, *, varies) -> N
     assert dw.dtype == first.dtype and dw.shape == first.shape, what
     assert_error_within_det(what, dw, det, ref)
     suite.assert_dw_within(dw, det, mag, what=f"{what} vs the deterministic package")
+
+
+def _fused(name: str) -> bool:
+    """Whether the backward module ``name`` is a fused backward
+    (``bwd_bf16_fused``, ``bwd_f32_fused``; grid kind
+    ``claimed_row_blocks``): the deterministic package's backward program
+    under this package's names, whose CTAs claim 16-row blocks and sum the
+    weight gradient exactly in fixed point, so its ``dx``, ``dz`` and ``dw``
+    (BF16 or FP32, accumulated too) are the deterministic package's bits on
+    the same inputs and device, and repeat them."""
+    return loader.MODULES[name]["grid_rule"]["kind"] == "claimed_row_blocks"
+
+
+def assert_det_bits_where_fused(name: str, got, det) -> None:
+    """Where the backward module ``name`` is a fused backward
+    (:func:`_fused`), each of ``got`` (``dx``, ``dz`` and, when given,
+    ``dw``) is the bits of the deterministic package's output of the same
+    call in ``det``; the other backwards need not give its bits, so nothing
+    is checked for them."""
+    if not _fused(name):
+        return
+    assert len(got) == len(det) <= 3, (len(got), len(det))
+    for what, g, d in zip(("dx", "dz", "dw")[: len(got)], got, det, strict=True):
+        assert_same_bits(
+            f"{what} of the fused backward vs the deterministic package", g, d
+        )
 
 
 def _assert_refusal(error: BaseException) -> None:
@@ -767,16 +809,21 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
     :class:`CakeRMSNormSiLUGateNondetFunction`.  When
     ``torch.use_deterministic_algorithms(True)`` is enabled between its forward
     and its backward, the backward of a node in the first rows of the
-    row-claims band ``bwd_bf16_rc`` (``suite._band_shape``) raises PyTorch's
-    alert, naming the autograd backward and the deterministic autograd
-    function, immediately before the launch of the row-claims backward, whose
-    weight-gradient sum's order depends on scheduling; under
-    ``warn_only=True`` it warns and runs it.  A node there whose weight needs
-    no gradient, and a node in each small-row band of a BF16 weight gradient
-    on this device (``BAND_ROLES``: the short backward on every
-    architecture, the exact tiny backward on sm_100a and sm_107a, each
-    summing on chip in a fixed order), does not alert.  The launches are recorded and
-    skipped (``run_module`` stubbed)."""
+    row-claims band ``bwd_bf16_rc`` (``suite._band_shape``; sm_100a and
+    sm_103a) raises PyTorch's alert, naming the autograd backward and the
+    deterministic autograd function, immediately before the launch of the
+    row-claims backward, whose weight-gradient sum's order depends on
+    scheduling; under ``warn_only=True`` it warns and runs it.  A node there
+    whose weight needs no gradient, and a node in the first rows of every
+    other band of a BF16 weight gradient on this device whose module repeats
+    its bits (``suite._varies``: the small-row bands of ``BAND_ROLES``, the
+    short backward on every architecture and the exact tiny backward on
+    sm_100a and sm_107a, each summing on chip in a fixed order; the fused
+    band on sm_107a, the deterministic package's program; the static and the
+    claimed backwards, adding their partials exactly), does not alert.  On an
+    architecture that routes no row-claims backward (sm_107a) no band's
+    backward alerts.  The launches are recorded and skipped (``run_module``
+    stubbed)."""
     launched: list[str] = []
     monkeypatch.setattr(
         loader, "run_module", lambda name, *a, **k: launched.append(name)
@@ -785,13 +832,21 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
     q = f"{backend.__name__}.CakeRMSNormSiLUGateNondetFunction.backward"
     d = f"{deterministic_facade.__name__}.CakeRMSNormSiLUGateDetFunction"
     row_claims = suite._band_shape("bwd_bf16_rc")
-    small_bands = [
+    # an architecture that routes the row-claims backward has its band
+    assert (row_claims is None) == ("bwd_bf16_rc" not in loader.ROUTES[arch]), arch
+    bands = suite._device_bands("bwd_bf16")
+    quiet_bands = [
         band
-        for band, _, _ in suite._device_bands("bwd_bf16")
-        if band in loader.BAND_ROLES
+        for band, _, _ in bands
+        if not suite._varies(loader.route_module(arch, band))
     ]
-    smalls = [suite._band_shape(band) for band in small_bands]
-    assert row_claims is not None and smalls and None not in smalls, arch
+    quiet = [suite._band_shape(band) for band in quiet_bands]
+    assert None not in quiet, (arch, quiet_bands, quiet)
+    assert any(band in loader.BAND_ROLES for band in quiet_bands), quiet_bands
+    if row_claims is None:
+        assert not any(
+            suite._varies(loader.route_module(arch, band)) for band, _, _ in bands
+        ), (arch, bands)
 
     def node(shape, weight_grad=True):
         x, z, w, _ = _inputs(*shape, 21)
@@ -809,34 +864,40 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
             arch, "bwd_bf16", shape[0] * shape[1], _sm_count()
         )
 
-    assert module(row_claims) == loader.route_module(arch, "bwd_bf16_rc")
-    for band, small in zip(small_bands, smalls, strict=True):
-        assert module(small) == loader.route_module(arch, band), (band, small)
-    y = node(row_claims)
-    launched.clear()
-    torch.use_deterministic_algorithms(True)
-    with pytest.raises(RuntimeError) as info:
-        y.backward(torch.ones_like(y))
-    assert str(info.value) == (
-        f"{q} does not have a deterministic implementation, but you set "
-        f"'torch.use_deterministic_algorithms(True)'. You can call {d} instead, "
-        "or use the 'warn_only=True' option, if that's acceptable for your "
-        "application."
-    )
-    assert launched == []
-    torch.use_deterministic_algorithms(False)
-    y = node(row_claims)
-    launched.clear()
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    with pytest.warns(UserWarning) as record:
-        y.backward(torch.ones_like(y))
-    assert [str(r.message) for r in record if backend.__name__ in str(r.message)] == [
-        f"{q} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True, warn_only=True)'; the "
-        f"non-deterministic kernels run. {d} is the deterministic one."
-    ]
-    assert launched == [module(row_claims)]
-    for shape, weight_grad in ((row_claims, False), *((s, True) for s in smalls)):
+    for band, shape in zip(quiet_bands, quiet, strict=True):
+        assert module(shape) == loader.route_module(arch, band), (band, shape)
+    if row_claims is not None:
+        assert module(row_claims) == loader.route_module(arch, "bwd_bf16_rc")
+        y = node(row_claims)
+        launched.clear()
+        torch.use_deterministic_algorithms(True)
+        with pytest.raises(RuntimeError) as info:
+            y.backward(torch.ones_like(y))
+        assert str(info.value) == (
+            f"{q} does not have a deterministic implementation, but you set "
+            f"'torch.use_deterministic_algorithms(True)'. You can call {d} instead, "
+            "or use the 'warn_only=True' option, if that's acceptable for your "
+            "application."
+        )
+        assert launched == []
+        torch.use_deterministic_algorithms(False)
+        y = node(row_claims)
+        launched.clear()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning) as record:
+            y.backward(torch.ones_like(y))
+        assert [
+            str(r.message) for r in record if backend.__name__ in str(r.message)
+        ] == [
+            f"{q} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; the "
+            f"non-deterministic kernels run. {d} is the deterministic one."
+        ]
+        assert launched == [module(row_claims)]
+    no_alert = [(shape, True) for shape in quiet]
+    if row_claims is not None:
+        no_alert.insert(0, (row_claims, False))
+    for shape, weight_grad in no_alert:
         torch.use_deterministic_algorithms(False)
         y = node(shape, weight_grad)
         launched.clear()
@@ -857,23 +918,32 @@ def test_no_call_alerts_under_deterministic_algorithms(
     bits runs with no warning and no error: the forward and the backward
     into a BF16 and an FP32 weight gradient at the first rows of each
     ``BACKWARD_BANDS`` band of this device (``_band_modules``; for a BF16
-    weight gradient every band but the row-claims bands, whose backward
-    alerts: :func:`test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled`),
+    weight gradient every band but the row-claims bands of sm_100a and
+    sm_103a, whose backward
+    alerts: :func:`test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled`;
+    the fused bands, the deterministic package's program, among them on every
+    architecture),
     and the autograd backward, with the weight gradient, of
     :func:`cake_rmsnorm_silu_gate_nondet`, of
     :class:`CakeRMSNormSiLUGateNondetFunction` and of a non-reentrant
     checkpoint at the first rows of the first such BF16 band whose backward
-    takes a workspace.  The functional calls launch ``module_for_rows``'
-    modules."""
+    takes a workspace (the fused band on sm_107a).  The functional calls
+    launch ``module_for_rows``' modules."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     calls = []
+    fused = set()
     for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
         for band, (name, first, _) in _band_modules(arch, role, sms).items():
+            if _fused(name):
+                fused.add(name)
             if suite._varies(name):
                 continue
             assert loader.module_for_rows(arch, role, first, sms) == name, (role, band)
             calls.append((first, dtype, name))
+    # every fused band of this device (an FP32 one on every architecture) runs
+    # under the deterministic algorithms
+    assert fused and fused <= {name for _, _, name in calls}, (fused, calls)
     least = min(
         rows
         for rows, dtype, name in calls
@@ -960,7 +1030,10 @@ def test_nondet_entry_points_run_this_package(
     :func:`assert_dw_repeats_within_det`) and lie within the error budget of
     the deterministic package's outputs, ``dx`` and ``dz`` within one BF16
     ulp of FP64, ``dw`` (of each call) also within one BF16 rounding plus the FP32
-    accumulation budget of the deterministic ``dw``.  The two workspace kinds
+    accumulation budget of the deterministic ``dw``; where the backward is a
+    fused backward (on sm_107a with 206 SMs or more, as with 212 or 216, at
+    these rows) ``dx``, ``dz`` and ``dw`` are
+    the deterministic package's bits.  The two workspace kinds
     do not substitute, and a refusal launches nothing: this backward refuses
     an FP32 tensor (the deterministic package's workspace), naming both modes'
     workspaces, and the deterministic backward refuses this package's
@@ -1004,6 +1077,7 @@ def test_nondet_entry_points_run_this_package(
     for got in (dw, again[2]):
         err = (got.double() - dw_d.double()).abs()
         assert (err <= dw_d.double().abs() * 2.0**-7 + mag * 2.0**-20).all()
+    assert_det_bits_where_fused(launched[1], (dx, dz, dw), (dx_d, dz_d, dw_d))
     # an FP32 buffer (the deterministic package's workspace) is not a
     # workspace of the non-deterministic backward, nor the other way round
     launched.clear()
@@ -1128,8 +1202,10 @@ def test_accuracy_matrix_within_the_deterministic_error(
     backward launches, ``dx``, ``dz`` and ``dw`` are the first launch's bits
     (``dw`` where its band repeats it; in a row-claims band each launch's
     ``dw`` lies within the budgets below instead,
-    :func:`assert_dw_repeats_within_det`) and ``dx`` and ``dz`` the
-    deterministic package's; each output lies within
+    :func:`assert_dw_repeats_within_det`), ``dx`` and ``dz`` within one BF16
+    ulp of FP64, and in a fused band ``dx``, ``dz`` and ``dw`` the
+    deterministic package's bits (:func:`assert_det_bits_where_fused`); each
+    output lies within
     the error budget of the deterministic package's output against the FP64
     reference (``y`` also within one BF16 ulp of FP64), and ``dw`` within the
     weight-gradient budget of the deterministic ``dw``."""
@@ -1170,26 +1246,43 @@ def test_accuracy_matrix_within_the_deterministic_error(
     suite.assert_dw_within(
         first[2], dets[2], mag, what="dw vs the deterministic package"
     )
+    assert_det_bits_where_fused(
+        suite._backward_module(x.numel() // D, dw_dtype), first, dets
+    )
 
 
 @requires_device
-def test_accumulation_within_the_deterministic_error(determinism_setting) -> None:
-    """Two microbatches accumulated into an FP32 and a BF16 buffer: the same
+@pytest.mark.parametrize(
+    "band", [None, "bwd_f32_fused"], ids=["1031x48", "bwd_f32_fused"]
+)
+def test_accumulation_within_the_deterministic_error(band, determinism_setting) -> None:
+    """Two microbatches of ``T x H`` rows (1031 tokens of 48 heads; for
+    ``band`` the fewest whole tokens of 48 heads in the fused FP32 band,
+    ``suite._band_shape``, where a BF16 weight gradient runs the band of its
+    own role: the fused backward on sm_107a, the row-claims backward on
+    sm_100a and sm_103a) accumulated into an FP32 and a BF16 buffer: the same
     starting buffer gives the same bits (a BF16 buffer where its band
     repeats a BF16 ``dw``; in a row-claims band each buffer instead meets the
     checks that follow), within two roundings of the
     deterministic accumulation and within the error budget of the
-    deterministic package's against the FP64 sum.  Autograd accumulation into
+    deterministic package's against the FP64 sum, and in a fused band the
+    deterministic accumulation's bits.  Autograd accumulation into
     ``.grad`` over two microbatches gives the sum of the two nodes' weight
     gradients (recorded by a hook), each the functional backward's bits (in
     a row-claims band each within the budgets of
     :func:`assert_dw_repeats_within_det` instead), and twice the functional
     backward's ``dx`` and ``dz`` bits, ``x.grad`` and ``z.grad`` within one
     BF16 ulp of twice the FP64 ``dx`` and ``dz`` and within the error budget
-    of twice the deterministic package's."""
-    x, z, w, dy = suite.make(1031, 48, seed=6)
-    x2, z2, _, dy2 = suite.make(1031, 48, seed=7)
-    rows = 1031 * 48
+    of twice the deterministic package's; in a fused band the functional
+    backward's ``dx``, ``dz`` and ``dw`` are the deterministic package's
+    bits."""
+    shape = (1031, 48) if band is None else suite._band_shape(band)
+    if shape is None:
+        pytest.skip(f"this device routes no {band} band")
+    T, H = shape
+    x, z, w, dy = suite.make(T, H, seed=6)
+    x2, z2, _, dy2 = suite.make(T, H, seed=7)
+    rows = T * H
     _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
     dw64b = suite.fp64_reference(dy2, x2, z2, w, EPS)[3]
     mag = suite.magnitudes(dy, x, z, EPS) + suite.magnitudes(dy2, x2, z2, EPS)
@@ -1221,6 +1314,13 @@ def test_accumulation_within_the_deterministic_error(determinism_setting) -> Non
             assert_error_within_det(
                 f"{dtype} accumulator", main, main_reference, want, mag=mag
             )
+        if _fused(suite._backward_module(rows, dtype)):
+            assert_same_bits(
+                f"{dtype} accumulator of the fused backward vs the deterministic "
+                "package",
+                mains[0],
+                main_reference,
+            )
     # autograd accumulation into .grad over two microbatches
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     node_dws: list[torch.Tensor] = []
@@ -1233,6 +1333,9 @@ def test_accumulation_within_the_deterministic_error(determinism_setting) -> Non
     assert_same_bits("z.grad", za.grad, dz + dz)
     assert_same_bits("w.grad", wa.grad, node_dws[0] + node_dws[1])
     dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS)
+    assert_det_bits_where_fused(
+        suite._backward_module(rows), (dx, dz, dw), (dx_d, dz_d, dw_d)
+    )
     for k, node_dw in enumerate(node_dws):
         assert_dw_repeats_within_det(
             f"node {k}: dw",
@@ -1250,18 +1353,34 @@ def test_accumulation_within_the_deterministic_error(determinism_setting) -> Non
 
 
 @requires_device
+@pytest.mark.parametrize(
+    "band", [None, "bwd_bf16_fused"], ids=["257x48", "bwd_bf16_fused"]
+)
 def test_compute_grad_weight_false_within_the_deterministic_error(
+    band,
     determinism_setting,
 ) -> None:
     """Without the weight gradient (with this package's workspace or none,
     and through autograd with a weight that needs no gradient), ``dx`` and
     ``dz`` are the bits of a backward with the weight gradient, within one
-    BF16 ulp of FP64 and within the deterministic package's error budget."""
-    x, z, w, dy = suite.make(257, 48, seed=12)
+    BF16 ulp of FP64 and within the deterministic package's error budget, at
+    257 tokens of 48 heads and, for ``band``, at the fewest whole tokens of 48
+    heads in the fused BF16 band (``suite._band_shape``; a call without the
+    weight gradient takes the BF16 bands; sm_107a only, elsewhere skipped);
+    where the backward is a fused backward they are the deterministic
+    package's bits."""
+    shape = (257, 48) if band is None else suite._band_shape(band)
+    if shape is None:
+        pytest.skip(f"this device routes no {band} band")
+    T, H = shape
+    x, z, w, dy = suite.make(T, H, seed=12)
     _, dx64, dz64, _ = suite.fp64_reference(dy, x, z, w, EPS)
     dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS, compute_grad_weight=False)
     want_dx, want_dz, _ = nd_backward(dy, x, z, w, EPS)
-    ws = nd_workspace(257 * 48, x.device)
+    assert_det_bits_where_fused(
+        suite._backward_module(T * H), (want_dx, want_dz), (dx_d, dz_d)
+    )
+    ws = nd_workspace(T * H, x.device)
     for workspace in (ws, None):
         dx, dz, dw = nd_backward(
             dy, x, z, w, EPS, compute_grad_weight=False, workspace=workspace
@@ -1286,19 +1405,24 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
 def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     """A workspace of the architecture's bytes (``suite.WORKSPACE_BYTES``)
     with nonzero bytes in every buffer (the integer windows, the FP64 column
-    sums, the class words, the arrival ticket and the claim counter) zeroed by
+    sums, the class words, the arrival ticket and the claim counter, and the
+    fused backward's fixed-point digits, flag words and its own ticket and
+    counter over the first 18952 bytes) zeroed by
     ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``, then reused
     without a reset over the backend suite's sequence of shapes, then the
     first rows of each ``BACKWARD_BANDS`` band of this device none of them
     runs (``suite._band_shape``; so every backward program of the
-    architecture among them), weight-gradient dtypes and accumulation: every
+    architecture among them, the fused backwards too), weight-gradient
+    dtypes and accumulation: every
     output repeats bit for bit (an accumulated ``dw`` from the same starting
     value too; a BF16 ``dw`` in a row-claims band instead meets the checks
     that follow on each call), ``dx`` and
     ``dz`` lie within one BF16 ulp of FP64, ``dx``, ``dz`` and ``dw`` lie
     within the error budget of the deterministic package's,
     ``dw`` within the budget of the deterministic ``dw`` and of the FP64
-    reference, and the workspace is zero after every call."""
+    reference, in a fused band ``dx``, ``dz`` and ``dw`` (accumulated too)
+    are the deterministic package's bits, and the workspace is zero after
+    every call."""
     device = torch.device("cuda")
     ws = nd_workspace(1, device)
     assert ws.dtype == torch.uint8
@@ -1379,6 +1503,9 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
             ("dx", "dz"), (dx, dz), dets[:2], (dx64, dz64), strict=True
         ):
             assert_error_within_det(f"{what} {case}", got, det, ref)
+        assert_det_bits_where_fused(
+            loader.module_for_rows(arch, _role_of(dtype), T * H, sms), runs[0], dets
+        )
         for _, _, dw in runs if varies else runs[:1]:
             assert dw.dtype == dtype
             assert_error_within_det(f"dw {case}", dw, dets[2], want, mag=mag)
@@ -1977,8 +2104,10 @@ def test_forward_gate_edges_keep_the_fp64_classes(
 # backward), 288 rows (the exact tiny backward of a BF16
 # weight gradient on sm_100a and sm_107a, the row-claims backward on
 # sm_103a), then 1008, 6192, 49488, 49536 and 245808 rows in the bands past
-# them (the static, the row-claims and the claimed backwards, as the
-# architecture's ``BACKWARD_BANDS`` and the SM count place them).
+# them (the fused, the static, the row-claims and the claimed backwards, as
+# the architecture's ``BACKWARD_BANDS`` and the SM count place them: 1008 and
+# 6192 rows in the fused band of an FP32 weight gradient on every
+# architecture and of a BF16 one on sm_107a).
 GATE_EDGE_BACKWARD_COLUMNS = 96
 GATE_EDGE_BACKWARD_CASES = [
     pytest.param(1, 48, id="1x48"),
@@ -2004,12 +2133,14 @@ def test_backward_gate_edges_keep_the_fp64_classes(
     ``GATE_EDGE_BACKWARD_COLUMNS`` columns (``_gate_edge_inputs``) the
     backward launches ``module_for_rows``' module, every output repeats bit
     for bit (but a BF16 ``dw`` in a row-claims band, which meets the checks
-    that follow on each call instead), ``dx`` and ``dz`` have the
-    deterministic package's ``NaN`` positions and its bits elsewhere, ``dx``,
+    that follow on each call instead), ``dx`` and ``dz`` lie within one BF16
+    ulp of FP64, ``dx``,
     ``dz`` and ``dw`` have the FP64 reference's ``NaN``, ``+inf`` and
     ``-inf`` positions in every band, their finite
     elements (each has some) lie within the error budget of the
-    deterministic package's, and the workspace is zero after every call."""
+    deterministic package's, in a fused band ``dx``, ``dz`` and ``dw`` are
+    the deterministic package's bits (``NaN`` payloads included), and the
+    workspace is zero after every call."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
@@ -2037,6 +2168,7 @@ def test_backward_gate_edges_keep_the_fp64_classes(
             assert_same_bits(what, a, g)
     assert_dx_dz_within_fp64("dx", got[0], dx64)
     assert_dx_dz_within_fp64("dz", got[1], dz64)
+    assert_det_bits_where_fused(name, got, dets)
     checked = [
         ("dx", got[0], dets[0], dx64),
         ("dz", got[1], dets[1], dz64),
@@ -2062,7 +2194,8 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     ``dx``, ``dz``, ``dw`` and the accumulated ``dw`` lie
     within the error budget of the deterministic package's, ``dw`` within the
     weight-gradient budget of the deterministic ``dw`` and the accumulated one
-    within that of the FP64 reference."""
+    within that of the FP64 reference; for a fused backward ``dx``, ``dz``,
+    ``dw`` and the accumulated ``dw`` are the deterministic package's bits."""
     rows = x.numel() // D
     mag = suite.magnitudes(dy, x, z, EPS)
     _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
@@ -2100,6 +2233,7 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     suite.assert_dw_within(
         first[2], dets[2], mag, what="dw vs the deterministic package"
     )
+    assert_det_bits_where_fused(name, first, dets)
     acc = [
         nd_backward(
             dy,
@@ -2119,6 +2253,12 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     for acc_dw in acc if varies else acc[:1]:
         assert_error_within_det("accumulated dw", acc_dw, acc_d, 0.25 + dw64, mag=mag)
         suite.assert_dw_within(acc_dw, 0.25 + dw64, mag, what="accumulated dw vs FP64")
+    if _fused(name):
+        assert_same_bits(
+            "accumulated dw of the fused backward vs the deterministic package",
+            acc[0],
+            acc_d,
+        )
     assert launched == [name] * (suite.REPEATS + 2), launched
 
 
@@ -2176,8 +2316,9 @@ def test_backward_band_edges_within_the_deterministic_error(
 ) -> None:
     """At the first and the last rows of each ``BACKWARD_BANDS`` band on this
     device's SM count (:func:`_band_modules`: the small-row backwards, the
-    static backwards, the row-claims backwards and the claimed backward, each
-    where the architecture routes it) and where a chunked program's chunks
+    fused backwards, the static backwards, the row-claims backwards and the
+    claimed backward, each where the architecture routes it) and where a
+    chunked program's chunks
     grow by a block (``backward_chunks``): ``module_for_rows`` runs the
     band's program from its first to its last rows only, and
     ``_check_backward`` holds on flat [rows, 128] inputs into the band's
@@ -2264,23 +2405,43 @@ def test_backward_shapes_within_the_deterministic_error(
     _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch)
 
 
+# The backend suite's ``BULK_BAND_CASES`` (strided and packed inputs in the
+# bands of the row-claims, the claimed and the fused backwards) and the same
+# layouts in the fused bands (``bwd_bf16_fused``, ``bwd_f32_fused``: the
+# deterministic package's program, whose CTAs run one row block each in their
+# bands and warm no rows) where the suite does not list them; a case of a
+# band this device does not route skips.
+FUSED_BANDS = ("bwd_bf16_fused", "bwd_f32_fused")
+BULK_LAYOUTS = ("projection", "head_major", "one_token", "contiguous")
+LAYOUT_BAND_CASES = [
+    *suite.BULK_BAND_CASES,
+    *(
+        pytest.param(band, layout, id=f"{band}-{layout}")
+        for band in FUSED_BANDS
+        if band not in {case.values[0] for case in suite.BULK_BAND_CASES}
+        for layout in BULK_LAYOUTS
+    ),
+]
+
+
 @requires_device
-@pytest.mark.parametrize("band,layout", suite.BULK_BAND_CASES)
+@pytest.mark.parametrize("band,layout", LAYOUT_BAND_CASES)
 def test_layouts_in_the_row_claims_and_claimed_backward_bands_within_the_deterministic_error(
     band,
     layout,
     determinism_setting,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The backend suite's ``BULK_BAND_CASES`` (strided and packed inputs in
-    the bands of the row-claims and the claimed backwards,
+    """``LAYOUT_BAND_CASES`` (strided and packed inputs in the bands of the
+    row-claims, the claimed and the fused backwards,
     ``suite._bulk_band_shape``): ``module_for_rows`` runs the band's program,
     the launch passes the strides of the layout, which pass the kernels'
     packed-rows test (``_packed``: ``dy``, ``x`` and ``z`` of one packed row
     stride, the rows the sm_100a and sm_103a programs warm with a bulk
     prefetch) for packed rows of more than one token only, and
     ``_check_backward`` holds (on the other layouts those programs warm the
-    rows with a prefetch per thread)."""
+    rows with a prefetch per thread; the fused programs warm no rows in their
+    bands, and a fused backward gives the deterministic package's bits)."""
     shape = suite._bulk_band_shape(band, layout)
     if shape is None:
         pytest.skip(f"this device routes no {band} band with a {layout} input")
@@ -2328,8 +2489,9 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
     positions, their other elements within one BF16 ulp of FP64 and within
     the error budget,
     on every repeat the same bits (but a BF16 ``dw`` in a row-claims band,
-    whose every launch meets the weight gradient's checks instead), with the
-    workspace zero after every call."""
+    whose every launch meets the weight gradient's checks instead), in a
+    fused band ``dx``, ``dz`` and ``dw`` the deterministic package's bits
+    (``NaN`` payloads included), with the workspace zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)
@@ -2386,6 +2548,7 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
         assert_error_within_det(
             f"finite {what}", got, det, ref, mask=torch.isfinite(ref)
         )
+    assert_det_bits_where_fused(name, first_run, dets)
     dw_d = dets[2]
     for dw in dws if varies else dws[:1]:
         assert_same_classes("dw", dw, dw64)
@@ -2401,15 +2564,16 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 def _block_rows(name: str) -> int:
     """The rows of one row block of the backward module ``name``, from its
     record: ``rows_per_block`` of its grid rule for a chunked backward (grid
-    kind ``chunks``: the static and the claimed backwards, 8),
-    ``rows_per_cta`` for a row-claims backward (``row_claims``, 16), and for
+    kind ``chunks``: the static and the claimed backwards, 8) and for a fused
+    backward (``claimed_row_blocks``, 16), ``rows_per_cta`` for a row-claims
+    backward (``row_claims``, 16), and for
     a small-row backward (``cluster``) its launch block's threads over the
     teams of its CTA over 16 threads a row (``suite._cluster_block_rows``):
     16 rows for the short backward (one 256-thread team a CTA), 8 for the
     exact tiny backwards (4 teams of the deterministic backward's 128-thread
     CTA in a 512-thread CTA, each team its own 8-row block)."""
     rule = loader.MODULES[name]["grid_rule"]
-    if rule["kind"] == "chunks":
+    if rule["kind"] in ("chunks", "claimed_row_blocks"):
         return int(rule["rows_per_block"])
     if rule["kind"] == "row_claims":
         return int(rule["rows_per_cta"])
@@ -2452,8 +2616,9 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     have the FP64 reference's ``NaN``, ``+inf`` and ``-inf`` positions and
     their other elements within one BF16 ulp of FP64, on every repeat the
     same bits (but a BF16 ``dw`` in a row-claims band,
-    whose every launch meets the weight gradient's checks instead), with the
-    workspace zero after every call."""
+    whose every launch meets the weight gradient's checks instead), in a
+    fused band ``dx``, ``dz`` and ``dw`` the deterministic package's bits
+    (``NaN`` payloads included), with the workspace zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)
@@ -2518,6 +2683,7 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
         assert_error_within_det(
             f"finite {what}", got, det, ref, mask=torch.isfinite(ref)
         )
+    assert_det_bits_where_fused(name, first_run, dets)
     dw_d = dets[2]
     for dw in dws if varies else dws[:1]:
         assert_same_classes(f"dw rows={rows}", dw, dw64)
@@ -2647,16 +2813,21 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 # ``STRIDED_FORWARD_BANDS`` band, where the one-head layouts with packed rows
 # run the forward of that row count's ``FORWARD_BANDS`` band), the
 # row-claims mid backward (sm_100a and sm_103a: thread 0 warms the next block
-# of packed rows) and the claimed backward (on sm_100a and sm_103a a CTA's
+# of packed rows), the claimed backward (on sm_100a and sm_103a a CTA's
 # next block, with a bulk prefetch per tensor where the rows are packed; on
-# sm_107a the rows of the block two ahead).  The one-head inputs take one row
-# past each one's start (``_start_rows``).
+# sm_107a the rows of the block two ahead); and the fused backwards (the
+# deterministic package's program, which reads the rows through their token
+# and head strides and in its bands, one row block a CTA, warms none), whose
+# bits must not depend on the layout either.  The one-head inputs take one
+# row past each one's start (``_start_rows``).
 ONE_HEAD_ROUTES = [
     pytest.param("fwd", "fwd_mid", id="fwd_mid"),
     pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
     pytest.param("bwd_bf16", "bwd_bf16_rc_mid", id="bwd_bf16_rc_mid"),
     pytest.param("bwd_bf16", "bwd_bf16_mid", id="bwd_bf16_claimed"),
     pytest.param("bwd_f32", "bwd_f32_mid", id="bwd_f32_claimed"),
+    pytest.param("bwd_bf16", "bwd_bf16_fused", id="bwd_bf16_fused"),
+    pytest.param("bwd_f32", "bwd_f32_fused", id="bwd_f32_fused"),
 ]
 
 
@@ -2666,8 +2837,8 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     role, band, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One row past the start of the mid and the extra-long forward (their
-    strided bands) and of the row-claims mid and the claimed backward: a
-    one-head input of every layout (``ONE_HEAD_LAYOUTS``) launches
+    strided bands) and of the row-claims mid, the claimed and the fused
+    backwards: a one-head input of every layout (``ONE_HEAD_LAYOUTS``) launches
     ``module_for_rows``' module (for the forward, the module of its layout's
     packing) with head stride 128, passes the packed-rows test exactly when its
     rows follow one another (or the host copied it), and returns the same
@@ -2678,7 +2849,9 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     workspace zero after every call, ``dx`` and ``dz`` within one BF16 ulp of
     FP64; each module's outputs lie within the error
     budget of the deterministic package's on the flat rows, ``dw`` also within
-    the weight-gradient budget of the deterministic ``dw``."""
+    the weight-gradient budget of the deterministic ``dw``, and a fused
+    backward's ``dx``, ``dz`` and ``dw`` are the deterministic package's bits
+    on the flat rows."""
     arch = loader.device_arch(torch.cuda.current_device())
     name = loader.ROUTES[arch].get(band)
     if name is None:
@@ -2755,6 +2928,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
             suite.assert_dw_within(
                 want[2], dets[2], mag, what="dw vs the deterministic package"
             )
+            assert_det_bits_where_fused(name, want, dets)
 
 
 # Identical rows whose weight-gradient terms ``dy * silu(z) * x * rstd`` are
@@ -2762,9 +2936,11 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
 # BF16 subnormal, so ``silu(z)`` is 2^-134 exactly; ``dy`` 2^-16 .. 2^-14 by
 # column): each term rounds to 0 or 2^-149 in FP32, the same in every row, so
 # the error grows with the rows.  Row counts of the small-row band (16 rows)
-# and past it (4096, 65536 and 262144 rows: the static, the row-claims and the
-# claimed backwards, as the architecture's ``BACKWARD_BANDS`` and the SM count
-# place them).
+# and past it (4096, 65536 and 262144 rows: the fused, the static, the
+# row-claims and the claimed backwards, as the architecture's
+# ``BACKWARD_BANDS`` and the SM count place them; 4096 rows in the fused band
+# of an FP32 weight gradient on every architecture and of a BF16 one on
+# sm_107a).
 SUBNORMAL_SHAPES = [
     pytest.param(16, 1, id="16x1"),
     pytest.param(4096, 1, id="4096x1"),
@@ -2804,7 +2980,9 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
     the error budget of the deterministic package's, and every ``dw`` lies
     within that budget widened by the
     documented underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row
-    plus half the dtype's smallest subnormal, with the workspace zero."""
+    plus half the dtype's smallest subnormal, with the workspace zero; a
+    fused backward's ``dx``, ``dz`` and ``dw`` are the deterministic
+    package's bits."""
     x, z, w, dy = _underflowing_rows(T, H)
     rows = T * H
     arch = loader.device_arch(torch.cuda.current_device())
@@ -2850,4 +3028,5 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
         outputs, first, dets, (dx64, dz64, dw64), strict=False
     ):
         assert_error_within_det(what, got, det, ref)
+    assert_det_bits_where_fused(name, first, dets)
     assert launched == [name] * suite.REPEATS, launched

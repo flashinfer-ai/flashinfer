@@ -76,7 +76,19 @@ CTAs claim the blocks from the workspace's claim counter, so a CTA that
 starts late takes fewer blocks; each CTA adds its FP32 runs of rows (the
 row-claims mid backward: as FP32 two-sum pairs) to FP64 accumulators of the
 workspace with atomics and takes a ticket, and the CTA that arrives last
-rounds the sum into ``dw``.  Beside a long-resident
+rounds the sum into ``dw``.  The fused backwards (``bwd_f32_fused`` on
+every architecture, ``bwd_bf16_fused`` on SM107; grid kind
+``claimed_row_blocks``: the deterministic package's backward program under
+this package's names) cut the rows into blocks of 16 rows and launch
+``G = min(blocks, 4 * SMs)`` CTAs of 256 threads; where the rows have more
+blocks than the grid has CTAs, the CTAs claim runs of blocks from the
+workspace's claim counter, in halving rounds and then single blocks, so a
+CTA that starts late takes fewer blocks (their bands end below that, at most
+60 rows per SM, so there CTA ``b`` runs block ``b``); each CTA adds its
+blocks' weight-gradient terms exactly into fixed-point digits of the
+workspace and takes a ticket, and the CTA that arrives last rounds the sum
+once into ``dw``, so it repeats its bits and is the deterministic package's.
+Beside a long-resident
 one-thread kernel on another stream each call must keep its speed: per token
 count, the median of seven event-timed calls with the side kernel resident is
 at most ``MAX_RATIO`` times the median of seven calls alone, or at most
@@ -88,8 +100,9 @@ CTA of the chunked backwards needs 15616 bytes of dynamic shared memory (the
 launch record's ``dynamic_smem_bytes``: the two halves of the 8 x 128 FP32
 fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128 columns,
 7168 bytes, and the run cell, the arrival flag and the 8-entry claim table,
-160 bytes, 15520 bytes rounded up) and each CTA of the row-claims backwards
-20736 bytes, so a side kernel holding every SM with a small carveout can
+160 bytes, 15520 bytes rounded up), each CTA of the row-claims backwards
+20736 bytes and each CTA of the fused backwards 26368 bytes, so a side
+kernel holding every SM with a small carveout can
 delay its start until the side kernel exits (no test here asserts that delay;
 documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The
 documented remedy is checked here: with the side kernel's preferred carveout
@@ -126,7 +139,10 @@ grid has CTAs) of either weight-gradient dtype, at its first such whole
 tokens and at the most tokens whose rows give each CTA the band end's whole
 row blocks a CTA (the band's last whole tokens where that is not past the
 first; a weight-gradient dtype with no such band skips); in each row-claims
-band, at its first and its last whole tokens.  The persistent forwards
+band (SM100 and SM103; SM107 routes none) and in each fused band (its CTAs
+claim 16-row blocks at run time where the rows have more blocks than the
+grid has CTAs; in its rows each CTA runs one block, so the share of one row
+block is 1), at its first and its last whole tokens.  The persistent forwards
 beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
 the share of one CTA's blocks in the call (a CTA whose slot the side kernel
 holds walks all of its blocks once it starts), plus ``PROPORTIONAL_SLACK``,
@@ -171,7 +187,9 @@ measurement that counts (to the last one when none does).  The small-row
 backwards (``SHORT_BACKWARD_PROBES``, BF16 and FP32 weight gradients) keep
 their speed beside the one-thread kernel and, beside the short forward's side
 kernels, end no later than the backward they replace (the module of the
-role's first band past its small-row bands, at the same rows) by the short
+role's first band past its small-row bands, at the same rows: the fused
+backward, but for a BF16 weight gradient on SM100 and SM103 the row-claims
+backward) by the short
 forward's bound and measurement rule: there a measurement
 counts only when the small-row backward's and the replaced backward's alone
 medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest alone
@@ -182,12 +200,17 @@ time, and a run counts only when the side kernel held the intended SMs before
 the call started.  In every test ``y``, ``dx`` and ``dz`` are bitwise those of
 the first call alone of the same entry point and module, and so is ``dw`` of
 every module but a row-claims backward (a chunk's partial does not depend on
-the grid or on the CTA that claimed it, the sum of the partials is exact, and
-a small-row backward sums in a fixed order); every ``dw`` lies within the
+the grid or on the CTA that claimed it, the sum of the partials is exact, a
+fused backward sums exactly in fixed point, and a small-row backward sums in
+a fixed order); every ``dw`` lies within the
 backend suite's budget of an FP64 reference (the row-claims backwards' ``dw``
 is checked against that budget only: its FP32 runs and the order of its FP64
 additions follow the blocks each CTA claimed), the small-row backward's
-``dx`` and ``dz`` are bitwise those of the backward it replaces, and the
+``dx`` and ``dz`` are bitwise those of the backward it replaces (where that
+is a fused backward, whose row arithmetic is the deterministic package's,
+those of the role's own static backward at the same rows instead, and the
+fused backward's ``dx``, ``dz`` and ``dw`` the deterministic package's
+bits), and the
 workspace is zero after every call.  PyTorch's deterministic algorithms are
 off in every test (a row-claims backward raises PyTorch's alert under them).
 """
@@ -683,8 +706,25 @@ def _backward_module(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> str:
 def _dw_repeats(name: str) -> bool:
     """Whether the backward module ``name`` repeats its weight gradient bit for
     bit: every module but a row-claims backward, whose CTAs claim row blocks at
-    run time and add their sums with FP64 atomics."""
+    run time and add their sums with FP64 atomics (a fused backward's CTAs
+    claim row blocks too, but add their terms exactly in fixed point)."""
     return loader.MODULES[name]["grid_rule"]["kind"] != "row_claims"
+
+
+def _fused(name: str) -> bool:
+    """Whether the backward module ``name`` is a fused backward (grid kind
+    ``claimed_row_blocks``): the deterministic package's backward program
+    under this package's names, whose ``dx``, ``dz`` and ``dw`` are that
+    package's bits and whose row arithmetic is that package's."""
+    return loader.MODULES[name]["grid_rule"]["kind"] == "claimed_row_blocks"
+
+
+def _backward_with(module: str, dy, x, z, w, dw, workspace):
+    """One backward into ``dw`` that runs the module ``module`` whatever its
+    rows (``module_for_rows`` replaced for the call)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pkg, "module_for_rows", lambda *_args: module)
+        return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
 
 
 def _check_outputs(
@@ -719,14 +759,43 @@ def _check_outputs(
         )
 
 
-def _check_replaced_rows(tokens: int, alone, replaced_alone) -> None:
+def _check_replaced_rows(
+    tokens: int, alone, replaced_alone, replaced: str, inputs, dw_dtype
+) -> None:
     """``dx`` and ``dz`` of the small-row backward's first call alone bitwise
-    those of the backward it replaces (the same row arithmetic; their weight
-    gradients sum different partials and are each checked by
-    :func:`_check_outputs`)."""
-    first, replaced = alone[0][1], replaced_alone[0][1]
-    assert torch.equal(replaced[0], first[0]), f"dx tokens={tokens} (replaced)"
-    assert torch.equal(replaced[1], first[1]), f"dz tokens={tokens} (replaced)"
+    those of the backward it replaces, the module ``replaced`` (the same row
+    arithmetic; their weight gradients sum different partials and are each
+    checked by :func:`_check_outputs`).  Where ``replaced`` is a fused
+    backward (:func:`_fused`), whose row arithmetic is the deterministic
+    package's, its first call's ``dx``, ``dz`` and ``dw`` are instead bitwise
+    those of the deterministic package's backward of ``inputs`` (``x``,
+    ``z``, ``w``, ``dy``) into a ``dw_dtype`` weight gradient, and the
+    small-row backward's ``dx`` and ``dz`` bitwise those of the role's own
+    static backward (``ROUTES[arch][role]``, the backward the small-row
+    backward replaced before the fused band) at the same rows, which leaves
+    its workspace zero."""
+    first, rep = alone[0][1], replaced_alone[0][1]
+    if not _fused(replaced):
+        assert torch.equal(rep[0], first[0]), f"dx tokens={tokens} (replaced)"
+        assert torch.equal(rep[1], first[1]), f"dz tokens={tokens} (replaced)"
+        return
+    x, z, w, dy = inputs
+    det = det_pkg.cake_rmsnorm_silu_gate_det_train_backward(
+        dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device)
+    )
+    for what, got, want in zip(("dx", "dz", "dw"), rep, det, strict=True):
+        assert torch.equal(got, want), (
+            f"{what} tokens={tokens}: the fused backward vs the deterministic package"
+        )
+    arch, _sms = _device()
+    static = loader.route_module(arch, _backward_role(dw_dtype))
+    assert not _fused(static), (arch, static)
+    workspace = workspace_for(tokens * H, x.device)
+    dw = torch.empty(D, dtype=dw_dtype, device=x.device)
+    same = _backward_with(static, dy, x, z, w, dw, workspace)
+    assert torch.equal(same[0], first[0]), f"dx tokens={tokens} (static backward)"
+    assert torch.equal(same[1], first[1]), f"dz tokens={tokens} (static backward)"
+    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
 
 
 @pytest.mark.parametrize("tokens", ALL_SM_TOKENS)
@@ -820,26 +889,33 @@ def _band_kind(name: str) -> str:
     """The schedule of the backward module ``name``: ``"cluster"`` (a
     small-row backward), ``"static"`` (a chunked backward of a call role: CTA
     ``b`` runs the chunks ``b``, ``b + grid``, ...), ``"claimed"`` (another
-    chunked backward: its CTAs claim runs of chunks) or ``"row_claims"``."""
+    chunked backward: its CTAs claim runs of chunks), ``"row_claims"`` or
+    ``"fused"`` (grid kind ``claimed_row_blocks``: the deterministic
+    package's backward program, whose CTAs claim runs of 16-row blocks where
+    the rows have more blocks than the grid has CTAs)."""
     record = loader.MODULES[name]
     kind = record["grid_rule"]["kind"]
+    if kind == "claimed_row_blocks":
+        return "fused"
     if kind != "chunks":
         return kind
     return "static" if record["role"] in loader.ROLES else "claimed"
 
 
 def _rows_per_block(name: str) -> int:
-    """Rows of a row block of the chunked or row-claims backward module
-    ``name``: ``rows_per_block`` of a chunked one, ``rows_per_cta`` of a
-    row-claims one."""
+    """Rows of a row block of the chunked, row-claims or fused backward module
+    ``name``: ``rows_per_block`` of a chunked or a fused one, ``rows_per_cta``
+    of a row-claims one."""
     rule = loader.MODULES[name]["grid_rule"]
-    return int(rule["rows_per_block" if rule["kind"] == "chunks" else "rows_per_cta"])
+    return int(
+        rule["rows_per_cta" if rule["kind"] == "row_claims" else "rows_per_block"]
+    )
 
 
 def _work_units(name: str, rows: int) -> int:
     """What the CTAs of the backward module ``name`` share out at ``rows``
     rows: the chunks of a chunked backward (``backward_chunks``), the row
-    blocks of a row-claims backward."""
+    blocks of a row-claims or a fused backward."""
     if loader.MODULES[name]["grid_rule"]["kind"] == "chunks":
         return loader.backward_chunks(name, rows)[1]
     return -(-rows // _rows_per_block(name))
@@ -952,17 +1028,21 @@ def test_backward_slows_in_proportion_to_the_sms_held(
 # give each CTA of that grid the band end's whole row blocks a CTA
 # (``floor(band end / (wave * rows_per_block))``), or the band's last whole
 # tokens where those are not past "first" (a band that ends below 2 whole row
-# blocks a CTA).  A row-claims band: "first" and "last" are its first and its
-# last whole tokens.  Every size comes from BACKWARD_BANDS and the device's SM
-# count; the ``nth`` such band of the weight gradient's role, where the
-# architecture has one.
+# blocks a CTA).  A row-claims band and a fused band (the deterministic
+# package's backward program, whose CTAs claim 16-row blocks at run time
+# where the rows have more blocks than its grid has CTAs; in its band, which
+# ends below 4 blocks per SM, each CTA runs one block, so the share of one
+# row block is 1): "first" and "last" are its first and its last whole
+# tokens.  Every size comes from BACKWARD_BANDS and the device's SM count; the
+# ``nth`` such band of the weight gradient's role, where the architecture has
+# one.
 BACKWARD_EDGES = ("first", "last")
 
 
 def _edge_band(arch: str, last, band: str, kind: str) -> bool:
     """Whether the ``BACKWARD_BANDS`` band ``(last, band)`` of ``arch`` is a
     band of ``kind`` (``_band_kind`` of its module) the edge tests probe: any
-    row-claims band; a static band without an end, of a count of rows, or
+    row-claims or fused band; a static band without an end, of a count of rows, or
     whose end in rows per SM passes one wave of one-block chunks
     (``ctas_per_sm * rows_per_block``: only past it does a static backward
     run more chunks than CTAs)."""
@@ -1001,8 +1081,9 @@ def _band_edge(
     dw_dtype: torch.dtype, kind: str, nth: int, edge: str
 ) -> tuple[int, str, float]:
     """``(T, module, block_share)`` of ``edge`` of the ``nth`` static
-    multi-chunk band (``kind`` "static") or row-claims band (``kind``
-    "row_claims") of a ``dw_dtype`` weight gradient on the current device
+    multi-chunk band (``kind`` "static"), row-claims band (``kind``
+    "row_claims") or fused band (``kind`` "fused") of a ``dw_dtype`` weight
+    gradient on the current device
     (``BACKWARD_EDGES``), its module and the share of one row block of each
     of its CTAs in the call alone (``_block_share``); skips where the
     architecture has fewer such bands, or where "last" is not past "first"."""
@@ -1081,6 +1162,20 @@ def test_row_claims_backward_band_edges_slow_in_proportion_to_the_sms_held(
         ctas,
         threads,
         dw_dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("edge", BACKWARD_EDGES)
+@pytest.mark.parametrize(("dw_dtype", "nth"), _backward_band_probes("fused"))
+def test_fused_backward_band_edges_slow_in_proportion_to_the_sms_held(
+    dw_dtype: torch.dtype, nth: int, edge: str, ctas: int, threads: int
+) -> None:
+    tokens, name, block_share = _band_edge(dw_dtype, "fused", nth, edge)
+    _backward_slows_in_proportion(
+        f"fused_band{nth}_{edge}", tokens, name, block_share, ctas, threads, dw_dtype
     )
 
 
@@ -1567,7 +1662,7 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 # BACKWARD_BANDS: 6 tokens past 256 rows, 11 tokens past 512), where the
 # module of the role's next band takes over from the small-row backward (on
 # SM100 and SM103 for a BF16 weight gradient the row-claims backward, else the
-# static backward); it runs in the keeps-speed and the max-shared start tests
+# fused backward); it runs in the keeps-speed and the max-shared start tests
 # only.
 SHORT_BACKWARD_PROBES = ("1x48", "5x48", "second_band", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
@@ -1586,9 +1681,9 @@ CARVEOUT_MAX_L1 = 0
 
 # Why the small-carveout and held tests skip the "past" probe: the backward it
 # runs is the backward a small-row backward replaces (a held test would
-# compare it with itself), and this file asserts no start of the chunked or
-# the row-claims backwards beside a side kernel holding every SM with a small
-# carveout ("a side kernel holding every SM with a small carveout can delay
+# compare it with itself), and this file asserts no start of the chunked, the
+# row-claims or the fused backwards beside a side kernel holding every SM with
+# a small carveout ("a side kernel holding every SM with a small carveout can delay
 # its start until the side kernel exits (no test here asserts that delay;
 # documented in flashinfer.cake_rmsnorm_silu_gate_nondet_train)").
 PAST_PROBE_SKIP = (
@@ -1745,7 +1840,8 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
 # kernel exits (observed on R200): there it
 # must end at most MAX_ALL_SM_EXTRA_MS after the backward it replaces (the
 # module of the role's first band past its small-row bands, on SM107 the
-# static backward, 15616 bytes a CTA) beside it.
+# fused backward, 26368 bytes a CTA, for both weight-gradient dtypes) beside
+# it.
 SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)
 
 
@@ -1778,9 +1874,7 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
 
         def call_replaced():
             # the module the short backward replaces at these rows
-            with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(pkg, "module_for_rows", lambda *_args: replaced)
-                return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
+            return _backward_with(replaced, dy, x, z, w, dw, workspace)
 
         rep_alone_ms, rep_busy_ms, rep_alone, rep_busy = _paired_medians(
             call_replaced, _spin(carveout), ALL_SM_RUNS
@@ -1798,7 +1892,9 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
             _dw_reference(dy, x, z),
             module=replaced,
         )
-        _check_replaced_rows(tokens, alone, rep_alone)
+        _check_replaced_rows(
+            tokens, alone, rep_alone, replaced, (x, z, w, dy), dw_dtype
+        )
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         assert busy_ms - rep_busy_ms <= MAX_ALL_SM_EXTRA_MS, (
             f"tokens={tokens}: beside an all-SM kernel with the {label} carveout "
@@ -1833,9 +1929,7 @@ def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
 
     def call_replaced():
         # the module the short backward replaces at these rows
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(pkg, "module_for_rows", lambda *_args: replaced)
-            return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
+        return _backward_with(replaced, dy, x, z, w, dw, workspace)
 
     dw_reference = _dw_reference(dy, x, z)
     spin = _spin(carveout, ctas=ctas, threads=threads)
@@ -1866,7 +1960,9 @@ def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
         _check_outputs(
             "backward", tokens, rep_alone, rep_busy, dw_reference, module=replaced
         )
-        _check_replaced_rows(tokens, alone, rep_alone)
+        _check_replaced_rows(
+            tokens, alone, rep_alone, replaced, (x, z, w, dy), dw_dtype
+        )
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         if counts:
             break

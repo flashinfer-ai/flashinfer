@@ -19,7 +19,8 @@ package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
 approximate FP32 intrinsics, and one backward kernel whose CTAs add the
 weight-gradient partials exactly as 64-bit integer windows, the last CTA
 rounding the sum once, or, for a BF16 weight gradient in its row-claims bands,
-add FP32 runs of rows to FP64 accumulators with atomics) against the
+add FP32 runs of rows to FP64 accumulators with atomics; in its fused bands
+it runs its copy of the deterministic package's backward) against the
 deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
 the exact fixed-point weight-gradient sum), each called through its own public
@@ -51,9 +52,11 @@ that the claimed backward (at most 8 CTAs per SM
 over chunks of rows); on SM103 the short backward up to 256 rows, a row-claims
 backward up to 700 rows per SM, the row-claims mid backward up to 1294 rows per
 SM and the claimed backward past that; on SM107 the short backward up to 256
-rows, the exact tiny backward up to 512 rows, the static backward up to 24 rows
-per SM, the row-claims backward up to 68 and the claimed backward past that.
+rows, the exact tiny backward up to 512 rows, the fused backward (its copy of
+the deterministic package's backward) up to 60 rows per SM, the static
+backward up to 64 and the claimed backward past that.
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
+fused backward up to 60 rows per SM on SM100 (56 on SM103, 48 on SM107), the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
 every forward kernel of packed rows and every BF16 backward kernel that a
@@ -130,8 +133,8 @@ STAGES = ("fwd", "bwd", "ckpt")
 #   and 2048 the row-claims backward; 4097 the row-claims mid backward; 30000
 #   to 33000 the claimed backward.
 # - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
-#   backward; 16 the static backward; 129 the row-claims backward; 1031 and
-#   more the claimed backward.
+#   backward; 16 and 129 the fused backward; 1031 and more the claimed
+#   backward.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 
