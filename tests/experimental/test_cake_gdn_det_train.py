@@ -540,6 +540,22 @@ def _record_launch_values(monkeypatch) -> list[tuple[str, tuple]]:
     return launches
 
 
+def _record_launch_scalars(monkeypatch) -> list[tuple[str, tuple]]:
+    """:func:`_record_launch_values` with every tensor value recorded as ``None``: the record keeps no device memory
+    alive, so a test that measures the caching allocator around the launches can take it."""
+    launches: list[tuple[str, tuple]] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, grid, values, **kwargs):
+        launches.append(
+            (stage, tuple(None if isinstance(x, torch.Tensor) else x for x in values))
+        )
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return launches
+
+
 def _tape_words(launches, stage: str) -> list[int]:
     """The tape word of every launch of ``stage`` (its ``tape`` parameter, wherever the record puts it)."""
     names = cake_backend.parameters(cake_backend.stage_record(stage, _current_arch()))
@@ -4635,9 +4651,9 @@ def test_fwd_split_shape_class(row, sm_count, monkeypatch) -> None:
 # whether its split forward table gives way to the planner's cheapest serial table.  At 212 SMs the 3 sequences of
 # 11000 / 12000 / 9768 tokens with HV 48 (144 serial CTAs, fill 0.68, the serial table 1.06 x the split table's price)
 # take it; with HV 24 (72 CTAs, 1.51 x) and fewer value heads, and the long rows, the split table stays (64 x 4096 is
-# serial without the rule).  At 208 and 216 SMs (the R200 boards of other SM counts) the same rows are expected: every
-# row but A16 and 64 x 4096 has fewer serial CTAs than 0.65 of the SMs, A16 fills 0.69 / 0.67 of them and its ratio
-# moves little with the SM count (the FWD_A_SERIAL lines, pytest -s, report the ratios of every SM count).
+# serial without the rule).  At 208 SMs the same rows take it.  At 216 SMs every row keeps its split table: A16 fills
+# 0.67 of the SMs but its serial table prices 1.42 x the split table's, above the 1.10 limit (the FWD_A_SERIAL lines,
+# pytest -s, report the ratios of every SM count).
 _FWD_A_SERIAL_KEPT = {
     "A16": True,
     "h8_hv24": False,
@@ -4649,7 +4665,11 @@ _FWD_A_SERIAL_KEPT = {
     "P1": False,
     "64x4096": False,
 }
-FWD_A_SERIAL_ROWS = {sm_count: _FWD_A_SERIAL_KEPT for sm_count in (208, 212, 216)}
+FWD_A_SERIAL_ROWS = {
+    208: _FWD_A_SERIAL_KEPT,
+    212: _FWD_A_SERIAL_KEPT,
+    216: dict.fromkeys(_FWD_A_SERIAL_KEPT, False),
+}
 
 
 @pytest.mark.parametrize(
@@ -4702,7 +4722,10 @@ def test_fwd_a_serial_keep_rule(arch, sm_count, monkeypatch) -> None:
     for row, want in FWD_A_SERIAL_ROWS.get(sm_count, {}).items():
         assert (row in kept) is want, (row, sorted(kept), ratios)
     if sm_count in FWD_A_SERIAL_ROWS:
-        assert 1.0 < ratios["A16"] <= 1.10 < ratios["h8_hv24"], ratios
+        if FWD_A_SERIAL_ROWS[sm_count]["A16"]:
+            assert 1.0 < ratios["A16"] <= 1.10 < ratios["h8_hv24"], ratios
+        else:
+            assert ratios["A16"] > 1.10, ratios
         chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
         assert _segments(chunks, tables["h8_hv24"]) > len(chunks), tables["h8_hv24"]
     pinned = cake_chain.make_options(scan_config=(64, 1), segment_chunks=64)
@@ -5198,7 +5221,7 @@ def test_fwd_routes_checkpoint_writes_the_tape_once(
         backward(*step())
     for leaf in leaves.values():
         leaf.grad = None
-    launches = _record_launch_values(monkeypatch)
+    launches = _record_launch_scalars(monkeypatch)
     gc.collect()
     torch.cuda.synchronize()
     requested, _blocks = _allocator_bytes(device)
