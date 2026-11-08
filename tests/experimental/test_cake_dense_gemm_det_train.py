@@ -7069,8 +7069,10 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # epilogue released by row half on sm_100a; round 9: the same form on sm_103a, and the sm_103a 12288 -> 4096
 # forward at T 16231 / 16384; round 10: the 4096 -> 12288 input gradient at T 16384 on sm_100a and at
 # T 16231 / 16384 on sm_103a; round 11: the sm_100a 4096 -> 12288 input gradient at T 16231; round 12: the sm_100a
-# 4096 -> 12288 weight gradient at T 16231, the ragged rule's program in 2-row raster groups) name their T-exact key
-# and its program.
+# 4096 -> 12288 weight gradient at T 16231, the ragged rule's program in 2-row raster groups) name their T-exact key and
+# its program; the sm_103a keys that also walk K serpentine (``kser`` 76: the 12288 -> 4096 forward at T 16384, the
+# 4096 -> 12288 input gradient at T 16231 / 16384) name the ``_ks76`` program, the plan of the 152-SM part they were
+# re-measured on.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -7285,7 +7287,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_ks76_pro7'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
@@ -7312,8 +7314,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8rs'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
@@ -9098,14 +9100,10 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 4096, 12288): (
-        (16231, 16384),
+        (16231,),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_100a", True, 4096, 12288): (
-        (16231, 16384),
-        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
-    ),
-    ("sm_103a", True, 4096, 12288): (
         (16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
     ),
@@ -9172,7 +9170,8 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups;
     round 9: the same form on the sm_103a 17408 -> 5120 forward, and the sm_103a 12288 -> 4096 forward at
     T 16231 / 16384 in 8-column-tile groups; round 10: the same form on the 4096 -> 12288 input gradient
-    at T 16384 on sm_100a and at T 16231 / 16384 on sm_103a in 16-column-tile groups; round 11: the sm_100a keys moved
+    at T 16384 on sm_100a and at T 16231 / 16384 on sm_103a in 16-column-tile groups, the sm_103a keys with ``kser``
+    in test_gb_t_exact_kser_rules_plan_their_programs; round 11: the sm_100a keys moved
     to neighbouring T - the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and 17408 -> 5120 forwards and
     the 5120 -> 17408 input gradient at T 16172, the 4096 -> 12288 input gradient at T 16231; the sm_103a keys moved
     to neighbouring T - the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and 17408 -> 5120 forwards and
@@ -9322,16 +9321,17 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
 
 
 # The GB T-exact serpentine-K rules: (arch, B MN-major, N, K) -> (the T of the exact keys, the program on the 76-pair parts, the
-# program without ``kser``).  Each key names the T 16231 key's program of the row with ``kser`` 76; the wave guard keeps it on
+# program without ``kser``).  Each key names the T 16231 key's program of the row with ``kser`` 76 (at T 16172; at the T of
+# the row's round-9 / round-10 keys the key's own rule gains ``kser`` 76); the wave guard keeps it on
 # the 152-SM parts only (76 CTA pairs), every other part plans the program without it.
 GB_T_EXACT_KSER_ROWS = {
     ("sm_103a", False, 4096, 12288): (
-        (16172,),
+        (16172, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_ks76_pro7",
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", True, 4096, 12288): (
-        (16172,),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7",
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
     ),
@@ -9372,8 +9372,9 @@ def test_kser_instance_key_symbol_and_refusals():
 
 @pytest.mark.parametrize("arch", ["sm_103a"])
 def test_gb_t_exact_kser_rules_plan_their_programs(arch, monkeypatch):
-    """The GB T-exact serpentine-K rules (sm_103a: the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at
-    T 16172) plan their ``_ks76`` program on the 152-SM part and the program without ``kser`` on the 148- and 160-SM parts
+    """The GB T-exact serpentine-K rules (sm_103a: the 12288 -> 4096 forward at T 16172 / 16384 and
+    the 4096 -> 12288 input gradient at T 16172 / 16231 / 16384) plan their ``_ks76`` program on the 152-SM part
+    and the program without ``kser`` on the 148- and 160-SM parts
     (the wave guard); on every part the plan is the plan of the key's rule without ``kser`` but for the program (whole K per
     output tile, the same K partitions, raster group and grid), and T +- 1 plan the row's plan without the key."""
     monkeypatch.setattr(cake_backend, "_DUMMIES", {})

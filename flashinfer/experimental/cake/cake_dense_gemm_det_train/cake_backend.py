@@ -1919,15 +1919,18 @@ ROW_RULES: dict[tuple, dict] = {
     # ---- sm_103a: the GB T-exact rules of round 9 - the 12288 -> 4096 forward at T 16231 / 16384 (the half-tail
     #      program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups,
     #      in place of the ragged rule's overlapped half-tail program in 16-column-tile groups), with the per-tile K
-    #      partitions of the row's plan without them, measured on GB300 against that plan ----
+    #      partitions of the row's plan without them, measured on GB300 against that plan; at T 16384 the key also
+    #      walks K serpentine over blocks of 76 items (``kser`` 76, see the T 16172 keys),
+    #      in 16-column-tile groups at T 16384 ----
     ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
-    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
     # ---- sm_103a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16231 / 16384 (the sm_100a
     #      key's program: the half-tail program with the tall epilogue released by row half and the column-grouped
     #      raster in 16-column-tile groups, in place of the ragged rule's overlapped half-tail program), with the
-    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan ----
-    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
-    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan; at T 16231 / 16384
+    #      the key also walks K serpentine over blocks of 76 items (``kser`` 76, see the T 16172 keys) ----
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
     # ---- sm_103a: the GB T-exact rules of round 11 - measured T-exact rules moved to neighbouring T: the 16384 -> 6144
     #      forward at T 16172 / 16384 (round 8's rule), the 12288 -> 4096 forward at T 16172 (round 9's rule), the
     #      17408 -> 5120 forward at T 16172 (round 9's rule), the 5120 -> 17408 input gradient at T 16172 (round 4's
