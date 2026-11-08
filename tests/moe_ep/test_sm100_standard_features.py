@@ -92,7 +92,9 @@ def test_standard_features(
         num_valid_tokens_tensor=count if mode == "PERSISTENT" else None,
         apply_routing_weights_before_fc2=early,
         enable_in_kernel_fc2_reduce=in_kernel,
-        knobs={"in_kernel_fc2_reduce": True} if in_kernel else knobs,
+        knobs=knobs
+        if knobs is not None
+        else ({"in_kernel_fc2_reduce": True} if in_kernel else None),
     )
     if autotune:
         options["knobs"] = "auto"
@@ -371,3 +373,46 @@ def test_standard_cake_finalizer(mode, monkeypatch):
             assert pkg.output_error(output, indices, expected) < 0.03
     finally:
         layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_4
+@pytest.mark.parametrize(
+    "activation,mode,early,wire,in_kernel",
+    [
+        ("minimax_scale", "DEFAULT", True, "bf16", False),
+        ("minimax", "PERSISTENT", False, "bf16", False),
+        ("minimax", "NONE", True, "bf16", False),
+        ("situ", "DEFAULT", False, "bf16", False),
+        ("situ_unbounded", "PERSISTENT", True, "bf16", False),
+        ("situ_unbounded", "NONE", False, "bf16", False),
+        ("minimax", "DEFAULT", True, "mxfp8", False),
+        ("minimax", "PERSISTENT", False, "mxfp8", False),
+        ("situ_unbounded", "DEFAULT", False, "nvfp4", False),
+        ("situ", "PERSISTENT", True, "nvfp4", False),
+        ("minimax", "DEFAULT", True, "bf16", True),
+    ],
+)
+def test_standard_nvfp4_n64_features(
+    activation, mode, early, wire, in_kernel, monkeypatch
+):
+    test_standard_features(
+        "nvfp4",
+        activation,
+        mode,
+        early,
+        wire,
+        in_kernel,
+        monkeypatch,
+        knobs={
+            "mma_tiler_mnk": (256, 64, 128),
+            "cluster_shape_mn": (2, 1),
+            "schedule_policy": ("grouped", None),
+            "work_id_mode": "grid_stride",
+            "fc2_use_bulk": False,
+            "token_in_flag_batch": 1,
+            "epi_flag_batches": (1, 4),
+            "token_back_mode": "epi_warps",
+            "reduce_topk_in_kernel": in_kernel,
+        },
+    )

@@ -106,3 +106,17 @@ def test_native_custom_finalizer_rejects_in_kernel_reduction():
             enable_in_kernel_fc2_reduce=True,
             finalize_mode=moe_ep.FinalizeMode.NONE,
         )
+
+
+@pytest.mark.parametrize("capacity", [32, 1024, 8192])
+def test_native_nvfp4_n64_profile(capacity):
+    cfg = make_config(
+        capacity,
+        knobs={
+            "mma_tiler_mnk": (256, 64, 128),
+            "fc2_use_bulk": True,
+            "fc2_tma_stages": 1,
+        },
+    )
+    assert cfg.resolved_mma_tiler_mnk == (256, 64, 128)
+    assert cfg.token_padding_block == 64
