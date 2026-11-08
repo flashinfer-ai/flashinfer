@@ -3351,7 +3351,12 @@ def _m_share_planned(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bo
     the backward's summaries), the device's architecture is one of :data:`M_SHARE_ARCHS` with the stitch composing the
     end adjoints and the M-share stages delivered, and :func:`cake_plan.m_share` takes it on the device."""
     split, split1, segs = meta.fwd_split, meta.bwd_split, meta.bwd_segments
-    if split is None or split1 is None or not split1.num_summary or meta.seq_lens is None:
+    if (
+        split is None
+        or split1 is None
+        or not split1.num_summary
+        or meta.seq_lens is None
+    ):
         return False
     if (
         split.length != segs.segment_len
@@ -3483,7 +3488,9 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     # (``"m_share"``): the backward's first wave reads the middle pieces' M halves the summary stores in it
     m_share = tape and meta.m_share
     seg_state = (
-        torch.empty((split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), dtype=f32, device=device)
+        torch.empty(
+            (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), dtype=f32, device=device
+        )
         if m_share
         else workspaces.take(
             table,
@@ -4129,12 +4136,22 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     hv = num_v_heads
     chain = _adjoint_chain_stage(cake_backend.device_arch(index))
     # M-share composes with the stitch only (piece_chain reads M as gm stores it)
-    shared = m_share is not None and split1.num_summary > 0 and split1.gonly is not None and chain == "stitch"
+    shared = (
+        m_share is not None
+        and split1.num_summary > 0
+        and split1.gonly is not None
+        and chain == "stitch"
+    )
     seg_state = (
         m_share
         if shared
-        else workspaces.take(table, "b_seg_state", (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), torch.float32,
-                             device)  # fmt: skip
+        else workspaces.take(
+            table,
+            "b_seg_state",
+            (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM),
+            torch.float32,
+            device,
+        )  # fmt: skip
     )
     store0 = 1 if has_initial_state else 0
     common = (meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
@@ -4148,12 +4165,21 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
         bound(stage, entries, count, dht, use_final, store_initial)()
 
     if shared and M_SHARE_ONE_LAUNCH:
-        walk("dhu_tc2_dvl32_modes", split1.pass1, split1.num_walk + split1.num_summary, dht32, use_dht, store0)
+        walk(
+            "dhu_tc2_dvl32_modes",
+            split1.pass1,
+            split1.num_walk + split1.num_summary,
+            dht32,
+            use_dht,
+            store0,
+        )
     elif split1.num_summary:
         summaries = (
             bound("dhu_tc2_dvl32_modes", split1.gonly, split1.num_summary, dht32, 0, 0)
             if shared
-            else bound("dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0)
+            else bound(
+                "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
+            )
         )
         walks = bound(
             "dhu_tc2_dvl32_modes", split1.walk, split1.num_walk, dht32, use_dht, store0
@@ -4935,7 +4961,19 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
 def _general_backward(ctx, saved, do, dht, grad_qkv):
     """The backward chain over the saved tape (:func:`_backward_chain`); records the plan of the forward's key when
     the forward made one (a call without a final-state gradient)."""
-    qn, kn, rstd_q, rstd_k, v_flat, g_cs, beta32, A, saved_state, *state_tensors, m_share = saved
+    (
+        qn,
+        kn,
+        rstd_q,
+        rstd_k,
+        v_flat,
+        g_cs,
+        beta32,
+        A,
+        saved_state,
+        *state_tensors,
+        m_share,
+    ) = saved
     g_shape, beta_shape = ctx.grad_shapes
     tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
             "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
