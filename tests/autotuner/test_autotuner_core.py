@@ -547,12 +547,21 @@ def test_choose_one_retunes_when_runner_candidates_expand(
     monkeypatch, explicit_cuda_graph
 ):
     class OtherRunner(DummyRunner):
-        pass
+        def __init__(self, tactic, layout):
+            super().__init__((tactic,))
+            self.layout = layout
+
+        def __hash__(self):
+            return 0
+
+        def get_cache_key_extras(self, inputs):
+            return (self.layout,)
 
     tuner = AutoTuner()
     monkeypatch.setattr(AutoTuner, "_instance", tuner)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    first, second, third = DummyRunner((0,)), OtherRunner((1,)), OtherRunner((2,))
+    first = DummyRunner((0,))
+    second, third = OtherRunner(1, "a"), OtherRunner(2, "b")
     inputs = [torch.empty(4, 8)]
     config = TuningConfig()
     calls = []
@@ -602,7 +611,7 @@ def test_choose_one_retunes_when_runner_candidates_expand(
     calls.clear()
 
     with autotune():
-        # Cache-key extras distinguish candidates of the same runner class.
+        # Only cache-key extras distinguish the two OtherRunner candidates.
         assert tuner.choose_one("expand", [first, second, third], config, inputs) == (
             second,
             1,
@@ -616,6 +625,44 @@ def test_choose_one_retunes_when_runner_candidates_expand(
         assert calls == []
         assert tuner.choose_one("expand", [first, third], config, inputs) == (third, 2)
         assert calls == [first, third]
+
+
+@pytest.mark.parametrize("buckets", [(4,), (4, 8)])
+def test_choose_one_reuses_coverage_after_runner_preparation(monkeypatch, buckets):
+    class PreparingRunner(DummyRunner):
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            self.prepared = True
+            return True
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, second = DummyRunner((0,)), PreparingRunner((1,))
+    runners = [first, second]
+    inputs = [torch.empty(buckets[-1], 8)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        )
+    )
+    calls = []
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        calls.append(tactic)
+        return 1.0 + tactic
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with autotune():
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == [0, 1] * len(buckets)
+        calls.clear()
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == []
 
 
 @pytest.mark.parametrize("failure", ["empty", "profiling"])

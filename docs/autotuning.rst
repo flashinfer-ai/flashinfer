@@ -97,9 +97,9 @@ whose top bucket the operation's own bucket mapper never produces.  Lookups
 below or between tuned buckets still use the fallback, and replay coverage
 reports still count such a lookup as a miss.
 
-Notably, user-loaded file configs (level 2) are
-**always consulted, even during tuning mode**, so that already-tuned shapes
-from a cache file are never re-profiled.
+User-loaded file configs (level 2) are also consulted during tuning. A
+multi-runner tune can re-profile a loaded winner whose recorded coverage omits
+a current candidate. See `Cache Hit Behavior During Tuning`_.
 
 Config Caching
 --------------
@@ -297,9 +297,9 @@ stable across FlashInfer, CUDA, cuDNN, or cuBLAS versions.
 Auditing Tuned Configs
 ^^^^^^^^^^^^^^^^^^^^^^
 
-A cache file decides performance: the first process that tunes an entry picks the
-tactic that later processes loading the file use without re-measuring it, unless
-they tune under a different measurement policy.
+A cache file preserves the tactic chosen by the process that tunes an entry.
+Later tuning can measure again when the measurement policy differs or the
+recorded comparison lacks coverage for a current runner.
 Tuning again into a fresh file is a new measurement, not a check; when several
 tactics measure within timing noise of each other, separate runs can pick
 different ones.
@@ -323,8 +323,10 @@ candidate's, and ``candidates`` the number of tactics that measured successfully
 ``margin`` is ``runner_up_ms / time_ms - 1``; one within the run-to-run noise of the
 measurement, like the 0.08% above, marks a near-tie that another tuning run may
 resolve differently. ``runner_up_ms`` and ``margin`` are ``null`` when only one
-tactic measured. Lookups never read the record, and entries without it load as
-before.
+tactic measured. These timing fields are for auditing. Multi-runner tuning
+checks the optional ``candidate_keys`` field, which records the compared
+runners. Entries without that field can still serve inference and compatible
+single-runner tuning.
 
 To make near-tied picks more consistent across processes, set a tie tolerance:
 ``autotune(True, tie_tolerance=0.005)`` treats tactics measured within 0.5% of the

@@ -839,6 +839,15 @@ class DummyRunnerB(DummyRunner):
     pass
 
 
+class DummyRunnerWithExtras(DummyRunner):
+    def __init__(self, extras, valid_tactics=(0, 1, 2)):
+        super().__init__(valid_tactics)
+        self._extras = extras
+
+    def get_cache_key_extras(self, inputs):
+        return self._extras
+
+
 @pytest.mark.parametrize("storage", ["legacy", "managed"])
 def test_persisted_winner_requires_candidate_coverage_for_tuning(
     cache_root, monkeypatch, storage
@@ -849,9 +858,11 @@ def test_persisted_winner_requires_candidate_coverage_for_tuning(
         lambda: {"gpu": "test GPU"},
     )
     path = cache_root / "legacy.json"
-    first, second = DummyRunner((0,)), DummyRunnerB((1,))
+    first = DummyRunnerWithExtras(("layout_a",), (0,))
+    second = DummyRunnerWithExtras(("layout_b",), (1,))
+    third = DummyRunnerWithExtras(("layout_c",), (2,))
     inputs = [torch.zeros(8, 16)]
-    calls = _install_fake_profile(monkeypatch, {-1: 3.0, 0: 2.0, 1: 1.0})
+    calls = _install_fake_profile(monkeypatch, {-1: 3.0, 0: 2.0, 1: 1.0, 2: 0.5})
 
     def context(tune_mode):
         if storage == "legacy":
@@ -897,6 +908,12 @@ def test_persisted_winner_requires_candidate_coverage_for_tuning(
     with context(False):
         assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
     assert calls == []
+    with context(True):
+        assert tuner.choose_one(_OP, [first, second, third], _CONFIG, inputs) == (
+            third,
+            2,
+        )
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1, 2]
 
 
 def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
@@ -919,15 +936,6 @@ def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
         )
     assert isinstance(runner, DummyRunnerB) and tactic == 1
     assert calls == []
-
-
-class DummyRunnerWithExtras(DummyRunner):
-    def __init__(self, extras, valid_tactics=(0, 1, 2)):
-        super().__init__(valid_tactics)
-        self._extras = extras
-
-    def get_cache_key_extras(self, inputs):
-        return self._extras
 
 
 def test_extras_distinguish_entries(cache_root, monkeypatch):

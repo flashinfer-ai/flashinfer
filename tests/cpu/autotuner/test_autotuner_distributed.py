@@ -736,6 +736,66 @@ finally:
 """
 
 
+_FINAL_SELECTION_WORKER_SRC = r"""
+import datetime, os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+
+rank = int(os.environ["RANK"])
+case = os.environ["CACHE_CASE"]
+complete = case == "final_cached_disagreement"
+agreed = case == "final_incomplete_agreement"
+root = Path(os.environ["CASE_ROOT"])
+
+class RunnerA(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        return [0]
+    def forward(self, inputs, tactic=-1):
+        return inputs[0]
+
+class RunnerB(RunnerA):
+    def validate_tactic_for_profile(self, inputs, tactic, profile):
+        return True
+    def validate_tactic(self, inputs, tactic):
+        return agreed or rank == 0
+
+profiled = []
+
+def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+    profiled.append(runner)
+    if isinstance(runner, RunnerB):
+        elapsed = torch.tensor(1.0)
+    else:
+        elapsed = torch.tensor(2.0 if complete else float("inf"))
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()
+
+AutoTuner._profile_single_kernel = profile
+torch.cuda.is_current_stream_capturing = lambda: False
+dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+                        rank=rank, world_size=int(os.environ["WORLD_SIZE"]),
+                        timeout=datetime.timedelta(seconds=30))
+try:
+    set_autotune_process_group(dist.group.WORLD)
+    tuner = AutoTuner.get()
+    runners = [RunnerA(), RunnerB()]
+    inputs = [torch.zeros(8, 8)]
+    expected = (runners[1], 0) if agreed else (runners[0], -1)
+    with autotune(True):
+        for repeat in (False, True):
+            profiled.clear()
+            chosen, tactic = tuner.choose_one("test::final_selection", runners, TuningConfig(), inputs)
+            assert (chosen, tactic) == expected, (rank, case, type(chosen).__name__, tactic)
+            assert profiled == ([] if repeat and complete else runners)
+    print("cache agreement OK", rank, case, flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "case",
@@ -752,6 +812,9 @@ finally:
         "partial_managed",
         "concurrent_publish",
         "failed_profile",
+        "final_incomplete_disagreement",
+        "final_incomplete_agreement",
+        "final_cached_disagreement",
         "rejected_legacy",
         "rejected_shortlist_v1",
         "rejected_shortlist_managed",
@@ -760,6 +823,12 @@ finally:
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
     """Group lookups converge despite partial, racing, or divergent caches."""
+    if case.startswith("final_"):
+        worker_src = _FINAL_SELECTION_WORKER_SRC
+    elif case.startswith("rejected_"):
+        worker_src = _REJECTED_CACHE_WORKER_SRC
+    else:
+        worker_src = _CACHE_HIT_WORKER_SRC
     processes = []
     deadline = time.monotonic() + 120
     try:
@@ -774,13 +843,7 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
             )
             processes.append(
                 subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        _REJECTED_CACHE_WORKER_SRC
-                        if case.startswith("rejected_")
-                        else _CACHE_HIT_WORKER_SRC,
-                    ],
+                    [sys.executable, "-c", worker_src],
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

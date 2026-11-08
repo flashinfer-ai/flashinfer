@@ -1250,7 +1250,9 @@ def set_autotune_process_group(
     skip decisions, profile count, measurement policy and ordered candidates.
     Rank-local shapes and cache roots may differ. A mismatch raises on every
     participating rank before tactic measurement. Cached selections must agree;
-    any miss or disagreement makes every rank re-profile.
+    any miss or disagreement makes every rank re-profile. In multi-runner
+    tuning, disagreement on the final selection makes every rank use the
+    fallback.
 
     Input/candidate/runner preparation OOMs keep coordinated fallback. Other
     caught Python preparation errors raise across the group. Matching nested
@@ -1370,8 +1372,10 @@ def _sync_oom_across_tune_group(
     return False
 
 
-def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
-    """Reuse cached results only when every rank has the same selection."""
+def _all_ranks_hit_cache(
+    local_hit: bool, selection: Any = None, *, phase="cache"
+) -> bool:
+    """Require the same usable selection on every rank."""
     if _tune_process_group is None:
         return local_hit
     if local_hit:
@@ -1381,7 +1385,7 @@ def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
         except Exception:
             local_hit = False
     status, agreed = _tuning_group_agreement(
-        "cache", selection if local_hit else None, int(not local_hit)
+        phase, selection if local_hit else None, int(not local_hit)
     )
     return not status and agreed
 
@@ -3220,13 +3224,10 @@ class AutoTuner:
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
-            # Pre-compute runner arg names to avoid calling inspect.signature in the loop
-            runner_arg_names_map = {}
-            for r in runners:
-                runner_arg_names_map[r] = {
-                    param.name
-                    for param in inspect.signature(r.forward).parameters.values()
-                }
+            # Preparation can change a runner's hash, so keep parameters in runner order.
+            runner_parameters = [
+                inspect.signature(r.forward).parameters for r in runners
+            ]
 
             # Default-candidate coverage (autotune_v2 contexts): the default
             # path (runners[0], tactic=-1) always races as a candidate, so a
@@ -3238,7 +3239,7 @@ class AutoTuner:
             # Scoped to v2 so plain autotune() selection is byte-identical.
             race_default = self._in_v2_context
 
-            incomplete_winner: tuple[TunableRunner, Any] | None = None
+            incomplete_winner: tuple[int, Any] | None = None
             pbar = None
             for _step, p in enumerate(profiles):
                 tensors = None
@@ -3409,9 +3410,8 @@ class AutoTuner:
                                 return runners[0], -1
 
                             try:
-                                runner_arg_names = runner_arg_names_map[r]
                                 if (
-                                    "do_preparation" in runner_arg_names
+                                    "do_preparation" in runner_parameters[r_id]
                                     and valid_tactics
                                 ):
                                     handled = r.precompile_tactics(
@@ -3548,6 +3548,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
+                            # Publish and look up coverage using the prepared runners.
+                            profiling_candidates = _ProfilingCandidates.from_runners(
+                                runners, inputs
+                            )
                             cache_key = self._get_cache_key(
                                 custom_op,
                                 runners[runner_id],
@@ -3568,7 +3572,7 @@ class AutoTuner:
                                     tuning_config,
                                     runner.get_cache_key_extras(inputs),
                                 ):
-                                    incomplete_winner = (runner, tactic)
+                                    incomplete_winner = (runner_id, tactic)
                                 pbar.update(1)
                                 continue
                             if _tune_process_group is None:
@@ -3614,7 +3618,7 @@ class AutoTuner:
 
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
-            is_cache_hit, runner_id, tactic, _ = self.search_cache(
+            has_selection, runner_id, tactic, _ = self.search_cache(
                 custom_op,
                 runners,
                 input_shapes,
@@ -3624,12 +3628,24 @@ class AutoTuner:
                 profiling_candidates=profiling_candidates,
             )
 
-            if not is_cache_hit and incomplete_winner is not None:
-                runner, measured_tactic = incomplete_winner
+            if not has_selection and incomplete_winner is not None:
+                measured_runner_id, measured_tactic = incomplete_winner
                 if self._tactic_still_valid(
-                    runner, inputs, measured_tactic, custom_op, "profiling"
+                    runners[measured_runner_id],
+                    inputs,
+                    measured_tactic,
+                    custom_op,
+                    "profiling",
                 ):
-                    return incomplete_winner
+                    has_selection = True
+                    runner_id, tactic = incomplete_winner
+            if profiling_candidates is not None and _tune_process_group is not None:
+                # Rank-local inputs can reject a winner after profile agreement.
+                selection = (runner_id, type(runners[runner_id]).__name__, tactic)
+                if not _all_ranks_hit_cache(
+                    has_selection, selection, phase=("final_selection", custom_op)
+                ):
+                    return runners[0], -1
             return runners[runner_id], tactic
 
     def _discard_profile_cache(
