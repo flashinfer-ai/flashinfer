@@ -525,8 +525,10 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
     sm_107a at 4 and 8 groups, and the 3 / 3 head / tail wide tile on sm_103a at 4, 8
     and 16 groups, else the plain wide tile; the down projection (``K`` 2048) takes
     the plain wide tile.
-    The weight gradient's 512-wide k tile starts at 4096 rows per group (32 groups) on
-    every architecture."""
+    The weight gradient's 512-wide k tile starts at the architecture's
+    ``k512_min_rows_per_group`` (3072 rows per group on sm_100a and sm_103a, 4096 on
+    sm_107a): at 32 groups on every architecture, and at the measured E32 row of
+    112576 rows (3518 per group) on sm_100a and sm_103a only."""
     c = HOST_PLAN_CONSTANTS
     name = cake_jit.record_name("dgrad")
     for groups in EXPERT_GROUPS:
@@ -545,10 +547,13 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
                 "main_wide_ef" if ef else "main_wide_ts33" if ts33 else "main_wide"
             )
             assert stage == expected, (arch, groups, k)
-        k512 = EXPERT_ROWS // groups >= 4096
+        k512 = EXPERT_ROWS // groups >= c["k512_min_rows_per_group"][arch]
         for k in (2048, 6144):
             tile_k = cb.select_wgrad_tile(k, arch, EXPERT_ROWS, groups, c)
             assert tile_k == (512 if k512 else 256), (arch, groups, k)
+    for k in (2048, 6144):
+        tile_k = cb.select_wgrad_tile(k, arch, 112576, 32, c)
+        assert tile_k == (256 if arch == "sm_107a" else 512), (arch, k)
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
