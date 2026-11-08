@@ -6726,7 +6726,7 @@ def test_memory_plan_forms():
         geometry=g,
         recompute=False,
     )
-    assert mp.form in ("fused", "unfused") and not mp.fits and not mp.recompute
+    assert mp.form in ("fused", "fused_ip", "unfused") and not mp.fits and not mp.recompute
     for bad in (
         dict(rows=0),
         dict(rows=17000),
@@ -6745,6 +6745,78 @@ def test_memory_plan_forms():
             opt_in.memory_plan("loss", **args)
     with pytest.raises(ValueError, match="entry"):
         opt_in.memory_plan("other", **small)
+
+
+def test_memory_plan_fused_ip():
+    """The budget form ``"fused_ip"`` (:attr:`Plan.dw_split`).  The split row ``a`` is a granule multiple whose lower
+    accumulator's ``4 a H`` bytes hold the BF16 ``[V, H]`` ``dW``, and the in-place pieces tile ``[0, a)`` in granule
+    multiples with ``m1 <= 2 * m0`` after the first piece.  The loss entry's multi-chunk calls with the fused cast get
+    it after the fused form and before the unfused one: the issue's four-chunk call with 5 % of the labels ignored
+    (H 6144) and the H 4096 call with a third ignored, where the fused form does not fit -- with or without the
+    recompute arm -- while the H 6144 call with a third ignored keeps the partial form.  Its prediction is the fused
+    form's phases with the two accumulators and, in the ``dW`` phase, the first piece's temporary in place of the
+    ``[V, H]`` output.  The log-probability entry, a one-chunk call and ``fuse_dw_cast=False`` never get it."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    step = opt_in.dw_block_step(g)
+    for V in (154880, 151936, 248320, 4 * step, 5 * step):
+        a = opt_in.dw_split_rows(V, g)
+        assert a % step == 0 and V <= 2 * a < V + 2 * step, (V, a)
+        pieces = opt_in._dw_split_pieces(a, step)
+        assert pieces[0][0] == 0 and pieces[-1][1] == a, (V, pieces)
+        assert all(m0 % step == 0 and m0 < m1 for m0, m1 in pieces), (V, pieces)
+        assert all(p[1] == q[0] for p, q in zip(pieces, pieces[1:])), (V, pieces)
+        assert all(m1 <= 2 * m0 for m0, m1 in pieces[1:]), (V, pieces)
+        assert pieces[0][1] <= max(step, -(-a // (16 * step)) * step), (V, pieces)
+    blocks = opt_in._allocated_bytes
+    tile = int(g.stats_tile)
+    V, C = 154880, 4096
+    for H, T, R, form in (
+        (6144, 16384, 15565, "fused_ip"),
+        (4096, 16384, 10977, "fused_ip"),
+        (6144, 16384, 10977, "partial"),
+    ):
+        args = dict(num_rows=T, rows=R, hidden=H, vocab=V, chunk=C, geometry=g)
+        mp = opt_in.memory_plan("loss", **args)
+        assert mp.form == form and mp.fits, (H, R, mp)
+        if form != "fused_ip":
+            continue
+        assert mp.dw_rows == V and mp.block_rows is None and not mp.recompute, mp
+        assert opt_in.memory_plan("loss", recompute=False, **args) == mp
+        assert opt_in.memory_plan("logprob", **args).form != "fused_ip"
+        assert opt_in.memory_plan("loss", fuse_dw_cast=False, **args).form != "fused_ip"
+        # the phases (``buffer_rows`` = a chunk, compacted, the fused dX finalize, no K-slice slabs)
+        a = opt_in.dw_split_rows(V, g)
+        p0 = opt_in._dw_split_pieces(a, step)[0][1]
+        r_last = R - (-(-R // C) - 1) * C
+        dxacc, dx_out = blocks(4 * R * H), blocks(2 * T * H)
+        acc = blocks(4 * a * H) + blocks(4 * (V - a) * H)
+        logits = blocks(2 * C * V)
+        bufs = logits + blocks(8 * C * -(-V // tile)) + blocks(2 * C * H)
+        rowvec = blocks(4 * T, 4) + blocks(4 * R, 8)
+        held = dxacc + acc + logits + rowvec
+        phases = (
+            dxacc + acc + bufs + rowvec,
+            held + dx_out + blocks(4 * T),
+            dx_out + acc + logits + blocks(2 * r_last * H) + blocks(2 * p0 * H) + rowvec,
+        )
+        assert mp.predicted_bytes == max(phases), (H, R, mp, phases)
+        unfused = opt_in.memory_plan("loss", recompute=False, fuse_dw_cast=False, **args)
+        assert unfused.form == "unfused" and unfused.fits, unfused
+        # the fused form's dW phase (the [V, H] output beside one accumulator) is what does not fit
+        last_fused = (
+            dx_out
+            + blocks(4 * V * H)
+            + logits
+            + blocks(2 * r_last * H)
+            + blocks(2 * V * H)
+            + rowvec
+        )
+        assert last_fused > mp.budget_bytes, (H, R, last_fused, mp)
+    # one chunk: no accumulator to split
+    one = opt_in.memory_plan(
+        "loss", num_rows=4096, rows=3891, hidden=6144, vocab=V, chunk=C, geometry=g
+    )
+    assert one.form != "fused_ip", one
 
 
 def test_memory_plan_counts_the_x_copy():
@@ -9171,7 +9243,8 @@ def _force_budget_plan(monkeypatch, form, calls: list) -> None:
 
 @pytest.mark.parametrize("objective", ["ce", "policy"])
 def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
-    """Every ``memory_mode="budget"`` form of the loss entry -- fused, unfused, an accumulate of the leading vocabulary
+    """Every ``memory_mode="budget"`` form of the loss entry -- fused, the fused cast into the split accumulator's
+    storage (``"fused_ip"``; a one-chunk call runs the fused form), unfused, an accumulate of the leading vocabulary
     rows with the others recomputed in vocabulary blocks (several blocks with a short last one; one granule), a
     recompute of every row (three blocks; one block) -- gives the bits (integer views) of the fast form: one chunk,
     two chunks, three compacted chunks (the dW side stream), three uncompacted chunks and the
@@ -9197,7 +9270,7 @@ def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
             backend="cake",
             **(dict(kw, memory_mode="fast") if "num_valid_rows" in kw else kw),
         )
-        for form in _budget_forms(step):
+        for form in _budget_forms(step) + (("fused_ip", DEFAULT_V, None),):
             calls: list = []
             _force_budget_plan(monkeypatch, form, calls)
             _poison_allocator()
@@ -9205,6 +9278,108 @@ def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
             assert calls == ["loss"], (T, C, kw, form)
             _assert_same_bits(fast, budget)
         monkeypatch.undo()
+
+
+@pytest.mark.parametrize(
+    "H, T, ignore, objective",
+    [
+        (4096, 16384, 0.33, "ce"),
+        (4096, 16384, 0.33, "policy"),
+        (6144, 16384, 0.05, "ce"),
+    ],
+)
+def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective):
+    """The budget form ``"fused_ip"`` at the default call's shapes it serves (H 4096 with a third of the labels
+    ignored; H 6144 with 5 % ignored, four chunks): the default step picks it and its outputs are bitwise the fast
+    step's; its backward casts ``dW`` into the lower accumulator's storage, which autograd takes as ``W.grad`` without
+    a copy (``4 a H`` bytes); the step's peak -- of the call that binds and of one from the remembered binding -- stays
+    within the planned budget (``0.98 B``) and below the fast step's.  A non-reentrant checkpointed step gives the
+    same bits; a retained graph casts out of place (the accumulators read, never written) and the following backward
+    in place, both to the fast bits; a :class:`ForwardResult` casts out of place, repeatably."""
+    _require_program(entry="loss")
+    V = DEFAULT_V
+    inp = make_inputs(
+        T,
+        objective=objective,
+        seed=SEED + 9200 + H,
+        H=H,
+        V=V,
+        device=CUDA,
+        ignore_frac=ignore,
+    )
+    module_name, record = cake_backend.record_for(CUDA)
+    a = opt_in.dw_split_rows(V, Geometry.from_record(record))
+    fast, fast_peak, _ = _budget_step(inp, 4096, "loss", memory_mode="fast")
+    casts: list = []
+    split_cast = opt_in._dw_cast_split
+
+    def spy(*args, **kw):
+        casts.append(bool(kw["in_place"]))
+        return split_cast(*args, **kw)
+
+    monkeypatch.setattr(opt_in, "_dw_cast_split", spy)
+    peaks = []
+    for _ in range(2):  # the first call also binds; the second launches from the remembered binding
+        result, peak, mplan = _budget_step(inp, 4096, "loss")
+        assert mplan is not None and mplan.form == "fused_ip" and mplan.fits, mplan
+        _assert_same_bits(fast, result)
+        assert result["dW"].untyped_storage().nbytes() == 4 * a * H, (
+            result["dW"].untyped_storage().nbytes(),
+            a,
+        )
+        peaks.append(peak)
+        del result
+    assert casts == [True, True], casts
+    assert max(peaks) <= mplan.budget_bytes < fast_peak, (peaks, mplan, fast_peak)
+
+    def step_through(fn):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        loss, logp = fn(X, W)
+        return loss, logp, X, W
+
+    kw = dict(
+        objective=objective,
+        loss_div=inp.loss_div if objective == "ce" else None,
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=4096,
+        return_logp=True,
+        backend="cake",
+    )
+
+    def call(X, W):
+        return opt_in.cake_lm_head_det_train_loss(X, W, inp.labels, **kw)
+
+    # a non-reentrant checkpoint: the recomputation's form and the in-place cast
+    casts.clear()
+    loss, logp, X, W = step_through(
+        lambda X, W: torch.utils.checkpoint.checkpoint(call, X, W, use_reentrant=False)
+    )
+    loss.backward()
+    _assert_same_bits(
+        fast, dict(loss=loss.detach(), logp=logp.detach(), dX=X.grad, dW=W.grad)
+    )
+    assert casts == [True], casts
+    # a retained graph: out of place, then in place
+    casts.clear()
+    loss, logp, X, W = step_through(call)
+    kept = torch.autograd.grad(loss, (X, W), retain_graph=True)
+    freed = torch.autograd.grad(loss, (X, W))
+    assert casts == [False, True], casts
+    for dX, dW in (kept, freed):
+        _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
+    del kept, freed, loss, logp
+    # the eager forward's result: out of place, repeatable
+    casts.clear()
+    res = opt_in.forward_loss(
+        inp.X, inp.W, inp.labels, need_dx=True, need_dw=True, memory_mode="auto", **kw
+    )
+    assert res.memory_plan is not None and res.memory_plan.form == "fused_ip"
+    for _ in range(2):
+        dX, dW = res.backward()
+        _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
+    assert casts == [False, False], casts
 
 
 def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):

@@ -403,6 +403,17 @@ keyword.
   weight-gradient form whose predicted peak stays within `B` less a 2 % margin
   (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
   `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
+  `"fused_ip"` (loss entry, two or more chunks: the fast form's kernels with
+  the FP32 accumulator split at the vocabulary row `a =
+  cake_backend_opt_in.dw_split_rows(V)`, half the vocabulary rounded up to
+  the weight-gradient block, so each chunk runs the accumulate GEMM on rows
+  `[0, a)` and `[a, V)`; a backward that frees the graph casts `dW` in place:
+  the deferred last chunk's fused scale + cast GEMM writes the BF16 rows of
+  `[0, a)` into the first part's own storage, in pieces that each start at
+  most twice as far in as the previous one ends (the first one, `a / 16`
+  rows rounded up to the block, through a temporary), then the rows `[a,
+  V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
+  that keeps the graph, and `ForwardResult.backward`, cast out of place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
   `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
   only) or `"recompute"` (none).  The last two recompute the other rows of
