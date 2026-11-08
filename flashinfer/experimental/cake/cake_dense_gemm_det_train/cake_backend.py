@@ -1547,7 +1547,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, False, False, False, 5120, None, 1024): {"block_n": 224, "cta_rows": 128, "hints": ('none', 'evict_first'), "cgrp": True, "pro": 15},
     # ---- sm_107a: the 212-SM tranche - ragged rules measured on R200 (212 SMs) at T 16172 - 16384 against the plan the
     #      row had without them, both in the cold-L2 frame and under sustained back-to-back load; the half-tail and
-    #      column-grouped forward / input-gradient rows keep every output bitwise equal to that plan's ----
+    #      column-grouped forward / input-gradient rows keep every output bitwise equal to that plan's; eight of the keys
+    #      apply from a token floor on (``ROW_RULE_MIN_T``) ----
     # the 12288 -> 4096 input gradient: the half-tail program with the column-grouped raster (faster)
     ('sm_107a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
     # the 4096 -> 12288 input gradient: the half-tail program with the column-grouped raster (at least as fast)
@@ -1563,8 +1564,6 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 2048, 6144, None): {"cgrp": True, "htail": True, "pro": 15},
     # the 4096 -> 12288 forward: the half-tail program with the column-grouped raster (at least as fast)
     ('sm_107a', False, False, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
-    # the 5120 -> 5120 forward: the column-grouped raster in 12-column-tile groups (at least as fast)
-    ('sm_107a', False, False, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     # the 12288 -> 4096 weight gradient (direct orientation): the tail tiles split into 3 K parts (faster)
     ('sm_107a', True, True, False, False, False, 12288, None, 4096): {"sk_parts": 3, "pro": 15},
     # the 4096 -> 12288 weight gradient (direct orientation): the tail tiles split into 3 K parts, 16-row raster
@@ -1944,6 +1943,41 @@ ARCH_RULE_DEFAULTS: dict[str, dict] = {
 # always wins (either weight-gradient orientation); sm_100a and sm_107a inherit nothing.
 RULE_PARENT: dict[str, str] = {"sm_103a": "sm_100a"}
 
+# FlashInfer-only token tiers of ragged ``ROW_RULES`` keys of the sm_107a 212-SM tranche (measured at T 16172 - 16384):
+# ``key -> ((bound, rule), ...)`` in ascending ``bound``.  At a token count T (``M`` of a forward / input-gradient key,
+# ``K`` of a weight-gradient key) below a tier's ``bound``, the first such tier's ``rule`` plans the row in place of the
+# key's; the last ``bound`` is the key's floor, from which on the key's own rule applies.  A tier rule is the rule
+# FlashInfer main planned the row with (``{}``: none); the fp32 5120 -> 5120 weight gradient plans with no rule up to
+# T 257.  The counts are the R200 A/B of every plan the tranche changed against FlashInfer main (212 SMs, CUPTI cold
+# L2, 2026-11-08).  An exact (N, K, M) key has no tiers.
+# fmt: off
+ROW_RULE_MIN_T: dict[tuple, tuple[tuple[int, dict], ...]] = {
+    # q_b 2048 x 16384 input gradient: slower at 11, flat at 3, faster at 1 of the 15 measured T 1 - 1025; faster at
+    # 12, flat at 3 of the 15 from 2048 on
+    ('sm_107a', False, True, False, False, False, 2048, 16384, None): ((2048, {"cgrp": True, "group_m": 8}),),
+    # 5120 -> 5120 input gradient: slower at the 10 measured T 1 - 257; faster at 15, flat at 6 of the 21 from 959 on
+    ('sm_107a', False, True, False, False, False, 5120, 5120, None): ((959, {}),),
+    # 5120 -> 5120 fp32 weight gradient: faster at the 10 measured T 1 - 257 with no rule (the plan the rule's
+    # registry fallback ran there); slower at 10, flat at 1 of the 11 measured T 959 - 8192; faster at the 10 from
+    # 16129 on
+    ('sm_107a', True, True, True, False, False, 5120, None, 5120): ((258, {}), (16129, {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ('none', 'none'), "epi": 'reg', "b_swz": 128, "pd": 0, "pf": 0})),
+    # 12288 -> 4096 weight gradient: slower at 5, flat at 16 of the 21 measured T 1 - 8192; faster at the 10 from
+    # 16129 on
+    ('sm_107a', True, True, False, False, False, 12288, None, 4096): ((16129, {}),),
+    # 4096 -> 12288 weight gradient: slower at 5, flat at 14, faster at 2 of the 21 measured T 1 - 8192; faster at the
+    # 10 from 16129 on
+    ('sm_107a', True, True, False, False, False, 4096, None, 12288): ((16129, {}),),
+    # 12288 -> 4096 input gradient: slower at T 2 and 7, faster at T 1; faster at 26, flat at 2 of the 28 measured T
+    # from 33 on
+    ('sm_107a', False, True, False, False, False, 12288, 4096, None): ((33, {}),),
+    # 4096 -> 12288 forward: slower at T 2 and 7, faster at T 1; faster at 25, flat at 3 of the 28 measured T from 33 on
+    ('sm_107a', False, False, False, False, False, 12288, 4096, None): ((33, {}),),
+    # 5120 -> 5120 weight gradient: slower at 2, flat at 18, faster at 1 of the 21 measured T 1 - 8192; faster at the
+    # 10 from 16129 on
+    ('sm_107a', True, True, False, False, False, 5120, None, 5120): ((16129, {}),),
+}
+# fmt: on
+
 
 def _measured_row_rule(
     arch: str,
@@ -1960,7 +1994,8 @@ def _measured_row_rule(
     ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else the parent architecture's entry
     (``RULE_PARENT``: sm_103a reads the sm_100a table for the rows its lanes did not measure), else empty (the lookup
     of Cake ``row_rule``; FlashInfer-only split so the registry fallback can drop the MEASURED rule alone, see
-    ``cake_dense_gemm_det_train_projection_plan``)."""
+    ``cake_dense_gemm_det_train_projection_plan``).  A ragged key with token tiers (``ROW_RULE_MIN_T``) yields the
+    first tier whose bound exceeds the token count (``M`` of a ragged-M key, ``K`` of a ragged-K key)."""
     ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
     for tail in (
         (int(N), int(K), int(M)),
@@ -1969,6 +2004,10 @@ def _measured_row_rule(
     ):
         rule = ROW_RULES.get(ident + tail)
         if rule is not None:
+            tokens = int(M) if tail[2] is None else int(K)
+            for bound, below in ROW_RULE_MIN_T.get(ident + tail, ()):
+                if tokens < bound:
+                    return dict(below)  # under the key's token floor: the tier's rule
             return dict(rule)
     parent = RULE_PARENT.get(arch)
     if parent is not None:

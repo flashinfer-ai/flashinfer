@@ -267,7 +267,7 @@ EXPECTED_TEMPLATES = {
     },
     ('q_b', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_det_gemm_kn_n256_m256_ov_ht_pro7',
-        (1001, 212): 'dense_proj_det_gemm_kn_n256_ht_cg_pro15',
+        (1001, 212): 'dense_proj_det_gemm_kn_n256_cg_pro7',
         (2049, 148): 'dense_proj_det_gemm_kn_n256_m256_ov_pro7',
         (2049, 212): 'dense_proj_det_gemm_kn_n256_cg_pro15',
     },
@@ -3373,7 +3373,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule); three ragged sm_107a weight-gradient keys add 3 sm_107a
     # keys (test_sm107a_ragged_wgrad_rules_plan_their_programs); the MLA absorbed-query forward adds one sm_100a key
-    # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 10 sm_107a keys and re-values 2
+    # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 9 sm_107a keys and re-values 2
     # (test_sm107a_212_tranche_rules_plan_their_programs); the MLA value-projection input gradient's head-interleaved
     # raster adds one sm_103a key (test_round15_store_hint_knob); the MLA value-projection forward's raster adds three
     # sm_100a T-exact keys (test_round15_store_hint_knob)
@@ -3400,7 +3400,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
         + 1
         + 3
         + 1
-        + 10
+        + 9
         + 1
         + 3
         + 1
@@ -3409,7 +3409,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
         sum(k[0] == "sm_100a" for k in ROW_RULES)
         == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 6 + 3 + 1
     )
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 10
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 9
     assert (
         sum(k[0] == "sm_103a" for k in ROW_RULES)
         == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8 + 1
@@ -11353,7 +11353,6 @@ SM107A_212_TRANCHE = {
     ("sm_107a", False, True, False, False, False, 2048, 16384, None): (_T212_HT_CG, 2048, 16384, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
     ("sm_107a", False, True, False, False, False, 2048, 6144, None): (_T212_HT_CG, 2048, 6144, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
     ("sm_107a", False, False, False, False, False, 12288, 4096, None): (_T212_HT_CG, 4096, 12288, "fwd", "bf16", "dense_proj_det_gemm_kk_n256_ht_cg_pro15"),
-    ("sm_107a", False, False, False, False, False, 5120, 5120, None): (_T212_CG12, 5120, 5120, "fwd", "bf16", "dense_proj_det_gemm_kk_n256_cg_pro15"),
     ("sm_107a", True, True, False, False, False, 12288, None, 4096): ({"sk_parts": 3, "pro": 15}, 12288, 4096, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_pro15"),
     ("sm_107a", True, True, False, False, False, 4096, None, 12288): ({"group_m": 16, "sk_parts": 3, "pro": 15}, 4096, 12288, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_pro15"),
     ("sm_107a", True, True, False, False, False, 5120, None, 5120): ({"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}, 5120, 5120, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_sks_sb2_pro7"),
@@ -11417,6 +11416,76 @@ def test_sm107a_212_tranche_rules_plan_their_programs(monkeypatch, key):
                 assert plan.cgrp, where
                 assert _k_partitions(plan) == _k_partitions(plain), where
                 assert _k_partitions(plan) == [(0, plan.k_blocks)], where
+
+
+# The token tiers of the sm_107a 212-SM tranche (cake_backend.ROW_RULE_MIN_T): key -> ((bound, rule), ...).  Under a
+# bound the key plans the row with the tier's rule (FlashInfer main's rule of the row, or no rule; the fp32 5120 -> 5120
+# weight gradient with no rule up to T 257); from the floor (the last bound) on, the tranche rule.  T = M of a forward /
+# input gradient, K of a weight gradient.
+# fmt: off
+_FI_MAIN_QB_DGRAD = {"cgrp": True, "group_m": 8}  # the round-26 rule (test_round26_rules_plan_like_the_cake_launcher)
+_FI_MAIN_5120_WGRAD_F32 = {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ("none", "none"), "epi": "reg", "b_swz": 128, "pd": 0, "pf": 0}
+SM107A_212_TRANCHE_TIERS = {
+    ("sm_107a", False, True, False, False, False, 2048, 16384, None): ((2048, _FI_MAIN_QB_DGRAD),),
+    ("sm_107a", False, True, False, False, False, 5120, 5120, None): ((959, {}),),
+    ("sm_107a", True, True, True, False, False, 5120, None, 5120): ((258, {}), (16129, _FI_MAIN_5120_WGRAD_F32)),
+    ("sm_107a", True, True, False, False, False, 12288, None, 4096): ((16129, {}),),
+    ("sm_107a", True, True, False, False, False, 4096, None, 12288): ((16129, {}),),
+    ("sm_107a", False, True, False, False, False, 12288, 4096, None): ((33, {}),),
+    ("sm_107a", False, False, False, False, False, 12288, 4096, None): ((33, {}),),
+    ("sm_107a", True, True, False, False, False, 5120, None, 5120): ((16129, {}),),
+}
+# fmt: on
+
+
+def test_sm107a_212_tranche_floor_table():
+    assert cake_backend.ROW_RULE_MIN_T == SM107A_212_TRANCHE_TIERS
+    for key, tiers in cake_backend.ROW_RULE_MIN_T.items():
+        # ragged tranche keys only: one token dimension left out, the training T at or above the floor
+        assert key in SM107A_212_TRANCHE and (key[7] is None) != (key[8] is None), key
+        bounds = [bound for bound, _ in tiers]
+        assert (
+            bounds == sorted(set(bounds)) and bounds[0] > 1 and bounds[-1] <= 16172
+        ), key
+        assert all(
+            ROW_RULES[key] == SM107A_212_TRANCHE_RULES[key] != below
+            for _, below in tiers
+        ), key
+
+
+@pytest.mark.parametrize("key", list(SM107A_212_TRANCHE_TIERS))
+def test_sm107a_212_tranche_token_floors(monkeypatch, key):
+    """At T 1, each tier bound - 1, each bound and 16172 on the 212- and 216-SM parts: under a bound the plan equals the
+    row's plan with the tier's rule in place of the key's (no key for ``{}``); from the floor on it equals the tranche
+    rule's plan and differs from the plan with FlashInfer main's rule of the row (no key for ``{}``)."""
+    tiers = cake_backend.ROW_RULE_MIN_T[key]
+    main_rule = tiers[-1][1]
+    _rule, K, N, op, out_dtype, _program = SM107A_212_TRANCHE[key]
+
+    def plan_with(rule, T, sm_count):
+        with monkeypatch.context() as m:
+            m.delitem(cake_backend.ROW_RULE_MIN_T, key)
+            if rule is None:
+                pass  # the tranche rule
+            elif rule:
+                m.setitem(ROW_RULES, key, rule)
+            else:
+                m.delitem(ROW_RULES, key)
+            return _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+
+    token_counts = (
+        {1, 16172} | {bound - 1 for bound, _ in tiers} | {bound for bound, _ in tiers}
+    )
+    for sm_count in (212, 216):
+        for T in sorted(token_counts):
+            plan = _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+            below = next((rule for bound, rule in tiers if bound > T), None)
+            where = (sm_count, T, plan.template)
+            if below is not None:
+                assert plan == plan_with(below, T, sm_count), where
+            else:
+                assert plan == plan_with(None, T, sm_count), where
+                assert plan != plan_with(main_rule, T, sm_count), where
 
 
 def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatch):
