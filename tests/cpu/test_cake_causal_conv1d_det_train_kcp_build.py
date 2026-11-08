@@ -329,7 +329,7 @@ def test_forward_launches_one_sm_short(monkeypatch) -> None:
     """The forward record carries no ``reserve_sms`` (the non-deterministic package runs the same record); the host
     launches it ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs wide (:func:`kcp._launch_grid`), one SM short of the
     co-resident count, while that grid holds every channel tile of ``C``, else the full co-resident grid
-    (:func:`kcp._forward_grid`), and the head program's grid is not touched."""
+    (:func:`kcp._forward_grid`), also on a device too small to give up an SM."""
 
     kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
     assert kcp.FWD_RESERVE_SMS == 1
@@ -361,5 +361,15 @@ def test_forward_launches_one_sm_short(monkeypatch) -> None:
             ), (name, n_ch_tiles)
         with pytest.raises(ValueError, match="spans more channel tiles"):
             kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=full[0] + 1)
+        # a one-SM device: no SM to give up, so every C the full grid holds launches it
+        one_sm = (ctas_per_sm, 1, 1)
+        monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: one_sm)
+        for n_ch_tiles in (1, one_sm[0]):
+            assert (
+                kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=n_ch_tiles)
+                == one_sm
+            ), (name, n_ch_tiles)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=one_sm[0] + 1)
         seen.add(name)
     assert seen, "no kcp_fwd program in the table"

@@ -162,9 +162,10 @@ KCP_BWD_HEAD = "kcp_bwd_head"
 COOPERATIVE_DEFAULT = False
 # SMs of co-resident CTAs the forward (``kcp_fwd``) leaves free.  The forward record carries no ``reserve_sms`` (the
 # non-deterministic package's KCP forward runs the same record), so the rule is this host's (:func:`_launch_grid`): with
-# one small-carveout kernel of another stream resident on an SM (a communication kernel), no forward CTA waits for a
-# second wave.  A ``C`` with more channel tiles than that shorter grid holds launches the full grid
-# (:func:`_forward_grid`).  ``y`` is formed per token in a fixed FMA order, so it does not depend on the grid.
+# the shorter grid, no forward CTA waits for a second wave beside one small-carveout kernel of another stream resident
+# on an SM (a communication kernel).  A ``C`` whose channel tiles need the reserved SM launches the full grid
+# (:func:`_forward_grid`) and gives up that property.  ``y`` is formed per token in a fixed FMA order, so it does not
+# depend on the grid.
 FWD_RESERVE_SMS = 1
 GRAPH_MODES = (
     "off",
@@ -213,18 +214,20 @@ def _launch_grid(
 def _forward_grid(
     record: dict[str, Any], *, device_index: int, C: int, n_ch_tiles: int
 ) -> tuple[int, int, int]:
-    """The forward's launch grid: :func:`_launch_grid` (one SM short, :data:`FWD_RESERVE_SMS`) when it holds all
-    ``n_ch_tiles`` channel tiles, else the record's full co-resident grid, which every ``C`` it holds launched with
-    before the reservation; a ``ValueError`` when not even that grid holds them.  ``y`` does not depend on the grid."""
+    """The forward's launch grid: :func:`_launch_grid` (one SM short, :data:`FWD_RESERVE_SMS`) when that grid holds
+    all ``n_ch_tiles`` channel tiles, else the record's full co-resident grid, which every ``C`` it holds launched with
+    before the reservation (also on a device too small to give up an SM); a ``ValueError`` when not even the full grid
+    holds them.  ``y`` does not depend on the grid."""
 
-    grid = _launch_grid(record, device_index=device_index)
-    if n_ch_tiles > grid[0]:
-        grid = _record_launch_grid(record, device_index=device_index)
-    if n_ch_tiles > grid[0]:
+    full = _record_launch_grid(record, device_index=device_index)
+    if n_ch_tiles > full[0]:
         raise ValueError(
             f"C={C} spans more channel tiles than the forward's grid on this device holds"
         )
-    return grid
+    reserved = FWD_RESERVE_SMS * int(record["grid_rule"]["ctas_per_sm"])
+    if full[0] - reserved >= max(n_ch_tiles, 1):
+        return _launch_grid(record, device_index=device_index)
+    return full
 
 
 def _cooperative(cooperative: Optional[bool]) -> bool:

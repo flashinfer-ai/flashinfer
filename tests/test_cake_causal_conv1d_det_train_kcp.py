@@ -459,7 +459,8 @@ def test_forward_grid_is_one_sm_short_unless_a_channel_tile_needs_the_sm(
     """On both host paths the forward launches ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs when that grid holds
     every channel tile of ``C``, else the record's full co-resident grid (``kcp._forward_grid``): with the device's
     full grid made exactly ``C``'s channel tile count (``_record_launch_grid`` patched), the forward launches that full
-    grid instead of refusing ``C``, and ``y`` stays bitwise the unpartitioned forward's in both cases."""
+    grid instead of refusing ``C``, and ``y`` stays bitwise the unpartitioned forward's in both cases; a full grid one
+    CTA short of ``C``'s tile count refuses ``C``."""
 
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
         kcp as conv_kcp,
@@ -475,8 +476,8 @@ def test_forward_grid_is_one_sm_short_unless_a_channel_tile_needs_the_sm(
     def tiles(C: int) -> int:
         return conv_kcp.plan(1, C, 1, geometry=geometry, legacy=True)["n_ch_tiles"]
 
-    # the smallest C (a multiple of 1024) with more channel tiles than the reserved CTAs, so that a full grid of
-    # exactly its tile count can still reserve them
+    # the smallest C (a multiple of 1024) with more channel tiles than the reserved CTAs: a full grid of exactly its
+    # tile count then leaves a shorter grid of at least one CTA, too small for C
     C = 1024
     while tiles(C) <= reserved:
         C += 1024
