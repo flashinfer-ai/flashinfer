@@ -20,6 +20,7 @@ from ...batch_invariant import canon, jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
 from ...batch_invariant.quantization.cute_ext import CuteF32
 from . import spec as S
+from . import pdl
 
 MODULE = "batch_invariant_moe"
 WARPS = 4
@@ -124,7 +125,7 @@ class CombineKernel:
                     )
                 if valid & (j < n_vec):
                     cute.copy(atom_out, out, cute.local_tile(row_out, (VEC,), (jc,)))
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 WARPS_PER_SM_TARGET = 32  # the combine's warp count target per SM: one warp's serial slabs of a row are latency-bound

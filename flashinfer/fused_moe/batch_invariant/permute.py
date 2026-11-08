@@ -39,6 +39,7 @@ from cutlass import Boolean, Int32, Uint32
 from ...batch_invariant import jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
 from .blocks.scheduler import MAX_E, build_group_tables
+from . import pdl
 
 MODULE = "batch_invariant_moe"
 THREADS = 1024
@@ -80,7 +81,7 @@ class HistogramKernel:
             v = hist[tidx]
             if v > 0:
                 cute.arch.atomic_add(mCounts.iterator + tidx, v)
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 class PositionKernel:
@@ -158,7 +159,7 @@ class PositionKernel:
                 mSrc[base + prefix] = i
             running = running + total
             cute.arch.barrier()
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 class PlanKernel:
@@ -287,7 +288,7 @@ class PlanKernel:
                     mDestPad[i] = base_pad + prefix
                     mPosPad[base + prefix] = base_pad + prefix
             running = running + Int32(cute.arch.popc(Uint32(ballot)))
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 PLAN_THREADS = 256  # plan_multi: threads per CTA (8 warps)
@@ -378,7 +379,7 @@ class PlanBlocksKernel:
             i = base_w + c * LANES + lane
             if i < n:
                 mDest[i] = rs[c] + wcnt[warp * MAX_E + es[c]]
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 class PlanFinishKernel:
@@ -481,7 +482,7 @@ class PlanFinishKernel:
                     pp = s_off_pad[e] + pre_b[e] + r
                     mDestPad[i] = pp
                     mPosPad[p] = pp
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 class PlanMultiKernel:
@@ -598,7 +599,7 @@ class GatherKernel:
             cute.copy(atom, cute.local_tile(row_x, (vec,), (jc,)), frag)
             if valid & (j < n_vec):
                 cute.copy(atom, frag, cute.local_tile(row_p, (vec,), (jc,)))
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 def plan_kernel_name(kind: str, align: int, dual: bool, pad_align: int) -> str:

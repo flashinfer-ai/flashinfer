@@ -26,6 +26,7 @@ from cutlass import Float32, Int16, Int32, Uint32
 from ...batch_invariant import canon, jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
 from . import spec as S
+from . import pdl
 from .blocks.scheduler import MAX_E, build_group_tables
 from .permute import LANES, MODULE
 from .route import route_token
@@ -187,7 +188,7 @@ class RoutePlanKernel:
                     mSrc[r] = Int32(-1)
             for r in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
                 mSrc[r] = Int32(-1)
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 def route_plan_kernel_name(

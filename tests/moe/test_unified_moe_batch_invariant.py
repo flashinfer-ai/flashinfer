@@ -1180,6 +1180,32 @@ def test_route_plan_equals_route_and_plan(T, k, E, method, align):
 
 
 @needs_device
+def test_alternating_inputs_under_programmatic_dependent_launch():
+    """Two problems run alternately through the op, back to back without host syncs (the kernels' PDL chains overlap: a
+    kernel's prologue runs while its predecessor computes, and the allocator hands every reused intermediate the other
+    call's bytes), many times; every output equals the problem's isolated result bit for bit. A missing or misplaced
+    ``griddepcontrol.wait`` would read the other call's intermediates."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 64, 8, 256, 64, 256
+    probs = []
+    for seed in (3, 11):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed, adversarial=True)
+        ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+        ref = bits(api.fused_moe(x, ids, wts, (w1, w2)))
+        torch.cuda.synchronize()
+        probs.append((x, ids, wts, (w1, w2), ref))
+    outs = []
+    for _ in range(20):
+        for x, ids, wts, w, _r in probs:
+            outs.append(api.fused_moe(x, ids, wts, w))
+    torch.cuda.synchronize()
+    for i, out in enumerate(outs):
+        assert torch.equal(bits(out), probs[i % 2][4]), i
+
+
+@needs_device
 def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
     (the same ids and weights from ``route``) bit for bit."""
