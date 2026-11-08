@@ -29,7 +29,19 @@ for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
 scan of one launch whose CTAs fill at most half of the SMs runs as
 ``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
 :func:`fwd_ho_vh2_engaged`, where the record is the split program,
-:func:`fwd_ho_vh2_splits`; the same bits).  The backward runs ``dv_local`` and
+:func:`fwd_ho_vh2_splits`; the same bits).  A call with FP32 ``beta``,
+normalized q / k, a value-head group of at most three, no ``prep`` /
+``scan_config`` / ``segment_chunks`` pin and a host-built table runs one of two
+forwards on the WY A producer ``wy_a`` instead (other bits than the prep
+forward, bitwise run to run): on the architectures of ``FWD_A_ARCHS``, where the
+forward segment table is serial, ``wy_a`` and ``fwd_ho_a``, the fused scan and
+output on its A (:func:`fwd_a_route`); on those of ``FWD_SPLIT_ARCHS``, where
+the forward segment table splits a sequence and the host plan's piece table
+is in the split's shape class, the one-wave split forward
+(:func:`fwd_split_route`: the first pieces beside the middle pieces' affine
+maps on a side stream, the stitch, the other pieces; on wy_a's A, or on the
+WY stage's w / u below ``FWD_SPLIT_A_MIN_PIECE``).  Both keep the tape only
+when the call records a backward (:func:`_forward_tape`).  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -86,9 +98,12 @@ stored it, counted per tile in a workspace; the same math and the same bits.
 
 The chain is deterministic: no atomic on a value (the wavefront pair's ready
 counts are atomic counters whose order no value depends on), no data-dependent
-ordering, and the two groups of a two-stream stage write disjoint outputs, so
-the outputs and gradients are bitwise run to run for one layout and one plan,
-with one or two streams.
+ordering, and the two groups of a two-stream stage write disjoint outputs (as do
+the first pieces and the middle pieces' maps of the split forward), so the
+outputs and gradients are bitwise run to run for one layout and one plan, with
+one or two streams.  Every route is chosen from host facts (shapes, dtypes, the
+architecture, the SM count, the pins), never from a pointer or a value: an
+operand whose address a stage cannot read is copied first.
 The plan pins that tests and tuning use are explicit keyword arguments of
 :func:`cake_gdn_det` (``scan_config``, ``segment_chunks``,
 ``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``);
@@ -99,19 +114,25 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import cache, lru_cache
+from types import MappingProxyType
 from typing import Any, cast
 
 import torch
 
-from . import cake_backend, cake_jit
+from . import cake_backend, cake_jit, cake_plan
 
 __all__ = [
     "CHAIN_PLAN",
     "CHUNK",
     "FINALIZE_STAGES",
     "FULL",
+    "FWD_A_ARCHS",
+    "FWD_A_SERIAL_KEEP",
+    "FWD_SPLIT_ARCHS",
     "HEAD_DIM",
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
@@ -121,6 +142,7 @@ __all__ = [
     "TC_PLAN_PRESCAN",
     "TC_PLAN_SELECT",
     "TC_PLAN_STEP",
+    "WY_A_MAX_GROUP",
     "CakeGDNDetFunction",
     "ChainOptions",
     "ChunkMeta",
@@ -137,8 +159,11 @@ __all__ = [
     "choose_scan_plan",
     "dhu_tc_pricing",
     "finalize_stage",
+    "fwd_a_route",
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
+    "fwd_serial_keep_pricing",
+    "fwd_split_route",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -219,6 +244,20 @@ _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
               "bwd_num_segments_max")  # fmt: skip
+# the forwards on the WY stage's A: wy_a (k / q as the tensors its binding encodes the tensor maps from, k twice for
+# its two boxes), fwd_ho_a (the scan and output on that A), fwd_fused (fwd_ho's scan and output with a tape word and
+# the split forward's wave-1 outputs) and the summaries of the split forward's middle pieces
+_WY_A_ARGS = ("k_tma64", "k_tma32", "q_tma", "glog", "beta", "a_out", "rk_out", "rq_out", "gcs_out", "qn_out", "kn_out",
+              "chunk_start", "chunk_len", "num_chunks", "num_heads", "num_v_heads")  # fmt: skip
+_FWD_A_ARGS = ("qn_tma", "kn_tma", "v_tma", "a_tma", "g_cs", "beta", "h0", "seg_start", "h_tma", "h_out", "v_new_tma",
+               "v_new", "o_tma", "o_out", "final_state", "w_tma", "w_out", "chunk_start", "chunk_len",
+               "seg_chunk_start", "seg_seq", "seq_chunk_start", "walk", "num_heads", "num_v_heads",
+               "use_initial_state", "store_final_state", "use_seg_start", "scale", "tape")  # fmt: skip
+_FWD_FUSED_ARGS = (*_FWD_HO_ARGS, "tape", "seg_state", "seg_flag", "split_out")
+_SUMMARY_TAIL_ARGS = ("b_out", "m_out", "seg_flag", "chunk_start", "chunk_len", "seg_chunk_start", "walk", "m_slot",
+                      "num_heads", "num_v_heads", "b_head", "b_row", "m_head", "m_row", "m_col")  # fmt: skip
+_FWD_SUMMARY_ARGS = ("kn_tma", "w_tma", "u_tma", "g_cs", *_SUMMARY_TAIL_ARGS)
+_FWD_SUMMARY_A_ARGS = ("kn_tma", "v_tma", "a_tma", "g_cs", "beta", *_SUMMARY_TAIL_ARGS)
 LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "meta": _META_ARGS,
     "prep": _PREP_ARGS,
@@ -227,8 +266,13 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
     "wy_tc2": _WY_ARGS + ("v_row_heads",),
+    "wy_a": _WY_A_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
+    "fwd_ho_a": _FWD_A_ARGS,
+    "fwd_fused": _FWD_FUSED_ARGS,
+    "fwd_summary": _FWD_SUMMARY_ARGS,
+    "fwd_summary_a": _FWD_SUMMARY_A_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
@@ -326,8 +370,11 @@ class ChainOptions:
     ``None``: the selection rule) and the pass 2 of a split ``SDT_CONFIG`` plan on a host-built table (``"reg"``:
     ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2`` after the fused pre-scan; the same bits); ``prep``
     forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
-    grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule); ``save_state`` keeps the
-    forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
+    grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule) and with it the prep forward (a
+    ``prep``, ``scan_config`` or ``segment_chunks`` pin keeps a call off the forwards on wy_a's A, :func:`fwd_a_route`,
+    :func:`fwd_split_route`); ``save_state`` keeps the forward state of the architecture's tape level for the backward
+    (:func:`cake_plan.tape_state`: ``w`` / ``h`` / ``v_new`` under ``T_full``; else they are recomputed, as ``u``
+    is where ``h`` / ``v_new`` are); ``host_cache`` keeps the
     chunk tables, the selection results and the per-stream workspaces between calls; ``lpt`` dispatches the
     sequences of a host-built table longest first (the same bits; ``False``: the caller's order); ``streams`` is
     ``2`` to let a host-built table's serial scans (the adjoint one beside ``tail_g2``, and beside ``tail_g3`` on the
@@ -507,7 +554,9 @@ class ChunkMeta:
     ``bwd_wavefront``: the adjoint scan stage of the wavefront pair where the table's side of the wavefront rule
     holds (:func:`_wavefront_table`; ``None``: the separate launches); ``bwd_tc``: the adjoint table is priced for
     ``dhu_tc2`` (:func:`tc_plan_pricing`, :func:`chain_plan_pricing`), which runs it.  ``ready``: the write of a
-    cached table (:func:`_use_table`; ``None``: a table built for its call)."""
+    cached table (:func:`_use_table`; ``None``: a table built for its call).  ``fwd_split``: the tables of the
+    one-wave split of the forward scan on the host plan's piece table (:class:`ForwardSplit`, with their own write),
+    which the forward of :func:`fwd_split_route` runs instead of the pre-scan (``None``: the other plans)."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -524,6 +573,7 @@ class ChunkMeta:
     bwd_wavefront: str | None = None
     bwd_tc: bool = False
     ready: TableReady | None = None
+    fwd_split: ForwardSplit | None = None
 
 
 @dataclass(frozen=True)
@@ -650,8 +700,12 @@ def build_chunk_meta(
 # capture), so the table's write must be done when the capture starts: torch.cuda.graph synchronizes the device first.
 # That covers only work queued before the capture; a table another thread builds during the capture must have its
 # stream synchronized before the capture reads it.  The table is then kept for the process, since every replay reads it.
+# The split forward's tables (two allocations: the int32 tables and the int64 indices) carry one write of their own; a
+# hit on a layout's ChunkMeta makes them safe too (:func:`_use_meta_tables`), since the forward reads them from it.
 _HOST_META: dict = {}
 _HOST_META_LIMIT = 256
+_FORWARD_SPLITS: dict = {}
+_FORWARD_SPLITS_LIMIT = 256
 _GRAPH_TABLES: dict[int, torch.Tensor] = {}
 
 
@@ -679,6 +733,20 @@ def _use_table(
         table.record_stream(stream)
 
 
+def _use_forward_split(split: ForwardSplit, device_index: int) -> None:
+    """:func:`_use_table` for both allocations of the split forward's tables (:func:`forward_split_tables`)."""
+    _use_table(split.seg_chunk_start, split.ready, device_index)
+    _use_table(split.first_index, split.ready, device_index)
+
+
+def _use_meta_tables(meta: ChunkMeta, device_index: int) -> None:
+    """:func:`_use_table` for every cached device table a :class:`ChunkMeta` carries: its chunk table and the split
+    forward's tables."""
+    _use_table(meta.chunk_start, meta.ready, device_index)
+    if meta.fwd_split is not None:
+        _use_forward_split(meta.fwd_split, device_index)
+
+
 def _host_chunk_meta(
     seq_lens: tuple[int, ...],
     plans: tuple[ScanPlan, ScanPlan],
@@ -691,7 +759,7 @@ def _host_chunk_meta(
     meta = _HOST_META.pop(key, None)
     if meta is not None:
         _HOST_META[key] = meta
-        _use_table(meta.chunk_start, meta.ready, device_index)
+        _use_meta_tables(meta, device_index)
         return meta
     meta = build_chunk_meta(
         seq_lens, torch.device("cuda", device_index), scan_plans=plans, lpt=lpt
@@ -1868,10 +1936,13 @@ def _priced_plans(
     num_v_heads: int,
     device_index: int,
     options: ChainOptions,
+    *,
+    keep_serial: bool = False,
 ) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
     """``plans`` with the adjoint table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split tables of
     ``CHAIN_PLAN``, and whether the adjoint table runs on ``dhu_tc2`` for that pricing (``ChunkMeta.bwd_tc``); plan
-    pins (and a ``dhu_scan`` pin) keep the planner's tables."""
+    pins (and a ``dhu_scan`` pin) keep the planner's tables.  ``keep_serial``: the forward table is the serial table
+    of ``FWD_A_SERIAL_KEEP``, which ``CHAIN_PLAN`` does not deepen."""
     if not TC_PLAN or options.pins != (None, None) or options.dhu_scan is not None:
         return plans, False
     index = int(device_index)
@@ -1894,7 +1965,11 @@ def _priced_plans(
         for kind in ("fwd", "bwd"):
             plan = plans[0] if kind == "fwd" else plans[1]
             serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
-            if (serial and stream_split is not None) or (kind == "bwd" and kept):
+            if (
+                (serial and stream_split is not None)
+                or (kind == "bwd" and kept)
+                or (kind == "fwd" and keep_serial)
+            ):
                 continue
             deeper = chain_plan_pricing(kind, chunks, int(num_v_heads), index, plan)
             if not deeper["select"]:
@@ -1915,12 +1990,15 @@ def host_plans(
     *,
     total_tokens: int | None = None,
     num_heads: int | None = None,
+    a_inputs: bool = False,
 ) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
     """The forward and adjoint tables of a host layout (``seq_lens``, tokens per sequence) on device ``device_index``
     and whether the adjoint table runs on ``dhu_tc2`` for its pricing (``ChunkMeta.bwd_tc``): the planner's tables,
-    the serial-scan rule's adjoint plan (``num_heads``, the key heads; ``None``: no value-head group), then the tables
-    priced for the tcgen05 chains (``TC_PLAN``, ``CHAIN_PLAN``); plan pins (and a ``dhu_scan`` pin) keep the
-    planner's tables.  Host work only."""
+    the serial-scan rule's adjoint plan (``num_heads``, the key heads; ``None``: no value-head group), the serial
+    forward table of ``FWD_A_SERIAL_KEEP`` (``a_inputs``: the call meets the input conditions of the forwards on
+    wy_a's A, :func:`_wy_a_inputs`, so :func:`fwd_a_route` serves that table), then the tables priced for the tcgen05
+    chains (``TC_PLAN``, ``CHAIN_PLAN``); plan pins (and a ``dhu_scan`` pin) keep the planner's tables.  Host work
+    only."""
     options = options or make_options()
     seq_lens = tuple(int(n) for n in seq_lens)
     index = int(device_index)
@@ -1931,7 +2009,23 @@ def host_plans(
     plans = _serial_adjoint_plan(
         seq_lens, plans, num_heads, int(num_v_heads), index, options
     )
-    return _priced_plans(seq_lens, plans, num_heads, int(num_v_heads), index, options)
+    keep_serial = False
+    if a_inputs and options.pins == (None, None):
+        arch = cake_backend.device_arch(index)
+        if (
+            arch in FWD_A_ARCHS
+            and _available("wy_a", arch)
+            and _available("fwd_ho_a", arch)
+        ):
+            # the serial forward table of FWD_A_SERIAL_KEEP (fwd_a_route serves it; CHAIN_PLAN deepens no forward
+            # table)
+            keep = fwd_serial_keep_pricing(
+                seq_lens, int(num_v_heads), index, plans[0], total_tokens=total_tokens
+            )
+            if keep["select"]:
+                plans, keep_serial = (keep["serial"], plans[1]), True
+    return _priced_plans(seq_lens, plans, num_heads, int(num_v_heads), index, options,
+                         keep_serial=keep_serial)  # fmt: skip
 
 
 # --------------------------------------------------------------------------- #
@@ -2564,10 +2658,778 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     return h, v_new, final_state, o
 
 
+# --------------------------------------------------------------------------- #
+# the forward on the WY stage's A (the rows whose forward scan is serial)
+# --------------------------------------------------------------------------- #
+# On an architecture of ``FWD_A_ARCHS`` a call on a host-built table whose forward segment table is serial (no sequence
+# split over several scan CTAs, ``ChunkMeta.fwd_segments``) runs two launches instead of the prep, the WY stage and
+# ``fwd_ho``: ``wy_a``, the WY A producer (``A = bf16(X)``, ``X = (I + L)^-1`` of every chunk and value head by a
+# tcgen05 product and TF32x3 merges, within half a BF16 ulp of the FP64 ``X``, beside the prep's rstd_q / rstd_k / g_cs
+# / qn / kn; one persistent CTA per SM over the (chunk, key head) items in a fixed order), and ``fwd_ho_a``, the fused
+# scan and output on that A, qn and kn (``u = bf16(A bf16(beta v))`` and ``w = bf16(A bf16(beta 2^g kn))`` formed in
+# the CTA; one CTA per (segment, value head) on ``fwd_ho``'s walk).  ``fwd_ho_a`` writes the tape's h / v_new / w
+# (:data:`FWD_A_TAPE`) when the call keeps a tape and none when it keeps none (:func:`_forward_tape`); o and the final
+# state are the same bits either way.  The tape is the ``T_full`` level's (:data:`cake_plan.LEVEL_STATE`) in the
+# layouts the backward reads (u is never formed in memory).  Every reduction runs in a fixed order with no atomic, so
+# the route is bitwise run to run; its bits differ from the prep forward's (another A producer).  The route serves
+# FP32 beta, normalized q / k, value-head groups of at most :data:`WY_A_MAX_GROUP` and calls without a ``prep`` /
+# ``scan_config`` / ``segment_chunks`` pin (:func:`_wy_a_inputs`); every other call, and every row whose forward
+# segment table splits a sequence, runs the prep forward (the split forward keeps its own route).  The route is
+# decided from those host facts alone: q / k are copied to 16-byte aligned rows where wy_a's tensor maps cannot read
+# them in place, v where the stages that read it by rows cannot, g and beta where their base is not 16-byte aligned.
+FWD_A_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
+WY_A_MAX_GROUP = 3
+# On an architecture of ``FWD_A_SERIAL_KEEP`` (price factor, fill) a host-built table without plan pins of a call the
+# forward on wy_a's A serves keeps a SERIAL forward table where the register planner takes a split one, prices its
+# cheapest serial table at most the factor above it (the planner record's ``priced`` entries,
+# :func:`fwd_serial_keep_pricing`) and the serial table's CTAs (sequences x HV) fill at least the fill fraction of the
+# SMs; ``CHAIN_PLAN`` then deepens no forward table there and :func:`fwd_a_route` serves the row.  A planner table
+# that is serial already keeps every rule.  Measured with the non-deterministic package's programs on R200 (sm_107a,
+# 212 SMs): the 3 sequences of 11000 / 12000 / 9768 tokens with HV 48 (144 serial CTAs, ratio 1.06) run fwd
+# 0.71-0.85, fwd+bwd 0.89-0.95 and checkpoint 0.82-0.90 of the split table's time; with HV 24 (72 CTAs, ratio 1.51)
+# the serial table is slower, so 1.10 keeps the measured win and the fill of 0.65 keeps it off layouts of fewer
+# serial CTAs.
+FWD_A_SERIAL_KEEP: dict[str, tuple[float, float]] = {"sm_107a": (1.10, 0.65)}
+# fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
+FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
+
+
+def _wy_a_inputs(
+    num_heads: int,
+    num_v_heads: int,
+    beta_dtype: torch.dtype,
+    normalize_qk: bool,
+    options: ChainOptions,
+) -> bool:
+    """The input conditions of the forwards on wy_a's A (:func:`fwd_a_route`, :func:`fwd_split_route`) that a call
+    fixes before its table: normalized q / k, FP32 beta, no ``prep`` / ``scan_config`` / ``segment_chunks`` pin and a
+    value-head group of at most :data:`WY_A_MAX_GROUP`.  Shapes, dtypes and pins only (never an address)."""
+    return (
+        bool(normalize_qk)
+        and beta_dtype == torch.float32
+        and options.prep is None
+        and options.pins == (None, None)
+        and int(num_v_heads) <= WY_A_MAX_GROUP * int(num_heads)
+    )
+
+
+def _fwd_a_inputs(
+    meta: ChunkMeta, q, k, v, beta, normalize_qk: bool, options: ChainOptions
+) -> bool:
+    """:func:`_wy_a_inputs` of a call on ``meta``, a host-built table."""
+    return meta.seq_lens is not None and _wy_a_inputs(
+        int(q.shape[-2]), int(v.shape[-2]), beta.dtype, normalize_qk, options
+    )
+
+
+def fwd_a_route(
+    meta: ChunkMeta, arch: str, q, k, v, beta, normalize_qk: bool, options: ChainOptions
+) -> bool:
+    """Whether a forward on ``meta`` runs ``wy_a`` and ``fwd_ho_a`` (see :data:`FWD_A_ARCHS`): an architecture of
+    ``FWD_A_ARCHS`` with both records, :func:`_fwd_a_inputs` and a serial forward segment table."""
+    if arch not in FWD_A_ARCHS or not _fwd_a_inputs(
+        meta, q, k, v, beta, normalize_qk, options
+    ):
+        return False
+    segs = meta.fwd_segments
+    if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
+        return False
+    return _available("wy_a", arch) and _available("fwd_ho_a", arch)
+
+
+@lru_cache(maxsize=4096)
+def _fwd_scan_record(total_tokens, seq_lens, num_v_heads, device_index, sset, props):
+    """The register planner's pricing record of a host layout's forward table without plan pins."""
+    _plan, rec = choose_scan_plan("fwd_h", total_tokens, len(seq_lens), num_v_heads, device_index, seq_lens,
+                                  sset)  # fmt: skip
+    return rec
+
+
+def fwd_serial_keep_pricing(
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    plan: ScanPlan,
+    *,
+    total_tokens: int | None = None,
+) -> dict:
+    """The forward table rule of :data:`FWD_A_SERIAL_KEEP` on a host layout whose planner forward table without plan
+    pins is ``plan``: ``{"select", "ratio", "fill", "serial", "limit", "min_fill"}``, ``serial`` the planner's cheapest
+    serial table, ``ratio`` its price over the price of ``plan`` and ``fill`` its CTAs over the SMs (``select``: ``plan``
+    splits a sequence, ``ratio`` is at most the architecture's ``limit`` and ``fill`` at least its ``min_fill``).  Host
+    work only."""
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    seq_lens = tuple(int(n) for n in seq_lens)
+    limit, min_fill = FWD_A_SERIAL_KEEP.get(arch, (None, None))
+    rec: dict[str, Any] = {
+        "select": False,
+        "ratio": None,
+        "fill": None,
+        "serial": None,
+        "limit": limit,
+        "min_fill": min_fill,
+    }
+    chunks = tuple(-(-n // CHUNK) for n in seq_lens)
+    if (
+        limit is None
+        or min_fill is None
+        or not chunks
+        or plan.segment_len <= 0
+        or max(chunks) <= plan.segment_len
+    ):
+        return rec
+    tokens = sum(seq_lens) if total_tokens is None else int(total_tokens)
+    priced = _fwd_scan_record(tokens, seq_lens, int(num_v_heads), index, stage_set(arch),
+                              _device_props(index)).get("priced") or []  # fmt: skip
+    chosen = [
+        cost
+        for config, seg_len, cost in priced
+        if tuple(config) == tuple(plan.config) and seg_len == plan.segment_len and cost
+    ]
+    serial = [
+        (cost, tuple(config))
+        for config, seg_len, cost in priced
+        if seg_len == 0 and cost is not None
+    ]
+    if not chosen or not serial:
+        return rec
+    cost, config = min(serial)
+    ratio = cost / chosen[0]
+    fill = len(seq_lens) * int(num_v_heads) / _device_props(index)[0]
+    rec.update(
+        select=ratio <= limit and fill >= min_fill,
+        ratio=round(ratio, 4),
+        fill=round(fill, 4),
+        serial=ScanPlan(config, 0),
+    )
+    return rec
+
+
+# Whether the forward of the call in flight keeps a tape: :func:`cake_gdn_det` sets it off around a call that records
+# no backward (grad mode off, or no input that requires grad); an autograd Function applied directly keeps one.
+_RECORDS_BACKWARD: ContextVar[bool] = ContextVar(
+    "cake_gdn_det_records_backward", default=True
+)
+_TOP_SAVED_TENSORS_HOOKS = getattr(
+    torch._C._autograd, "_top_saved_tensors_default_hooks", None
+)
+
+
+def _checkpoint_first_pass() -> bool:
+    """Whether the call runs in the first pass of a non-reentrant activation checkpoint (``torch.utils.checkpoint``,
+    ``use_reentrant=False``): that pass's saved tensors are dropped and the forward runs again before the backward, so
+    it keeps no tape.  Read from the innermost saved-tensor hooks (a private PyTorch hook, absent: keep the tape): the
+    checkpoint's own pack hook; any other hooks, or none, keep the tape."""
+    if _TOP_SAVED_TENSORS_HOOKS is None:
+        return False
+    hooks = _TOP_SAVED_TENSORS_HOOKS(False)
+    if hooks is None:
+        return False
+    pack = hooks[0]
+    return getattr(pack, "__module__", None) == "torch.utils.checkpoint" and getattr(
+        pack, "__qualname__", ""
+    ).startswith("_checkpoint_hook.")
+
+
+def _forward_tape() -> bool:
+    """Whether the forward in flight keeps a tape (:data:`_RECORDS_BACKWARD`, outside a checkpoint's first pass)."""
+    return _RECORDS_BACKWARD.get() and not _checkpoint_first_pass()
+
+
+def _tma_operands(q, k):
+    """q / k as wy_a's tensor maps read them: in place where both are (:func:`_tma_rows`, the head views of a packed
+    row among them), else contiguous rows at a 16-byte aligned base."""
+    if _tma_rows(q) and _tma_rows(k):
+        return q, k
+    return _aligned(q, TMA_ALIGN_BYTES), _aligned(k, TMA_ALIGN_BYTES)
+
+
+def _forward_state(meta: ChunkMeta, kn, v):
+    """The (shape, dtype) of each state tensor of :data:`cake_plan.STATE_NAMES` (``w``, ``u``, ``h``, ``v_new``) of
+    a forward over ``meta``, as the prep forward makes them."""
+    num_v_heads = v.shape[-2]
+    total_tokens = v.numel() // (num_v_heads * HEAD_DIM)
+    return (
+        ((total_tokens, num_v_heads, HEAD_DIM), kn.dtype),
+        (tuple(v.shape), v.dtype),
+        ((meta.num_chunks, num_v_heads, HEAD_DIM, HEAD_DIM), kn.dtype),
+        (tuple(v.shape), v.dtype),
+    )
+
+
+def _start_state(initial_state, meta: ChunkMeta, output_final_state: bool, num_v_heads: int, table, workspaces,
+                 device):  # fmt: skip
+    """``(final_state, h0, use_init)`` of a forward on wy_a's A: the final-state output (a zero-row workspace when the
+    call outputs none) and the initial state rows in table order (the final-state buffer and 0 without one)."""
+    f32 = torch.float32
+    if output_final_state:
+        final_state = torch.empty(
+            (meta.num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM), dtype=f32, device=device
+        )
+    else:
+        final_state = workspaces.take(
+            table, "f_zero_state", (0, num_v_heads, HEAD_DIM, HEAD_DIM), f32, device
+        )
+    initial_rows = _table_rows(initial_state, meta)
+    if initial_rows is None:
+        return final_state, final_state, 0
+    h0 = initial_rows.contiguous()
+    if h0.dtype != f32:
+        h0 = h0.float()
+    return final_state, h0, 1
+
+
+def _launch_wy_a(q, k, g32, beta32, meta: ChunkMeta, num_heads: int, num_v_heads: int, index: int):  # fmt: skip
+    """``wy_a`` over ``meta``'s chunks (one persistent CTA per SM, at most one per (chunk, key head)): A, rstd_q,
+    rstd_k, g_cs, qn and kn."""
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device, f32, bf16 = q.device, torch.float32, q.dtype
+    qn = torch.empty(q.shape, dtype=bf16, device=device)
+    kn = torch.empty(k.shape, dtype=bf16, device=device)
+    rstd_q = torch.empty((total_tokens, num_heads), dtype=f32, device=device)
+    rstd_k = torch.empty((total_tokens, num_heads), dtype=f32, device=device)
+    g_cs = torch.empty((total_tokens, num_v_heads), dtype=f32, device=device)
+    A = torch.empty((total_tokens, num_v_heads, CHUNK), dtype=bf16, device=device)
+    sm_count = _device_props(index)[0]
+    _launch("wy_a", min(sm_count, meta.num_chunks * num_heads), 1, 1, k, k, q, g32, beta32, A.view(torch.uint32),
+            rstd_k, rstd_q, g_cs, qn.view(torch.uint32), kn.view(torch.uint32), meta.chunk_start, meta.chunk_len,
+            meta.num_chunks, num_heads, num_v_heads)  # fmt: skip
+    return qn, kn, rstd_q, rstd_k, g_cs, A
+
+
+def _forward_tape_tensors(kept, state, device, *, formed=()):
+    """The state tensors of a forward on wy_a's A by :data:`cake_plan.STATE_NAMES`: an allocation for each name the
+    tape keeps (``kept``) or the forward forms in memory (``formed``), ``None`` for the rest."""
+    return {
+        name: torch.empty(shape, dtype=dtype, device=device)
+        if name in kept or name in formed
+        else None
+        for name, (shape, dtype) in zip(cake_plan.STATE_NAMES, state, strict=True)
+    }
+
+
+def _forward_result(fwd: dict[str, Any], kept, forward: str) -> dict[str, Any]:
+    """The tape dict of a forward on wy_a's A: the state the tape keeps, ``None`` for the rest (the backward rebuilds
+    it)."""
+    for name in cake_plan.STATE_NAMES:
+        if name not in kept:
+            fwd[name] = None
+    fwd["mode"] = _TAPE_MODE
+    fwd["forward"] = forward
+    return fwd
+
+
+def _forward_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk, options,
+               tape) -> dict[str, Any]:  # fmt: skip
+    """The forward of :func:`fwd_a_route`'s calls: ``wy_a`` then ``fwd_ho_a``; the tape of
+    :func:`cake_gdn_det_train_forward` (``None`` for the state it does not keep: u always)."""
+    num_heads, num_v_heads = q.shape[-2], v.shape[-2]
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device = q.device
+    index = _tensor_index(q)
+    bf16 = q.dtype
+    q, k = _tma_operands(q, k)
+    # fwd_ho_a's tensor map reads v in place where the stages that read v by rows do (:func:`_v_rows`), else a copy
+    if _v_rows(v) is None:
+        v = _aligned(v, ROW_ALIGN_BYTES)
+    kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+    qn, kn, rstd_q, rstd_k, g_cs, A = _launch_wy_a(
+        q, k, g32, beta32, meta, num_heads, num_v_heads, index
+    )
+    state = _forward_tape_tensors(kept, _forward_state(meta, kn, v), device)
+    o = torch.empty(v.shape, dtype=v.dtype, device=device)
+    workspaces = _workspaces(options)
+    table = workspaces.table(index)
+    # fwd_ho_a binds every tape tensor it does not write to a one-row stand-in (its tensor map encodes, nothing stores)
+    word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
+    rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
+    h_t = state["h"]
+    if h_t is None:
+        h_t = workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    v_new_t = rows if state["v_new"] is None else state["v_new"]
+    w_t = rows if state["w"] is None else state["w"]
+    final_state, h0, use_init = _start_state(initial_state, meta, output_final_state, num_v_heads, table, workspaces,
+                                             device)  # fmt: skip
+    segs = meta.fwd_segments
+    walk = _walk(device, segs, options)
+    _launch("fwd_ho_a", segs.num_segments * num_v_heads, 1, 1, qn, kn, v, A, g_cs, beta32, h0, final_state, h_t, h_t,
+            v_new_t, v_new_t, o, o, final_state, w_t, w_t, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start,
+            segs.seg_seq, meta.seq_chunk_start, walk, num_heads, num_v_heads, use_init,
+            1 if output_final_state else 0, 0, float(scale), word)  # fmt: skip
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
+    fwd: dict[str, Any] = {
+        "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
+        "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
+        "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
+        "final_state": final_state if output_final_state else None, "initial_state": initial_state, "options": options,
+        **state,
+    }  # fmt: skip
+    return _forward_result(fwd, kept, "fwd_ho_a")
+
+
+# --------------------------------------------------------------------------- #
+# the split forward (the rows whose forward segment table splits a sequence)
+# --------------------------------------------------------------------------- #
+# On an architecture of ``FWD_SPLIT_ARCHS`` a call the forward on wy_a's A serves (:func:`_wy_a_inputs`) on a
+# host-built table whose forward segment table splits a sequence runs the one-wave split of the forward scan on the
+# host plan's piece table (:func:`cake_plan.pieces`) instead of the pre-scan, the stitch and ``fwd_ho``: the front
+# ``wy_a`` (A, rstd_q / rstd_k / g_cs / qn / kn) and the WY stage with ``recompute = 1`` on that A (w and u), then
+# wave 1, the first piece of every split sequence from its initial state (``fwd_fused``, its end state into the B half
+# of the stitch's segment state by ``split_out``, its flag 0) beside the affine maps ``[B | M]`` of the middle pieces
+# (``fwd_summary``, side stream, joined back before the stitch), the stitch (``reverse = 0``: the start state of every
+# piece) and wave 2, every other piece from its stitched start state (``fwd_fused``; a sequence of one piece runs
+# whole there from its initial state, which the stitch copies).  ``fwd_fused`` is ``fwd_ho``'s scan and output on
+# the WY stage's w / u with the tape word of :data:`FWD_FUSED_TAPE`: h and v_new when the call keeps a tape, none
+# without one.  Wave 1 and the summary write disjoint segments, every piece's state is composed by the stitch in a
+# fixed order and no launch uses an atomic on a value, so the forward is bitwise run to run with one or two streams.
+# The rows whose pieces are shorter than the architecture's :data:`cake_plan.FORWARD_SPLIT_MIN_PIECE` keep the prep
+# forward (there the split's fixed costs exceed what it saves), as do the calls ``scan_config`` / ``segment_chunks``
+# pin.  The piece table depends on the sequence lengths, HV and the SM count alone.
+FWD_SPLIT_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a")
+# fwd_fused's tape word per tape entry
+FWD_FUSED_TAPE = {"h": 1, "v_new": 2}
+# On an architecture of ``FWD_SPLIT_A_ARCHS`` (a subset of ``FWD_SPLIT_ARCHS``) the split forward runs on wy_a's A
+# alone (no WY stage, u and w never formed in memory): both waves are ``fwd_ho_a`` (with the h / v_new / w tapes of
+# :data:`FWD_A_TAPE`) on the split tables, and the middle pieces' maps are ``fwd_summary_a`` (the same maps and layout
+# as ``fwd_summary``, u and w formed in the CTA).  ``fwd_ho_a`` has no ``split_out``: wave 1 stores the end state of
+# each first piece as its sequence's final state, which is copied into the B half of the segment state (one row per
+# first piece, distinct rows), the first pieces' flags zeroed, before the stitch.
+FWD_SPLIT_A_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a")
+# the shortest piece (chunks, the planned piece length) whose split forward runs on wy_a's A, per architecture (none
+# listed: every split forward).  Measured with the non-deterministic package's programs on GB300 (sm_103a): the
+# 63-chunk pieces of three sequences of about 11k tokens at HV 24 take 1.03 of the W form's time per checkpointed
+# step, the pieces of 132 chunks and more 0.90-0.91 per forward; B200 (sm_100a) takes the A form on every split row.
+FWD_SPLIT_A_MIN_PIECE: Mapping[str, int] = MappingProxyType({"sm_103a": 96})
+# the stages of the split forward on wy_a's A, and of the split forward on the WY stage's w / u
+FWD_SPLIT_A_STAGES = ("wy_a", "fwd_ho_a", "fwd_summary_a", "stitch")
+FWD_SPLIT_W_STAGES = ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch")
+# fwd_summary's output layout into the stitch's [B | M] FP32 [K][V + K] block: b_head, b_row, m_head, m_row, m_col
+_SUMMARY_LAYOUT = (
+    HEAD_DIM * 2 * HEAD_DIM,
+    2 * HEAD_DIM,
+    HEAD_DIM * 2 * HEAD_DIM,
+    2 * HEAD_DIM,
+    HEAD_DIM,
+)
+
+
+@dataclass(frozen=True)
+class ForwardSplit:
+    """The tables of the one-wave split forward over a piece table (:func:`forward_split_tables`): the pieces as a
+    segment table (``seg_chunk_start``, ``seg_seq``, ``seq_seg_start``), ``first_end`` (the table's
+    ``seq_chunk_start`` with each split sequence ending at the end of its first piece, so wave 1 stores that piece's
+    end state), the walks of wave 1 (``first``: each split sequence's first piece), of the summary (``middle``) and of
+    wave 2 (``rest``: every other piece, and the one piece of every unsplit sequence), and ``slot`` (the identity: the
+    summary's map of piece ``s`` goes to segment ``s``); ``first_index`` (``first`` as int64, distinct segments) and
+    ``first_seq`` (int64, the sequence of each first piece; ``None`` where every sequence splits, in table order) index
+    the copy of wave 1's end states into the segment state when the waves run ``fwd_ho_a``
+    (:data:`FWD_SPLIT_A_ARCHS`).  ``one_stream``: the summary then wave 1 on the caller's stream instead of the
+    summary on a side stream (the same kernels and bits).  ``ready``: the write of cached tables (both copies;
+    :func:`_use_forward_split`; ``None``: tables built for their call)."""
+
+    seg_chunk_start: torch.Tensor
+    seg_seq: torch.Tensor
+    seq_seg_start: torch.Tensor
+    first_end: torch.Tensor
+    first: torch.Tensor
+    middle: torch.Tensor
+    rest: torch.Tensor
+    slot: torch.Tensor
+    first_index: torch.Tensor
+    first_seq: torch.Tensor | None
+    num_segments: int
+    num_first: int
+    num_middle: int
+    num_rest: int
+    length: int
+    one_stream: bool = False
+    ready: TableReady | None = None
+
+
+def forward_split_lists(chunks, length: int) -> tuple[list[int], ...]:
+    """The host lists of :class:`ForwardSplit` for sequences of ``chunks`` chunks (table order) at piece length
+    ``length``: ``seg_chunk_start``, ``seg_seq``, ``seq_seg_start``, ``first_end``, ``first``, ``middle``, ``rest``
+    (pieces by :func:`segment_bounds`: balanced to within one chunk, ``ceil(n / length)`` of them)."""
+    seg_chunk_start: list[int] = [0]
+    seg_seq: list[int] = []
+    seq_seg_start: list[int] = [0]
+    first_end: list[int] = [0]
+    first: list[int] = []
+    middle: list[int] = []
+    rest: list[int] = []
+    for seq, n in enumerate(int(c) for c in chunks):
+        c0, s0 = seg_chunk_start[-1], len(seg_seq)
+        bounds = segment_bounds(n, int(length))
+        seg_chunk_start.extend(c0 + b for b in bounds[1:])
+        seg_seq.extend([seq] * (len(bounds) - 1))
+        seq_seg_start.append(len(seg_seq))
+        count = len(bounds) - 1
+        if count >= 2:
+            first.append(s0)
+            first_end.append(c0 + bounds[1])
+            middle.extend(range(s0 + 1, s0 + count - 1))
+            rest.extend(range(s0 + 1, s0 + count))
+        else:
+            first_end.append(c0 + n)
+            rest.append(s0)
+    return seg_chunk_start, seg_seq, seq_seg_start, first_end, first, middle, rest
+
+
+def forward_split_tables(
+    chunks: tuple[int, ...], length: int, device_index: int, one_stream: bool = False
+) -> ForwardSplit:
+    """:class:`ForwardSplit` of sequences of ``chunks`` chunks (table order) at piece length ``length``, copied to CUDA
+    device ``device_index`` in two transfers (the int32 tables, the int64 indices).  Not cached here: the host route
+    caches it with its write (:func:`_host_forward_split`)."""
+    lists = forward_split_lists(chunks, length)
+    num_segments = len(lists[1])
+    parts = [*lists, list(range(num_segments))]
+    # an empty walk binds a one-entry table (its launch is skipped)
+    parts = [part if part else [0] for part in parts]
+    table = torch.tensor([x for part in parts for x in part], dtype=torch.int32)
+    device = torch.device("cuda", int(device_index))
+    table = table.pin_memory().to(device, non_blocking=True)
+    views = []
+    offset = 0
+    for part in parts:
+        views.append(table[offset : offset + len(part)])
+        offset += len(part)
+    # the int64 indices of the copy of wave 1's end states (fwd_ho_a waves): first pieces and their sequences
+    first = lists[4]
+    first_seq = [lists[1][s] for s in first]
+    index = torch.tensor(
+        first + (first_seq if first_seq != list(range(len(chunks))) else []),
+        dtype=torch.int64,
+    )
+    index = index.pin_memory().to(device, non_blocking=True)
+    first_index = index[: len(first)]
+    first_seq_index = index[len(first) :] if index.numel() > len(first) else None
+    return ForwardSplit(seg_chunk_start=views[0], seg_seq=views[1], seq_seg_start=views[2], first_end=views[3],
+                        first=views[4], middle=views[5], rest=views[6], slot=views[7],
+                        first_index=first_index, first_seq=first_seq_index, num_segments=num_segments,
+                        num_first=len(first), num_middle=len(lists[5]), num_rest=len(lists[6]), length=int(length),
+                        one_stream=bool(one_stream))  # fmt: skip
+
+
+def forward_split_length(
+    meta: ChunkMeta, arch: str, num_v_heads: int, device_index: int
+) -> int | None:
+    """The piece length of the split forward of a host-built ``meta`` on ``arch``: the host plan's
+    (:func:`cake_plan.host_plan` on the planner's SM count) where ``meta``'s forward segment table splits a sequence
+    and the row is in the split's shape class (:func:`cake_plan.forward_split_length`), else ``None``."""
+    segs = meta.fwd_segments
+    if arch not in FWD_SPLIT_ARCHS or meta.seq_lens is None:
+        return None
+    if not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs):
+        return None
+    index = int(device_index)
+    plan = cake_plan.host_plan(
+        tuple(meta.seq_lens), int(num_v_heads), arch, _device_props(index)[0]
+    )
+    return cake_plan.forward_split_length(arch, plan.pieces)
+
+
+def _host_forward_split(
+    meta: ChunkMeta, num_v_heads: int, device_index: int, options: ChainOptions
+) -> ForwardSplit | None:
+    """:func:`forward_split_tables` of a host-built ``meta`` (its sequences in table order; wave 1 on one stream under
+    ``streams = 1``), cached in ``_FORWARD_SPLITS`` for the ``_FORWARD_SPLITS_LIMIT`` most recently used keys with
+    their write (outside a CUDA graph capture; a hit is made safe to read, :func:`_use_forward_split`), or ``None``
+    where :func:`forward_split_length` gives none or ``options`` pin the scan tables (``scan_config`` /
+    ``segment_chunks``: the prep forward's split scan runs as pinned)."""
+    if options.scan_config is not None or options.segment_chunks is not None:
+        return None
+    index = int(device_index)
+    length = forward_split_length(
+        meta, cake_backend.device_arch(index), num_v_heads, index
+    )
+    if length is None:
+        return None
+    chunks = cake_plan.chunk_counts(cast("tuple[int, ...]", meta.seq_lens))
+    if meta.order is not None:
+        chunks = tuple(chunks[seq] for seq in meta.order)
+    key = (tuple(chunks), int(length), index, options.streams == 1)
+    split = _FORWARD_SPLITS.pop(key, None)
+    if split is not None:
+        _FORWARD_SPLITS[key] = split
+        _use_forward_split(split, index)
+        return split
+    split = forward_split_tables(*key)
+    # a table built inside a CUDA graph capture (see "cached device tables") is not kept
+    if torch.cuda.is_current_stream_capturing():
+        return split
+    split = replace(split, ready=_table_ready(index))
+    if len(_FORWARD_SPLITS) >= _FORWARD_SPLITS_LIMIT:
+        _FORWARD_SPLITS.pop(next(iter(_FORWARD_SPLITS)), None)
+    _FORWARD_SPLITS[key] = split
+    return split
+
+
+def fwd_split_route(
+    meta: ChunkMeta, arch: str, q, k, v, beta, normalize_qk: bool, options: ChainOptions
+) -> bool:
+    """Whether a forward on ``meta`` runs the split forward (see :data:`FWD_SPLIT_ARCHS`): ``meta`` carries its tables
+    (:attr:`ChunkMeta.fwd_split`), the call meets :func:`_fwd_a_inputs` and the records of its form are delivered."""
+    split = meta.fwd_split
+    if split is None or arch not in FWD_SPLIT_ARCHS:
+        return False
+    if not _fwd_a_inputs(meta, q, k, v, beta, normalize_qk, options):
+        return False
+    return _fwd_split_a(arch, split.length) or all(
+        _available(stage, arch) for stage in FWD_SPLIT_W_STAGES
+    )
+
+
+def _fwd_split_a(arch: str, length: int) -> bool:
+    """Whether the split forward on ``arch`` at piece length ``length`` (chunks) runs on wy_a's A
+    (:data:`FWD_SPLIT_A_ARCHS` within ``FWD_SPLIT_ARCHS``, pieces of at least :data:`FWD_SPLIT_A_MIN_PIECE` chunks,
+    its stages delivered): a shape-only choice, from the host plan's piece length."""
+    return (
+        arch in FWD_SPLIT_ARCHS
+        and arch in FWD_SPLIT_A_ARCHS
+        and int(length) >= FWD_SPLIT_A_MIN_PIECE.get(arch, 0)
+        and all(_available(stage, arch) for stage in FWD_SPLIT_A_STAGES)
+    )
+
+
+def _split_workspaces(split: ForwardSplit, num_v_heads: int, table, workspaces, device):
+    """The stitch's segment state ``[B | M]``, its flags and the pieces' start states of a split forward."""
+    f32 = torch.float32
+    seg_state = workspaces.take(table, "f_seg_state", (split.num_segments, num_v_heads, HEAD_DIM, 2 * HEAD_DIM), f32,
+                                device)  # fmt: skip
+    seg_flag = workspaces.take(
+        table, "f_seg_flag", (split.num_segments, num_v_heads), torch.int32, device
+    )
+    seg_start = workspaces.take(table, "f_seg_start", (split.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM), f32,
+                                device)  # fmt: skip
+    return seg_state, seg_flag, seg_start
+
+
+def _first_wave(split: ForwardSplit, index: int, summary, wave1) -> None:
+    """Wave 1 (``wave1()``) beside the middle pieces' maps (``summary()``, on a side stream joined back before this
+    returns, also when a launch raises); both on the caller's stream, the summary first, under ``one_stream`` or where
+    either has no piece.  The two write disjoint segments, so the bits are the same either way."""
+    if not split.num_middle or not split.num_first or split.one_stream:
+        if split.num_middle:
+            summary()
+        if split.num_first:
+            wave1()
+        return
+    main = torch.cuda.current_stream(index)
+    side = _side_stream(index, main)
+    fork = torch.cuda.Event()
+    fork.record(main)
+    try:
+        with torch.cuda.stream(side):
+            side.wait_event(fork)
+            summary()
+        wave1()
+    finally:
+        main.wait_stream(side)  # the join
+
+
+def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk, options,
+                   tape) -> dict[str, Any]:  # fmt: skip
+    """The forward of :func:`fwd_split_route`'s calls (:data:`FWD_SPLIT_ARCHS`); the tape of
+    :func:`cake_gdn_det_train_forward` (``None`` for the state it does not keep)."""
+    split = cast("ForwardSplit", meta.fwd_split)
+    if _fwd_split_a(arch, split.length):
+        return _forward_split_a(q, k, v, g32, beta32, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
+                                output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
+                                tape=tape)  # fmt: skip
+    num_heads, num_v_heads = q.shape[-2], v.shape[-2]
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device = q.device
+    index = _tensor_index(q)
+    bf16 = q.dtype
+    hv = num_v_heads
+    q, k = _tma_operands(q, k)
+    # wy_tc2 reads v by rows at its token pitch (:func:`_v_rows`); any other layout, a contiguous v whose base is not
+    # 16-byte aligned among them, is copied into contiguous rows
+    v_rows = _v_rows(v)
+    if v_rows is None:
+        v, v_rows = _aligned(v, ROW_ALIGN_BYTES), num_v_heads
+    kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+    qn, kn, rstd_q, rstd_k, g_cs, A = _launch_wy_a(
+        q, k, g32, beta32, meta, num_heads, num_v_heads, index
+    )
+    # w and u are formed in memory either way (both waves and the summary read them); h and v_new only on the tape
+    state = _forward_tape_tensors(
+        kept, _forward_state(meta, kn, v), device, formed=("w", "u")
+    )
+    w, u = state["w"], state["u"]
+    o = torch.empty(v.shape, dtype=v.dtype, device=device)
+    workspaces = _workspaces(options)
+    table = workspaces.table(index)
+    word = sum(FWD_FUSED_TAPE[name] for name in kept if name in FWD_FUSED_TAPE)
+    rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
+    h_t = state["h"]
+    if h_t is None:
+        h_t = workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    v_new_t = rows if state["v_new"] is None else state["v_new"]
+    final_state, h0, use_init = _start_state(initial_state, meta, output_final_state, num_v_heads, table, workspaces,
+                                             device)  # fmt: skip
+    seg_state, seg_flag, seg_start = _split_workspaces(
+        split, hv, table, workspaces, device
+    )
+    _launch("wy_tc2", meta.num_chunks, hv, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
+            num_heads, hv, 1, v_rows)  # fmt: skip
+
+    def fused(walk, count, ends, use_seg, store_final, split_out):
+        _launch("fwd_fused", count * hv, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h_t, v_new_t, v_new_t, o, o,
+                final_state, meta.chunk_start, meta.chunk_len, split.seg_chunk_start, split.seg_seq, ends, walk,
+                num_heads, hv, use_init, store_final, use_seg, float(scale), word, seg_state, seg_flag,
+                split_out)  # fmt: skip
+
+    def summary():
+        _launch("fwd_summary", split.num_middle * hv, 1, 1, kn, w, u, g_cs, seg_state, seg_state, seg_flag,
+                meta.chunk_start, meta.chunk_len, split.seg_chunk_start, split.middle, split.slot, num_heads, hv,
+                *_SUMMARY_LAYOUT)  # fmt: skip
+
+    _first_wave(
+        split,
+        index,
+        summary,
+        lambda: fused(split.first, split.num_first, split.first_end, 0, 1, 1),
+    )
+    _launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, h0, seg_start, split.seq_seg_start, seg_flag, hv,
+            use_init, 0)  # fmt: skip
+    fused(
+        split.rest,
+        split.num_rest,
+        meta.seq_chunk_start,
+        1,
+        1 if output_final_state else 0,
+        0,
+    )
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
+    fwd: dict[str, Any] = {
+        "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
+        "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
+        "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
+        "final_state": final_state if output_final_state else None, "initial_state": initial_state, "options": options,
+        **state,
+    }  # fmt: skip
+    return _forward_result(fwd, kept, "fwd_split")
+
+
+def _forward_split_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk,
+                     options, tape) -> dict[str, Any]:  # fmt: skip
+    """The split forward on wy_a's A (:data:`FWD_SPLIT_A_ARCHS`): ``wy_a``, then wave 1 (``fwd_ho_a`` on the first
+    pieces, their end states as the final states) beside the middle pieces' maps (``fwd_summary_a``, side stream), the
+    copy of those end states into the segment state, the stitch and wave 2 (``fwd_ho_a`` on every other piece from its
+    stitched start state); the tape of :func:`cake_gdn_det_train_forward`, as the serial route's (u ``None``)."""
+    split = cast("ForwardSplit", meta.fwd_split)
+    num_heads, num_v_heads = q.shape[-2], v.shape[-2]
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device = q.device
+    index = _tensor_index(q)
+    f32, bf16 = torch.float32, q.dtype
+    hv = num_v_heads
+    q, k = _tma_operands(q, k)
+    # fwd_ho_a's and fwd_summary_a's tensor maps read v in place where the stages that read v by rows do, else a copy
+    if _v_rows(v) is None:
+        v = _aligned(v, ROW_ALIGN_BYTES)
+    kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+    qn, kn, rstd_q, rstd_k, g_cs, A = _launch_wy_a(
+        q, k, g32, beta32, meta, num_heads, num_v_heads, index
+    )
+    state = _forward_tape_tensors(kept, _forward_state(meta, kn, v), device)
+    o = torch.empty(v.shape, dtype=v.dtype, device=device)
+    workspaces = _workspaces(options)
+    table = workspaces.table(index)
+    word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
+    rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
+    h_t = state["h"]
+    if h_t is None:
+        h_t = workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    v_new_t = rows if state["v_new"] is None else state["v_new"]
+    w_t = rows if state["w"] is None else state["w"]
+    final_state, h0, use_init = _start_state(initial_state, meta, output_final_state, num_v_heads, table, workspaces,
+                                             device)  # fmt: skip
+    state_shape = (meta.num_seqs, hv, HEAD_DIM, HEAD_DIM)
+    # wave 1 stores the first pieces' end states as final states: the final-state output, or a buffer of every
+    # sequence's rows
+    first_final = (
+        final_state
+        if output_final_state
+        else workspaces.take(table, "f_first_final", state_shape, f32, device)
+    )
+    seg_state, seg_flag, seg_start = _split_workspaces(
+        split, hv, table, workspaces, device
+    )
+
+    def wave(walk, count, ends, init, use_seg, store_final, final):
+        _launch("fwd_ho_a", count * hv, 1, 1, qn, kn, v, A, g_cs, beta32, h0, seg_start, h_t, h_t, v_new_t, v_new_t,
+                o, o, final, w_t, w_t, meta.chunk_start, meta.chunk_len, split.seg_chunk_start, split.seg_seq, ends,
+                walk, num_heads, hv, init, store_final, use_seg, float(scale), word)  # fmt: skip
+
+    def summary():
+        _launch("fwd_summary_a", split.num_middle * hv, 1, 1, kn, v, A, g_cs, beta32, seg_state, seg_state, seg_flag,
+                meta.chunk_start, meta.chunk_len, split.seg_chunk_start, split.middle, split.slot, num_heads, hv,
+                *_SUMMARY_LAYOUT)  # fmt: skip
+
+    if split.num_first:
+        # the first pieces' segments hold their end states (flag 0: a state, not a map) for the stitch; the segments
+        # of first_index are distinct, so the fill is a plain store
+        seg_flag.index_fill_(0, split.first_index, 0)
+    _first_wave(
+        split,
+        index,
+        summary,
+        lambda: wave(
+            split.first, split.num_first, split.first_end, use_init, 0, 1, first_final
+        ),
+    )
+    if split.num_first:
+        ends = (
+            first_final
+            if split.first_seq is None
+            else first_final.index_select(0, split.first_seq)
+        )
+        # one distinct segment row per first piece: a plain copy, the same bits under any order
+        seg_state[:, :, :, :HEAD_DIM].index_copy_(0, split.first_index, ends)
+    _launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, h0, seg_start, split.seq_seg_start, seg_flag, hv,
+            use_init, 0)  # fmt: skip
+    wave(
+        split.rest,
+        split.num_rest,
+        meta.seq_chunk_start,
+        0,
+        1,
+        1 if output_final_state else 0,
+        final_state,
+    )
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
+    fwd: dict[str, Any] = {
+        "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
+        "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
+        "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
+        "final_state": final_state if output_final_state else None, "initial_state": initial_state, "options": options,
+        **state,
+    }  # fmt: skip
+    return _forward_result(fwd, kept, "fwd_split")
+
+
 def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None,
-                               output_final_state=False, normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
+                               output_final_state=False, normalize_qk=True, options: ChainOptions | None = None,
+                               tape: bool = True) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
-    output and the tape the backward reads."""
+    output and the tape the backward reads (``"forward"``: ``"fwd_split"``, ``"fwd_ho_a"`` or ``"fwd_ho"``).  A call
+    of :func:`fwd_split_route` runs the split forward, one of :func:`fwd_a_route` the forward on wy_a's A, every
+    other call the prep forward.  The forwards on wy_a's A put in the tape only the state the architecture's tape level
+    keeps (:func:`cake_plan.tape_state`; ``None`` for the rest, u always), and none when ``tape`` is ``False`` (a call
+    that records no backward); the backward rebuilds what the tape lacks.  The prep forward's tape carries all four."""
     options = options or ChainOptions()
     num_heads, key_dim = q.shape[-2], q.shape[-1]
     num_v_heads, value_dim = v.shape[-2], v.shape[-1]
@@ -2578,6 +3440,16 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
     total_tokens = q.numel() // (num_heads * key_dim)
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
+    # the route is decided from host facts (the table, the architecture, shapes, dtypes, pins) before any operand is
+    # copied; the forwards on wy_a's A then read g and beta as contiguous rows at a 16-byte aligned base
+    split = fwd_split_route(meta, arch, q, k, v, beta, normalize_qk, options)
+    if split or fwd_a_route(meta, arch, q, k, v, beta, normalize_qk, options):
+        g_rows = _aligned(g if g.dtype == torch.float32 else g.float(), ROW_ALIGN_BYTES)
+        beta_rows = _aligned(beta, ROW_ALIGN_BYTES)
+        run = _forward_split if split else _forward_a
+        return run(q, k, v, g_rows, beta_rows, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
+                   output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
+                   tape=tape)  # fmt: skip
     device = q.device
     # q and k stay views when prep_tma reads them in place (a packed row's head views); v stays a view when the
     # stages that read it take its row pitch (wy_tc reads contiguous rows only); an operand whose address the loads
@@ -2644,7 +3516,7 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
         "w": w, "u": u, "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
         "final_state": final_state if output_final_state else None, "initial_state": initial_state, "h": h,
-        "v_new": v_new, "options": options, "mode": _TAPE_MODE,
+        "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_ho",
     }  # fmt: skip
 
 
@@ -2680,7 +3552,11 @@ def cake_gdn_det_train_backward(
     if initial_state is None:
         initial_state = forward.get("initial_state")
     has_initial_state = initial_state is not None
-    if forward.get("w") is None or forward.get("u") is None:
+    # the tape of a forward on wy_a's A lacks u (and w / h / v_new where it keeps no tape): the WY stage runs again
+    # (recompute = 1, on the tape's A) where w is missing, or h / v_new are missing with u, and the forward scan where
+    # h / v_new are missing
+    rebuild_state = forward.get("h") is None or forward.get("v_new") is None
+    if forward.get("w") is None or (rebuild_state and forward.get("u") is None):
         w, u = _launch_wy(
             arch,
             kn,
@@ -2696,8 +3572,8 @@ def cake_gdn_det_train_backward(
             v_rows=v_rows,
         )
     else:
-        w, u = forward["w"], forward["u"]
-    if forward.get("h") is None or forward.get("v_new") is None:
+        w, u = forward["w"], forward.get("u")
+    if rebuild_state:
         h, v_new, _ = _launch_fwd_h(arch, kn, w, u, g_cs, _table_rows(initial_state, meta), meta, num_heads,
                                     num_v_heads,
                                     store_final_state=False, table=table, workspaces=workspaces,
@@ -3051,11 +3927,14 @@ def _chunk_meta(
     options: ChainOptions,
     *,
     num_heads: int | None = None,
+    a_inputs: bool = False,
 ) -> ChunkMeta:
     """The chunk and segment tables of one call on device ``index``: a ``host_cache`` hit on the layout's key, else
     planned (the layout's sequence lengths are derived only then).  ``num_heads`` (the key heads) lets a host-built
     table take the serial-scan rule's adjoint plan (:func:`_serial_adjoint_plan`; ``None``: the planner's plans);
-    then the tables priced for the tcgen05 chains (:func:`host_plans`)."""
+    then the tables priced for the tcgen05 chains (:func:`host_plans`).  ``a_inputs`` (the call meets
+    :func:`_wy_a_inputs`) lets a host-built table take the serial forward table of ``FWD_A_SERIAL_KEEP`` and carry
+    the split forward's tables (:func:`_host_forward_split`)."""
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
         layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
@@ -3086,11 +3965,17 @@ def _chunk_meta(
         options.finalize,
         TC_PLAN,
         tuple(sorted(CHAIN_PLAN)),
+        bool(a_inputs),
+        FWD_A_ARCHS,
+        FWD_SPLIT_ARCHS,
+        tuple(sorted(cake_plan.FORWARD_SPLIT_MIN_PIECE.items())),
+        tuple(sorted(FWD_A_SERIAL_KEEP.items())),
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
         if meta is not None:
-            _use_table(meta.chunk_start, meta.ready, int(index))
+            # the split forward's tables too: the forward reads them from the hit without a lookup of its own
+            _use_meta_tables(meta, int(index))
             return meta
     if cu_seqlens is None:
         seq_lens = (int(seq_len),) * int(batch)
@@ -3099,10 +3984,14 @@ def _chunk_meta(
         _check_offsets(layout, total_tokens)
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
     plans, bwd_tc = host_plans(seq_lens, int(num_v_heads), int(index), options, total_tokens=total_tokens,
-                               num_heads=num_heads)  # fmt: skip
+                               num_heads=num_heads, a_inputs=a_inputs)  # fmt: skip
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if bwd_tc:
         meta = replace(meta, bwd_tc=True)
+    if a_inputs:
+        fwd_split = _host_forward_split(meta, int(num_v_heads), int(index), options)
+        if fwd_split is not None:
+            meta = replace(meta, fwd_split=fwd_split)
     if options.streams == 2:
         fwd_groups, bwd_groups = sequence_groups(
             meta, int(num_v_heads), _device_props(int(index))[0]
@@ -3138,16 +4027,32 @@ class CakeGDNDetFunction(torch.autograd.Function):
             num_v_heads,
             options,
             num_heads=num_heads,
+            a_inputs=_wy_a_inputs(
+                num_heads, num_v_heads, beta.dtype, use_qk_l2norm_in_kernel, options
+            ),
         )
+        tape = _forward_tape()
         fwd = cake_gdn_det_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
                                          initial_state=initial_state, output_final_state=output_final_state,
-                                         normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
-        state_tensors = (
-            (fwd["w"], fwd["u"], fwd["h"], fwd["v_new"]) if options.save_state else ()
-        )
+                                         normalize_qk=use_qk_l2norm_in_kernel, options=options,
+                                         tape=tape)  # fmt: skip
+        # a fixed saved list of 13: the state the architecture's tape level keeps under save_state
+        # (cake_plan.tape_state: w, h and v_new under T_full), a placeholder of the same shape, dtype and device for
+        # the rest and for everything without a tape (a checkpoint's first pass compares the two passes' saved
+        # lists); the backward reads only the state the level keeps (CakeGDNDetFunction.backward)
+        kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+        state_tensors = [
+            fwd[name]
+            if name in kept
+            else cake_plan.placeholder(shape, dtype, fwd["qn"].device)
+            for name, (shape, dtype) in zip(
+                cake_plan.STATE_NAMES,
+                _forward_state(meta, fwd["kn"], fwd["v"]),
+                strict=True,
+            )
+        ]
         ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
                               fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
-        ctx.saved_state_tensors = bool(state_tensors)
         ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
         ctx.grad_shapes = (g.shape, beta.shape)
         ctx.normalize_qk = bool(use_qk_l2norm_in_kernel)
@@ -3171,8 +4076,17 @@ class CakeGDNDetFunction(torch.autograd.Function):
         tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
                 "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
                 "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options, "mode": ctx.mode}  # fmt: skip
-        if ctx.saved_state_tensors:
-            tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
+        # the state of the architecture's tape level under save_state (a checkpoint's recomputed forward keeps it
+        # even where its first pass kept none); every other entry is a placeholder, never read: the backward
+        # rebuilds that state (as it does for a level entry that is a placeholder, judged from its strides alone)
+        kept = cake_plan.tape_state(ctx.arch, ctx.options.save_state)
+        tape.update(
+            (name, saved)
+            for name, saved in zip(cake_plan.STATE_NAMES, state_tensors, strict=True)
+            if name in kept
+            and saved is not None
+            and not cake_plan.is_placeholder(saved)
+        )
         grads = cake_gdn_det_train_backward(
             tape,
             do.contiguous(),
@@ -3256,5 +4170,14 @@ def cake_gdn_det(
         g = g.float()
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    return CakeGDNDetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
-                                    cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
+    # a call that records no backward (grad mode off, or no input that requires grad) keeps no forward tape
+    records = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+    )
+    token = None if records else _RECORDS_BACKWARD.set(False)
+    try:
+        return CakeGDNDetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
+                                        cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
+    finally:
+        if token is not None:
+            _RECORDS_BACKWARD.reset(token)
