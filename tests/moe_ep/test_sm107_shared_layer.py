@@ -3,6 +3,8 @@
 """Shared weight ownership, workspace bindings and tuning compatibility."""
 
 import dataclasses
+import gc
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -98,8 +100,21 @@ def test_shared_layer_construction_retains_both_weight_sets(monkeypatch):
     assert other._get_transformed_weights() is prepared
     assert layer._preprocessing_count == 1
     assert other._preprocessing_count == 0
+    weight_refs = [
+        weakref.ref(value)
+        for weights in (prepared.routed, prepared.shared)
+        for pair in weights
+        for value in pair
+    ]
+    assert layer._workspace is None
     other.destroy()
+    del other, prepared
+    gc.collect()
+    assert all(ref() is not None for ref in weight_refs)
     layer.destroy()
+    del layer
+    gc.collect()
+    assert all(ref() is None for ref in weight_refs)
 
 
 def test_routed_w4a4_inherited_weight_preparation():
@@ -203,11 +218,12 @@ def test_shared_binding_reuses_weights_and_rebinds_pool():
 def test_shared_forward_uses_live_extent(live, output_mode):
     ws, prepared = _workspace()
     bind_prepared_weights(ws, prepared)
+    ws.launch.side_effect = lambda *args, output: output.fill_(3)
     output = None
     if output_mode == "caller":
-        output = torch.empty((live, 128), dtype=torch.bfloat16)
+        output = torch.zeros((live, 128), dtype=torch.bfloat16)
     elif output_mode == "strided":
-        output = torch.empty((live, 256), dtype=torch.bfloat16)[:, ::2]
+        output = torch.zeros((live, 256), dtype=torch.bfloat16)[:, ::2]
     result = block_scaled.sm107_block_scaled_mega_moe(
         output, *prepared.routed, ws, num_tokens=live
     )
@@ -220,8 +236,10 @@ def test_shared_forward_uses_live_extent(live, output_mode):
             result.untyped_storage().data_ptr()
             == ws.output_activation.untyped_storage().data_ptr()
         )
+        torch.testing.assert_close(result, torch.full_like(result, 3))
     else:
         assert result is None
+        torch.testing.assert_close(output, torch.full_like(output, 3))
 
 
 def test_shared_cache_records_cannot_alias_routed_only():
@@ -533,9 +551,6 @@ def test_shared_layer_pooled_replay(
             assert view.shape == (live, problem.HIDDEN)
             assert_reference(view, expected[0], "mxfp4_mxfp8")
         # Captures depend on layer-owned weights, not caller references.
-        import gc
-        import weakref
-
         weight_refs = [weakref.ref(v) for pair in prepared.shared for v in pair]
         del source, prepared, zero_shared
         gc.collect()

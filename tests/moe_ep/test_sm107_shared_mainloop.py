@@ -3,8 +3,16 @@
 """Mixed-weight tasks share stage boundaries without sharing weight formats."""
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.arch_rubin
+
+
+@pytest.fixture(autouse=True)
+def _require_rubin_worker():
+    # The root architecture hook is absent with --confcutdir=tests/moe_ep.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
 
 
 def _mainloop(tile, *, shared):
