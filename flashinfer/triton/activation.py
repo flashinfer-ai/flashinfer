@@ -47,6 +47,7 @@ def silu_and_mul(
         o_scale_ptr=o_scale,
         x_ptr=x,
         x_stride=x.stride(0),
+        x_inner_stride=x.stride(1),
         x_scale_ptr=x_scale,
         d=d,
         BLOCK_SIZE=1024,

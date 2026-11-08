@@ -11,6 +11,7 @@ def silu_and_mul_kernel(
     o_scale_ptr,
     x_ptr,
     x_stride,
+    x_inner_stride,
     x_scale_ptr,
     d,
     BLOCK_SIZE: tl.constexpr,
@@ -24,7 +25,8 @@ def silu_and_mul_kernel(
         o_stride:    Output tensor stride.
         o_scale_ptr: The optional, known scale of the output activations.
         x_ptr:       Pointer to the 2D input tensor.
-        x_stride:    Input tensor stride.
+        x_stride:    Input row stride.
+        x_inner_stride: Input column stride.
         x_scale_ptr: The optional, known scale of the input tensor.
         d:           The number of elements along the second dimension.
         BLOCK_SIZE:  Tunable block size to process in each kernel.
@@ -47,8 +49,11 @@ def silu_and_mul_kernel(
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
 
-    a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
-    b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+    x_offsets = offsets.to(tl.int64) * x_inner_stride
+    a = tl.load(x_row_ptr + x_offsets, mask=mask).to(tl.float32)
+    b = tl.load(x_row_ptr + x_offsets + d.to(tl.int64) * x_inner_stride, mask=mask).to(
+        tl.float32
+    )
 
     if HAS_X_SCALE:
         x_scale = tl.load(x_scale_ptr)
