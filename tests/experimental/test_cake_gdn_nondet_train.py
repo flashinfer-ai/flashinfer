@@ -355,7 +355,7 @@ PDL_STAGES = frozenset(
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 45 and len(set(cake_jit.STAGES)) == 45
+    assert len(cake_jit.STAGES) == 47 and len(set(cake_jit.STAGES)) == 47
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -1448,6 +1448,9 @@ def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) ->
     # package's bits
     # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty); plan "stage1": the shipped plan, where a row the
     # one-wave split prices runs the split beside the group's cluster tail instead of the R form
+    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
+    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     index = cake_chain._device_index(device)
     arch = cake_backend.device_arch(index)
     seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
@@ -2632,6 +2635,9 @@ def test_the_tail_keeps_the_deterministic_bits_but_dq_dk(
     # same bits run to run (the planner's tables, as the deterministic package plans them).  Without the FP32
     # dv_local adjoint (DVL32_ARCHS empty) the package keeps the deterministic package's o, dv, dg and dbeta, and its
     # fixed-order tails all of the deterministic bits; dq / dk stay within the budgets of both
+    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
+    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     seq_lens = TAIL_LAYOUT
     group = heads[1] // heads[0]
@@ -3580,7 +3586,9 @@ def test_packed_views_give_the_contiguous_bits(
 ) -> None:
     # q / k / v as head views of one packed row give the bits of contiguous copies, every output and gradient:
     # prep_tma reads q / k in place (also where the rule's band would run the plain prep on contiguous rows: the two
-    # preps give the same bits), v is copied byte for byte; a plain pin copies q / k as well
+    # preps give the same bits), v is copied byte for byte; a plain pin copies q / k as well.  The prep's forward:
+    # fwd_a_route's forward reads the packed row in place too (test_fwd_a_packed_views_give_the_contiguous_bits)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     seq_lens = (300, 77, 640, 1)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=233)
     pins = {"prep": "plain"} if band == "plain-pin" else {}
@@ -4765,3 +4773,282 @@ def test_the_backward_plan_under_activation_checkpointing(device, monkeypatch) -
     assert len(replays) == 2
     for got in runs:
         _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- the forward on the WY stage's A
+# Layouts whose forward segment table is serial on every device of the package (more sequences x value heads than SMs,
+# 192 CTAs): partial chunks, a one-token sequence, value-head groups of three, two and one.
+FWD_A_CASES = {
+    "g3": ((16, 48), (300, 77, 1, 130)),
+    "g2": ((16, 32), (300, 77, 1, 130, 64, 65)),
+    "g1": ((16, 16), (300, 77, 1, 130, 64, 65, 200, 17, 129, 5, 63, 250)),
+}
+
+
+def _fwd_a_or_skip(device) -> str:
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if arch not in cake_chain.FWD_A_ARCHS:
+        pytest.skip(f"the forward on the WY stage's A is not routed on {arch}")
+    return arch
+
+
+def _record_launch_values(monkeypatch) -> list[tuple[str, tuple]]:
+    """The (stage, values) of every launch from here on, in order."""
+    launches: list[tuple[str, tuple]] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, grid, values, **kwargs):
+        launches.append((stage, tuple(values)))
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return launches
+
+
+def _tape_words(launches) -> list[int]:
+    """The tape word of every fwd_ho_a launch (its last argument at the call site, wherever the record puts it)."""
+    names = cake_backend.parameters(
+        cake_backend.stage_record(
+            "fwd_ho_a", cake_backend.device_arch(torch.cuda.current_device())
+        )
+    )
+    return [
+        int(values[names.index("tape")])
+        for stage, values in launches
+        if stage == "fwd_ho_a"
+    ]
+
+
+def test_fwd_a_route_rule(monkeypatch) -> None:
+    # the forward on the WY stage's A takes a host-built table whose forward segment table is serial, FP32 beta,
+    # normalized q / k, a value-head group of at most three, no prep pin and 16-byte aligned q / k
+    monkeypatch.setattr(cake_chain, "_available", lambda _stage, _arch: True)
+
+    def meta(seq_lens, segment_len=0, num_segments=None):
+        segs = types.SimpleNamespace(
+            segment_len=segment_len,
+            num_segments=len(seq_lens) if num_segments is None else num_segments,
+        )
+        return types.SimpleNamespace(
+            seq_lens=seq_lens, num_seqs=len(seq_lens), fwd_segments=segs
+        )
+
+    def tensors(h, hv, beta_dtype=torch.float32):
+        q = torch.empty(1, 64, h, HEAD_DIM, dtype=torch.bfloat16, device="meta")
+        v = torch.empty(1, 64, hv, HEAD_DIM, dtype=torch.bfloat16, device="meta")
+        return q, q, v, torch.empty(1, 64, hv, dtype=beta_dtype, device="meta")
+
+    whole = meta((300, 77, 1, 130))
+    route = cake_chain.fwd_a_route
+    opts = cake_chain.make_options()
+    assert route(whole, "sm_100a", *tensors(16, 48), True, opts)
+    assert route(whole, "sm_103a", *tensors(16, 48), True, opts)
+    assert not route(whole, "sm_107a", *tensors(16, 48), True, opts)
+    assert not route(whole, "sm_100a", *tensors(16, 48, torch.bfloat16), True, opts)
+    assert not route(whole, "sm_100a", *tensors(16, 48), False, opts)
+    assert not route(whole, "sm_100a", *tensors(12, 48), True, opts)  # a group of four
+    assert not route(
+        whole, "sm_100a", *tensors(16, 48), True, cake_chain.make_options(prep="tma")
+    )
+    # long sequences on a serial forward segment table route; the same lengths on a split table do not
+    assert route(meta((11000, 12000, 9768)), "sm_100a", *tensors(16, 48), True, opts)
+    assert not route(
+        meta((11000, 12000, 9768), 64, 9), "sm_100a", *tensors(16, 48), True, opts
+    )
+    assert not route(
+        meta((131071, 87531, 43385), 128, 33), "sm_100a", *tensors(2, 6), True, opts
+    )
+    assert route(meta((4096,) * 64), "sm_100a", *tensors(2, 6), True, opts)
+    assert route(meta((64, 17, 1)), "sm_100a", *tensors(1, 3), True, opts)
+    # a split table of short sequences and the device-built table (no lengths) keep the forward of the prep
+    assert not route(
+        meta((4096,) * 64, 16, 1024), "sm_100a", *tensors(2, 6), True, opts
+    )
+    device_built = types.SimpleNamespace(
+        seq_lens=None,
+        num_seqs=2,
+        fwd_segments=types.SimpleNamespace(segment_len=0, num_segments=2),
+    )
+    assert not route(device_built, "sm_100a", *tensors(2, 6), True, opts)
+
+
+@pytest.mark.parametrize("case", sorted(FWD_A_CASES))
+def test_fwd_a_matches_the_fp64_recurrence(case, device, monkeypatch) -> None:
+    # wy_a and fwd_ho_a replace the prep, the WY stage and fwd_ho; o, the final state and every gradient (the initial
+    # state's too) within the accuracy gate of the FP64 recurrence
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES[case]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=401)
+    gen = torch.Generator().manual_seed(402)
+    h0 = (
+        torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen) * 0.1
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    stages = _record_launches(monkeypatch)
+    got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
+    fwd = stages[: stages.index("fwd_ho_a") + 1]
+    assert fwd[-2:] == ["wy_a", "fwd_ho_a"], fwd
+    assert not {"prep", "prep_tma", "wy_tc2", "fwd_ho"} & set(stages), stages
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
+
+
+@pytest.mark.parametrize("case", sorted(FWD_A_CASES))
+def test_fwd_a_within_the_budgets_of_the_prep_forward(
+    case, device, monkeypatch
+) -> None:
+    # the forward on the WY stage's A against the forward of the prep, the WY stage and fwd_ho on the same inputs
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES[case]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=403)
+    got = _run(inputs, seq_lens, output_final_state=True)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
+    stages = _record_launches(monkeypatch)
+    want = _run(inputs, seq_lens, output_final_state=True)
+    assert "fwd_ho" in stages and "fwd_ho_a" not in stages, stages
+    _assert_within_budget(got, want, OUTPUT_NAMES + ("final_state",))
+
+
+def test_fwd_a_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
+    # a call that records no backward (no_grad, or no input that requires grad) writes no tape (word 0); o and the final
+    # state are the bits of the taped call (word 11: h, v_new and w)
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES["g3"]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=405)
+    cu = _cu(seq_lens)
+    kwargs = {
+        "scale": 1.0 / math.sqrt(HEAD_DIM),
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": True,
+        "cu_seqlens": torch.tensor(cu, dtype=torch.int64, device=device),
+        "cu_seqlens_cpu": torch.tensor(cu, dtype=torch.int64),
+    }
+    launches = _record_launch_values(monkeypatch)
+    leaves = [
+        inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    taped = cake_gdn_nondet(*leaves, **kwargs)
+    with torch.no_grad():
+        no_grad = cake_gdn_nondet(*leaves, **kwargs)
+    plain = cake_gdn_nondet(
+        *(inputs[n] for n in ("q", "k", "v", "g", "beta")), **kwargs
+    )
+    torch.cuda.synchronize()
+    assert _tape_words(launches) == [11, 0, 0], _tape_words(launches)
+    for got in (no_grad, plain):
+        _assert_same_bits(
+            {"o": got[0], "final_state": got[1]},
+            {"o": taped[0].detach(), "final_state": taped[1].detach()},
+            ("o", "final_state"),
+        )
+
+
+def test_fwd_a_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -> None:
+    # wy_a always normalizes q / k: a call without the in-kernel normalization runs the prep, wy_tc2 and fwd_ho on a
+    # layout fwd_a_route takes otherwise, with the bits of the package whose forward is the prep's everywhere
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES["g3"]
+    # unit-norm q / k rows, as a caller that normalizes them itself passes them
+    inputs = _inputs(
+        seq_lens, heads, torch.float32, device, seed=409, normalized_qk=True
+    )
+    stages = _record_launches(monkeypatch)
+    _run(inputs, seq_lens)
+    assert "fwd_ho_a" in stages, stages
+    stages.clear()
+    got = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
+    assert "fwd_ho_a" not in stages and "wy_a" not in stages, stages
+    assert "fwd_ho" in stages or "fwd_ho_vh2" in stages, stages
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
+    want = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
+    assert all(bool(torch.isfinite(got[name].float()).all()) for name in OUTPUT_NAMES)
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("reentrant", [False, True], ids=["non-reentrant", "reentrant"])
+def test_fwd_a_checkpoint_writes_the_tape_once(reentrant, device, monkeypatch) -> None:
+    # under torch.utils.checkpoint the first pass keeps no tape (its saved tensors are dropped either way) and the
+    # recompute writes it: the gradients are the bits of the plain call
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES["g3"]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=407)
+    want = _run(inputs, seq_lens)
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+
+    def layer(q, k, v, g, beta):
+        o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+                               cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
+        return o
+
+    leaves = {
+        n: inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    }
+    launches = _record_launch_values(monkeypatch)
+    o = checkpoint(layer, *leaves.values(), use_reentrant=reentrant)
+    (o.float() * inputs["do"].float()).sum().backward()
+    torch.cuda.synchronize()
+    assert _tape_words(launches) == [0, 11], _tape_words(launches)
+    got = {
+        "o": o.detach(),
+        **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+    }
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("case", sorted(FWD_A_CASES))
+def test_fwd_a_packed_views_give_the_contiguous_bits(case, device, monkeypatch) -> None:
+    # q / k / v as head views of one packed row: wy_a reads q / k and fwd_ho_a reads v in place (no copy launch), the
+    # bits of contiguous inputs on every output and gradient
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES[case]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=409)
+    want = _run(inputs, seq_lens)
+    launches = _record_launch_values(monkeypatch)
+    got = _run_packed(inputs, seq_lens, heads)
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+    wy_a = next(values for stage, values in launches if stage == "wy_a")
+    assert any(not t.is_contiguous() for t in wy_a if isinstance(t, torch.Tensor)), (
+        "q / k were copied"
+    )
+
+
+def test_fwd_a_saved_list_keeps_its_arity(device) -> None:
+    # the saved list of the forward on the WY stage's A has the entries, shapes, dtypes and devices of the prep
+    # forward's: the T_full state (w, h, v_new) and a placeholder for u
+    arch = _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES["g3"]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=411)
+    cu = _cu(seq_lens)
+    leaves = {
+        n: inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    }
+    o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                           scale=1.0 / math.sqrt(HEAD_DIM), use_qk_l2norm_in_kernel=True,
+                           cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                           cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64))  # fmt: skip
+    saved = _saved_list(o)
+    assert len(saved) == 9 + len(cake_plan.STATE_NAMES)
+    kept = cake_plan.tape_state(arch, True)
+    total, hv = sum(seq_lens), heads[1]
+    chunks = sum(-(-n // 64) for n in seq_lens)
+    shapes = {"w": (total, hv, HEAD_DIM), "u": (1, total, hv, HEAD_DIM), "h": (chunks, hv, HEAD_DIM, HEAD_DIM),
+              "v_new": (1, total, hv, HEAD_DIM)}  # fmt: skip
+    for name, t in zip(cake_plan.STATE_NAMES, saved[9:], strict=True):
+        placeholder = (
+            all(s == 0 for s in t.stride())
+            and t.untyped_storage().nbytes() == t.element_size()
+        )
+        assert placeholder is (name not in kept), (name, t.stride())
+        assert tuple(t.shape) == shapes[name] and t.dtype == torch.bfloat16, (
+            name,
+            t.shape,
+            t.dtype,
+        )
+    assert saved[7].shape == (total, hv, 64) and saved[7].dtype == torch.bfloat16  # A

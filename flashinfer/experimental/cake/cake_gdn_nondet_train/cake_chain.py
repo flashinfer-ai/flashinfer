@@ -30,7 +30,13 @@ for the segment start states; on the architectures of ``FWD_HO_VH2_ARCHS`` a
 scan of one launch whose CTAs fill at most half of the SMs runs as
 ``fwd_ho_vh2``, two CTAs per segment and value head, one value half each,
 :func:`fwd_ho_vh2_engaged`, where the record is the split program,
-:func:`fwd_ho_vh2_splits`; the same bits).  The backward runs ``dv_local`` and
+:func:`fwd_ho_vh2_splits`; the same bits).  On the architectures of
+``FWD_A_ARCHS`` a host-built table whose forward segment table is serial
+runs two launches instead (:func:`fwd_a_route`): the WY A
+producer ``wy_a`` (A by tcgen05 and TF32x3 merges beside the prep's bits) and
+the fused scan and output on its A, qn and kn, ``fwd_ho_a``, which writes the
+tape's h / v_new / w only when the call keeps a tape; the backward reads that
+tape unchanged.  The backward runs ``dv_local`` and
 the register scan of the adjoint state (with the pre-scan and the stitch on a
 split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
@@ -111,6 +117,7 @@ from __future__ import annotations
 import math
 import warnings
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import cache, lru_cache
 from operator import itemgetter
@@ -150,6 +157,8 @@ __all__ = [
     "CHAIN_PLAN",
     "FWD_HO_VH2_ARCHS",
     "FWD_HO_VH2_STEP",
+    "FWD_A_ARCHS",
+    "WY_A_MAX_GROUP",
     "SPLIT_R_FORM",
     "TC_PLAN",
     "TC_PLAN_GAIN",
@@ -182,6 +191,7 @@ __all__ = [
     "finalize_stage",
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
+    "fwd_a_route",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -274,6 +284,16 @@ _TAIL_F32X_ARGS = (
     "dk_row_stride",
     "dv_row_stride",
 )
+# the WY A producer of package v2's forward: k bound to two tensor maps (64- and 32-row boxes), then q; A, qn and kn are
+# written as BF16 pairs (32-bit words)
+_WY_A_ARGS = ("k_tma64", "k_tma32", "q_tma", "glog", "beta", "a_out", "rk_out", "rq_out", "gcs_out", "qn_out", "kn_out",
+              "chunk_start", "chunk_len", "num_chunks", "num_heads", "num_v_heads")  # fmt: skip
+# the fused scan and output on wy_a's A, qn and kn: every tape tensor bound as its tensor map and its pointer, the tape
+# word last
+_FWD_A_ARGS = ("qn_tma", "kn_tma", "v_tma", "a_tma", "g_cs", "beta", "h0", "seg_start", "h_tma", "h_out", "v_new_tma",
+               "v_new", "o_tma", "o_out", "final_state", "w_tma", "w_out", "chunk_start", "chunk_len",
+               "seg_chunk_start", "seg_seq", "seq_chunk_start", "walk", "num_heads", "num_v_heads", "use_initial_state",
+               "store_final_state", "use_seg_start", "scale", "tape")  # fmt: skip
 _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_seg_chunk_start", "fwd_seg_seq",
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
@@ -286,7 +306,9 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "prep_tma_bf16beta": _PREP_TMA_ARGS,
     "wy_tc": _WY_ARGS,
     "wy_tc2": _WY_ARGS + ("v_row_heads",),
+    "wy_a": _WY_A_ARGS,
     "fwd_ho": _FWD_HO_ARGS,
+    "fwd_ho_a": _FWD_A_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "piece_chain": _CHAIN_ARGS,
@@ -2921,12 +2943,235 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     return h, v_new, final_state, o
 
 
+# --------------------------------------------------------------------------- #
+# the forward on the WY stage's A (the rows whose forward scan is serial)
+# --------------------------------------------------------------------------- #
+# On an architecture of ``FWD_A_ARCHS`` a call on a host-built table whose forward segment table is serial (no sequence
+# split over several scan CTAs, ``ChunkMeta.fwd_segments``) runs two launches instead of the prep, ``wy_tc2`` and
+# ``fwd_ho``: ``wy_a``, the WY A producer (``A = bf16(X)``, ``X = (I + L)^-1`` of every chunk and value head by a
+# tcgen05 product and TF32x3 merges, within half a BF16 ulp of the FP64 ``X``, beside the prep's rstd_q / rstd_k / g_cs
+# / qn / kn bits; one persistent CTA per SM over the (chunk, key head) items), and ``fwd_ho_a``, the fused scan and
+# output on that A, qn and kn (``u = bf16(A bf16(beta v))`` and ``w = bf16(A bf16(beta 2^g kn))`` formed in the CTA at
+# the deterministic forward's rounding points; one CTA per (segment, value head) on ``fwd_ho``'s walk).  ``fwd_ho_a``
+# writes the tape's h / v_new / w (:data:`FWD_A_TAPE`) when the call keeps a tape and none when it keeps none
+# (:func:`_forward_tape`); o and the final state are the same bits either way.  The tape is the ``T_full`` level's in
+# the same layouts, so the backward reads it unchanged (u is never formed in memory: its entry is a placeholder, as
+# under ``T_full``).  The route serves FP32 beta, normalized q / k, value-head groups of at most :data:`WY_A_MAX_GROUP`
+# and calls without a ``prep`` pin; every other call, and every row whose forward segment table splits a sequence, runs
+# the prep, ``wy_tc2`` and ``fwd_ho`` (the split forward keeps its own route). sm_107a builds both programs but keeps
+# the prep route until its timing is measured.
+FWD_A_ARCHS = ("sm_100a", "sm_103a")
+WY_A_MAX_GROUP = 3
+# fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
+FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
+
+
+def fwd_a_route(
+    meta: ChunkMeta, arch: str, q, k, v, beta, normalize_qk: bool, options: ChainOptions
+) -> bool:
+    """Whether a forward on ``meta`` runs ``wy_a`` and ``fwd_ho_a`` (see :data:`FWD_A_ARCHS`): q and k 16-byte aligned
+    (wy_a's tensor maps), the rest as there."""
+    num_heads, num_v_heads = int(q.shape[-2]), int(v.shape[-2])
+    if (
+        arch not in FWD_A_ARCHS
+        or not normalize_qk
+        or beta.dtype != torch.float32
+        or options.prep is not None
+        or meta.seq_lens is None
+        or num_v_heads > WY_A_MAX_GROUP * num_heads
+        or (q.data_ptr() | k.data_ptr()) % TMA_ALIGN_BYTES
+    ):
+        return False
+    segs = meta.fwd_segments
+    if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
+        return False
+    return _available("wy_a", arch) and _available("fwd_ho_a", arch)
+
+
+# Whether the forward of the call in flight keeps a tape: :func:`cake_gdn_nondet` sets it off around a call that
+# records no backward (grad mode off, or no input that requires grad); an autograd Function applied directly keeps one.
+_RECORDS_BACKWARD: ContextVar[bool] = ContextVar(
+    "cake_gdn_nondet_records_backward", default=True
+)
+_TOP_SAVED_TENSORS_HOOKS = getattr(
+    torch._C._autograd, "_top_saved_tensors_default_hooks", None
+)
+
+
+def _checkpoint_first_pass() -> bool:
+    """Whether the call runs in the first pass of a non-reentrant activation checkpoint (``torch.utils.checkpoint``,
+    ``use_reentrant=False``): that pass's saved tensors are dropped and the forward runs again before the backward, so
+    it keeps no tape.  Read from the innermost saved-tensor hooks: the checkpoint's own pack hook; any other hooks, or
+    none, keep the tape."""
+    if _TOP_SAVED_TENSORS_HOOKS is None:
+        return False
+    hooks = _TOP_SAVED_TENSORS_HOOKS(False)
+    if hooks is None:
+        return False
+    pack = hooks[0]
+    return getattr(pack, "__module__", None) == "torch.utils.checkpoint" and getattr(
+        pack, "__qualname__", ""
+    ).startswith("_checkpoint_hook.")
+
+
+def _forward_tape() -> bool:
+    """Whether the forward in flight keeps a tape (:data:`_RECORDS_BACKWARD`, outside a checkpoint's first pass)."""
+    return _RECORDS_BACKWARD.get() and not _checkpoint_first_pass()
+
+
+def _forward_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk, options,
+               tape) -> dict[str, Any]:  # fmt: skip
+    """The forward of :func:`fwd_a_route`'s calls: ``wy_a`` then ``fwd_ho_a``; the tape of
+    :func:`cake_gdn_nondet_train_forward`."""
+    num_heads, num_v_heads = q.shape[-2], v.shape[-2]
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device = q.device
+    index = _tensor_index(q)
+    f32, bf16 = torch.float32, q.dtype
+    # wy_a's tensor maps take q / k at their strides: the head views of a packed row are read in place; any other
+    # layout is copied into contiguous rows (:func:`_tma_rows`)
+    if not (_tma_rows(q) and _tma_rows(k)):
+        q, k = _dense(q), _dense(k)
+    # fwd_ho_a's tensor map reads v in place where the stages that read v by rows do (:func:`_v_rows`), else a copy
+    copy_v = _v_rows(v) is None
+    pieces = [(q.shape, bf16), (k.shape, bf16), ((total_tokens, num_heads), f32), ((total_tokens, num_heads), f32),
+              ((total_tokens, num_v_heads), f32), ((total_tokens, num_v_heads, CHUNK), bf16)]  # fmt: skip
+    if copy_v:
+        pieces.append((v.shape, v.dtype))
+    state = [((total_tokens, num_v_heads, HEAD_DIM), bf16), (v.shape, v.dtype),
+             ((meta.num_chunks, num_v_heads, HEAD_DIM, HEAD_DIM), bf16), (v.shape, v.dtype)]  # fmt: skip
+    # the state the tape keeps (cake_plan.tape_state; none without a tape) are views of the forward's one allocation,
+    # the rest of the state stands as placeholders (u is never formed in memory)
+    kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+    on_tape = [name in kept for name in cake_plan.STATE_NAMES]
+    views = _carve(
+        device, pieces + [s for s, on in zip(state, on_tape, strict=True) if on]
+    )
+    qn, kn, rstd_q, rstd_k, g_cs, A = views[:6]
+    v_dense = views[6] if copy_v else None
+    kept_views = iter(views[len(pieces) :])
+    w, u, h, v_new = (
+        next(kept_views) if on else cake_plan.placeholder(shape, dtype, device)
+        for (shape, dtype), on in zip(state, on_tape, strict=True)
+    )
+    o = torch.empty(v.shape, dtype=v.dtype, device=device)
+    workspaces = _workspaces(options)
+    table = workspaces.table(index)
+    # fwd_ho_a binds every tape tensor it does not write to a one-row stand-in (its tensor map encodes, nothing stores)
+    word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
+    rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
+    h_t = (
+        h
+        if "h" in kept
+        else workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    )
+    v_new_t = v_new if "v_new" in kept else rows
+    w_t = w if "w" in kept else rows
+    if output_final_state:
+        final_state = torch.empty(
+            (meta.num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM), dtype=f32, device=device
+        )
+    else:
+        final_state = workspaces.take(
+            table, "f_zero_state", (0, num_v_heads, HEAD_DIM, HEAD_DIM), f32, device
+        )
+    initial_rows = _table_rows(initial_state, meta)
+    if initial_rows is not None:
+        h0 = initial_rows.contiguous()
+        if h0.dtype != f32:
+            h0 = h0.float()
+        use_init = 1
+    else:
+        h0, use_init = final_state, 0
+    segs = meta.fwd_segments
+    walk = _walk(device, segs, options)
+    sm_count = _device_props(index)[0]
+    launches = [
+        _prepared(
+            "wy_a",
+            min(sm_count, meta.num_chunks * num_heads),
+            1,
+            1,
+            k,
+            k,
+            q,
+            g32,
+            beta32,
+            A.view(torch.uint32),
+            rstd_k,
+            rstd_q,
+            g_cs,
+            qn.view(torch.uint32),
+            kn.view(torch.uint32),
+            meta.chunk_start,
+            meta.chunk_len,
+            meta.num_chunks,
+            num_heads,
+            num_v_heads,
+        ),  # fmt: skip
+        _prepared(
+            "fwd_ho_a",
+            segs.num_segments * num_v_heads,
+            1,
+            1,
+            qn,
+            kn,
+            v_dense if copy_v else v,
+            A,
+            g_cs,
+            beta32,
+            h0,
+            final_state,
+            h_t,
+            h_t,
+            v_new_t,
+            v_new_t,
+            o,
+            o,
+            final_state,
+            w_t,
+            w_t,
+            meta.chunk_start,
+            meta.chunk_len,
+            segs.seg_chunk_start,
+            segs.seg_seq,
+            meta.seq_chunk_start,
+            walk,
+            num_heads,
+            num_v_heads,
+            use_init,
+            1 if output_final_state else 0,
+            0,
+            float(scale),
+            word,
+        ),  # fmt: skip
+    ]
+    if copy_v:
+        _dense(v, v_dense)
+    for launch in launches:
+        _fire(launch)
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
+    return {
+        "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
+        "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
+        "w": w, "u": u, "v": v_dense if copy_v else v, "beta32": beta32, "meta": meta, "scale": float(scale),
+        "output": o, "final_state": final_state if output_final_state else None, "initial_state": initial_state,
+        "h": h, "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_ho_a",
+    }  # fmt: skip
+
+
 def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None,
                                   output_final_state=False, normalize_qk=True,
-                                  options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
+                                  options: ChainOptions | None = None,
+                                  tape: bool = True) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
-    output and the tape the backward reads (the tape carries this package's tag, ``"mode": "nondet"``).  The forward
-    runs fixed-order programs only today: it raises no determinism alert under PyTorch's deterministic algorithms."""
+    output and the tape the backward reads (the tape carries this package's tag, ``"mode": "nondet"``).  ``tape``
+    (``False``: a call that records no backward) lets the forward of :func:`fwd_a_route` skip the state of the tape
+    (placeholders stand for it).  The forward runs fixed-order programs only today: it raises no determinism alert
+    under PyTorch's deterministic algorithms."""
     options = options or ChainOptions()
     num_heads, key_dim = q.shape[-2], q.shape[-1]
     num_v_heads, value_dim = v.shape[-2], v.shape[-1]
@@ -2938,12 +3183,16 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
-    # q / k stay views where prep_tma reads them in place (the head views of a packed row)
-    q, k, prep = _prep_inputs(q, k, meta.num_chunks, num_heads, arch, options)
     g32 = g.contiguous()
     if g32.dtype != torch.float32:
         g32 = g32.float()
     beta = beta.contiguous()
+    if fwd_a_route(meta, arch, q, k, v, beta, normalize_qk, options):
+        return _forward_a(q, k, v, g32, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
+                          output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
+                          tape=tape)  # fmt: skip
+    # q / k stay views where prep_tma reads them in place (the head views of a packed row)
+    q, k, prep = _prep_inputs(q, k, meta.num_chunks, num_heads, arch, options)
     beta_bf16 = beta.dtype == torch.bfloat16
     # every tensor of the forward is made before its first launch, so the launches follow one another without host
     # work between them: the tape's tensors (and the state its tape level keeps under save_state,
@@ -3021,7 +3270,7 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
         "w": w, "u": u, "v": v, "beta32": beta32, "meta": meta, "scale": float(scale), "output": o,
         "final_state": final_state if output_final_state else None, "initial_state": initial_state, "h": h,
-        "v_new": v_new, "options": options, "mode": _TAPE_MODE,
+        "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_ho",
     }  # fmt: skip
 
 
@@ -4119,7 +4368,8 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
                        num_v_heads // num_heads)  # fmt: skip
     fwd = cake_gdn_nondet_train_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale,
                                         initial_state=initial_state, output_final_state=output_final_state,
-                                        normalize_qk=use_qk_l2norm_in_kernel, options=options)  # fmt: skip
+                                        normalize_qk=use_qk_l2norm_in_kernel, options=options,
+                                        tape=_forward_tape())  # fmt: skip
     # the saved list keeps its arity whatever the tape level keeps (a metadata-equal placeholder stands for the rest
     # of the state, :func:`cake_plan.placeholder`); the backward reads the kept names from the plan, never a
     # placeholder
@@ -4410,6 +4660,29 @@ def cake_gdn_nondet(
         options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
                                warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
                                dhu_scan=dhu_scan, prep=prep, lpt=lpt, streams=streams, tail=tail)  # fmt: skip
+    records = torch.is_grad_enabled() and (
+        q.requires_grad
+        or k.requires_grad
+        or v.requires_grad
+        or g.requires_grad
+        or beta.requires_grad
+        or (initial_state is not None and initial_state.requires_grad)
+    )
+    if not records:
+        # the forward keeps no tape (_forward_tape): nothing will read it
+        token = _RECORDS_BACKWARD.set(False)
+        try:
+            return _apply(q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
+                          use_qk_l2norm_in_kernel, options)  # fmt: skip
+        finally:
+            _RECORDS_BACKWARD.reset(token)
+    return _apply(q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
+                  use_qk_l2norm_in_kernel, options)  # fmt: skip
+
+
+def _apply(q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
+           use_qk_l2norm_in_kernel, options):  # fmt: skip
+    """The autograd Function of a checked call of :func:`cake_gdn_nondet` (the packed row's where it applies)."""
     if g.dtype != torch.float32:
         g = g.float()
     if scale is None:
