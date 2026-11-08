@@ -39,13 +39,15 @@ workspace; dK / dV stored as FP32 window gradients or as BF16) and
 ``bwd_fold`` (row-map destinations only: the FP32 window rows added into
 their destination rows in ascending window order) and ``bwd_post`` (dQ from
 the accumulator).  Every sum has one fixed order, so every output is bitwise
-reproducible run to run for one shape, one ``max_seqlen_k`` and one
-workspace budget.  Every launch is a plain stream-ordered launch: nothing
+reproducible run to run for one shape, one ``max_seqlen_k``, one workspace
+budget and the same host boundaries.  Every launch is a plain stream-ordered launch: nothing
 cooperative, no PDL.
 """
 
 from __future__ import annotations
 
+import bisect
+from collections.abc import Sequence
 from typing import Any, Optional
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -335,8 +337,9 @@ MODULES: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 # The host plan: grids, workspace chunks and scratch sizes from host-known
 # values only (the tensors' shapes, the segment count ``len(cu_seqlens) - 1``,
-# ``max_seqlen_k``, the workspace budget and the SM count); nothing here reads
-# a tensor.
+# ``max_seqlen_k``, the workspace budget, the SM count and, when the caller
+# gives them, host copies of the segment boundaries); nothing here reads a
+# tensor.
 
 # Forward: a CTA pair covers 256 query rows of one (segment, query head); the
 # grid is persistent (tickets from a self-resetting counter), one pair per two
@@ -433,6 +436,69 @@ def tiles_per_key_block(total_q: int, num_segments: int) -> int:
     return max(1, (total_q + (BWD_TILE_ROWS - 1) * num_segments) // BWD_TILE_ROWS)
 
 
+def host_seqlens(
+    cu_seqlens_q: Sequence[int], cu_seqlens_k: Sequence[int], total_q: int, total_k: int, num_segments: int
+) -> tuple[list[int], list[int]]:
+    """``(q_lens, k_lens)`` from host copies of the segment boundaries, checked against the operands' sizes:
+    ``B + 1`` ints each, starting at 0, non-decreasing, ending at ``T_q`` / ``T_k``."""
+    lens = []
+    for name, cu, total in (("cu_seqlens_q_host", cu_seqlens_q, total_q), ("cu_seqlens_k_host", cu_seqlens_k, total_k)):
+        cu = [int(x) for x in cu]
+        if len(cu) != num_segments + 1 or cu[0] != 0 or cu[-1] != total:
+            raise ValueError(
+                f"{name} must hold {num_segments + 1} boundaries from 0 to {total}, got {len(cu)} ending at "
+                f"{cu[-1] if cu else None}"
+            )
+        seg = [b - a for a, b in zip(cu, cu[1:])]
+        if min(seg, default=0) < 0:
+            raise ValueError(f"{name} must be non-decreasing")
+        lens.append(seg)
+    return lens[0], lens[1]
+
+
+def exact_tiles(q_lens: Sequence[int], k_lens: Sequence[int], blocks: int) -> list[int]:
+    """One head pair's dS^T tiles of every key block ``n < blocks`` over all segments, the counts the device tile
+    tables number: ``sum_b cnt(b, n)``, ``cnt(b, n) = ceil(q_b / 64) - max(128 n - (k_b - q_b), 0) // 64`` for ``n <
+    ceil(k_b / 128)`` and ``q_b > 0``, else 0.  With ``c_b = ceil((k_b - q_b) / 64)`` that is ``ceil(q_b / 64)``
+    below ``m_b = max(c_b // 2 + 1, 0)`` and ``ceil(q_b / 64) + c_b - 2 n`` from there: one constant and one
+    linear piece per segment, summed through first differences."""
+    flat = [0] * (blocks + 1)
+    slope = [0] * (blocks + 1)
+    for q, k in zip(q_lens, k_lens):
+        if q <= 0 or k <= 0:
+            continue
+        end = min(-(-k // BWD_TILE_KEYS), blocks)
+        tiles = -(-q // BWD_TILE_ROWS)
+        c = -(-(k - q) // BWD_TILE_ROWS)
+        flat[0] += tiles
+        flat[end] -= tiles
+        start = min(max(c // 2 + 1, 0), end)
+        flat[start] += c
+        flat[end] -= c
+        slope[start] += 1
+        slope[end] -= 1
+    level = slope_sum = 0
+    counts = []
+    for n in range(blocks):
+        level += flat[n]
+        slope_sum += slope[n]
+        counts.append(level - 2 * n * slope_sum)
+    return counts
+
+
+def _even_ranges(prefix: list[int], blocks: int, limit: int) -> list[tuple[int, int]]:
+    """Greedy key-block ranges ``[n0, n1)`` with even bounds, each the widest whose tiles (``prefix[n1] -
+    prefix[n0]``) stay within ``limit``, two key blocks at least."""
+    even = prefix[0::2]
+    ranges = []
+    n = 0
+    while n < blocks:
+        n1 = max(2 * (bisect.bisect_right(even, prefix[n] + limit) - 1), n + 2)
+        ranges.append((n, n1))
+        n = n1
+    return ranges
+
+
 def chunk_plan(
     *,
     total_q: int,
@@ -442,29 +508,55 @@ def chunk_plan(
     num_segments: int,
     max_seqlen_k: Optional[int],
     budget_bytes: int,
-) -> dict[str, int]:
-    """The workspace chunks of one backward call: ``h_chunk`` KV heads times ``n_chunk`` key blocks per chunk,
-    ``tile_stride`` tiles per head pair (a bound of :func:`tiles_per_key_block` per key block), the all-zero tile
-    ``zero_tile`` after the chunk's tiles and ``ws_tiles`` in all.  As many KV heads as fit with every key block;
-    else one KV head and the widest even key-block range that fits; at least one KV head and two key blocks, even
-    past the budget."""
-    blocks = key_blocks(total_k, max_seqlen_k)
+    seqlens: Optional[tuple[Sequence[int], Sequence[int]]] = None,
+) -> dict[str, Any]:
+    """The workspace chunks of one backward call: ``h_chunk`` KV heads times the key-block ranges ``ranges`` (``[n0,
+    n1)``, even bounds, covering ``[0, key_blocks)``) per chunk, ``tile_stride`` tiles per head pair, the all-zero
+    tile ``zero_tile`` after the chunk's tiles and ``ws_tiles`` in all.  As many KV heads as fit with every key
+    block; else one KV head and key-block ranges that fit; at least one KV head and two key blocks, even past the
+    budget.
+
+    Without ``seqlens`` every key block counts :func:`tiles_per_key_block` tiles and the ranges are ``n_chunk`` wide.
+    With ``seqlens`` (the host ``(q_lens, k_lens)`` of :func:`host_seqlens`) the counts are exact
+    (:func:`exact_tiles`), each range is the widest that fits (:func:`_even_ranges`), ``tile_stride`` is the most
+    tiles of one range and ``n_chunk`` the widest range; ``key_blocks`` comes from the longest segment unless
+    ``max_seqlen_k`` is smaller."""
     pairs = num_heads_q // num_heads_kv // 2
-    per_block = tiles_per_key_block(total_q, num_segments)
     cap = max(0, int(budget_bytes) // DS_TILE_BYTES - 1)
-    per_head = blocks * pairs * per_block
-    if per_head * num_heads_kv <= cap:
-        h_chunk, n_chunk = num_heads_kv, blocks
-    elif per_head <= cap:
-        h_chunk, n_chunk = cap // per_head, blocks
+    if seqlens is None:
+        blocks = key_blocks(total_k, max_seqlen_k)
+        per_block = tiles_per_key_block(total_q, num_segments)
+        per_head = blocks * pairs * per_block
+        if per_head * num_heads_kv <= cap:
+            h_chunk, n_chunk = num_heads_kv, blocks
+        elif per_head <= cap:
+            h_chunk, n_chunk = cap // per_head, blocks
+        else:
+            h_chunk, n_chunk = 1, max(2, (cap // (pairs * per_block)) & ~1)
+        stride = n_chunk * per_block
+        ranges = [(n0, min(n0 + n_chunk, blocks)) for n0 in range(0, blocks, n_chunk)]
     else:
-        h_chunk, n_chunk = 1, max(2, (cap // (pairs * per_block)) & ~1)
-    stride = n_chunk * per_block
+        q_lens, k_lens = seqlens
+        longest = max(k_lens, default=0)
+        blocks = key_blocks(total_k, longest if max_seqlen_k is None else min(int(max_seqlen_k), longest))
+        prefix = [0]
+        for count in exact_tiles(q_lens, k_lens, blocks):
+            prefix.append(prefix[-1] + count)
+        per_head = pairs * max(1, prefix[-1])
+        if per_head * num_heads_kv <= cap:
+            h_chunk, ranges = num_heads_kv, [(0, blocks)]
+        elif per_head <= cap:
+            h_chunk, ranges = cap // per_head, [(0, blocks)]
+        else:
+            h_chunk, ranges = 1, _even_ranges(prefix, blocks, cap // pairs)
+        stride = max(1, max(prefix[n1] - prefix[n0] for n0, n1 in ranges))
+        n_chunk = max(n1 - n0 for n0, n1 in ranges)
     zero_tile = h_chunk * pairs * stride
     return {
         "key_blocks": blocks,
         "h_chunk": h_chunk,
         "n_chunk": n_chunk,
+        "ranges": ranges,
         "tile_stride": stride,
         "zero_tile": zero_tile,
         "ws_tiles": zero_tile + 1,
@@ -543,7 +635,9 @@ __all__ = [
     "SCRATCH_TILE_ROWS",
     "STAGES",
     "chunk_plan",
+    "exact_tiles",
     "grid",
+    "host_seqlens",
     "key_blocks",
     "pair_bound",
     "rows_pad",
