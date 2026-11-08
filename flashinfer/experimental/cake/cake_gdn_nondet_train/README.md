@@ -308,6 +308,18 @@ captured in a CUDA graph (warm it up first, like any captured call).  Every
 tail runs on the caller's stream.
 `streams=1` keeps every launch on the caller's stream.
 
+The one-wave split of the adjoint walk is priced with the cost entry of the
+device (`adjoint_split_costs`: the entry of `ADJOINT_SPLIT_DEVICE_COSTS` for
+the architecture and SM count, else that of `ADJOINT_SPLIT_COSTS`).  Its wave 1
+runs the middle pieces' summaries on the side stream beside the last pieces'
+walks, both launches bound before the fork; where the shorter of the two costs
+at most the entry's `fork` (the host's fork and join: 65 us on GB200's Grace
+host, 0 elsewhere), wave 1 runs on the caller's stream, summaries first, with
+the same bits.  `cake_plan.ADJOINT_FORMS` fixes the backward form of a device
+and head shape where a measurement decided it: `nocut` keeps the planner's
+tables without the split and runs every pre-scan of the call, forward and
+backward, without the warm-up cut (GB200, H 1 / HV 3).
+
 ## Speed against the deterministic package
 
 `benchmarks/bench_cake_gdn_nondet_train.py` times this package against

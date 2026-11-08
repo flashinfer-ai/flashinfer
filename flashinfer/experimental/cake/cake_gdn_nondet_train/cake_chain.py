@@ -138,6 +138,8 @@ __all__ = [
     "TAIL_WORKSPACE_TILES",
     "ADJOINT_SPLIT_ARCHS",
     "ADJOINT_SPLIT_COSTS",
+    "ADJOINT_SPLIT_DEVICE_COSTS",
+    "adjoint_split_costs",
     "ADJOINT_CHAIN_STAGES",
     "CHAIN_VSPLIT",
     "AdjointSplit",
@@ -630,6 +632,8 @@ class ChunkMeta:
     bwd_tc: bool = False
     # the one-wave split of the adjoint walk over bwd_segments (:func:`adjoint_split_pricing`)
     bwd_split: AdjointSplit | None = None
+    # the pre-scans' warm-up threshold of the layout's plan entry (cake_plan.ADJOINT_FORMS; None: the call's options)
+    warmup_log2: float | None = None
 
 
 @dataclass(frozen=True)
@@ -987,10 +991,14 @@ SCAN_STEP_FACTOR = {(32, 2): 1.0, (32, 1): 1.18, (64, 1): 1.27}
 WARMUP_THRESH_LOG2 = -10.0 / math.log(2.0)
 
 
-def warmup_thresh_log2(options: ChainOptions) -> float:
-    return (
-        options.warmup_log2 if options.warmup_log2 is not None else WARMUP_THRESH_LOG2
-    )
+def warmup_thresh_log2(options: ChainOptions, meta: ChunkMeta | None = None) -> float:
+    """The pre-scans' warm-up threshold of a call: the caller's ``warmup_log2``, else that of the layout's plan entry
+    (``meta.warmup_log2``, :data:`cake_plan.ADJOINT_FORMS`), else ``WARMUP_THRESH_LOG2``."""
+    if options.warmup_log2 is not None:
+        return options.warmup_log2
+    if meta is not None and meta.warmup_log2 is not None:
+        return meta.warmup_log2
+    return WARMUP_THRESH_LOG2
 
 
 @dataclass(frozen=True)
@@ -2042,6 +2050,28 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "fork": 0.0,
     },
 }
+# The cost entries of a device whose SM count differs from the one its architecture's entry was measured on (the same
+# keys), by (architecture, SM count): sm_100a on GB200 (152 SMs, Grace host), where wave 1's fork and join cost 65 us
+# of host time (wave 1 then runs on one stream at the group-of-three pair rows of HV 3 and 6, on two at HV 12).
+ADJOINT_SPLIT_DEVICE_COSTS: dict[tuple[str, int], dict[str, float]] = {
+    ("sm_100a", 152): {
+        "walk": 2.38,
+        "summary": 2.79,
+        "serial_low": 2.18,
+        "serial_full": 2.42,
+        "stitch": 9.3,
+        "stitch_piece": 3.1,
+        "fixed": 15.0,
+        "fork": 65.0,
+    },
+}
+
+
+def adjoint_split_costs(arch: str, sm_count: int) -> dict[str, float] | None:
+    """The cost entry of ``arch`` on a device of ``sm_count`` SMs: the device's (``ADJOINT_SPLIT_DEVICE_COSTS``) where
+    one was measured, else the architecture's (``ADJOINT_SPLIT_COSTS``); ``None`` without either."""
+    found = ADJOINT_SPLIT_DEVICE_COSTS.get((arch, int(sm_count)))
+    return found if found is not None else ADJOINT_SPLIT_COSTS.get(arch)
 
 
 def bwd_piece_table(chunks, num_v_heads: int, sm_count: int) -> int | None:
@@ -2057,9 +2087,9 @@ def bwd_piece_table(chunks, num_v_heads: int, sm_count: int) -> int | None:
 
 def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) -> dict:
     """The one-wave split (:func:`bwd_piece_table`) against the serial table of ``chunks``, both at their full cost
-    (``ADJOINT_SPLIT_COSTS``, microseconds): the split pays wave 1 (its longest last piece or one-piece sequence at the
-    walk's step, its longest middle piece at the summary's), the stitch over the most pieces of a sequence, wave 2 (its
-    longest other piece) and its fixed cost; the serial table pays its longest sequence at the step of its fill.
+    (:func:`adjoint_split_costs`, microseconds): the split pays wave 1 (its longest last piece or one-piece sequence at
+    the walk's step, its longest middle piece at the summary's), the stitch over the most pieces of a sequence, wave 2
+    (its longest other piece) and its fixed cost; the serial table pays its longest sequence at the step of its fill.
     ``select`` where the split is cheaper; ``segment_len`` is ``L`` (0 without a split); ``one_stream`` where wave 1
     runs on the caller's stream: it has summaries and the shorter of its two launches is at most the ``fork`` cost."""
     chunks = tuple(int(n) for n in chunks)
@@ -2071,7 +2101,7 @@ def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) ->
         "serial_us": None,
         "one_stream": False,
     }
-    costs = ADJOINT_SPLIT_COSTS.get(arch)
+    costs = adjoint_split_costs(arch, sms)
     if costs is None or not chunks:
         return out
     fill = min(1.0, len(chunks) * hv / sms)
@@ -2118,18 +2148,41 @@ def _adjoint_chain_stage(arch: str) -> str | None:
     return delivered[0] if delivered else None
 
 
+def _adjoint_form(
+    device_index: int, num_v_heads: int, group: int | None, options: ChainOptions
+) -> str | None:
+    """The backward form that :data:`cake_plan.ADJOINT_FORMS` fixes for a call of ``num_v_heads`` value heads in groups
+    of ``group`` on device ``device_index`` (``None``: the pricing decides; so does a call with a plan or ``dhu_scan``
+    pin, or without a known group)."""
+    if not group or options.pins != (None, None) or options.dhu_scan is not None:
+        return None
+    index = int(device_index)
+    return cake_plan.adjoint_form(
+        cake_backend.device_arch(index),
+        _device_props(index)[0],
+        int(num_v_heads) // int(group),
+        int(num_v_heads),
+    )
+
+
 def _adjoint_split_length(
-    seq_lens, num_v_heads: int, device_index: int, options: ChainOptions
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions,
+    group: int | None = None,
 ) -> int | None:
     """``L`` of the one-wave split a host layout takes on device ``device_index``, ``None`` for the other plans: the
     device's architecture in ``ADJOINT_SPLIT_ARCHS`` with the forms and a chain stage delivered, no plan or ``dhu_scan``
-    pin, and :func:`adjoint_split_pricing` selecting it."""
+    pin, no form of :data:`cake_plan.ADJOINT_FORMS` for the call (value-head group ``group``), and
+    :func:`adjoint_split_pricing` selecting it."""
     index = int(device_index)
     arch = cake_backend.device_arch(index)
     if (
         arch not in ADJOINT_SPLIT_ARCHS
         or options.pins != (None, None)
         or options.dhu_scan is not None
+        or _adjoint_form(index, num_v_heads, group, options) is not None
     ):
         return None
     if not all(_available(stage, arch) for stage in ADJOINT_SPLIT_STAGES):
@@ -2674,7 +2727,7 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
         )
         _launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new, final_state,
                 seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
-                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options))  # fmt: skip
+                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options, meta))  # fmt: skip
         _launch(split_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                 final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_init, 1 if store_final_state else 0,
@@ -2802,7 +2855,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         run(_prepared(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                       final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_init, 0, seg_flag,
-                      warmup_thresh_log2(options)))  # fmt: skip
+                      warmup_thresh_log2(options, meta)))  # fmt: skip
         run(_prepared("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start,
                       segs.seq_seg_start, seg_flag, num_v_heads, use_init, 0))  # fmt: skip
         use_seg = 1
@@ -3556,12 +3609,12 @@ def _backward_chain(
             ex.launch(sdt_prescan(arch), segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, g_cs,
                       dht32, dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start,
                       segs.seg_seq, meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options))  # fmt: skip
+                      warmup_thresh_log2(options, meta))  # fmt: skip
         else:
             ex.launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32,
                       dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options))  # fmt: skip
+                      warmup_thresh_log2(options, meta))  # fmt: skip
         dh_end = workspaces.take(table, "b_dh_end", (segs.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM),
                                  torch.float32, device)  # fmt: skip
         ex.launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
@@ -3922,9 +3975,10 @@ def _host_plans(
         cake_backend.device_arch(index) in ADJOINT_SPLIT_ARCHS
         and options.pins == (None, None)
         and (options.dhu_scan is None)
+        and _adjoint_form(index, int(num_v_heads), group, options) is None
     ):
         # the one-wave split of the adjoint walk or the serial table, priced at their full cost: never a pre-scan's
-        # split table, whose cost follows the gates
+        # split table, whose cost follows the gates (a form of cake_plan.ADJOINT_FORMS keeps the planner's tables)
         length = _adjoint_split_length(seq_lens, int(num_v_heads), index, options)
         bwd = plans[1]
         if length is not None:
@@ -3986,6 +4040,7 @@ def _chunk_meta(
         options.tail,
         SPLIT_R_FORM,
         tuple(sorted(ADJOINT_SPLIT_ARCHS)),
+        id(cake_plan.ADJOINT_FORMS),
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -4002,7 +4057,12 @@ def _chunk_meta(
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if bwd_tc:
         meta = replace(meta, bwd_tc=True)
-    split_len = _adjoint_split_length(seq_lens, int(num_v_heads), int(index), options)
+    split_len = _adjoint_split_length(
+        seq_lens, int(num_v_heads), int(index), options, group
+    )
+    if _adjoint_form(int(index), int(num_v_heads), group, options) == "nocut":
+        # the plan entry's planner tables run every pre-scan without the warm-up cut (forward and backward)
+        meta = replace(meta, warmup_log2=cake_plan.NOCUT_WARMUP_LOG2)
     if split_len is not None and int(plans[1].segment_len) == split_len:
         # wave 1 on one stream where the pricing says so or where the caller keeps every launch on its stream
         one_stream = options.streams == 1 or bool(

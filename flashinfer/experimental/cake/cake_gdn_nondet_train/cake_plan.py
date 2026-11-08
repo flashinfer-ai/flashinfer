@@ -15,7 +15,8 @@ limitations under the License.
 
 The host plan of one call that the forward and the backward share: the one-wave piece table of the sequences
 (:func:`pieces`), cached with the device's SM count per sequence-length table (:func:`host_plan`), the frozen tape
-level of each architecture (:data:`TAPE_LEVELS`, :func:`tape_state`), and the placeholder that keeps a saved list's
+level of each architecture (:data:`TAPE_LEVELS`, :func:`tape_state`), the backward forms that a measurement fixes for a
+device and head shape (:data:`ADJOINT_FORMS`, :func:`adjoint_form`), and the placeholder that keeps a saved list's
 arity where a call saves no tensor (:func:`placeholder`).
 
 A long sequence's scan splits into pieces of at most ``L`` chunks: the smallest ``L`` whose first wave fits one CTA
@@ -39,6 +40,8 @@ import torch
 from . import cake_backend, cake_jit
 
 __all__ = [
+    "ADJOINT_FORMS",
+    "NOCUT_WARMUP_LOG2",
     "LEVEL_STATE",
     "STATE_NAMES",
     "TAPE_LEVELS",
@@ -48,6 +51,7 @@ __all__ = [
     "host_plan",
     "piece_length",
     "pieces",
+    "adjoint_form",
     "placeholder",
     "tape_state",
 ]
@@ -67,6 +71,26 @@ LEVEL_STATE: Mapping[str, tuple[str, ...]] = MappingProxyType(
 TAPE_LEVELS: Mapping[str, str] = MappingProxyType(
     {"sm_100a": "T_full", "sm_103a": "T_full", "sm_107a": "T_full"}
 )
+
+# The backward form of a call where a measurement on the device fixes it instead of the split's pricing, by
+# (architecture, SM count, H, HV).  ``"nocut"``: the planner's tables (no one-wave split of the adjoint walk; a group of
+# three keeps its pre-scan R-form table) with every pre-scan of the call, forward and backward, run without the warm-up
+# cut (threshold :data:`NOCUT_WARMUP_LOG2`), so neither the plan nor its bits depend on the gates.  sm_100a on GB200
+# (152 SMs) at H 1 / HV 3: measured at the pair rows (three sequences of about 11k tokens), faster than the split in
+# fwd+bwd and the checkpointed step and as fast in the backward, within the accuracy budget of the split.
+ADJOINT_FORMS: Mapping[tuple[str, int, int, int], str] = MappingProxyType(
+    {("sm_100a", 152, 1, 3): "nocut"}
+)
+# the warm-up threshold (log2) of the "nocut" form: no step of a pre-scan falls below it
+NOCUT_WARMUP_LOG2: float = -1.0e30
+
+
+def adjoint_form(
+    arch: str, sm_count: int, num_heads: int, num_v_heads: int
+) -> str | None:
+    """The form :data:`ADJOINT_FORMS` fixes for a call of ``num_heads`` / ``num_v_heads`` heads on a device of
+    ``arch`` with ``sm_count`` SMs, ``None`` where the pricing decides."""
+    return ADJOINT_FORMS.get((arch, int(sm_count), int(num_heads), int(num_v_heads)))
 
 
 def chunk_counts(seq_lens: Sequence[int]) -> tuple[int, ...]:

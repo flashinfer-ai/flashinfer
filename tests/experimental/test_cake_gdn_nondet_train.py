@@ -4214,6 +4214,16 @@ def test_adjoint_split_one_stream_rule(monkeypatch) -> None:
             assert rec["one_stream"] is False, (arch, seq_lens, num_v_heads, rec)
     costs = {"walk": 2.38, "summary": 2.79, "serial_low": 2.18, "serial_full": 2.42, "stitch": 9.3,
              "stitch_piece": 3.1, "fixed": 15.0}  # fmt: skip
+    # the delivered device entry of GB200 (sm_100a, 152 SMs) is these costs with a fork cost of 65 us
+    assert cake_chain.adjoint_split_costs("sm_100a", 152) == {**costs, "fork": 65.0}
+    assert (
+        cake_chain.adjoint_split_costs("sm_100a", 148)
+        is cake_chain.ADJOINT_SPLIT_COSTS["sm_100a"]
+    )
+    for num_v_heads, one in {3: True, 6: True, 12: False}.items():
+        rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 152, "sm_100a")
+        assert rec["segment_len"] > 0 and rec["one_stream"] is one, (num_v_heads, rec)
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_DEVICE_COSTS", {})
     for fork, want in (
         (65.0, {3: True, 6: True, 12: False}),
         (0.0, {3: False, 6: False, 12: False}),
@@ -4289,6 +4299,8 @@ def _split_device(monkeypatch, device, *, split: bool, chain: str | None = None)
     costs = {"walk": 1.0, "summary": 1.0, "serial_low": 1.0, "serial_full": 1.0, "stitch": 0.0, "stitch_piece": 0.0,
              "fixed": 0.0 if split else 1e9}  # fmt: skip
     monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_COSTS", {arch: costs})
+    monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_DEVICE_COSTS", {})
+    monkeypatch.setattr(cake_plan, "ADJOINT_FORMS", types.MappingProxyType({}))
     return arch
 
 
@@ -4413,6 +4425,89 @@ def test_adjoint_split_one_stream_gives_the_two_stream_bits(
             ), stages
     assert gm_streams[True] == {main} and main not in gm_streams[False], gm_streams
     _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
+
+
+def test_adjoint_forms_fix_the_planner_tables_without_the_cut(monkeypatch) -> None:
+    # cake_plan.ADJOINT_FORMS: GB200 (sm_100a, 152 SMs) at H 1 / HV 3 keeps the planner's tables (no one-wave split,
+    # as on an architecture outside ADJOINT_SPLIT_ARCHS) and runs its pre-scans without the warm-up cut; HV 6, other SM
+    # counts, a call without its group and a pinned call keep the pricing
+    assert cake_plan.adjoint_form("sm_100a", 152, 1, 3) == "nocut"
+    for key in (
+        ("sm_100a", 148, 1, 3),
+        ("sm_100a", 152, 2, 6),
+        ("sm_103a", 152, 1, 3),
+        ("sm_100a", 152, 1, 6),
+    ):
+        assert cake_plan.adjoint_form(*key) is None, key
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: (152, 232448, 10))
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_100a")
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    options = cake_chain.make_options()
+    seq_lens = (11000, 12000, 9768)
+    got = cake_chain._host_plans(seq_lens, 3, 0, options, group=3)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+        want = cake_chain._host_plans(seq_lens, 3, 0, options, group=3)
+    assert got == want
+    if all(cake_chain._available(stage, "sm_100a") for stage in _SPLIT_STAGES):
+        assert cake_chain._adjoint_split_length(seq_lens, 3, 0, options) is not None
+        assert cake_chain._adjoint_split_length(seq_lens, 6, 0, options, 2) is not None
+    assert cake_chain._adjoint_split_length(seq_lens, 3, 0, options, 3) is None
+    assert cake_chain._adjoint_form(0, 3, 3, options) == "nocut"
+    assert cake_chain._adjoint_form(0, 3, None, options) is None
+    assert (
+        cake_chain._adjoint_form(0, 3, 3, cake_chain.make_options(segment_chunks=64))
+        is None
+    )
+    assert cake_chain._adjoint_form(0, 6, 2, options) is None
+    # the threshold: the caller's warmup_log2 first, then the plan entry's, then the module's
+    meta = types.SimpleNamespace(warmup_log2=cake_plan.NOCUT_WARMUP_LOG2)
+    assert cake_chain.warmup_thresh_log2(options, meta) == cake_plan.NOCUT_WARMUP_LOG2
+    assert cake_chain.warmup_thresh_log2(options) == cake_chain.WARMUP_THRESH_LOG2
+    assert (
+        cake_chain.warmup_thresh_log2(cake_chain.make_options(warmup_log2=-3.0), meta)
+        == -3.0
+    )
+
+
+def test_adjoint_form_gives_the_bits_of_no_split_without_the_cut(
+    device, monkeypatch
+) -> None:
+    # a call that the plan table's "nocut" form serves makes the launches (stages, grids, arguments) and the bits of
+    # the planner without the split (ADJOINT_SPLIT_ARCHS empty) and with warmup_log2 = NOCUT_WARMUP_LOG2, forward and
+    # backward: wave 1's summaries never run and no launch reads the module's threshold
+    seq_lens, heads = (700, 1500, 230), (1, 3)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7013)
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    runs, logs = {}, {}
+    for form in (True, False):
+        with monkeypatch.context() as m:
+            _split_device(m, device, split=True)
+            if form:
+                m.setattr(
+                    cake_plan,
+                    "ADJOINT_FORMS",
+                    types.MappingProxyType({(arch, SPLIT_SMS, 1, 3): "nocut"}),
+                )
+                pins = {}
+            else:
+                m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+                pins = {"warmup_log2": cake_plan.NOCUT_WARMUP_LOG2}
+            logs[form] = _logged_launches(m)
+            runs[form] = _run(inputs, seq_lens, **pins)
+            stages = [entry[0] for entry in logs[form]]
+            assert "dhu_tc2_dvl32_gm" not in stages, stages
+            assert not any(
+                cake_chain.WARMUP_THRESH_LOG2 in entry[3] for entry in logs[form]
+            ), stages
+    assert logs[True] == logs[False]
+    _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
+    # without the form the pricing splits this layout (wave 1's summaries run)
+    with monkeypatch.context() as m:
+        _split_device(m, device, split=True)
+        launches = _logged_launches(m)
+        _run(inputs, seq_lens)
+    assert "dhu_tc2_dvl32_gm" in [entry[0] for entry in launches]
 
 
 def test_adjoint_split_packed_views_give_the_contiguous_bits(
