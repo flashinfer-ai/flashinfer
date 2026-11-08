@@ -507,7 +507,11 @@ FWD_O_FUSE_DEFAULT = 1
 # cake_kda_det_train_kcp_saved_bytes are unchanged.
 # "always" = every saving forward keeps them, "never" = none (the previous form); both via _kcp_test_knobs only (the
 # A/B record).  Not on a lean arena, under graph replay or a capture, with the SPEC-3 probe, nor where the backward's
-# intra program is its first q / k reader (the in-kernel L2 norm's segmented rows): those keep or use none.  The rows
+# intra program is its first q / k reader (the in-kernel L2 norm's segmented rows): those keep or use none.  Nor on a
+# call without a workspace (``workspace=None``): its default workspace frees its storage at the end of every call, and
+# a tensor allocated during the recompute and kept to the backward took bytes of the block the backward's default arena
+# needs next, so the caching allocator reserved another arena (+3.5 to +12.4 GiB per rank on the four-pack CP16
+# workload; the backward launches its intra program instead).  The rows
 # are the intra program's on the same operands: without the fused in-kernel L2 norm the same record on the same rows;
 # with it the forward record normalizes the raw q / k in the kernel while the backward's runs on the prep's normalized
 # rows, so that form keeps them only on the architectures of :data:`INTRA_ROWS_L2N_ARCHS`, where the two were measured
@@ -5088,6 +5092,8 @@ class CakeKDADetKcpCall:
         self.fwd_walk = "kcp_fwdh_tape"
         # a workspace=None call on a pooled default workspace: (pool key, weak context); None otherwise (_prepare)
         self.default: tuple[tuple[Any, ...], Any] | None = None
+        # a call without a workspace (workspace=None: a pooled or a fresh default workspace; _prepare)
+        self.ws_default = False
 
     # -- buffers
     def buf(self, name: str) -> torch.Tensor:
@@ -6034,11 +6040,12 @@ def _intra_rows_keep(call: CakeKDADetKcpCall) -> bool:
     backward pass (a checkpoint recompute), ``"always"`` on every saving forward, ``"never"`` on none; never on a rank
     without local stages or tokens, with more internal rows than twice its tokens, under graph replay or inside a
     capture, on a lean arena (its backward binds none), where the backward's intra program is its first q / k reader
-    (it normalizes: the launch stays), nor with the fused in-kernel L2 norm outside :data:`INTRA_ROWS_L2N_ARCHS`."""
+    (it normalizes: the launch stays), with the fused in-kernel L2 norm outside :data:`INTRA_ROWS_L2N_ARCHS`, nor on a
+    call without a workspace (its default workspace's storage is freed between the two calls)."""
     mode = getattr(call.opts, "intra_rows", INTRA_ROWS_DEFAULT)
     if mode == "never" or (mode == "ckpt" and not _kcp_phase_in_backward()):
         return False  # the original forward of the shipped rule: one phase query
-    if call.local is None or call.T_r == 0:
+    if call.local is None or call.T_r == 0 or call.ws_default:
         return False
     if not isinstance(call.backend, KernelBackend) or call.opts.graph != "off":
         return False
@@ -7024,6 +7031,7 @@ def _prepare(
     opts = options if isinstance(options, CakeKDADetKcpOptions) else _options(options)
     # workspace=None: the pooled default workspace's key and storages (_default_workspace)
     default = parked = None
+    ws_default = workspace is None
     if save_mode not in SAVE_MODES:
         raise ValueError(f"save_mode must be one of {SAVE_MODES}, got {save_mode!r}")
     if save_mode != "light":
@@ -7117,6 +7125,7 @@ def _prepare(
     call.gate, call.gate_params = gate, gp
     call.l2n, call.l2n_mode = l2n, workspace.l2n
     call.default = default
+    call.ws_default = ws_default
     backend.begin_call(call)
     return call, batched
 
