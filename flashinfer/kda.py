@@ -195,6 +195,7 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
     backend: Literal[
         "auto",
         "cute-dsl",
@@ -360,6 +361,10 @@ def recurrent_kda(
         kg_cache (Optional[torch.Tensor]):
             Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
             cache ``[num_slots, HV, T_max, 2*K]``.
+        cu_seqlens_cpu (Optional[torch.Tensor]):
+            CPU copy of ``cu_seqlens`` with the same values. The CuTe DSL
+            prefill then takes the offsets from it instead of copying
+            ``cu_seqlens`` to the host, which synchronizes the stream.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
             permutation of shape ``[N]``. CuTe DSL packed engine calls generate
@@ -1081,6 +1086,7 @@ def recurrent_kda(
                     checkpoint_cu_starts=checkpoint_cu_starts,
                     checkpoint_state_indices=checkpoint_state_indices,
                     checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
                 )
 
     use_flash_kda_prefill = (
