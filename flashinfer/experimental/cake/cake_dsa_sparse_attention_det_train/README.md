@@ -277,11 +277,10 @@ runner (sm_100a, sm_103a, sm_107a); `p8949_nope` autograd (sm_100a, sm_103a,
 sm_107a).
 
 Backward time of the non-deterministic package divided by this package's
-(median of 3 same-GPU rounds; below 1: this package is slower): 0.852 to 0.997
-on sm_100a (13 rows), 0.884 to 1.003 on sm_103a (13 rows), 0.826 to 0.970 on
-sm_107a (13 rows).  The two are at parity on `p8949_nope` on sm_103a (1.003);
-on every other row this package's backward is slower.  The forward is the
-non-deterministic package's forward kernel.
+(median of 3 same-GPU rounds; below 1: this package is slower): 0.848 to 0.990
+on sm_100a (13 rows), 0.882 to 0.970 on sm_103a (13 rows), 0.830 to 0.967 on
+sm_107a (13 rows).  This package's backward is slower on every row.  The
+forward is the non-deterministic package's forward kernel.
 
 ## NoPE (zero-rope) program
 
