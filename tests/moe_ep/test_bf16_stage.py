@@ -13,6 +13,10 @@ from flashinfer.moe_ep.core import bf16_stage
 def test_staging_uses_tensor_device(ids_dtype):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTeDSL is not available")
     device, other = 0, 1
     previous = torch.cuda.current_device()
     graph = None

@@ -166,6 +166,83 @@ def test_cached_split_tactic_capture_failure_retries_other_tactics(
             assert sorted(r["selection"] for r in records) == [[0, 10], [2, 20]]
 
 
+@pytest.mark.parametrize("all_runners", [False, True])
+def test_capture_rejections_survive_replay_and_allow_fresh_search(
+    monkeypatch, all_runners
+):
+    from flashinfer.moe_ep.core.selection import NoEligibleCandidate
+
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    measure = c.measure
+
+    def reject_runner(*args, **kwargs):
+        if all_runners or plan.selected[0] == 0:
+            raise CaptureUnsupported("runner cannot capture")
+        return measure(*args, **kwargs)
+
+    with autotune_v2(persistent_cache=False):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        stale = tuner.get_protocol_records(BACKEND_NAMESPACE)
+        monkeypatch.setattr(c, "measure", reject_runner)
+        if all_runners:
+            with pytest.raises(CaptureUnsupported):
+                tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        else:
+            assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)[
+                "selection"
+            ] == [2, 20]
+
+    c.measured.clear()
+    plan.prepared.clear()
+    gather = c.gather
+
+    def gather_stale_peer(value):
+        if isinstance(value, dict) and "capture_rejected" in value:
+            return [stale[record_key(value["contract"])], value]
+        return gather(value)
+
+    monkeypatch.setattr(c, "gather", gather_stale_peer)
+    with autotune_v2(mode="replay", persistent_cache=False):
+        if all_runners:
+            with pytest.raises(CaptureUnsupported):
+                tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+            assert not plan.prepared
+        else:
+            assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)[
+                "selection"
+            ] == [2, 20]
+            assert plan.prepared == [(2, 20)]
+        assert not c.measured
+        # An existing outer winner must also consult the backend rejection.
+        with pytest.raises(NoEligibleCandidate, match="failed capture"):
+            protocol.check_replay(
+                tuner.protocol_context(BACKEND_NAMESPACE), [0, 11], plan.enumerate()
+            )
+        # Capture failures do not exclude other workloads.
+        protocol.contract = {"capacity": 64}
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            -1,
+        ]
+        protocol.contract = {"capacity": 32}
+
+    monkeypatch.setattr(c, "gather", gather)
+    monkeypatch.setattr(c, "measure", measure)
+    with autotune_v2(persistent_cache=False):
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            11,
+        ]
+        assert c.measured == [(0, 10), (0, 11), (2, 20)]
+        protocol.check_replay(
+            tuner.protocol_context(BACKEND_NAMESPACE), [0, 11], plan.enumerate()
+        )
+
+
 def test_disabled_and_skipped_do_not_measure():
     tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
     t = SimpleNamespace(hidden_states=torch.empty(1))

@@ -274,6 +274,79 @@ def test_search_replay_and_captured_lifetime(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
+def test_capture_rejection_blocks_backend_and_outer_replay(
+    rubin_bootstrap,  # noqa: F811
+    monkeypatch,
+    tmp_path,
+):
+    from flashinfer.autotune_cache import autotune_v2_reload
+    from flashinfer.moe_ep.modes.selection import SplitPlan
+
+    bootstrap = rubin_bootstrap
+    monkeypatch.setattr(problem, "INTERMEDIATE", 384)
+    fleet, weights, config, t, global_weights = inputs_and_config(bootstrap)
+    options = dict(
+        cache_root=str(tmp_path / "rejected"),
+        measurement_policy=MeasurementPolicy(execution_mode="cuda_graph"),
+    )
+    layers, graphs = [], []
+
+    def create(cfg):
+        layer = moe_ep.MoEEpLayer(bootstrap, fleet, weights, backend=cfg)
+        layers.append(layer)
+        layer.warmup(t)
+        return layer
+
+    try:
+        # Seed a backend winner and a forced split outer winner.
+        forced = dataclasses.replace(config, candidate=1)
+        with autotune_v2(**options):
+            seed = create(forced)
+            assert seed.get_selected_plan()["candidate"] == 1
+        forward = SplitPlan.forward
+
+        def reject_capture(plan, tensors):
+            output = forward(plan, tensors)
+            if torch.cuda.is_current_stream_capturing() and bootstrap.rank == 0:
+                raise RuntimeError("split capture rejected")
+            return output
+
+        monkeypatch.setattr(SplitPlan, "forward", reject_capture)
+        with autotune_v2(**options):
+            layer = create(config)
+            assert layer.get_selected_plan()["candidate"] == 0
+            assert "No split tactic completed" in layer.rejected_candidates[1]
+        dist.barrier()
+        autotune_v2_reload()
+        with autotune_v2(mode="replay", **options):
+            monkeypatch.setattr(
+                Collective, "measure", lambda *a, **k: pytest.fail("replay measured")
+            )
+            # The old outer winner must not bypass the recorded rejection.
+            with pytest.raises(RuntimeError, match="No EP candidate completed"):
+                create(forced)
+            # A different outer key must also skip the rejected backend winner.
+            reordered = dataclasses.replace(config, candidates=config.candidates[::-1])
+            replay = create(reordered)
+            assert replay.get_selected_plan()["candidate"] == 1
+            assert_output(replay(t), t, global_weights)
+            graph = torch.cuda.CUDAGraph()
+            graphs.append(graph)
+            with torch.cuda.graph(graph):
+                output = replay(t)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_output(output, t, global_weights)
+    finally:
+        for graph in graphs:
+            graph.reset()
+        torch.cuda.synchronize()
+        for layer in reversed(layers):
+            layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
 def test_ineligible_split_and_rank_agreement(
     rubin_bootstrap,  # noqa: F811
     monkeypatch,

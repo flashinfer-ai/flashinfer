@@ -362,6 +362,43 @@ class SplitProtocol:
         self.contract, self.settings = contract, settings
         self.fallback = fallback
 
+    def _runner_contract(self, context, choice, peers):
+        return {
+            **self.contract,
+            "candidate": self.collective.gather(
+                plain(self.plan.backend_config(choice["runner"]))
+            ),
+            "runners": [
+                {k: v for k, v in peer.items() if k != "tactics"} for peer in peers
+            ],
+            "measurement": self.settings,
+            "fallback": context.tuner.protocol_context(
+                f"moe_{choice['backend']}", force_tune=context.force_tune
+            ).skipped,
+        }
+
+    def _records(self, context, contract):
+        records = self.collective.gather(context.lookup(record_key(contract)))
+        records = [
+            r
+            for r in records
+            if isinstance(r, dict) and r.get("contract") == plain(contract)
+        ]
+        rejected = []
+        for record in records:
+            for tactic in record.get("capture_rejected", []):
+                if tactic not in rejected:
+                    rejected.append(tactic)
+        return records, rejected
+
+    def check_replay(self, context, selection, choices):
+        choice = next(v for v in choices if v["runner"] == selection[0])
+        peers = self.collective.gather(plain(choice))
+        contract = self._runner_contract(context, choice, peers)
+        _, rejected = self._records(context, contract)
+        if plain(selection[1]) in rejected:
+            raise NoEligibleCandidate("The cached split tactic failed capture")
+
     def run(self, context):
         c, plan = self.collective, self.plan
         choices = c.prepare(plan.enumerate, optional=True)
@@ -400,34 +437,32 @@ class SplitProtocol:
             c.prepare(lambda: plan.prepare(selection))
             return TuningResult({"selection": plain(selection)})
         winners, measured = [], 0
+        fallback_selection = None
         for choice, tactics, peers in agreed:
-            runner_skipped = context.tuner.protocol_context(
-                f"moe_{choice['backend']}", force_tune=context.force_tune
-            ).skipped
-            if runner_skipped:
+            contract = self._runner_contract(context, choice, peers)
+            if contract["fallback"]:
                 tactics = [-1]
-            contract = {
-                **self.contract,
-                "candidate": c.gather(plain(plan.backend_config(choice["runner"]))),
-                "runners": [
-                    {k: v for k, v in peer.items() if k != "tactics"} for peer in peers
-                ],
-                "measurement": self.settings,
-                "fallback": runner_skipped,
-            }
             key = record_key(contract)
-
-            def compatible(record):
-                return (
-                    valid_score(record)
-                    and record.get("contract") == plain(contract)
+            records, rejected = (
+                ([], []) if context.force_tune else self._records(context, contract)
+            )
+            cached = next(
+                (
+                    record
+                    for record in records
+                    if valid_score(record)
                     and isinstance(record.get("selection"), list)
                     and len(record["selection"]) == 2
                     and record["selection"][0] == choice["runner"]
                     and record["selection"][1] in [plain(t) for t in tactics]
-                )
-
-            cached = None if context.force_tune else c.lookup(context, key, compatible)
+                    and record["selection"][1] not in rejected
+                ),
+                None,
+            )
+            # A default tactic can resolve to a rejected configuration. Only
+            # use that fallback for runners without a recorded capture failure.
+            if not rejected and fallback_selection is None:
+                fallback_selection = (choice["runner"], -1)
             if not context.tuning_enabled:
                 if cached is not None:
                     winners.append(cached)
@@ -450,7 +485,11 @@ class SplitProtocol:
                         warmup=lambda: plan.warmup(self.tensors),
                     )
                 except CaptureUnsupported:
+                    if plain(tactic) not in rejected:
+                        rejected.append(plain(tactic))
                     continue
+                if plain(tactic) in rejected:
+                    rejected.remove(plain(tactic))
                 measured += 1
                 passing.append(
                     {
@@ -463,15 +502,27 @@ class SplitProtocol:
                 # the remaining agreed tactics still need to be tried.
                 if cached and tactic == cached_tactic:
                     break
-            if not passing:
-                continue
-            winner = min(passing, key=lambda v: v["p50_us"])
-            winners.append(winner)
-            c.publish(context, key, winner)
-        if not winners and not context.tuning_enabled:
-            selection = (agreed[0][0]["runner"], -1)
-            c.prepare(lambda: plan.prepare(selection))
-            return TuningResult({"selection": plain(selection)})
+            record = {"contract": plain(contract), "capture_rejected": rejected}
+            if passing:
+                winner = min(passing, key=lambda v: v["p50_us"])
+                winners.append(winner)
+                record.update(winner)
+            # Keep failures under the same workload and measurement contract.
+            # Refresh every rank's memory copy so a later successful retry can
+            # replace a rejection even when the ranks use separate disk stores.
+            c.publish(context, key, record)
+            c.prepare(
+                lambda: context.tuner.publish_protocol_record(
+                    context.namespace, key, record, persist=False
+                )
+            )
+        if (
+            not winners
+            and not context.tuning_enabled
+            and fallback_selection is not None
+        ):
+            c.prepare(lambda: plan.prepare(fallback_selection))
+            return TuningResult({"selection": plain(fallback_selection)})
         if not winners:
             raise CaptureUnsupported("No split tactic completed full-EP measurement")
         winner = min(winners, key=lambda v: v["p50_us"])

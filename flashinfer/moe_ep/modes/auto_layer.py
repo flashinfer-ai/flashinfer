@@ -648,6 +648,11 @@ class _OuterProtocol:
                         raise NoEligibleCandidate(
                             "The cached split runner or tactic is not eligible for this profile"
                         )
+                    SplitProtocol(
+                        plan, t, self.c, self._split_contract, self._settings
+                    ).check_replay(
+                        tuner.protocol_context(BACKEND_NAMESPACE), selected, choices
+                    )
                     self.c.prepare(lambda: plan.prepare(selected))
                     plan.warmup(t)
             except NoEligibleCandidate:
@@ -699,6 +704,12 @@ class _OuterProtocol:
                 },
             }
         )
+        self._settings = settings
+        self._split_contract = {
+            k: v
+            for k, v in contract.items()
+            if k not in ("candidates", "forced", "eligible", "implementations")
+        }
         key = record_key(contract)
 
         def compatible(record):
@@ -755,17 +766,7 @@ class _OuterProtocol:
                                         trial,
                                         self.tensors,
                                         c,
-                                        {
-                                            k: v
-                                            for k, v in contract.items()
-                                            if k
-                                            not in (
-                                                "candidates",
-                                                "forced",
-                                                "eligible",
-                                                "implementations",
-                                            )
-                                        },
+                                        self._split_contract,
                                         settings,
                                         fallback=context.skipped,
                                     ),
