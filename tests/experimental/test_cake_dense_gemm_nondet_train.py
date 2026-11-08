@@ -2991,13 +2991,15 @@ def test_k1_chain_plans_run_the_chain_programs(monkeypatch):
 
 
 def test_k1_chain_programs_are_registered():
-    """The three-chain programs ship on the architectures of their one-chain programs: the 128-wide and 256-wide FP32
-    transposed-store programs on sm_100a, sm_103a and sm_107a, the 192-wide FP32 row-major-store program on sm_107a;
-    each is the one-chain program's build with ``chains=3``."""
+    """The chain programs ship on the architectures of their one-chain programs: the three-chain 128-wide and 256-wide
+    FP32 transposed-store programs on sm_100a, sm_103a and sm_107a, the three-chain and two-chain 192-wide FP32
+    row-major-store programs on sm_107a (the two-chain one for :data:`K1_ORDERED_RANGES_BY_SM`); each is the one-chain
+    program's build with ``chains`` set."""
     want = {
         "dense_proj_gemm_atomic_nn_n128_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n192_f32_c3": ("sm_107a",),
+        "dense_proj_gemm_atomic_nn_n192_f32_c2": ("sm_107a",),
     }
     got = {}
     for arch, kernels in cake_jit.KERNELS.items():
@@ -3006,14 +3008,14 @@ def test_k1_chain_programs_are_registered():
                 got.setdefault(template, []).append(arch)
     assert {t: tuple(sorted(a)) for t, a in got.items()} == want
     for template, arches in want.items():
-        one = template[: -len("_c3")]
+        one, chains = template[: -len("_c3")], int(template[-1])
         for arch in arches:
             chained = cake_jit.MODULES[cake_jit.KERNELS[arch][template]]
             single = cake_jit.MODULES[cake_jit.KERNELS[arch][one]]
             assert chained["build"]["module"] == single["build"]["module"]
             assert chained["build"]["kwargs"] == {
                 **single["build"]["kwargs"],
-                "chains": 3,
+                "chains": chains,
             }
             assert chained["arg_plan"] == single["arg_plan"]
             assert chained["launch"] == single["launch"]
@@ -5930,24 +5932,54 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
 
 #: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables).
 K1_FORWARD_PROGRAM_ROWS = {
-    part: {(K, 512, T): "dense_proj_gemm_wave_kk_n224" for K in (4096, 5120) for T in (16172, 16231, 16384)}
+    part: {
+        (K, 512, T): "dense_proj_gemm_wave_kk_n224"
+        for K in (4096, 5120)
+        for T in (16172, 16231, 16384)
+    }
     for part in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152))
 }
-_KD, _KD_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef", "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
+_KD, _KD_TMA = (
+    "dense_proj_gemm_dgrad_kn_n256_f32_ef",
+    "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma",
+)
 K1_DGRAD_PROGRAM_ROWS = {
     ("sm_100a", 148): {
-        **{(K, 1024, T, "f32"): _KD for K in (4096, 5120) for T in (16172, 16231, 16384)},
-        **{(K, 512, T, "f32"): _KD_TMA for K in (4096, 5120) for T in (16172, 16231, 16384)},
+        **{
+            (K, 1024, T, "f32"): _KD
+            for K in (4096, 5120)
+            for T in (16172, 16231, 16384)
+        },
+        **{
+            (K, 512, T, "f32"): _KD_TMA
+            for K in (4096, 5120)
+            for T in (16172, 16231, 16384)
+        },
     },
-    ("sm_100a", 152): {(K, N, T, "f32"): _KD_TMA for K in (4096, 5120) for N in (512, 1024) for T in (16172, 16231, 16384)},
+    ("sm_100a", 152): {
+        (K, N, T, "f32"): _KD_TMA
+        for K in (4096, 5120)
+        for N in (512, 1024)
+        for T in (16172, 16231, 16384)
+    },
     ("sm_103a", 152): {
-        **{(K, 1024, T, "f32"): _KD for K in (4096, 5120) for T in (16172, 16231, 16384)},
-        **{(K, 512, T, "f32"): _KD_TMA for K in (4096, 5120) for T in (16172, 16231, 16384)},
+        **{
+            (K, 1024, T, "f32"): _KD
+            for K in (4096, 5120)
+            for T in (16172, 16231, 16384)
+        },
+        **{
+            (K, 512, T, "f32"): _KD_TMA
+            for K in (4096, 5120)
+            for T in (16172, 16231, 16384)
+        },
     },
 }
 K1_WGRAD_SK_ROWS = {
     ("sm_100a", 148): {
-        (5120, 1024, T, dt): "dense_proj_gemm_sk_nn_n256" + ("_f32" if dt == "f32" else "") + "_t"
+        (5120, 1024, T, dt): "dense_proj_gemm_sk_nn_n256"
+        + ("_f32" if dt == "f32" else "")
+        + "_t"
         for T in (16172, 16231, 16384)
         for dt in ("bf16", "f32")
     },
@@ -5978,10 +6010,18 @@ def test_k1_program_tables():
     assert cake_backend.wave_forward_template(224) == "dense_proj_gemm_wave_kk_n224"
     assert cake_backend.dgrad_program_template(False) == _KD
     assert cake_backend.dgrad_program_template(True) == _KD_TMA
-    assert cake_backend.wgrad_sk_template(256, True) == "dense_proj_gemm_sk_nn_n256_f32_t"
+    assert (
+        cake_backend.wgrad_sk_template(256, True) == "dense_proj_gemm_sk_nn_n256_f32_t"
+    )
     assert cake_backend.K1_ORDERED_RANGES_BY_SM == K1_ORDERED_ROWS
-    assert cake_backend.atomic_k1_template(64, True, 1, "mirror") == "dense_proj_gemm_atomic_nn_n64_f32_t_mirror"
-    assert cake_backend.atomic_k1_template(192, True, 2) == "dense_proj_gemm_atomic_nn_n192_f32_c2"
+    assert (
+        cake_backend.atomic_k1_template(64, True, 1, "mirror")
+        == "dense_proj_gemm_atomic_nn_n64_f32_t_mirror"
+    )
+    assert (
+        cake_backend.atomic_k1_template(192, True, 2)
+        == "dense_proj_gemm_atomic_nn_n192_f32_c2"
+    )
     with pytest.raises(ValueError, match="split_order"):
         cake_backend.atomic_k1_template(64, True, 1, "index")
     for (arch, sms), rows in K1_ORDERED_ROWS.items():
@@ -5990,14 +6030,23 @@ def test_k1_program_tables():
             kw = dict(arch=arch, L=L, M=M, N=N, out_f32=dt == "f32", sm_count=sms)
             for lo, hi, value in ranges:
                 bn, splits, chains, order = value
-                assert cake_backend.atomic_k1_template(bn, True, chains, order) in cake_jit.KERNELS[arch]
+                assert (
+                    cake_backend.atomic_k1_template(bn, True, chains, order)
+                    in cake_jit.KERNELS[arch]
+                )
                 for T in sorted({lo, hi, (lo + hi) // 2}):
                     assert cake_backend.k1_ordered_plan(K=T, **kw) == value, (key, T)
                 for T in (lo - 1, hi + 1):
                     assert cake_backend.k1_ordered_plan(K=T, **kw) is None, (key, T)
                 for other in (208, 211, 213, 216):
-                    assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, sm_count=other)) is None
-                assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, out_f32=False)) is None
+                    assert (
+                        cake_backend.k1_ordered_plan(K=lo, **dict(kw, sm_count=other))
+                        is None
+                    )
+                assert (
+                    cake_backend.k1_ordered_plan(K=lo, **dict(kw, out_f32=False))
+                    is None
+                )
                 assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, L=2)) is None
 
 
@@ -6019,9 +6068,16 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
         (4096, 48, 16172, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
         (4096, 1024, 16384, "dense_proj_gemm_atomic_nn_n192_f32_c2", 1, 2, "arrival"),
     ):
-        plan, *_, reason = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)
+        plan, *_, reason = cake_backend.plan_atomic_gemm(
+            *operands(T, d_in, d_out), **kw
+        )
         assert plan is not None and reason == "", (d_in, d_out, T, reason)
-        assert (plan.template, plan.splits, plan.chains, plan.split_order) == (template, splits, chains, order)
+        assert (plan.template, plan.splits, plan.chains, plan.split_order) == (
+            template,
+            splits,
+            chains,
+            order,
+        )
         assert plan.reproducible and plan.workspace == (splits > 1)
     # outside the ranges: the split tables' choice (4096 -> 32 at 16171 tokens, 4096 -> 48 at 16231 tokens)
     for d_in, d_out, T in ((4096, 32, 16171), (4096, 48, 16231), (4096, 1024, 16230)):
@@ -6039,44 +6095,81 @@ def test_k1_program_rows_bind_their_program(monkeypatch, arch):
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     bf16, f32 = torch.bfloat16, torch.float32
     for (K, N, T), template in sorted(K1_FORWARD_PROGRAM_ROWS[(arch, 152)].items()):
-        X, W, out = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, N, dtype=bf16)
+        X, W, out = (
+            torch.empty(T, K, dtype=bf16),
+            torch.empty(N, K, dtype=bf16),
+            torch.empty(T, N, dtype=bf16),
+        )
         module = cake_jit.KERNELS[arch][template]
         assert cake_backend._k1_forward_program_of(X, W, out) == module
         n = len(entry_fn.calls)
-        assert cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, out) is out
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, out)
+            is out
+        )
         assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_DET_CACHE
         record = cake_jit.MODULES[module]
         items = -(-N // 512) * -(-T // record["build"]["kwargs"]["tile_n"])
         grid = (2 * min(76, items), 1, 1)
-        values = dict(A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=N, N=T, K=K, L=1, enable_pdl=0)
+        values = dict(
+            A=W.unsqueeze(0),
+            B=X.unsqueeze(0),
+            C=out.unsqueeze(0),
+            M=N,
+            N=T,
+            K=K,
+            L=1,
+            enable_pdl=1,  # the default on a part the package serves
+        )
         plan = cake_jit.arg_plan_of(record)
         want = cake_backend._order_atomic_arguments(module, plan, values, grid)
         _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
         assert cake_backend._k1_forward_program_of(X[:-1], W, out[:-1]) is None
-        assert cake_backend._k1_forward_program_of(X, W, torch.empty(T, N, dtype=f32)) is None
-        assert cake_backend._k1_forward_program_of(torch.empty(K, T, dtype=bf16).t(), W, out) is None
+        assert (
+            cake_backend._k1_forward_program_of(X, W, torch.empty(T, N, dtype=f32))
+            is None
+        )
+        assert (
+            cake_backend._k1_forward_program_of(
+                torch.empty(K, T, dtype=bf16).t(), W, out
+            )
+            is None
+        )
     for (K, N, T, _), template in sorted(K1_DGRAD_PROGRAM_ROWS[(arch, 152)].items()):
-        G, W, out = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, K, dtype=f32)
+        G, W, out = (
+            torch.empty(T, N, dtype=bf16),
+            torch.empty(N, K, dtype=bf16),
+            torch.empty(T, K, dtype=f32),
+        )
         module = cake_jit.KERNELS[arch][template]
         assert cake_backend._k1_dgrad_program_of(G, W, out) == module
         n = len(entry_fn.calls)
-        assert cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out) is out
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out) is out
+        )
         assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_DET_CACHE
         record = cake_jit.MODULES[module]
         grid = (2 * min(76, -(-T // 256) * -(-K // 256)), 1, 1)
         spare = det_backend._dummy_map(out.device, bf16)
         values = dict(A=G, B=W.unsqueeze(0), out=det_backend._dummy(out.device, bf16), out32=out, C16=spare,
-                      C32=out.unsqueeze(0), M=T, N=K, K=N, ldo=K, enable_pdl=0)  # fmt: skip
+                      C32=out.unsqueeze(0), M=T, N=K, K=N, ldo=K, enable_pdl=1)  # fmt: skip
         plan = cake_jit.arg_plan_of(record)
         want = cake_backend._order_atomic_arguments(module, plan, values, grid)
         _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
         assert cake_backend._k1_dgrad_program_of(G[:-1], W, out[:-1]) is None
-        assert cake_backend._k1_dgrad_program_of(G, W, torch.empty(T, K, dtype=bf16)) is None
+        assert (
+            cake_backend._k1_dgrad_program_of(G, W, torch.empty(T, K, dtype=bf16))
+            is None
+        )
     # another SM count: the deterministic routing
     facts = dataclasses.replace(det_backend.device_facts(), sm_count=151)
     monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
     K, N, T = 4096, 512, 16231
-    X, W, out = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, N, dtype=bf16)
+    X, W, out = (
+        torch.empty(T, K, dtype=bf16),
+        torch.empty(N, K, dtype=bf16),
+        torch.empty(T, N, dtype=bf16),
+    )
     assert cake_backend._k1_forward_program_of(X, W, out) is None
 
 
@@ -6090,16 +6183,23 @@ def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch):
     facts = dataclasses.replace(det_backend.device_facts(), sm_count=148)
     monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
     bf16 = torch.bfloat16
-    for (d_in, d_out, T, dt), template in sorted(K1_WGRAD_SK_ROWS[("sm_100a", 148)].items()):
+    for (d_in, d_out, T, dt), template in sorted(
+        K1_WGRAD_SK_ROWS[("sm_100a", 148)].items()
+    ):
         G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
         out = torch.empty(d_out, d_in, dtype=torch.float32 if dt == "f32" else bf16)
         module = cake_jit.KERNELS["sm_100a"][template]
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) == module
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, True, None) is None
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", 128) is None
-        assert cake_backend._k1_wgrad_sk_program_of(G[:-1], X[:-1], out, "auto", None) is None
+        assert (
+            cake_backend._k1_wgrad_sk_program_of(G[:-1], X[:-1], out, "auto", None)
+            is None
+        )
         n = len(entry_fn.calls)
-        assert cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out) is out
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out) is out
+        )
         assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_ATOMIC_CACHE
         line = (d_in // 256) * (d_out // 256) * -(-T // 64)
         arena = cake_backend._ATOMIC_ARENAS[(0, 0)]
@@ -6109,7 +6209,7 @@ def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch):
         plan = cake_jit.arg_plan_of(cake_jit.MODULES[module])
         want = cake_backend._order_atomic_arguments(module, plan, values, (148, 1, 1))
         _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
-    assert int(arena.buffers["k1_tickets"].count_nonzero()) == 0
+    assert int(arena.buffers["k1_tickets"].view(torch.int32).count_nonzero()) == 0
     facts = dataclasses.replace(facts, sm_count=152)
     monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
     assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) is None
@@ -8370,17 +8470,33 @@ def test_k1_forward_and_input_gradient_alert_only_when_order_varying(
                 (lambda: cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out_d32), (G, W, out_d32)),
                 (lambda: cake_backend.cake_dense_gemm_nondet_train_projection(G, W, out_d32), (G, W, out_d32)),
             )  # fmt: skip
-            for call, views in cases:
+            # a row of K1_FORWARD_PROGRAM_RULES_BY_SM / K1_DGRAD_PROGRAM_RULES_BY_SM on this part runs this package's
+            # program from the entry point, uncached: the same bits on every run, so never an alert
+            programs = (
+                cake_backend._k1_forward_program_of(X, W, out_f),
+                None,
+                cake_backend._k1_dgrad_program_of(G, W, out_d),
+                cake_backend._k1_dgrad_program_of(G, W, out_d32),
+                None,
+            )
+            for (call, views), program in zip(cases, programs, strict=True):
                 cake_backend._drop_convenience_entries()
                 # the planning call, then the call from the cached key
                 for _ in range(2):
                     before = len(entry_fn.calls)
                     alert = _call_under_the_mode(call)
+                    if program is not None:
+                        assert alert is None, (K, N, T, program)
+                        caches = _k1_convenience_caches()
+                        assert not any(list(c.values()) for c in caches), (K, N, T)
+                        assert len(entry_fn.calls) == before + 1
+                        continue
                     entry = _single_k1_entry()
                     assert (alert is not None) == bool(entry.order_varying), (K, N, T)
                     assert len(entry_fn.calls) == before + (alert is None)
-                fixed += not entry.order_varying
-                varying += bool(entry.order_varying)
+                order_varying = program is None and bool(entry.order_varying)
+                fixed += not order_varying
+                varying += order_varying
                 prepared = cake_backend.cake_dense_gemm_nondet_train_projection_prepare(
                     *views
                 )
@@ -8672,7 +8788,10 @@ def test_registered_templates_are_the_ones_the_planners_name():
             named.setdefault(arch, set()).update(rows.values())
     assert set(named) == {"sm_100a", "sm_103a", "sm_107a"}
     for arch, templates in named.items():
-        assert templates <= set(cake_jit.KERNELS[arch]), (arch, sorted(templates - set(cake_jit.KERNELS[arch])))
+        assert templates <= set(cake_jit.KERNELS[arch]), (
+            arch,
+            sorted(templates - set(cake_jit.KERNELS[arch])),
+        )
         wanted |= templates
     dsm = {
         arch: {
@@ -13119,9 +13238,11 @@ def test_k1_dgrad_rows_bind_their_plan(monkeypatch, arch):
     """``cake_dense_gemm_nondet_train_projection_dgrad()`` binds, for a row of :data:`K1_DGRAD_RULES_BY_SM` on its
     part (both operands with a unit stride on their last axis), the program of the row's knobs, and the deterministic
     plan for a token count, output dtype or SM count outside the table; an operand without a unit stride on its last
-    axis gets no knobs."""
+    axis gets no knobs.  The rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`, which come first, are taken out
+    (``test_k1_program_rows_bind_their_program`` holds them)."""
     _cpu_k1_launches(monkeypatch, arch)
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    monkeypatch.setattr(cake_backend, "K1_DGRAD_PROGRAM_RULES_BY_SM", {})
     bf16 = torch.bfloat16
     rows = cake_backend.K1_DGRAD_RULES_BY_SM[(arch, 152)]
     picked = sorted(rows.items())[:: max(1, len(rows) // 6)]
@@ -13312,7 +13433,7 @@ def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
     sk = cake_backend.K1_WGRAD_SK_RULES_BY_SM.get((arch, sms), {})
     template = sk.get((d_in, d_out, T, "f32" if f32 else "bf16"))
     if template is not None:
-        return ("sk", int(template.split("_n")[1].split("_")[0]), None)
+        return ("sk", int(template.rsplit("_n", 1)[1].split("_")[0]), None)
     kw = dict(arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms)
     dsm = cake_backend.k1_dsm_plan(**kw)
     if dsm is not None:
@@ -13577,7 +13698,9 @@ def test_gpu_k1_forward_named_rows_keep_the_det_bits():
         if isinstance(value, str) and key not in own
     }
     if not rows:
-        pytest.skip(f"no named K1 forward row of {arch} on {sms} SMs outside the program table")
+        pytest.skip(
+            f"no named K1 forward row of {arch} on {sms} SMs outside the program table"
+        )
     g = torch.Generator(device=device).manual_seed(SEED + 171)
     for (K, N, T), program in sorted(rows.items()):
         what = f"forward {K} {N} {T} {program}"
@@ -13624,7 +13747,10 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
         run(out)
         torch.cuda.synchronize()
         assert not cake_backend._K1_DET_CACHE, what
-        assert cake_backend._k1_forward_program_of(X, W, out) == cake_jit.KERNELS[arch][template], what
+        assert (
+            cake_backend._k1_forward_program_of(X, W, out)
+            == cake_jit.KERNELS[arch][template]
+        ), what
         ref = torch.full_like(out, float("nan"))
         det_backend.cake_dense_gemm_det_train_projection_forward(X, W, ref)
         torch.cuda.synchronize()
@@ -13644,7 +13770,10 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
         run(out)
         torch.cuda.synchronize()
         assert not cake_backend._K1_DET_CACHE, what
-        assert cake_backend._k1_dgrad_program_of(G, W, out) == cake_jit.KERNELS[arch][template], what
+        assert (
+            cake_backend._k1_dgrad_program_of(G, W, out)
+            == cake_jit.KERNELS[arch][template]
+        ), what
         ref = torch.full_like(out, float("nan"))
         det_backend.cake_dense_gemm_det_train_projection_dgrad(G, W, ref)
         torch.cuda.synchronize()

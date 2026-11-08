@@ -1106,7 +1106,9 @@ def k1_ordered_plan(
     ).get(key, ()):
         if lo <= int(K) <= hi:
             fits = k1_splits_fit(splits, K) and k1_chains_fit(chains, K)
-            return (int(block_n), int(splits), int(chains), str(order)) if fits else None
+            return (
+                (int(block_n), int(splits), int(chains), str(order)) if fits else None
+            )
     return None
 
 
@@ -1553,7 +1555,9 @@ def wave_forward_template(tile_n: int) -> str:
 #: The registry template of this package's input-gradient program of 256-wide output tiles with FP32 output
 #: (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`): row stores, or TMA stores of the tile from shared memory (``tma_store``).
 def dgrad_program_template(tma_store: bool) -> str:
-    return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef" + ("_tma" if tma_store else "")
+    return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef" + (
+        "_tma" if tma_store else ""
+    )
 
 
 _WAVE_N224 = "dense_proj_gemm_wave_kk_n224"
@@ -1645,7 +1649,9 @@ def _k1_program_module(table: dict, key: tuple, out: torch.Tensor) -> Optional[s
     return cake_jit.KERNELS.get(facts.arch, {}).get(template)
 
 
-def _k1_forward_program_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> Optional[str]:
+def _k1_forward_program_of(
+    X: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
     """The module of this package the forward call ``(X, W, out)`` runs (:data:`K1_FORWARD_PROGRAM_RULES_BY_SM`), or
     ``None``: a shape without a row of the table, operands that are not BF16 and K-major on one CUDA device, an
     ``out`` that is not BF16 with a unit inner stride, and a part without the row keep the deterministic routing.  The
@@ -1655,35 +1661,71 @@ def _k1_forward_program_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) 
     key = (int(X.shape[1]), int(W.shape[0]), int(X.shape[0]))
     if not any(key in rows for rows in K1_FORWARD_PROGRAM_RULES_BY_SM.values()):
         return None
-    if X.dtype != torch.bfloat16 or W.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+    if (
+        X.dtype != torch.bfloat16
+        or W.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+    ):
         return None
-    if X.stride(1) != 1 or W.stride(1) != 1 or out.stride(1) != 1 or int(W.shape[1]) != key[0]:
+    if (
+        X.stride(1) != 1
+        or W.stride(1) != 1
+        or out.stride(1) != 1
+        or int(W.shape[1]) != key[0]
+    ):
         return None
     if tuple(out.shape) != (key[2], key[1]) or _k1_index(X, W, out) < 0:
         return None
     return _k1_program_module(K1_FORWARD_PROGRAM_RULES_BY_SM, key, out)
 
 
-def _k1_dgrad_program_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> Optional[str]:
+def _k1_dgrad_program_of(
+    G: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
     """The module of this package the input-gradient call ``(G, W, out)`` runs (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`),
     or ``None``: a shape and output dtype without a row of the table, operands that are not BF16 with a unit stride on
     their last axis on one CUDA device, an ``out`` without a unit inner stride, and a part without the row keep the
     deterministic routing.  The device is read only for a shape of the table."""
-    if G.dim() != 2 or W.dim() != 2 or out.dim() != 2 or out.dtype not in (torch.bfloat16, torch.float32):
+    if (
+        G.dim() != 2
+        or W.dim() != 2
+        or out.dim() != 2
+        or out.dtype not in (torch.bfloat16, torch.float32)
+    ):
         return None
-    key = (int(W.shape[1]), int(W.shape[0]), int(G.shape[0]), "f32" if out.dtype == torch.float32 else "bf16")
+    key = (
+        int(W.shape[1]),
+        int(W.shape[0]),
+        int(G.shape[0]),
+        "f32" if out.dtype == torch.float32 else "bf16",
+    )
     if not any(key in rows for rows in K1_DGRAD_PROGRAM_RULES_BY_SM.values()):
         return None
-    if G.dtype != torch.bfloat16 or W.dtype != torch.bfloat16 or int(G.shape[1]) != key[1]:
+    if (
+        G.dtype != torch.bfloat16
+        or W.dtype != torch.bfloat16
+        or int(G.shape[1]) != key[1]
+    ):
         return None
-    if G.stride(1) != 1 or W.stride(1) != 1 or out.stride(1) != 1 or tuple(out.shape) != (key[2], key[0]):
+    if (
+        G.stride(1) != 1
+        or W.stride(1) != 1
+        or out.stride(1) != 1
+        or tuple(out.shape) != (key[2], key[0])
+    ):
         return None
     if _k1_index(G, W, out) < 0:
         return None
     return _k1_program_module(K1_DGRAD_PROGRAM_RULES_BY_SM, key, out)
 
 
-def _launch_k1_program(module: str, values: dict[str, Any], items: int, out: torch.Tensor, enable_pdl: Optional[bool]) -> None:
+def _launch_k1_program(
+    module: str,
+    values: dict[str, Any],
+    items: int,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> None:
     """Launch this package's program ``module`` (a forward / input-gradient program of the tables above, one CTA pair
     per SM pair up to ``items`` work items) with ``values`` in its argument order, the PDL flag of ``enable_pdl`` for
     ``out``'s device, on the current stream of that device."""
@@ -1699,19 +1741,33 @@ def _launch_k1_program(module: str, values: dict[str, Any], items: int, out: tor
         fn(*arguments)
 
 
-def _launch_wave_forward(module: str, X: torch.Tensor, W: torch.Tensor, out: torch.Tensor, enable_pdl: Optional[bool]) -> torch.Tensor:
+def _launch_wave_forward(
+    module: str,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` on the one-wave forward program ``module``: ``W`` / ``X`` / ``out`` as
     batches of one (``[1, N, K]``, ``[1, T, K]``, ``[1, T, N]``), ``M = N`` features and ``N = T`` tokens of the
     program."""
     tile_n = int(MODULES[module]["build"]["kwargs"]["tile_n"])
     F, K, T = int(W.shape[0]), int(W.shape[1]), int(X.shape[0])
     items = _ceil_div(F, _WAVE_ITEM_ROWS) * _ceil_div(T, tile_n)
-    values = dict(A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=F, N=T, K=K, L=1)
+    values = dict(
+        A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=F, N=T, K=K, L=1
+    )
     _launch_k1_program(module, values, items, out, enable_pdl)
     return out
 
 
-def _launch_dgrad_program(module: str, G: torch.Tensor, W: torch.Tensor, out: torch.Tensor, enable_pdl: Optional[bool]) -> torch.Tensor:
+def _launch_dgrad_program(
+    module: str,
+    G: torch.Tensor,
+    W: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` on the input-gradient program ``module``: the program's ``M = T`` rows,
     ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
     stride, and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the program never
@@ -1741,7 +1797,11 @@ def _launch_dgrad_program(module: str, G: torch.Tensor, W: torch.Tensor, out: to
 #: The registry template of this package's stream-K weight-gradient program of ``block_n``-wide transposed-store tiles
 #: (:data:`K1_WGRAD_SK_RULES_BY_SM`).
 def wgrad_sk_template(block_n: int, out_f32: bool) -> str:
-    return f"{cake_jit.TEMPLATE_PREFIXES[10]}nn_n{int(block_n)}" + ("_f32" if out_f32 else "") + "_t"
+    return (
+        f"{cake_jit.TEMPLATE_PREFIXES[10]}nn_n{int(block_n)}"
+        + ("_f32" if out_f32 else "")
+        + "_t"
+    )
 
 
 _SK_N256_T = "dense_proj_gemm_sk_nn_n256_t"
@@ -1777,14 +1837,24 @@ K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], s
 
 
 def _k1_wgrad_sk_program_of(
-    G: torch.Tensor, X: torch.Tensor, out: torch.Tensor, sk: Any, cta_rows: Optional[int]
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    sk: Any,
+    cta_rows: Optional[int],
 ) -> Optional[str]:
     """The stream-K module of this package the weight-gradient call ``(G, X, out)`` runs
     (:data:`K1_WGRAD_SK_RULES_BY_SM`), or ``None``: a call with a non-default ``sk`` / ``cta_rows``, a shape and output
     dtype without a row of the table, operands that are not BF16 with a unit stride on their last axis on one CUDA
     device, an ``out`` of another shape or without a unit inner stride, and a part without the row keep the other
     tables.  The device is read only for a shape of the table."""
-    if sk != "auto" or cta_rows is not None or G.dim() != 2 or X.dim() != 2 or out.dim() != 2:
+    if (
+        sk != "auto"
+        or cta_rows is not None
+        or G.dim() != 2
+        or X.dim() != 2
+        or out.dim() != 2
+    ):
         return None
     if out.dtype not in (torch.bfloat16, torch.float32):
         return None
@@ -1794,14 +1864,25 @@ def _k1_wgrad_sk_program_of(
         return None
     if G.dtype != torch.bfloat16 or X.dtype != torch.bfloat16 or int(X.shape[0]) != T:
         return None
-    if G.stride(1) != 1 or X.stride(1) != 1 or out.stride(1) != 1 or tuple(out.shape) != (d_out, d_in):
+    if (
+        G.stride(1) != 1
+        or X.stride(1) != 1
+        or out.stride(1) != 1
+        or tuple(out.shape) != (d_out, d_in)
+    ):
         return None
     if _k1_index(X, G, out) < 0:
         return None
     return _k1_program_module(K1_WGRAD_SK_RULES_BY_SM, key, out)
 
 
-def _launch_wgrad_sk(module: str, G: torch.Tensor, X: torch.Tensor, out: torch.Tensor, enable_pdl: Optional[bool]) -> torch.Tensor:
+def _launch_wgrad_sk(
+    module: str,
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
     """``out[d_out, d_in] = G[T, d_out].T @ X[T, d_in]`` on the stream-K program ``module`` (transposed store: ``A = X``,
     ``B = G`` as batches of one, ``M = d_in``, ``N = d_out``, ``K = T``): one unit per CTA pair of the part (at most
     one per 64-token K block of the line), the unit length the line's K blocks over the units, rounded up; the units'
@@ -1813,7 +1894,11 @@ def _launch_wgrad_sk(module: str, G: torch.Tensor, X: torch.Tensor, out: torch.T
     facts = det.device_facts(out.device)
     block_n = int(MODULES[module]["build"]["kwargs"]["block_n"])
     T, d_out, d_in = int(G.shape[0]), int(G.shape[1]), int(X.shape[1])
-    line = _ceil_div(d_in, K1_PAIR_ROWS) * _ceil_div(d_out, block_n) * _ceil_div(T, K1_BLOCK_K)
+    line = (
+        _ceil_div(d_in, K1_PAIR_ROWS)
+        * _ceil_div(d_out, block_n)
+        * _ceil_div(T, K1_BLOCK_K)
+    )
     units = max(1, min(int(facts.sm_count) // 2, line))
     arena = _atomic_arena_for(index, stream, out.device)
     with _ATOMIC_PLAN_LOCK:
@@ -1886,7 +1971,9 @@ def atomic_k1_template(
     than one accumulation chain; ``_<split_order>`` for a split order of :data:`K1_SPLIT_ORDERS` other than
     ``"arrival"``."""
     if split_order not in K1_SPLIT_ORDERS:
-        raise ValueError(f"split_order is one of {K1_SPLIT_ORDERS}, got {split_order!r}")
+        raise ValueError(
+            f"split_order is one of {K1_SPLIT_ORDERS}, got {split_order!r}"
+        )
     return (
         f"{cake_jit.TEMPLATE_PREFIXES[0]}nn_n{int(block_n)}"
         + ("_f32" if out_f32 else "")
