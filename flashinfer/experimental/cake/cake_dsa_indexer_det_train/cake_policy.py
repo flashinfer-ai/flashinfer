@@ -267,7 +267,8 @@ def sample_class_for(
     """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
     record's ``sample_class_rule`` and ``sample_long_rule``, from the call's ``tiles`` / ``shift``: the wide-unit
     programs take the class rule's shift on packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny
-    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count; a long-unit call
+    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count -- where that
+    count exceeds ``sample_tiles_tiny_units``, only on calls of more mean unit tiles than it; a long-unit call
     (more than ``sample_dispatch_mean_tiles_max`` mean unit tiles) of a kind the long rule names takes its shift.  A
     knob the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rules or with sampling off nothing
     changes."""
@@ -288,15 +289,21 @@ def sample_class_for(
     if class_rule is None:
         return tiles, shift
     # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
+    mean = policy.mean_unit_tiles(T, num_keys, S, ratio)
     if "wide" in physical:
         if not shift_knob and S >= CLASS_RULE_MIN_SEGMENTS:
             shift = int(class_rule[1])
     elif (
         not tiles_knob
-        and policy.mean_unit_tiles(T, num_keys, S, ratio)
-        <= policy.sample_dispatch_tiny_tiles_max
+        and mean <= policy.sample_dispatch_tiny_tiles_max
         and S >= CLASS_RULE_MIN_SEGMENTS
         and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
+        # a rule that samples more tiles than the tiny default applies only where the mean unit holds more than that
+        # many tiles: on shorter units the larger sample covers whole units (the ratio-4 pooled packed calls)
+        and not (
+            int(class_rule[0]) > policy.sample_tiles_tiny_units
+            and mean <= int(class_rule[0])
+        )
     ):
         tiles = int(class_rule[0])
         if not shift_knob:

@@ -4124,7 +4124,8 @@ def test_repeatability_bitwise():
 
 def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
     """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
-    inputs) sample ``sample_class_rule[0]`` tiles at its shift, and the long-unit l6 calls (the two-segment 262144-key
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift -- not a call whose units average no more tiles than that
+    (the ratio-4 pooled packed rows keep the tiny defaults) -- and the long-unit l6 calls (the two-segment 262144-key
     document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
     of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
     architectures set no long-unit rule, and the sm_107a FP8 record sets neither rule."""
@@ -4146,6 +4147,19 @@ def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
         return choice.sample_tiles_max, choice.sample_shift_permille
 
     assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # the ratio-4 pooled packed call (top-512 pools, about 21 mean unit tiles) keeps the tiny defaults: the class
+    # rule's larger sample would cover its whole units; sm_100a / sm_103a sample the tiny default count under theirs
+    pooled = plan(10624, 43824, 16, top_k=512, ratio=4)
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(pooled) == (
+        policy.sample_tiles_tiny_units,
+        policy.sample_shift_for(512),
+    )
+    for other in ("sm_100a", "sm_103a"):
+        assert (
+            policy_for(other).sample_class_rule[0]
+            == policy_for(other).sample_tiles_tiny_units
+        )
     for top_k in (256, 2048, 4096):
         doc = plan(16384, 270336, 2, top_k=top_k)
         assert doc.physical_kind in long_rule[0], top_k
