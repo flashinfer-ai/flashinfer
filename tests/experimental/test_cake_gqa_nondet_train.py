@@ -1254,7 +1254,8 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
         seqlens=fewer_tiles,
     )
     assert one["ranges"] == [(0, one["key_blocks"])], one["ranges"]
-    assert sum(counts[: one["key_blocks"]]) > one["tile_stride"], one  # overfills the one range
+    # The device numbering overfills that one range too.
+    assert sum(counts[: one["key_blocks"]]) > one["tile_stride"], one
     x = _inputs(*device_lens, h_q, h_kv, device)
     ws = cake_backend.CakeGQANondetWorkspace(device, budget_bytes=1)
     base = _run(x, "bf16", workspace=ws)
@@ -1281,7 +1282,12 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
         ),
         "tiles past a range": (*dev, _cu(fewer_tiles[0]), _cu(fewer_tiles[1]), 1),
         # The same host boundaries at the default budget: one range (the int32 one-subtraction check).
-        "tiles past the one range": (*dev, _cu(fewer_tiles[0]), _cu(fewer_tiles[1]), None),
+        "tiles past the one range": (
+            *dev,
+            _cu(fewer_tiles[0]),
+            _cu(fewer_tiles[1]),
+            None,
+        ),
     }
     for label, (cu_q, cu_k, host_q, host_k, budget) in cases.items():
         result = _child_backward(cu_q, cu_k, host_q, host_k, budget)
@@ -1299,8 +1305,8 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
 
 def _child_check_ranges(tile_base, plan, total_q) -> subprocess.CompletedProcess:
     """A child process (a device-side assert ends its CUDA context) queuing :func:`cake_backend._check_ranges` of one
-    segment on the int32 tile table ``tile_base`` (wrapped as int32 stores it) and a 100-key device segment; it prints
-    ``checked`` after the synchronization."""
+    segment on the int32 tile table ``tile_base`` (wrapped as int32 stores it); it prints ``checked`` after the
+    synchronization."""
     code = (
         "import importlib, sys\n"
         f"sys.path[:0] = {sys.path!r}\n"
@@ -1308,8 +1314,7 @@ def _child_check_ranges(tile_base, plan, total_q) -> subprocess.CompletedProcess
         f"b = importlib.import_module({cake_backend.__name__!r})\n"
         "d = torch.device('cuda:0')\n"
         f"tb = torch.tensor({list(tile_base)!r}, dtype=torch.int32, device=d)\n"
-        "ck = torch.tensor([0, 100], dtype=torch.int32, device=d)\n"
-        f"b._check_ranges(tb, ck, {dict(plan)!r}, 1, {total_q!r})\n"
+        f"b._check_ranges(tb, {dict(plan)!r}, 1, {total_q!r})\n"
         "torch.cuda.synchronize()\n"
         "print('checked', flush=True)\n"
     )
