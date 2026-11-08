@@ -31,6 +31,7 @@ from flashinfer.gemm.batch_invariant.api import (
     GEMM_FP8BS_ARCHS,
     gemm_fp8_nt_groupwise_batch_invariant,
     mm_fp8_batch_invariant,
+    native_k_staging,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant.generator import (
@@ -431,6 +432,71 @@ def test_public_api_runs_the_class_and_both_layouts_agree():
             assert api(a, w, sa, sb, "K", out=out) is out and torch.equal(
                 bits(out), ref
             )
+
+
+@needs_device
+def test_k_native_scale_staging_is_a_placement():
+    """The ``K`` layout's two stagings -- the K-native ring (four blocks per stage, a row's four scales one 16-byte copy from
+    the caller's tensor) and the per-block ring over the MN-major copy -- and the ``MN`` layout compute the same bits at
+    every shape of the DeepSeek grid, forced either way; the API's own choice (``native_k_staging``: a few rows) and a
+    K-layout tensor whose base is not 16-byte aligned (handed over as its copy) likewise. The staging changes which bytes
+    a ring stage holds, never the fold."""
+    for N, K in DS_PAIRS:
+        for M in DS_MS:
+            a, w, sa, sb = operands(M, N, K, seed=81)
+            ref = bits(
+                gemm_fp8_nt_groupwise_batch_invariant(
+                    a, w, sa.t().contiguous(), sb.t().contiguous(), "MN"
+                )
+            )
+            assert torch.equal(bits(ours(a, w, sa, sb, native_k=True)), ref), (
+                "native",
+                M,
+                N,
+                K,
+            )
+            assert torch.equal(bits(ours(a, w, sa, sb, native_k=False)), ref), (
+                "copy",
+                M,
+                N,
+                K,
+            )
+            assert torch.equal(bits(ours(a, w, sa, sb)), ref), ("default", M, N, K)
+            del a, w, sa, sb, ref
+    assert native_k_staging(64) and not native_k_staging(65)
+    M, N, K = 64, 7168, 7168
+    a, w, sa, sb = operands(M, N, K, seed=83)
+    # a 4-byte-aligned base (a column view): not the 16-byte copies'; the API hands the copy over
+    sa_off = torch.empty(M, K // BLOCK_K + 1, device="cuda")[:, 1:]
+    sa_off.copy_(sa)
+    assert sa_off.data_ptr() % 16 != 0
+    ref = bits(ours(a, w, sa, sb, native_k=True))
+    assert torch.equal(bits(ours(a, w, sa_off, sb)), ref)
+    assert torch.equal(bits(api(a, w, sa, sb, "K")), ref)
+    ref32 = bits(reference(a, w, sa, sb, torch.float32))
+    assert torch.equal(
+        bits(ours(a, w, sa, sb, native_k=True, out_dtype=torch.float32)).cpu(), ref32
+    )
+    # the operator (its autotuner path) takes the staging the rule names: the K layout as it is at a few rows, the MN
+    # copy at more, the MN layout never native
+    from flashinfer.gemm.batch_invariant.blocks import compile_fp8bs
+
+    seen = []
+    real = compile_fp8bs.get_compiled_fp8bs
+
+    def recording(cfg, clusters, out_fmt="bf16", family="", native_k=False):
+        seen.append(native_k)
+        return real(cfg, clusters, out_fmt, family, native_k)
+
+    compile_fp8bs.get_compiled_fp8bs = recording
+    try:
+        for M, mode, want in ((16, "K", True), (128, "K", False), (16, "MN", False)):
+            a, w, sa, sb = operands(M, 2048, 1024, seed=85)
+            seen.clear()
+            api(a, w, sa, sb, mode)
+            assert seen and all(v == want for v in seen), (M, mode, seen)
+    finally:
+        compile_fp8bs.get_compiled_fp8bs = real
 
 
 # ----------------------------------------------------------------------------------------------- R1 / R2 / R3

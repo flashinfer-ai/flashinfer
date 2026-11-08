@@ -42,6 +42,7 @@ from .api import (
     bmm_fp8_batch_invariant,
     fp4_format_for,
     gemm_fp8_nt_groupwise_batch_invariant,
+    native_k_staging,
     mm_bf16_batch_invariant,
     mm_fp4_batch_invariant,
     mm_mxfp8_batch_invariant,
@@ -194,6 +195,29 @@ TUNING_CONFIG_FP8BS = TuningConfig(
         ConstraintSpec(2, -1, lambda shapes: shapes[0][-2]),
     ),
 )
+#: The same tuning for the K-layout runner (the K-native staging at a few rows): the A scales are (M, K / 128) there, so the
+#: row count is their first mode.
+TUNING_CONFIG_FP8BS_K = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_graph_replay=True,
+    use_cold_l2_cache=True,
+    cold_chain_launches=8,
+    profile_arena_input_indices=(1,),
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (-2,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            OUT_INDEX["gemm_fp8_nt_groupwise"], -2, lambda shapes: shapes[0][-2]
+        ),
+        ConstraintSpec(2, -2, lambda shapes: shapes[0][-2]),
+    ),
+)
 TUNING_CONFIG_BMM_FP8 = _tuning_config(
     OUT_INDEX["bmm_fp8"]
 )  # inputs [A, B, A_scale, B_scale, out]
@@ -224,6 +248,7 @@ class BatchInvariantGemmRunner(TunableRunner):
         chunks: int,
         sm_count: int,
         family: str,
+        scale_mode: str = "MN",
     ) -> None:
         assert api in APIS, api
         self.api = api
@@ -232,6 +257,9 @@ class BatchInvariantGemmRunner(TunableRunner):
         self.chunks = chunks
         self.sm_count = sm_count
         self.family = family
+        # the block-scale class's scale layout as the runner receives it: "MN" (the K layout's copy), or "K" with the
+        # K-native staging (a few rows: `api.native_k_staging`); a placement, part of the tuner's cache key
+        self.scale_mode = scale_mode
 
     def _shape(self, inputs: List[torch.Tensor]) -> tuple:
         a, b = inputs[0], inputs[1]
@@ -254,6 +282,7 @@ class BatchInvariantGemmRunner(TunableRunner):
             self.chunks,
             self.sm_count,
             self.family,
+            self.scale_mode,
         )
 
     def get_valid_tactics(
@@ -346,11 +375,19 @@ class BatchInvariantGemmRunner(TunableRunner):
                 in_fmt=self.in_fmt,
             )
         if self.api == "gemm_fp8_nt_groupwise":
-            a, b, sfa, sfb, out = (
-                inputs  # the scales in the MN layout: (K / 128, M) and (K / 128, ceil(N / 128))
-            )
+            # the scales in the runner's layout: MN (K / 128, M) and (K / 128, ceil(N / 128)), or K (M, K / 128) and
+            # (ceil(N / 128), K / 128) with the K-native staging
+            a, b, sfa, sfb, out = inputs
             return gemm_fp8_nt_groupwise_batch_invariant(
-                a, b, sfa, sfb, "MN", out, out_dtype=out.dtype, config=cfg
+                a,
+                b,
+                sfa,
+                sfb,
+                self.scale_mode,
+                out,
+                out_dtype=out.dtype,
+                config=cfg,
+                native_k=self.scale_mode == "K",
             )
         a, b, out, bias = (
             inputs  # bias: the (N,) vector or None (the autotuner keeps a None input as is)
@@ -367,9 +404,17 @@ BatchInvariantBf16GemmRunner = (
 
 @functools.cache
 def _runner(
-    api: str, in_fmt: str, b_major: str, chunks: int, sm_count: int, family: str
+    api: str,
+    in_fmt: str,
+    b_major: str,
+    chunks: int,
+    sm_count: int,
+    family: str,
+    scale_mode: str = "MN",
 ) -> BatchInvariantGemmRunner:
-    return BatchInvariantGemmRunner(api, in_fmt, b_major, chunks, sm_count, family)
+    return BatchInvariantGemmRunner(
+        api, in_fmt, b_major, chunks, sm_count, family, scale_mode
+    )
 
 
 def mm_bf16_batch_invariant_auto(
@@ -559,8 +604,10 @@ def gemm_fp8_nt_groupwise_batch_invariant_auto(
 ) -> torch.Tensor:
     """``flashinfer.gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, scale_major_mode, ..., batch_invariant=True)``: the
     block-scale class behind the FlashInfer API's autotuner. The scale tensors reach the runner in the MN layout (a
-    K-major tensor is copied once: a layout copy, no arithmetic), so the tuned row count has one tensor mode to follow;
-    ``mma_sm`` is a placement of the backends and is ignored; the scale granularity must be the class's (1, 128, 128)."""
+    K-major tensor is copied once: a layout copy, no arithmetic), except at a few rows in the K layout, where the runner
+    takes them as they are for the K-native staging (:func:`native_k_staging`; a placement, the tuner's candidates run
+    the production staging); the tuned row count follows ``a``. ``mma_sm`` is a placement of the backends and is ignored;
+    the scale granularity must be the class's (1, 128, 128)."""
     if backend != "auto":
         raise unsupported(
             CLASS_FP8BS,
@@ -579,16 +626,40 @@ def gemm_fp8_nt_groupwise_batch_invariant_auto(
     if out_dtype not in GEMM_FP8BS_API_OUT_DTYPES:
         raise unsupported(CLASS_FP8BS, f"out_dtype={out_dtype}", "bf16 or fp16 output")
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
-        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype, mn_copy=False
     )
     if M == 0:
         return out
-    sfa_mn = sfa.t()  # (K / 128, M), contiguous: the MN layout (the K layout's copy)
-    sfb_mn = sfb.t().contiguous()  # (K / 128, ceil(N / 128))
-    runner = _runner("gemm_fp8_nt_groupwise", "e4m3_bs", "k", 1, *part_of(a.device))
-    inputs = [a, b, sfa_mn, sfb_mn, out]
+    native_k = (
+        scale_major_mode == "K"
+        and native_k_staging(M)
+        and sfa.data_ptr() % 16 == 0
+        and sfb.data_ptr() % 16 == 0
+    )
+    if native_k:
+        inputs = [
+            a,
+            b,
+            sfa,
+            sfb,
+            out,
+        ]  # the K layout as it is: (M, K / 128) and (ceil(N / 128), K / 128)
+        mode = "K"
+    else:
+        if scale_major_mode == "K":
+            sfa = sfa.t().contiguous().t()  # the layout copy, no arithmetic
+        sfa_mn = sfa.t()  # (K / 128, M), contiguous: the MN layout
+        sfb_mn = sfb.t().contiguous()  # (K / 128, ceil(N / 128))
+        inputs = [a, b, sfa_mn, sfb_mn, out]
+        mode = "MN"
+    runner = _runner(
+        "gemm_fp8_nt_groupwise", "e4m3_bs", "k", 1, *part_of(a.device), mode
+    )
     chosen, tactic = AutoTuner.get().choose_one(
-        CUSTOM_OP_FP8BS, [runner], TUNING_CONFIG_FP8BS, inputs
+        CUSTOM_OP_FP8BS,
+        [runner],
+        TUNING_CONFIG_FP8BS_K if native_k else TUNING_CONFIG_FP8BS,
+        inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
     return out

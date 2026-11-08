@@ -1392,6 +1392,20 @@ def mm_fp4_batch_invariant(
 # ----------------------------------------------------------------------------- the block-scale fp8 class
 
 
+#: The K-native scale staging: at most half the CTA tile's rows live (an empirical crossover).
+NATIVE_K_MAX_ROWS = 64
+
+
+def native_k_staging(M: int) -> bool:
+    """Whether the block-scale class stages ``K``-layout scales natively -- four blocks per ring stage, a row's four
+    consecutive scales one 16-byte ``cp.async`` from the caller's tensor as it is -- or through the MN-major copy and the
+    per-block ring. The gather costs one 32-byte sector per live row of the CTA tile and stage (the rows clamped to the
+    last one collapse onto its sector), the MN-major rows one sector per eight rows: with at most half the tile's rows
+    live the gather hides under the stage's operand TMA and the staging saves the copy's launch; with every row live it
+    stands on the chain's critical path. A placement: the bits never depend on it (``blocks/blockscale_fp8.py``)."""
+    return M <= NATIVE_K_MAX_ROWS
+
+
 def _blockscale_scale_view(
     s: torch.Tensor,
     name: str,
@@ -1439,13 +1453,14 @@ def prepare_fp8_blockscale_operands(
     scale_major_mode: Optional[str],
     out: Optional[torch.Tensor],
     out_dtype: torch.dtype,
+    mn_copy: bool = True,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int
 ]:
     """The block-scale class's typed checks: device and architecture, e4m3 A and B, 2-D shapes with matching K, K a whole
     number of 128-element scale blocks, N a multiple of 8, A's row placement, B a row-major (N, K) weight (the NT
     operator: K contiguous, 16-byte rows), the scale tensors of the layout's shapes (the ``K`` layout's A scales handed
-    over as their MN-major copy), the output's dtype / shape / layout (allocated when absent). Returns
+    over as their MN-major copy when ``mn_copy``), the output's dtype / shape / layout (allocated when absent). Returns
     ``(a, b, sfa, sfb, out, M, N, K)`` with ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views."""
     cls = CLASS_FP8BS
     check_device(a.device, cls, GEMM_FP8BS_ARCHS)
@@ -1493,7 +1508,7 @@ def prepare_fp8_blockscale_operands(
     _check_base(b, "B", cls)
     KB, NB = K // BLOCK_K, -(-N // SCALE_BLOCK_N)
     sfa = _blockscale_scale_view(
-        a_scale, "a_scale", M, KB, scale_major_mode, a.device, mn_copy=True
+        a_scale, "a_scale", M, KB, scale_major_mode, a.device, mn_copy=mn_copy
     )
     sfb = _blockscale_scale_view(b_scale, "b_scale", NB, KB, scale_major_mode, a.device)
     if out_dtype not in GEMM_FP8BS_OUT_DTYPES:
@@ -1512,6 +1527,7 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     *,
     out_dtype: torch.dtype = torch.bfloat16,
     config: Optional[Knobs] = None,
+    native_k: Optional[bool] = None,
 ) -> torch.Tensor:
     """The block-scale class ``gemm.e4m3.kblock128`` of :func:`flashinfer.gemm_fp8_nt_groupwise` (``scale_granularity_mnk =
     (1, 128, 128)``): per element ``out = cvt(fold_kb fma.rn(mul.rn(s_a[m, kb], s_b[n // 128, kb]), P_kb, acc))`` with
@@ -1519,9 +1535,10 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     ``b`` (N, K) e4m3 row-major; ``a_scale`` (M, K / 128) and ``b_scale`` (ceil(N / 128), K / 128) fp32 in the ``K``
     layout, or their transposes in the ``MN`` layout; ``out_dtype`` bf16 / fp16 (fp32 exposes the fold for tests);
     ``config`` forces a record of the class's space (the dispatcher's pick by default: every record computes the same
-    bits). One launch, no split, no workspace."""
+    bits), ``native_k`` the ``K`` layout's scale staging (:func:`native_k_staging` by default; a placement). One launch,
+    no split, no workspace."""
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
-        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype, mn_copy=False
     )
     cls = CLASS_FP8BS
     if M == 0:
@@ -1538,11 +1555,24 @@ def gemm_fp8_nt_groupwise_batch_invariant(
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
             "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
         )
+    # the K layout's staging (a placement: the fold never changes): the K-native ring at a few rows, the tensors read as they
+    # are from 16-byte-aligned bases (the four-block copies); the MN-major copy and the per-block ring otherwise
+    if native_k is None:
+        native_k = native_k_staging(M)
+    native_k = (
+        scale_major_mode == "K"
+        and native_k
+        and sfa.data_ptr() % 16 == 0
+        and sfb.data_ptr() % 16 == 0
+    )
+    if scale_major_mode == "K" and not native_k:
+        sfa = sfa.t().contiguous().t()
     kernel = get_compiled_fp8bs(
         config,
         persistent_clusters(a.device, config),
         OUT_FMT_OF_DTYPE[out_dtype],
         family=part_of(a.device)[1],
+        native_k=native_k,
     )
     _require_disjoint(
         cls,
