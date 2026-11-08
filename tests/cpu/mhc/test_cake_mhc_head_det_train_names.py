@@ -70,11 +70,12 @@ REMOVED_PREFIXES = (
 REMOVED_NAMES = ("route_key", "route_modules")
 # The registry's records: library -> (role, architectures, CTA threads, BF16 values per vector, the hidden size the
 # build is for, 0 for any).  On sm_100a and sm_103a a 64-bit library per hidden size: the forward in 256-thread CTAs
-# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (256 on sm_100a at 5120 and 7168), the
-# accumulating backward in 1024-thread CTAs.  On sm_107a the hidden-4096 forward and writing backward move 256-bit
-# vectors in 128-thread CTAs and the accumulating backward is the L2 bulk-reduce library (128-bit vectors, 256-thread
-# CTAs).  The unsuffixed libraries take any hidden size: 128-bit forward and 256-bit backward vectors in 256-thread
-# CTAs, for a small problem on sm_107a (and the backward on sm_100a / sm_103a).
+# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (480 on sm_100a and 640 on sm_103a at
+# 4096, 256 on sm_100a at 5120 and 7168), the accumulating backward in 768-thread CTAs.  On sm_107a the hidden-4096
+# forward and writing backward move 256-bit vectors in 128-thread CTAs and the accumulating backward is the L2
+# bulk-reduce library (128-bit vectors, 256-thread CTAs).  The unsuffixed libraries take any hidden size: 128-bit
+# forward and 256-bit backward vectors in 256-thread CTAs, for a small problem on sm_107a (and the backward on
+# sm_100a / sm_103a).
 _LW64 = ("sm_100a", "sm_103a")
 RECORDS = {
     "cake_mhc_det_train_head_fwd": ("head_fwd", ("sm_107a",), 256, 8, 0),
@@ -88,7 +89,8 @@ RECORDS = {
     },
     "cake_mhc_det_train_head_fwd__lw256_t128_h4096": ("head_fwd", ("sm_107a",), 128, 16, 4096),
     "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
-    "cake_mhc_det_train_head_bwd__lw64_t512_h4096": ("head_bwd", _LW64, 512, 4, 4096),
+    "cake_mhc_det_train_head_bwd__lw64_t480_h4096": ("head_bwd", ("sm_100a",), 480, 4, 4096),
+    "cake_mhc_det_train_head_bwd__lw64_t640_h4096": ("head_bwd", ("sm_103a",), 640, 4, 4096),
     "cake_mhc_det_train_head_bwd__lw64_t512_h5120": ("head_bwd", ("sm_103a",), 512, 4, 5120),
     "cake_mhc_det_train_head_bwd__lw64_t512_h7168": ("head_bwd", ("sm_103a",), 512, 4, 7168),
     "cake_mhc_det_train_head_bwd__lw64_t256_h5120": ("head_bwd", ("sm_100a",), 256, 4, 5120),
@@ -96,7 +98,7 @@ RECORDS = {
     "cake_mhc_det_train_head_bwd__lw256_t128_h4096": ("head_bwd", ("sm_107a",), 128, 16, 4096),
     "cake_mhc_det_train_head_bwd__acc": ("head_bwd_acc", ("sm_107a",), 256, 16, 0),
     **{
-        f"cake_mhc_det_train_head_bwd__acc_lw64_t1024_h{h}": ("head_bwd_acc", _LW64, 1024, 4, h)
+        f"cake_mhc_det_train_head_bwd__acc_lw64_t768_h{h}": ("head_bwd_acc", _LW64, 768, 4, h)
         for h in (4096, 5120, 7168)
     },
     "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": (
@@ -315,7 +317,7 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
             loader.route_module(arch, role, hidden, 16384)
     with pytest.raises(ValueError, match="is built for hidden 4096, got 5120"):
         loader.vectors_per_token(
-            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t512_h4096"], 5120
+            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t480_h4096"], 5120
         )
 
 

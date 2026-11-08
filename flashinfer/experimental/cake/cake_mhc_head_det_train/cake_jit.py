@@ -36,11 +36,12 @@ on an architecture at a hidden size (:func:`route_module`).  On sm_100a and
 sm_103a every kernel moves 64-bit vectors (4 BF16 values) per thread and is
 built for one hidden size (the ``_h<hidden>`` libraries; the record's
 ``hidden``): the forward in 256-thread CTAs on sm_100a and 128-thread CTAs on
-sm_103a, the backward in 512-thread CTAs (256 on sm_100a at hidden 5120 and
-7168) and the accumulating backward in 1024-thread CTAs.  On sm_107a the
-hidden-4096 forward and writing backward move 256-bit vectors (16 values) in
-128-thread CTAs, and the accumulating backward has L2 do its additions (bulk
-reductions from a shared-memory segment of 128-bit vectors, 256-thread CTAs).
+sm_103a, the backward in 512-thread CTAs (480 on sm_100a and 640 on sm_103a
+at hidden 4096, 256 on sm_100a at hidden 5120 and 7168) and the accumulating
+backward in 768-thread CTAs.  On sm_107a the hidden-4096 forward and writing
+backward move 256-bit vectors (16 values) in 128-thread CTAs, and the
+accumulating backward has L2 do its additions (bulk reductions from a
+shared-memory segment of 128-bit vectors, 256-thread CTAs).
 The unsuffixed libraries take any hidden size (``hidden`` 0), with 128-bit
 forward vectors (8 values) and 256-bit backward vectors (16 values) in
 256-thread CTAs; they serve a small problem (:data:`SMALL_ROUTES`): every role
@@ -377,9 +378,42 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd",
     },
-    "cake_mhc_det_train_head_bwd__lw64_t512_h4096": {
+    "cake_mhc_det_train_head_bwd__lw64_t480_h4096": {
         "arches": [
             "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["parameter", "T"],
+            ["parameter", "hv"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "vectors", "threads": 480, "vector_elems": 4},
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_head_bwd__lw64_t480_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__lw64_t480_h4096",
+        "launch": {
+            "block": (480, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_head_bwd__lw64_t480_h4096",
+        "logical": {
+            "T": "rows",
+            "dx": "dx",
+            "dy": "dy",
+            "hv": "hv",
+        },
+        "role": "head_bwd",
+    },
+    "cake_mhc_det_train_head_bwd__lw64_t640_h4096": {
+        "arches": [
             "sm_103a",
         ],
         "arg_plan": [
@@ -392,18 +426,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "vectors", "threads": 512, "vector_elems": 4},
+        "grid_rule": {"kind": "vectors", "threads": 640, "vector_elems": 4},
         "hidden": 4096,
-        "kernel": "cake_mhc_det_train_head_bwd__lw64_t512_h4096",
-        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__lw64_t512_h4096",
+        "kernel": "cake_mhc_det_train_head_bwd__lw64_t640_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__lw64_t640_h4096",
         "launch": {
-            "block": (512, 1, 1),
+            "block": (640, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_det_train_head_bwd__lw64_t512_h4096",
+        "library": "cake_mhc_det_train_head_bwd__lw64_t640_h4096",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -616,7 +650,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd_acc",
     },
-    "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096": {
+    "cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -631,18 +665,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "vectors", "threads": 1024, "vector_elems": 4},
+        "grid_rule": {"kind": "vectors", "threads": 768, "vector_elems": 4},
         "hidden": 4096,
-        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096",
-        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096",
+        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096",
         "launch": {
-            "block": (1024, 1, 1),
+            "block": (768, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096",
+        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -651,7 +685,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd_acc",
     },
-    "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120": {
+    "cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -666,18 +700,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "vectors", "threads": 1024, "vector_elems": 4},
+        "grid_rule": {"kind": "vectors", "threads": 768, "vector_elems": 4},
         "hidden": 5120,
-        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120",
+        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120",
         "launch": {
-            "block": (1024, 1, 1),
+            "block": (768, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120",
+        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -686,7 +720,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd_acc",
     },
-    "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168": {
+    "cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -701,18 +735,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "vectors", "threads": 1024, "vector_elems": 4},
+        "grid_rule": {"kind": "vectors", "threads": 768, "vector_elems": 4},
         "hidden": 7168,
-        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168",
+        "kernel": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168",
         "launch": {
-            "block": (1024, 1, 1),
+            "block": (768, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168",
+        "library": "cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -769,14 +803,14 @@ ROUTES: dict[str, dict[str, dict[int, str]]] = {
             7168: "cake_mhc_det_train_head_fwd__lw64_t256_h7168",
         },
         "head_bwd": {
-            4096: "cake_mhc_det_train_head_bwd__lw64_t512_h4096",
+            4096: "cake_mhc_det_train_head_bwd__lw64_t480_h4096",
             5120: "cake_mhc_det_train_head_bwd__lw64_t256_h5120",
             7168: "cake_mhc_det_train_head_bwd__lw64_t256_h7168",
         },
         "head_bwd_acc": {
-            4096: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096",
-            5120: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120",
-            7168: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168",
+            4096: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096",
+            5120: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120",
+            7168: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168",
         },
     },
     "sm_103a": {
@@ -786,14 +820,14 @@ ROUTES: dict[str, dict[str, dict[int, str]]] = {
             7168: "cake_mhc_det_train_head_fwd__lw64_t128_h7168",
         },
         "head_bwd": {
-            4096: "cake_mhc_det_train_head_bwd__lw64_t512_h4096",
+            4096: "cake_mhc_det_train_head_bwd__lw64_t640_h4096",
             5120: "cake_mhc_det_train_head_bwd__lw64_t512_h5120",
             7168: "cake_mhc_det_train_head_bwd__lw64_t512_h7168",
         },
         "head_bwd_acc": {
-            4096: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h4096",
-            5120: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120",
-            7168: "cake_mhc_det_train_head_bwd__acc_lw64_t1024_h7168",
+            4096: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h4096",
+            5120: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h5120",
+            7168: "cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168",
         },
     },
     "sm_107a": {

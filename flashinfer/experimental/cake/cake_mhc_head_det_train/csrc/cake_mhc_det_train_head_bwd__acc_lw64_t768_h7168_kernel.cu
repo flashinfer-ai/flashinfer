@@ -54,8 +54,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(1024) void
-kernel_cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, int T, CakeFastDivmod hv)
+__global__ __launch_bounds__(768) void
+kernel_cake_mhc_det_train_head_bwd__acc_lw64_t768_h7168(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, int T, CakeFastDivmod hv)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -69,14 +69,14 @@ kernel_cake_mhc_det_train_head_bwd__acc_lw64_t1024_h5120(__nv_bfloat16* __restri
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    unsigned int cta_q = (unsigned int)bid / 1280;
-    unsigned int cta_r = (unsigned int)bid - cta_q * 1280;
-    unsigned int within = cta_r * 1024 + (unsigned int)tid;
-    unsigned int sub = within / 1280;
-    unsigned int token = cta_q * 1024 + sub;
-    unsigned int col = within - sub * 1280;
+    unsigned int cta_q = (unsigned int)bid / 1792;
+    unsigned int cta_r = (unsigned int)bid - cta_q * 1792;
+    unsigned int within = cta_r * 768 + (unsigned int)tid;
+    unsigned int sub = within / 1792;
+    unsigned int token = cta_q * 768 + sub;
+    unsigned int col = within - sub * 1792;
     if (token < (unsigned int)T) {
-        long long row = 5120ll;
+        long long row = 7168ll;
         long long xbase = (long long)token * (row * 4ll) + (long long)col * 4ll;
         unsigned int grad[2];
         long long gbase = (long long)token * row + (long long)col * 4ll;
