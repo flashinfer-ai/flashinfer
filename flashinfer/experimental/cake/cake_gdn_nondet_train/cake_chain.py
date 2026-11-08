@@ -164,6 +164,7 @@ __all__ = [
     "FWD_HO_VH2_ARCHS",
     "FWD_HO_VH2_STEP",
     "FWD_A_ARCHS",
+    "FWD_A_SERIAL_KEEP",
     "WY_A_MAX_GROUP",
     "SPLIT_R_FORM",
     "TC_PLAN",
@@ -198,6 +199,7 @@ __all__ = [
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
     "fwd_a_route",
+    "fwd_serial_keep_pricing",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -3007,6 +3009,17 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
 # route's time under both gate regimes, the same bits run to run; the split forward stays off there.
 FWD_A_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 WY_A_MAX_GROUP = 3
+# On an architecture of ``FWD_A_SERIAL_KEEP`` a host-built table without plan pins keeps a SERIAL forward table where
+# the register planner takes a split one and prices its cheapest serial table at most the architecture's factor above
+# it (the planner record's ``priced`` entries, :func:`fwd_serial_keep_pricing`); ``CHAIN_PLAN`` then deepens no forward
+# table there and :func:`fwd_a_route` serves the row.  A planner table that is serial already keeps every rule.  R200
+# (sm_107a, 212 SMs; 4 fresh processes, CUPTI, cold L2) against the split tables: the 3 sequences of 11000 / 12000 /
+# 9768 tokens with HV 48 (144 serial CTAs, ratio 1.06) run fwd 0.71-0.85, fwd+bwd 0.89-0.95, checkpoint 0.82-0.90 and
+# bwd 1.00 of the split table's time under both gate regimes, the same bits run to run; with HV 24 (72 CTAs, ratio
+# 1.51) the serial table is slower (fwd 1.25, fwd+bwd 1.08, checkpoint 1.08 under the bandwidth gate), with HV 12
+# (2.74) 21-34 % slower.  The crossover between 1.06 and 1.51 is not measured: 1.10 keeps the measured win.  On B200
+# the planner keeps the serial table of the HV 48 layout itself.
+FWD_A_SERIAL_KEEP: dict[str, float] = {"sm_107a": 1.10}
 # fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
 FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
 
@@ -3024,6 +3037,65 @@ def fwd_a_route(
     if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
         return False
     return _available("wy_a", arch) and _available("fwd_ho_a", arch)
+
+
+@lru_cache(maxsize=4096)
+def _fwd_scan_record(total_tokens, seq_lens, num_v_heads, device_index, sset, props):
+    """The register planner's pricing record of a host layout's forward table without plan pins."""
+    _plan, rec = choose_scan_plan("fwd_h", total_tokens, len(seq_lens), num_v_heads, device_index, seq_lens,
+                                  sset)  # fmt: skip
+    return rec
+
+
+def fwd_serial_keep_pricing(
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    plan: ScanPlan,
+    *,
+    total_tokens: int | None = None,
+) -> dict:
+    """The forward table rule of :data:`FWD_A_SERIAL_KEEP` on a host layout whose planner forward table without plan
+    pins is ``plan``: ``{"select", "ratio", "serial", "limit"}``, ``serial`` the planner's cheapest serial table and
+    ``ratio`` its price over the price of ``plan`` (``select``: ``plan`` splits a sequence and ``ratio`` is at most the
+    architecture's ``limit``).  Host work only."""
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    seq_lens = tuple(int(n) for n in seq_lens)
+    limit = FWD_A_SERIAL_KEEP.get(arch)
+    rec: dict[str, Any] = {
+        "select": False,
+        "ratio": None,
+        "serial": None,
+        "limit": limit,
+    }
+    chunks = tuple(-(-n // CHUNK) for n in seq_lens)
+    if (
+        limit is None
+        or not chunks
+        or plan.segment_len <= 0
+        or max(chunks) <= plan.segment_len
+    ):
+        return rec
+    tokens = sum(seq_lens) if total_tokens is None else int(total_tokens)
+    priced = _fwd_scan_record(tokens, seq_lens, int(num_v_heads), index, stage_set(arch),
+                              _device_props(index)).get("priced") or []  # fmt: skip
+    chosen = [
+        cost
+        for config, seg_len, cost in priced
+        if tuple(config) == tuple(plan.config) and seg_len == plan.segment_len and cost
+    ]
+    serial = [
+        (cost, tuple(config))
+        for config, seg_len, cost in priced
+        if seg_len == 0 and cost is not None
+    ]
+    if not chosen or not serial:
+        return rec
+    cost, config = min(serial)
+    ratio = cost / chosen[0]
+    rec.update(select=ratio <= limit, ratio=round(ratio, 4), serial=ScanPlan(config, 0))
+    return rec
 
 
 def _fwd_a_inputs(
@@ -4657,12 +4729,12 @@ def host_plans(
     group: int | None = None,
 ) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
     """The forward and adjoint tables of a host layout (``seq_lens``, tokens per sequence) on device ``device_index``
-    and whether the adjoint table is priced for ``dhu_tc2`` (``ChunkMeta.bwd_tc``): the planner's tables, the adjoint
-    table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split tables of ``CHAIN_PLAN``; plan pins (and a
-    ``dhu_scan`` pin) keep the planner's tables.  ``group`` is the call's value-head group ``HV / H`` (``None``: a
-    group the R form of :func:`split_r_form` does not serve), the one input besides the layout that changes a table:
-    on an architecture of ``SPLIT_R_FORM`` a group of three keeps a planner's split adjoint table that the R form
-    groups.  Host work only."""
+    and whether the adjoint table is priced for ``dhu_tc2`` (``ChunkMeta.bwd_tc``): the planner's tables, the serial
+    forward table of ``FWD_A_SERIAL_KEEP``, the adjoint table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split
+    tables of ``CHAIN_PLAN``; plan pins (and a ``dhu_scan`` pin) keep the planner's tables.  ``group`` is the call's
+    value-head group ``HV / H`` (``None``: a group the R form of :func:`split_r_form` does not serve), the one input
+    besides the layout that changes a table: on an architecture of ``SPLIT_R_FORM`` a group of three keeps a planner's
+    split adjoint table that the R form groups.  Host work only."""
     return _host_plans(
         seq_lens,
         num_v_heads,
@@ -4691,7 +4763,14 @@ def _host_plans(
         total_tokens = sum(seq_lens)
     plans = scan_plans(int(total_tokens), len(seq_lens), int(num_v_heads), index, seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
-    bwd_tc = kept = False
+    bwd_tc = kept = keep_serial = False
+    if options.pins == (None, None):
+        # the serial forward table of FWD_A_SERIAL_KEEP (fwd_a_route serves it; CHAIN_PLAN deepens no forward table)
+        keep = fwd_serial_keep_pricing(
+            seq_lens, int(num_v_heads), index, plans[0], total_tokens=total_tokens
+        )
+        if keep["select"]:
+            plans, keep_serial = (keep["serial"], plans[1]), True
     if TC_PLAN and options.pins == (None, None) and options.dhu_scan is None:
         chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
         bwd = plans[1]
@@ -4726,7 +4805,11 @@ def _host_plans(
             for kind in ("fwd", "bwd"):
                 plan = plans[0] if kind == "fwd" else plans[1]
                 serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
-                if (serial and stream_split is not None) or (kind == "bwd" and kept):
+                if (
+                    (serial and stream_split is not None)
+                    or (kind == "bwd" and kept)
+                    or (kind == "fwd" and keep_serial)
+                ):
                     continue
                 deeper = chain_plan_pricing(kind, chunks, int(num_v_heads), index, plan)
                 if not deeper["select"]:
@@ -4808,6 +4891,7 @@ def _chunk_meta(
         id(cake_plan.ADJOINT_FORMS),
         FWD_SPLIT_ARCHS,
         tuple(sorted(cake_plan.FORWARD_SPLIT_MIN_PIECE.items())),
+        tuple(sorted(FWD_A_SERIAL_KEEP.items())),
         tuple(sorted(M_SHARE_ARCHS)),
         id(cake_plan.M_SHARE_COSTS),
         cake_plan.M_SHARE_MIN_SAVING,

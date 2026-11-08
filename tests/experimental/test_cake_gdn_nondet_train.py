@@ -3054,6 +3054,8 @@ def test_chain_plan_rule_on_r200(sm_count, plan, monkeypatch) -> None:
         cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
     )
     monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_107a")
+    # CHAIN_PLAN's own tables: the serial forward table of FWD_A_SERIAL_KEEP (test_fwd_a_serial_keep_rule) is off
+    monkeypatch.setattr(cake_chain, "FWD_A_SERIAL_KEEP", {})
     if plan == "planner":
         monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
     split_arch = "sm_107a" in cake_chain.ADJOINT_SPLIT_ARCHS
@@ -3136,6 +3138,77 @@ def test_chain_plan_rule_on_r200(sm_count, plan, monkeypatch) -> None:
             tuple(planner),
             False,
         ), pins
+
+
+# The forward table rule of FWD_A_SERIAL_KEEP on the gating rows, per SM count of R200 (sm_107a): row -> whether its
+# split forward table gives way to the planner's cheapest serial table.  The 3 sequences of 11000 / 12000 / 9768 tokens
+# with HV 48 (144 serial CTAs, the serial table 1.06 x the split table's price) take it; with HV 24 (72 CTAs, 1.51 x)
+# and fewer value heads, and the long rows, the split table stays (64 x 4096 is serial without the rule).  B200 and
+# GB300 keep every table.
+FWD_A_SERIAL_ROWS = {
+    212: {
+        "A16": True,
+        "h8_hv24": False,
+        "h4_hv12": False,
+        "h2_hv6": False,
+        "h1_hv3": False,
+        "issue": False,
+        "P3": False,
+        "P1": False,
+        "64x4096": False,
+    }
+}
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 212), ("sm_107a", 216)],
+    ids=["B200", "GB300", "R200-212", "R200-216"],
+)
+def test_fwd_a_serial_keep_rule(arch, sm_count, monkeypatch) -> None:
+    # a split forward table priced within FWD_A_SERIAL_KEEP's factor of the cheapest serial table becomes that serial
+    # table (whatever CHAIN_PLAN prices), so fwd_a_route's table condition holds; the adjoint table does not change;
+    # plan pins keep the planner's tables
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    options = cake_chain.make_options()
+    kept, ratios, tables = set(), {}, {}
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        (fwd, bwd), bwd_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "FWD_A_SERIAL_KEEP", {})
+            (fwd0, bwd0), tc0 = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        assert (bwd, bwd_tc) == (bwd0, tc0), row
+        planner = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )[0]
+        rec = cake_chain.fwd_serial_keep_pricing(seq_lens, num_v_heads, 0, planner)
+        ratios[row], tables[row] = rec["ratio"], fwd
+        if fwd == fwd0:
+            assert not rec["select"], (row, rec)
+            continue
+        kept.add(row)
+        assert rec["select"] and rec["ratio"] <= rec["limit"], (row, rec)
+        assert fwd == rec["serial"] and fwd.segment_len == 0, (row, fwd)
+        assert _segments(chunks, fwd0) > len(chunks), (row, fwd0)
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=(fwd, bwd))
+        assert meta.fwd_segments.num_segments == len(seq_lens), row
+    if arch not in cake_chain.FWD_A_SERIAL_KEEP:
+        assert kept == set()
+    for row, want in FWD_A_SERIAL_ROWS.get(sm_count, {}).items():
+        assert (row in kept) is want, (row, sorted(kept), ratios)
+    if sm_count in FWD_A_SERIAL_ROWS:
+        assert 1.0 < ratios["A16"] <= 1.10 < ratios["h8_hv24"], ratios
+        chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
+        assert _segments(chunks, tables["h8_hv24"]) > len(chunks), tables["h8_hv24"]
+    pinned = cake_chain.make_options(scan_config=(64, 1), segment_chunks=64)
+    planner = cake_chain.scan_plans(sum(_PAIR_LAYOUT), 3, 48, 0, _PAIR_LAYOUT, scan_config=(64, 1),
+                                    segment_chunks=64)  # fmt: skip
+    assert planner[0].segment_len == 64, planner
+    assert cake_chain.host_plans(_PAIR_LAYOUT, 48, 0, pinned) == (tuple(planner), False)
 
 
 # The split R form (SPLIT_R_FORM): the bench layouts of a value-head group of three whose planner adjoint table it
