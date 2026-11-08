@@ -298,10 +298,10 @@ no memset.  The chain keeps one workspace per (device, stream of the launch)
 with `host_cache=True` (a fresh one per call otherwise), and launches the
 chunk table in segments of at most `TAIL_WORKSPACE_TILES // HV` chunks (4096
 slots, 256 MiB; at least one chunk), in stream order.  Calls on different streams take different workspaces.  A
-CUDA graph captured on its own stream takes a workspace of that stream (zeroed
-inside the capture when the capture creates it); replay one captured graph at
-a time, not concurrently with itself or with eager calls on its capture
-stream.  A value-head group of one uses no workspace.
+CUDA graph capture takes its own workspace (fresh buffers from the graph's
+memory pool, the counters zeroed inside the capture) instead of the pooled one
+of its stream; replay one captured graph at a time, not concurrently with
+itself.  A value-head group of one uses no workspace.
 
 The autograd backward of a host-table or equal-length call with
 `host_cache=True` and the kept tape is planned before it launches.  Its first
@@ -317,7 +317,9 @@ a strided or unaligned `do` is first copied, as the general path copies it),
 no final-state gradient, the stream's pool tables and the module tables the
 record was made with; otherwise the call runs the general path and records
 again.  A replay makes the same launches as the general path, so the bits
-are the same.
+are the same.  A backward inside a CUDA graph capture neither replays nor
+records a plan (a plan's launches read the pooled workspaces of its stream):
+it runs the general path on the capture's own workspaces.
 `cake_chain.BWD_PLAN = False` keeps every call on the general path.
 
 On the host-table route the long sequences start first.  The tables list the
@@ -351,6 +353,24 @@ before the stage returns (also when a launch raises), so the call can be
 captured in a CUDA graph (warm it up first, like any captured call).  Every
 tail runs on the caller's stream.
 `streams=1` keeps every launch on the caller's stream.
+
+The host-table route caches device tables between calls: a layout's chunk and
+segment tables, its split tables (the split forward's and the adjoint walk's)
+and the identity walk of the forward scan.  A table is written on the stream
+of the call that builds it, and an eager call on another stream waits for
+that write (an event recorded after it) before its launches read the table;
+a hit on a layout's tables covers its adjoint split tables too, which only the
+backward (and its replayed plan) reads.  A CUDA graph capture does not cache
+the tables it builds, since they are written only when the graph replays.  It
+reads the cached tables without waiting, so their writes must be done when
+the capture starts (`torch.cuda.graph` synchronizes the device first), and
+keeps them for the life of the process, since every replay reads them.  The
+device synchronization covers only work queued before the capture: while one
+thread captures calls of this package, another thread's call on the same
+device that builds a table must have its stream synchronized before the
+capture reads that layout.  A capture also takes its own workspaces instead of
+the pooled per-stream ones, and its backward neither replays nor records a
+plan.
 
 The one-wave split of the adjoint walk is priced with the cost entry of the
 device (`adjoint_split_costs`: the entry of `ADJOINT_SPLIT_DEVICE_COSTS` for
@@ -410,7 +430,7 @@ tail rule show.
 | `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits as `"reg"` on `dhu_tc2`, within the budgets on `dhu_tc2_dvl32`) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward state of the architecture's tape level for the backward (`T_full`: `w`, `h`, `v_new`; `u`, read only to rebuild `h` / `v_new`, is freed when the forward returns); `False` recomputes them |
-| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections, the per-stream workspaces and the backward's launch record between calls |
+| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections, the per-stream workspaces and the backward's launch record between calls (a CUDA graph capture takes its own workspaces and no launch record) |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order |
 | `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream |
 | `tail` | rule | backward tail (see Chain): `"tail"`, `"tail_g2_f32x"` or `"tail_g2"` (`HV == 2 * H` only), `"tail_g3_f32x"` or `"tail_g3"` (`HV == 3 * H` only) or `"unfused"` |
