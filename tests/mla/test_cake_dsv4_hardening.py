@@ -2100,3 +2100,88 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
     assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()
+
+
+# ---------------------------------------------------------- padded rows on the source-exact routes
+# The routes whose programs launch one CTA per request position (max_q_len x
+# batch_size, whatever the metadata rows), at every sparse width they take.
+_SOURCE_EXACT_PADDED_CASES = [
+    _align_case(route, heads, dtype, [5, 3, 4], "ragged", width, page, form=form)
+    for route, dtype in (
+        ("bf16_h8_h16_source_exact", _BF16),
+        ("fp8_h8_h16_source_exact", _FP8),
+    )
+    for heads, width, page, form in (
+        (8, 64, 64, "h8-192"),
+        (16, 128, 64, "h16-256"),
+        (16, 132, 2, "h16-260"),
+    )
+] + [_align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512)]
+
+
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _SOURCE_EXACT_PADDED_CASES
+)
+def test_source_exact_padded_rows_match_the_unpadded_call(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page
+):
+    """A padded ragged call on a source-exact route: the metadata of the first
+    ``T`` rows alone (tables and lengths of exactly ``T`` rows) under the
+    query and ``cum_seq_lens_q`` of every row, for ``T`` = 1, the first
+    request boundary and one row short of the end.  Rows below ``T`` get
+    bitwise the unpadded call's output and every row at or past ``T`` keeps
+    its NaN, in an aligned ``out`` and in one 2 bytes off its store alignment
+    (staged through a ``T``-row buffer); the bytes around ``out`` stay
+    untouched.  ``T = 1`` also runs with its one row viewed out of a
+    ``[1, W + 1]`` parent (odd row stride), whose next row would be a
+    misaligned 16-byte index load."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(len(q_lens))],
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+    )
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls == [(route, case.rows)], calls
+    assert not torch.isnan(expected).any()
+
+    table, lens = case.sparse_indices, case.sparse_topk_lens
+    cols = int(table.shape[1])
+    ends = case.cum_seq_lens_q.tolist()
+    one_row = torch.full((1, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    one_row[:, :cols] = table[:1]
+    assert one_row[:, :cols].stride(0) % 4 != 0
+    metadata = [
+        (rows, table[:rows].clone()) for rows in sorted({1, ends[1], ends[-1] - 1})
+    ]
+    metadata.append((1, one_row[:, :cols]))
+    numel = expected.numel()
+    for rows, rows_table in metadata:
+        padded = dataclasses.replace(
+            case, sparse_indices=rows_table, sparse_topk_lens=lens[:rows].clone()
+        )
+        for offset_bytes in (0, 2):
+            raw = torch.full(
+                (numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0"
+            )
+            start = ((-raw.data_ptr()) % 32 + offset_bytes) // raw.element_size()
+            out = raw[start : start + numel].view(case.query.shape)
+            assert out.data_ptr() % 32 == offset_bytes
+            calls.clear()
+            got = padded.run(workspace=workspace, out=out, float_scales=True)
+            torch.cuda.synchronize()
+            where = f"T={rows} of {case.rows}, stride {rows_table.stride(0)}, out +{offset_bytes} B"
+            assert calls == [(route, rows)], (where, calls)
+            assert torch.equal(
+                got[:rows].view(torch.int16), expected[:rows].view(torch.int16)
+            ), where
+            assert torch.isnan(got[rows:]).all(), where
+            assert torch.isnan(raw[:start]).all(), where
+            assert torch.isnan(raw[start + numel :]).all(), where
