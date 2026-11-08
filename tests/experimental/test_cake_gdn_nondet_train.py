@@ -298,6 +298,15 @@ def _metrics(a: torch.Tensor, ref: torch.Tensor) -> dict:
     }
 
 
+def _sizing(label: str, got: torch.Tensor, ref: torch.Tensor) -> str:
+    """One SIZING line (``pytest -s``): the relative RMS error and the largest error over the largest reference value."""
+    m = _metrics(got, ref)
+    rel = m["max_abs"] / m["max_ref"] if m["max_ref"] > 0 else 0.0
+    line = f"SIZING {label} rel_rms={m['rel_rms']:.3e} max_abs_rel={rel:.3e}"
+    print(line)
+    return line
+
+
 def _assert_close_to_reference(got: dict, ref: dict, names) -> None:
     report = {}
     failed = []
@@ -1532,31 +1541,37 @@ G3_R_FORM_ROWS = {
 @pytest.mark.parametrize("plan", ["planner", "stage1"])
 @pytest.mark.parametrize("row", sorted(G3_R_FORM_ROWS))
 def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) -> None:
-    # the R form beside tail_g3_f32x gives the bits of one dhu_tc2 launch (one stream); at the same tables the package
-    # tail's bits (the planner's split table that SPLIT_R_FORM keeps serves a group of three's cluster tail only, so
-    # that comparison runs without it); without the FP32 dv_local adjoint and with tail_g3 pinned, the deterministic
-    # package's bits
+    # every route the package ships for the row (the forward's A / split routes, the FP32 dv_local adjoint, the
+    # cluster tail): within the budgets of the deterministic package.  Then on the prep's forward in both packages
+    # (prep, wy_tc2, fwd_ho; fwd_a_route's forward: test_fwd_a_within_the_budgets_of_the_prep_forward): the R form
+    # beside tail_g3_f32x gives the bits of one dhu_tc2 launch (one stream); at the same tables the package tail's bits
+    # (the planner's split table that SPLIT_R_FORM keeps serves a group of three's cluster tail only, so that
+    # comparison runs without it), within the budgets of the deterministic package; without the FP32 dv_local adjoint
+    # the deterministic package's o, dv, dg and dbeta (dq / dk within its budgets), and with tail_g3 pinned all of its
+    # bits
     # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty); plan "stage1": the shipped plan, where a row the
     # one-wave split prices runs the split beside the group's cluster tail instead of the R form
-    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
-    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
-    _prep_forward_on_both(monkeypatch)
     index = cake_chain._device_index(device)
     arch = cake_backend.device_arch(index)
     seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
     if plan == "planner":
         monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
-    elif (
-        cake_chain._adjoint_split_length(
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
+    _assert_within_budget(
+        _run(inputs, seq_lens), _run(inputs, seq_lens, det=True), OUTPUT_NAMES
+    )
+    _prep_forward_on_both(monkeypatch)
+    if (
+        plan == "stage1"
+        and cake_chain._adjoint_split_length(
             seq_lens, heads[1], index, cake_chain.make_options()
         )
         is not None
     ):
-        _check_group_of_three_split(seq_lens, heads, device, monkeypatch)
+        _check_group_of_three_split(inputs, seq_lens, device, monkeypatch)
         return
     if not SERIAL_G3_R_FORM.get(arch, False):
         pytest.skip(f"{arch} runs one dhu_tc2 launch on these rows")
-    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
     main = torch.cuda.current_stream(device).cuda_stream
     launches = _record_streams(monkeypatch)
     got = _run(inputs, seq_lens)
@@ -1576,20 +1591,21 @@ def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) ->
         OUTPUT_NAMES,
     )
     monkeypatch.setattr(cake_chain, "SPLIT_R_FORM", split_r_form)
+    det = _run(inputs, seq_lens, det=True)
+    _assert_within_budget(got, det, OUTPUT_NAMES)
     monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
-    _assert_same_bits(
-        _run(inputs, seq_lens, tail="tail_g3"),
-        _run(inputs, seq_lens, det=True),
-        OUTPUT_NAMES,
-    )
+    _assert_same_bits(_run(inputs, seq_lens, tail="tail_g3"), det, OUTPUT_NAMES)
+    plain = _run(inputs, seq_lens)
+    for name in ("o", "dv", "dg", "dbeta"):
+        assert torch.equal(plain[name], det[name]), name
+    _assert_within_budget(plain, det, ("dq", "dk"))
 
 
-def _check_group_of_three_split(seq_lens, heads, device, monkeypatch) -> None:
+def _check_group_of_three_split(inputs, seq_lens, device, monkeypatch) -> None:
     """A group of three on a row the one-wave split prices: the split's forms and its composition beside tail_g3_f32x,
-    no R form and no other adjoint scan; the bits repeat, on one stream too, and the package tail gives the cluster
-    tail's bits at the same tables."""
+    no R form and no other adjoint scan; the bits repeat, on one stream too, the package tail gives the cluster
+    tail's bits at the same tables, and every output stays within the budgets of the deterministic package."""
     arch = cake_backend.device_arch(cake_chain._device_index(device))
-    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
     launches = _record_streams(monkeypatch)
     got = _run(inputs, seq_lens)
     stages = [stage for stage, _ in launches]
@@ -1606,6 +1622,7 @@ def _check_group_of_three_split(seq_lens, heads, device, monkeypatch) -> None:
     _assert_same_bits(_run(inputs, seq_lens, streams=1), got, OUTPUT_NAMES)
     _assert_same_bits(_run(inputs, seq_lens, tail="tail", host_cache=False), _run(inputs, seq_lens, host_cache=False),
                       OUTPUT_NAMES)  # fmt: skip
+    _assert_within_budget(got, _run(inputs, seq_lens, det=True), OUTPUT_NAMES)
 
 
 def test_one_round_groups_keep_the_bits_of_one_walk(device, monkeypatch) -> None:
@@ -2417,7 +2434,8 @@ FIXED_ORDER_CASES = (
     ((2, 4), {}),
     ((2, 6), {}),
     ((1, 3), {}),
-    ((1, 4), {"crossover0": True}),  # the rule with TAIL_MIN_CTAS = 0: the package tail
+    ((1, 4), {}),
+    ((2, 2), {}),
     ((2, 2), {"tail": "tail"}),
     ((2, 6), {"tail": "tail"}),
     ((2, 4), {"tail": "tail_g2"}),
@@ -2431,7 +2449,7 @@ FIXED_ORDER_CASES = (
 @pytest.mark.parametrize(
     "heads, pins",
     FIXED_ORDER_CASES,
-    ids=["rule-g2", "rule-g3", "rule-g3-h1", "rule-g4-large", "g1-tail", "g3-tail", "g2-tail-g2", "g3-tail-g3",
+    ids=["rule-g2", "rule-g3", "rule-g3-h1", "rule-g4", "rule-g1", "g1-tail", "g3-tail", "g2-tail-g2", "g3-tail-g3",
          "g3-unfused", "g2-f32x", "g3-h1-f32x"],
 )  # fmt: skip
 def test_torch_deterministic_algorithms_change_nothing(
@@ -2441,8 +2459,6 @@ def test_torch_deterministic_algorithms_change_nothing(
     # or as a warning) the autograd route and the low-level route run without an alert, to the same bits
     seq_lens = (300, 77)
     pins = dict(pins)
-    if pins.pop("crossover0", False):
-        monkeypatch.setattr(cake_chain, "TAIL_MIN_CTAS", _min_ctas_table(0))
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=251)
     want = _run(inputs, seq_lens, **pins)
     for warn_only in (False, True):
@@ -2634,36 +2650,29 @@ TAIL_RULE = {
     }
     for arch in ("sm_100a", "sm_103a", "sm_107a")
 }
-# the package tail's (chunk, value head) CTA floor per architecture and group class (1: G = 1; 4: the larger groups
-# without a cluster tail), from the backward crossovers measured on B200, GB300 and R200
-TAIL_MIN_CTAS_TABLE = {
-    "sm_100a": {1: 2048, 4: 2048},
-    "sm_103a": {1: 2048, 4: 1024},
-    "sm_107a": {1: 1024, 4: 1024},
-}
+# the value-head groups without a cluster tail (G = 1 and G >= 4) and the sizes in chunks (None: a large call) the
+# rule is checked at
+NO_CLUSTER_HEADS = ((4, 4), (2, 2), (1, 1), (1, 4), (2, 16), (1, 8))
+RULE_CHUNKS = (None, 1, 2, 7, 255, 256, 1024, 4096)
 
 
-def _min_ctas_table(value: int) -> dict[str, dict[int, int]]:
-    return {arch: {1: value, 4: value} for arch in TAIL_MIN_CTAS_TABLE}
-
-
-def test_tail_min_ctas_table() -> None:
-    assert cake_chain.TAIL_MIN_CTAS == TAIL_MIN_CTAS_TABLE
-    for arch, floors in TAIL_MIN_CTAS_TABLE.items():
-        assert cake_chain.tail_min_ctas(arch, 1) == floors[1], arch
-        for group in (3, 4, 5, 8, 16):
-            assert cake_chain.tail_min_ctas(arch, group) == floors[4], (arch, group)
-        # the rule at the floor: the package tail; one chunk below: unfused
-        for h, hv in ((4, 4), (1, 4), (2, 16)):
-            edge = floors[1 if hv == h else 4]
-            assert (
-                cake_chain.tail_form(h, hv, arch=arch, num_chunks=edge // hv)
-                == cake_chain.TAIL_DEFAULT
-            ), (arch, h, hv)
-            assert (
-                cake_chain.tail_form(h, hv, arch=arch, num_chunks=edge // hv - 1)
-                == "unfused"
-            ), (arch, h, hv)
+def test_the_rule_rounds_dq_dk_once_at_every_size() -> None:
+    # the rule takes no fixed-order tail (those round each value head's dq / dk partials before their sum): the
+    # cluster tail of G = 2 / 3 and the package tail of every other group, at every size
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        for h, hv in NO_CLUSTER_HEADS:
+            for chunks in RULE_CHUNKS:
+                assert (
+                    cake_chain.tail_form(h, hv, arch=arch, num_chunks=chunks)
+                    == cake_chain.TAIL_DEFAULT
+                ), (arch, h, hv, chunks)
+        for (h, hv), form in (
+            ((2, 4), "tail_g2_f32x"),
+            ((1, 3), "tail_g3_f32x"),
+            ((2, 6), "tail_g3_f32x"),
+        ):
+            for chunks in RULE_CHUNKS:
+                assert cake_chain.tail_form(h, hv, arch=arch, num_chunks=chunks) == form, (arch, h, hv, chunks)  # fmt: skip
 
 
 # the stages a backward launches per tail (beyond the shared scans), and the ones it never launches
@@ -2678,21 +2687,24 @@ TAIL_LAUNCHES = {
 }
 
 
-@pytest.mark.parametrize("min_tiles", [None, 0], ids=["rule", "crossover0"])
 @pytest.mark.parametrize(
     "heads",
     [(2, 4), (1, 3), (2, 6), (2, 2), (1, 4)],
     ids=["g2", "g3-h1", "g3", "g1", "g4"],
 )
-def test_the_dispatched_tail_runs(heads, min_tiles, device, monkeypatch) -> None:
-    # without a pin the backward launches the tail the rule names, and only that one; the pins launch theirs
+def test_the_dispatched_tail_runs(heads, device, monkeypatch) -> None:
+    # without a pin the backward launches the tail the rule names, and only that one (the package tail for G = 1 and
+    # G = 4 on this small layout); the pins launch theirs
     seq_lens = TAIL_LAYOUT
-    if min_tiles is not None:
-        monkeypatch.setattr(cake_chain, "TAIL_MIN_CTAS", _min_ctas_table(min_tiles))
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=289)
     launches = _record_tail_launches(monkeypatch, device)
     arch = cake_backend.device_arch(cake_chain._device_index(device))
     group = heads[1] // heads[0]
+    if group not in (2, 3):
+        assert (
+            cake_chain.tail_form(*heads, arch=arch, num_chunks=_num_chunks(seq_lens))
+            == "tail"
+        )
     forms = [None, "tail", "unfused"] + (
         [f"tail_g{group}", f"tail_g{group}_f32x"] if group in (2, 3) else []
     )
@@ -2706,6 +2718,40 @@ def test_the_dispatched_tail_runs(heads, min_tiles, device, monkeypatch) -> None
         ]
         assert stages & want and not stages & never, (form, sorted(stages))
         _assert_close_to_reference(got, _reference(inputs, seq_lens), OUTPUT_NAMES)
+
+
+# small calls of the groups without a cluster tail (G = 1 and G = 4), one sequence of one chunk and a single token
+# among them
+SMALL_TAIL_CASES = {
+    "g1": ((2, 2), (300, 77)),
+    "g1-h4": ((4, 4), (64,)),
+    "g4": ((1, 4), (300, 77)),
+    "g4-h2": ((2, 8), (130, 1, 64)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SMALL_TAIL_CASES))
+def test_small_calls_round_dq_dk_once(case, device, monkeypatch) -> None:
+    # without a pin a small call of a group without a cluster tail runs the package tail (the group's FP32 dq / dk
+    # partials summed in value-head order and rounded once), not the fixed-order unfused tail: the pinned package
+    # tail's bits, o / dv / dg / dbeta of the unfused pin, within the accuracy gate of the FP64 recurrence
+    heads, seq_lens = SMALL_TAIL_CASES[case]
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    assert (
+        cake_chain.tail_form(*heads, arch=arch, num_chunks=_num_chunks(seq_lens))
+        == "tail"
+    )
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=293)
+    launches = _record_tail_launches(monkeypatch, device)
+    got = _run(inputs, seq_lens)
+    stages = {stage for stage, _grid in launches}
+    want, never = TAIL_LAUNCHES["tail"]
+    assert stages & want and not stages & never, sorted(stages)
+    _assert_same_bits(_run(inputs, seq_lens, tail="tail"), got, OUTPUT_NAMES)
+    unfused = _run(inputs, seq_lens, tail="unfused")
+    for name in ("o", "dv", "dg", "dbeta"):
+        assert torch.equal(got[name], unfused[name]), name
+    _assert_close_to_reference(got, _reference(inputs, seq_lens), OUTPUT_NAMES)
 
 
 def test_tail_segments_rule(monkeypatch) -> None:
@@ -2730,15 +2776,11 @@ def test_tail_segments_rule(monkeypatch) -> None:
             heads: cake_chain.tail_form(*heads, arch=arch) for heads in want
         } == want, arch
         for h, hv in ((2, 2), (4, 16), (1, 4)):
-            edge = cake_chain.tail_min_ctas(arch, hv // h)
-            assert (
-                cake_chain.tail_form(h, hv, arch=arch, num_chunks=-(-edge // hv))
-                == cake_chain.TAIL_DEFAULT
-            ), (arch, h, hv)
-            assert (
-                cake_chain.tail_form(h, hv, arch=arch, num_chunks=-(-edge // hv) - 1)
-                == "unfused"
-            ), (arch, h, hv)
+            for chunks in (1, 2, 4096):
+                assert (
+                    cake_chain.tail_form(h, hv, arch=arch, num_chunks=chunks)
+                    == cake_chain.TAIL_DEFAULT
+                ), (arch, h, hv, chunks)
         # a cluster tail serves its group at any size
         assert (
             cake_chain.tail_form(2, 4, arch=arch, num_chunks=1)
@@ -2750,17 +2792,13 @@ def test_tail_segments_rule(monkeypatch) -> None:
             == cake_chain.tail_form(2, 6, arch=arch)
             == "tail_g3_f32x"
         )
-    # an architecture without a cluster tail for a group of three: tail_g3 below the package tail's crossover
+    # an architecture without a cluster tail for a group of three: the package tail at every size
     monkeypatch.setitem(cake_chain.CLUSTER_TAILS, "sm_107a", {2: "tail_g2"})
-    edge = cake_chain.tail_min_ctas("sm_107a", 3)
-    assert (
-        cake_chain.tail_form(2, 6, arch="sm_107a", num_chunks=-(-edge // 6) - 1)
-        == "tail_g3"
-    )
-    assert (
-        cake_chain.tail_form(2, 6, arch="sm_107a", num_chunks=-(-edge // 6))
-        == cake_chain.TAIL_DEFAULT
-    )
+    for chunks in (1, None):
+        assert (
+            cake_chain.tail_form(2, 6, arch="sm_107a", num_chunks=chunks)
+            == cake_chain.TAIL_DEFAULT
+        )
     assert (
         cake_chain.tail_form(2, 4, "tail_g2", arch="sm_100a") == "tail_g2"
         and cake_chain.tail_form(2, 6, "unfused", arch="sm_103a") == "unfused"
@@ -2797,40 +2835,64 @@ def test_tail_segments_rule(monkeypatch) -> None:
 def test_the_tail_keeps_the_deterministic_bits_but_dq_dk(
     heads, device, monkeypatch
 ) -> None:
-    # o, dv, dg and dbeta have one writer each: the same bits in every tail form of this package; dq / dk round once
-    # after the FP32 group sum in value-head order in the package tail and the cluster tails (the same bits), and the
-    # same bits run to run (the planner's tables, as the deterministic package plans them).  Without the FP32
-    # dv_local adjoint (DVL32_ARCHS empty) the package keeps the deterministic package's o, dv, dg and dbeta, and its
-    # fixed-order tails all of the deterministic bits; dq / dk stay within the budgets of both
-    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
-    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
+    # o, dv, dg and dbeta have one writer each: the same bits as the deterministic package and as this package's
+    # fixed-order tails; dq / dk round once after the FP32 group sum in value-head order, within the budgets of both
+    # and the same bits run to run (the planner's tables, as the deterministic package plans them); the cluster tail
+    # of G = 2 / 3 gives the package tail's bits.  The adjoint rounds dv2 as the deterministic package does
+    # (DVL32_ARCHS empty; the FP32 dv_local adjoint: test_the_tails_on_the_fp32_dv_local_adjoint_stay_within_the_budgets)
+    # and both packages run the prep's forward (prep, wy_tc2, fwd_ho; fwd_a_route's forward:
+    # test_fwd_a_within_the_budgets_of_the_prep_forward)
+    _prep_forward_on_both(monkeypatch)
+    monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    seq_lens = TAIL_LAYOUT
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=281)
+    got = _run(inputs, seq_lens, tail="tail")
+    _assert_same_bits(_run(inputs, seq_lens, tail="tail"), got, OUTPUT_NAMES)
+    det = _run(inputs, seq_lens, det=True)
+    pinned = [_run(inputs, seq_lens, tail="unfused")]
+    group = heads[1] // heads[0]
+    if group in (2, 3):
+        pinned.append(_run(inputs, seq_lens, tail=f"tail_g{group}"))
+        _assert_same_bits(
+            _run(inputs, seq_lens, tail=f"tail_g{group}_f32x"), got, OUTPUT_NAMES
+        )
+    for name in ("o", "dv", "dg", "dbeta"):
+        assert torch.equal(got[name], det[name]), name
+        assert all(torch.equal(got[name], run[name]) for run in pinned), name
+    for run in pinned:  # the fixed-order tails keep the deterministic package's bits
+        assert all(torch.equal(run[name], det[name]) for name in OUTPUT_NAMES)
+    _assert_within_budget(got, det, ("dq", "dk"))
+
+
+@pytest.mark.parametrize(
+    "heads", [(2, 4), (2, 6), (2, 2), (1, 4)], ids=["g2", "g3", "g1", "g4"]
+)
+def test_the_tails_on_the_fp32_dv_local_adjoint_stay_within_the_budgets(
+    heads, device, monkeypatch
+) -> None:
+    # with the FP32 dv_local adjoint (dhu_tc2_dvl32 rounds dv2 once) the tail forms still share o, dv, dg and dbeta,
+    # the package tail and the cluster tail of G = 2 / 3 give the same bits (run to run too), and every output stays
+    # within the budgets of the deterministic package
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if arch not in cake_chain.DVL32_ARCHS:
+        pytest.skip(f"{arch} runs the adjoint without the FP32 dv_local values")
     _prep_forward_on_both(monkeypatch)
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     seq_lens = TAIL_LAYOUT
     group = heads[1] // heads[0]
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=281)
-    for dvl32 in (True, False):
-        if not dvl32:
-            monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
-        got = _run(inputs, seq_lens, tail="tail")
-        _assert_same_bits(_run(inputs, seq_lens, tail="tail"), got, OUTPUT_NAMES)
-        pinned = [_run(inputs, seq_lens, tail="unfused")]
-        if group in (2, 3):
-            pinned.append(_run(inputs, seq_lens, tail=f"tail_g{group}"))
-            _assert_same_bits(
-                _run(inputs, seq_lens, tail=f"tail_g{group}_f32x"), got, OUTPUT_NAMES
-            )
-        for name in ("o", "dv", "dg", "dbeta"):
-            assert all(torch.equal(got[name], run[name]) for run in pinned), name
-        det = _run(inputs, seq_lens, det=True)
-        if not dvl32:
-            for name in ("o", "dv", "dg", "dbeta"):
-                assert torch.equal(got[name], det[name]), name
-            for (
-                run
-            ) in pinned:  # the fixed-order tails keep the deterministic package's bits
-                assert all(torch.equal(run[name], det[name]) for name in OUTPUT_NAMES)
-        _assert_within_budget(got, det, OUTPUT_NAMES)
+    got = _run(inputs, seq_lens, tail="tail")
+    _assert_same_bits(_run(inputs, seq_lens, tail="tail"), got, OUTPUT_NAMES)
+    pinned = [_run(inputs, seq_lens, tail="unfused")]
+    if group in (2, 3):
+        pinned.append(_run(inputs, seq_lens, tail=f"tail_g{group}"))
+        _assert_same_bits(
+            _run(inputs, seq_lens, tail=f"tail_g{group}_f32x"), got, OUTPUT_NAMES
+        )
+    for name in ("o", "dv", "dg", "dbeta"):
+        assert all(torch.equal(got[name], run[name]) for run in pinned), name
+    _assert_within_budget(got, _run(inputs, seq_lens, det=True), OUTPUT_NAMES)
 
 
 @pytest.mark.parametrize("poison", ["counter", "workspace"])
@@ -2881,11 +2943,11 @@ def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
     heads, beta_dtype, device, monkeypatch
 ) -> None:
     # a split (64, 1) plan's pass 2 on dhu_tc2 from the stitched segment states against the register pass 2 at the
-    # same segment table, with an initial state and a final-state gradient: without the FP32 dv_local adjoint the same
-    # bits on every output; with it (dhu_tc2_dvl32 rounds dv2 once) within the budgets of the register pass 2 and of the
-    # FP64 recurrence.  The pre-scan keeps its BF16 dv_local tile (dhu_pre_dvl_r64k1) in both
+    # same segment table: the same bits on every output, with an initial state and a final-state gradient.  The
+    # adjoint rounds dv2 as the register pass 2 does (DVL32_ARCHS empty; the FP32 dv_local adjoint:
+    # test_split_pass2_on_dhu_tc2_dvl32_within_the_budgets_of_the_register_pass2)
+    monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
     seq_lens = (1500, 77, 640)
-    arch = cake_backend.device_arch(cake_chain._device_index(device))
     inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=83)
     gen = torch.Generator().manual_seed(89)
     h0 = (
@@ -2896,38 +2958,78 @@ def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
     )
     launches = _record_streams(monkeypatch)
     names = OUTPUT_NAMES + ("final_state", "dh0")
-    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
-    for dvl32 in (True, False):
-        if not dvl32:
-            monkeypatch.setattr(cake_chain, "DVL32_ARCHS", ())
-        tc2 = cake_chain.dhu_tc2_stage(arch)
-        assert (tc2 == "dhu_tc2_dvl32") is (dvl32 and arch in cake_chain.DVL32_ARCHS)
-        runs = {}
-        for scan in ("tc", "reg"):
-            start = len(launches)
-            runs[scan] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht,
-                              scan_config=(64, 1), segment_chunks=6, dhu_scan=scan)  # fmt: skip
-            stages = [stage for stage, _stream in launches[start:]]
-            assert "stitch" in stages, stages
-            # the tc form: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
-            tc_stages = (cake_chain.sdt_prescan(arch), tc2)
-            reg_stages = ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
-            want, other = (
-                (tc_stages, reg_stages) if scan == "tc" else (reg_stages, tc_stages)
-            )
-            assert all(x in stages for x in want) and not any(
-                x in stages for x in other
-            ), (
-                scan,
-                stages,
-            )
-        assert cake_chain.sdt_prescan(arch) == cake_chain.SDT_PRESCAN
-        if tc2 == "dhu_tc2":
-            _assert_same_bits(runs["tc"], runs["reg"], names)
-        else:
-            _assert_same_bits(runs["tc"], runs["reg"], ("o", "final_state"))
-            _assert_within_budget(runs["tc"], runs["reg"], names)
-        _assert_close_to_reference(runs["tc"], ref, names)
+    runs = {}
+    for scan in ("tc", "reg"):
+        start = len(launches)
+        runs[scan] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, scan_config=(64, 1),
+                          segment_chunks=6, dhu_scan=scan)  # fmt: skip
+        stages = [stage for stage, _stream in launches[start:]]
+        assert "stitch" in stages, stages
+        # the tc form: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
+        want = (
+            ("dhu_pre_dvl_r64k1", "dhu_tc2")
+            if scan == "tc"
+            else ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
+        )
+        other = (
+            ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
+            if scan == "tc"
+            else ("dhu_pre_dvl_r64k1", "dhu_tc2")
+        )
+        assert all(x in stages for x in want) and not any(x in stages for x in other), (
+            scan,
+            stages,
+        )
+    _assert_same_bits(runs["tc"], runs["reg"], names)
+    _assert_close_to_reference(
+        runs["tc"], _reference(inputs, seq_lens, initial_state=h0, dht=dht), names
+    )
+
+
+@pytest.mark.parametrize(
+    "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
+)
+@pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
+def test_split_pass2_on_dhu_tc2_dvl32_within_the_budgets_of_the_register_pass2(
+    heads, beta_dtype, device, monkeypatch
+) -> None:
+    # the same plan with the FP32 dv_local adjoint (dhu_tc2_dvl32 rounds dv2 once): o and the final state keep the
+    # register pass 2's bits; every output within the budgets of the register pass 2 and of the FP64 recurrence.  The
+    # pre-scan keeps its BF16 dv_local tile (dhu_pre_dvl_r64k1)
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if arch not in cake_chain.DVL32_ARCHS:
+        pytest.skip(f"{arch} runs the adjoint without the FP32 dv_local values")
+    seq_lens = (1500, 77, 640)
+    inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=83)
+    gen = torch.Generator().manual_seed(89)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    launches = _record_streams(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    assert cake_chain.dhu_tc2_stage(arch) == "dhu_tc2_dvl32"
+    assert cake_chain.sdt_prescan(arch) == cake_chain.SDT_PRESCAN
+    tc_stages = (cake_chain.SDT_PRESCAN, "dhu_tc2_dvl32")
+    reg_stages = ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
+    runs = {}
+    for scan in ("tc", "reg"):
+        start = len(launches)
+        runs[scan] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, scan_config=(64, 1),
+                          segment_chunks=6, dhu_scan=scan)  # fmt: skip
+        stages = [stage for stage, _stream in launches[start:]]
+        assert "stitch" in stages, stages
+        want, other = (
+            (tc_stages, reg_stages) if scan == "tc" else (reg_stages, tc_stages)
+        )
+        assert all(x in stages for x in want) and not any(x in stages for x in other), (scan, stages)  # fmt: skip
+    _assert_same_bits(runs["tc"], runs["reg"], ("o", "final_state"))
+    _assert_within_budget(runs["tc"], runs["reg"], names)
+    _assert_close_to_reference(
+        runs["tc"], _reference(inputs, seq_lens, initial_state=h0, dht=dht), names
+    )
 
 
 @pytest.mark.parametrize(
@@ -4650,6 +4752,61 @@ def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
     _assert_within_budget(runs[True], runs[False], names)
 
 
+def test_adjoint_split_dh0_sizing(device, monkeypatch) -> None:
+    # the end adjoints of the split's pieces composed by the stitch (M x + B with hi / lo BF16 operand pairs: about 16
+    # bits per piece boundary, from the third piece on) against piece_chain (the same maps and flags in FP32 FFMA), and
+    # the stitch without the summaries' warm-up bound (warmup_log2 -1e30): dh0 per sequence (3, 6 and 1 pieces of 4
+    # chunks) and over all, each against the FP64 recurrence; the SIZING lines (pytest -s) report the errors and the
+    # accuracy gate holds every output
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    index = cake_chain._device_index(device)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7021)
+    gen = torch.Generator().manual_seed(7022)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    runs = {}
+    for label, chain, pins in (("stitch", "stitch", {}), ("stitch_nocut", "stitch", {"warmup_log2": -1e30}),
+                               ("piece_chain", "piece_chain", {})):  # fmt: skip
+        with monkeypatch.context() as m:
+            arch = _split_device(m, device, split=True, chain=chain)
+            cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+            meta = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1],
+                                          cake_chain.make_options(), heads[1] // heads[0])  # fmt: skip
+            assert meta.bwd_split is not None and meta.bwd_segments.segment_len == 4
+            assert meta.bwd_segments.num_segments == 10
+            launches = _record_streams(m)
+            runs[label] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, **pins)  # fmt: skip
+            assert chain in [stage for stage, _ in launches], (chain, launches)
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    pieces = [((n + 63) // 64 + 3) // 4 for n in seq_lens]  # (3, 6, 1)
+    assert max(pieces) >= 3, pieces
+    tag = f"bwd_dh0 {arch} piece_len=4"
+    for i, n in enumerate(seq_lens):
+        for chain, run in runs.items():
+            _sizing(
+                f"{tag} seq={i} tokens={n} pieces={pieces[i]} {chain}_vs_fp64",
+                run["dh0"][i],
+                ref["dh0"][i],
+            )
+        _sizing(f"{tag} seq={i} tokens={n} pieces={pieces[i]} stitch_vs_piece_chain", runs["stitch"]["dh0"][i],
+                runs["piece_chain"]["dh0"][i])  # fmt: skip
+    for chain, run in runs.items():
+        _sizing(f"{tag} all {chain}_vs_fp64", run["dh0"], ref["dh0"])
+    _sizing(
+        f"{tag} all stitch_vs_piece_chain",
+        runs["stitch"]["dh0"],
+        runs["piece_chain"]["dh0"],
+    )
+    for run in runs.values():
+        _assert_close_to_reference(run, ref, names)
+    _assert_within_budget(runs["stitch"], runs["piece_chain"], names)
+
+
 @pytest.mark.parametrize("how", ["fork_cost", "streams_1"])
 def test_adjoint_split_one_stream_gives_the_two_stream_bits(
     how, device, monkeypatch
@@ -5650,6 +5807,68 @@ def test_fwd_split_within_the_budgets_of_the_prep_forward(
     _assert_within_budget(got, want, OUTPUT_NAMES + ("final_state",))
 
 
+# the forward's routes through the stitch: the split forward (FWD_SPLIT_ARCHS) and the prep forward's pre-scan split
+# on a pinned segment table (the route of the other architectures' split rows); a pinned table's pieces in chunks
+FWD_STITCH_ROUTES = ("split", "prescan")
+FWD_PRESCAN_CHUNKS = 32
+
+
+@pytest.mark.usefixtures("fwd_split_test_class")
+@pytest.mark.parametrize("route", FWD_STITCH_ROUTES)
+def test_fwd_split_final_state_sizing(route, device, monkeypatch) -> None:
+    # a forward through the stitch composes each piece's start state as x' = M x + B with x and M as hi / lo BF16
+    # operand pairs (about 16 bits per piece boundary, from the third piece on): its final state against the serial
+    # forward's (segment_chunks 0) and both against the FP64 recurrence, per sequence (pieces of each) and over all;
+    # the SIZING lines (pytest -s) report the errors and the accuracy gate holds them
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    heads, seq_lens = FWD_SPLIT_CASES["g3"]
+    pins = {}
+    if route == "split":
+        _fwd_split_or_skip(device)
+        cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+        split = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1],
+                                       cake_chain.make_options(), heads[1] // heads[0]).fwd_split  # fmt: skip
+        # a middle piece: a sequence of three pieces or more
+        assert split is not None and split.num_middle >= 1
+        length = split.length
+    else:
+        pins["segment_chunks"] = length = FWD_PRESCAN_CHUNKS
+    pieces = [((n + 63) // 64 + length - 1) // length for n in seq_lens]
+    assert max(pieces) >= 3, pieces
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=431)
+    gen = torch.Generator().manual_seed(432)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    stages = _record_launches(monkeypatch)
+    got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, **pins)  # fmt: skip
+    if route == "split":
+        assert _forward_stages(stages) == _split_stages(), stages
+    else:
+        assert "stitch" in _forward_stages(stages), stages
+    stages.clear()
+    serial = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, segment_chunks=0)  # fmt: skip
+    assert "stitch" not in _forward_stages(stages), stages
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    tag = f"fwd_final_state {arch} route={route} piece_len={length}"
+    for i, n in enumerate(seq_lens):
+        for label, run in ((route, got), ("serial", serial)):
+            _sizing(f"{tag} seq={i} tokens={n} pieces={pieces[i]} {label}_vs_fp64", run["final_state"][i],
+                    ref["final_state"][i])  # fmt: skip
+        _sizing(f"{tag} seq={i} tokens={n} pieces={pieces[i]} {route}_vs_serial", got["final_state"][i],
+                serial["final_state"][i])  # fmt: skip
+    _sizing(f"{tag} all {route}_vs_fp64", got["final_state"], ref["final_state"])
+    _sizing(f"{tag} all serial_vs_fp64", serial["final_state"], ref["final_state"])
+    _sizing(f"{tag} all {route}_vs_serial", got["final_state"], serial["final_state"])
+    _assert_close_to_reference(got, ref, ("final_state",))
+    _assert_close_to_reference(serial, ref, ("final_state",))
+    _assert_within_budget(got, serial, ("final_state",))
+
+
 @pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
 def test_fwd_split_runs_give_the_same_bits(case, device) -> None:
@@ -6009,9 +6228,7 @@ def test_deterministic_algorithms_run_the_a_and_split_routes(
     with _deterministic_algorithms(True), warnings.catch_warnings():
         warnings.simplefilter("error")
         stages = _record_launches(monkeypatch)
-        got = _run(
-            inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht
-        )
+        got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
         o = checkpoint(layer, *leaves.values(), use_reentrant=False)
         (o.float() * inputs["do"].float()).sum().backward()
         torch.cuda.synchronize()

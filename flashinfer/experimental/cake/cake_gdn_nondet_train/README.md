@@ -246,19 +246,18 @@ changes the bits of the outputs that depend on it (other segment boundaries),
 so the deterministic package's bits need its tables: pin `scan_config` /
 `segment_chunks`.  Then one of six
 tails computes `dq`, `dk`, `dv`, `dg` and `dbeta`.  The device's architecture,
-the call's value-head group `G = HV / H` and its (chunk, value head) CTAs
-select the fastest one measured on B200, GB300 and R200 (the production rows, packs,
-source head pairs and group shapes of `benchmarks/bench_cake_gdn_nondet_train.py`),
-and the `tail` keyword pins one:
+and the call's value-head group `G = HV / H` select one that rounds `dq` /
+`dk` once (the cluster tail of `G = 2` and `G = 3`, the package tail of every
+other group, at every size), and the `tail` keyword pins any of them:
 
 | tail | selected for | `dq` / `dk` rounding | run to run |
 |---|---|---|---|
-| `"tail"`: one tcgen05 kernel per (chunk, value head), a workspace slot per value head, the last CTA of a (chunk, key head) sums the slots | `G` other than 2 and 3 with at least the architecture's `TAIL_MIN_CTAS` chunks x `HV` | the value heads' FP32 partials summed in value-head order, one BF16 rounding after the FP32 L2-norm pullback | bitwise |
+| `"tail"`: one tcgen05 kernel per (chunk, value head), a workspace slot per value head, the last CTA of a (chunk, key head) sums the slots | `G` other than 2 and 3 | the value heads' FP32 partials summed in value-head order, one BF16 rounding after the FP32 L2-norm pullback | bitwise |
 | `"tail_g2_f32x"`: one two-CTA cluster kernel per (chunk, key head), the CTAs exchange their FP32 partials over distributed shared memory | `G = 2` | as `"tail"` (the same bits) | bitwise |
 | `"tail_g3_f32x"`: as `"tail_g2_f32x"` with three-CTA clusters | `G = 3` | as `"tail"` (the same bits) | bitwise |
 | `"tail_g2"`: the deterministic package's two-CTA cluster kernel | a pin at `G = 2` | each value head's partial rounded to BF16, summed in a fixed order (the deterministic package's bits) | bitwise |
 | `"tail_g3"`: the deterministic package's three-CTA cluster kernel | a pin at `G = 3` | as `"tail_g2"` | bitwise |
-| `"unfused"`: `dqkwg`, the WY pullback and the finalize | `G` other than 2 and 3 below the architecture's `TAIL_MIN_CTAS` chunks x `HV` | as `"tail_g2"` | bitwise |
+| `"unfused"`: `dqkwg`, the WY pullback and the finalize | a pin | as `"tail_g2"` | bitwise |
 
 The cluster tails are the same on `sm_100a`, `sm_103a` and `sm_107a`
 (`CLUSTER_TAILS` holds them per architecture; `sm_103a` and `sm_107a` take
@@ -280,20 +279,11 @@ tail, or a row that records no gradient takes `CakeGDNNondetFunction`, with
 the same bits.  The forward still copies `v` into a contiguous tensor (the WY
 stage reads it contiguous).
 
-`TAIL_MIN_CTAS` holds the (chunk, value head) CTAs from which the package
-tail runs, per architecture and group class (`tail_min_ctas(arch, G)`):
-
-| architecture | `G = 1` | `G` of 4 and more |
-|---|---|---|
-| `sm_100a` (B200) | 2048 | 2048 |
-| `sm_103a` (GB300) | 2048 | 1024 |
-| `sm_107a` (R200) | 1024 | 1024 |
-
-Each floor is the smallest size where `"tail"` measured no slower than
-`"unfused"` in the backward.  On B200 the two tie at 2048 CTAs, and `"tail"`
-is at least 16 % faster from 3072 CTAs on.  The backward time ratio `"tail"` /
-`"unfused"` at 1024 CTAs is 1.02 (`G = 1`) and 0.89 (`G = 4`) on GB300, and
-0.87 (`G = 1`) and 0.77-0.79 (`G = 4`) on R200 (216 SMs).
+The package tail runs at every size, so `dq` / `dk` round once on small
+calls too.  There it can be slower than `"unfused"` in the backward: the two
+tie at 2048 (chunk, value head) CTAs on B200; on GB300 the backward time ratio
+`"tail"` / `"unfused"` is 1.02 at 1024 CTAs (`G = 1`) and at 512 (`G = 4`); on
+R200 (216 SMs) `"tail"` is faster from 1024 CTAs on.
 
 Every tail meets the deterministic package's accuracy budgets.  `dv`, `dg`
 and `dbeta` have one writer each and the same bits in every tail; they are

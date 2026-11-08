@@ -66,9 +66,9 @@ for other groups the package's tail, one tcgen05 kernel per (chunk, value head)
 whose value heads write their FP32 ``dq`` / ``dk`` partials to a workspace slot
 each, the last arriving CTA of a (chunk, key head) summing the slots in
 value-head order, running the finalize and rounding ``dq`` / ``dk`` to BF16
-once (:func:`tail_segments` bounds the workspace), and below the architecture's
-``TAIL_MIN_CTAS`` (chunk, value head) CTAs the deterministic package's
-``dqkwg``, WY pullback and finalize ("unfused").
+once (:func:`tail_segments` bounds the workspace), at every size.  The
+deterministic package's ``dqkwg``, WY pullback and finalize ("unfused"), which
+round each value head's partials before their sum, run only when pinned.
 Every launch is fixed-order.  A host-built table lists the sequences longest first
 (:func:`lpt_sequence_order`; every chunk keeps its token offset, the state rows
 are gathered into that order and the final state and its gradient scattered
@@ -153,7 +153,6 @@ __all__ = [
     "CLUSTER_TAILS",
     "TAIL_DEFAULT",
     "TAIL_FORMS",
-    "TAIL_MIN_CTAS",
     "TAIL_TILE_FLOATS",
     "TAIL_WORKSPACE_TILES",
     "ADJOINT_SPLIT_ARCHS",
@@ -220,7 +219,6 @@ __all__ = [
     "sequence_groups",
     "stage_set",
     "tail_form",
-    "tail_min_ctas",
     "tail_segments",
     "two_stream_split",
     "ONE_ROUND_TAIL_DEVICES",
@@ -921,27 +919,15 @@ def finalize_stage(
 # workspace holds at most ``max(TAIL_WORKSPACE_TILES, num_v_heads)`` slots.
 TAIL_TILE_FLOATS = 2 * CHUNK * HEAD_DIM
 TAIL_WORKSPACE_TILES = 4096
-# Below this many (chunk, value head) CTAs a call's backward takes the fixed-order unfused tail, per architecture and
-# group class (1: a value-head group of one; 4: the larger groups without a cluster tail): where the package tail's
-# fused per-CTA chain is latency-bound it measured slower in the backward.  Crossovers (package tail / unfused):
-# B200 G = 1 between 2048 and 3072 CTAs (a tie at 2048), G = 4 about 2048 (the 1024-CTA rows within their spreads);
-# GB300 G = 1 between 1024 and 2048 (1.02 at 1024), G = 4 between 512 and 1024 (1.02 at 512, 0.89 at 1024); R200
-# (216 SMs) G = 1 between 512 and 1024 (0.87 at 1024), G = 4 at most 1024 (0.77-0.79 at 1024; 0.93 at 512, where
-# forward + backward ties).
-TAIL_MIN_CTAS: dict[str, dict[int, int]] = {
-    "sm_100a": {1: 2048, 4: 2048},
-    "sm_103a": {1: 2048, 4: 1024},
-    "sm_107a": {1: 1024, 4: 1024},
-}
-# The cluster tail the rule takes per architecture and value-head group, and the package tail it takes elsewhere from
-# its TAIL_MIN_CTAS on.  The cluster tails exchange the group's FP32 dq / dk partials over distributed shared memory,
-# so dq / dk round once, as the package tail's (the same bits).  B200 kernel times (CUPTI, cold L2, four processes,
-# both gate regimes): tail_g3_f32x is 1.024-1.034 x tail_g3 (which rounds each value head's partials to BF16) on the
-# (2, 6) head pair at 241,817-262,144 tokens and the (16, 48) pair at 32,768 tokens, 1.034-1.051 x on the pairs
-# (8, 24) .. (1, 3), where the package tail is 1.073-1.081 x tail_g3 at 3,782 or more (chunk, value head) CTAs, 1.05 x
-# at the (4, 12) pair and 0.99-1.006 x at the (2, 6) and (1, 3) pairs (1,539 and 3,078 CTAs); tail_g2_f32x is
-# 1.014-1.036 x tail_g2, which measured 16-19 % faster than the package tail at G = 2 (B200 and GB300).  sm_103a and
-# sm_107a take the same forms until they are measured there.
+# The cluster tail the rule takes per architecture and value-head group; every other group takes the package tail at
+# every size, so dq / dk round once in every form the rule takes.  The cluster tails exchange the group's FP32 dq / dk
+# partials over distributed shared memory, so dq / dk round once, as the package tail's (the same bits).  B200 kernel
+# times (CUPTI, cold L2, four processes, both gate regimes): tail_g3_f32x is 1.024-1.034 x tail_g3 (which rounds each
+# value head's partials to BF16) on the (2, 6) head pair at 241,817-262,144 tokens and the (16, 48) pair at 32,768
+# tokens, 1.034-1.051 x on the pairs (8, 24) .. (1, 3), where the package tail is 1.073-1.081 x tail_g3 at 3,782 or more
+# (chunk, value head) CTAs, 1.05 x at the (4, 12) pair and 0.99-1.006 x at the (2, 6) and (1, 3) pairs (1,539 and 3,078
+# CTAs); tail_g2_f32x is 1.014-1.036 x tail_g2, which measured 16-19 % faster than the package tail at G = 2 (B200 and
+# GB300).  sm_103a and sm_107a take the same forms until they are measured there.
 CLUSTER_TAILS: dict[str, dict[int, str]] = {
     "sm_100a": {2: "tail_g2_f32x", 3: "tail_g3_f32x"},
     "sm_103a": {2: "tail_g2_f32x", 3: "tail_g3_f32x"},
@@ -977,12 +963,6 @@ def adjoint_r_form(
     return split_tc and g3
 
 
-def tail_min_ctas(arch: str, group: int) -> int:
-    """The (chunk, value head) CTAs from which ``arch`` runs the package tail for a value-head group ``group`` without a
-    cluster tail: ``TAIL_MIN_CTAS[arch]`` of its class (``1`` for a group of one, ``4`` for the larger groups)."""
-    return TAIL_MIN_CTAS[arch][1 if group == 1 else 4]
-
-
 def tail_form(
     num_heads: int,
     num_v_heads: int,
@@ -991,26 +971,20 @@ def tail_form(
     arch: str,
     num_chunks: int | None = None,
 ) -> str:
-    """The backward tail of one call on ``arch`` over ``num_chunks`` chunks (``None``: a large call): ``forced`` when
-    given (``"tail_g2"`` / ``"tail_g2_f32x"`` serve a value-head group of two, ``"tail_g3"`` / ``"tail_g3_f32x"`` a
-    group of three), else the cluster tail of ``CLUSTER_TAILS[arch]`` for the call's value-head group
-    ``G = num_v_heads / num_heads``; otherwise the package tail ``TAIL_DEFAULT`` from :func:`tail_min_ctas` (chunk,
-    value head) CTAs on, and below them the fixed-order ``"tail_g3"`` for a group of three, ``"unfused"`` for the
-    others (the fastest forms measured for the architecture, value-head group and size,
-    ``benchmarks/bench_cake_gdn_nondet_train.py`` on B200 and GB300)."""
+    """The backward tail of one call on ``arch`` over ``num_chunks`` chunks (``None``: a large call; the size does not
+    change the form): ``forced`` when given (``"tail_g2"`` / ``"tail_g2_f32x"`` serve a value-head group of two,
+    ``"tail_g3"`` / ``"tail_g3_f32x"`` a group of three), else the cluster tail of ``CLUSTER_TAILS[arch]`` for the
+    call's value-head group ``G = num_v_heads / num_heads``, otherwise the package tail ``TAIL_DEFAULT``.  Every form
+    the rule takes sums a value-head group's FP32 ``dq`` / ``dk`` partials and rounds them to BF16 once; the
+    fixed-order ``"tail_g2"`` / ``"tail_g3"`` / ``"unfused"``, which round each value head's partials first, run only
+    when pinned."""
     if num_heads <= 0 or num_v_heads % num_heads != 0:
         raise ValueError(
             f"num_v_heads={num_v_heads} must be a positive multiple of num_heads={num_heads}"
         )
     group = num_v_heads // num_heads
     if forced is None:
-        cluster = CLUSTER_TAILS[arch]
-        if group in cluster:
-            return cluster[group]
-        floor = tail_min_ctas(arch, group)
-        if num_chunks is not None and int(num_chunks) * num_v_heads < floor:
-            return "tail_g3" if group == 3 else "unfused"
-        return TAIL_DEFAULT
+        return CLUSTER_TAILS[arch].get(group, TAIL_DEFAULT)
     if forced not in TAIL_FORMS:
         raise ValueError(f"tail={forced!r}")
     serves = GROUP_TAILS.get(forced)
@@ -4742,7 +4716,8 @@ def _backward_chain(
     v, beta32 = forward["v"], forward["beta32"]
     num_heads, num_v_heads = qn.shape[-2], v.shape[-2]
     v_rows = _v_rows(v)
-    if v_rows is None:  # a tape whose v is not one the stages read in place: copied into fresh contiguous rows
+    # a tape whose v is not one the stages read in place: copied into fresh contiguous rows
+    if v_rows is None:
         ex.refuse("v is not read in place")
         v = _dense(v, torch.empty(v.shape, dtype=v.dtype, device=v.device))
         v_rows = num_v_heads
