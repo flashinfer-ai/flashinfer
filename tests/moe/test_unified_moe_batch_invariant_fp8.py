@@ -1042,6 +1042,37 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
 
 
+@needs_device
+def test_alternating_inputs_under_programmatic_dependent_launch():
+    """Two W8A8 problems run alternately through the op, back to back without host syncs (the kernels' PDL chains overlap
+    and every reused intermediate holds the other call's bytes), many times; every output equals the problem's isolated
+    result bit for bit."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        fused_moe_fp8,
+    )
+
+    T, k, H, I, E = 64, 8, 256, 64, 256
+    probs = []
+    for seed in (3, 11):
+        x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=seed, adversarial=True)
+        W = MoEWeightsE4M3.prepare(w1, w2, m_x, M_INTER)
+        xq = _xq(x, m_x)
+        ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+        ref = bits(fused_moe_fp8(xq, ids, wts, W))
+        torch.cuda.synchronize()
+        probs.append((xq, ids, wts, W, ref))
+    outs = []
+    for _ in range(20):
+        for xq, ids, wts, W, _r in probs:
+            outs.append(fused_moe_fp8(xq, ids, wts, W))
+    torch.cuda.synchronize()
+    for i, out in enumerate(outs):
+        assert torch.equal(bits(out), probs[i % 2][4]), i
+
+
 def _flashinfer_fp8_per_tensor_reference(
     x, w1, w2, ids, weights, m_x, m_inter, act, activation_fn=None
 ) -> torch.Tensor:

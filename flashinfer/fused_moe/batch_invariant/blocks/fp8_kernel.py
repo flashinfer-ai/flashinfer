@@ -46,6 +46,7 @@ from .scheduler import (
     build_group_tables,
     warp_roles,
 )
+from .. import pdl
 
 IN_FMT = "e4m3"
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_DENSE)
@@ -167,7 +168,7 @@ class ScaledGroupedBlockGemmFp8:
         # programmatic dependent launch: wait for the predecessor grid before any dependent read (counts, the operands, the
         # scales), and let the successor start its prologue at once
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_early()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         use_2cta_instrs = atom_thr_size == 2
         bidx, _, _ = cute.arch.block_idx()
