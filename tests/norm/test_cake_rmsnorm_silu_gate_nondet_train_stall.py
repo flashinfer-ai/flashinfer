@@ -74,9 +74,10 @@ shared memory, the backward (BF16 and FP32 weight gradients) and the forward
 start beside it and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far
 below the side kernel's ``ALL_SM_SPIN_MS`` lifetime; so do the small-row
 backwards of a BF16 and an FP32 weight gradient at 1 and 5 tokens (48 and 240
-rows, the first band of each role) and at the most whole tokens of their
-role's second band (``SHORT_BACKWARD_PROBES``), which on SM100 and SM103 also
-start beside it with the default and the maximum-L1 carveout.  On SM107 they
+rows, the band of each role), which on SM100 and SM103 also start beside it
+with the default and the maximum-L1 carveout, and the static backward that
+takes the rows past the band, at its first whole tokens
+(``SHORT_BACKWARD_PROBES``).  On SM107 they
 do not start beside the side kernel with such a small carveout until that
 kernel exits (observed on R200 for the small-row backwards): there each must
 end at most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the
@@ -1171,14 +1172,13 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 
 
 # The small-row backwards of a BF16 and an FP32 weight gradient: one token and
-# five tokens of H heads (48 and 240 rows, in the first BACKWARD_BANDS band of
-# each role on every architecture) and the most whole tokens of H heads in the
-# role's second band ("band1": 21 tokens, 1008 rows, of a BF16 weight gradient
-# on SM100 and SM107 and 12 tokens, 576 rows, on SM103; of an FP32 one 21, 15
-# and 18 tokens, 1008, 720 and 864 rows, on SM100, SM103 and SM107), beside
-# the short forward's side kernels.  Their held test takes the short forward's
-# bound, slack and SHORT_MAX_ALONE_SPREAD.
-SHORT_BACKWARD_PROBES = ("1x48", "5x48", "band1")
+# five tokens of H heads (48 and 240 rows, in the BACKWARD_BANDS band of each
+# role on every architecture), beside the short forward's side kernels; their
+# held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD.
+# And "past": the first whole tokens of H heads past the role's last band (11
+# tokens, 528 rows), where the static backward takes over from the small-row
+# backward; it runs in the keeps-speed and the max-shared start tests only.
+SHORT_BACKWARD_PROBES = ("1x48", "5x48", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
 )
@@ -1193,29 +1193,50 @@ SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
 CARVEOUT_MAX_L1 = 0
 
 
-def _short_backward(probe: str, dw_dtype: torch.dtype) -> tuple[int, str, str]:
-    """``(tokens, the small-row backward, the backward it replaces)`` of the
+# Why the small-carveout and held tests skip the "past" probe: the static
+# backward it runs is the backward a small-row backward replaces (a held test
+# would compare it with itself), and this file asserts no start of the static
+# backward beside a side kernel holding every SM with a small carveout ("a
+# side kernel holding every SM with a small carveout can delay its start until
+# the side kernel exits (no test here asserts that delay; documented in
+# flashinfer.cake_rmsnorm_silu_gate_nondet_train)").
+PAST_PROBE_SKIP = (
+    "the static backward past the small-row band: it is the backward a "
+    "small-row backward replaces, and a side kernel holding every SM with a "
+    "small carveout can delay its start until the side kernel exits (no test "
+    "here asserts that delay; documented in "
+    "flashinfer.cake_rmsnorm_silu_gate_nondet_train)"
+)
+
+
+def _short_backward(
+    probe: str, dw_dtype: torch.dtype, *, past: bool = False
+) -> tuple[int, str, str]:
+    """``(tokens, the probed backward, the backward it replaces)`` of the
     ``SHORT_BACKWARD_PROBES`` entry ``probe`` for a ``dw_dtype`` weight
-    gradient: the tokens of H heads (for ``band1`` the most whole tokens
-    within the role's second ``BACKWARD_BANDS`` band), the module of the
-    architecture's band holding their rows and the role's module, the static
-    backward; skips where no band holds them."""
+    gradient: the tokens of H heads (for ``past`` the first whole tokens past
+    the role's last ``BACKWARD_BANDS`` band), the module that runs their rows
+    and the role's module, the static backward.  ``past`` probes run the
+    static backward and skip unless ``past`` is set; the others skip where no
+    band holds their rows."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
-    if probe == "band1":
+    static = loader.route_module(arch, role)
+    if probe == "past":
+        if not past:
+            pytest.skip(PAST_PROBE_SKIP)
         bands = loader.BACKWARD_BANDS.get(arch, {}).get(role, ())
-        if len(bands) < 2:
-            pytest.skip(f"{arch} has no second {role} band")
-        tokens = int(bands[1][0]) // H
-        assert tokens * H > int(bands[0][0]), (arch, role, tokens)
-    else:
-        tokens = int(probe.split("x")[0])
+        tokens = (int(bands[-1][0]) if bands else 0) // H + 1
+        name = loader.module_for_rows(arch, role, tokens * H, sms)
+        assert name == static, (arch, role, tokens, name)
+        return tokens, name, static
+    tokens = int(probe.split("x")[0])
     name = loader.module_for_rows(arch, role, tokens * H, sms)
     if loader.MODULES[name]["role"] not in loader.BAND_ROLES:
         pytest.skip(f"{arch} runs no small-row backward for {tokens * H} rows")
-    return tokens, name, loader.route_module(arch, role)
+    return tokens, name, static
 
 
 @pytest.mark.parametrize("probe", SHORT_BACKWARD_PROBES)
@@ -1223,7 +1244,7 @@ def _short_backward(probe: str, dw_dtype: torch.dtype) -> tuple[int, str, str]:
 def test_short_backward_keeps_its_speed_beside_a_resident_kernel(
     dw_dtype: torch.dtype, probe: str
 ) -> None:
-    tokens, _name, _replaced = _short_backward(probe, dw_dtype)
+    tokens, _name, _replaced = _short_backward(probe, dw_dtype, past=True)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
@@ -1258,7 +1279,7 @@ def test_short_backward_keeps_its_speed_beside_a_resident_kernel(
 def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     dw_dtype: torch.dtype, probe: str
 ) -> None:
-    tokens, _name, _replaced = _short_backward(probe, dw_dtype)
+    tokens, _name, _replaced = _short_backward(probe, dw_dtype, past=True)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)

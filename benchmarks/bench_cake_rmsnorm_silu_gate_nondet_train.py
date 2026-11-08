@@ -38,10 +38,9 @@ non-deterministic forward of packed rows (the benchmark's inputs) runs its tiny
 forward up to 140 rows per SM on SM100, 120 on SM103 and 65 on SM107 and past
 that a persistent forward (the mid, long or extra-long one) by bands of rows
 per SM (``cake_jit.FORWARD_BANDS``).
-Its backward runs one cluster of 16 CTAs up to 1024 rows on SM100 and SM107
-and 620 on SM103 (with a BF16 weight gradient or
-``compute_grad_weight=False``; 1024, 720 and 900 rows with an FP32 one),
-else one kernel of at most 8 CTAs per SM over
+Its backward runs one cluster of 16 CTAs up to 512 rows (with a BF16 or an
+FP32 weight gradient or ``compute_grad_weight=False``), else one kernel of at
+most 8 CTAs per SM over
 chunks of rows: the static backward while every chunk has a CTA, the claimed
 backward past that.  At ``--heads 48`` the default token counts reach every
 one of these kernels that a 148-SM B200 routes (2048 tokens: the extra-long

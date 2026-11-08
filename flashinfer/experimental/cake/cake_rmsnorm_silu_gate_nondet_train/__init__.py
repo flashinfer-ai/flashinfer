@@ -44,13 +44,12 @@ package's bits except where the exact sum lies within its FP64 sum's error of
 a rounding boundary.  An infinite or ``NaN`` partial makes its column's
 ``dw`` infinite or ``NaN`` with the class the FP64 sum gives it (a ``NaN``'s
 sign and payload need not be its).  A call of few rows runs a small-row
-backward instead (``cake_jit.BACKWARD_BANDS``: up to 1024 rows on sm_100a
-and sm_107a and 620 on sm_103a with a BF16 weight gradient or with
-``compute_grad_weight=False``, up to 1024, 720 and 900 rows on sm_100a,
-sm_103a and sm_107a with an FP32 one): one thread-block cluster of 16 CTAs,
+backward instead (``cake_jit.BACKWARD_BANDS``: up to 512 rows on every
+architecture, with a BF16 or an FP32 weight gradient or with
+``compute_grad_weight=False``): one thread-block cluster of 16 CTAs,
 its ``dx`` and ``dz`` the same arithmetic, that sums the weight gradient on
 chip in a fixed order and rounds it once, the same bits on every call.  The
-exact tiny backward (4 or 8 teams of the deterministic backward's 128-thread
+exact tiny backward (4 teams of the deterministic backward's 128-thread
 CTA a CTA) adds the deterministic backward's chunk partials in its reduction
 order in FP64.
 

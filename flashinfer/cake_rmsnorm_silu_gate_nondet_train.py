@@ -67,9 +67,8 @@ streams.  The kernels are those of the standalone package
   it.  While every chunk has a CTA of one wave (8 CTAs per SM) CTA ``b`` runs
   chunk ``b``; past that the CTAs claim runs of chunks from the workspace's
   claim counter, so a CTA that starts late takes fewer.  A call of few rows
-  (up to 1024 rows on sm_100a and sm_107a and 620 on sm_103a with a BF16
-  weight gradient or with ``compute_grad_weight=False``, up to 1024, 720 and
-  900 rows on sm_100a, sm_103a and sm_107a with an FP32 one) runs one
+  (up to 512 rows, with a BF16 or an FP32 weight gradient or with
+  ``compute_grad_weight=False``) runs one
   thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same arithmetic,
   which adds the weight-gradient partials of each column in a fixed order in
   FP64, rounds that sum to FP32 (then to BF16 for a BF16 weight gradient) and
@@ -394,9 +393,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     output repeats bit for bit, whatever the grid and the order in which CTAs
     run; ``dw`` is the deterministic backward's bits except where the exact sum
     lies within that backward's FP64 sum error of a rounding boundary.  A call
-    of few rows (up to 1024 rows on sm_100a and sm_107a and 620 on sm_103a
-    with a BF16 ``dw`` or with ``compute_grad_weight=False``, up to 1024, 720
-    and 900 rows with an FP32 ``dw``) runs one cluster of 16 CTAs (``dx`` and
+    of few rows (up to 512 rows, with a BF16 or an FP32 ``dw`` or with
+    ``compute_grad_weight=False``) runs one cluster of 16 CTAs (``dx`` and
     ``dz`` the same arithmetic) that adds the partials of a ``dw`` column in a
     fixed order in FP64 and uses no workspace.
     The deterministic backward is

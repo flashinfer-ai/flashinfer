@@ -1368,20 +1368,21 @@ CLAIMED_ROUTES = {"bwd_bf16_mid": 8, "bwd_f32_mid": 8}
 
 # The small-row backward bands of each architecture and backward role: (last
 # row, role) in increasing rows, each band's module one cluster of 16 CTAs of
-# the exact tiny backward whatever the rows (the measured fastest of its 4-
-# and 8-team programs at each row count).
+# the exact tiny backward whatever the rows (its 4-team program up to its
+# max_rows; past it the static backward, which starts beside a kernel resident
+# on every SM where an 8-team, 1024-thread program does not).
 BACKWARD_BANDS = {
     "sm_100a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
-        "bwd_f32": ((512, "bwd_f32_t512"), (1024, "bwd_f32_t1024")),
+        "bwd_bf16": ((512, "bwd_bf16_t512"),),
+        "bwd_f32": ((512, "bwd_f32_t512"),),
     },
     "sm_103a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"), (620, "bwd_bf16_t1024")),
-        "bwd_f32": ((512, "bwd_f32_t512"), (720, "bwd_f32_t1024")),
+        "bwd_bf16": ((512, "bwd_bf16_t512"),),
+        "bwd_f32": ((512, "bwd_f32_t512"),),
     },
     "sm_107a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"), (1024, "bwd_bf16_t1024")),
-        "bwd_f32": ((512, "bwd_f32_t512"), (900, "bwd_f32_t1024")),
+        "bwd_bf16": ((512, "bwd_bf16_t512"),),
+        "bwd_f32": ((512, "bwd_f32_t512"),),
     },
 }
 
@@ -1438,12 +1439,7 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     grid rule carries rows per SM: the bands are host plan only."""
     assert loader.FORWARD_BANDS == FORWARD_BANDS
     assert loader.STRIDED_FORWARD_BANDS == STRIDED_FORWARD_BANDS
-    assert loader.BAND_ROLES == (
-        "bwd_bf16_t512",
-        "bwd_bf16_t1024",
-        "bwd_f32_t512",
-        "bwd_f32_t1024",
-    )
+    assert loader.BAND_ROLES == ("bwd_bf16_t512", "bwd_f32_t512")
     assert loader.BACKWARD_BANDS == BACKWARD_BANDS
     for arch in loader.ARCHES:
         forward = {"fwd"}
@@ -1544,17 +1540,17 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     assert "fwd_long" not in routes
     # the backward on every architecture: the small-row backwards in their
     # bands whatever the SMs (on sm_100a the 4-team exact tiny backward up to
-    # 512 rows, the 8-team one up to 1024), the static backward from the next row up to 64 rows per
-    # SM (8 chunks of one 8-row block per SM), the claimed backward past it,
-    # at every larger row count
+    # 512 rows), the static backward from the next row up to 64 rows per SM (8
+    # chunks of one 8-row block per SM), the claimed backward past it, at every
+    # larger row count
     for rows, role, band in (
         (1, "bwd_bf16", "bwd_bf16_t512"),
         (192, "bwd_bf16", "bwd_bf16_t512"),
         (193, "bwd_bf16", "bwd_bf16_t512"),
         (256, "bwd_bf16", "bwd_bf16_t512"),
         (512, "bwd_bf16", "bwd_bf16_t512"),
-        (513, "bwd_bf16", "bwd_bf16_t1024"),
-        (1024, "bwd_f32", "bwd_f32_t1024"),
+        (513, "bwd_bf16", "bwd_bf16"),
+        (1024, "bwd_f32", "bwd_f32"),
         (1, "bwd_f32", "bwd_f32_t512"),
         (512, "bwd_f32", "bwd_f32_t512"),
     ):
@@ -1948,9 +1944,7 @@ SHORT_BACKWARD_GRIDS = [
 # the record's) of the small-row backwards.
 SMALL_ROW_BACKWARDS = {
     "bwd_bf16_t512": (512, 512, None),
-    "bwd_bf16_t1024": (1024, 1024, None),
     "bwd_f32_t512": (512, 512, None),
-    "bwd_f32_t1024": (1024, 1024, None),
 }
 
 

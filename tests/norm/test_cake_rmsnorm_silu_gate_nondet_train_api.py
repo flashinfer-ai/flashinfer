@@ -1572,10 +1572,9 @@ def test_forward_gate_edges_keep_the_fp64_classes(
 
 # Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
 # first GATE_EDGE_BACKWARD_COLUMNS columns, so every output keeps finite
-# elements (``dw`` in the other columns): 48,
-# 240 and 1008 rows (the first small-row band, and the second one or, where
-# that band ends below 1008 rows, the static backward) and 6192 and 49488 rows
-# (the static or the claimed backward, by the SM count).
+# elements (``dw`` in the other columns): 48 and 240 rows (the small-row
+# band), 1008 rows (the static backward past it) and 6192 and 49488 rows (the
+# static or the claimed backward, by the SM count).
 GATE_EDGE_BACKWARD_COLUMNS = 96
 GATE_EDGE_BACKWARD_CASES = [
     pytest.param(1, 48, id="1x48"),
