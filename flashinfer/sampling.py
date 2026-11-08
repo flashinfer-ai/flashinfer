@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from numbers import Real
+from threading import Lock
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
@@ -49,6 +50,9 @@ from .utils import (
 )
 
 
+_rng_state_lock = Lock()
+
+
 def get_seed_and_offset(
     increment: int,
     generator: Optional[torch.Generator] = None,
@@ -56,16 +60,19 @@ def get_seed_and_offset(
 ) -> Tuple[int, int]:
     if generator is None:
         generator = get_default_generators(device)
-    # add mutex if multi-trheading needed
-    state = generator.get_state()
-    seed, offset = map(int, state.view(torch.int64))
-    # Reserve this call's range, leaving the generator at the next unused offset.
-    next_offset = offset + (increment + 3) // 4 * 4
-    generator.set_state(
-        torch.tensor(
-            [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
-        ).view(torch.uint8)
-    )
+    # Serialize FlashInfer reservations: get_state/set_state alone do not
+    # make the read-modify-write atomic. A shared lock avoids retaining
+    # caller-owned generators in a per-generator lock cache.
+    with _rng_state_lock:
+        state = generator.get_state()
+        seed, offset = map(int, state.view(torch.int64))
+        # Reserve this call's range, leaving the generator at the next unused offset.
+        next_offset = offset + (increment + 3) // 4 * 4
+        generator.set_state(
+            torch.tensor(
+                [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
+            ).view(torch.uint8)
+        )
     return seed, offset
 
 
