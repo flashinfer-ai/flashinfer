@@ -2047,6 +2047,47 @@ _SM107A_CELL_INDEX: dict[tuple[int, int], dict[tuple[int, int], str]] = {
     for nk, cells in _SM107A_CELLS.items()
 }
 
+# SM107a masked_m setup twins (216 SMs): an N=7168 K=2048 key with at least
+# ``b_min`` (and at most ``b_max``) groups whose route picks the one masked
+# BLOCK_N stage of a program below runs that program's twin instead, under the
+# route's name with ``_mmsetup`` appended.  The twin prefetches masked_m into L2
+# at entry, sums the tile count 32 groups per unrolled step and finds each
+# tile's group by one warp ballot over 32 groups; its tiles, coordinates and K
+# order are its parent's, so the outputs are bitwise equal (measured faster on
+# the 216-SM board).  Program -> (twin, b_min, b_max or None).
+_SM107A_MMSETUP_NK = (7168, 2048)
+_SM107A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
+    # BLOCK_N 144, K tile 256 (the bn144 cells).
+    "cake_batch_deepgemm_fp8_fa7c913fa26439d68c52": (
+        "cake_batch_deepgemm_fp8_aaa43b818034beed6ed4",
+        64,
+        None,
+    ),
+    # BLOCK_N 192 with 256-byte L2 promotion (the bn192 cells and band).
+    "cake_batch_deepgemm_fp8_e73ad8a03db49514daf6": (
+        "cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850",
+        64,
+        None,
+    ),
+}
+
+
+def _mmsetup_twin(
+    arch: str, B: int, N: int, K: int, stages: tuple[tuple[Any, ...], ...]
+) -> tuple[tuple[Any, ...], ...] | None:
+    """``stages`` with the masked_m setup twin in place of its parent
+    (``_SM107A_MMSETUP_TWINS``), or ``None`` when the key keeps the parent."""
+    if arch != "sm_107a" or (N, K) != _SM107A_MMSETUP_NK or len(stages) != 1:
+        return None
+    stage = stages[0]
+    twin = _SM107A_MMSETUP_TWINS.get(stage[0]) if stage[1] == "masked_bn" else None
+    if twin is None:
+        return None
+    program, b_min, b_max = twin
+    if b_min > B or (b_max is not None and b_max < B):
+        return None
+    return ((program, *stage[1:]),)
+
 
 # fmt: off
 _ROUTES: tuple[_Route, ...] = (
@@ -2611,15 +2652,20 @@ def select(
     """The first table row of ``arch`` that matches, as a :class:`RoutePlan`; ``None`` = named gap.
 
     ``sm_count`` is the SM count the table was exported for (the ``DISPATCH_TABLES``
-    key); it only enters the launch grids.
+    key); it only enters the launch grids.  An SM107a masked_m setup twin
+    (``_SM107A_MMSETUP_TWINS``) takes its parent's stage on its keys.
     """
     for row in _TABLE[arch]:
         if _matches(row, arch, B, M, N, K, expected_m):
+            route, stages = row.route, row.stages
+            twin = _mmsetup_twin(arch, B, N, K, stages)
+            if twin is not None:
+                route, stages = f"{route}_mmsetup", twin
             return RoutePlan(
-                route=row.route,
+                route=route,
                 parent=row.parent,
                 stages=tuple(
-                    _stage_plan(s, sm_count, B, M, N, K, expected_m) for s in row.stages
+                    _stage_plan(s, sm_count, B, M, N, K, expected_m) for s in stages
                 ),
                 workspaces=_workspaces(row.workspaces, B, M, N, K),
             )
