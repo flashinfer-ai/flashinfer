@@ -9368,6 +9368,9 @@ def test_gpu_k1_chain_programs(shape, monkeypatch):
         {(arch, sm_count): {key: ((T, T, (block_n, 3)),)}},
     )
     monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
+    # the stream-K rows and the fixed-order ranges come before the chain ranges
+    monkeypatch.setattr(cake_backend, "K1_WGRAD_SK_RULES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_ORDERED_RANGES_BY_SM", {})
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     try:
         out.fill_(float("nan"))
@@ -13646,12 +13649,18 @@ def _repeats_into_nan(run, out, what, reruns=RERUNS):
 
 
 def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
-    """On a part of a table of :data:`K1_DGRAD_RULES_BY_SM`: the input gradient of every row binds the table's
-    program, gives the deterministic package's input gradient bit for bit (the deterministic plan's bits), meets the
-    deterministic package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned
-    outputs.  A part without rows skips."""
+    """On a part of a table of :data:`K1_DGRAD_RULES_BY_SM`: the input gradient of every row (not a row of
+    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`, which runs this package's program) binds the table's program, gives the
+    deterministic package's input gradient bit for bit (the deterministic plan's bits), meets the deterministic
+    package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned outputs.  A part
+    without such rows skips."""
     device, arch, sms = _part_or_skip()
-    rows = cake_backend.K1_DGRAD_RULES_BY_SM.get((arch, sms), {})
+    own = cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
+    rows = {
+        key: value
+        for key, value in cake_backend.K1_DGRAD_RULES_BY_SM.get((arch, sms), {}).items()
+        if key not in own
+    }
     if not rows:
         pytest.skip(f"no K1 input-gradient row of {arch} on {sms} SMs")
     g = torch.Generator(device=device).manual_seed(SEED + 170)
