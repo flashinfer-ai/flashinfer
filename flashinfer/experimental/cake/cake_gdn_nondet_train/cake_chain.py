@@ -1965,7 +1965,7 @@ def split_r_form(
 # adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
 # cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
 # full cost.
-ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a"})
+ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_107a"})
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
 ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
@@ -1977,7 +1977,8 @@ SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
 # summaries beside the last pieces' walks (``summary``); the step of the serial walk at an empty and at a full wave
 # (``serial_low`` / ``serial_full``, interpolated by the fill); the composition's fixed cost and its cost per
 # composed piece (``stitch`` / ``stitch_piece``); the split's fixed cost (its extra launches and the stream fork and
-# join).
+# join).  sm_100a measured on B200 (148 SMs), sm_107a on R200 (212 SMs; ``serial_full`` extrapolated from the 144-CTA
+# rows, the fullest serial wave of the bench rows there).
 ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
     "sm_100a": {
         "walk": 2.69,
@@ -1986,6 +1987,15 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "serial_full": 2.72,
         "stitch": 10.5,
         "stitch_piece": 3.0,
+        "fixed": 15.0,
+    },
+    "sm_107a": {
+        "walk": 2.0,
+        "summary": 2.09,
+        "serial_low": 1.67,
+        "serial_full": 1.7,
+        "stitch": 8.1,
+        "stitch_piece": 3.4,
         "fixed": 15.0,
     },
 }
