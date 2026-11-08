@@ -712,9 +712,9 @@ def test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled(
     weight-gradient sum's order depends on scheduling; under
     ``warn_only=True`` it warns and runs it.  A node there whose weight needs
     no gradient, and a node in each small-row band of a BF16 weight gradient
-    on this device (``BAND_ROLES``: the short backward on sm_100a and
-    sm_103a, the exact tiny backward on sm_100a and sm_107a, each summing on
-    chip in a fixed order), does not alert.  The launches are recorded and
+    on this device (``BAND_ROLES``: the short backward on every
+    architecture, the exact tiny backward on sm_100a and sm_107a, each
+    summing on chip in a fixed order), does not alert.  The launches are recorded and
     skipped (``run_module`` stubbed)."""
     launched: list[str] = []
     monkeypatch.setattr(
@@ -1820,8 +1820,8 @@ def test_forward_gate_edges_keep_the_fp64_classes(
 # Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
 # first GATE_EDGE_BACKWARD_COLUMNS columns, so every output keeps finite
 # elements (``dw`` in the other columns): 48 and 240 rows (the first
-# small-row band of each role: for a BF16 weight gradient the short backward
-# on sm_100a and sm_103a), 288 rows (the exact tiny backward of a BF16
+# small-row band of each role: for a BF16 weight gradient the short
+# backward), 288 rows (the exact tiny backward of a BF16
 # weight gradient on sm_100a and sm_107a, the row-claims backward on
 # sm_103a), then 1008, 6192, 49488, 49536 and 245808 rows in the bands past
 # them (the static, the row-claims and the claimed backwards, as the

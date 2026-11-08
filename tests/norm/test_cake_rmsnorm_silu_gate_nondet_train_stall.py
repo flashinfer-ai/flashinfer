@@ -43,8 +43,8 @@ of the weight gradient's dtype (a call without a weight gradient takes the
 BF16 bands).  A small-row backward, up to a count of rows, is one cluster of
 16 CTAs, scheduled together on the SMs of one GPC, whose CTAs each wait for
 the other CTAs' FP32 partials of their columns and finish them in a fixed
-order, with no workspace: the short backward of a BF16 weight gradient on
-SM100 and SM103 (256-thread CTAs of 16-row blocks, 6144 bytes of dynamic
+order, with no workspace: the short backward of a BF16 weight gradient
+(256-thread CTAs of 16-row blocks, 6144 bytes of dynamic
 shared memory each) and the exact tiny backward (512-thread CTAs of 4 teams
 of 8-row blocks, 19584 bytes each).  The chunked backwards cut the rows into
 blocks of 8 rows and the blocks into ``C = ceil(blocks / B)`` chunks of
@@ -91,7 +91,7 @@ gradients) and the forward start beside it and cost at most
 FP32 weight gradient at 1 and 5 tokens (48 and 240 rows, where a small-row
 band of the role holds them) and at the first whole tokens of the role's
 second small-row band (the exact tiny backward of a BF16 weight gradient on
-SM100, past the short backward's band), which on SM100 and SM103 also start
+SM100 and SM107, past the short backward's band), which on SM100 and SM103 also start
 beside it with the default and the maximum-L1 carveout, and the backward that
 takes the rows past the role's small-row bands, at its first whole tokens
 (``SHORT_BACKWARD_PROBES``).  On SM107 they do not start beside the side
@@ -1499,10 +1499,9 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 # The small-row backwards of a BF16 and an FP32 weight gradient: one token and
 # five tokens of H heads (48 and 240 rows, in the role's first small-row
 # BACKWARD_BANDS band on every architecture: for a BF16 weight gradient the
-# short backward on SM100 and SM103), and "second_band": the first whole
-# tokens of H heads in the role's second small-row band (the exact tiny
-# backward of a BF16 weight gradient on SM100, past the short backward's
-# band; skipped where the role has one small-row band), beside the short
+# short backward), and "second_band": the first whole tokens of H heads in
+# the role's second small-row band (the exact tiny backward of a BF16 weight
+# gradient on SM100 and SM107, past the short backward's band; skipped where the role has one small-row band), beside the short
 # forward's side kernels; their held test takes the short forward's bound,
 # slack and SHORT_MAX_ALONE_SPREAD.  And "past": the first whole tokens of H
 # heads past the role's last small-row band (by the band ends of

@@ -63,13 +63,13 @@ vary from run to run.  The kernels are those of the standalone package
   each column in a fixed order in FP64, rounds that sum to FP32 (then to BF16
   for a BF16 weight gradient) and uses no workspace.  The short backward
   (256-thread CTAs, every CTA's FP32 partials added in rank order) runs a
-  BF16 weight gradient or ``compute_grad_weight=False`` up to 256 rows on
-  SM100 and SM103; its weight gradient repeats its bits, which need not be the
-  deterministic package's.  The exact tiny backward (the deterministic
+  BF16 weight gradient or ``compute_grad_weight=False`` up to 256 rows; its
+  weight gradient repeats its bits, which need not be the deterministic
+  package's.  The exact tiny backward (the deterministic
   backward's chunk partials in its reduction order: the deterministic pair's
   bits) runs an FP32 weight gradient up to 512 rows on every architecture and
   a BF16 one (or ``compute_grad_weight=False``) from 257 up to 512 rows on
-  SM100 and up to 512 rows on SM107.  Past those rows the rows (``T * H``)
+  SM100 and SM107.  Past those rows the rows (``T * H``)
   and the SM count pick the kernel by bands of rows per SM.  The chunked
   backwards run over the deterministic backward's chunks of rows (8-row
   blocks, ``max(1, ceil(blocks / 8192))`` blocks a chunk), at most 8 CTAs per
@@ -436,8 +436,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     where the exact sum lies within that backward's FP64 sum error of a
     rounding boundary.  A call of few rows runs one cluster of 16 CTAs
     (``dx`` and ``dz`` the same arithmetic) that adds the partials of a ``dw``
-    column in a fixed order in FP64 and uses no workspace: up to 256 rows on
-    SM100 and SM103 with a BF16 ``dw`` or ``compute_grad_weight=False`` (the
+    column in a fixed order in FP64 and uses no workspace: up to 256 rows
+    with a BF16 ``dw`` or ``compute_grad_weight=False`` (the
     short backward, whose ``dw`` repeats its bits, which need not be the
     deterministic backward's), else up to 512 rows (the exact tiny backward,
     the deterministic backward's bits; SM103 runs it for an FP32 ``dw``

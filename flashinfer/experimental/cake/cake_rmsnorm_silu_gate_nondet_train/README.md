@@ -49,11 +49,17 @@ BF16 exact tiny backward and its row-claims band starts at 257 rows.  On
 B200 (`sm_100a`) the steps with the short and with the exact tiny backward
 are within 3 % of each other at up to 256 rows, and under FlashInfer's
 benchmark timer the short backward alone is the faster of the two at every
-row count up to 256.
+row count up to 256.  On R200 (`sm_107a`) the step with the exact tiny
+backward takes 2.9 % .. 6.4 % longer than with the short backward at
+96 .. 256 rows (the mean of 4 passes; longer in every pass) and 1.1 % less
+at 48 rows, within that row count's pass-to-pass spread; at 336 .. 512 rows
+the step with the row-claims backward takes 18.7 % .. 24.5 % longer than
+with the exact tiny backward, so `sm_107a` runs the exact tiny backward
+from 257 to 512 rows.
 
 `y` is not the deterministic package's bits.  `dx` and `dz` are, in every
 band.  Outside the row-claims bands and the short backward's band (a BF16
-`dw` up to 256 rows on `sm_100a` and `sm_103a`) `dw` is too, except where the
+`dw` up to 256 rows) `dw` is too, except where the
 exact sum lies within the deterministic FP64 sum's error of a rounding
 boundary.  In the short backward's band `dw` is that program's own
 fixed-order sum: the same bits on every call, which need not be the
@@ -175,7 +181,7 @@ the same inputs on the same device.
 | `fwd_mid` | whole waves of 6 CTAs per SM (as many waves as the rows need), each CTA at most 2 blocks of 16 rows | its forward bands |
 | `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
 | `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
-| `bwd_bf16_short` | short backward (a BF16 weight gradient; `sm_100a`, `sm_103a`): one cluster of 16 CTAs of 256 threads, 16 lanes a row, CTA `r` running the 16-row blocks `r`, `r + 16`, ... with the row-claims backward's row arithmetic; CTA `r` adds every CTA's FP32 partials of the columns `8r` .. `8r + 7` in rank order in FP64 (a fixed order), no workspace | the rows of its band (at most 256) |
+| `bwd_bf16_short` | short backward (a BF16 weight gradient; every architecture): one cluster of 16 CTAs of 256 threads, 16 lanes a row, CTA `r` running the 16-row blocks `r`, `r + 16`, ... with the row-claims backward's row arithmetic; CTA `r` adds every CTA's FP32 partials of the columns `8r` .. `8r + 7` in rank order in FP64 (a fixed order), no workspace | the rows of its band (at most 256) |
 | `bwd_bf16_t512` (`sm_100a`, `sm_107a`), `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its band (at most 512) |
 | `bwd_f32` (every architecture), `bwd_bf16` (`sm_107a`) | static backward: 128 threads, 8-row blocks, CTA `b` runs chunks `b`, `b + grid`, ... (the same bits at any grid); on `sm_100a` and `sm_103a` 4 copies of the weight-gradient windows and no prefetch, on `sm_107a` 4 copies plus occupancy words (the last CTA reads only the windows some CTA added into) | its backward band (the call role `bwd_bf16` has no program on `sm_100a` and `sm_103a`: no BF16 band routes a static backward there) |
 | `bwd_bf16_rc` | row-claims backward (a BF16 weight gradient): 256 threads, 16 lanes a row, 16-row blocks, the CTAs past one wave claiming blocks from the claim counter; each thread's FP32 run of rows added to 4 FP64 accumulator copies with atomics, the CTA that arrives last rounding the sum | its backward band (every architecture) |
@@ -193,7 +199,7 @@ the 20 hex digits shown):
 | `fwd_mid` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` |
 | `fwd_long` | `c6151f64f22ae65a48eb` | (not routed) | (not routed) |
 | `fwd_xlong` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` |
-| `bwd_bf16_short` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` | (none) |
+| `bwd_bf16_short` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` |
 | `bwd_bf16_t512` | `f6a3420d9aaa20a99e8d` | (none) | `f6a3420d9aaa20a99e8d` |
 | `bwd_bf16` | (none) | (none) | `6d7cf79fb3d679d07410` |
 | `bwd_bf16_rc` | `615c6fae07a6a89f3a45` | `615c6fae07a6a89f3a45` | `615c6fae07a6a89f3a45` |
@@ -231,7 +237,7 @@ past them:
 | --- | --- | --- |
 | `sm_100a` | 1-256 rows `bwd_bf16_short`, 257-512 rows `bwd_bf16_t512`, up to 800 rows per SM `bwd_bf16_rc`, up to 1329 rows per SM `bwd_bf16_rc_mid`, past that `bwd_bf16_mid` | 1-512 rows `bwd_f32_t512`, up to 256 rows per SM `bwd_f32`, past that `bwd_f32_mid` |
 | `sm_103a` | 1-256 rows `bwd_bf16_short`, up to 700 rows per SM `bwd_bf16_rc`, up to 1294 rows per SM `bwd_bf16_rc_mid`, past that `bwd_bf16_mid` | 1-512 rows `bwd_f32_t512`, up to 256 rows per SM `bwd_f32`, past that `bwd_f32_mid` |
-| `sm_107a` | 1-512 rows `bwd_bf16_t512`, up to 24 rows per SM `bwd_bf16`, up to 68 rows per SM `bwd_bf16_rc`, past that `bwd_bf16_mid` | 1-512 rows `bwd_f32_t512`, up to 64 rows per SM `bwd_f32`, past that `bwd_f32_mid` |
+| `sm_107a` | 1-256 rows `bwd_bf16_short`, 257-512 rows `bwd_bf16_t512`, up to 24 rows per SM `bwd_bf16`, up to 68 rows per SM `bwd_bf16_rc`, past that `bwd_bf16_mid` | 1-512 rows `bwd_f32_t512`, up to 64 rows per SM `bwd_f32`, past that `bwd_f32_mid` |
 
 For example, the BF16 row-claims bands hold 513 to 196692 rows on a 148-SM
 B200 (`bwd_bf16_rc` up to 118400), 257 to 196688 rows on a 152-SM GB300
@@ -291,7 +297,7 @@ A row-claims backward lays two, 4104 bytes in all:
 
 | program | `sm_100a`, `sm_103a` | `sm_107a` |
 | --- | --- | --- |
-| `bwd_bf16_short` | none | (no program) |
+| `bwd_bf16_short` | none | none |
 | `bwd_bf16_t512` | none (`sm_100a`; no program on `sm_103a`) | none |
 | `bwd_f32_t512` | none | none |
 | `bwd_bf16` | (no program) | 5 slots (4 window copies, then the occupancy words), 36360 bytes |

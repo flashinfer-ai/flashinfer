@@ -355,9 +355,9 @@ the row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 257
 rows to 1294 rows per SM, SM107 above 24 to 68 rows per SM), where its last
 bits may vary from run to run.  ``y`` is not the deterministic package's bits;
 ``dx`` and ``dz`` are in every band, and outside the row-claims bands and the
-short backward's band (a BF16 weight gradient up to 256 rows on SM100 and
-SM103) ``dw`` is too, except where the exact sum lies within the
-deterministic FP64 sum's error of a rounding boundary.  In the short
+short backward's band (a BF16 weight gradient up to 256 rows) ``dw`` is too,
+except where the exact sum lies within the deterministic FP64 sum's error of a
+rounding boundary.  In the short
 backward's band ``dw`` is that kernel's own fixed-order sum, the same bits on
 every call, which need not be the deterministic package's.  The FP64 error of
 each output (relative L2 and the largest error relative to the largest
@@ -400,14 +400,13 @@ inputs, and within the deterministic package's absolute bounds.
   with the row-claims backward's row arithmetic; CTA ``r`` adds every CTA's
   FP32 partials of the columns ``8r`` to ``8r + 7`` in rank order in FP64)
   runs a BF16 weight gradient (or ``compute_grad_weight=False``) up to 256
-  rows on SM100 and SM103.  The exact tiny backward (4 teams of the
-  deterministic backward's 128-thread CTA a CTA, adding the deterministic
-  backward's chunk partials in its reduction order in FP64) runs an FP32
-  weight gradient up to 512 rows on every architecture, and a BF16 one (or
-  ``compute_grad_weight=False``) from 257 up to 512 rows on SM100 and up to
-  512 rows on SM107; SM103 has no BF16 exact tiny backward.  Past those rows
-  the rows (``T * H``) and the SM count pick the kernel by bands of rows per
-  SM.  The chunked
+  rows.  The exact tiny backward (4 teams of the deterministic backward's
+  128-thread CTA a CTA, adding the deterministic backward's chunk partials in
+  its reduction order in FP64) runs an FP32 weight gradient up to 512 rows on
+  every architecture, and a BF16 one (or ``compute_grad_weight=False``) from
+  257 up to 512 rows on SM100 and SM107; SM103 has no BF16 exact tiny
+  backward.  Past those rows the rows (``T * H``) and the SM count pick the
+  kernel by bands of rows per SM.  The chunked
   backwards launch at most 8 CTAs per SM; they sum the deterministic
   backward's chunk partials exactly in 64-bit integer windows and round that
   sum to FP32 from its FP64 value (then to BF16 for a BF16 weight gradient),
@@ -446,7 +445,13 @@ inputs, and within the deterministic package's absolute bounds.
   rows, so SM103 runs no BF16 exact tiny backward; on B200 (SM100) the steps
   with the short and with the exact tiny backward are within 3 % of each
   other at up to 256 rows, and under FlashInfer's benchmark timer the short
-  backward alone is the faster of the two at every row count up to 256.
+  backward alone is the faster of the two at every row count up to 256.  On
+  R200 (SM107) the step with the exact tiny backward takes 2.9 % to 6.4 %
+  longer than with the short backward at 96 to 256 rows (the mean of 4
+  passes; longer in every pass) and 1.1 % less at 48 rows, within that row
+  count's pass-to-pass spread; at 336 to 512 rows the step with the
+  row-claims backward takes 18.7 % to 24.5 % longer than with the exact tiny
+  backward, so SM107 runs the exact tiny backward from 257 to 512 rows.
   Under
   ``torch.use_deterministic_algorithms(True)`` a call that computes the
   weight gradient there raises PyTorch's alert (rule 3); no other call

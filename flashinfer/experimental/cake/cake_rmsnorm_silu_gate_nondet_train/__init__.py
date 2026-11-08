@@ -54,7 +54,7 @@ arithmetic, that sums the weight gradient on chip in a fixed order and rounds
 it once, the same bits on every call.  The exact tiny backward (4 teams of
 the deterministic backward's 128-thread CTA a CTA) adds the deterministic
 backward's chunk partials in its reduction order in FP64; the short backward
-of a BF16 weight gradient on sm_100a and sm_103a (256-thread CTAs) has each
+of a BF16 weight gradient (256-thread CTAs) has each
 CTA finish 8 columns from every CTA's FP32 partials in rank order in FP64.
 Where a
 row-claims backward saves at least 3 % of a checkpointed training step, a

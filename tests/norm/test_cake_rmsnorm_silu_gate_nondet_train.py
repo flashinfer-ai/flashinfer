@@ -46,8 +46,7 @@ near-zero variance, saturated gates, weight-gradient terms that cancel per
 column, FP32 and BF16 weight gradients,
 accumulation, ``compute_grad_weight=False``, the small-row backwards (one
 cluster each, in the rows of their ``BACKWARD_BANDS`` bands: the short
-backward of a BF16 weight gradient on sm_100a and sm_103a and the exact tiny
-backwards; no workspace made
+backward of a BF16 weight gradient and the exact tiny backwards; no workspace made
 or touched, a caller workspace checked and left as it is, the first row count
 past them on the backward), empty work, a workspace reused across shapes (zero after every
 call), a workspace with nonzero scratch returned to zero by
@@ -2525,8 +2524,8 @@ SHORT_BACKWARD_GRIDS = [
 ROW_LANES = 16
 # role -> (threads a CTA, teams a CTA, CTAs of the cluster) of each small-row
 # backward (``BAND_ROLES``), one cluster each, whose CTAs each run their
-# teams' row blocks: the short backward of a BF16 weight gradient (on sm_100a
-# and sm_103a; one 256-thread team a CTA, CTA ``r`` running the 16-row blocks
+# teams' row blocks: the short backward of a BF16 weight gradient (on every
+# architecture; one 256-thread team a CTA, CTA ``r`` running the 16-row blocks
 # ``r``, ``r + 16``, ...) and the exact tiny backwards (``_t512``: 4 teams of
 # the deterministic backward's 128-thread CTA a CTA, team ``q`` of CTA ``r``
 # running the 8-row block ``r + 16 q``).  A row block holds
@@ -2722,8 +2721,8 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
 )
 def test_short_backward_accumulates_and_skips_the_weight_gradient(dw_dtype):
     """On the small-row backward of 240 rows of a ``dw_dtype`` weight
-    gradient (the short backward of a BF16 weight gradient on sm_100a and
-    sm_103a, else the exact tiny backward): ``accumulate_grad_weight`` adds
+    gradient (the short backward of a BF16 weight gradient, else the exact
+    tiny backward): ``accumulate_grad_weight`` adds
     to the accumulator before the one rounding (within the budget, the same
     bits on every launch), ``compute_grad_weight=False`` leaves
     ``grad_weight`` as it is, and ``dx`` and ``dz`` are the same bits either

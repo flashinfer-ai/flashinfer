@@ -94,10 +94,10 @@ takes) is one thread-block cluster of 16 CTAs that sums the weight gradient
 on chip in a fixed order and rounds it once, with no workspace: the exact
 tiny backward (``<role>_t512``: 4 teams of the deterministic backward's
 128-thread CTA a CTA, up to 512 rows; ``dx``, ``dz`` and the weight gradient
-the deterministic pair's bits) and, for a BF16 weight gradient on sm_100a
-and sm_103a, the short backward (``bwd_bf16_short``: 256-thread CTAs with
-the row-claims backward's row arithmetic, each CTA finishing 8 columns from
-every CTA's FP32 partials in rank order in FP64, up to 256 rows).
+the deterministic pair's bits) and, for a BF16 weight gradient, the short
+backward (``bwd_bf16_short``: 256-thread CTAs with the row-claims backward's
+row arithmetic, each CTA finishing 8 columns from every CTA's FP32 partials
+in rank order in FP64, up to 256 rows).
 ``BACKWARD_BANDS`` gives each backward its rows on each architecture.
 
 Grids (:func:`launch_grid`): the forward and the short forward launch one
@@ -922,7 +922,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_sums": 512,
         },
     },
-    # The short backward into a BF16 weight gradient on sm_100a and sm_103a:
+    # The short backward into a BF16 weight gradient on every architecture:
     # one cluster of 16 CTAs of 256 threads (CTA r runs the 16-row blocks r,
     # r + 16, ...), the row-claims backward's row arithmetic (16 lanes per row,
     # the gate on packed FP32 pairs), CTA r of the cluster finishing the
@@ -934,6 +934,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -1536,6 +1537,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
+        "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
@@ -1657,6 +1659,7 @@ BACKWARD_BANDS: dict[
     },
     "sm_107a": {
         "bwd_bf16": (
+            ((ROWS, 256), "bwd_bf16_short"),
             ((ROWS, 512), "bwd_bf16_t512"),
             (24, "bwd_bf16"),
             (68, "bwd_bf16_rc"),
