@@ -570,7 +570,7 @@ def _sm_count() -> int:
 
 
 def _hidden_sizes() -> tuple[int, ...]:
-    """The hidden sizes the device's architecture routes every kind of (the deterministic package's sizes there)."""
+    """The hidden sizes the device's architecture routes every kind of (this package's sizes)."""
     arch = _arch()
     return tuple(loader.supported_hidden_sizes(arch)) if arch else ()
 
@@ -1009,15 +1009,17 @@ def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
 @requires_device
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
 def test_hidden_sizes_follow_the_device(hidden: int) -> None:
-    """This package takes a hidden size exactly where the deterministic package does: on sm_100a / sm_103a 5120 and
+    """On sm_100a / sm_103a this package takes a hidden size exactly where the deterministic package does: 5120 and
     7168 size their workspaces (the forward one the deterministic package's, the backward one larger than its, both
-    other than the H 4096 sizes) and the entry points run on them; on sm_107a (hidden 4096 only) the workspace
-    helpers and the entry points refuse them with ``ValueError``."""
+    other than the H 4096 sizes) and the entry points run on them.  On sm_107a this package takes hidden 4096 only,
+    while the deterministic package also takes 5120 and 7168: this package's workspace helpers and entry points
+    refuse them with ``ValueError``."""
     dev = _device()
-    exported = det_facade.is_cake_mhc_det_train_supported(dev, hidden)
+    exported = facade.is_cake_mhc_nondet_train_supported(dev, hidden)
     assert exported == (hidden in _hidden_sizes()) == (_arch() != "sm_107a")
-    assert facade.is_cake_mhc_nondet_train_supported(dev, hidden) == exported
     assert backend.is_cake_mhc_nondet_train_supported(dev, hidden) == exported
+    if exported:
+        assert det_facade.is_cake_mhc_det_train_supported(dev, hidden)
     i = _inputs(7, hidden=hidden) if exported else None
     with warnings.catch_warnings():
         warnings.simplefilter("error", ExperimentalWarning)
