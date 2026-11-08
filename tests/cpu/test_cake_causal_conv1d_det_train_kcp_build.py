@@ -16,9 +16,9 @@ limitations under the License.
 The KCP registry (``kcp_jit``) of the Cake causal convolution training package: the records against the frozen
 kernel ABIs and the identity rule, the routes and the selection by channel count, and the ``build.json`` entries of
 the KCP programs.  Each backward program ships twice: the cooperative build (route ``kcp_bwd``) and its ``split``
-build (route ``kcp_bwd_split``, FlashInfer issue #8365), an ordinary launch one SM short of co-resident
-(``reserve_sms``) whose ``dweight`` partial rows the zero-history package's fixed-order reduce program sums.  No device
-is needed; nothing is built or launched.
+build (route ``kcp_bwd_split``, FlashInfer issue #8365, built with ``pair=True``: the token arithmetic on packed
+``f32x2`` channel pairs), an ordinary launch one SM short of co-resident (``reserve_sms``) whose ``dweight`` partial
+rows the zero-history package's fixed-order reduce program sums.  No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -75,9 +75,9 @@ REDUCE = "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5"
 FALLBACK = "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
 R200_FALLBACK = "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp"
 BIG = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
-SPLIT_FALLBACK = "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp"
-SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp"
-SPLIT_BIG = "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp"
+SPLIT_FALLBACK = "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp"
+SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp"
+SPLIT_BIG = "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp"
 BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
 
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
@@ -116,7 +116,7 @@ PROGRAMS = {
     ),
     SPLIT_FALLBACK: (
         BWD,
-        {"vec": 8, "copy": "tma2d", "split": True},
+        {"vec": 8, "copy": "tma2d", "split": True, "pair": True},
         ("sm_100a", "sm_103a"),
         "kcp_bwd_split",
         BWD_TMA_PLAN,
@@ -124,7 +124,7 @@ PROGRAMS = {
     ),
     SPLIT_R200_FALLBACK: (
         BWD,
-        {"vec": 8, "min_blocks": 2, "split": True},
+        {"vec": 8, "min_blocks": 2, "split": True, "pair": True},
         ("sm_107a",),
         "kcp_bwd_split",
         BWD_PLAN,
@@ -132,7 +132,14 @@ PROGRAMS = {
     ),
     SPLIT_BIG: (
         BWD,
-        {"vec": 8, "copy": "tma2d", "stage_tokens": 8, "min_blocks": 2, "split": True},
+        {
+            "vec": 8,
+            "copy": "tma2d",
+            "stage_tokens": 8,
+            "min_blocks": 2,
+            "split": True,
+            "pair": True,
+        },
         ARCHES,
         "kcp_bwd_split",
         BWD_TMA_PLAN,
