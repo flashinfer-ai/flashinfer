@@ -69,24 +69,25 @@ blocks, thread 0 warming the CTA's next block and the first block of the CTA
 a wave later in L2), the long forward (256-thread CTAs walking 32-row
 blocks) and the extra-long forward (the long forward whose thread 0 also
 warms the CTA's next block in L2); and the pipelined forwards, builds of the
-deterministic package's forward kernel file with this package's gate (its
-builds with ``split_gate`` 1: the forward's ``ex2.approx`` / ``rcp.approx``
-sigmoid, which does not flush where the deterministic gate gives 0, ``z``
-from about -87.34 down), under this package's names, routed where they make
-the training step, two forwards and the backward, faster than this package's
-own: 128-thread CTAs walking 16-row blocks, each thread loading its row of
-the CTA's next block into registers while it computes the current one, with
-the mid forward's L2 prefetches and the L2 ``evict_first`` policy on the
-loads of ``x`` and ``z``, one CTA per block below 8192 rows per SM
-(``fwd_pipe`` on sm_100a and sm_103a; on sm_107a ``fwd_pipe_packed``, for
+deterministic package's forward kernel file with a gate that does not flush
+(its builds with ``split_gate`` 1: the reciprocal of a scaled ``1 + e``, which
+does not flush where the deterministic gate gives 0, ``z`` from about -87.34
+down, and gives the deterministic bits elsewhere), under this package's names,
+routed where they make the training step, two forwards and the backward, faster
+than this package's own: 128-thread CTAs walking 16-row blocks, each thread
+loading its row of the CTA's next block into registers while it computes the
+current one, with the mid forward's L2 prefetches and the L2 ``evict_first``
+policy on the loads of ``x`` and ``z``, one CTA per block below 8192 rows per
+SM (``fwd_pipe`` on sm_100a and sm_103a; on sm_107a ``fwd_pipe_packed``, for
 packed rows, with four sum chains, ``rsqrt.approx.ftz``, ``w`` loaded behind
-the first block's loads and one 32-byte store per lane).  Each program's arithmetic is fixed; the
-programs associate a row's sum of squares differently (the tiny and the short
-forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
-sm_107a pipelined forward: four 4-term chains of 8 lanes added in pairs, then
-folded by 1, 2, 4; the others: 16-term chains of 8 lanes folded by 1, 2, 4),
-so ``y``'s bits can differ between the programs, and so between the bands of one architecture, while
-each program gives the same bits for the same inputs on the same device.
+the first block's loads and one 32-byte store per lane).  Each program's
+arithmetic is fixed; the programs associate a row's sum of squares differently
+(the tiny and the short forward: 8-term FMA chains of 16 lanes folded by XOR
+shuffles 1, 2, 4, 8; the sm_107a pipelined forward: four 4-term chains of 8
+lanes added in pairs, then folded by 1, 2, 4; the others: 16-term chains of 8
+lanes folded by 1, 2, 4), so ``y``'s bits can differ between the programs, and
+so between the bands of one architecture, while each program gives the same
+bits for the same inputs on the same device.
 
 The backward's call role is the static backward (CTA ``b``
 runs the chunks ``b``, ``b + grid``, ... and claims nothing); its mid role is
@@ -515,7 +516,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd_tiny",
     },
     # The pipelined forward: the deterministic package's forward program with
-    # this package's gate (split_gate 1, under this package's name): 128
+    # a gate that does not flush (split_gate 1, under this package's name): 128
     # threads, 8 lanes per row (16-row blocks), at most 6 CTAs per SM, each
     # thread loading its row of the CTA's next block into registers while it
     # computes the current one, thread 0 warming the CTA's next block and the
@@ -581,13 +582,13 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # The sm_107a pipelined forward of packed rows (x and z hold row n at
     # element 128 n, fewer than PACKED_ROWS rows): the deterministic package's
-    # sm_107a forward of packed rows with this package's gate, the schedule above with the sum of
-    # squares as four FMA chains, rsqrt.approx.ftz, w loaded behind the first
-    # block's loads, each row's offset taken from its index alone and one
-    # 32-byte store per lane (build {"min_blocks": 6, "packed_rows": 1,
-    # "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz": 1, "split_gate":
-    # 1, "store_width": 256, "sum_pairs": 1, "threads": 128, "w_late": 1});
-    # FORWARD_BANDS gives it its rows.
+    # sm_107a forward of packed rows with a gate that does not flush, the
+    # schedule above with the sum of squares as four FMA chains,
+    # rsqrt.approx.ftz, w loaded behind the first block's loads, each row's
+    # offset taken from its index alone and one 32-byte store per lane (build
+    # {"min_blocks": 6, "packed_rows": 1, "prefetch_ahead": 1, "prefetch_wave":
+    # 1, "rsqrt_ftz": 1, "split_gate": 1, "store_width": 256, "sum_pairs": 1,
+    # "threads": 128, "w_late": 1}); FORWARD_BANDS gives it its rows.
     "cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7": {
         "arches": [
             "sm_107a",

@@ -33,8 +33,9 @@ in the row-claims bands of ``cake_jit.BACKWARD_BANDS`` (the roles
 run to run.  The forward computes ``rstd`` with ``rsqrt.approx``
 and the SiLU gate with ``ex2.approx`` and ``rcp.approx`` (no flush of a
 nonzero sigmoid of a normal ``z``), rounding ``y`` to BF16 once; its bits are
-not the deterministic package's, and its error against an FP64 reference
-stays within the family's budget.  Each forward program's arithmetic is fixed,
+the deterministic package's only from the pipelined forwards where that
+package's gate does not flush, and its error against an FP64 reference stays
+within the family's budget.  Each forward program's arithmetic is fixed,
 but the programs may associate a row's sum of squares differently (the row
 count and the SM count pick the program), so ``y`` repeats bit for bit for the
 same inputs on the same device.  The backward writes ``dx`` and ``dz``
@@ -160,9 +161,9 @@ Host design (the input layout rules are the deterministic package's):
   ``_kernel_view``), the long forward (3 CTAs per SM, at most 6 blocks of 32
   rows each; sm_100a), the extra-long forward (the long forward whose thread
   0 also warms the CTA's next block in L2) and the pipelined forwards (the
-  deterministic package's forward programs with this package's gate: the mid
-  forward's schedule and L2 prefetches with the L2 ``evict_first`` policy on
-  the loads of x and z, one CTA per block below 8192 rows per SM; on sm_107a
+  deterministic package's forward programs with a gate that does not flush: the
+  mid forward's schedule and L2 prefetches with the L2 ``evict_first`` policy
+  on the loads of x and z, one CTA per block below 8192 rows per SM; on sm_107a
   its program of packed rows).  The bands past the tiny forward's (packed
   rows): on sm_100a the pipelined forward up to 85 rows per SM, the mid
   forward up to 160, the long forward up to 400, the extra-long forward up to

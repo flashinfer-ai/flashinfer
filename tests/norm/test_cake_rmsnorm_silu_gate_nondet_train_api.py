@@ -1738,7 +1738,9 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     tiny, short, pipelined, mid, long and extra-long forwards, each where the
     architecture's bands name it).  ``y`` repeats bit for bit and lies
     within the error budget of the deterministic package's ``y`` and within
-    one BF16 ulp of FP64."""
+    one BF16 ulp of FP64; where a pipelined forward (a deterministic forward
+    program with a gate that does not flush) runs, ``y`` is the deterministic
+    package's bits (no ``z`` here reaches the deterministic gate's flush)."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
@@ -1771,6 +1773,8 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     assert name == want, (arch, rows, sms)
     y64 = suite.fp64_reference(dy, x, z, w, EPS)[0]
     y_det = det_forward(x, z, w, EPS)
+    if loader.MODULES[name]["role"] in ("fwd_pipe", "fwd_pipe_packed"):
+        assert_same_bits("y of the pipelined forward", y, y_det)
     assert_error_within_det("y", y, y_det, y64)
     assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
