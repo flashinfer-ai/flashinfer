@@ -248,7 +248,7 @@ CUDA graph replay. The NVFP4/BF16 case also checks fast SiTU. Separate
 tests compare exact quantizer bytes at zero, tiny values and midpoint ties,
 and check masked reducer slots filled with NaNs. The sparse oracle checks
 routing, gate/up order and scale layouts; it does not measure dense MMA
-accumulation error. SM100 hardware remains untested.
+accumulation error.
 All seven distributed tests passed on every EP8 and EP16 rank, including
 alternating eager calls and graph replays with the current standard provider
 and separate caller buffers. The EP16 preflight also verified 16 distinct
