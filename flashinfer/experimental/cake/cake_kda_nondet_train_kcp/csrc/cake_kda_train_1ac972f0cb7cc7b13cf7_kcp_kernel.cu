@@ -859,7 +859,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
                 int par = c % 2;
-                long long gn_base = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128;
+                long long gn_base = ((long long)(row0 + c * 64 + 64 - 1) * (long long)num_heads + (long long)head) * 128ll;
                 float my_decay = approx_exp2(gk[gn_base + (long long)lane_v]);
                 {
                     uint32_t _addr_64 = static_cast<uint32_t>(dec_addr + (unsigned int)(par * 512 + lane_v * 4));
@@ -1111,7 +1111,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(xs_ready_addr);
-                long long u_base = ((long long)(row0 + c * 64) * (long long)num_heads + (long long)head) * 128 + (long long)lane_v;
+                long long u_base = ((long long)(row0 + c * 64) * (long long)num_heads + (long long)head) * 128ll + (long long)lane_v;
                 int u_stride = num_heads * 128;
                 float uv[64];
                 uv[0] = 0.0f;
@@ -1725,7 +1725,7 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
             asm volatile("tcgen05.fence::after_thread_sync;");
             int slot = out_index[seg];
             if (slot >= 0) {
-                long long tile = (long long)((head / out_hg * out_n + slot) * out_hg + head % out_hg) * (long long)tile_stride * 16384;
+                long long tile = (long long)((head / out_hg * out_n + slot) * out_hg + head % out_hg) * (long long)tile_stride * 16384ll;
                 float tmem_load_0[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -1756,31 +1756,31 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[4 + 0], tmem_load_0[4 + 1], tmem_load_0[4 + 2], tmem_load_0[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[8 + 0], tmem_load_0[8 + 1], tmem_load_0[8 + 2], tmem_load_0[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[12 + 0], tmem_load_0[12 + 1], tmem_load_0[12 + 2], tmem_load_0[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 12ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[16 + 0], tmem_load_0[16 + 1], tmem_load_0[16 + 2], tmem_load_0[16 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 16) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 16ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[20 + 0], tmem_load_0[20 + 1], tmem_load_0[20 + 2], tmem_load_0[20 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 20) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 20ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[24 + 0], tmem_load_0[24 + 1], tmem_load_0[24 + 2], tmem_load_0[24 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 24) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 24ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_0[28 + 0], tmem_load_0[28 + 1], tmem_load_0[28 + 2], tmem_load_0[28 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_0 + 28) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_0 + 28ll) = _v4;
                     }
                 }
                 float tmem_load_1[32];
@@ -1813,31 +1813,31 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[4 + 0], tmem_load_1[4 + 1], tmem_load_1[4 + 2], tmem_load_1[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[8 + 0], tmem_load_1[8 + 1], tmem_load_1[8 + 2], tmem_load_1[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[12 + 0], tmem_load_1[12 + 1], tmem_load_1[12 + 2], tmem_load_1[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 12ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[16 + 0], tmem_load_1[16 + 1], tmem_load_1[16 + 2], tmem_load_1[16 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 16) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 16ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[20 + 0], tmem_load_1[20 + 1], tmem_load_1[20 + 2], tmem_load_1[20 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 20) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 20ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[24 + 0], tmem_load_1[24 + 1], tmem_load_1[24 + 2], tmem_load_1[24 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 24) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 24ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_1[28 + 0], tmem_load_1[28 + 1], tmem_load_1[28 + 2], tmem_load_1[28 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_1 + 28) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_1 + 28ll) = _v4;
                     }
                 }
                 float tmem_load_2[32];
@@ -1870,31 +1870,31 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[4 + 0], tmem_load_2[4 + 1], tmem_load_2[4 + 2], tmem_load_2[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[8 + 0], tmem_load_2[8 + 1], tmem_load_2[8 + 2], tmem_load_2[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[12 + 0], tmem_load_2[12 + 1], tmem_load_2[12 + 2], tmem_load_2[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 12ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[16 + 0], tmem_load_2[16 + 1], tmem_load_2[16 + 2], tmem_load_2[16 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 16) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 16ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[20 + 0], tmem_load_2[20 + 1], tmem_load_2[20 + 2], tmem_load_2[20 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 20) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 20ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[24 + 0], tmem_load_2[24 + 1], tmem_load_2[24 + 2], tmem_load_2[24 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 24) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 24ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_2[28 + 0], tmem_load_2[28 + 1], tmem_load_2[28 + 2], tmem_load_2[28 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_2 + 28) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_2 + 28ll) = _v4;
                     }
                 }
                 float tmem_load_3[32];
@@ -1927,31 +1927,31 @@ kernel_cake_kda_train_1ac972f0cb7cc7b13cf7_kcp(const __grid_constant__ CUtensorM
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[4 + 0], tmem_load_3[4 + 1], tmem_load_3[4 + 2], tmem_load_3[4 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 4) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 4ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[8 + 0], tmem_load_3[8 + 1], tmem_load_3[8 + 2], tmem_load_3[8 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 8) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 8ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[12 + 0], tmem_load_3[12 + 1], tmem_load_3[12 + 2], tmem_load_3[12 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 12) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 12ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[16 + 0], tmem_load_3[16 + 1], tmem_load_3[16 + 2], tmem_load_3[16 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 16) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 16ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[20 + 0], tmem_load_3[20 + 1], tmem_load_3[20 + 2], tmem_load_3[20 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 20) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 20ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[24 + 0], tmem_load_3[24 + 1], tmem_load_3[24 + 2], tmem_load_3[24 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 24) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 24ll) = _v4;
                     }
                     {
                         float4 _v4 = make_float4(tmem_load_3[28 + 0], tmem_load_3[28 + 1], tmem_load_3[28 + 2], tmem_load_3[28 + 3]);
-                        *reinterpret_cast<float4*>(out + row_at_3 + 28) = _v4;
+                        *reinterpret_cast<float4*>(out + row_at_3 + 28ll) = _v4;
                     }
                 }
             }
