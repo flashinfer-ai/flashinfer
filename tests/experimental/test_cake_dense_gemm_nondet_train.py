@@ -532,10 +532,13 @@ def no_k1_chains(monkeypatch):
     (:func:`k1_chain_plan`), so a test of those tables holds them without it (``test_k1_chain_ranges`` holds the
     chain ranges).  The one-split ranges of :data:`K1_ONE_SPLIT_RANGES_BY_SM`, which come next, go too
     (``test_k1_152_sm_one_split_ranges`` holds them), and so do the cluster ranges of :data:`K1_DSM_RANGES_BY_SM`,
-    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_dsm_ranges`` holds them)."""
+    which :func:`plan_atomic_gemm` reads before all of them (``test_k1_dsm_ranges`` holds them), and the fixed-order
+    ranges of :data:`K1_ORDERED_RANGES_BY_SM`, which it reads next (``test_k1_ordered_ranges_plan_their_program``
+    holds them)."""
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_ORDERED_RANGES_BY_SM", {})
 
 
 @pytest.mark.parametrize(
@@ -6495,7 +6498,9 @@ def test_k1_chain_ranges_bind_per_token_count(monkeypatch, sm_count):
     row of ``K1_CHAIN_RANGES`` binds the one-split program of three chains at the first and the last token count of a
     range and at 4097 tokens inside it (inside the row's 212-SM two-split range too), and the routing of the other
     tables at the measured token counts where the program failed (the deterministic program, or a program of one chain:
-    the one-split program of ``5120 -> 1024`` at 32768 tokens on 216 SMs), each token count its own cache entry."""
+    the one-split program of ``5120 -> 1024`` at 32768 tokens on 216 SMs; the fixed-order program of
+    :data:`K1_ORDERED_RANGES_BY_SM` where one of its ranges holds the token count: two chains of ``4096 -> 1024`` at
+    16384 tokens on 212 SMs), each token count its own cache entry."""
     arch = "sm_107a"
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     facts = det_backend.DeviceFacts(
@@ -6515,6 +6520,12 @@ def test_k1_chain_ranges_bind_per_token_count(monkeypatch, sm_count):
                     cases.append((T, (block_n, 1, chains)))
         misses = K1_CHAIN_MISSES[sm_count].get((d_in, d_out), ())
         for T in misses:
+            ordered = cake_backend.k1_ordered_plan(
+                arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=True, sm_count=sm_count
+            )
+            if ordered is not None:
+                cases.append((T, tuple(ordered[:3])))
+                continue
             with monkeypatch.context() as m:
                 m.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
                 other = cake_backend.k1_plan(
@@ -13338,7 +13349,8 @@ K1_ROUTE_PARTS = (
 def test_k1_no_order_varying_plan_on_bench_rows():
     """On every part of :data:`K1_ROUTE_PARTS`, no weight-gradient row of the bench's ``small-output`` class (BF16
     and FP32 out, its token counts) plans the CTA-pair program at three or more splits (partials added in the order
-    they finish): the planner gives the cluster program, one or two splits, or the deterministic program.  The router
+    they finish): the planner gives the stream-K program, the cluster program, a fixed split order, one or two splits,
+    or the deterministic program.  The router
     weight gradient of the bench's ``router`` class plans no stream-K partition with more than two partials per
     element: its row runs the SIMT program, the deterministic program (at the split count of its ``"det_s<n>"``
     window or the deterministic package's), or a partition of at most two partials."""
