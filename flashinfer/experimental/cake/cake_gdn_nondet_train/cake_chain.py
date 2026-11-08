@@ -4295,13 +4295,14 @@ def _plan_globals() -> tuple:
 class _BackwardPlan:
     """One recorded backward (:class:`_Recorder`): its steps, the number of its slots, the stream it runs on (the
     caller's, ``main``, and its side stream), the layout's ``ChunkMeta``, whether the caller gives its gradient views
-    (``packed``), the module globals and pool tables it was recorded with, the slots of the six gradients.  ``ops``
-    is ``None`` for a key whose backward cannot be planned: its calls run the general path without recording."""
+    (``packed``), the module globals and pool tables it was recorded with, the slots of the six gradients and the
+    layout of the saved tensors and ``do`` it read (:func:`_slot_layout`).  ``ops`` is ``None`` for a key whose
+    backward cannot be planned: its calls run the general path without recording."""
 
     __slots__ = ("ops", "size", "stream", "main", "side", "meta", "packed", "names", "tables", "zeroed", "grads",
-                 "fork_event", "join_event")  # fmt: skip
+                 "layout", "fork_event", "join_event")  # fmt: skip
 
-    def __init__(self, ops, size, stream, main, side, meta, packed, names, tables, zeroed, grads):  # fmt: skip
+    def __init__(self, ops, size, stream, main, side, meta, packed, names, tables, zeroed, grads, layout):  # fmt: skip
         self.ops = ops
         self.size = size
         self.stream = stream
@@ -4313,22 +4314,37 @@ class _BackwardPlan:
         self.tables = tables
         self.zeroed = zeroed
         self.grads = grads
+        self.layout = layout
         # the fork and the join of a plan with a side stream (recorded right before each wait)
         self.fork_event = torch.cuda.Event() if main is not None else None
         self.join_event = torch.cuda.Event() if main is not None else None
 
-    def ready(self, do, grad_qkv) -> bool:
-        """Whether this call may replay the plan: the same stream, a contiguous ``do``, the caller's gradient views
-        when the plan takes them, the pool's tables of the stream and the module globals of the recording."""
+    def ready(self, saved, do, grad_qkv) -> bool:
+        """Whether this call may replay the plan: the same stream, the caller's gradient views when the plan takes
+        them, the pool's tables of the stream, the module globals of the recording, and saved tensors and a ``do`` of
+        the recorded layout.  A saved-tensor hook may give the backward tensors of another layout than the forward's
+        key names (``torch.autograd.graph.save_on_cpu`` unpacks a strided v contiguous), and a plan's launches hold
+        the recorded strides as constants."""
         stream = _stream_key(self.stream[0])
         return (
             stream == self.stream
-            and do.is_contiguous()
             and (grad_qkv is not None) == self.packed
             and _POOLED.tables.get(stream) is self.tables
             and _POOLED.zeroed.get(stream) is self.zeroed
             and _plan_globals() == self.names
+            and _slot_layout((*saved, do)) == self.layout
         )
+
+
+def _slot_layout(slots) -> tuple:
+    """The shape, strides, dtype and 16-byte base alignment of every tensor of ``slots`` (``None`` for another
+    entry): what a recorded plan's launches assume of the saved tensors and ``do`` beyond their addresses."""
+    return tuple(
+        (t.shape, t.stride(), t.dtype, t.data_ptr() % 16)
+        if isinstance(t, torch.Tensor)
+        else None
+        for t in slots
+    )
 
 
 class _Recorder(_DirectExecutor):
@@ -4338,6 +4354,7 @@ class _Recorder(_DirectExecutor):
     anything else, or a :meth:`refuse`, leaves the call without a plan."""
 
     __slots__ = (
+        "layout",
         "slots",
         "slot_of",
         "ops",
@@ -4350,6 +4367,7 @@ class _Recorder(_DirectExecutor):
     )
 
     def __init__(self, slots, index: int, meta: ChunkMeta):
+        self.layout = _slot_layout(slots)
         self.slots = list(slots)
         self.slot_of = {id(t): i for i, t in enumerate(self.slots) if t is not None}
         self.ops: list = []
@@ -4496,7 +4514,7 @@ class _Recorder(_DirectExecutor):
             return None
         main, side = self.streams or (None, None)
         return _BackwardPlan(tuple(self.ops), len(self.slots), self.stream, main, side, self.meta, packed,
-                             _plan_globals(), self._tables(), self._zeroed(), self.grads_of)  # fmt: skip
+                             _plan_globals(), self._tables(), self._zeroed(), self.grads_of, self.layout)  # fmt: skip
 
 
 def _replay(plan: _BackwardPlan, saved, do, grad_qkv):
@@ -5533,7 +5551,10 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
         saved, table = saved[:-1], saved[-1]
         ctx.meta = _device_meta(table, layout)[0]
     plan = ctx.plan
-    if plan is not None and dht is None and plan.ready(do, grad_qkv):
+    if plan is not None and dht is None:
+        # the do the general path reads (contiguous at a 16-byte aligned base) and the plan recorded
+        do = _aligned_rows(do)
+    if plan is not None and dht is None and plan.ready(saved, do, grad_qkv):
         dq, dk, dv, dg, dbeta, dh0 = _replay(plan, saved, do, grad_qkv)
     else:
         dq, dk, dv, dg, dbeta, dh0 = _general_backward(ctx, saved, do, dht, grad_qkv)
@@ -5586,7 +5607,7 @@ def _general_backward(ctx, saved, do, dht, grad_qkv):
     if recorder is not None:
         plan = recorder.plan(grad_qkv is not None)
         if plan is None:  # the key's calls keep the general path
-            plan = _BackwardPlan(None, 0, recorder.stream, None, None, ctx.meta, False, (), None, None, ())  # fmt: skip
+            plan = _BackwardPlan(None, 0, recorder.stream, None, None, ctx.meta, False, (), None, None, (), None)  # fmt: skip
         _BWD_PLANS.pop(key, None)
         if len(_BWD_PLANS) >= _BWD_PLANS_LIMIT:
             del _BWD_PLANS[next(iter(_BWD_PLANS))]

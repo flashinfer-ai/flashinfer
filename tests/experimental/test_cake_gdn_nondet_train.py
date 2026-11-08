@@ -5172,6 +5172,93 @@ def test_a_backward_plan_replays_only_for_its_heads(device, monkeypatch) -> None
         )
 
 
+def _saved_layouts(monkeypatch) -> list:
+    """The layout (:func:`cake_chain._slot_layout`) of the saved tensors and ``do`` of every backward, in order."""
+    layouts = []
+    backward = cake_chain._function_backward
+
+    def recording(ctx, do, *args):
+        layouts.append(cake_chain._slot_layout((*ctx.saved_tensors, do)))
+        return backward(ctx, do, *args)
+
+    monkeypatch.setattr(cake_chain, "_function_backward", recording)
+    return layouts
+
+
+def test_a_backward_plan_replays_only_for_its_saved_layout(device, monkeypatch) -> None:
+    # under torch.autograd.graph.save_on_cpu the backward reads the saved tensors as the hook unpacks them: the
+    # packed row's strided v comes back contiguous while the forward's key names the strided view.  Calls with and
+    # without the hook alternate, in either order: each replays only a plan of its own saved layout and gives the
+    # general path's bits
+    seq_lens, heads = BWD_PLAN_CASES["packed-g3"][:2]
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7111)
+
+    def run(offload):
+        hook = (
+            torch.autograd.graph.save_on_cpu() if offload else contextlib.nullcontext()
+        )
+        with hook:
+            return _run_packed(inputs, seq_lens, heads)
+
+    layouts = _saved_layouts(monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        general = {offload: run(offload) for offload in (False, True)}
+    assert layouts[0] != layouts[1], (
+        "the hook gives the backward saved tensors of another layout"
+    )
+    for order in ((False, True), (True, False)):
+        monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+        replays = _counted_replays(monkeypatch)
+        for offload in (*order, order[0]):
+            for _ in range(2):
+                _assert_same_bits(run(offload), general[offload], OUTPUT_NAMES)
+        assert replays, "calls of one layout still replay their plan"
+
+
+def test_a_backward_plan_takes_a_misaligned_do(device, monkeypatch) -> None:
+    # the loss reads o through a concatenation behind one element, so o's gradient is a contiguous slice 2 bytes past
+    # a 16-byte boundary: after two calls with an aligned do (the plan and its replay), the call with that do replays
+    # the plan on the aligned copy the general path reads, with the general path's bits
+    seq_lens, heads = TAIL_LAYOUT, (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7113)
+    cu = _cu(seq_lens)
+
+    def run(misaligned):
+        leaves = {
+            n: inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        o, _ = cake_gdn_nondet(*(leaves[n] for n in ("q", "k", "v", "g", "beta")), scale=1.0 / math.sqrt(HEAD_DIM),
+                               cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                               cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64),
+                               use_qk_l2norm_in_kernel=True)  # fmt: skip
+        do = inputs["do"].to(o.dtype)
+        if misaligned:
+            pad = torch.zeros(1, dtype=o.dtype, device=device)
+            weight = torch.cat([pad, do.flatten()])
+            (torch.cat([pad, o.flatten()]) * weight).float().sum().backward()
+        else:
+            o.backward(do)
+        torch.cuda.synchronize()
+        return {
+            "o": o.detach(),
+            **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+        }
+
+    layouts = _saved_layouts(monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        general = {misaligned: run(misaligned) for misaligned in (False, True)}
+    do_stride, do_offset = layouts[1][-1][1], layouts[1][-1][3]
+    assert do_offset != 0 and do_stride == layouts[0][-1][1], layouts[1][-1]
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    replays = _counted_replays(monkeypatch)
+    for misaligned in (False, False, True, False):
+        _assert_same_bits(run(misaligned), general[misaligned], OUTPUT_NAMES)
+    assert len(replays) == 3 and len(set(map(id, replays))) == 1
+
+
 def test_the_backward_plan_holds_no_tensor_of_a_call(device, monkeypatch) -> None:
     # a plan's tensors are views of the stream's pooled workspaces and of the layout's chunk tables: a replayed call
     # leaves the device memory where it was once its outputs and gradients are dropped

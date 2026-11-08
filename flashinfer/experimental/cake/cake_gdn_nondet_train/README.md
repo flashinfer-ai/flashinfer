@@ -305,15 +305,19 @@ stream.  A value-head group of one uses no workspace.
 
 The autograd backward of a host-table or equal-length call with
 `host_cache=True` and the kept tape is planned before it launches.  Its first
-call for a layout, stream and set of arguments records its launches, the
-gradients it allocates and its stream switches.  Later calls replay that
-record: the saved tensors, `do` and the new gradients fill its slots, and
-every other argument is a pooled workspace of the stream, a chunk table of
-the layout or a scalar.  The record holds no tensor of a call.  A replay
-needs the same stream, a contiguous `do`, no final-state gradient, the
-stream's pool tables and the module tables the record was made with;
-otherwise the call runs the general path and records again.  A replay makes
-the same launches as the general path, so the bits are the same.
+call for a layout, stream and set of arguments (the q / k and value head
+counts among them) records its launches, the gradients it allocates and its
+stream switches.  Later calls replay that record: the saved tensors, `do` and
+the new gradients fill its slots, and every other argument is a pooled
+workspace of the stream, a chunk table of the layout or a scalar.  The record
+holds no tensor of a call.  A replay needs the same stream, saved tensors and
+a `do` of the recorded shapes, strides, dtypes and 16-byte base alignment (a
+saved-tensor hook such as `torch.autograd.graph.save_on_cpu` can change them;
+a strided or unaligned `do` is first copied, as the general path copies it),
+no final-state gradient, the stream's pool tables and the module tables the
+record was made with; otherwise the call runs the general path and records
+again.  A replay makes the same launches as the general path, so the bits
+are the same.
 `cake_chain.BWD_PLAN = False` keeps every call on the general path.
 
 On the host-table route the long sequences start first.  The tables list the
