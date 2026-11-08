@@ -1112,7 +1112,32 @@ def test_combine_and_gather_warp_placements_keep_the_bits():
             assert warps_per_row(Tk, H // (16 // x.element_size()), sms) in (1, 2, 4, 8)
 
 
+def _padded_plan_host(ex: torch.Tensor, E: int, align: int):
+    """The padded permutation plan on the host: ``counts``, ``dest`` (the group offsets the exclusive prefix of the counts
+    rounded up to ``align`` rows, the slots of a group in slot order) and ``src`` over the padded bound with ``-1`` in every
+    padding slot -- the integers the block-scaled classes' padded plan defines."""
+    T, k = ex.shape
+    flat = ex.reshape(-1).cpu().long()
+    n = flat.numel()
+    counts = (
+        torch.bincount(flat, minlength=E) if n else torch.zeros(E, dtype=torch.long)
+    )
+    padded = -(-counts // align) * align
+    off = torch.cumsum(padded, 0) - padded
+    order = torch.argsort(flat, stable=True)
+    sorted_e = flat[order]
+    group_start = torch.cumsum(counts, 0) - counts
+    rank = torch.arange(n) - group_start[sorted_e]
+    dest = torch.empty(n, dtype=torch.long)
+    dest[order] = off[sorted_e] + rank
+    n_pad = -(-(n + (align - 1) * min(E, n)) // align) * align if n else 0
+    src = torch.full((n_pad,), -1, dtype=torch.long)
+    src[dest] = torch.arange(n)
+    return counts.int().cuda(), dest.view(T, k).int().cuda(), src.int().cuda()
+
+
 @needs_device
+@pytest.mark.parametrize("align", [1, 128])
 @pytest.mark.parametrize(
     "T,k,E,method",
     [
@@ -1123,9 +1148,11 @@ def test_combine_and_gather_warp_placements_keep_the_bits():
         (0, 8, 128, "softmax_renorm"),
     ],
 )
-def test_route_plan_equals_route_and_plan(T, k, E, method):
+def test_route_plan_equals_route_and_plan(T, k, E, method, align):
     """``api.route_plan`` (the routing and the permutation plan in one launch for small token counts) gives the route kernel's
-    bits and the plan's integers: experts, weights, counts, dest and src equal those of ``route`` followed by ``permute_plan``."""
+    bits and the plan's integers: experts, weights, counts, dest and src equal those of ``route`` followed by ``permute_plan``
+    (``align`` 1) or by the padded plan of the block-scaled classes (``align`` 128: the group offsets at whole 128-row atoms,
+    ``src`` over the padded bound with -1 in the padding slots, filled inside the launch)."""
     from flashinfer.fused_moe.batch_invariant import api
     from flashinfer.fused_moe.batch_invariant import spec as S
 
@@ -1137,8 +1164,12 @@ def test_route_plan_equals_route_and_plan(T, k, E, method):
     bias = (torch.randn(E, generator=g) * 0.1).float().cuda() if meth.bias else None
     scale = 2.5 if meth.scaled else None
     ex, w = api.route(logits, k, meth, bias, scale)
-    counts, dest, src = api.permute_plan(ex, E)
-    ex2, w2, counts2, dest2, src2 = api.route_plan(logits, k, meth, bias, scale)
+    counts, dest, src = (
+        api.permute_plan(ex, E) if align == 1 else _padded_plan_host(ex, E, align)
+    )
+    ex2, w2, counts2, dest2, src2 = api.route_plan(
+        logits, k, meth, bias, scale, align=align
+    )
     torch.cuda.synchronize()
     assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2))
     assert (
