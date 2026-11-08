@@ -3077,7 +3077,7 @@ def run_cake_dsv4(
     program (``_kv4_bcl_variant``).  Its 64-head launches of few query rows
     (at most 41 to 64 by item width and request length,
     ``_KV4_L2PF_MAX_TOKENS``) over items 512 or 640 wide with compressed pages
-    of 64 rows, of one-token requests or of uniform 2- or 4-token requests, on
+    of 64 rows, of one-token requests or of uniform 4-token requests, on
     a device of 212 or 216 SMs run its L2 prefetch sibling
     (``_kv4_l2pf_variant``).  Warm up launches on both sides of those windows
     eagerly before a capture as well.

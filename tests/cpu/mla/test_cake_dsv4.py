@@ -7421,7 +7421,7 @@ def _l2pf_takes(
 @pytest.mark.cpu_only
 def test_l2pf_window_bounds():
     """The L2 prefetch window: 64 heads, compressed pages of 64 rows (the c4
-    layer), five (item width, request length) entries with their row
+    layer), four (item width, request length) entries with their row
     ceilings, devices of 212 or 216 SMs."""
     assert cake._KV4_L2PF_HEADS == 64
     assert cake._KV4_L2PF_PAGE == 64
@@ -7438,9 +7438,10 @@ def test_four_stage_launches_take_the_l2pf_sibling_in_its_window(
     """Where SM107 routes the L2 prefetch sibling to a program of its own, a
     four-stage launch takes it exactly inside the delivered rule: at the row
     ceiling of each entry and not one row above, never for other widths, head
-    counts, request lengths (3 or 5 tokens) or page sizes (2 rows or unknown),
-    never for a non-uniform or unknown request count past one-token requests,
-    and never on other SM counts.  SM100 and SM103 keep the four-stage key."""
+    counts, request lengths (2, 3 or 5 tokens) or page sizes (2 rows or
+    unknown), never for a non-uniform or unknown request count past one-token
+    requests, and never on other SM counts.  SM100 and SM103 keep the
+    four-stage key."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
@@ -7575,10 +7576,10 @@ def test_fp8_h64_m64_launch_takes_the_l2pf_sibling(
     """On 216 SMs with the L2 prefetch sibling routed to a program of its own,
     SM107 runs the multi-tile M64 launches of the rule (here items 640 wide)
     on it over the four-stage sibling's grid and partials, with either PDL
-    switch; the launches one request above the ceiling, of 3-token requests,
-    non-uniform or over compressed pages of 2 rows run the four-stage
-    sibling; where the process cannot launch that sibling, and on SM100 and
-    SM103, the route's program runs."""
+    switch; the launches one request above the ceiling, of 3-token requests
+    or over compressed pages of 2 rows run the four-stage sibling; where the
+    process cannot launch that sibling, and on SM100 and SM103, the route's
+    program runs."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
@@ -7667,8 +7668,8 @@ def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
     that the host sends to the four-stage sibling launch the L2 prefetch
     sibling inside the rule on 212 and 216 SMs, one CTA per row, bound to the
     compressed-KV pool and its row count; the first rows past each ceiling,
-    the c128 layer (pages of 2 rows), a 208-SM device and a ragged call of
-    2-token requests launch the four-stage sibling."""
+    the c128 layer (pages of 2 rows) and a 208-SM device launch the
+    four-stage sibling."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())

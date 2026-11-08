@@ -28,12 +28,10 @@ The 64-head decode rows of the L2 prefetch rule (few rows over items 512 or
 640 wide with compressed pages of 64 rows, ``_KV4_L2PF_MAX_TOKENS``) run the
 four-stage sibling's L2 prefetch sibling on devices of 212 or 216 SMs (the
 four-stage program elsewhere): those tests check the launched program, the
-output against the same reference, that masked columns contribute nothing,
-that it equals the four-stage program's output bit for bit, that row-tiled
-launches run the four-stage program with the same bits and that eager calls
-and CUDA graph replays are bitwise identical; the first rows past each
-ceiling, ragged calls of 2-token requests, 3-token calls and the c128 layer
-launch the four-stage program.  One-token calls of both one-token rules (the
+output against the same reference, that masked columns contribute nothing
+and that it equals the four-stage program's output bit for bit; the first
+rows past each ceiling, 3-token calls and the c128 layer launch the
+four-stage program.  One-token calls of both one-token rules (the
 L2 prefetch rule and the TMEM-batch sibling's decode window) also run the
 rule's program as ragged calls and as the chunks of row-tiled calls (every
 chunk after the first a ragged launch over all the call's requests), with the
