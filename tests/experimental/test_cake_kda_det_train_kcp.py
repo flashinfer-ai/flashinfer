@@ -5647,8 +5647,8 @@ def test_walk_streams_knob_is_gated_and_validated(monkeypatch) -> None:
 
 def test_bwd_tape_stream_knob_is_gated_and_validated(monkeypatch) -> None:
     """``bwd_tape_stream`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a
-    public keyword, validated against :data:`BWD_TAPE_STREAMS`; the shipped default is ``"pre"`` (the tape replay on
-    the side stream, issued before the adjoint offset walk)."""
+    public keyword, validated against :data:`BWD_TAPE_STREAMS`; the shipped default is ``"post"`` (the tape replay on
+    the side stream, forked after the adjoint offset walk)."""
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.BWD_TAPE_STREAMS == (
         "one",
@@ -5659,9 +5659,9 @@ def test_bwd_tape_stream_knob_is_gated_and_validated(monkeypatch) -> None:
         "mid_hi",
         "post_hi",
     )
-    assert cake_kcp.BWD_TAPE_STREAM_DEFAULT == "pre"
+    assert cake_kcp.BWD_TAPE_STREAM_DEFAULT == "post"
     assert cake_kcp.P2_KNOBS["bwd_tape_stream"] == cake_kcp.BWD_TAPE_STREAMS
-    assert cake_kcp._options({}).bwd_tape_stream == "pre"
+    assert cake_kcp._options({}).bwd_tape_stream == "post"
     with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"bwd_tape_stream": "one"}})
     with pytest.raises(TypeError):
@@ -7943,7 +7943,7 @@ def test_gpu_bwd_tape_stream_graph_replay_is_bitwise(device, monkeypatch) -> Non
         ref, rec = run("one", "off")
         assert rec["bwd_tape_stream"] == "one"
         fallback0 = cake_kcp.GRAPH_STATS["fallback"]
-        for form in ("pre", "pre_hi"):
+        for form in ("pre", "post", "post_hi"):
             events = []
             for i in range(5):
                 res, rec_b = run(form, "replay")
@@ -7954,7 +7954,7 @@ def test_gpu_bwd_tape_stream_graph_replay_is_bitwise(device, monkeypatch) -> Non
             assert events.count("capture") == 1 and events[-1] == "replay", events
             cake_kcp.graph_cache_clear()
         assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
-        res, rec = run("pre", "off")
-        assert same(ref, res) and rec["bwd_tape_stream"] == "pre"
+        res, rec = run("post", "off")
+        assert same(ref, res) and rec["bwd_tape_stream"] == "post"
     finally:
         cake_kcp.graph_cache_clear()

@@ -115,13 +115,14 @@ previous host path (``host_trim=0``) keeps one stream.  The test knob
 ``LAST_CALL[kind]["walk_streams"]`` records ``(decided form, form run,
 n_walk)`` per pair.
 
-Backward tape stream (``BWD_TAPE_STREAM_DEFAULT = "pre"``): the saved-set
+Backward tape stream (``BWD_TAPE_STREAM_DEFAULT = "post"``): the saved-set
 backward's tape replay (``kcp_fwdh_tape``: ``w`` / ``kg`` / ``u`` / ``gk`` and
 the initial states in, the ``h`` / ``v_new`` tapes out) runs on a per-device
-side stream (:class:`_TapeSide`) beside the adjoint offset walk, the merges and
-the b1 / b2 exchange, which read neither tape and write only the call's pools;
-the call's stream waits for it before the adjoint tape walk (its ``dh`` shares
-bytes with ``u`` in both backward layouts).  The first replay of a table set
+side stream (:class:`_TapeSide`), forked after the adjoint offset walk and
+issued after the b1 exchange, beside the exchange and the adjoint merge, which
+read neither tape and write only the call's pools; the call's stream waits for
+it before the adjoint tape walk (its ``dh`` shares bytes with ``u`` in both
+backward layouts).  The first replay of a table set
 on a device, a backward that launches ``kcp_dav``, the ring exchange, the
 ``overlap`` schedule, the previous host path and capped (full-width) tape
 launches keep the call's stream.  Placement never changes a bit; the test
@@ -561,7 +562,7 @@ KCP_DAV_DEFAULT = "auto"
 # the h / v_new tapes or writes an operand of the replay, so the form never changes a bit; _kcp_test_knobs only (the
 # A/B record).
 BWD_TAPE_STREAMS = ("one", "pre", "mid", "post", "pre_hi", "mid_hi", "post_hi")
-BWD_TAPE_STREAM_DEFAULT = "pre"
+BWD_TAPE_STREAM_DEFAULT = "post"  # the A/B record's fastest form (GB200 CP4: ts4 / cust5pad backward)
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
@@ -4696,9 +4697,9 @@ class CakeKDADetKcpOptions:
     remaining launches, bitwise; ``_kcp_test_knobs`` only), ``kcp_dav`` (``"auto"`` shipped: the backward launches
     ``kcp_dav`` only where :func:`cake_kcp_plan.kcp_dav_needed`; ``"always"`` = on every backward of the replay
     layout, the same bits; ``_kcp_test_knobs`` only), ``bwd_tape_stream`` (the saved-set backward's tape replay:
-    ``"pre"`` shipped, on a side stream beside the adjoint offset walk and the b1 / b2 exchange; ``"one"`` = the call's
-    stream; the other :data:`BWD_TAPE_STREAMS` forms move the fork / issue point or add a high-priority stream; the same
-    bits; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
+    ``"post"`` shipped, on a side stream forked after the adjoint offset walk, beside the b1 / b2 exchange; ``"one"`` =
+    the call's stream; the other :data:`BWD_TAPE_STREAMS` forms move the fork / issue point or add a high-priority
+    stream; the same bits; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
     ``_kcp_test_knobs``)."""
 
     save_transfer: bool | None = (
@@ -4730,7 +4731,7 @@ class CakeKDADetKcpOptions:
     intra_rows: str = INTRA_ROWS_DEFAULT  # shipped "ckpt" = a checkpoint recompute keeps its intra rows for its backward; "always" / "never" via _kcp_test_knobs only
     rows_probe: int = 0  # 1 = a backward that binds kept intra rows also launches its intra program and records the bitwise comparison (host sync); _kcp_test_knobs only
     kcp_dav: str = KCP_DAV_DEFAULT  # the backward's kcp_dav: "auto" (shipped) only where cake_kcp_plan.kcp_dav_needed; "always" on every backward of the replay layout (the same bits), via _kcp_test_knobs only
-    bwd_tape_stream: str = BWD_TAPE_STREAM_DEFAULT  # the saved-set backward's tape replay: a side-stream form of BWD_TAPE_STREAMS (shipped "pre") or "one" (the call's stream; the same bits), via _kcp_test_knobs only
+    bwd_tape_stream: str = BWD_TAPE_STREAM_DEFAULT  # the saved-set backward's tape replay: a side-stream form of BWD_TAPE_STREAMS (shipped "post") or "one" (the call's stream; the same bits), via _kcp_test_knobs only
 
     def check(self) -> CakeKDADetKcpOptions:
         if self.exchange not in EXCHANGES:
