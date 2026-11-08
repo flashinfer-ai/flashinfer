@@ -1129,3 +1129,80 @@ def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
     for n in TENSORS:
         assert torch.equal(again[n], got[n]), n
     assert again_log == got_log
+
+
+# --------------------------------------------------------------------------- the forward form of #1_l2n (one GPU)
+# With the in-kernel L2 norm a forward whose akk / g_cum have no reader (not a replay-mode or hand-off forward, no saved
+# set that keeps them) launches the record fwd_prep_l2n_fwd (no akk / g_cum stores; test knob prep_form = 1, the shipped
+# form); prep_form = 0 runs the full fwd_prep_l2n everywhere.  Every form of the output-walk matrix with the norm on:
+# out and every gradient bitwise the full form's, two full runs bitwise equal, and every backward replays the full #1.
+
+PREP_FORMS = tuple(
+    (f"l2n-{fid}", layers, ckpt, later, {**opts, "use_qk_l2norm_in_kernel": True}, knobs)
+    for fid, layers, ckpt, later, opts, knobs in FUSED_FORMS
+)
+
+
+@pytest.mark.parametrize("form", PREP_FORMS, ids=[f[0] for f in PREP_FORMS])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [s[1:] for s in FUSED_SHAPES],
+    ids=[s[0] for s in FUSED_SHAPES],
+)
+def test_prep_forward_form_is_bitwise_the_full_prep(
+    device, monkeypatch, lengths, heads, form
+) -> None:
+    """The forward form of #1_l2n (record ``fwd_prep_l2n_fwd``) against the full ``fwd_prep_l2n`` (test knob
+    ``prep_form`` 1 / 0) on every form of the output-walk matrix with the norm on: every tensor bitwise equal; the
+    first forward of every arm with ``prep_form`` 1 runs the forward form, no backward and no ``prep_form`` 0 call does."""
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    backend = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_backend"
+    )
+    if not kcp.l2n_records_shipped():
+        pytest.skip("the registry ships no in-kernel L2 norm records")
+    if not kcp.prep_form_shipped(backend.device_arch(device.index)):
+        pytest.skip("the registry ships no forward form of fwd_prep_l2n for this architecture")
+    cu = _cu(lengths)
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        entry = kcp.LAST_CALL[kind]
+        preps = tuple(
+            r for r, _g in (entry.get("records") or ()) if str(r).startswith("fwd_prep")
+        )
+        log.append((kind, preps))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def arm(prep_form: int) -> dict:
+        fid, layers, ckpt, later, opts, knobs = form
+        return _fused_arm(
+            device,
+            cu,
+            heads,
+            (fid, layers, ckpt, later, opts, {**knobs, "prep_form": prep_form}),
+            1,
+            log,
+        )
+
+    full = [arm(0) for _ in range(2)]
+    full_log = list(log)
+    fwd = arm(1)
+    fwd_log = list(log)
+    assert [k for k, _p in fwd_log] == [k for k, _p in full_log]
+    assert not any("fwd_prep_l2n_fwd" in p for _k, p in full_log), full_log
+    if fwd_log:  # a graph replay records no call
+        firsts = [p for k, p in fwd_log if k == "fwd"]
+        assert firsts and firsts[0] == ("fwd_prep_l2n_fwd",), fwd_log
+        assert all("fwd_prep_l2n_fwd" not in p for k, p in fwd_log if k == "bwd"), fwd_log
+    assert set(fwd) == set(full[0])
+    for n in fwd:
+        assert torch.equal(_bits(full[0][n]), _bits(full[1][n])), (form[0], n)
+        assert torch.equal(_bits(fwd[n]), _bits(full[0][n])), (form[0], n)
+        assert bool(torch.isfinite(fwd[n].float()).all()), n
+    assert kcp.kept_registry_size() == 0

@@ -149,6 +149,10 @@ IDENTITIES = {
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v1",
         {},
     ),
+    "fwd_prep_l2n_fwd": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v2",
+        {},
+    ),
     "bwd_dqkg_l2n": (
         f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_l2n_v1",
         {},
@@ -168,7 +172,7 @@ GRID_RULES = (
     "chunks_qk_heads_persistent",
     "chunk_head_items",
 )
-SELECT_RULES = ("always", "columns", "ctas_per_head")
+SELECT_RULES = ("always", "columns", "ctas_per_head", "prep_form")
 
 
 def _registry():

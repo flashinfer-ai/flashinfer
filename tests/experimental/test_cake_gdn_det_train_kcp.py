@@ -7010,8 +7010,15 @@ def _defer_run(kcp, part, W, ops, monkeypatch, *, defer: bool, knobs: dict, peak
 
 @pytest.mark.parametrize(
     "knobs",
-    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
-    ids=("light", "full", "l2n", "P2"),
+    [
+        {},
+        {"save_mode": "full"},
+        {"use_qk_l2norm_in_kernel": True},
+        {"use_qk_l2norm_in_kernel": True, "test_knobs": {"prep_form": 0}},
+        {"segments": 2},
+        {"use_qk_l2norm_in_kernel": True, "segments": 2},
+    ],
+    ids=("light", "full", "l2n", "l2n_pf0", "P2", "l2n_P2"),
 )
 @pytest.mark.parametrize("row", tuple(DEFER_ROWS))
 def test_eager_call_sizes_pools_and_tickets_after_the_first_launch(
@@ -7164,8 +7171,15 @@ def _memos_off(kcp, monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     "knobs",
-    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
-    ids=("light", "full", "l2n", "P2"),
+    [
+        {},
+        {"save_mode": "full"},
+        {"use_qk_l2norm_in_kernel": True},
+        {"use_qk_l2norm_in_kernel": True, "test_knobs": {"prep_form": 0}},
+        {"segments": 2},
+        {"use_qk_l2norm_in_kernel": True, "segments": 2},
+    ],
+    ids=("light", "full", "l2n", "l2n_pf0", "P2", "l2n_P2"),
 )
 @pytest.mark.parametrize("row", tuple(DEFER_ROWS))
 def test_launch_memos_hand_every_launch_the_same_arguments(monkeypatch, row, knobs) -> None:
@@ -7241,6 +7255,12 @@ def test_launch_memos_hand_every_launch_the_same_arguments(monkeypatch, row, kno
         assert seen["on1"][r] == seen["off"][r], r
         # the second pass reuses the device tables, so the very same launches repeat
         assert seen["on2"][r] == seen["off"][r], r
+    if knobs.get("use_qk_l2norm_in_kernel") and kcp.prep_form_shipped():
+        # the light save's forward runs the forward form of #1_l2n and its backward's replay the full record: one
+        # pass resolves both forms of the same launch, which the launch key (``_backward_tapes``) keeps apart
+        preps = {rec for per_rank in seen["on1"].values() for _n, rec, _g, _v in per_rank if rec.startswith("fwd_prep")}
+        pf = (knobs.get("test_knobs") or {}).get("prep_form", 1)
+        assert preps == ({"fwd_prep_l2n_fwd", "fwd_prep_l2n"} if pf == 1 else {"fwd_prep_l2n"}), preps
 
 
 def test_keyword_options_are_validated_once_per_keyword_set(monkeypatch) -> None:
