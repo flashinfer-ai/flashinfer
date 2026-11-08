@@ -3506,7 +3506,10 @@ def forward_split_lists(chunks, length: int) -> tuple[list[int], ...]:
     """The host lists of :class:`ForwardSplit` for sequences of ``chunks`` chunks (table order) at piece length
     ``length``: ``seg_chunk_start``, ``seg_seq``, ``seq_seg_start``, ``first_end``, ``first``, ``middle``, ``rest``
     (pieces by :func:`segment_bounds`: balanced to within one chunk, ``ceil(n / length)`` of them)."""
-    seg_chunk_start, seg_seq, seq_seg_start, first_end = [0], [], [0], [0]
+    seg_chunk_start: list[int] = [0]
+    seg_seq: list[int] = []
+    seq_seg_start: list[int] = [0]
+    first_end: list[int] = [0]
     first: list[int] = []
     middle: list[int] = []
     rest: list[int] = []
@@ -3557,7 +3560,9 @@ def forward_split_tables(
     index = index.pin_memory().to(device, non_blocking=True)
     first_index = index[: len(first)]
     first_seq_index = index[len(first) :] if index.numel() > len(first) else None
-    return ForwardSplit(*views, first_index=first_index, first_seq=first_seq_index, num_segments=num_segments,
+    return ForwardSplit(seg_chunk_start=views[0], seg_seq=views[1], seq_seg_start=views[2], first_end=views[3],
+                        first=views[4], middle=views[5], rest=views[6], slot=views[7],
+                        first_index=first_index, first_seq=first_seq_index, num_segments=num_segments,
                         num_first=len(first), num_middle=len(lists[5]), num_rest=len(lists[6]), length=int(length),
                         one_stream=bool(one_stream))  # fmt: skip
 
@@ -4962,7 +4967,7 @@ def _backward_chain(
             # the token-row strides of v, dq, dk and dv, which these tails take after their operands (dq / dk / dv's
             # from the caller when it gives it); the fixed-order cluster tails take v's token pitch in heads
             if form not in F32X_TAILS:
-                strides = (v_rows,)
+                strides: tuple[int, ...] = (v_rows,)
             elif qkv_stride is not None:
                 strides = (_row_stride(v), qkv_stride, qkv_stride, qkv_stride)
             else:
@@ -5306,12 +5311,12 @@ def _host_plans(
             bwd.segment_len > 0
             and max(-(-n // CHUNK) for n in seq_lens) > bwd.segment_len
         ):
-            serial = (
+            serial_config = (
                 bwd.config
                 if tuple(bwd.config) in REG_SCAN_CONFIGS
                 else REG_SCAN_CONFIGS[0]
             )
-            plans, bwd_tc, kept = (plans[0], ScanPlan(serial, 0)), False, False
+            plans, bwd_tc, kept = (plans[0], ScanPlan(serial_config, 0)), False, False
     return plans, bwd_tc, kept
 
 
