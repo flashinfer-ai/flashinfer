@@ -1016,9 +1016,11 @@ def _fold_index(
 
 @functools.cache
 def _side_stream(device_index: int, stream_id: int) -> torch.cuda.Stream:
-    """The high-priority side stream that builds the backward's tile tables and fold order for the caller stream
-    ``stream_id`` of device ``device_index`` (one per caller stream: two caller streams, or two graph captures, never
-    share one; high priority: its one-CTA kernels take the first SMs the main kernels free)."""
+    """The high-priority side stream of the caller stream ``stream_id`` of device ``device_index``: the backward's
+    tile tables (the one-CTA ``bwd_plan``), the host-boundary range check and, while the main kernels run, the
+    row-map fold order.  One cached stream per caller stream, from PyTorch's high-priority stream pool (a pool that
+    cycles, so two caller streams may share one stream past its size: their work then queues on it in order); high
+    priority: the fold order's kernels take the first SMs the main kernels free."""
     return torch.cuda.Stream(device_index, priority=-1)
 
 

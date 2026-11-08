@@ -1243,6 +1243,18 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
     counts = cake_jit.exact_tiles(*device_lens, plan["key_blocks"])
     over = [sum(counts[n0:n1]) - plan["tile_stride"] for n0, n1 in plan["ranges"]]
     assert max(over) > 0, over  # the device numbering overfills a range of that plan
+    one = cake_jit.chunk_plan(
+        total_q=3000,
+        total_k=3000,
+        num_heads_q=h_q,
+        num_heads_kv=h_kv,
+        num_segments=2,
+        max_seqlen_k=None,
+        budget_bytes=cake_jit.DEFAULT_WORKSPACE_BUDGET,
+        seqlens=fewer_tiles,
+    )
+    assert one["ranges"] == [(0, one["key_blocks"])], one["ranges"]
+    assert sum(counts[: one["key_blocks"]]) > one["tile_stride"], one  # overfills the one range
     x = _inputs(*device_lens, h_q, h_kv, device)
     ws = cake_backend.CakeGQANondetWorkspace(device, budget_bytes=1)
     base = _run(x, "bf16", workspace=ws)
@@ -1268,6 +1280,8 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
             None,
         ),
         "tiles past a range": (*dev, _cu(fewer_tiles[0]), _cu(fewer_tiles[1]), 1),
+        # The same host boundaries at the default budget: one range (the int32 one-subtraction check).
+        "tiles past the one range": (*dev, _cu(fewer_tiles[0]), _cu(fewer_tiles[1]), None),
     }
     for label, (cu_q, cu_k, host_q, host_k, budget) in cases.items():
         result = _child_backward(cu_q, cu_k, host_q, host_k, budget)
