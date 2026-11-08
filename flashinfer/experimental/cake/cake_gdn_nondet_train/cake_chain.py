@@ -5481,8 +5481,11 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
         pins = None if options is _DEFAULT_OPTIONS else options
         # CakeGDNNondetPackedFunction's forward sets row_shape
         packed = getattr(ctx, "row_shape", None) is not None
-        key = (id(meta), _stream_key(index), arch, pins, ctx.scale, ctx.normalize_qk, ctx.grad_shapes, ctx.dtypes,
-               fwd["v"].stride(), initial_state is not None, kept, packed, ctx.m_share)  # fmt: skip
+        # the head counts too: one ChunkMeta serves every value-head group whose host tables agree (G = 2 and G = 4 of
+        # a layout at HV = 4), and a plan's launches and gradients are those of the H it was recorded with
+        key = (id(meta), _stream_key(index), arch, pins, num_heads, num_v_heads, ctx.scale, ctx.normalize_qk,
+               ctx.grad_shapes, ctx.dtypes, fwd["v"].stride(), initial_state is not None, kept, packed,
+               ctx.m_share)  # fmt: skip
         plan = _BWD_PLANS.get(key)
         if plan is None or plan.meta is not meta:
             ctx.plan_key = key

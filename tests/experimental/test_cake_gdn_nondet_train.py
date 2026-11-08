@@ -5144,6 +5144,34 @@ def test_the_backward_plan_replays_the_general_path(case, device, monkeypatch) -
         _assert_same_bits(got, general, names)
 
 
+def test_a_backward_plan_replays_only_for_its_heads(device, monkeypatch) -> None:
+    # H = 2 and H = 1 at HV = 4 differ in the q / k heads only (the gate shapes, v's strides and the pins agree), and
+    # on sm_100a this layout's chunk tables are one ChunkMeta for both groups: each call replays only the plan of its
+    # own heads, in either order, with the general path's bits (a plan of the other H returns dq / dk of its shape)
+    seq_lens, pins = TAIL_LAYOUT, {"tail": "tail"}
+    inputs = {
+        heads: _inputs(seq_lens, heads, torch.float32, device, seed=7109)
+        for heads in ((2, 4), (1, 4))
+    }
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        general = {heads: _run(x, seq_lens, **pins) for heads, x in inputs.items()}
+    for order in (((2, 4), (1, 4)), ((1, 4), (2, 4))):
+        monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+        replays = _counted_replays(monkeypatch)
+        for heads in order:
+            # the general path records the plan of the key, the next call replays it
+            for _ in range(2):
+                _assert_same_bits(
+                    _run(inputs[heads], seq_lens, **pins), general[heads], OUTPUT_NAMES
+                )
+        plans = list(cake_chain._BWD_PLANS.values())
+        assert len(plans) == 2 and all(p.ops is not None for p in plans), plans
+        assert len(replays) == 2 and all(
+            a is b for a, b in zip(replays, plans, strict=True)
+        )
+
+
 def test_the_backward_plan_holds_no_tensor_of_a_call(device, monkeypatch) -> None:
     # a plan's tensors are views of the stream's pooled workspaces and of the layout's chunk tables: a replayed call
     # leaves the device memory where it was once its outputs and gradients are dropped
