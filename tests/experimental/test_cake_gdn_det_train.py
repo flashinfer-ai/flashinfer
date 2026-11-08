@@ -3091,26 +3091,37 @@ def test_a_cached_table_is_read_after_its_write_on_another_stream(
     _assert_bitwise(second, want, OUTPUT_NAMES)
 
 
+def _block_states(addresses) -> dict:
+    """The caching allocator's state of the block holding each address (``active_allocated``, ``active_pending_free``
+    while a stream recorded on a freed tensor may still use it, ``inactive`` once free)."""
+    states = {}
+    for segment in torch.cuda.memory_snapshot():
+        for block in segment["blocks"]:
+            for address in addresses:
+                if block["address"] <= address < block["address"] + block["size"]:
+                    states[address] = block["state"]
+    return states
+
+
 def test_an_evicted_table_waits_for_reads_on_another_stream(
     device, monkeypatch
 ) -> None:
-    # A call on stream s2, queued behind a sleep, hits tables built on stream s1.  The caches then drop every table and
-    # s1 allocates blocks of the tables' sizes (zero-filling any table block it gets): the allocator must not hand a
-    # table's memory out until s2's launches have read it, and must hand it out again after them.
+    # A call on stream s2, queued behind a sleep, hits tables built on stream s1; the caches then drop every table.
+    # The caching allocator must keep each table's block until s2's launches have read it (so no later allocation can
+    # overwrite it), and free it after them.
     if torch.cuda.get_allocator_backend() != "native":
-        pytest.skip("checks the reuse of freed blocks by the native caching allocator")
+        pytest.skip("reads the state of the native caching allocator's blocks")
     seq_lens = (300, 77, 640)
     inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=137)
     _fresh_table_caches(monkeypatch)
-    s1, s2 = _overlapping_streams(device)
+    s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    s1.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(s1):
         want = _run(inputs, seq_lens, lpt=False)
     tables = [m.chunk_start for m in cake_chain._HOST_META.values()]
     tables += [w for w, _ready in cake_chain._WALKS.values()]
     assert len(tables) == 2  # the chunk tables and the identity walk
-    blocks = {
-        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in tables
-    }
+    addresses = [t.untyped_storage().data_ptr() for t in tables]
     del tables
     cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
     s2.wait_stream(s1)
@@ -3120,36 +3131,16 @@ def test_an_evicted_table_waits_for_reads_on_another_stream(
     for name in ("_META_FRONT", "_HOST_META", "_WALKS"):
         getattr(cake_chain, name).clear()
     gc.collect()
-    junk = []
-
-    def reuse() -> set:
-        """Allocate on s1 until allocations overlap every table's memory (a freed block can merge with free neighbors;
-        at most 4096 rounds); zero each allocation that overlaps a table."""
-        got_back = set()
-        with torch.cuda.stream(s1):
-            for _ in range(4096):
-                for n in blocks.values():
-                    junk.append(torch.empty(n, dtype=torch.uint8, device=device))
-                    start = junk[-1].data_ptr()
-                    hit = {
-                        p
-                        for p, size in blocks.items()
-                        if start < p + size and p < start + n
-                    }
-                    if hit:
-                        got_back |= hit
-                        junk[-1].zero_()
-                if got_back == blocks.keys():
-                    break
-        return got_back
-
-    early = reuse()
+    dropped = _block_states(addresses)
     torch.cuda.synchronize()
-    assert not early, (
-        "a table's memory was handed out while a call on another stream could still read it"
-    )
+    with torch.cuda.stream(s1):
+        torch.empty(
+            1, device=device
+        )  # an allocation frees the blocks whose recorded uses are done
+    read = _block_states(addresses)
+    assert dropped == dict.fromkeys(addresses, "active_pending_free"), dropped
+    assert read == dict.fromkeys(addresses, "inactive"), read
     _assert_bitwise(got, want, OUTPUT_NAMES)
-    assert reuse() == blocks.keys()  # once s2 has read them the blocks are free again
 
 
 def test_tables_built_inside_a_capture_are_not_cached(device, monkeypatch) -> None:
