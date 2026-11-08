@@ -632,8 +632,6 @@ class ChunkMeta:
     bwd_tc: bool = False
     # the one-wave split of the adjoint walk over bwd_segments (:func:`adjoint_split_pricing`)
     bwd_split: AdjointSplit | None = None
-    # the pre-scans' warm-up threshold of the layout's plan entry (cake_plan.ADJOINT_FORMS; None: the call's options)
-    warmup_log2: float | None = None
 
 
 @dataclass(frozen=True)
@@ -991,14 +989,10 @@ SCAN_STEP_FACTOR = {(32, 2): 1.0, (32, 1): 1.18, (64, 1): 1.27}
 WARMUP_THRESH_LOG2 = -10.0 / math.log(2.0)
 
 
-def warmup_thresh_log2(options: ChainOptions, meta: ChunkMeta | None = None) -> float:
-    """The pre-scans' warm-up threshold of a call: the caller's ``warmup_log2``, else that of the layout's plan entry
-    (``meta.warmup_log2``, :data:`cake_plan.ADJOINT_FORMS`), else ``WARMUP_THRESH_LOG2``."""
-    if options.warmup_log2 is not None:
-        return options.warmup_log2
-    if meta is not None and meta.warmup_log2 is not None:
-        return meta.warmup_log2
-    return WARMUP_THRESH_LOG2
+def warmup_thresh_log2(options: ChainOptions) -> float:
+    return (
+        options.warmup_log2 if options.warmup_log2 is not None else WARMUP_THRESH_LOG2
+    )
 
 
 @dataclass(frozen=True)
@@ -2738,7 +2732,7 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
         )
         _launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new, final_state,
                 seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
-                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options, meta))  # fmt: skip
+                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options))  # fmt: skip
         _launch(split_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                 final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_init, 1 if store_final_state else 0,
@@ -2866,7 +2860,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         run(_prepared(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                       final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_init, 0, seg_flag,
-                      warmup_thresh_log2(options, meta)))  # fmt: skip
+                      warmup_thresh_log2(options)))  # fmt: skip
         run(_prepared("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start,
                       segs.seq_seg_start, seg_flag, num_v_heads, use_init, 0))  # fmt: skip
         use_seg = 1
@@ -3623,12 +3617,12 @@ def _backward_chain(
             ex.launch(sdt_prescan(arch), segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, g_cs,
                       dht32, dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start,
                       segs.seg_seq, meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options, meta))  # fmt: skip
+                      warmup_thresh_log2(options))  # fmt: skip
         else:
             ex.launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32,
                       dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options, meta))  # fmt: skip
+                      warmup_thresh_log2(options))  # fmt: skip
         dh_end = workspaces.take(table, "b_dh_end", (segs.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM),
                                  torch.float32, device)  # fmt: skip
         ex.launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
@@ -4074,9 +4068,6 @@ def _chunk_meta(
     split_len = _adjoint_split_length(
         seq_lens, int(num_v_heads), int(index), options, group
     )
-    if _adjoint_form(int(index), int(num_v_heads), group, options) == "nocut":
-        # the plan entry's planner tables run every pre-scan without the warm-up cut (forward and backward)
-        meta = replace(meta, warmup_log2=cake_plan.NOCUT_WARMUP_LOG2)
     if split_len is not None and int(plans[1].segment_len) == split_len:
         # wave 1 on one stream where the pricing says so or where the caller keeps every launch on its stream
         one_stream = options.streams == 1 or bool(

@@ -4433,55 +4433,61 @@ def test_adjoint_split_one_stream_gives_the_two_stream_bits(
     _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
 
 
-def test_adjoint_forms_fix_the_planner_tables_without_the_cut(monkeypatch) -> None:
-    # cake_plan.ADJOINT_FORMS: GB200 (sm_100a, 152 SMs) at H 1 / HV 3 keeps the planner's tables (no one-wave split,
-    # as on an architecture outside ADJOINT_SPLIT_ARCHS) and runs its pre-scans without the warm-up cut; HV 6, other SM
-    # counts, a call without its group and a pinned call keep the pricing
-    assert cake_plan.adjoint_form("sm_100a", 152, 1, 3) == "nocut"
+def test_adjoint_forms_keep_gb200_short_pairs_off_the_split(monkeypatch) -> None:
+    # cake_plan.ADJOINT_FORMS, frozen: GB200 (sm_100a, 152 SMs) at H 1 / HV 3 and H 2 / HV 6 keeps the planner's tables
+    # (no one-wave split, as on an architecture outside ADJOINT_SPLIT_ARCHS; the warm-up cut kept) although the
+    # pricing takes the split there (on one stream); H 4 / HV 12, other SM counts and architectures, a call without its
+    # group and a pinned call keep the pricing
+    assert dict(cake_plan.ADJOINT_FORMS) == {
+        ("sm_100a", 152, 1, 3): "nosplit",
+        ("sm_100a", 152, 2, 6): "nosplit",
+    }
     for key in (
         ("sm_100a", 148, 1, 3),
-        ("sm_100a", 152, 2, 6),
+        ("sm_100a", 152, 4, 12),
+        ("sm_100a", 152, 8, 24),
         ("sm_103a", 152, 1, 3),
+        ("sm_103a", 152, 2, 6),
         ("sm_100a", 152, 1, 6),
     ):
         assert cake_plan.adjoint_form(*key) is None, key
+    chunks = tuple(-(-n // 64) for n in (11000, 12000, 9768))
+    for num_v_heads in (3, 6):
+        rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 152, "sm_100a")
+        assert rec["segment_len"] > 0 and rec["one_stream"] is True, (num_v_heads, rec)
     monkeypatch.setattr(cake_chain, "_device_props", lambda _index: (152, 232448, 10))
     monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_100a")
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     options = cake_chain.make_options()
     seq_lens = (11000, 12000, 9768)
-    got = cake_chain._host_plans(seq_lens, 3, 0, options, group=3)
-    with monkeypatch.context() as m:
-        m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
-        want = cake_chain._host_plans(seq_lens, 3, 0, options, group=3)
-    assert got == want
+    for num_v_heads, group in ((3, 3), (6, 3)):
+        got = cake_chain._host_plans(seq_lens, num_v_heads, 0, options, group=group)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
+            want = cake_chain._host_plans(
+                seq_lens, num_v_heads, 0, options, group=group
+            )
+        assert got == want, num_v_heads
+        assert cake_chain._adjoint_form(0, num_v_heads, group, options) == "nosplit"
+        assert (
+            cake_chain._adjoint_split_length(seq_lens, num_v_heads, 0, options, group)
+            is None
+        )
     if all(cake_chain._available(stage, "sm_100a") for stage in _SPLIT_STAGES):
         assert cake_chain._adjoint_split_length(seq_lens, 3, 0, options) is not None
-        assert cake_chain._adjoint_split_length(seq_lens, 6, 0, options, 2) is not None
-    assert cake_chain._adjoint_split_length(seq_lens, 3, 0, options, 3) is None
-    assert cake_chain._adjoint_form(0, 3, 3, options) == "nocut"
+        assert cake_chain._adjoint_split_length(seq_lens, 12, 0, options, 3) is not None
+    assert cake_chain._adjoint_form(0, 12, 3, options) is None
     assert cake_chain._adjoint_form(0, 3, None, options) is None
     assert (
         cake_chain._adjoint_form(0, 3, 3, cake_chain.make_options(segment_chunks=64))
         is None
     )
     assert cake_chain._adjoint_form(0, 6, 2, options) is None
-    # the threshold: the caller's warmup_log2 first, then the plan entry's, then the module's
-    meta = types.SimpleNamespace(warmup_log2=cake_plan.NOCUT_WARMUP_LOG2)
-    assert cake_chain.warmup_thresh_log2(options, meta) == cake_plan.NOCUT_WARMUP_LOG2
-    assert cake_chain.warmup_thresh_log2(options) == cake_chain.WARMUP_THRESH_LOG2
-    assert (
-        cake_chain.warmup_thresh_log2(cake_chain.make_options(warmup_log2=-3.0), meta)
-        == -3.0
-    )
 
 
-def test_adjoint_form_gives_the_bits_of_no_split_without_the_cut(
-    device, monkeypatch
-) -> None:
-    # a call that the plan table's "nocut" form serves makes the launches (stages, grids, arguments) and the bits of
-    # the planner without the split (ADJOINT_SPLIT_ARCHS empty) and with warmup_log2 = NOCUT_WARMUP_LOG2, forward and
-    # backward: wave 1's summaries never run and no launch reads the module's threshold
+def test_adjoint_form_gives_the_bits_of_no_split(device, monkeypatch) -> None:
+    # a call that the plan table's "nosplit" form serves makes the launches (stages, grids, arguments) and the bits of
+    # the planner without the split (ADJOINT_SPLIT_ARCHS empty), forward and backward: wave 1's summaries never run
     seq_lens, heads = (700, 1500, 230), (1, 3)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7013)
     arch = cake_backend.device_arch(cake_chain._device_index(device))
@@ -4493,19 +4499,14 @@ def test_adjoint_form_gives_the_bits_of_no_split_without_the_cut(
                 m.setattr(
                     cake_plan,
                     "ADJOINT_FORMS",
-                    types.MappingProxyType({(arch, SPLIT_SMS, 1, 3): "nocut"}),
+                    types.MappingProxyType({(arch, SPLIT_SMS, 1, 3): "nosplit"}),
                 )
-                pins = {}
             else:
                 m.setattr(cake_chain, "ADJOINT_SPLIT_ARCHS", frozenset())
-                pins = {"warmup_log2": cake_plan.NOCUT_WARMUP_LOG2}
             logs[form] = _logged_launches(m)
-            runs[form] = _run(inputs, seq_lens, **pins)
+            runs[form] = _run(inputs, seq_lens)
             stages = [entry[0] for entry in logs[form]]
             assert "dhu_tc2_dvl32_gm" not in stages, stages
-            assert not any(
-                cake_chain.WARMUP_THRESH_LOG2 in entry[3] for entry in logs[form]
-            ), stages
     assert logs[True] == logs[False]
     _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
     # without the form the pricing splits this layout (wave 1's summaries run)
