@@ -2412,6 +2412,101 @@ class _RecordingLauncher:
         return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
+# The source-exact routes on a padded ragged call: (route, heads, dtype,
+# request lengths, sparse width, compressed page size).
+_SOURCE_EXACT_PADDED = [
+    ("bf16_h8_h16_source_exact", 16, torch.bfloat16, [5, 3, 4], 260, 2),
+    ("fp8_h8_h16_source_exact", 8, torch.float8_e4m3fn, [5, 3, 4], 192, 64),
+    ("fp8_h64_source_exact", 64, torch.float8_e4m3fn, [257, 100], 640, 64),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,sparse_topk,page", _SOURCE_EXACT_PADDED
+)
+def test_source_exact_programs_bind_the_metadata_rows(
+    monkeypatch, arch, route, num_heads, dtype, q_lens, sparse_topk, page
+):
+    """The source-exact programs launch one CTA per request position: the grid
+    is ``max_q_len`` x ``batch_size`` whatever the metadata rows ``T``.  A
+    padded ragged call (``cum_seq_lens_q`` describing more rows than ``T``)
+    through run_cake_dsv4, bound by the route's registered plan, passes
+    ``num_query_tokens = T``, the first ``T`` rows of the query and of
+    ``out`` and the caller's ``cum_seq_lens_q``: the program runs every
+    position at or past ``T`` as padding."""
+    plan = get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    names = [name for _, name in plan]
+    recorder = _install_fake_variants(monkeypatch, {route: plan})
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    query_rows, batch_size, max_q_len = sum(q_lens), len(q_lens), max(q_lens)
+    cum = torch.tensor([0, *q_lens], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    grid_y = 1 if route == "fp8_h64_source_exact" else num_heads // 8 * 4
+    for rows in (1, query_rows - 1):
+        table, lens = _combined_metadata(rows, sparse_topk - 128)
+        out = (
+            _aligned_u8(query_rows * num_heads * 512 * 2)
+            .view(torch.bfloat16)
+            .view(query_rows, num_heads, 512)
+        )
+        recorder.calls.clear()
+        cake.run_cake_dsv4(
+            query=torch.zeros((query_rows, num_heads, 512), dtype=dtype),
+            swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=dtype),
+            compressed_kv_cache=torch.zeros((8, 1, page, 512), dtype=dtype),
+            workspace_buffer=_aligned_u8(
+                get_cake_dsv4_workspace_bytes(
+                    rows, num_heads, sparse_topk, dtype, num_splits=1
+                )
+            ),
+            out=out,
+            bmm1_scale=0.5,
+            bmm2_scale=1.0,
+            sinks=None,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum,
+            seq_lens=torch.full((batch_size,), 1000, dtype=torch.int32),
+            backend="cake",
+            sparse_indices=table,
+            sparse_topk_lens=lens,
+        )
+        (call,) = recorder.calls
+        bound = dict(zip(names, call, strict=True))
+        assert bound["num_query_tokens"] == rows
+        assert bound["tmap_q"].shape[0] == rows
+        assert bound["O"].shape[0] == rows
+        assert bound["O"].data_ptr() == out.data_ptr()
+        assert bound["cum_seq_lens_q"].data_ptr() == cum.data_ptr()
+        assert (bound["max_q_len"], bound["batch_size"]) == (max_q_len, batch_size)
+        grid = (bound["grid_x"], bound["grid_y"], bound["grid_z"])
+        assert grid == (max_q_len, grid_y, batch_size)
+        if route == "fp8_h64_source_exact":
+            assert bound["total_work_items"] == max_q_len * batch_size
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("route", [route for route, *_ in _SOURCE_EXACT_PADDED])
+def test_source_exact_bindings_take_their_arg_plans(arch, route):
+    """The binding ``Run`` of each source-exact program takes the route's
+    registered plan, name for name and in order (``a_<name>`` for a kernel
+    argument, then ``grid_x``, ``grid_y``, ``grid_z``).  The host binds the
+    plan by name and calls ``Run`` positionally, so a plan naming
+    ``num_query_tokens`` that its program's binding does not take, or the
+    reverse, shifts every later argument."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import _get_csrc_dir
+
+    spec = get_cake_dsv4_spec(route, arch=arch)
+    (binding,) = [name for name in spec["sources"] if name.endswith("_binding.cu")]
+    text = (_get_csrc_dir() / binding).read_text(encoding="utf-8")
+    (params,) = re.findall(r"^void Run\(([^)]*)\)", text, re.MULTILINE)
+    taken = [param.split()[-1].removeprefix("a_") for param in params.split(",")]
+    assert taken == [name for _, name in spec["arg_plan"]], binding
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(

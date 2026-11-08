@@ -1667,7 +1667,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
-    # Their sm103a one-stage builds of packs 1, 2, 4 and 8
+    # Their one-stage builds of packs 1, 2, 4 and 8, for both targets
     # (_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES).
     ("context_fp8", "RUNTIME_PACK1_NC_PX_Q1"): (
         "cake_fmha_context_fp8_8e82b164f633739b5629",
@@ -2287,15 +2287,21 @@ _CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
 # where every tile holds at most one stage of query tokens (``max_q_len <=
 # 128 / pack_g``: the two-stage tile's second stage holds no row, so the
 # tile's rows, key blocks and arithmetic are the same) and it has more keys
-# than the form program's short-KV entry.
+# than the form program's short-KV entry (sm103a: 128; sm100a has none).
+# Both targets run the build with the 4-stage K/V ring and each stage's P
+# tile in the other stage's S columns (timed B200: 4 .. 32 requests of 1 ..
+# 64 query tokens over 64 .. 2048 keys, heads 32/4, 32/8, 16/8 and 32/32, ran
+# 5 .. 35 % faster than the two-stage form program with P in its own S
+# columns).
 _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
     str, dict[tuple[str, int, int | None], str]
 ] = {
-    "sm103a": {
+    target: {
         (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
         for form in _CONTEXT_FP8_FORMS.values()
         for pack in (1, *_CONTEXT_FP8_RUNTIME_PACKS[::-1])
-    },
+    }
+    for target in ("sm100a", "sm103a")
 }
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack

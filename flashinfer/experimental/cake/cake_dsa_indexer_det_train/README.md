@@ -351,8 +351,8 @@ that writes the registry verifies the record against them before it is frozen.
   where the shape alone bounds the work units by the grid,
   `cake_policy.ticket_static_path`, the scan never touches the ticket word;
   none for a program of the `static_scan_kinds` of its form's record, which
-  keeps the static unit enumeration on every call: on `sm_107a` the BF16 l6
-  and CTA-pair l6 programs and every FP8 program);
+  keeps the static unit enumeration on every call: on `sm_107a` every FP8
+  program);
   the prepared runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No

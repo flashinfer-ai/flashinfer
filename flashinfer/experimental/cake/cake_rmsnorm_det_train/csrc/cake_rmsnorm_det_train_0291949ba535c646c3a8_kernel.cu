@@ -361,7 +361,7 @@ kernel_cake_rmsnorm_det_train_0291949ba535c646c3a8(__nv_bfloat16* __restrict__ g
                 float kx = rq * rq * rq * cq;
                 float nkx = -kx;
                 if (row6a < row_end) {
-                    unsigned long long dx_base = (unsigned long long)row6a * 256;
+                    unsigned long long dx_base = (unsigned long long)row6a * 256ull;
                     float2 rr = make_float2(rq, rq);
                     float2 rrn = make_float2(-rq, -rq);
                     float2 nn = make_float2(nkx, nkx);
@@ -428,7 +428,7 @@ kernel_cake_rmsnorm_det_train_0291949ba535c646c3a8(__nv_bfloat16* __restrict__ g
             }
             asm volatile("cp.async.wait_group 0;");
         }
-        unsigned long long pbase = (unsigned long long)c * 256;
+        unsigned long long pbase = (unsigned long long)c * 256ull;
         #pragma unroll
         for (int v_3 = 0; v_3 < 1; v_3++) {
             int fcol = (v_3 * 32 + tir) * 8;
