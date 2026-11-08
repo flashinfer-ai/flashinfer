@@ -111,7 +111,13 @@ def adjoint_form(
 M_SHARE_COSTS: Mapping[tuple[str, int], Mapping[str, float]] = MappingProxyType(
     {
         ("sm_100a", 148): MappingProxyType(
-            {"walk": 2.236, "summary": 2.679, "gonly": 1.930, "corun_summary": 2.3, "corun_gonly": 17.1}
+            {
+                "walk": 2.236,
+                "summary": 2.679,
+                "gonly": 1.930,
+                "corun_summary": 2.3,
+                "corun_gonly": 17.1,
+            }
         ),
     }
 )
@@ -132,7 +138,9 @@ def _wave1_pieces(chunks: Sequence[int], length: int) -> tuple[int, int]:
     return last, middle
 
 
-def m_share_saving(chunks: Sequence[int], num_v_heads: int, arch: str, sm_count: int) -> float | None:
+def m_share_saving(
+    chunks: Sequence[int], num_v_heads: int, arch: str, sm_count: int
+) -> float | None:
     """The priced saving (us) of M-share in the backward's first wave over sequences of ``chunks`` chunks with
     ``num_v_heads`` value heads on a device of ``arch`` with ``sm_count`` SMs (:data:`M_SHARE_COSTS`): the first wave
     with the summary, ``max(last walk, middle summary) + corun_summary``, less the first wave with the walks from zero,
