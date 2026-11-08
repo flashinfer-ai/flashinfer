@@ -33,27 +33,44 @@ contract (the route reads ``group``, ``world_size``, ``cu_seqlens_local``,
 never stored in the context), FP32 taps only, no bias, the legacy channel tile
 rule ``cake_jit.plan(..., legacy=True)``, the same forward and head programs
 (this package's copies of the det programs) and the same exchanges, recompute
-handle, graph replay and multi-tensor calls.  The one difference is the main
-backward program (registry ``kcp_jit``, kind ``kcp_bwd``): ONE ORDINARY launch
-(no cooperative attribute, no grid barrier, so a kernel resident on another
-stream never holds it back) whose CTAs add their FP32 ``dweight`` CTA rows into
-the zeroed FP32 accumulators ``acc`` (``[C, 4]``) with unordered global
-reductions; the last CTA of each channel tile (a ticket on its ``work``
-counter) stores the rank-local FP32 ``dweight`` partial and zeroes the tile's
-accumulators and counter.  ``acc`` / ``work`` are the package's cached
-backward workspace of the device and current stream (zero before and after
-every launch; inside a CUDA Graph capture with a nonzero capture id one zeroed
-buffer per capture and stream, shared by the capture's backward calls on that
-stream, with another fill node when a call needs a larger buffer, and kept
-alive after its graph is freed until a later capture on that stream replaces
-it; with capture id 0, also without ``cuda.bindings``, each captured call
-zeroes a buffer of its own).
+handle, graph replay and multi-tensor calls.  The difference is the backward
+after the head program, which overlaps the halo exchange (:func:`_bwd_overlap`):
+
+1. the exchange is issued;
+2. the main program (registry ``kcp_jit``, kind ``kcp_bwd_dyn``) runs before
+   the exchange is waited, with every ``tail_row_off`` entry ``-1`` (no tail
+   row arrived).  Its CTAs take units of tokens from lanes and, through Cluster
+   Launch Control, the lanes of CTAs that have not started, so a kernel resident
+   on another stream leaves no work waiting for the SMs it holds; their FP32
+   ``dweight`` runs are added into four FP32 accumulator copies in the order the
+   runs end, summed once per channel tile;
+3. after the wait, when the rank receives tail rows, the tail-row program
+   (kind ``kcp_bwd_halo``) writes ``dx`` of the last three rows of each
+   fragment that has them again, from the received rows.
+
+The plan of the main program is :func:`kcp_jit.dyn_plan` (units of ``M``
+tokens, ``P`` lanes per 2048-channel tile, one CTA per SM).  A call that
+reserves SMs (``bwd_reserve_sms >= 1``), has more than
+:data:`kcp_jit.DYN_MAX_CHANNELS` channels or no token runs the one-program
+backward (kind ``kcp_bwd``) after the wait instead: one ordinary launch whose
+CTAs add their FP32 ``dweight`` CTA rows into the zeroed FP32 accumulators
+``acc`` (``[C, 4]``) with unordered global reductions; the last CTA of each
+channel tile (a ticket on its ``work`` counter) stores the rank-local FP32
+``dweight`` partial and zeroes the tile's accumulators and counter.  Both
+programs' workspaces are the package's cached backward workspace of the device
+and current stream (zero before and after every launch; inside a CUDA Graph
+capture with a nonzero capture id one zeroed buffer per capture and stream,
+shared by the capture's backward calls on that stream, with another fill node
+when a call needs a larger buffer, and kept alive after its graph is freed
+until a later capture on that stream replaces it; with capture id 0, also
+without ``cuda.bindings``, each captured call zeroes a buffer of its own).
 
 Numerics: ``y`` and ``hist`` are the det KCP forward's bits; ``dx`` is the det
-KCP backward's bits (same per-thread FP32 steps, same tail fold, one BF16
-rounding); ``dweight`` is the rank's FP32 partial, within the det program's
-budget of an FP64 oracle (``5e-2 + 1e-4 |dw|``) but not bitwise reproducible
-run to run (the cross-CTA sum is unordered; the only relaxed property).  The
+KCP backward's bits on both backward forms (same per-thread FP32 steps, same
+tail fold, one BF16 rounding); ``dweight`` is the rank's FP32 partial, within
+the det program's budget of an FP64 oracle (``5e-2 + 1e-4 |dw|``) but not
+bitwise reproducible run to run (the cross-CTA sum is unordered; the only
+relaxed property).  The
 cross-rank reduction of ``dweight`` stays the framework's.
 
 Numerical mode: the package is chosen by its module name and no entry takes a
