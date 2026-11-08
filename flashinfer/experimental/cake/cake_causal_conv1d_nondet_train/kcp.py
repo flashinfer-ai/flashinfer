@@ -1081,7 +1081,7 @@ def _graph_entry(
         or int(getattr(ctx, "n_frag", 0)) == 0
     ):
         return None
-    key = (kind, id(ctx), int(ctx.world_size), tuple(_sig(t) for t in tensors))
+    key: tuple = (kind, id(ctx), int(ctx.world_size), tuple(_sig(t) for t in tensors))
     if extra:
         key += tuple(extra)
     if kind.startswith("bwd") and _TEST_KNOBS["bwd_route"] != BWD_ROUTE_DEFAULT:

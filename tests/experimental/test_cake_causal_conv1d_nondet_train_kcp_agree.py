@@ -89,9 +89,10 @@ def test_fingerprint_matches_its_definition(layout) -> None:
     assert all(0 <= v < 2**63 for v in conv_kcp._fingerprint(ctx, "bwd", (8,), False))
     # The partition field tells layouts apart.
     other, _ = _ctx(layout="contiguous" if layout != "contiguous" else "zigzag")
-    assert conv_kcp._fingerprint(ctx, "fwd", (8,), False)[6] != conv_kcp._fingerprint(
-        other, "fwd", (8,), False
-    )[6]
+    assert (
+        conv_kcp._fingerprint(ctx, "fwd", (8,), False)[6]
+        != conv_kcp._fingerprint(other, "fwd", (8,), False)[6]
+    )
 
 
 class _Gather:
@@ -122,7 +123,8 @@ def test_once_per_context_and_phase(monkeypatch) -> None:
     ctx, _ = _ctx()
     cpu = torch.device("cpu")
     conv_kcp._agree(ctx, "fwd", (64,), False, device=cpu)
-    conv_kcp._agree(ctx, "fwd", (128,), True, device=cpu)  # already checked: no collective
+    # Already checked: no collective.
+    conv_kcp._agree(ctx, "fwd", (128,), True, device=cpu)
     assert gather.calls == 1
     conv_kcp._agree(ctx, "bwd", (64,), False, device=cpu)
     conv_kcp._agree(ctx, "bwd", (64,), False, device=cpu)
