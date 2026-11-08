@@ -2125,9 +2125,7 @@ def _kcp_backward_multi(
         zip(calls, tails, strict=True)
     ):
         if overlap and i == 0:
-            _bwd_tail(
-                e, x_flat, w, dy_flat, hist_t, dx, tail, S=S, C=C, device=device
-            )
+            _bwd_tail(e, x_flat, w, dy_flat, hist_t, dx, tail, S=S, C=C, device=device)
         else:
             _bwd_main(
                 e,

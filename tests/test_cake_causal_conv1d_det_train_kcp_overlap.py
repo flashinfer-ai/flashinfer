@@ -132,9 +132,7 @@ def _recorder(monkeypatch) -> list[str]:
 
 
 def _want(ctx, *, overlap: bool, cooperative: bool, n: int = 1) -> list[str]:
-    head = (
-        ["kcp_bwd_head"] * n if int(ctx.T_r) and int(ctx.halo.n_head_rows) else []
-    )
+    head = ["kcp_bwd_head"] * n if int(ctx.T_r) and int(ctx.halo.n_head_rows) else []
     # the cooperative record has no reduce program; the split record's reduce follows it on the stream
     main = ["kcp_bwd"] if cooperative else ["kcp_bwd_split", "reduce"]
     if not overlap:
@@ -153,9 +151,7 @@ def test_overlapped_backward_order_and_bits(
 ) -> None:
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    _, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
     ref = {}
     for coop in (True, False):
         ref[coop] = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
@@ -236,9 +232,7 @@ def test_overlapped_no_tail_rows_outlive_the_host_cache(monkeypatch) -> None:
     name, lens, cuts, C = ROWS[0]
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    _, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
     ref = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist, cooperative=False
     )
