@@ -27,7 +27,6 @@ SCHEDULER_LAYOUTS = (
     (32, 9),
 )
 EPILOGUE_TOPKS = (2, 8)
-EPI_COLS = 1024  # Epilogue column vector.
 SWIGLU_BWD_TILES = 8  # 128 x 128 tiles per backward SwiGLU task half.
 
 
@@ -2809,11 +2808,13 @@ class MoKScheduler:
 
 
 class MoKEpilogues:
-    """Prepared standalone epilogues: persistent (token, 1024-column) streams.
+    """Prepared standalone epilogues: persistent token-major streams.
 
+    CTA ``b`` of ``ctas`` reduces tokens ``b, b + ctas, ...`` through
+    registers, one 16-byte vector per thread and row, with no shared memory.
     Per vector the arithmetic is native: FP32 accumulation from the shared
     row, then the routed rows in ascending expert-slot order, one BF16
-    rounding. Top-k changes the physical shared-memory layout.
+    rounding.
     """
 
     def __init__(self, top_k: int):
@@ -2858,7 +2859,7 @@ class MoKEpilogues:
         ):
             raise ValueError("Scores must be contiguous CUDA FP32 [tokens, top_k]")
         output = torch.empty_like(shared)
-        ctas = self._ctas(tokens, hidden, shared.device)
+        ctas = self._ctas(tokens, shared.device)
         with _ffi_stream():
             self.forward_module.launch(
                 grid=(ctas, 1, 1),
@@ -2893,7 +2894,7 @@ class MoKEpilogues:
             or not scores.is_contiguous()
         ):
             raise ValueError("Scores must be contiguous CUDA FP32 [tokens, top_k]")
-        ctas = self._ctas(tokens, hidden, routed.device)
+        ctas = self._ctas(tokens, routed.device)
         fixed = dict(routed=routed, tokens=tokens, hidden=hidden, ctas=ctas)
         if backward:
             fixed["scores"] = self._no_scores[routed.device]
@@ -2921,7 +2922,7 @@ class MoKEpilogues:
         self._check(shared, routed)
         tokens, hidden = shared.shape
         output = torch.empty_like(shared)
-        ctas = self._ctas(tokens, hidden, shared.device)
+        ctas = self._ctas(tokens, shared.device)
         with _ffi_stream():
             self.backward_module.launch(
                 grid=(ctas, 1, 1),
@@ -2935,7 +2936,7 @@ class MoKEpilogues:
             )
         return output
 
-    def _ctas(self, tokens, hidden, device):
+    def _ctas(self, tokens, device):
         import torch
 
         if device not in self._sms:
@@ -2943,6 +2944,6 @@ class MoKEpilogues:
                 device
             ).multi_processor_count
             self._no_scores[device] = torch.zeros(1, dtype=torch.float32, device=device)
-        # Two resident CTAs per SM (six 18 KB stages each for top-k 8).
-        units = tokens * ((hidden + EPI_COLS - 1) // EPI_COLS)
-        return max(1, min(units, 2 * self._sms[device]))
+        # Four CTAs per SM keep enough tokens in flight on the register path;
+        # a CTA owns at least one token.
+        return max(1, min(tokens, 4 * self._sms[device]))
