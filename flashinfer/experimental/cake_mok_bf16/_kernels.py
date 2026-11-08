@@ -433,13 +433,25 @@ class MoKForward:
 
     Launch-invariant geometry is memoised per geometry; the counters are one
     zero-filled slab per call.
+
+    ``context=False`` loads the context-free forward (role
+    ``forward[_clamped]_noctx``) for activation checkpointing: its fused tiles
+    store hidden, which the down projection reads, and skip the gate and up
+    stores only backward reads. It takes the same arguments; the unread gate
+    and up maps are given the hidden tensors, so the call allocates no gate or
+    up storage and returns ``None`` in their four places. ``y_shared``, the
+    combine rows, ``hidden_*`` and ``x_routed`` are the context forward's
+    words.
     """
 
-    def __init__(self, clamped=False):
+    def __init__(self, clamped=False, context=True):
         from .jit import load_kernel
 
-        self.clamped = clamped
-        self.module = load_kernel(_role("forward", clamped))
+        if type(context) is not bool:
+            raise TypeError("context must be a boolean")
+        self.clamped, self.context = clamped, context
+        role = _role("forward", clamped) + ("" if context else "_noctx")
+        self.module = load_kernel(role)
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
         self._geometry = {}
@@ -492,16 +504,23 @@ class MoKForward:
         )
         options = dict(device=x.device, dtype=torch.bfloat16)
         x_routed = torch.empty((macro_size, hidden), **options)
-        gate_shared = torch.empty((local_tokens, intermediate), **options)
-        gate_routed = torch.empty((macro_size, intermediate), **options)
-        up_shared, up_routed = (
-            torch.empty_like(gate_shared),
-            torch.empty_like(gate_routed),
-        )
-        hidden_shared, hidden_routed = (
-            torch.empty_like(gate_shared),
-            torch.empty_like(gate_routed),
-        )
+        if self.context:
+            gate_shared = torch.empty((local_tokens, intermediate), **options)
+            gate_routed = torch.empty((macro_size, intermediate), **options)
+            up_shared, up_routed = (
+                torch.empty_like(gate_shared),
+                torch.empty_like(gate_routed),
+            )
+            hidden_shared, hidden_routed = (
+                torch.empty_like(gate_shared),
+                torch.empty_like(gate_routed),
+            )
+            maps = (gate_shared, up_shared, gate_routed, up_routed)
+        else:
+            hidden_shared = torch.empty((local_tokens, intermediate), **options)
+            hidden_routed = torch.empty((macro_size, intermediate), **options)
+            gate_shared = gate_routed = up_shared = up_routed = None
+            maps = (hidden_shared, hidden_shared, hidden_routed, hidden_routed)
         y_shared, y_routed = torch.empty_like(x), torch.empty_like(x_routed)
         key = (
             local_tokens,
@@ -533,10 +552,10 @@ class MoKForward:
                 wg_routed=routed_gate,
                 wu_routed=routed_up,
                 wd_routed=routed_down,
-                gate_shared_out=gate_shared,
-                up_shared_out=up_shared,
-                gate_routed_out=gate_routed,
-                up_routed_out=up_routed,
+                gate_shared_out=maps[0],
+                up_shared_out=maps[1],
+                gate_routed_out=maps[2],
+                up_routed_out=maps[3],
                 hidden_shared_out=hidden_shared,
                 hidden_routed_out=hidden_routed,
                 hidden_shared_in=hidden_shared,

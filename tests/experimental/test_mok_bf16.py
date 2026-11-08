@@ -4,8 +4,8 @@
 
 Covers the fused forward/backward (ring replay, empty experts, variable
 widths, CUDA Graph replay), clamped SwiGLU, FP32 weight-gradient
-accumulation, GLM-5.3-Flash local expert counts, context-only recompute,
-every exported scheduler layout and the epilogues, plus the host-only
+accumulation, GLM-5.3-Flash local expert counts, context-only recompute, the
+context-free forward, every exported scheduler layout and the epilogues, plus the host-only
 communication-split tables, resolvers and configuration switches.
 
 Backend suite: the package is imported only through
@@ -369,6 +369,127 @@ def test_recompute_context(swiglu_limit, macro):
 
     for a, b in zip(gradients(saved), gradients(rebuilt), strict=True):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("swiglu_limit", [None, 0.125], ids=["plain", "clamped"])
+@pytest.mark.parametrize("macro", [768, 4096], ids=["replay", "resident"])
+def test_context_free_forward(swiglu_limit, macro):
+    """The context-free forward writes the context forward's y, combine rows,
+    hidden and routed x bitwise, in every launch, without gate/up storage; the
+    context recomputed after it gives backward the saved context's bits."""
+    require_gpu()
+    clamped = swiglu_limit is not None
+    forward, context_free = MoKForward(clamped), MoKForward(clamped, context=False)
+    recompute, backward = MoKRecompute(clamped), MoKBackward(clamped)
+    tokens, hidden, intermediate, experts, topk, mini, comm = (
+        512,
+        512,
+        256,
+        4,
+        2,
+        256,
+        4,
+    )
+    torch.manual_seed(4127)
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, **options) * 0.125
+    dy = torch.randn_like(x) * 0.125
+    shared = [
+        torch.randn(intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(hidden, intermediate, **options) / intermediate**0.5,
+    ]
+    routed = [
+        torch.randn(experts, intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(experts, intermediate, hidden, **options) / hidden**0.5,
+        torch.randn(experts, hidden, intermediate, **options) / intermediate**0.5,
+    ]
+    scores = torch.rand(tokens, topk, device="cuda") + 0.1
+    row = torch.arange(tokens, device="cuda")
+    routes = torch.stack([(row * 3 + slot) % experts for slot in range(topk)], -1)
+    s = single_rank_schedule(routes, experts)
+    schedule = (s["peers"], s["schedule"], s["num_tokens"], s["counts"])
+    weights = (shared[0], routed[0], shared[1], routed[1], shared[2], routed[2])
+    rows = min(s["actual"], macro)
+
+    def run(kernel):
+        combine = torch.zeros(tokens * topk, hidden, **options)
+        values = kernel(
+            x, [x.data_ptr()], combine, [combine.data_ptr()], *weights,
+            *schedule, topk, swiglu_limit, comm, macro, mini,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return values, combine
+
+    saved, combine = run(forward)
+    assert torch.count_nonzero(combine).item() > 0
+    assert torch.count_nonzero(saved[7]).item() > 0
+    for _ in range(3):
+        values, free_combine = run(context_free)
+        assert values[1:5] == (None,) * 4
+        assert torch.equal(free_combine, combine)
+        assert torch.equal(values[7], saved[7])  # y_shared
+        assert torch.equal(values[5], saved[5])  # hidden_shared
+        for index in (0, 6):  # routed x, hidden of the resident macrobatch
+            assert torch.equal(values[index][:rows], saved[index][:rows]), index
+    rebuilt = recompute(
+        x, [x.data_ptr()], shared[0], routed[0], shared[1], routed[1],
+        *schedule, topk, swiglu_limit, comm, macro, mini,
+    )  # fmt: skip
+
+    def gradients(context):
+        dx_peer = torch.zeros(tokens * topk, hidden, **options)
+        ds_peer = torch.zeros_like(scores)
+        values = backward(
+            dy, [dy.data_ptr()], dx_peer, [dx_peer.data_ptr()],
+            scores, [scores.data_ptr()], ds_peer, [ds_peer.data_ptr()],
+            *weights, *context[:7], x, [x.data_ptr()], *schedule,
+            topk, swiglu_limit, comm, macro, mini,
+        )  # fmt: skip
+        return (dx_peer, ds_peer, values[0], *values[9:])
+
+    expected = gradients(saved)
+    assert all(torch.count_nonzero(value).item() > 0 for value in expected)
+    for a, b in zip(expected, gradients(rebuilt), strict=True):
+        assert torch.equal(a, b)
+
+
+def test_context_free_forward_arguments_are_checked_before_device_work(monkeypatch):
+    """``save_context`` and ``context`` must be booleans; MXFP8 routed experts
+    have no context-free forward. Each refusal comes before any copy, barrier
+    or launch (host only)."""
+    with pytest.raises(TypeError, match="context must be a boolean"):
+        MoKForward(False, context=1)
+    functional = object.__new__(backend.MoKFunctional)
+    functional.local_experts = 4
+    events = []
+    monkeypatch.setattr(
+        backend.MoKFunctional, "_inputs", staticmethod(lambda *args: (None, 256))
+    )
+    monkeypatch.setattr(functional, "_check_device", lambda workspace: None)
+    monkeypatch.setattr(functional, "_barrier", lambda w: events.append("barrier"))
+    monkeypatch.setattr(functional, "_kernels", lambda *a: events.append("kernels"))
+    monkeypatch.setattr(
+        backend.MoKFunctional,
+        "_copy_source",
+        staticmethod(lambda *args: events.append("copy")),
+    )
+    options = dict(dtype=torch.bfloat16)
+    x = torch.zeros(256, 256, **options)
+    shared = [torch.zeros(256, 256, **options) for _ in range(3)]
+    data = torch.zeros(4, 256, 256, dtype=torch.uint8)
+    mxfp8 = [(data, torch.zeros(64, dtype=torch.uint8)) for _ in range(3)]
+    with pytest.raises(TypeError, match="save_context must be a boolean"):
+        functional.forward(None, None, None, x, None, *shared, *mxfp8, save_context=0)
+    with pytest.raises(ValueError, match="save_context=False requires BF16"):
+        functional.forward(
+            None, None, None, x, None, *shared, *mxfp8, save_context=False
+        )
+    with pytest.raises(TypeError, match="save_context must be a boolean"):
+        functional.prepare(None, save_context="no")
+    with pytest.raises(ValueError, match="save_context=False requires BF16"):
+        functional.prepare(None, True, save_context=False)
+    assert events == ["kernels"]  # prepare compiles the MXFP8 pair, then refuses
 
 
 @pytest.mark.parametrize("ep,experts", SCHEDULER_LAYOUTS)

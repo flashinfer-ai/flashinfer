@@ -151,6 +151,7 @@ class MoKFunctional:
         self.fp32_wgrad = fp32_wgrad
         self._forward_kernels, self._backward_kernels = {}, {}
         self._recompute_kernels = {}
+        self._context_free_forward_kernels = {}
         # id(native workspace) -> asynchronous per-rank routed-load observation.
         self._load_state = {}
         from .jit import target_arch
@@ -177,6 +178,22 @@ class MoKFunctional:
             self._backward_kernels[key] = backward(key[1], self.fp32_wgrad)
         return self._forward_kernels[key], self._backward_kernels[key]
 
+    def _context_free_forward_kernel(self, swiglu_limit, mxfp8=False):
+        """The context-free forward of a SwiGLU variant (BF16 routed experts)."""
+        if mxfp8:
+            raise ValueError(
+                "save_context=False requires BF16 routed experts; the MXFP8 "
+                "forward always saves its context"
+            )
+        key = swiglu_limit is not None
+        if key not in self._context_free_forward_kernels:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Call prepare(..., save_context=False) before CUDA Graph capture"
+                )
+            self._context_free_forward_kernels[key] = MoKForward(key, context=False)
+        return self._context_free_forward_kernels[key]
+
     def _recompute_kernel(self, swiglu_limit, mxfp8=False):
         key = (mxfp8, swiglu_limit is not None)
         if key not in self._recompute_kernels:
@@ -186,9 +203,17 @@ class MoKFunctional:
             self._recompute_kernels[key] = recompute(key[1])
         return self._recompute_kernels[key]
 
-    def prepare(self, swiglu_limit=None, mxfp8=False):
-        """Compile the forward/backward kernels of this variant now."""
+    def prepare(self, swiglu_limit=None, mxfp8=False, *, save_context=True):
+        """Compile the forward/backward kernels of this variant now.
+
+        ``save_context=False`` also compiles the context-free forward that
+        ``forward(..., save_context=False)`` runs (BF16 routed experts only).
+        """
+        if type(save_context) is not bool:
+            raise TypeError("save_context must be a boolean")
         self._kernels(swiglu_limit, mxfp8)
+        if not save_context:
+            self._context_free_forward_kernel(swiglu_limit, mxfp8)
 
     def prepare_recompute(self, swiglu_limit=None, mxfp8=False):
         """Compile the context-recompute kernel for this variant now."""
@@ -651,7 +676,21 @@ class MoKFunctional:
         routed_up_weights,
         routed_down_weights,
         swiglu_limit=None,
+        *,
+        save_context=True,
     ):
+        """Returns ``(y, context)``.
+
+        ``save_context=False`` (BF16 routed experts) runs the context-free
+        forward of an activation-checkpointed step: it stores no gate/up
+        context, returns ``(y, None)`` with ``y`` bitwise identical to the
+        context forward's, and the step rebuilds the context with
+        ``recompute_forward_context`` (same schedule, inputs, weights and
+        ``swiglu_limit``) before ``backward``. Compile it with
+        ``prepare(swiglu_limit, save_context=False)`` before CUDA Graph capture.
+        """
+        if type(save_context) is not bool:
+            raise TypeError("save_context must be a boolean")
         workspace, source_count = self._inputs(
             config, workspace, schedule, x, router_weights
         )
@@ -661,6 +700,11 @@ class MoKFunctional:
             (shared_gate_weights, shared_up_weights, shared_down_weights),
             (routed_gate_weights, routed_up_weights, routed_down_weights),
         )
+        if mxfp8 and not save_context:
+            raise ValueError(
+                "save_context=False requires BF16 routed experts; the MXFP8 "
+                "forward always saves its context"
+            )
         shared_rows = self._shared_rows(source_count)
         self._copy_source(workspace.x_buffer, x, 0, shared_rows)
         self._copy_source(
@@ -670,7 +714,10 @@ class MoKFunctional:
             source_count * workspace.topk : shared_rows * workspace.topk
         ].zero_()
         self._barrier(workspace)
-        forward_kernel, _ = self._kernels(swiglu_limit, mxfp8)
+        if save_context:
+            forward_kernel, _ = self._kernels(swiglu_limit, mxfp8)
+        else:
+            forward_kernel = self._context_free_forward_kernel(swiglu_limit)
         fwd_comm_sms, _ = self._comm_split(config, workspace)
         program = {"multimacro": self._multimacro(config, workspace)} if mxfp8 else {}
         values = forward_kernel(
@@ -699,6 +746,8 @@ class MoKFunctional:
             workspace.combine_buffer[: shared_rows * workspace.topk],
             workspace.router_weight_buffer[:shared_rows],
         )
+        if not save_context:
+            return output[:source_count], None
         context = MoKForwardContext(
             x_routed=values[0],
             gate_shared=values[1],
@@ -729,7 +778,8 @@ class MoKFunctional:
         routed gate/up GEMMs and SwiGLU for the resident first macrobatch; no
         down projection, combine or output epilogue. Pass the same schedule,
         inputs, weights and ``swiglu_limit`` as the checkpointed forward; the
-        returned context is interchangeable with that forward's context.
+        returned context is interchangeable with that forward's context. It is
+        the only context source after ``forward(..., save_context=False)``.
         """
         workspace, source_count = self._inputs(config, workspace, schedule, x, None)
         self._check_device(workspace)
