@@ -3377,7 +3377,10 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 9 sm_107a keys and re-values 2
     # (test_sm107a_212_tranche_rules_plan_their_programs); the MLA value-projection input gradient's head-interleaved
     # raster adds one sm_103a key (test_round15_store_hint_knob); the MLA value-projection forward's raster adds three
-    # sm_100a T-exact keys (test_round15_store_hint_knob)
+    # sm_100a T-exact keys (test_round15_store_hint_knob); round 13 adds three sm_103a T-exact weight-gradient keys
+    # (the 17408 -> 5120 fp32 weight gradient at T 16231 / 16384 in 12-row raster groups:
+    # test_gb_t_exact_raster_f32_wgrad_rules_plan_their_programs; the indexer_q weight gradient at T 16384:
+    # test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
     assert (
         len(ROW_RULES)
         == 109
@@ -3405,6 +3408,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
         + 1
         + 3
         + 1
+        + 3
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
@@ -3413,7 +3417,7 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 9
     assert (
         sum(k[0] == "sm_103a" for k in ROW_RULES)
-        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8 + 1
+        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8 + 1 + 3
     )
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -9685,6 +9689,7 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
         and key[8] is not None
         and key not in GB_T_EXACT_SKS_WGRAD_ROWS
         and key not in GB_T_EXACT_RASTER_WGRAD_ROWS
+        and key not in GB_T_EXACT_RASTER_F32_WGRAD_ROWS
     )
     assert exact == sorted(key for key in GB_T_EXACT_WGRAD_ROWS if key[0] == arch)
     registered = _registered(arch)
@@ -9778,10 +9783,11 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
-# The GB T-exact weight-gradient rules of round 3: ROW_RULES key -> the program it plans at its T (K = T, in the direct
-# orientation the row plans without it), the ragged rule's synchronised two-partial stream-K plan with its bf16 tiles
-# through the one-slot TMA store: the same per-tile K partitions (the same stream-K units, slabs and two-addend fixup) as
-# the row's plan without it, so every output is bitwise equal to that plan's.
+# The GB T-exact weight-gradient rules of round 3 (round 13: the sm_103a key at T 16384): ROW_RULES key -> the program
+# it plans at its T (K = T, in the direct orientation the row plans without it), the ragged rule's synchronised
+# two-partial stream-K plan with its bf16 tiles through the one-slot TMA store: the same per-tile K partitions (the same
+# stream-K units, slabs and two-addend fixup) as the row's plan without it, so every output is bitwise equal to that
+# plan's.
 GB_T_EXACT_SKS_WGRAD_ROWS = {
     (
         "sm_100a",
@@ -9825,6 +9831,17 @@ GB_T_EXACT_SKS_WGRAD_ROWS = {
         False,
         2048,
         16231,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16384,
         4096,
     ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
 }
@@ -10060,6 +10077,172 @@ def test_gb_t_exact_raster_wgrad_rows_match_fp64_and_repeat_bitwise(key, monkeyp
     plain.launch()
     torch.cuda.synchronize()
     _check(plain_out, ref)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+
+
+# The GB T-exact fp32 weight-gradient rules of round 13 (the sm_103a 17408 -> 5120 fp32 weight gradient at T 16231 /
+# 16384): ROW_RULES key -> the program it plans at its T (K = T, in the direct orientation).  Without the key the row
+# plans its own 128-row fp32 program, which sm_103a does not generate, and the registry's knob fallback runs the 256-row
+# tiles through the one-slot TMA store; the key names that program and plans it in 12-row raster groups in place of
+# the default: the same program, tiles and K steps as the fallback plan.
+GB_T_EXACT_RASTER_F32_WGRAD_ROWS = {
+    (
+        "sm_103a",
+        True,
+        True,
+        True,
+        False,
+        False,
+        17408,
+        16231,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_f32_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        True,
+        False,
+        False,
+        17408,
+        16384,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_f32_tma1_pro7",
+}
+
+
+def _gb_f32_wgrad_views(N, T, M):
+    """Empty operands of a GB T-exact fp32 weight-gradient key (N, K = T, M): G[T, M] and X[T, N] in bf16 and the fp32
+    output dW[M, N] (the direct orientation)."""
+    G = torch.empty(T, M, dtype=torch.bfloat16)
+    X = torch.empty(T, N, dtype=torch.bfloat16)
+    return G, X, torch.empty(M, N, dtype=torch.float32)
+
+
+def test_gb_t_exact_raster_f32_wgrad_rules_plan_their_programs(monkeypatch):
+    """The GB T-exact fp32 weight-gradient rules of round 13 (sm_103a: the 17408 -> 5120 fp32 weight gradient at
+    T 16231 / 16384) plan, at their T on every SM count of the GB300 parts and in the direct orientation, the program
+    the row runs without the key (the registry's knob fallback: the row's own 128-row program is not generated), with
+    that plan in every field but the raster group width (12) and the fallback flag; one token more or less plans the
+    row's plan without the key."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(GB_T_EXACT_RASTER_F32_WGRAD_ROWS)
+    assert keys and all(key[0] == "sm_103a" and key[3] for key in keys), keys
+    registered = _registered("sm_103a")
+
+    def plan_at(N, T, M, kw):
+        G, X, out = _gb_f32_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch="sm_103a")
+        assert not transposed, (N, T, M)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+        return plan
+
+    for key in keys:
+        _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        template = GB_T_EXACT_RASTER_F32_WGRAD_ROWS[key]
+        assert template in registered, (key, template)
+        assert ROW_RULES[key] == {
+            "cta_rows": 256,
+            "epi": "tma",
+            "slots": 1,
+            "group_m": 12,
+        }, key
+        for sm_count in (148, 152, 160):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch="sm_103a")
+            mirror = dict(kw, _fallback=False)
+            plans = {t: plan_at(N, t, M, mirror) for t in (T - 1, T, T + 1)}
+            with monkeypatch.context() as m:
+                for k in _gb_t_exact_keys_of(key):
+                    m.delitem(ROW_RULES, k)
+                without = {t: plan_at(N, t, M, mirror) for t in (T - 1, T, T + 1)}
+                plain = plan_at(N, T, M, kw)
+            for t in (T - 1, T + 1):
+                assert _plan_signature(plans[t]) == _plan_signature(without[t]), (
+                    key,
+                    t,
+                )
+            plan, own = plans[T], without[T]
+            # without the key the row's own plan is the 128-row program, which sm_103a does not generate; the
+            # registry's knob fallback runs the rule's program in the default raster groups
+            assert own.template not in registered, (key, sm_count, own.template)
+            assert plain.knob_fallback, (key, sm_count, plain.template)
+            assert not (plain.rule_fallback or plain.swap_fallback), (key, sm_count)
+            assert plan.template == template == plain.template, (
+                key,
+                sm_count,
+                plan.template,
+                plain.template,
+            )
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert plan.group_m == 12 and plain.group_m != 12, (
+                key,
+                sm_count,
+                plain.group_m,
+            )
+            sig, base = _plan_signature(plan), _plan_signature(plain)
+            assert {f for f in sig if sig[f] != base[f]} == {
+                "group_m",
+                "knob_fallback",
+            }, (key, sm_count)
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(GB_T_EXACT_RASTER_F32_WGRAD_ROWS),
+    ids=lambda key: f"{key[0]}-nn-f32-{key[6]}x{key[8]}-T{key[7]}",
+)
+def test_gb_t_exact_raster_f32_wgrad_rows_match_fp64_and_repeat_bitwise(
+    key, monkeypatch
+):
+    """Each round-13 GB T-exact fp32 weight-gradient row of the device's architecture runs its program at its T against
+    the FP64 reference of the exact BF16 operands (the package fp32 tolerance) and returns the same bits on a second
+    launch; the plan the row has without the key runs the same program in its own raster groups and meets the same
+    tolerance, and where both plans keep whole K per output tile the two outputs are bitwise equal.  A key of another
+    architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    template = GB_T_EXACT_RASTER_F32_WGRAD_ROWS[key]
+    _require_program(template)
+    ref = torch.matmul(G.double().t(), X.double())
+    out = torch.full((M, N), float("nan"), dtype=torch.float32, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
+    assert prepared.template == template, prepared.template
+    assert not prepared.plan.transposed_out
+    assert prepared.plan.group_m == ROW_RULES[key]["group_m"], prepared.plan.group_m
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, ref)
+    first = out.clone()
+    out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int32), first.view(torch.int32)), key
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        for k in _gb_t_exact_keys_of(key):
+            m.delitem(ROW_RULES, k)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
+    assert plain.template == template, plain.template
+    assert plain.plan.group_m != prepared.plan.group_m, plain.plan.group_m
+    plain.launch()
+    torch.cuda.synchronize()
+    _check(plain_out, ref)
+    if _whole_k(prepared.plan) and _whole_k(plain.plan):
+        assert torch.equal(out.view(torch.int32), plain_out.view(torch.int32)), key
     cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 

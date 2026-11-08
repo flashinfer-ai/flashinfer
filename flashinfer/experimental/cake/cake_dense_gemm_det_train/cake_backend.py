@@ -1950,6 +1950,15 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
     ('sm_103a', True, True, False, False, False, 5120, 16172, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_103a', True, True, False, False, False, 17408, 16172, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 13 - the 17408 -> 5120 fp32 weight gradient at T 16231 / 16384 in
+    #      12-row raster groups (the program the row runs without them: its own 128-row fp32 program is not generated
+    #      on sm_103a, so the registry's knob fallback runs the 256-row tiles through the one-slot TMA store; the rule
+    #      names that program so it plans it directly) and the indexer_q 2048 -> 4096 weight gradient at T 16384 with
+    #      the rule of its T 16172 / 16231 keys (round 3), each with the per-tile K partitions of the row's plan without
+    #      it (bitwise equal to that plan), measured on GB300 against that plan on two nodes ----
+    ('sm_103a', True, True, True, False, False, 17408, 16231, 5120): {"cta_rows": 256, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, True, False, False, 17408, 16384, 5120): {"cta_rows": 256, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 2048, 16384, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
 }
 # fmt: on
 
