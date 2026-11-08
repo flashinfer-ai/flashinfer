@@ -182,7 +182,8 @@ COUNTER_BYTES_PER_ROW = 32
 QSTAT_WORDS = 4  # FP32 per-query bound terms of bwd_delta (a_lat, b_lat, a_rope, b_rope; NoPE uses the first two)
 GLOBAL_WORDS = 16  # u32 words of the backward's global state (maxima, the flagged-row count); bwd_delta zeroes them
 REDO_WORD = 8  # the global word that counts the rows the redo preparation flags (the redo's ``redo_count``)
-NONFINITE_WORD = 9  # the global word that counts the rows with a non-finite contribution
+# the global word that counts the rows with a non-finite contribution
+NONFINITE_WORD = 9
 O_LO_BYTES_PER_TOKEN = NUM_HEADS * D_LATENT * 2  # BF16 o_lo: 64 KiB per query token
 
 
@@ -1483,11 +1484,7 @@ def _plan(
         if backward
         else "workspace"
     )
-    region = (
-        accumulator_region_layout(num_kv, num_dst)
-        if backward
-        else {"total": 0}
-    )
+    region = accumulator_region_layout(num_kv, num_dst) if backward else {"total": 0}
     if backward:
         _check_accumulator_span(num_dst, D_QK, dst_row_stride)
     layout = workspace_layout(
@@ -1678,7 +1675,8 @@ def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     indices, _ = _pointer_operand(t["indices"])
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
-    if not plan.backward or "det_globals" not in t:  # a forward launch binds no backward scratch
+    # a forward launch binds no backward scratch
+    if not plan.backward or "det_globals" not in t:
         return values
     device = t["indices"].device
     f32 = _inert_operand(device, torch.float32)

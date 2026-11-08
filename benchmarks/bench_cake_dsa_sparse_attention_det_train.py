@@ -96,9 +96,14 @@ def _p8949_indices(t, s, device, gen):
     recent = pos[:, None] - torch.arange(1024, device=device)[None, :]
     older = (pos - 1024).double()
     u = torch.rand((t, 1023), device=device, dtype=torch.float64, generator=gen)
-    strata = 1 + (
-        (torch.arange(1023, device=device)[None, :] + u) * (older[:, None] - 1) / 1023
-    ).long()
+    strata = (
+        1
+        + (
+            (torch.arange(1023, device=device)[None, :] + u)
+            * (older[:, None] - 1)
+            / 1023
+        ).long()
+    )
     sink = torch.zeros((t, 1), device=device, dtype=torch.long)
     return torch.cat([sink, strata, recent.flip(1)], 1).int().contiguous()
 

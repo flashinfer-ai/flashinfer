@@ -574,7 +574,9 @@ def test_nope_dkv_acc_is_previous_plus_fresh():
     assert _same_bits(acc[:S, :D_LATENT], want)
     assert _same_bits(acc[:, D_LATENT:], prev[:, D_LATENT:])
     assert _same_bits(acc[S:], prev[S:])
-    dst_map = (torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)).contiguous()
+    dst_map = (
+        torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)
+    ).contiguous()
     first = prev.clone()
     run(dkv_acc=first, dkv_dst_map=dst_map)
     assert not _same_bits(first, prev)
@@ -776,9 +778,14 @@ def _p8949_indices(t, s, gen):
     recent = pos[:, None] - torch.arange(1024, device="cuda")[None, :]
     older = (pos - 1024).double()
     u = torch.rand((t, 1023), device="cuda", dtype=torch.float64, generator=gen)
-    strata = 1 + (
-        (torch.arange(1023, device="cuda")[None, :] + u) * (older[:, None] - 1) / 1023
-    ).long()
+    strata = (
+        1
+        + (
+            (torch.arange(1023, device="cuda")[None, :] + u)
+            * (older[:, None] - 1)
+            / 1023
+        ).long()
+    )
     sink = torch.zeros((t, 1), device="cuda", dtype=torch.long)
     return torch.cat([sink, strata, recent.flip(1)], 1).int().contiguous()
 
@@ -820,7 +827,9 @@ def test_accuracy_issue_8949_shape():
     acc = torch.zeros(p["kv_latent"].shape[0], D_QK, device="cuda")
     out, lse, o_lo = cake_backend.forward(*args, topk_length=tl)
     cake_backend.backward(*args, out, o_lo, lse, p["dout"], topk_length=tl, dkv_acc=acc)
-    assert _same_bits(acc[:, :D_LATENT], fp32[2]) and _same_bits(acc[:, D_LATENT:], fp32[3])
+    assert _same_bits(acc[:, :D_LATENT], fp32[2]) and _same_bits(
+        acc[:, D_LATENT:], fp32[3]
+    )
     n_out, n_lse, n_o_lo = nondet_backend.forward(*args, topk_length=tl)
     nondet = nondet_backend.backward(
         *args, n_out, n_o_lo, n_lse, p["dout"], topk_length=tl
@@ -837,10 +846,14 @@ def test_accuracy_issue_8949_shape_nope():
     args = (p["q_latent"], p["kv_latent"], p["indices"])
     tl = p["topk_length"]
     out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-    dq, dkv = cake_backend.backward_nope(*args, out, o_lo, lse, p["dout"], topk_length=tl)
+    dq, dkv = cake_backend.backward_nope(
+        *args, out, o_lo, lse, p["dout"], topk_length=tl
+    )
     acc = torch.zeros(p["kv_latent"].shape[0], D_LATENT, device="cuda")
     out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-    cake_backend.backward_nope(*args, out, o_lo, lse, p["dout"], topk_length=tl, dkv_acc=acc)
+    cake_backend.backward_nope(
+        *args, out, o_lo, lse, p["dout"], topk_length=tl, dkv_acc=acc
+    )
     assert _same_bits(acc, dkv)
     n_out, n_lse, n_o_lo = nondet_backend.forward_nope(*args, topk_length=tl)
     nondet = nondet_backend.backward_nope(
@@ -889,7 +902,9 @@ def test_accuracy_issue_8946_glm52_packed_dkv_acc_with_map():
     index = dst_map.long()
 
     def mapped(t):
-        return torch.zeros(rows, t.shape[1], dtype=torch.float64, device="cuda").index_add_(0, index, t.double())
+        return torch.zeros(
+            rows, t.shape[1], dtype=torch.float64, device="cuda"
+        ).index_add_(0, index, t.double())
 
     grads = (dql, dqr, acc[:, :D_LATENT], acc[:, D_LATENT:])
     ref_mapped = dict(ref)
@@ -907,10 +922,14 @@ def test_accuracy_issue_8946_glm53_flash_nope():
     args = (inp.q, inp.kv, inp.idx_global)
     tl = inp.topk_length
     out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-    dq, dkv = cake_backend.backward_nope(*args, out, o_lo, lse, inp.dout, topk_length=tl)
+    dq, dkv = cake_backend.backward_nope(
+        *args, out, o_lo, lse, inp.dout, topk_length=tl
+    )
     acc = torch.zeros(inp.total_k, D_LATENT, device="cuda")
     out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-    cake_backend.backward_nope(*args, out, o_lo, lse, inp.dout, topk_length=tl, dkv_acc=acc)
+    cake_backend.backward_nope(
+        *args, out, o_lo, lse, inp.dout, topk_length=tl, dkv_acc=acc
+    )
     assert _same_bits(acc, dkv)
     n_out, n_lse, n_o_lo = nondet_backend.forward_nope(*args, topk_length=tl)
     nondet = nondet_backend.backward_nope(
@@ -931,10 +950,13 @@ def _sink_beta(q_parts, k_parts, scale, target=0.95):
     lo, hi = 0.0, 4.0
     for _ in range(24):
         mid = 0.5 * (lo + hi)
-        logits = sum(
-            torch.einsum("thd,sd->ths", (q.float() + mid * k[0].float()), k.float())
-            for q, k in zip(q_parts, k_parts, strict=True)
-        ) * scale
+        logits = (
+            sum(
+                torch.einsum("thd,sd->ths", (q.float() + mid * k[0].float()), k.float())
+                for q, k in zip(q_parts, k_parts, strict=True)
+            )
+            * scale
+        )
         logits = logits.masked_fill(~causal[:, None, :], float("-inf"))
         w = torch.softmax(logits, -1)[..., 0].mean().item()
         if w < target:
@@ -972,7 +994,9 @@ def test_backward_dominant_key_exercises_the_redo():
     )
     first = [t.clone() for t in runner.step()]
     words = _globals(runner)
-    assert words[cake_backend.REDO_WORD] > 0, "coverage: no row was flagged for the redo"
+    assert words[cake_backend.REDO_WORD] > 0, (
+        "coverage: no row was flagged for the redo"
+    )
     assert words[cake_backend.NONFINITE_WORD] == 0
     for _ in range(REPEATS - 1):
         for a, b in zip(runner.step(), first, strict=True):
@@ -993,7 +1017,9 @@ def test_backward_dominant_key_exercises_the_redo():
         topk_length=inp.topk_length,
         own_key=torch.zeros(inp.total_q, dtype=torch.long, device="cuda"),
     )
-    print("SINK rope flagged", words[cake_backend.REDO_WORD], "weight", ref["self_weight"])
+    print(
+        "SINK rope flagged", words[cake_backend.REDO_WORD], "weight", ref["self_weight"]
+    )
     assert 0.8 < ref["self_weight"] < 0.999
     _check_rope_accuracy("sink_rope", first, ref, canonical=False, nondet=nondet)
 
@@ -1008,17 +1034,23 @@ def test_backward_dominant_key_exercises_the_redo_nope():
     runner.forward()
     first = [t.clone() for t in runner.backward()]
     words = _globals(runner)
-    assert words[cake_backend.REDO_WORD] > 0, "coverage: no row was flagged for the redo"
+    assert words[cake_backend.REDO_WORD] > 0, (
+        "coverage: no row was flagged for the redo"
+    )
     assert words[cake_backend.NONFINITE_WORD] == 0
     for _ in range(REPEATS - 1):
         runner.forward()
         for a, b in zip(runner.backward(), first, strict=True):
             assert _same_bits(a, b)
     out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=inp.topk_length)
-    eager = cake_backend.backward_nope(*args, out, o_lo, lse, dout, topk_length=inp.topk_length)
+    eager = cake_backend.backward_nope(
+        *args, out, o_lo, lse, dout, topk_length=inp.topk_length
+    )
     for a, b in zip(eager, first, strict=True):
         assert _same_bits(a, b)
-    n_out, n_lse, n_o_lo = nondet_backend.forward_nope(*args, topk_length=inp.topk_length)
+    n_out, n_lse, n_o_lo = nondet_backend.forward_nope(
+        *args, topk_length=inp.topk_length
+    )
     nondet = nondet_backend.backward_nope(
         *args, n_out, n_o_lo, n_lse, dout, topk_length=inp.topk_length
     )
@@ -1028,7 +1060,9 @@ def test_backward_dominant_key_exercises_the_redo_nope():
         topk_length=inp.topk_length,
         own_key=torch.zeros(inp.total_q, dtype=torch.long, device="cuda"),
     )
-    print("SINK nope flagged", words[cake_backend.REDO_WORD], "weight", ref["self_weight"])
+    print(
+        "SINK nope flagged", words[cake_backend.REDO_WORD], "weight", ref["self_weight"]
+    )
     assert 0.8 < ref["self_weight"] < 0.999
     _check_nope_accuracy("sink_nope", first[0], first[1], ref, nondet=nondet)
 
@@ -1063,7 +1097,12 @@ def test_forced_redo_of_most_rows_repeats_bit_for_bit(monkeypatch, nope):
     runner = prepare()
     first = step(runner)
     words = _globals(runner)
-    print("FORCED_REDO", "nope" if nope else "rope", "flagged", words[cake_backend.REDO_WORD])
+    print(
+        "FORCED_REDO",
+        "nope" if nope else "rope",
+        "flagged",
+        words[cake_backend.REDO_WORD],
+    )
     assert words[cake_backend.REDO_WORD] > inp.total_k // 4
     assert words[cake_backend.NONFINITE_WORD] == 0
     assert all(torch.isfinite(t.float()).all() for t in first)
@@ -1089,25 +1128,38 @@ def test_backward_skewed_magnitudes(nope):
     inp = make_inputs([512], [1024], seed=SEED + 25, topk=256)
     gen = torch.Generator(device="cuda").manual_seed(SEED + 25)
     S, T = inp.total_k, inp.total_q
-    k_scale = torch.exp2(torch.randint(-3, 4, (S, 1), device="cuda", generator=gen).float())
-    t_scale = torch.exp2(torch.randint(-8, 9, (T, 1, 1), device="cuda", generator=gen).float())
+    k_scale = torch.exp2(
+        torch.randint(-3, 4, (S, 1), device="cuda", generator=gen).float()
+    )
+    t_scale = torch.exp2(
+        torch.randint(-8, 9, (T, 1, 1), device="cuda", generator=gen).float()
+    )
     kv = (inp.kv_latent.float() * k_scale).bfloat16()
     dout = (inp.dout.float() * t_scale).bfloat16()
     tl = inp.topk_length
     if nope:
         args = (inp.q_latent, kv, inp.idx_global)
         out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-        dq, dkv = cake_backend.backward_nope(*args, out, o_lo, lse, dout, topk_length=tl)
+        dq, dkv = cake_backend.backward_nope(
+            *args, out, o_lo, lse, dout, topk_length=tl
+        )
         n = nondet_backend.forward_nope(*args, topk_length=tl)
-        nondet = nondet_backend.backward_nope(*args, n[0], n[2], n[1], dout, topk_length=tl)
+        nondet = nondet_backend.backward_nope(
+            *args, n[0], n[2], n[1], dout, topk_length=tl
+        )
         ref = reference_fp64_nope(*args, dout=dout, topk_length=tl)
         _check_nope_accuracy("skewed_nope", dq, dkv, ref, nondet=nondet)
-        got_rows, floor_rows = rel_l2_rows(dkv, ref["dkv"]), rel_l2_rows(ref["dkv_emu"], ref["dkv"])
+        got_rows, floor_rows = (
+            rel_l2_rows(dkv, ref["dkv"]),
+            rel_l2_rows(ref["dkv_emu"], ref["dkv"]),
+        )
     else:
         k_rope = (inp.k_rope.float() * k_scale).bfloat16()
         args = (inp.q_latent, inp.q_rope, kv, k_rope, inp.idx_global)
         out, lse, o_lo = cake_backend.forward(*args, topk_length=tl)
-        grads = cake_backend.backward(*args, out, o_lo, lse, dout, topk_length=tl, dkv_fp32=True)
+        grads = cake_backend.backward(
+            *args, out, o_lo, lse, dout, topk_length=tl, dkv_fp32=True
+        )
         n = nondet_backend.forward(*args, topk_length=tl)
         nondet = nondet_backend.backward(
             *args, n[0], n[2], n[1], dout, topk_length=tl, dkv_fp32=True
@@ -1154,7 +1206,9 @@ def test_nonfinite_dout_writes_nan_rows(nope, mode, value):
         if nope:
             args = (inp.q_latent, inp.kv_latent, inp.idx_global)
             out, lse, o_lo = cake_backend.forward_nope(*args, topk_length=tl)
-            dq, dkv = cake_backend.backward_nope(*args, out, o_lo, lse, d, topk_length=tl, **kw)
+            dq, dkv = cake_backend.backward_nope(
+                *args, out, o_lo, lse, d, topk_length=tl, **kw
+            )
             return [dq], (acc if acc is not None else dkv)
         args = _rope_args(inp)
         out, lse, o_lo = cake_backend.forward(*args, topk_length=tl)
@@ -1196,13 +1250,19 @@ def test_autograd_step_does_not_synchronize(form):
     S = inp.total_k
     kw = {}
     if form == "rope_acc_map":
-        kw["dkv_dst_map"] = (torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)).contiguous()
+        kw["dkv_dst_map"] = (
+            torch.arange(S, device="cuda", dtype=torch.int32) % (S // 2)
+        ).contiguous()
         kw["dkv_acc"] = torch.zeros(S // 2, D_QK, device="cuda")
     elif form == "nope_acc":
         kw["dkv_acc"] = torch.zeros(S, D_LATENT, device="cuda")
     if nope:
         leaves = [inp.q_latent.detach().clone().requires_grad_(True)]
-        kv = inp.kv_latent if "dkv_acc" in kw else inp.kv_latent.detach().clone().requires_grad_(True)
+        kv = (
+            inp.kv_latent
+            if "dkv_acc" in kw
+            else inp.kv_latent.detach().clone().requires_grad_(True)
+        )
 
         def step():
             out = cake_backend.cake_dsa_sparse_attention_det_nope(
