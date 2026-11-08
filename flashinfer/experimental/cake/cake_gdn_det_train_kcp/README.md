@@ -155,7 +155,15 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   (the stream `tvm_ffi.use_torch_stream()` binds, without building a
   `torch.cuda.Stream` per launch).  The registry's answers (in-kernel L2 norm
   and fused-output records) and the chunk table's token count are derived once
-  and reused.
+  and reused.  An eager call sizes its workspace pools and ticket slots after
+  its first launch is issued, so that host work overlaps the launch (a
+  backward whose first program is persistent, #6 on saved or kept tapes, sizes
+  the ticket slots alone before it); a captured call sizes them first.  Each
+  launch key's record, grid and test flag are resolved once per context plan,
+  and the plan's pool tables with their kernel addressing, its walk, merge-chain
+  and zero-block device tables, split lists and pool sizes are derived at first
+  use; `cake_gdn_det_kcp` validates its keyword options once per keyword set.
+  Launches, arguments and bits are unchanged.
 * On `sm_100a` and `sm_103a`, with a zigzag or zigzag-per-document partition
   of at most 8 ranks, the summaries' offset walk runs on a side stream beside
   the transfer walk (fork / join with CUDA events; the same launches,
@@ -525,8 +533,9 @@ The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
 32-bit ticket word (the `ticket` argument), which every launch leaves at zero
 again.  The host keeps one such word per launch site in the caller's
-workspace, 128-byte aligned, zeroed once when the workspace is allocated and
-never read back; a kernel resident on a side stream therefore delays one CTA,
+workspace, 128-byte aligned, zeroed once when the workspace is first sized
+(an eager call: after its first launch, or before a persistent first program)
+and never read back; a kernel resident on a side stream therefore delays one CTA,
 not the whole grid.
 
 ## Layout of this package
