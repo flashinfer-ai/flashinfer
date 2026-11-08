@@ -37,8 +37,9 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish (no row of the shipped tables: only a caller's explicit
-  ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts) add four splits in the fixed
-  mirror order or run two chains of one split, the one-split rows store whole tiles, and the rows of
+  ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts, and one 148-SM sm_100a row that
+  runs two splits) add four splits in the fixed mirror order or run two chains of one split, the one-split rows store
+  whole tiles, and the rows of
   :data:`K1_WGRAD_DET_RULES_BY_SM` run another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
   ``sm_100a``, 152-SM ``sm_103a`` and 212-SM ``sm_107a`` parts, in that table's token ranges; the odd numbers of K
@@ -943,16 +944,12 @@ K1_CHAIN_RANGES_BY_SM: dict[
 #: 3.54e-6); from 1024 tokens up, where the deterministic program adds the halves of an output's token reduction in two
 #: partials, that error was 2.10 to 2.38 times the deterministic program's (reported, not a rule), and at 256 to 800
 #: tokens the same.  The protocol, the measured token counts and the times are in the 152-SM one-split table of the
-#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs one split of 256-wide tiles at 16172 to 16384 tokens:
-#: on a B200 part 86.3 to 88.1 us against 103.2 to 126.2 us of the deterministic plan (``nn_n256_m256_pro7``), faster in
-#: 5 of 5 paired groups in eager launches and in CUDA graph replays, within the BF16 budget, the same bits on 20 repeats.
+#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs two splits of 256-wide tiles there instead
+#: (:data:`K1_ORDERED_RANGES_BY_SM`): one split missed the accuracy check on mirrored cancelling inputs.
 # fmt: off
 K1_ONE_SPLIT_RANGES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, int], ...]]
 ] = {
-    ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, 256),),
-    },
     ("sm_100a", 152): {
         ("sm_100a", 1, 4096, 32, "f32"): ((256, 2048, 64),),
         ("sm_100a", 1, 4096, 128, "f32"): ((256, 3328, 64),),
@@ -1142,28 +1139,38 @@ K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
 #: of the routing of every other K1 table except :data:`K1_DSM_RANGES_BY_SM`; every other token count, part and row
 #: keeps that routing.  These rows' programs of the other tables were either slower, or missed the accuracy check of
 #: :data:`K1_DSM_RANGES_BY_SM` (within 1.1 times the reference's median error on six input kinds) on mirrored cancelling
-#: inputs, and these programs met it on all six kinds on a 212-SM R200 part.  On 212-SM sm_107a parts the thin FP32
-#: weight gradient ``4096 -> 32`` (16172 to 16384 tokens) runs four splits of 64-wide tiles in the mirror order (the same
-#: bits on every repeat; three splits in the arrival order and three CTAs of the cluster program missed the check
-#: there): its worst kind at most 0.70 times the reference's error, about 2 % slower than four splits in the arrival
-#: order (whose bits vary run to run) and 0.97 to 0.98 times the deterministic program's time.  ``4096 -> 48`` and
-#: ``4096 -> 64`` take the cluster program of :data:`K1_DSM_RANGES_BY_SM` there.  The FP32 weight gradients
-#: ``4096 -> 1024`` (the 192-wide row-major program) and ``5120 -> 1024`` (the 256-wide transposed-store program) run
-#: one split with the chain count of the parity of their 64-token K blocks from 16172 to 16384 tokens: four chains at
-#: an odd count (253 and 255 blocks), two at an even count (254 and 256 blocks; two chains are bit for bit two splits of
-#: one chain); ``5120 -> 512`` (the 128-wide transposed-store program) runs two chains at the even counts there.  At an
-#: odd count most of the reference's tiles add three K segments: two partials lost about 15 % on the long sums and
-#: three equal partials (the three-chain program of :data:`K1_CHAIN_RANGES_BY_SM`) missed the mirrored cancelling
-#: inputs, and four chains met the check.  Measured on a 212-SM R200 part at 16172, 16231 and 16384 tokens: every
-#: kind within the check (the worst kind of four chains 0.79 times the reference's error at ``4096 -> 1024`` and 0.60
-#: times at ``5120 -> 1024``), the same bits on 200 repeats; four chains took 1.005 to 1.010 times the three-chain
-#: program's time, two chains 0.999 to 1.000 times the time of the former route of their row (three chains, or the
-#: deterministic program at ``5120 -> 512``).
+#: inputs, and these programs met it on all six kinds (on a 212-SM R200 part; the 148-SM row below on a B200 part).  On
+#: 212-SM sm_107a parts the thin FP32 weight gradient ``4096 -> 32`` (16172 to 16384 tokens) runs four splits of 64-wide
+#: tiles in the mirror order (the same bits on every repeat; three splits in the arrival order and three CTAs of the
+#: cluster program missed the check there): its worst kind at most 0.70 times the reference's error, about 2 % slower
+#: than four splits in the arrival order (whose bits vary run to run) and 0.97 to 0.98 times the deterministic program's
+#: time.  ``4096 -> 48`` and ``4096 -> 64`` take the cluster program of :data:`K1_DSM_RANGES_BY_SM` there.  The FP32
+#: weight gradients ``4096 -> 1024`` (the 192-wide row-major program) and ``5120 -> 1024`` (the 256-wide
+#: transposed-store program) run one split with the chain count of the parity of their 64-token K blocks from 16172 to
+#: 16384 tokens: four chains at an odd count (253 and 255 blocks), two at an even count (254 and 256 blocks; two chains
+#: are bit for bit two splits of one chain); ``5120 -> 512`` (the 128-wide transposed-store program) runs two chains at
+#: the even counts there.  At an odd count most of the reference's tiles add three K segments: two partials lost about
+#: 15 % on the long sums and three equal partials (the three-chain program of :data:`K1_CHAIN_RANGES_BY_SM`) missed the
+#: mirrored cancelling inputs, and four chains met the check.  Measured on a 212-SM R200 part at 16172, 16231 and 16384
+#: tokens: every kind within the check (the worst kind of four chains 0.79 times the reference's error at
+#: ``4096 -> 1024`` and 0.60 times at ``5120 -> 1024``), the same bits on 200 repeats; four chains took 1.005 to 1.010
+#: times the three-chain program's time, two chains 0.999 to 1.000 times the time of the former route of their row
+#: (three chains, or the deterministic program at ``5120 -> 512``).  On 148-SM sm_100a parts the BF16 weight gradient
+#: ``4096 -> 1024`` runs two splits of 256-wide tiles (one add of two partials, the same bits on every run) from 16172
+#: to 16384 tokens: its former route, one split of one chain, missed the check on mirrored cancelling inputs at every
+#: token count of that window (1.87 to 1.95 times the reference's error, and 1.38 to 1.39 times on the permuted ones).
+#: Measured on a B200 part at 16172, 16231, 16256, 16300 and 16384 tokens: two splits met all six kinds (at most 1.08
+#: times the reference's error; the reference's own error at the even block counts) and repeated bit for bit; they took
+#: 96.5 to 97.5 us, 1.108 to 1.116 times one split's time and 0.80 to 0.93 times the deterministic program's (103.8 to
+#: 122.2 us), which also met the check.
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int, int, str]], ...]],
 ] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 2, 1, "arrival")),),
+    },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
         ("sm_107a", 1, 4096, 1024, "f32"): (

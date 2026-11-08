@@ -547,7 +547,7 @@ def no_k1_chains(monkeypatch):
 @pytest.mark.parametrize(
     "arch, sm_count, rows",
     [
-        ("sm_100a", 148, 30),
+        ("sm_100a", 148, 28),
         ("sm_103a", 152, 26),
         ("sm_103a", 148, 28),
         ("sm_107a", 216, 15),
@@ -557,9 +557,10 @@ def no_k1_chains(monkeypatch):
     ],
 )
 def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
-    """The verdicts of the three architectures (on sm_107a with the chain ranges of 216 SMs) take 30 / 26 / 15 of the
+    """The verdicts of the three architectures (on sm_107a with the chain ranges of 216 SMs) take 28 / 26 / 15 of the
     124 weight-gradient rows (the MLA head rows, ``L = 64``, run the deterministic program), at 16172 and 16231 tokens:
-    148-SM sm_100a ``4096 -> 1024`` BF16 runs one split (:data:`K1_ONE_SPLIT_RANGES_BY_SM`), 152-SM sm_103a
+    148-SM sm_100a ``4096 -> 1024`` BF16 is not among them (its two splits there come from
+    :data:`K1_ORDERED_RANGES_BY_SM`, which :func:`plan_atomic_gemm` reads before :func:`k1_plan`), 152-SM sm_103a
     ``5120 -> 64`` and ``5120 -> 128`` FP32 (and ``5120 -> 48`` BF16 at 16231 tokens) run the deterministic program
     there (:data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`), and the sm_107a rows that ran three or four splits run two
     splits or the deterministic program;
@@ -1524,17 +1525,14 @@ def test_k1_152_sm_one_split_ranges(monkeypatch):
     or above a range, BF16 out, every other row and every other SM count (148, 150, 151, 153,
     160) keep the route they take without the table.  A range starts and ends at a measured token count and lies below
     the window of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`; no chain range of :data:`K1_CHAIN_RANGES_BY_SM` covers it.
-    The table's other part is the 148-SM sm_100a one (B200: ``4096 -> 1024`` BF16 at one split of 256-wide tiles in the
-    window, ``test_k1_wgrad_changed_rows_take_their_route``)."""
+    The table has no other part (148-SM sm_100a ``4096 -> 1024`` BF16 runs two splits in the window instead,
+    :data:`K1_ORDERED_RANGES_BY_SM`, ``test_k1_wgrad_changed_rows_take_their_route``)."""
     table = {
         part: rows
         for part, rows in cake_backend.K1_ONE_SPLIT_RANGES_BY_SM.items()
         if part[1] == 152
     }
-    assert cake_backend.K1_ONE_SPLIT_RANGES_BY_SM[("sm_100a", 148)] == {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, 256),)
-    }
-    assert len(cake_backend.K1_ONE_SPLIT_RANGES_BY_SM) == len(table) + 1
+    assert len(cake_backend.K1_ONE_SPLIT_RANGES_BY_SM) == len(table)
     first, _ = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
     assert table == {
         part: {(part[0], 1, M, N, "f32"): want for (M, N), want in rows.items()}
@@ -6346,6 +6344,9 @@ _KB_PARITY_RANGES = (
     (16321, 16384, 2),
 )
 K1_ORDERED_ROWS = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 2, 1, "arrival")),),
+    },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
         **{
@@ -6412,7 +6413,7 @@ def test_k1_program_tables():
             for lo, hi, value in ranges:
                 bn, splits, chains, order = value
                 assert (
-                    cake_backend.atomic_k1_template(bn, True, chains, order)
+                    cake_backend.atomic_k1_template(bn, dt == "f32", chains, order)
                     in cake_jit.KERNELS[arch]
                 )
                 for T in sorted({lo, hi, (lo + hi) // 2}):
@@ -6421,13 +6422,13 @@ def test_k1_program_tables():
                     # next to a range: the row's adjacent range (the K-block parity ranges), else no range
                     near = next((v for a, b, v in ranges if a <= T <= b), None)
                     assert cake_backend.k1_ordered_plan(K=T, **kw) == near, (key, T)
-                for other in (208, 211, 213, 216):
+                for other in (sms - 4, sms - 1, sms + 1, sms + 4):
                     assert (
                         cake_backend.k1_ordered_plan(K=lo, **dict(kw, sm_count=other))
                         is None
                     )
                 assert (
-                    cake_backend.k1_ordered_plan(K=lo, **dict(kw, out_f32=False))
+                    cake_backend.k1_ordered_plan(K=lo, **dict(kw, out_f32=dt != "f32"))
                     is None
                 )
                 assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, L=2)) is None
@@ -13969,8 +13970,8 @@ K1_WGRAD_CHANGED_ROWS = {
         (4096, 48, "f32", 16231): ("dsm", 32, 2), (4096, 48, "f32", 16384): ("dsm", 32, 2),
         (4096, 64, "f32", 16172): ("dsm", 64, 4),
         (4096, 64, "f32", 16231): ("dsm", 32, 2), (4096, 64, "f32", 16384): ("dsm", 32, 2),
-        (4096, 1024, "bf16", 16172): ("pair", 256, 1), (4096, 1024, "bf16", 16231): ("pair", 256, 1),
-        (4096, 1024, "bf16", 16384): ("pair", 256, 1),
+        (4096, 1024, "bf16", 16172): ("ordered", 256, 2), (4096, 1024, "bf16", 16231): ("ordered", 256, 2),
+        (4096, 1024, "bf16", 16384): ("ordered", 256, 2),
         (5120, 1024, "bf16", 16172): ("sk", 256, None), (5120, 1024, "bf16", 16231): ("sk", 256, None),
         (5120, 1024, "bf16", 16384): ("sk", 256, None), (5120, 1024, "f32", 16172): ("sk", 256, None),
         (5120, 1024, "f32", 16231): ("sk", 256, None), (5120, 1024, "f32", 16384): ("sk", 256, None),
