@@ -88,7 +88,7 @@ All operands must be contiguous.
 | `dfn`, `dscale`, `dbase` | FP32 | as `fn`, `scale`, `base` | Parameter gradients |
 
 - `T` is a run-time scalar and may change between calls. `T == 1` is supported. `T == 0` returns empty outputs without a launch.
-- The hidden size `H` comes from `X.shape[2]`. SM100 and SM103 serve 4096, 5120 and 7168; SM107 serves 4096. One process can mix calls with different hidden sizes.
+- The hidden size `H` comes from `X.shape[2]` and must be 4096, 5120 or 7168. One process can mix calls with different hidden sizes.
 
 | Architecture | Devices | Target |
 |---|---|---|
