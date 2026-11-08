@@ -181,7 +181,7 @@ def _whole_sm_ranges() -> dict[tuple[str, str], tuple[tuple[int, Optional[int]],
 WHOLE_SM = _whole_sm_ranges()
 
 # Temporary bridge for #9134: removed when the nondet package stops running
-# 0dcdc563 on sm_103a bwd_residual_h6144.
+# 0dcdc563 on sm_103a and sm_107a bwd_residual_h6144.
 # Per architecture and deterministic route: the ``(above, at_most, program)``
 # windows of the deterministic package's earlier programs on a route it has
 # since moved to programs that start beside an all-SM kernel.  This package's
@@ -191,6 +191,10 @@ DET_PROGRAMS_BEFORE = {
     ("sm_103a", "bwd_residual_h6144"): (
         (0, 32, "07135550fae8b07bb82c"),
         (32, None, "0dcdc563be377247044e"),
+    ),
+    ("sm_107a", "bwd_residual_h6144"): (
+        (0, 960, "c15868b87bfb2c21645e"),
+        (960, None, "0dcdc563be377247044e"),
     ),
 }
 
