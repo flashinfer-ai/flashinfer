@@ -40,6 +40,7 @@ exactly as the zero-history backward route selects its programs: a record's
 without a rule is the fallback; ``dx``, the deterministic FP32 ``dweight`` and
 the predecessor fragments' tail derivatives ``dpre_tail`` in one cooperative
 launch), ``kcp_bwd_split`` (the same two programs built with ``split=True``,
+on sm_107a the big-channel one with its stage's tokens in two rolled passes,
 selected by the same rule: each is an ordinary launch one SM short of
 co-resident -- ``grid_rule.reserve_sms`` -- writing per-CTA ``dweight`` partial
 rows, followed on the same stream by the record's ``reduce`` program, the
@@ -637,7 +638,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "x"],
@@ -722,6 +722,97 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_100a": 512,
                 "sm_103a": 512,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # sm_107a's big-channel split backward: the build above with its
+        # stage's eight tokens run as two rolled passes of four (each pass's
+        # first row loaded a pass ahead), ``dx`` and the partial rows bitwise
+        # the build above's; it runs when ``C >= select_rule.channels[arch]``,
+        # else the architecture's fallback record runs.
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "reserve_sms": 1,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 82944,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp",
+        # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
+        # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "kcp_bwd_split",
+        "select_rule": {
+            "channels": {
                 "sm_107a": 1024,
             },
             "kind": "channels_at_least",
@@ -918,7 +1009,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "kcp_bwd_split": [
             "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
-            "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
+            "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",

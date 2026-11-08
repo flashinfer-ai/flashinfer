@@ -86,6 +86,8 @@ BIG = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
 SPLIT_FALLBACK = "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp"
 SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp"
 SPLIT_BIG = "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp"
+# sm_107a's big-channel split program: SPLIT_BIG's build with its stage's tokens in two rolled passes
+SPLIT_BIG_ROLL = "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp"
 TAIL = "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp"
 BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
 
@@ -149,7 +151,23 @@ PROGRAMS = {
             "split": True,
             "pair": True,
         },
-        ARCHES,
+        ("sm_100a", "sm_103a"),
+        "kcp_bwd_split",
+        BWD_TMA_PLAN,
+        2,
+    ),
+    SPLIT_BIG_ROLL: (
+        BWD,
+        {
+            "vec": 8,
+            "copy": "tma2d",
+            "stage_tokens": 8,
+            "min_blocks": 2,
+            "split": True,
+            "pair": True,
+            "fast_roll": True,
+        },
+        ("sm_107a",),
         "kcp_bwd_split",
         BWD_TMA_PLAN,
         2,
@@ -255,13 +273,13 @@ def test_routes_and_selection() -> None:
             (
                 "kcp_bwd_split",
                 SPLIT_R200_FALLBACK if arch == "sm_107a" else SPLIT_FALLBACK,
-                SPLIT_BIG,
+                SPLIT_BIG_ROLL if arch == "sm_107a" else SPLIT_BIG,
             ),
         ):
             assert routes[kind] == [fallback, big]
             assert kcp_jit.route_modules(arch, kind) == (fallback, big)
             assert kcp_jit.select_rule(kcp_jit.MODULES[big]) == {
-                "channels": BIG_C_MIN,
+                "channels": {a: BIG_C_MIN[a] for a in kcp_jit.MODULES[big]["arches"]},
                 "kind": "channels_at_least",
             }
             assert kcp_jit.select_rule(kcp_jit.MODULES[fallback]) is None
