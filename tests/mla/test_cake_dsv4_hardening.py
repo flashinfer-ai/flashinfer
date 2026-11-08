@@ -2104,7 +2104,8 @@ def test_misaligned_caller_out_matches_aligned(
 
 # ---------------------------------------------------------- padded rows on the source-exact routes
 # The routes whose programs launch one CTA per request position (max_q_len x
-# batch_size, whatever the metadata rows), at every sparse width they take.
+# batch_size, whatever the metadata rows), at every head count and sparse
+# width they take.
 _SOURCE_EXACT_PADDED_CASES = [
     _align_case(route, heads, dtype, [5, 3, 4], "ragged", width, page, form=form)
     for route, dtype in (
@@ -2114,16 +2115,18 @@ _SOURCE_EXACT_PADDED_CASES = [
     for heads, width, page, form in (
         (8, 64, 64, "h8-192"),
         (16, 128, 64, "h16-256"),
+        (8, 132, 2, "h8-260"),
         (16, 132, 2, "h16-260"),
     )
 ] + [_align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512)]
 
 
+@pytest.mark.parametrize("swa", ["long", "short-stale"])
 @pytest.mark.parametrize(
     "route,num_heads,dtype,q_lens,layout,width,page", _SOURCE_EXACT_PADDED_CASES
 )
 def test_source_exact_padded_rows_match_the_unpadded_call(
-    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page, swa
 ):
     """A padded ragged call on a source-exact route: the metadata of the first
     ``T`` rows alone (tables and lengths of exactly ``T`` rows) under the
@@ -2134,18 +2137,33 @@ def test_source_exact_padded_rows_match_the_unpadded_call(
     (staged through a ``T``-row buffer); the bytes around ``out`` stay
     untouched.  ``T = 1`` also runs with its one row viewed out of a
     ``[1, W + 1]`` parent (odd row stride), whose next row would be a
-    misaligned 16-byte index load."""
+    misaligned 16-byte index load.  ``swa="short-stale"`` gives every request
+    an SWA cache a few tokens longer than its query, with valid stale slots
+    past the causal window: the rows of the requests ``T`` cuts see fewer than
+    128 SWA slots, so a window taken from the cut length instead of the
+    request's would attend a stale slot and move a row below ``T``."""
     _skip_unless_cake_gpu()
     calls = _count_dispatches(monkeypatch)
+    short = swa == "short-stale"
     case = _build_case(
         num_heads=num_heads,
         dtype=dtype,
-        seq_lens=[_LONG_SEQ + 37 * i for i in range(len(q_lens))],
+        seq_lens=(
+            [q + 3 + 7 * i for i, q in enumerate(q_lens)]
+            if short
+            else [_LONG_SEQ + 37 * i for i in range(len(q_lens))]
+        ),
         q_lens=q_lens,
         layout=layout,
         compressed_width=width,
         compressed_page=page,
+        swa_tail="stale" if short else "minus_one",
     )
+    if short:
+        # The first row (T = 1 cuts its request) and the last row below
+        # T = cum[B] - 1 (the cut last request) see fewer than 128 SWA slots.
+        visible = case.visible()
+        assert int(visible[0]) < SWA_WINDOW and int(visible[-2]) < SWA_WINDOW
     workspace = _workspace_128mib()
     expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
     torch.cuda.synchronize()
