@@ -4052,6 +4052,11 @@ def saved_states(saved: CakeGDNDetKcpSaved) -> torch.Tensor:
 
 def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
     """The launch inventory of the last forward / backward (evidence)."""
+    ws = call.ws
+    # the byte counts once each: workspace_bytes is the pools' sum + the tapes + the ticket slots (CakeGDNDetKcpWorkspace.bytes)
+    pool_bytes = ws.pool_bytes
+    tape_bytes = ws.tape_bytes
+    workspace_bytes = sum(pool_bytes.values()) + tape_bytes + ws.ticket_bytes
     LAST_CALL[kind] = {
         **{f"n_{k}": v for k, v in call.counters.items()},
         "sequence": list(call.sequence),
@@ -4067,9 +4072,9 @@ def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
         "H_qk": call.H_qk,
         "HV": call.HV,
         "T_r": call.T_r,
-        "workspace_bytes": call.ws.bytes,
-        "pool_bytes": call.ws.pool_bytes,
-        "tape_bytes": call.ws.tape_bytes,
+        "workspace_bytes": workspace_bytes,
+        "pool_bytes": pool_bytes,
+        "tape_bytes": tape_bytes,
         "fresh_bytes": {k: t.numel() * t.element_size() for k, t in call.bufs.items()},
         "precision_mode": call.precision_mode,
         "transfer_walk": call.transfer_walk,
