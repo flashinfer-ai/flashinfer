@@ -1626,6 +1626,24 @@ def test_one_round_groups_keep_the_bits_of_one_walk(device, monkeypatch) -> None
     replays = _counted_replays(monkeypatch)
     recorded = _run(inputs, seq_lens)
     first = list(log)
+    # the fork and both walks come first, back to back, before the host work that makes the tail's outputs: no
+    # gradient is made before the fork (the walks run while the host makes them)
+    (plan,) = cake_chain._BWD_PLANS.values()
+    ops = plan.ops
+    forks = [i for i, op in enumerate(ops) if op[0] == cake_chain._OP_FORK]
+    assert len(forks) == 1, ops
+    f = forks[0]
+    assert [op[:2] for op in ops[f + 1 : f + 5]] == [
+        (cake_chain._OP_LAUNCH, tc2),
+        (cake_chain._OP_STREAM, 1),
+        (cake_chain._OP_LAUNCH, tc2),
+        (cake_chain._OP_STREAM, 0),
+    ], ops[f : f + 5]
+    made = {op[1] for op in ops[:f] if op[0] == cake_chain._OP_EMPTY}
+    made |= {
+        op[1] + j for op in ops[:f] if op[0] == cake_chain._OP_QKV for j in range(3)
+    }
+    assert not made & set(plan.grads[:5]), (made, plan.grads)
     log.clear()
     runs = [_run(inputs, seq_lens) for _ in range(4)]
     assert log == first * 4 and len(replays) == 4

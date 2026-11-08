@@ -3964,9 +3964,12 @@ def _backward_chain(
         # value-head group (its workspace bounded by segmented launches), or the cluster kernel of a group of two or
         # three (GROUP_TAILS); the FP32-partial cluster tails write dq / dk / dv through their token-row strides, into
         # the caller's views (``grad_qkv``) when given
+        forked = None  # the early groups' (caller's stream, side stream) from their fork before the walks
         if groups is not None:
             # R form: group A's dhu_tc2 (the caller's stream) first, so the host work that makes the tail's outputs
-            # below runs while it does; the early groups bind both walks and fork before them (below)
+            # below runs while it does.  The early groups (one_round_split) bind both walks, fork and fire them back to
+            # back here, group A's on the caller's stream and group B's on the side stream, so that host work runs
+            # while both walk (a fork after it would hold the device idle for its length); their tails follow below
             na, ca = groups.split, groups.split_chunk
 
             def dhu_tc2(s0, s1):
@@ -3976,97 +3979,113 @@ def _backward_chain(
                                meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0,
                                scale)  # fmt: skip
 
-            if not groups.early:
+            if groups.early:
+                walk_a, walk_b = dhu_tc2(0, na), dhu_tc2(na, segs.num_segments)
+                forked = ex.fork(index)
+                try:
+                    walk_a()
+                    with ex.on(forked[1]):
+                        walk_b()
+                except BaseException:
+                    ex.join(*forked)
+                    raise
+            else:
                 dhu_tc2(0, na)()
-        qkv_stride = None
-        if grad_qkv is not None and form in F32X_TAILS:
-            qkv = ex.qkv(grad_qkv)
-            dq, dk, dv = qkv[0], qkv[1], qkv[2]
-            if len(qkv) > 3:
-                qkv_stride = qkv[3]
-        else:
-            dq = ex.empty(qn.shape, qn.dtype, device)
-            dk = ex.empty(kn.shape, kn.dtype, device)
-            dv = ex.empty(v.shape, v.dtype, device)
-        dbeta = ex.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
-                         torch.bfloat16 if dbeta_bf16 else torch.float32, device)  # fmt: skip
-        dg = ex.empty(
-            forward.get("g_shape") or (total_tokens, num_v_heads), torch.float32, device
-        )
-        normalize = 1 if forward.get("normalize_qk", True) else 0
-        rstd_q, rstd_k = forward["rstd_q"], forward["rstd_k"]
-        num_chunks = meta.num_chunks
-        # the token-row strides of v, dq, dk and dv, which these tails take after their operands (dq / dk / dv's
-        # from the caller when it gives it); the fixed-order cluster tails take v's token pitch in heads
-        if form not in F32X_TAILS:
-            strides = (v_rows,)
-        elif qkv_stride is not None:
-            strides = (_row_stride(v), qkv_stride, qkv_stride, qkv_stride)
-        else:
-            strides = tuple(_row_stride(t) for t in (v, dq, dk, dv))
-        if form in GROUP_TAILS and groups is None:
-            # one launch over the whole table, issued directly: the host path of the deterministic package's tail
-            ex.launch(form + ("_bf16" if dbeta_bf16 else ""), num_chunks * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k,
-                      v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start,
-                      meta.chunk_len, num_heads, num_v_heads, scale, normalize, *strides)  # fmt: skip
-            return ex.grads(
-                meta, dq, dk, dv, dg, dbeta, dh0 if has_initial_state else None
+        try:
+            # the host work that makes the tail's outputs (an early fork's walks run meanwhile)
+            qkv_stride = None
+            if grad_qkv is not None and form in F32X_TAILS:
+                qkv = ex.qkv(grad_qkv)
+                dq, dk, dv = qkv[0], qkv[1], qkv[2]
+                if len(qkv) > 3:
+                    qkv_stride = qkv[3]
+            else:
+                dq = ex.empty(qn.shape, qn.dtype, device)
+                dk = ex.empty(kn.shape, kn.dtype, device)
+                dv = ex.empty(v.shape, v.dtype, device)
+            dbeta = ex.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
+                             torch.bfloat16 if dbeta_bf16 else torch.float32, device)  # fmt: skip
+            dg = ex.empty(
+                forward.get("g_shape") or (total_tokens, num_v_heads),
+                torch.float32,
+                device,
             )
-
-        def rows(a, b):
-            # the chunk rows [a, b) of the per-chunk tensors: the tensors themselves for the whole table (no slicing
-            # on the host path of a one-launch tail)
-            if (a, b) == (0, num_chunks):
-                return h, dh, meta.chunk_start, meta.chunk_len
-            return h[a:b], dh[a:b], meta.chunk_start[a:b], meta.chunk_len[a:b]
-
-        if form in GROUP_TAILS:
-            stage = form + ("_bf16" if dbeta_bf16 else "")
-
-            def tail(c0, c1):
-                h_r, dh_r, cs_r, cl_r = rows(c0, c1)
-                ex.launch(stage, (c1 - c0) * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k, v_new, do, dv2, h_r, dh_r, g_cs,
-                          v, A, beta32, dq, dk, dg, dv, dbeta, cs_r, cl_r, num_heads, num_v_heads, scale,
-                          normalize, *strides)  # fmt: skip
-
-        else:
-            stage = form + ("_bf16" if dbeta_bf16 else "")
-            group = num_v_heads // num_heads
-
-            def tail(c0, c1):
-                # the workspace of the stream that launches (every tail runs on the caller's stream), and launches of
-                # at most its rows in stream order
-                ranges, tiles = tail_segments(c1 - c0, num_heads, num_v_heads)
-                ws = workspaces.take_zeroed(
-                    index,
-                    "tail_ws",
-                    max(tiles * group, 1),
-                    (TAIL_TILE_FLOATS,),
-                    torch.float32,
-                    device,
+            normalize = 1 if forward.get("normalize_qk", True) else 0
+            rstd_q, rstd_k = forward["rstd_q"], forward["rstd_k"]
+            num_chunks = meta.num_chunks
+            # the token-row strides of v, dq, dk and dv, which these tails take after their operands (dq / dk / dv's
+            # from the caller when it gives it); the fixed-order cluster tails take v's token pitch in heads
+            if form not in F32X_TAILS:
+                strides = (v_rows,)
+            elif qkv_stride is not None:
+                strides = (_row_stride(v), qkv_stride, qkv_stride, qkv_stride)
+            else:
+                strides = tuple(_row_stride(t) for t in (v, dq, dk, dv))
+            if form in GROUP_TAILS and groups is None:
+                # one launch over the whole table, issued directly: the host path of the deterministic package's tail
+                ex.launch(form + ("_bf16" if dbeta_bf16 else ""), num_chunks * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k,
+                          v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start,
+                          meta.chunk_len, num_heads, num_v_heads, scale, normalize, *strides)  # fmt: skip
+                return ex.grads(
+                    meta, dq, dk, dv, dg, dbeta, dh0 if has_initial_state else None
                 )
-                ws_count = workspaces.take_zeroed(
-                    index, "tail_count", max(tiles, 1), (), torch.uint32, device
-                )
-                for s0, s1 in ranges:
-                    a, b = c0 + s0, c0 + s1
-                    h_r, dh_r, cs_r, cl_r = rows(a, b)
-                    ex.launch(stage, (b - a) * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k, v_new, do, dv2, h_r, dh_r,
-                              g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, ws, ws_count, cs_r, cl_r, num_heads,
-                              num_v_heads, scale, normalize, tiles, v_rows)  # fmt: skip
+
+            def rows(a, b):
+                # the chunk rows [a, b) of the per-chunk tensors: the tensors themselves for the whole table (no slicing
+                # on the host path of a one-launch tail)
+                if (a, b) == (0, num_chunks):
+                    return h, dh, meta.chunk_start, meta.chunk_len
+                return h[a:b], dh[a:b], meta.chunk_start[a:b], meta.chunk_len[a:b]
+
+            if form in GROUP_TAILS:
+                stage = form + ("_bf16" if dbeta_bf16 else "")
+
+                def tail(c0, c1):
+                    h_r, dh_r, cs_r, cl_r = rows(c0, c1)
+                    ex.launch(stage, (c1 - c0) * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k, v_new, do, dv2, h_r, dh_r, g_cs,
+                              v, A, beta32, dq, dk, dg, dv, dbeta, cs_r, cl_r, num_heads, num_v_heads, scale,
+                              normalize, *strides)  # fmt: skip
+
+            else:
+                stage = form + ("_bf16" if dbeta_bf16 else "")
+                group = num_v_heads // num_heads
+
+                def tail(c0, c1):
+                    # the workspace of the stream that launches (every tail runs on the caller's stream), and launches of
+                    # at most its rows in stream order
+                    ranges, tiles = tail_segments(c1 - c0, num_heads, num_v_heads)
+                    ws = workspaces.take_zeroed(
+                        index,
+                        "tail_ws",
+                        max(tiles * group, 1),
+                        (TAIL_TILE_FLOATS,),
+                        torch.float32,
+                        device,
+                    )
+                    ws_count = workspaces.take_zeroed(
+                        index, "tail_count", max(tiles, 1), (), torch.uint32, device
+                    )
+                    for s0, s1 in ranges:
+                        a, b = c0 + s0, c0 + s1
+                        h_r, dh_r, cs_r, cl_r = rows(a, b)
+                        ex.launch(stage, (b - a) * num_v_heads, 1, 1, qn, kn, rstd_q, rstd_k, v_new, do, dv2, h_r, dh_r,
+                                  g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, ws, ws_count, cs_r, cl_r, num_heads,
+                                  num_v_heads, scale, normalize, tiles, v_rows)  # fmt: skip
+        except BaseException:
+            # the early groups' side stream, joined as the dispatch below would
+            if forked is not None:
+                ex.join(*forked)
+            raise
 
         if groups is None:
             tail(0, meta.num_chunks)
         elif groups.early:
-            # one round (one_round_split): both walks bound, then forked together; the caller's stream walks group A
-            # (the longer sequences) and runs its tail, the side stream walks group B (the sequences that end first)
-            # and runs its tail on the SMs the walks leave
-            walk_a, walk_b = dhu_tc2(0, na), dhu_tc2(na, segs.num_segments)
-            main, side = ex.fork(index)
+            # one round (one_round_split): both walks forked and fired above; the caller's stream runs group A's tail
+            # (the longer sequences) after its walk, the side stream group B's (the sequences that end first) after
+            # its walk, on the SMs the walks leave
+            main, side = forked
             try:
-                walk_a()
                 with ex.on(side):
-                    walk_b()
                     tail(ca, meta.num_chunks)
                 tail(0, ca)
             finally:
