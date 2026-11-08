@@ -3094,35 +3094,62 @@ def test_a_cached_table_is_read_after_its_write_on_another_stream(
 def test_an_evicted_table_waits_for_reads_on_another_stream(
     device, monkeypatch
 ) -> None:
-    # A call on stream s2, queued behind a sleep, hits tables built on the current stream.  The caches then drop every
-    # table and the current stream at once reuses memory of their sizes (zero-filled): the tables' memory must stay
-    # untouched until s2's launches have read it.
+    # A call on stream s2, queued behind a sleep, hits tables built on stream s1.  The caches then drop every table and
+    # s1 allocates blocks of the tables' sizes (zero-filling any table block it gets): the allocator must not hand a
+    # table's memory out until s2's launches have read it, and must hand it out again after them.
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip("checks the reuse of freed blocks by the native caching allocator")
     seq_lens = (300, 77, 640)
     inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=137)
     _fresh_table_caches(monkeypatch)
-    want = _run(inputs, seq_lens, lpt=False)
-    sizes = [
-        m.chunk_start.untyped_storage().nbytes() for m in cake_chain._HOST_META.values()
-    ]
-    sizes += [w.untyped_storage().nbytes() for w, _ready in cake_chain._WALKS.values()]
-    assert len(sizes) == 2  # the chunk tables and the identity walk
+    s1, s2 = _overlapping_streams(device)
+    with torch.cuda.stream(s1):
+        want = _run(inputs, seq_lens, lpt=False)
+    tables = [m.chunk_start for m in cake_chain._HOST_META.values()]
+    tables += [w for w, _ready in cake_chain._WALKS.values()]
+    assert len(tables) == 2  # the chunk tables and the identity walk
+    blocks = {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in tables
+    }
+    del tables
     cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
-    s2 = torch.cuda.Stream(device=device)
-    s2.wait_stream(torch.cuda.current_stream(device))
+    s2.wait_stream(s1)
     with torch.cuda.stream(s2):
-        torch.cuda._sleep(1_000_000_000)
+        torch.cuda._sleep(2_000_000_000)
         got = _issue(inputs, cu_seqlens, cu_seqlens_cpu, lpt=False)
     for name in ("_META_FRONT", "_HOST_META", "_WALKS"):
         getattr(cake_chain, name).clear()
     gc.collect()
-    junk = [
-        torch.zeros(n // 4, dtype=torch.int32, device=device)
-        for n in sizes
-        for _ in range(4)
-    ]
+    junk = []
+
+    def reuse() -> set:
+        """Allocate on s1 until allocations overlap every table's memory (a freed block can merge with free neighbors;
+        at most 4096 rounds); zero each allocation that overlaps a table."""
+        got_back = set()
+        with torch.cuda.stream(s1):
+            for _ in range(4096):
+                for n in blocks.values():
+                    junk.append(torch.empty(n, dtype=torch.uint8, device=device))
+                    start = junk[-1].data_ptr()
+                    hit = {
+                        p
+                        for p, size in blocks.items()
+                        if start < p + size and p < start + n
+                    }
+                    if hit:
+                        got_back |= hit
+                        junk[-1].zero_()
+                if got_back == blocks.keys():
+                    break
+        return got_back
+
+    early = reuse()
     torch.cuda.synchronize()
+    assert not early, (
+        "a table's memory was handed out while a call on another stream could still read it"
+    )
     _assert_bitwise(got, want, OUTPUT_NAMES)
-    del junk
+    assert reuse() == blocks.keys()  # once s2 has read them the blocks are free again
 
 
 def test_tables_built_inside_a_capture_are_not_cached(device, monkeypatch) -> None:
