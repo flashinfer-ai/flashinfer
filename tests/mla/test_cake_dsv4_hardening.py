@@ -2100,3 +2100,118 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
     assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()
+
+
+# ---------------------------------------------------------- padded rows on the source-exact routes
+# The routes whose programs launch one CTA per request position (max_q_len x
+# batch_size, whatever the metadata rows), at every head count and sparse
+# width they take.  The H8/H16 routes run request lengths 5, 3, 4 and 1, 5, 5:
+# with a one-row first request, T = 1 ends at a request boundary and both
+# later requests start at or past T.
+_SOURCE_EXACT_PADDED_CASES = [
+    _align_case(route, heads, dtype, q_lens, "ragged", width, page, form=form + tag)
+    for route, dtype in (
+        ("bf16_h8_h16_source_exact", _BF16),
+        ("fp8_h8_h16_source_exact", _FP8),
+    )
+    for heads, width, page, form in (
+        (8, 64, 64, "h8-192"),
+        (16, 128, 64, "h16-256"),
+        (8, 132, 2, "h8-260"),
+        (16, 132, 2, "h16-260"),
+    )
+    for q_lens, tag in (([5, 3, 4], ""), ([1, 5, 5], "-q1-5-5"))
+] + [_align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512)]
+
+
+@pytest.mark.parametrize("swa", ["long", "short-stale"])
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _SOURCE_EXACT_PADDED_CASES
+)
+def test_source_exact_padded_rows_match_the_unpadded_call(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page, swa
+):
+    """A padded ragged call on a source-exact route: the metadata of the first
+    ``T`` rows alone (tables and lengths of exactly ``T`` rows) under the
+    query and ``cum_seq_lens_q`` of every row, for ``T`` = 1, the first
+    request boundary and one row short of the end.  Rows below ``T`` get
+    bitwise the unpadded call's output, in an aligned ``out`` and in one 2
+    bytes off its store alignment (the program writes a ``T``-row staging
+    buffer, which the host copies into ``out``).  In the aligned ``out``
+    every row at or past ``T`` keeps its NaN: the program wrote none of them.
+    In the staged call those rows are out of the program's reach, so the same
+    check holds by construction.  The bytes around ``out`` stay untouched.
+    ``T = 1`` also runs with its one row viewed out of a ``[1, W + 1]``
+    parent (odd row stride), whose next row would be a misaligned 16-byte
+    index load.  These checks see what lands in ``out`` only: a read of a
+    metadata row at or past ``T``, or a write past the end of the staging
+    buffer, leaves ``out`` as it is.  Those show under ``compute-sanitizer
+    --tool memcheck`` with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` (each
+    ``T``-row table, the lengths and the staging buffer an allocation of its
+    own).  ``swa="short-stale"`` gives every request
+    an SWA cache a few tokens longer than its query, with valid stale slots
+    past the causal window: the rows of the requests ``T`` cuts see fewer than
+    128 SWA slots, so a window taken from the cut length instead of the
+    request's would attend a stale slot and move a row below ``T``."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    short = swa == "short-stale"
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=(
+            [q + 3 + 7 * i for i, q in enumerate(q_lens)]
+            if short
+            else [_LONG_SEQ + 37 * i for i in range(len(q_lens))]
+        ),
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+        swa_tail="stale" if short else "minus_one",
+    )
+    if short:
+        # The rows below T of a request T cuts see fewer than 128 SWA slots:
+        # the first row (T = 1 cuts a first request longer than one row) and
+        # the last row below T = cum[B] - 1 (which cuts the last request).
+        visible = case.visible()
+        assert int(visible[0]) < SWA_WINDOW and int(visible[-2]) < SWA_WINDOW
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls == [(route, case.rows)], calls
+    assert not torch.isnan(expected).any()
+
+    table, lens = case.sparse_indices, case.sparse_topk_lens
+    cols = int(table.shape[1])
+    ends = case.cum_seq_lens_q.tolist()
+    one_row = torch.full((1, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    one_row[:, :cols] = table[:1]
+    assert one_row[:, :cols].stride(0) % 4 != 0
+    metadata = [
+        (rows, table[:rows].clone()) for rows in sorted({1, ends[1], ends[-1] - 1})
+    ]
+    metadata.append((1, one_row[:, :cols]))
+    numel = expected.numel()
+    for rows, rows_table in metadata:
+        padded = dataclasses.replace(
+            case, sparse_indices=rows_table, sparse_topk_lens=lens[:rows].clone()
+        )
+        for offset_bytes in (0, 2):
+            raw = torch.full(
+                (numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0"
+            )
+            start = ((-raw.data_ptr()) % 32 + offset_bytes) // raw.element_size()
+            out = raw[start : start + numel].view(case.query.shape)
+            assert out.data_ptr() % 32 == offset_bytes
+            calls.clear()
+            got = padded.run(workspace=workspace, out=out, float_scales=True)
+            torch.cuda.synchronize()
+            where = f"T={rows} of {case.rows}, stride {rows_table.stride(0)}, out +{offset_bytes} B"
+            assert calls == [(route, rows)], (where, calls)
+            assert torch.equal(
+                got[:rows].view(torch.int16), expected[:rows].view(torch.int16)
+            ), where
+            assert torch.isnan(got[rows:]).all(), where
+            assert torch.isnan(raw[:start]).all(), where
+            assert torch.isnan(raw[start + numel :]).all(), where

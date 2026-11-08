@@ -25,13 +25,13 @@ also on sm_103a for launches of at most 128 keys; MW: without the short-KV chain
 sm_100a launches of many tiles over few keys; OW: stage 0 stored as soon as its last PV
 is in, or for a Q1 program the short-KV chain, for sm_100a launches of one tile per CTA;
 NC, LSE, SINK, NC_LSE, NC_SINK: the non-causal, LSE and attention-sink forms, for every
-page size and both targets, with PX and PX_Q1 ones for sm_103a); the RUNTIME_SK programs
-are the same schedule with the key range of a tile split over several work units, whose
-FP32 partials the tile's last unit merges (S2: two units per split tile at most, the
-merging unit's own term from its TMEM O, for sm_100a). The host module
-``flashinfer.cake_fmha`` selects the program from the head counts, the page size, the
-planned maximum lengths and the kind of scale arguments of a launch, computes the grid
-and launches it; other shapes keep the module's other context routes.
+page size and both targets, with PX ones for sm_103a and PX_Q1 ones for both targets);
+the RUNTIME_SK programs are the same schedule with the key range of a tile split over
+several work units, whose FP32 partials the tile's last unit merges (S2: two units per
+split tile at most, the merging unit's own term from its TMEM O, for sm_100a). The host
+module ``flashinfer.cake_fmha`` selects the program from the head counts, the page size,
+the planned maximum lengths and the kind of scale arguments of a launch, computes the
+grid and launches it; other shapes keep the module's other context routes.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -10439,8 +10439,11 @@ RUNTIME_PACK1_NC_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_8e82b164f633739b5629_kernel.cu",
         "cake_fmha_context_fp8_8e82b164f633739b5629_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10505,8 +10508,11 @@ RUNTIME_PACK2_NC_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_e93a40c1207c92f87a57_kernel.cu",
         "cake_fmha_context_fp8_e93a40c1207c92f87a57_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10571,8 +10577,11 @@ RUNTIME_PACK4_NC_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_3a283b3a3d8e2458600a_kernel.cu",
         "cake_fmha_context_fp8_3a283b3a3d8e2458600a_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10637,8 +10646,11 @@ RUNTIME_PACK8_NC_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_0d8e81c1e5cc25d494be_kernel.cu",
         "cake_fmha_context_fp8_0d8e81c1e5cc25d494be_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10703,8 +10715,11 @@ RUNTIME_PACK1_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_6cb0aa1bc299570e3bb6_kernel.cu",
         "cake_fmha_context_fp8_6cb0aa1bc299570e3bb6_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10769,8 +10784,11 @@ RUNTIME_PACK2_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_a5fe9901f54f0f82983e_kernel.cu",
         "cake_fmha_context_fp8_a5fe9901f54f0f82983e_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10835,8 +10853,11 @@ RUNTIME_PACK4_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_a20192c91fa6463266af_kernel.cu",
         "cake_fmha_context_fp8_a20192c91fa6463266af_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10901,8 +10922,11 @@ RUNTIME_PACK8_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_67e4a476e798c6ef5eab_kernel.cu",
         "cake_fmha_context_fp8_67e4a476e798c6ef5eab_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -10967,8 +10991,11 @@ RUNTIME_PACK1_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_42a34f611e416b95f3c4_kernel.cu",
         "cake_fmha_context_fp8_42a34f611e416b95f3c4_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11033,8 +11060,11 @@ RUNTIME_PACK2_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_70a1f8d6422b88b2a5d1_kernel.cu",
         "cake_fmha_context_fp8_70a1f8d6422b88b2a5d1_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11099,8 +11129,11 @@ RUNTIME_PACK4_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_a8f20df7b8e78c71187b_kernel.cu",
         "cake_fmha_context_fp8_a8f20df7b8e78c71187b_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11165,8 +11198,11 @@ RUNTIME_PACK8_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_340f1b13ef6db66a4819_kernel.cu",
         "cake_fmha_context_fp8_340f1b13ef6db66a4819_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11231,8 +11267,11 @@ RUNTIME_PACK1_NC_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_f39420f79b571a0d7e68_kernel.cu",
         "cake_fmha_context_fp8_f39420f79b571a0d7e68_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11297,8 +11336,11 @@ RUNTIME_PACK2_NC_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_94e7c483b24b790cc3ee_kernel.cu",
         "cake_fmha_context_fp8_94e7c483b24b790cc3ee_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11363,8 +11405,11 @@ RUNTIME_PACK4_NC_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_aaafe5a028f797974fcd_kernel.cu",
         "cake_fmha_context_fp8_aaafe5a028f797974fcd_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11429,8 +11474,11 @@ RUNTIME_PACK8_NC_LSE_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_51fbdbb46101ec85a10c_kernel.cu",
         "cake_fmha_context_fp8_51fbdbb46101ec85a10c_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11495,8 +11543,11 @@ RUNTIME_PACK1_NC_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_9d57fae5c177b84f333c_kernel.cu",
         "cake_fmha_context_fp8_9d57fae5c177b84f333c_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11561,8 +11612,11 @@ RUNTIME_PACK2_NC_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_56ed41488640572f208c_kernel.cu",
         "cake_fmha_context_fp8_56ed41488640572f208c_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11627,8 +11681,11 @@ RUNTIME_PACK4_NC_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_9633967d1993341e9e9e_kernel.cu",
         "cake_fmha_context_fp8_9633967d1993341e9e9e_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -11693,8 +11750,11 @@ RUNTIME_PACK8_NC_SINK_PX_Q1 = cake_program.CakeProgram(
         "cake_fmha_context_fp8_cdfe342fcf2ea3cd54e1_kernel.cu",
         "cake_fmha_context_fp8_cdfe342fcf2ea3cd54e1_binding.cu",
     ),
-    targets=("sm_103a",),
-    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",

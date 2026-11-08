@@ -494,19 +494,30 @@ def _device_index(device: Optional[torch.device]) -> int:
 # ``num_queries`` tokens (``token = token_base + token_step * (blockIdx.x + k * gridDim.x)``), so every grid
 # <= ``num_queries`` is legal.  One persistent CTA per SM overlaps each token's prologue / epilogue with its
 # predecessor's tail and measured 0.5-19 % faster than a CTA per token while the launch's FP32 dkv window
-# (``num_kv`` x 2048 B) is within 64 MiB; beyond it the CTAs' token drift widens the set of keys live in L2
-# (3-9 % slower at 268-553 MB windows), so those launches keep a CTA per token.
+# (``num_kv`` x 2048 B) is within 64 MiB; beyond its architecture's window the CTAs' token drift widens the set of
+# keys live in L2 (3-9 % slower at 268-553 MB windows), so those launches keep a CTA per token.  SM100 / SM103 keep
+# the persistent grid up to 128 MiB (65,536 keys: 0.8-2.6 % faster backward); on SM107 the 128 MiB window is
+# 1.4-3.7 % slower, so it keeps 64 MiB, the window of an architecture without its own entry.
 NOPE_PERSISTENT_DKV_BYTES = 64 << 20
+NOPE_PERSISTENT_DKV_BYTES_BY_ARCH = {
+    "sm_100a": 128 << 20,
+    "sm_103a": 128 << 20,
+    "sm_107a": 64 << 20,
+}
 NOPE_DKV_BYTES_PER_KEY = 2048
 
 
-def nope_bwd_launch_grid(num_queries: int, num_kv_in_pass: int, sm_count: int) -> int:
+def nope_bwd_launch_grid(
+    num_queries: int, num_kv_in_pass: int, sm_count: int, arch: Optional[str] = None
+) -> int:
     """Grid (x) of a NoPE main-stage launch over ``num_queries`` tokens whose key pass covers ``num_kv_in_pass``
     keys -- the kernel's own rule, mirrored: one persistent CTA per SM (``min(num_queries, sm_count)``, at least one)
-    while the pass's FP32 dkv window (``num_kv_in_pass`` x 2048 B) is within :data:`NOPE_PERSISTENT_DKV_BYTES`, else
-    a CTA per token (``num_queries``).  The host never launches zero tokens (the empty paths return before planning).
+    while the pass's FP32 dkv window (``num_kv_in_pass`` x 2048 B) is within the window of ``arch``
+    (:data:`NOPE_PERSISTENT_DKV_BYTES_BY_ARCH`, :data:`NOPE_PERSISTENT_DKV_BYTES` without an entry), else a CTA per
+    token (``num_queries``).  The host never launches zero tokens (the empty paths return before planning).
     """
-    if int(num_kv_in_pass) * NOPE_DKV_BYTES_PER_KEY <= NOPE_PERSISTENT_DKV_BYTES:
+    window = NOPE_PERSISTENT_DKV_BYTES_BY_ARCH.get(arch, NOPE_PERSISTENT_DKV_BYTES)
+    if int(num_kv_in_pass) * NOPE_DKV_BYTES_PER_KEY <= window:
         return max(1, min(int(num_queries), int(sm_count)))
     return int(num_queries)
 
@@ -3467,13 +3478,13 @@ def _plan_nope(
         entries[delta] = _stage_entry(delta, arch, scalars, program)
         backward_order.append(delta)
         if passes == 1:
-            grid = (nope_bwd_launch_grid(T, S, sm_count), 1, 1)
+            grid = (nope_bwd_launch_grid(T, S, sm_count, arch), 1, 1)
             entries[main_stage] = _stage_entry(main_stage, arch, scalars, program, grid)
             backward_order.append(main_stage)
         else:
             for chunk_index, (_base, num_tokens) in enumerate(token_chunks):
                 chunk_scalars = dict(scalars, num_queries=int(num_tokens))
-                grid = (nope_bwd_launch_grid(int(num_tokens), S, sm_count), 1, 1)
+                grid = (nope_bwd_launch_grid(int(num_tokens), S, sm_count, arch), 1, 1)
                 for stage in pass_stages:
                     entries[(stage, chunk_index)] = _stage_entry(
                         stage,

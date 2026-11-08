@@ -7458,7 +7458,7 @@ FWD_MAP_CLAIM = {
 # at 7168.
 FWD_MAP_XNRM = {
     "sm_100a": ((64, 7168),),
-    "sm_103a": ((64, 6144),),
+    "sm_103a": ((64, 6656),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
 # FWD_COEF_REGIMES: the coefficient pass's dispatch per architecture, in grid units of the 8-token CTA (grid =

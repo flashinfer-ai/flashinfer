@@ -407,7 +407,7 @@ TABLES = {
     },
     "FWD_MAP_XNRM": {
         "sm_100a": ((64, 7168),),
-        "sm_103a": ((64, 6144),),
+        "sm_103a": ((64, 6656),),
         "sm_107a": ((64, 14928), (15288, 65536)),
     },
     "FWD_COEF_REGIMES": {"sm_100a": "round7", "sm_103a": "round5", "sm_107a": "round9"},
@@ -1757,7 +1757,9 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(4096, 152, "sm_103a") == "nsx_ct_xn"
     assert loader.fwd_map_program(5120, 152, "sm_103a") == "nsx_xn"
     assert loader.fwd_map_program(6144, 152, "sm_103a") == "nsx_xn"
-    assert loader.fwd_map_program(6145, 152, "sm_103a") == "nsx"
+    assert loader.fwd_map_program(6145, 152, "sm_103a") == "nsx_xn"
+    assert loader.fwd_map_program(6656, 152, "sm_103a") == "nsx_xn"
+    assert loader.fwd_map_program(6657, 152, "sm_103a") == "nsx"
     assert loader.fwd_map_program(1024, 152, "sm_103a") == "nsx_st5_mb1_xn"
     assert loader.fwd_map_program(64, 152, "sm_103a") == "nsx_st5_mb1"
     assert loader.fwd_map_program(65, 152, "sm_103a") == "nsx_st5_mb1_xn"

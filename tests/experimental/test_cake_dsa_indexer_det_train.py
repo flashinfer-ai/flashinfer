@@ -4754,10 +4754,11 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
 
 
 def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
-    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
-    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
-    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
-    the same architecture keeps its tail."""
+    """A program of the record's ``static_scan_kinds`` keeps the static enumeration on every call, also where the
+    call's units exceed the grid: its runner gets no ticket tail (no memset at prepare or run) and its rows stay
+    bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on the same architecture keeps its tail.
+    No BF16 record names a static kind now, so this skips; the FP8 form's static programs (sm_107a) are covered by
+    ``test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace``."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
@@ -5640,13 +5641,13 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
 
 def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
     """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
-    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    programs keep the static enumeration there (no BF16 record names one; sm_107a's FP8 record does), each a kind the
     architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
     assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
     assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "pair_l6"],
+        "sm_107a": [],
     }
     # prepare decides a call's tail from this per-architecture set (made once per process)
     for arch in cake_jit.POLICY:
