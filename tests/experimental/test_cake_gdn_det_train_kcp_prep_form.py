@@ -58,7 +58,10 @@ def _inputs(cu, H_qk: int = 2, HV: int = 6) -> dict[str, torch.Tensor]:
         "q": torch.randn(T, H_qk, 128, generator=gen).to(BF16),
         "k": torch.randn(T, H_qk, 128, generator=gen).to(BF16),
         "v": torch.randn(T, HV, 128, generator=gen).to(BF16),
-        "g": (-torch.exp(a_log)[None, :] * torch.nn.functional.softplus(torch.randn(T, HV, generator=gen)))
+        "g": (
+            -torch.exp(a_log)[None, :]
+            * torch.nn.functional.softplus(torch.randn(T, HV, generator=gen))
+        )
         .float()
         .contiguous(),
         "beta": torch.sigmoid(torch.randn(T, HV, generator=gen)).float().contiguous(),
@@ -67,7 +70,9 @@ def _inputs(cu, H_qk: int = 2, HV: int = 6) -> dict[str, torch.Tensor]:
 
 
 def _setup(cu=CU):
-    part = plan.cake_gdn_det_train_kcp_partition(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    part = plan.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
     return plan.cake_gdn_det_train_kcp_build_context(part, None, 0, CPU), _inputs(cu)
 
 
@@ -82,12 +87,19 @@ def _preps(kind: str) -> list[str]:
 def _saved_pass(ctx, ops, **o) -> dict[str, torch.Tensor]:
     o = {"backend": "fake", "use_qk_l2norm_in_kernel": True, **o}
     out, saved = kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, **o)
-    dq, dk, dv, dbeta, dg = kcp.cake_gdn_det_train_kcp_backward(*_ops(ops), ctx, ops["dout"], saved=saved, **o)
+    dq, dk, dv, dbeta, dg = kcp.cake_gdn_det_train_kcp_backward(
+        *_ops(ops), ctx, ops["dout"], saved=saved, **o
+    )
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}
 
 
-def _autograd(ctx, ops, *, ckpt: bool, handle: bool = False, **o) -> dict[str, torch.Tensor]:
-    leaves = [ops[n].detach().clone().requires_grad_(True) for n in ("q", "k", "v", "g", "beta")]
+def _autograd(
+    ctx, ops, *, ckpt: bool, handle: bool = False, **o
+) -> dict[str, torch.Tensor]:
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
     o = {"backend": "fake", "use_qk_l2norm_in_kernel": True, **o}
     hd = kcp.CakeGDNDetKcpRecomputeHandle() if handle else None
 
@@ -101,7 +113,10 @@ def _autograd(ctx, ops, *, ckpt: bool, handle: bool = False, **o) -> dict[str, t
     else:
         out = fn(*leaves, hd)
     out.backward(ops["dout"])
-    return {"out": out.detach(), **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)}}
+    return {
+        "out": out.detach(),
+        **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+    }
 
 
 def _same(a: dict, b: dict, what: str) -> None:
@@ -121,12 +136,19 @@ def test_registry_selects_the_forward_form_by_backward_tapes() -> None:
     assert (fwd["program"], fwd["variant"]) == (FULL, "fwd")
     assert full["select_rule"] == {"kind": "prep_form", "backward_tapes": True}
     assert fwd["select_rule"] == {"kind": "prep_form", "backward_tapes": False}
-    assert [p for p in full["arg_plan"] if p[1] not in ("akk_out", "g_cum")] == fwd["arg_plan"]
-    assert set(full["logical"].values()) - set(fwd["logical"].values()) == {"akk", "g_cum"}
+    assert [p for p in full["arg_plan"] if p[1] not in ("akk_out", "g_cum")] == fwd[
+        "arg_plan"
+    ]
+    assert set(full["logical"].values()) - set(fwd["logical"].values()) == {
+        "akk",
+        "g_cum",
+    }
     assert fwd["launch"] == full["launch"] and fwd["grid_rule"] == full["grid_rule"]
     assert fwd["arches"] == full["arches"] and fwd["library"] != full["library"]
     assert jit.records_of_program(FULL) == (FULL, FWD)
-    assert kcp.prep_form_shipped() and all(kcp.prep_form_shipped(a) for a in full["arches"])
+    assert kcp.prep_form_shipped() and all(
+        kcp.prep_form_shipped(a) for a in full["arches"]
+    )
     assert kcp.TART_MODULE_OF[FWD] == "gdn_chunk_det_train_fwd_prep_l2n_v2"
 
 
@@ -142,15 +164,25 @@ def test_forward_form_routing() -> None:
     assert _preps("bwd") == [FULL]
     kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, save_for_backward=False, **o)
     assert _preps("fwd") == [FWD]
-    kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, test_knobs={"prep_form": 0}, **o)
+    kcp.cake_gdn_det_train_kcp_forward(
+        *_ops(ops), ctx, test_knobs={"prep_form": 0}, **o
+    )
     assert _preps("fwd") == [FULL]
-    _, saved = kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, save_mode="full", **o)
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(
+        *_ops(ops), ctx, save_mode="full", **o
+    )
     assert _preps("fwd") == [FULL]
-    kcp.cake_gdn_det_train_kcp_backward(*_ops(ops), ctx, ops["dout"], saved=saved, save_mode="full", **o)
+    kcp.cake_gdn_det_train_kcp_backward(
+        *_ops(ops), ctx, ops["dout"], saved=saved, save_mode="full", **o
+    )
     assert _preps("bwd") == []  # the full backward runs no #1
-    _, saved = kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, boundary_mode="replay", **o)
+    _, saved = kcp.cake_gdn_det_train_kcp_forward(
+        *_ops(ops), ctx, boundary_mode="replay", **o
+    )
     assert _preps("fwd") == [FWD]
-    kcp.cake_gdn_det_train_kcp_backward(*_ops(ops), ctx, ops["dout"], saved=saved, boundary_mode="replay", **o)
+    kcp.cake_gdn_det_train_kcp_backward(
+        *_ops(ops), ctx, ops["dout"], saved=saved, boundary_mode="replay", **o
+    )
     assert _preps("bwd") == [FULL]
     kcp.cake_gdn_det_train_kcp_forward(*_ops(ops), ctx, backend="fake")
     assert _preps("fwd") == ["fwd_prep"]
@@ -166,7 +198,10 @@ def test_forward_form_binds_no_backward_tape() -> None:
         def run(self, name, args):
             call = args["_call"]
             if name == FULL and not call.backward:
-                seen[int(call.opts.knob("prep_form"))] = set(call.ws._tapes) & {"akk", "g_cum"}
+                seen[int(call.opts.knob("prep_form"))] = set(call.ws._tapes) & {
+                    "akk",
+                    "g_cum",
+                }
             super().run(name, args)
 
     previous = kcp.set_backend("fake", Recording())
@@ -198,7 +233,9 @@ def test_every_form_is_bitwise_the_full_prep(segments) -> None:
     ):
         ref = _saved_pass(ctx, ops, segments=segments, test_knobs={"prep_form": 0}, **o)
         _same(ref, _saved_pass(ctx, ops, segments=segments, **o), f"saved {o}")
-    direct = _autograd(ctx, ops, ckpt=False, segments=segments, test_knobs={"prep_form": 0})
+    direct = _autograd(
+        ctx, ops, ckpt=False, segments=segments, test_knobs={"prep_form": 0}
+    )
     _same(direct, _autograd(ctx, ops, ckpt=False, segments=segments), "autograd")
     for o in (
         {"reuse_recompute_tapes": False},
@@ -213,4 +250,10 @@ def test_every_form_is_bitwise_the_full_prep(segments) -> None:
             # the recompute forward hands its tapes over: it runs the full #1, the backward none
             assert kcp.LAST_CALL["bwd"]["tapes_source"] == "kept"
             assert _preps("bwd") == []
-    _same(direct, _autograd(ctx, ops, ckpt=True, handle=True, save_transfer=False, segments=segments), "handle")
+    _same(
+        direct,
+        _autograd(
+            ctx, ops, ckpt=True, handle=True, save_transfer=False, segments=segments
+        ),
+        "handle",
+    )

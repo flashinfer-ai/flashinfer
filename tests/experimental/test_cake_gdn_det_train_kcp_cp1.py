@@ -1069,7 +1069,13 @@ def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
         if all(c is not call for c, *_ in first):
             ws = call.ws
             first.append(
-                (call, name, sorted(ws._pools), ws._tickets is not None, ws._pending is not None)
+                (
+                    call,
+                    name,
+                    sorted(ws._pools),
+                    ws._tickets is not None,
+                    ws._pending is not None,
+                )
             )
         return real_run(self, name, args)
 
@@ -1102,7 +1108,13 @@ def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
         log = {
             kind: {
                 key: kcp.LAST_CALL[kind][key]
-                for key in ("records", "sequence", "workspace_bytes", "pool_bytes", "tape_bytes")
+                for key in (
+                    "records",
+                    "sequence",
+                    "workspace_bytes",
+                    "pool_bytes",
+                    "tape_bytes",
+                )
             }
             for kind in ("fwd", "bwd")
         }
@@ -1110,7 +1122,9 @@ def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
 
     ref, ref_log, ref_peak = step(False)
     n_ref = len(first)
-    assert n_ref >= 2 and all(tk and not pend and pools for _, _, pools, tk, pend in first)
+    assert n_ref >= 2 and all(
+        tk and not pend and pools for _, _, pools, tk, pend in first
+    )
     got, got_log, got_peak = step(True)
     deferred = first[n_ref:]
     assert len(deferred) == n_ref
@@ -1138,7 +1152,14 @@ def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
 # out and every gradient bitwise the full form's, two full runs bitwise equal, and every backward replays the full #1.
 
 PREP_FORMS = tuple(
-    (f"l2n-{fid}", layers, ckpt, later, {**opts, "use_qk_l2norm_in_kernel": True}, knobs)
+    (
+        f"l2n-{fid}",
+        layers,
+        ckpt,
+        later,
+        {**opts, "use_qk_l2norm_in_kernel": True},
+        knobs,
+    )
     for fid, layers, ckpt, later, opts, knobs in FUSED_FORMS
 )
 
@@ -1164,7 +1185,9 @@ def test_prep_forward_form_is_bitwise_the_full_prep(
     if not kcp.l2n_records_shipped():
         pytest.skip("the registry ships no in-kernel L2 norm records")
     if not kcp.prep_form_shipped(backend.device_arch(device.index)):
-        pytest.skip("the registry ships no forward form of fwd_prep_l2n for this architecture")
+        pytest.skip(
+            "the registry ships no forward form of fwd_prep_l2n for this architecture"
+        )
     cu = _cu(lengths)
     log: list = []
     record = kcp._record
@@ -1199,7 +1222,9 @@ def test_prep_forward_form_is_bitwise_the_full_prep(
     if fwd_log:  # a graph replay records no call
         firsts = [p for k, p in fwd_log if k == "fwd"]
         assert firsts and firsts[0] == ("fwd_prep_l2n_fwd",), fwd_log
-        assert all("fwd_prep_l2n_fwd" not in p for k, p in fwd_log if k == "bwd"), fwd_log
+        assert all("fwd_prep_l2n_fwd" not in p for k, p in fwd_log if k == "bwd"), (
+            fwd_log
+        )
     assert set(fwd) == set(full[0])
     for n in fwd:
         assert torch.equal(_bits(full[0][n]), _bits(full[1][n])), (form[0], n)

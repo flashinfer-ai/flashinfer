@@ -1353,10 +1353,13 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
         # them into saved tensors: no arena term in either layout); the tape walk had dropped them already
         assert gbytes._prep_form_shipped()
         dead = sum(off.get(f"fwd.{k}", 0) for k in ("akk", "gcum"))
-        assert dead == (0 if kw.get("save_mode") == "full" else off["fwd.akk"] + off["fwd.gcum"]) and not (
-            {"fwd.akk", "fwd.gcum"} & set(on)
+        assert dead == (
+            0 if kw.get("save_mode") == "full" else off["fwd.akk"] + off["fwd.gcum"]
+        ) and not ({"fwd.akk", "fwd.gcum"} & set(on)), kw
+        assert (
+            on["fwd.phase.prep"] - off["fwd.phase.prep"]
+            == 2 * row + on["fwd.qk_rstd"] - dead
         ), kw
-        assert on["fwd.phase.prep"] - off["fwd.phase.prep"] == 2 * row + on["fwd.qk_rstd"] - dead, kw
         assert on["fwd.phase.walk"] - off["fwd.phase.walk"] == 2 * row, kw
         assert on["forward"] == max(on["fwd.phase.prep"], on["fwd.phase.walk"]), kw
         replays = kw.get("boundary_mode") == "replay" or not (

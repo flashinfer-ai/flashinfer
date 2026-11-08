@@ -1973,7 +1973,9 @@ class _IndexedSpec:
         self.dev: dict[torch.device, torch.Tensor] = {}
 
 
-def _chain_device_tables(tb: Any, ch: Any, device: torch.device) -> tuple[torch.Tensor, ...]:
+def _chain_device_tables(
+    tb: Any, ch: Any, device: torch.device
+) -> tuple[torch.Tensor, ...]:
     """The device tables of the merge chains ``ch`` (``chain_start`` int32; ``elem_m``, ``elem_c``, ``elem_y``,
     ``x0_index``, ``y_final`` int64), cached by content on the head plan (:meth:`_Tables.dev`)."""
     tag = ("chain", ch.content())
@@ -2626,13 +2628,17 @@ class _Tables:
             t = self._memo_put(key, self.dev("neg", [-1] * int(self.NSEG), device))
         return t
 
-    def chain_tables(self, family: str, device: torch.device) -> tuple[torch.Tensor, ...]:
+    def chain_tables(
+        self, family: str, device: torch.device
+    ) -> tuple[torch.Tensor, ...]:
         """The six device tables of the plan's merge chain family ``family`` (``chain_start`` int32; ``elem_m``,
         ``elem_c``, ``elem_y``, ``x0_index``, ``y_final`` int64), uploaded in this order at first use."""
         key = ("chain", family, device)
         hit = self.memo.get(key)
         if hit is None:
-            hit = self._memo_put(key, _chain_device_tables(self, self.chains[family], device))
+            hit = self._memo_put(
+                key, _chain_device_tables(self, self.chains[family], device)
+            )
         return hit
 
     def split_lists(self, coll: str) -> tuple[list[int], list[int]]:
@@ -3433,7 +3439,9 @@ class CakeGDNDetKcpCall:
             self._deferred.append((name, args))
             return
         self.backend.run(name, args)
-        ws = getattr(self, "ws", None)  # (a test's stand-in call may carry no workspace)
+        ws = getattr(
+            self, "ws", None
+        )  # (a test's stand-in call may carry no workspace)
         if ws is not None and ws._pending is not None:
             # S4: the pools and ticket slots of this eager call are sized now, under the first launch's device time
             ws.settle()
@@ -3445,7 +3453,9 @@ class CakeGDNDetKcpCall:
             "num_qk_heads": self.H_qk,
             "seg_chunk_start": tb.seg_table(self.device),
             "num_seqs": int(tb.NSEG),
-            "walk_seg": tb.walk_table(walk, self.device),  # the plan's memo (content-keyed device table)
+            "walk_seg": tb.walk_table(
+                walk, self.device
+            ),  # the plan's memo (content-keyed device table)
             "chunk_bos": self.ctx.tables["chunk_bos"],
             "chunk_len": self.ctx.tables["chunk_len"],
         }
@@ -4449,7 +4459,10 @@ def _prep_backward_tapes(
     registry ships that record for the device's architecture (:func:`prep_form_shipped`)."""
     if replay or hand_off:
         return True
-    if keep and ("akk" in saved_tapes(call.opts.save_mode) or "g_cum" in saved_tapes(call.opts.save_mode)):
+    if keep and (
+        "akk" in saved_tapes(call.opts.save_mode)
+        or "g_cum" in saved_tapes(call.opts.save_mode)
+    ):
         return True
     if not call.l2n or call.T_r == 0 or int(call.opts.knob("prep_form")) != 1:
         return True
@@ -6291,7 +6304,9 @@ _KEYWORD_OPTIONS: dict[tuple, CakeGDNDetKcpOptions] = {}
 KEYWORD_OPTIONS_MAX = 64
 
 
-def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> CakeGDNDetKcpOptions:
+def _keyword_options(
+    over: dict[str, Any], knobs: dict[str, Any]
+) -> CakeGDNDetKcpOptions:
     try:
         key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
             None,
