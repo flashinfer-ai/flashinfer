@@ -39,7 +39,8 @@ package's forward kernel (it has no reduction, so ``y`` has the same bits; up
 to 12 rows per SM on SM100 and SM103, 59 on SM107, a forward with 16 threads
 to a row, and from 976 rows per SM on SM100 and SM103, 800 on SM107, a forward
 whose CTAs each walk several row blocks, also the same bits) and a one-kernel
-backward whose ``dx`` and ``dz`` are the deterministic backward's bits.  Its
+backward whose ``dx`` and ``dz`` lie within one BF16 ulp of FP64 plus 1/64 ulp
+of the tensor's largest finite magnitude (the same bits on every call).  Its
 CTAs take row blocks (one block each when the grid has a CTA for every block;
 past one wave of CTAs they claim the blocks in chunks), sum the weight
 gradient in FP32 runs of at most 16 rows folded into FP64 (a CTA of a few
@@ -63,8 +64,9 @@ number of its dtype is rounded to a multiple of the dtype's smallest
 subnormal (``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite
 ``grad_out`` makes its columns' weight gradient infinite or ``NaN``:
 ``NaN`` where the infinite term is in the last row and the last row block
-is partial (its padding rows reread that row and multiply it by zero), as
-in the deterministic backward.  On SM100 from 800 rows per SM and on SM103
+is partial (its padding rows reread that row and multiply it by zero; the
+deterministic backward gives the infinity there).  On SM100 from 800 rows per
+SM and on SM103
 from 700, up to 12000 (from 12000 the backward above), and on SM107 from 1024 up
 to 3200 (from 3200 the backward above), each thread keeps its folded FP32 runs,
 and each CTA its column sums over its row groups, as FP32 two-sum pairs (a sum
@@ -106,7 +108,8 @@ Mode and dispatch rules (the same in
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
-   alerts: every deterministic launch sums in a fixed order.  The
+   alerts: every deterministic launch gives the same bits for the same
+   inputs on the same device (a sum across CTAs is exact).  The
    non-deterministic forward never alerts.  A non-deterministic backward that
    computes the weight gradient raises PyTorch's alert immediately before its
    order-varying launch (``RuntimeError``; with ``warn_only=True`` a
@@ -116,11 +119,10 @@ Mode and dispatch rules (the same in
    host: a CUDA Graph checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
-   and run the backward of their own package.  A backward workspace holds the
-   raw partial sums of one package and serves only that package (FP32 for the
-   deterministic package, FP64 for the non-deterministic one): each backward
-   refuses the other package's workspace (``ValueError``), also in a call
-   with no rows.
+   and run the backward of their own package.  A backward workspace serves
+   only its own package (the deterministic package's is FP32, the
+   non-deterministic package's is not): each backward refuses the other
+   package's workspace (``ValueError``), also in a call with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.  The SiLU-gated RMSNorm section
@@ -140,7 +142,7 @@ the same time its own buffer.  A buffer that did not come from that factory, or
 that anything else wrote into, must be zeroed with
 ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace(ws)``
 before its next backward.  It is not interchangeable with the deterministic
-package's FP32 partial buffer: each backward refuses the other package's
+package's FP32 workspace: each backward refuses the other package's
 buffer (``ValueError``).  Calls without a workspace use one 4104-byte buffer
 per device, stream and backward kernel (one per weight-gradient dtype, two from
 800 rows per SM on SM100, from 700 on SM103 and from 1024 on SM107, and three
@@ -309,7 +311,7 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
     accumulators and the 8-byte word of the arrival ticket and the claim
     counter, a few KiB whatever ``rows``.
 
-    The deterministic package's FP32 partial buffer, which grows with
+    The deterministic package's FP32 workspace, 18952 bytes whatever
     ``rows``, has
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`.
 
@@ -343,7 +345,7 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace(
     serves every later call on its stream (any ``T`` and ``H``, BF16 or FP32
     weight gradient) and every CUDA Graph replay without a reset.  A backward
     that may run at the same time on another stream needs its own workspace.
-    It is not the deterministic package's FP32 partial buffer
+    It is not the deterministic package's FP32 workspace
     (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward_workspace`):
     each backward refuses the other package's buffer.
 
@@ -382,8 +384,9 @@ def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
     :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`, or that anything
     else wrote into (a launch that did not complete, another use of the
     buffer), needs one before its next backward.  The deterministic package's
-    FP32 partial buffer needs no reset (the deterministic backward writes every
-    element before reading it); passing one here is a ``ValueError``.  The
+    FP32 workspace has its own reset
+    (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_reset_workspace`);
+    passing one here is a ``ValueError``.  The
     reset does not depend on ``torch.use_deterministic_algorithms`` (a fill has
     no reduction).
 
@@ -421,8 +424,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
 
     in FP32, the statistics and the gate recomputed from ``x`` and ``z``.
 
-    One kernel of the non-deterministic package: the
-    same ``dx`` and ``dz`` bits as the deterministic backward, and each CTA
+    One kernel of the non-deterministic package: ``dx`` and ``dz`` within
+    one BF16 ulp of FP64 plus 1/64 ulp of the tensor's largest finite
+    magnitude (the same bits on every call), and each CTA
     sums the rows of the blocks it takes (its own block when the grid has a
     CTA for every block, else the chunks it claims) in FP32 runs of at most
     16 rows folded into FP64 (a CTA of a few blocks adds its runs across
@@ -445,8 +449,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     (within the same bound), and the workspace is not used.  The deterministic
     backward is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`
-    (``dw`` accumulated in FP32 per CTA chunk and in FP64 over the chunks in an
-    order fixed by the row count).
+    (``dw`` summed in FP32 runs of at most 16 rows, added exactly in fixed
+    point whatever the order of the CTAs, and rounded once).
     Under ``torch.use_deterministic_algorithms(True)`` a call that computes
     the weight gradient raises PyTorch's alert immediately before the
     order-varying launch (``RuntimeError``; with ``warn_only=True`` a

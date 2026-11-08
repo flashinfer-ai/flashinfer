@@ -120,12 +120,13 @@ def fp64_reference(dy, x, z, w, eps):
 
 def assert_bf16_close(got, want, *, what, scale=None):
     """``got`` (BF16) within one BF16 ulp of ``want`` plus an absolute floor of
-    1/64 ulp of the tensor's largest magnitude (cancellation in ``dx``)."""
+    1/64 ulp of the tensor's largest magnitude (cancellation in ``dx``), or of
+    ``scale`` (a number, or per-row scales that broadcast); a NaN fails."""
     want = want.double()
     floor = (scale if scale is not None else want.abs().max().item()) * BF16_RTOL / 64
     err = (got.double() - want).abs()
     bound = want.abs() * BF16_RTOL + floor
-    bad = err > bound
+    bad = ~(err <= bound)
     assert not bad.any(), (
         f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond one BF16 ulp; "
         f"worst err {err.max().item():.3e}"
@@ -210,6 +211,23 @@ def eager_grads(dy, x, z, w, eps):
     return y.detach(), xr.grad, zr.grad, wr.grad
 
 
+def row_scales(dy, x, z, w, eps):
+    """``(dx_scale, dz_scale)``: each row's scale of the backward's documented
+    floor, in FP64 from the inputs, ``[..., 1]``: for ``dz`` the row's largest
+    ``|dy * n * w|``; for ``dx`` the largest magnitudes of its two terms, the
+    row's largest ``|dn * rstd|`` (``dn = dy * silu(z) * w``) plus its largest
+    ``|x|`` times ``rstd^3`` times the mean of ``|dn * x|``."""
+    xd, zd, wd, gd = x.double(), z.double(), w.double(), dy.double()
+    rstd = 1.0 / torch.sqrt(xd.square().mean(dim=-1, keepdim=True) + eps)
+    dz_scale = (gd * (xd * rstd) * wd).abs().amax(dim=-1, keepdim=True)
+    dn = gd * torch.nn.functional.silu(zd) * wd
+    coef = rstd**3 * (dn * xd).abs().mean(dim=-1, keepdim=True)
+    dx_scale = (dn * rstd).abs().amax(dim=-1, keepdim=True) + xd.abs().amax(
+        dim=-1, keepdim=True
+    ) * coef
+    return dx_scale, dz_scale
+
+
 def check_all(x, z, w, dy, eps):
     y = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, eps)
     dx, dz, dw = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, eps)
@@ -231,6 +249,11 @@ def check_all(x, z, w, dy, eps):
     assert_bf16_close(y, ye, what="y vs eager", scale=y64.abs().max().item())
     assert_bf16_close(dz, dze, what="dz vs eager", scale=dz64.abs().max().item())
     assert_bf16_close(dx, dxe, what="dx vs eager", scale=dx64.abs().max().item())
+    # The documented bound: one BF16 ulp of the FP32 formula (the eager
+    # autograd) plus 1/64 ulp of the row's own scale.
+    dx_scale, dz_scale = row_scales(dy, x, z, w, eps)
+    assert_bf16_close(dz, dze, what="dz vs eager, row floor", scale=dz_scale)
+    assert_bf16_close(dx, dxe, what="dx vs eager, row floor", scale=dx_scale)
     assert (
         (dw.double() - dwe.double()).abs()
         <= dwe.double().abs() * BF16_RTOL + mag * 2.0**-20
@@ -411,6 +434,10 @@ GATE_EDGE_VALUES = [
 ]
 # The largest BF16 gate input below -87.3: from there down the gate is -0.
 GATE_FLUSHED = -87.5
+# The BF16 gate inputs whose FP32 sigmoid is subnormal (``z`` from about -87.34
+# to -88.72): the backward's sigmoid factor ``s`` is subnormal there too, not
+# flushed (the gate ``z * s`` is a normal number there).
+GATE_SUBNORMAL = (-88.5, -87.5)
 
 
 def _gate_edges(z, seed):
@@ -434,7 +461,11 @@ def test_gate_edge_values(T, H):
     """Gate inputs at the edges of the forward's gate (``GATE_EDGE_VALUES``)
     within ``check_all``'s bounds and ``y`` within each element's own bound
     (``assert_y_elementwise``); where ``z <= -87.5`` the forward's gate is
-    ``-0``, so ``y`` is zero there."""
+    ``-0``, so ``y`` is zero there.  Where the FP32 sigmoid is subnormal
+    (``GATE_SUBNORMAL``; ``check_all``'s floor would pass a zero ``dz``),
+    each ``dz`` lies within one BF16 ulp of the FP64 reference plus half the
+    smallest BF16 subnormal (``2^-134``).  The FP32 weight-gradient program
+    gives the BF16 program's ``dx`` and ``dz`` bits."""
     x, z, w, dy = make(T, H, seed=23)
     _gate_edges(z, 24)
     check_all(x, z, w, dy, EPS)
@@ -443,6 +474,21 @@ def test_gate_edge_values(T, H):
     flushed = z.float() <= GATE_FLUSHED
     assert bool(flushed.any())
     assert not bool(y[flushed].float().ne(0).any()), "y where z <= -87.5"
+    dx, dz, _ = backward(dy, x, z, w, EPS)
+    f32 = torch.empty(D, dtype=torch.float32, device=x.device)
+    dx32, dz32, _ = backward(dy, x, z, w, EPS, grad_weight=f32)
+    assert_same_bits(dx32, dx, "dx of the FP32 weight-gradient program")
+    assert_same_bits(dz32, dz, "dz of the FP32 weight-gradient program")
+    low, high = GATE_SUBNORMAL
+    band = (z.float() >= low) & (z.float() <= high)
+    assert bool(band.any())
+    dz = dz[band].double()
+    want = fp64_reference(dy, x, z, w, EPS)[2][band]
+    bad = ~((dz - want).abs() <= want.abs() * BF16_RTOL + 2.0**-134)
+    assert not bad.any(), (
+        f"dz where the FP32 sigmoid is subnormal: {int(bad.sum())} of "
+        f"{bad.numel()} elements beyond one BF16 ulp plus 2^-134"
+    )
 
 
 def test_infinite_and_nan_gates():

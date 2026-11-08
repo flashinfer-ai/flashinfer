@@ -52,23 +52,35 @@ Host design (every control is a keyword; no environment variable):
 - Backward: one kernel, BF16 or FP32 weight gradient.  It launches ``G =
   min(row blocks, 4 * SMs)`` 256-thread CTAs over blocks of 16 rows
   (``cake_jit.launch_grid``): CTA ``c`` takes block ``c`` when ``G`` covers
-  every block; otherwise every CTA claims chunks of consecutive blocks from a
-  counter in the workspace, following a table of halving rounds that every CTA
-  computes from the block count and ``G``, so a CTA that starts late takes
-  fewer blocks.  ``dx`` and ``dz`` are FP32 formulas rounded once each.  For
-  the weight gradient each thread sums its rows' terms ``a * n`` of a chunk in
-  FP32 runs of at most 16 rows and folds each run into an FP32 two-sum pair (a
-  sum and its exact error term); each CTA adds its pairs exactly into 64-bit
-  fixed-point digit counters and adds those to the workspace with integer
-  atomics, which are exact in any order.  The CTA that arrives last adds
-  ``grad_weight``'s value exactly as digits when accumulating, rounds each
-  column's exact sum once to FP32 (round to nearest even, in integer
-  arithmetic), stores it (a BF16 ``grad_weight`` takes that FP32 value rounded
-  to BF16, as an FP32 sum cast to BF16) and zeroes the workspace.  A chunk's
-  runs follow from the row count and ``G`` alone, whichever CTA takes it, so
-  the weight gradient is the same bits at every call with the same row count
-  on a device with the same SM count; each run errs by at most about
-  ``2^-20`` of its terms' magnitude and the digits sum exactly.
+  every block; otherwise every CTA claims chunks of blocks (interleaved within
+  each halving round) from a counter in the workspace, following a table of
+  halving rounds that every CTA computes from the block count and ``G``, so a
+  CTA that starts late takes fewer blocks.  ``dx`` and ``dz`` are FP32
+  formulas rounded once each, with ``rstd`` from the approximate FP32
+  reciprocal square root and the sigmoid factor ``s`` from the approximate
+  FP32 base-2 exponential of the exact FP32 product of ``-z`` and the 15-bit
+  head of ``log2(e)`` (the remaining bits applied to first order) and the
+  approximate reciprocal, on every element alike: each lies within one BF16
+  unit in the last place of the same formula in correctly rounded FP32 plus
+  1/64 of a unit of its row's scale (for ``dz`` the row's largest
+  ``|dy * x * rstd * w|``, for ``dx`` the sum of the largest magnitudes of its
+  two terms; rows whose sums reach ``2^127`` aside).  Like the FP32 sigmoid,
+  ``s`` is subnormal for ``z`` from about ``-87.34`` to ``-88.72`` and 0 below
+  that (the gate ``z * s`` is then ``-0``).  For the weight gradient each thread
+  sums its rows' terms ``a * n`` of a chunk in FP32 runs of at most 16 rows
+  and folds each run into an FP32 two-sum pair (a sum and its exact error
+  term); each CTA adds its pairs exactly into 64-bit fixed-point digit
+  counters and adds those to the workspace with integer atomics, which are
+  exact in any order.  The CTA that arrives last adds ``grad_weight``'s value
+  exactly as digits when accumulating, rounds each column's exact sum once to
+  FP32 (round to nearest even, in integer arithmetic), stores it (a BF16
+  ``grad_weight`` takes that FP32 value rounded to BF16, as an FP32 sum cast
+  to BF16) and zeroes the workspace.  A chunk's runs follow from the row count
+  and ``G`` alone, whichever CTA takes it, so the weight gradient is the same
+  bits at every call with the same row count on a device with the same SM
+  count; each run errs by at most about ``2^-20`` of its terms' magnitude (the
+  approximate gate and ``rstd`` put each term within a few FP32 units in the
+  last place of the FP32 formula's term) and the digits sum exactly.
 - Workspace: ``cake_jit.workspace_elements`` FP32 elements (18952 bytes): the
   digit counters (``2 * 9 * 128`` 64-bit words, read as ``uint64``), one
   32-bit flag word a column (infinite and ``NaN`` sums), and two 32-bit words,
@@ -676,11 +688,15 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         dx = BF16(rstd * a * weight - x * rstd^3 * mean(a * weight * x))
         dw = sum over every token and head of a * n
 
-    in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
-    is summed in FP32 runs of at most 16 rows, added exactly in fixed point in
-    an order-independent way, and rounded once to FP32 (then to BF16 for a
-    BF16 gradient; see the module): the same row count on a device with the
-    same SM count gives the same bits.
+    in FP32, the statistics and the gate recomputed from ``x`` and ``z`` with
+    the approximate reciprocal square root, base-2 exponential and reciprocal
+    (see the module): ``dx`` and ``dz`` lie within one BF16 unit in the last
+    place of these formulas in correctly rounded FP32 plus 1/64 of a unit of
+    the row's largest term, the same bits at every call.  ``dw`` is summed in
+    FP32 runs of at most 16 rows, added exactly in fixed point in an
+    order-independent way, and rounded once to FP32 (then to BF16 for a BF16
+    gradient; see the module): the same row count on a device with the same SM
+    count gives the same bits.
 
     Parameters
     ----------

@@ -263,8 +263,9 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward, BF16 weight gradient: 256 threads, 16 lanes per row
     # (16-row blocks), at most 4 CTAs per SM, claimed chunks, the weight
     # gradient summed exactly in fixed point and rounded once (build
-    # {"min_blocks": 4, "out": "bf16", "threads": 256}).
-    "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb": {
+    # {"math": "ax", "min_blocks": 4, "out": "bf16",
+    # "prefetch_share": None, "threads": 256}).
+    "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -302,8 +303,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "claimed_row_blocks",
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
+        "kernel": "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -311,7 +312,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 26368,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
+        "library": "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
         "logical": {
             "acc": "acc",
             "accumulate": "accumulate",
@@ -344,8 +345,9 @@ MODULES: dict[str, dict[str, Any]] = {
     # The backward, FP32 weight gradient: 256 threads, 16 lanes per row
     # (16-row blocks), at most 4 CTAs per SM, claimed chunks, the weight
     # gradient summed exactly in fixed point and rounded once (build
-    # {"min_blocks": 4, "out": "f32", "threads": 256}).
-    "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565": {
+    # {"math": "ax", "min_blocks": 4, "out": "f32",
+    # "prefetch_share": None, "threads": 256}).
+    "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -383,8 +385,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "claimed_row_blocks",
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
+        "kernel": "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -392,7 +394,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 26368,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
+        "library": "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
         "logical": {
             "acc": "acc",
             "accumulate": "accumulate",
@@ -427,19 +429,19 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "fwd": "cake_rmsnorm_silu_gate_det_train_36610c51a93167071e05",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
-        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
+        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
     },
     "sm_103a": {
         "fwd": "cake_rmsnorm_silu_gate_det_train_36610c51a93167071e05",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
-        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
+        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
     },
     "sm_107a": {
         "fwd": "cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4",
         "fwd_packed": "cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
-        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_8a6cb16beff15b6ffbfe",
+        "bwd_f32": "cake_rmsnorm_silu_gate_det_train_ae2073f31d0923e61736",
     },
 }
 
