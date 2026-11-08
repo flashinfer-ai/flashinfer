@@ -11639,8 +11639,9 @@ def test_gpu_k1_dsm_ranges_run_at_their_edges():
     launches into a NaN-poisoned ``out``; the convenience path binds the same program, with no arena, and its output
     has those bits too.  One token below a
     row's first range, one above its last and next to a gap between two of its ranges the row takes the route the
-    planner gives it without the table (another program or the deterministic program), within the same budget.  A
-    part of any other SM count or architecture skips."""
+    planner gives it without the table (another program or the deterministic program), within the same budget; so
+    does an edge with an odd number of 64-token K blocks inside a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, which
+    runs that table's program.  A part of any other SM count or architecture skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     rows = cake_backend.K1_DSM_RANGES_BY_SM.get((arch, sm_count), {})
@@ -11674,8 +11675,13 @@ def test_gpu_k1_dsm_ranges_run_at_their_edges():
             atomic = isinstance(
                 prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch
             )
-            if not held:
-                assert dsm is None, what
+            odd = cake_backend.k1_dsm_odd_block_plan(
+                arch=arch, L=L, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
+            )
+            if not held or odd is not None:
+                # outside the ranges, or an odd number of K blocks inside a range of
+                # K1_DSM_ODD_BLOCK_RANGES_BY_SM (that table's program): no cluster program
+                assert (dsm is None) == (not held), what
                 assert not (atomic and prepared.plan.dsm), what
                 prepared.launch()
                 torch.cuda.synchronize()
