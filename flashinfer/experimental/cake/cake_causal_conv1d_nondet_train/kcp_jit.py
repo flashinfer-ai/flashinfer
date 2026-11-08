@@ -532,7 +532,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": None,
     },
     # Route ``kcp_bwd_dyn``: the main program of the overlapped backward (no det program: its own kernel module key).
-    "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp": {
+    "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -577,8 +577,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
+        "kernel": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -586,7 +586,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
+        "library": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
         "logical": {
             "C": "C",
             "L": "L",
@@ -695,7 +695,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
@@ -713,7 +713,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
@@ -731,7 +731,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_34a539b6ed77717ac378_kcp",
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
