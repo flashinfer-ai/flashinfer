@@ -498,8 +498,9 @@ def _ckpt_rows_drop(ref: Any, key: int) -> None:
 
 # The architectures where a fused in-kernel L2 norm forward keeps its intra rows (INTRA_ROWS): its intra record on the
 # raw q / k and the backward's prep + intra record on the normalized rows write bitwise equal Aqk / Akk rows there
-# (rows_probe, gate g and raw, H = 64).  Elsewhere that form keeps none and the backward launches its intra program.
-INTRA_ROWS_L2N_ARCHS = ("sm_103a",)
+# (rows_probe on every real and pad row, gate g and raw, H = 64, CP4: sm_103a GB300, sm_100a GB200).  Elsewhere
+# (sm_107a until probed) that form keeps none and the backward launches its intra program.
+INTRA_ROWS_L2N_ARCHS = ("sm_100a", "sm_103a")
 ROWS_PROBES = (0, 1)
 # Walk form of the K1 / K2 state walks: "auto" (shipped) = the registry's rule per launch (cake_kcp_jit.walk_form: the
 # offset programs take their two-CTA ``_vh64`` record when the launch list-schedules within its longest chain, else the

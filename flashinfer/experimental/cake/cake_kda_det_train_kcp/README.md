@@ -176,8 +176,8 @@ reader), otherwise the backward copies them into its arena before it allocates
 any output and drops them.  The rows are the intra program's on the same
 operands, so every output is unchanged; with the fused in-kernel Q/K L2 norm
 the forward and backward intra records differ, and that form keeps the rows
-only on `cake_kcp.INTRA_ROWS_L2N_ARCHS` (sm_103a), where the two write bitwise
-equal rows.
+only on `cake_kcp.INTRA_ROWS_L2N_ARCHS` (sm_100a, sm_103a), where the two write
+bitwise equal rows.
 
 Walk-launch geometry: the walk kernels' CTA lists are issued
 longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
