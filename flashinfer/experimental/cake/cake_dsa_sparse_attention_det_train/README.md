@@ -111,27 +111,42 @@ all pairs (without dQ).
 The accumulator region of one backward holds, per destination row, the int32
 accumulator (576 columns; 512 for NoPE; the row-bound words live in the row
 until the grid stage reads them), 32 B of overflow counters, the grid words
-(8 B; 4 B for NoPE), the pair count, the redo mark and the redo list slot (4 B
-each), plus 4 B of key norm per key row.  `delta`, `qstat` and the global
-words are separate.
+(8 B; 4 B for NoPE) and the pair count (4 B).  `delta` and the global words
+are separate.  The rest lives in output storage that is dead while it is used:
+
+* `qstat` (`[T, 4]` FP32) and the key norms (4 B per key row) at the front of
+  dQ (`dq_latent`; the NoPE `dq`; 64 KiB per query token) when they fit (`S`
+  up to about `16380 T`) and dQ starts 16-byte aligned: `bwd_delta` and
+  `bwd_norm` write them, `bwd_norm` and `bwd_bound` read them, and then the
+  main stage writes every dQ element (`cake_backend.dq_scratch_layout`).
+* With fresh rope dK/dV outputs, the redo mark and the redo list slot (4 B
+  each per row) at the front of `dkv_latent`: `bwd_redo_prep` writes them,
+  `bwd_redo` reads them, and the fold writes the output last
+  (`cake_backend.redo_lists_fit`).  Otherwise (`dkv_acc`, NoPE) they are part
+  of the region.
+* Otherwise those parts stay in the workspace or the region.  The eager and
+  autograd entries allocate per call only `delta`, the global words and the
+  region (no `topk_length` vector).
 
 * The autograd entries use the storage of their saved `o_lo` (64 KiB per query
   token) for the region when it fits: `bwd_delta` is the only stage that reads
   `o_lo` (no later kernel reads `out` or `o_lo`).  The exact condition
-  (`cake_backend.carve_fits`, 256-byte aligned parts) is
+  (`cake_backend.carve_fits`, 256-byte aligned parts) with every part in the
+  region is
   `align(R * 2304) + align(R * 32) + align(R * 8) + 3 * align(R * 4) + align(S * 4) <= 65536 * T`
   for the rope program (`R` destination rows, `S` keys, `T` query tokens);
   for NoPE `align(R * 2048) + align(R * 32) + 4 * align(R * 4) +
-  align(S * 4) <= 65536 * T`.  At `S = R` this is about `R <= 27.7 T` (rope) and
-  `R <= 31.2 T` (NoPE).  A fresh NoPE `dkv` is its own integer accumulator (the
-  fold rewrites it as FP32 in place), so only 48 B per row and the key norms go
-  to the region.  A larger region is allocated per call.  Rows with more
-  destination rows per query token than that therefore use more memory than
-  the non-deterministic package, which adds into `dkv_acc` directly; for
+  align(S * 4) <= 65536 * T`; the key norms and the redo lists drop out when
+  they live in dQ or the output.  At `S = R` this is about `R <= 27.7 T`
+  (rope) and `R <= 31.2 T` (NoPE).  A fresh NoPE `dkv` is its own integer
+  accumulator (the fold rewrites it as FP32 in place), so only the per-row
+  words go to the region.  A larger region is allocated per call.  Rows with
+  more destination rows per query token than that therefore use more memory
+  than the non-deterministic package, which adds into `dkv_acc` directly; for
   example a 4096-query backward chunk over 268757 keys mapped to 260611
-  destination rows (about 619 MB), a 2123-query segment over 67923 keys (about
-  161 MB) and a NoPE 4096-query chunk over 269564 keys into `dkv_acc` (about
-  568 MB).
+  destination rows (a region of about 614 MB), a 2123-query segment over 67923
+  keys (about 160 MB) and a NoPE 4096-query chunk over 269564 keys into
+  `dkv_acc` (about 565 MB).
 * After such a backward, `o_lo` no longer holds the forward's residual.  A
   second backward through the same graph (`retain_graph=True`) first runs the
   forward again into the saved `out`, `lse` and `o_lo` (same kernel, same

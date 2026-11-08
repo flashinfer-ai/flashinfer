@@ -104,13 +104,17 @@ limitations under the License.
 # Storage.  The accumulator region of one backward -- per destination row the
 # int32 accumulator (576 columns; 512 for NoPE; the row-bound words live in the
 # row until the grid stage reads them), 32 B of overflow counters, the grid
-# words (8 B; 4 B for NoPE), the pair count, the redo mark and the redo list
-# slot (4 B each), plus 4 B of key norm per key row -- is carved from the
-# storage of ``o_lo`` when the call consumes it (``o_lo_scratch``) and the
-# region fits its ``T * 64 KiB`` (:func:`carve_fits`): ``bwd_delta`` is the
-# only stage that reads ``o_lo`` (no later kernel reads ``out`` or ``o_lo``).
-# ``delta``, ``qstat`` and the global words are never carved (``bwd_delta``
-# writes them).  Otherwise the
+# words (8 B; 4 B for NoPE) and the pair count, plus the redo mark and the redo
+# list slot (4 B each) and 4 B of key norm per key row where no dead output
+# storage holds them -- is carved from the storage of ``o_lo`` when the call
+# consumes it (``o_lo_scratch``) and the region fits its ``T * 64 KiB``
+# (:func:`carve_fits`): ``bwd_delta`` is the only stage that reads ``o_lo`` (no
+# later kernel reads ``out`` or ``o_lo``).  ``delta``, ``qstat`` and the global
+# words are never carved from ``o_lo`` (``bwd_delta`` writes them).  ``qstat``
+# and the key norms live at the front of dQ when they fit (the main stage
+# writes every dQ element after their last reader, :func:`dq_scratch_layout`),
+# the redo lists at the front of a fresh RoPE dK/dV output (the fold writes it
+# after the redo, :func:`redo_lists_fit`).  Otherwise the
 # region is a workspace region (prepared runner) or one allocation per call
 # (eager entries).  A fresh NoPE ``dkv`` is its own integer accumulator: the
 # fold turns it into FP32 in place.  The autograd entries always consume their
@@ -496,6 +500,11 @@ def validate_dsa_nope_inputs(
     return num_queries, num_kv, topk
 
 
+def _starts_aligned(t: Optional[torch.Tensor]) -> bool:
+    """Whether an optional output may hold carved scratch: absent (the binding allocates it) or 16-byte aligned."""
+    return t is None or t.data_ptr() % 16 == 0
+
+
 def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> None:
     if t is None:
         return
@@ -670,6 +679,8 @@ def accumulator_region_layout(
     *,
     program: str = cake_jit.PROGRAM,
     accumulator: bool = True,
+    knorm: bool = True,
+    redo: bool = True,
 ) -> dict:
     """Byte ``(offset, size)`` of every part of the accumulator region of one backward over ``num_kv`` key rows and
     ``num_dst`` destination rows, plus ``"total"``.
@@ -677,9 +688,11 @@ def accumulator_region_layout(
     In order: the int32 accumulator ``acc [num_dst, 576 | 512]`` (absent with ``accumulator=False``: a fresh NoPE
     ``dkv`` is its own accumulator; the row-bound words live in its rows), the overflow counters ``[num_dst, 4]``
     u64, the grid words ``[parts, num_dst]`` int32 (``parts``: 2 for RoPE, latent and rope; 1 for NoPE), the pair
-    counts, the redo marks and the redo list ``[num_dst]`` (4 bytes each) and the key norms ``[num_kv]`` FP32.
-    Nothing is zero-filled: the key-norm stage zeroes the bound words and the grid stage the accumulator rows and
-    counters of the rows the later stages read."""
+    counts, the redo marks and the redo list ``[num_dst]`` (4 bytes each; absent with ``redo=False``: they live in
+    the fresh dK/dV output, :func:`redo_lists_fit`) and the key norms ``[num_kv]`` FP32 (absent with
+    ``knorm=False``: they live in dQ, :func:`dq_scratch_layout`).  Nothing is zero-filled: the key-norm stage
+    zeroes the bound words and the grid stage the accumulator rows and counters of the rows the later stages
+    read."""
     parts = 2 if program == cake_jit.PROGRAM else 1
     R, S = int(num_dst), int(num_kv)
     sizes: list[tuple[str, int]] = []
@@ -689,11 +702,32 @@ def accumulator_region_layout(
         ("counters", R * COUNTER_BYTES_PER_ROW),
         ("grids", R * 4 * parts),
         ("row_pairs", R * 4),
-        ("redo_mark", R * 4),
-        ("redo_rows", R * 4),
-        ("knorm", S * 4),
     ]
+    if redo:
+        sizes += [("redo_mark", R * 4), ("redo_rows", R * 4)]
+    if knorm:
+        sizes.append(("knorm", S * 4))
     return _layout_of(sizes)
+
+
+def dq_scratch_layout(num_queries: int, num_kv: int) -> Optional[dict]:
+    """Byte ``(offset, size)`` of the per-query bound terms ``qstat`` (``[T, 4]`` FP32) and the key norms ``knorm``
+    (``[S]`` FP32) in the storage of ``dq_latent`` (the NoPE ``dq``; BF16, 64 KiB per query token), plus
+    ``"total"``; ``None`` when they do not fit it (``S`` above about ``16380 T``).  ``bwd_delta`` writes ``qstat``,
+    ``bwd_norm`` ``knorm``; ``bwd_norm`` and ``bwd_bound`` read them; the main stage then writes every element of
+    dQ (each token's CTA stores its dQ rows), so neither needs storage of its own."""
+    layout = _layout_of(
+        [("qstat", int(num_queries) * QSTAT_WORDS * 4), ("knorm", int(num_kv) * 4)]
+    )
+    return layout if layout["total"] <= int(num_queries) * O_LO_BYTES_PER_TOKEN else None
+
+
+def redo_lists_fit(num_kv: int, num_dst: int, *, dkv_fp32: bool = False) -> bool:
+    """Whether the redo marks and the redo list (``[num_dst]`` int32 each) fit the front of a fresh RoPE dK/dV
+    output (``dkv_latent``: ``[num_kv, 512]``, BF16 or FP32): the redo preparation writes them and the redo reads
+    them; the fold, the one stage that writes the output, runs after both."""
+    row_bytes = D_LATENT * (4 if dkv_fp32 else 2)
+    return _align(int(num_dst) * 4) * 2 <= int(num_kv) * row_bytes
 
 
 def carve_fits(
@@ -703,14 +737,18 @@ def carve_fits(
     *,
     program: str = cake_jit.PROGRAM,
     accumulator: bool = True,
+    knorm: bool = True,
+    redo: bool = True,
 ) -> bool:
-    """Whether the accumulator region (:func:`accumulator_region_layout`) fits the storage of ``o_lo``
-    (``num_queries * 64 KiB``): ``align(R * 2304) + align(R * 32) + align(R * 8) + 3 * align(R * 4) + align(S * 4)
-    <= 65536 * T`` for RoPE (with 256-byte alignment), ``align(R * 2048) + align(R * 32) + 4 * align(R * 4) +
-    align(S * 4) <= 65536 * T`` for NoPE; without the accumulator (a fresh NoPE ``dkv``) only the 48 B per row and
-    the key norms count.  At ``S = R`` that is ``R <= ~27.7 T`` (RoPE) and ``R <= ~31.2 T`` (NoPE)."""
+    """Whether the accumulator region (:func:`accumulator_region_layout` with the same ``accumulator`` / ``knorm`` /
+    ``redo``) fits the storage of ``o_lo`` (``num_queries * 64 KiB``).  With every part: ``align(R * 2304) +
+    align(R * 32) + align(R * 8) + 3 * align(R * 4) + align(S * 4) <= 65536 * T`` for RoPE (with 256-byte
+    alignment), ``align(R * 2048) + align(R * 32) + 4 * align(R * 4) + align(S * 4) <= 65536 * T`` for NoPE;
+    without the accumulator (a fresh NoPE ``dkv``) only the per-row words and the key norms count, and the key
+    norms (``knorm=False``) and the redo lists (``redo=False``) drop out when they live elsewhere.  At ``S = R``
+    that is ``R <= ~27.7 T`` (RoPE) and ``R <= ~31.2 T`` (NoPE)."""
     region = accumulator_region_layout(
-        num_kv, num_dst, program=program, accumulator=accumulator
+        num_kv, num_dst, program=program, accumulator=accumulator, knorm=knorm, redo=redo
     )
     return region["total"] <= int(num_queries) * O_LO_BYTES_PER_TOKEN
 
@@ -725,27 +763,37 @@ def workspace_layout(
     region: bool = True,
     program: str = cake_jit.PROGRAM,
     accumulator: bool = True,
+    dq_scratch: bool = False,
+    redo_in_output: bool = False,
+    per_call: bool = False,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region of a prepared runner plus ``"total"``.
 
-    The ``topk_length`` region backs a full-length vector when the caller passes none; ``delta`` (``[T, 64]`` FP32),
-    ``qstat`` (``[T, 4]`` FP32) and the global words exist for the backward, and the accumulator region
-    (:func:`accumulator_region_layout` over ``num_dst`` destination rows, ``num_kv`` by default) unless the runner
-    carves it from ``o_lo`` (``region=False``)."""
-    sizes = [("topk_length", int(num_queries) * 4)]
+    The ``topk_length`` region backs a full-length vector when the caller passes none (absent with ``per_call``:
+    the per-call allocation of an eager or autograd backward, whose lengths are the caller's or the binding's
+    own); ``delta`` (``[T, 64]`` FP32), ``qstat`` (``[T, 4]`` FP32; absent with ``dq_scratch``: it lives in dQ,
+    :func:`dq_scratch_layout`) and the global words exist for the backward, and the accumulator region
+    (:func:`accumulator_region_layout` over ``num_dst`` destination rows, ``num_kv`` by default; without the key
+    norms with ``dq_scratch``, without the redo lists with ``redo_in_output``) unless the runner carves it from
+    ``o_lo`` (``region=False``)."""
+    sizes = [] if per_call else [("topk_length", int(num_queries) * 4)]
     if backward:
-        sizes += [
-            ("delta", int(num_queries) * NUM_HEADS * 4),
-            ("qstat", int(num_queries) * QSTAT_WORDS * 4),
-            ("globals", GLOBAL_WORDS * 4),
-        ]
+        sizes.append(("delta", int(num_queries) * NUM_HEADS * 4))
+        if not dq_scratch:
+            sizes.append(("qstat", int(num_queries) * QSTAT_WORDS * 4))
+        sizes.append(("globals", GLOBAL_WORDS * 4))
         if region:
             R = int(num_kv) if num_dst is None else int(num_dst)
             sizes.append(
                 (
                     "region",
                     accumulator_region_layout(
-                        num_kv, R, program=program, accumulator=accumulator
+                        num_kv,
+                        R,
+                        program=program,
+                        accumulator=accumulator,
+                        knorm=not dq_scratch,
+                        redo=not redo_in_output,
                     )["total"],
                 )
             )
@@ -761,8 +809,11 @@ def workspace_layout_nope(
     num_dst: Optional[int] = None,
     region: bool = True,
     accumulator: bool = True,
+    dq_scratch: bool = False,
+    per_call: bool = False,
 ) -> dict:
-    """:func:`workspace_layout` of a NoPE runner (``accumulator=False`` for a fresh ``dkv``, its own accumulator)."""
+    """:func:`workspace_layout` of a NoPE runner (``accumulator=False`` for a fresh ``dkv``, its own accumulator;
+    the redo lists always in the region: a fresh NoPE ``dkv`` holds the integer accumulator)."""
     return workspace_layout(
         num_queries,
         num_kv,
@@ -772,6 +823,8 @@ def workspace_layout_nope(
         region=region,
         program=cake_jit.NOPE_PROGRAM,
         accumulator=accumulator,
+        dq_scratch=dq_scratch,
+        per_call=per_call,
     )
 
 
@@ -783,12 +836,20 @@ def _storage(
     program: str,
     accumulator: bool,
     o_lo_scratch: bool,
+    dq_scratch: bool = False,
+    redo_in_output: bool = False,
 ) -> str:
     """Where the accumulator region of a backward lives: ``"o_lo"`` when the call consumes ``o_lo`` and the region
     fits it (:func:`carve_fits`), else ``"workspace"`` (a workspace region of a prepared runner, one allocation per
     eager call)."""
     if o_lo_scratch and carve_fits(
-        num_queries, num_kv, num_dst, program=program, accumulator=accumulator
+        num_queries,
+        num_kv,
+        num_dst,
+        program=program,
+        accumulator=accumulator,
+        knorm=not dq_scratch,
+        redo=not redo_in_output,
     ):
         return "o_lo"
     return "workspace"
@@ -812,13 +873,18 @@ def dsa_train_workspace_size(
 
     ``num_dst`` is the number of destination rows of the accumulator (the rows of ``dkv_acc`` when the binding adds
     through a ``dkv_dst_map``; ``num_kv`` by default); ``o_lo_scratch=True`` (see :func:`prepare_dsa_train`) leaves
-    the accumulator region out when it fits ``o_lo``.  ``key_passes``, ``num_segments``, ``dkv_acc`` and
-    ``dkv_direct`` are accepted for parity with the non-deterministic package; the layout does not depend on them."""
+    the accumulator region out when it fits ``o_lo``; ``dkv_acc=False`` (fresh dK/dV outputs) puts the redo lists
+    in the output (:func:`redo_lists_fit`).  The size assumes ``dq_latent`` and ``dkv_latent`` start 16-byte
+    aligned (any the runner allocates); a caller's output that does not needs the larger layout of
+    :func:`prepare_dsa_train`'s plan.  ``key_passes``, ``num_segments`` and ``dkv_direct`` are accepted for parity
+    with the non-deterministic package; the layout does not depend on them."""
     record_for(device)
     _check_key_passes(key_passes, num_kv)
     _check_dkv_direct(dkv_direct)
-    del num_segments, dkv_acc
+    del num_segments
     R = int(num_kv) if num_dst is None else int(num_dst)
+    dq_scratch = dq_scratch_layout(num_queries, num_kv) is not None
+    redo_in_output = not dkv_acc and redo_lists_fit(num_kv, R)
     storage = _storage(
         num_queries,
         num_kv,
@@ -826,6 +892,8 @@ def dsa_train_workspace_size(
         program=cake_jit.PROGRAM,
         accumulator=True,
         o_lo_scratch=o_lo_scratch,
+        dq_scratch=dq_scratch,
+        redo_in_output=redo_in_output,
     )
     return int(
         workspace_layout(
@@ -835,6 +903,8 @@ def dsa_train_workspace_size(
             backward=backward,
             num_dst=R,
             region=storage == "workspace",
+            dq_scratch=dq_scratch,
+            redo_in_output=redo_in_output,
         )["total"]
     )
 
@@ -855,13 +925,14 @@ def dsa_nope_train_workspace_size(
 ) -> int:
     """Workspace bytes :func:`prepare_dsa_nope_train` needs for ``(T, S, K_slots)`` on ``device``: as
     :func:`dsa_train_workspace_size`; without ``dkv_acc`` the fresh ``dkv`` is its own accumulator, so the region
-    holds the counters, bounds, grids and key norms only."""
+    holds the per-row words only (the key norms in dQ when they fit it)."""
     record_for(device, cake_jit.NOPE_PROGRAM)
     _check_key_passes(key_passes, num_kv)
     _check_dkv_direct(dkv_direct)
     del num_segments
     R = int(num_kv) if num_dst is None else int(num_dst)
     accumulator = bool(dkv_acc)
+    dq_scratch = dq_scratch_layout(num_queries, num_kv) is not None
     storage = _storage(
         num_queries,
         num_kv,
@@ -869,6 +940,7 @@ def dsa_nope_train_workspace_size(
         program=cake_jit.NOPE_PROGRAM,
         accumulator=accumulator,
         o_lo_scratch=o_lo_scratch,
+        dq_scratch=dq_scratch,
     )
     return int(
         workspace_layout_nope(
@@ -879,6 +951,7 @@ def dsa_nope_train_workspace_size(
             num_dst=R,
             region=storage == "workspace",
             accumulator=accumulator,
+            dq_scratch=dq_scratch,
         )["total"]
     )
 
@@ -1271,6 +1344,12 @@ class _Plan:
     storage: str = "workspace"
     # The byte layout of the accumulator region (:func:`accumulator_region_layout`).
     region: dict = field(default_factory=dict, repr=False)
+    # ``qstat`` and ``knorm`` live in the storage of dQ (:func:`dq_scratch_layout`), not in the workspace / region.
+    dq_scratch: bool = False
+    # The redo marks and list live in the fresh dK/dV output (:func:`redo_lists_fit`), not in the region.
+    redo_in_output: bool = False
+    # The layout of the per-call workspace of an eager or autograd backward (no ``topk_length`` region).
+    call_layout: dict = field(default_factory=dict, repr=False)
     fold_mode: int = FOLD_BF16
     # The program's forward stage(s) (``module_name`` is the program); the NoPE plans set them.
     forward_stages: tuple[str, ...] = FORWARD_STAGES
@@ -1472,6 +1551,18 @@ def _plan(
     )
     _check_output(outputs.get("dk_rope"), "dk_rope", (num_kv, D_ROPE), dkv_dtype)
     num_dst = _num_dst(num_kv, dkv_acc, dkv_dst_map) if backward else 0
+    # the bound terms and key norms in dQ, the redo lists in the fresh dK/dV output (both dead storage there)
+    dq_scratch = (
+        backward
+        and dq_scratch_layout(num_queries, num_kv) is not None
+        and _starts_aligned(outputs.get("dq_latent"))
+    )
+    redo_in_output = (
+        backward
+        and not accumulate
+        and redo_lists_fit(num_kv, num_dst, dkv_fp32=dkv_fp32)
+        and _starts_aligned(outputs.get("dkv_latent"))
+    )
     storage = (
         _storage(
             num_queries,
@@ -1480,20 +1571,34 @@ def _plan(
             program=cake_jit.PROGRAM,
             accumulator=True,
             o_lo_scratch=o_lo_scratch,
+            dq_scratch=dq_scratch,
+            redo_in_output=redo_in_output,
         )
         if backward
         else "workspace"
     )
-    region = accumulator_region_layout(num_kv, num_dst) if backward else {"total": 0}
+    region = (
+        accumulator_region_layout(
+            num_kv, num_dst, knorm=not dq_scratch, redo=not redo_in_output
+        )
+        if backward
+        else {"total": 0}
+    )
     if backward:
         _check_accumulator_span(num_dst, D_QK, dst_row_stride)
-    layout = workspace_layout(
-        num_queries,
-        num_kv,
-        topk,
-        backward=backward,
-        num_dst=num_dst if backward else None,
-        region=storage == "workspace",
+    layout, call_layout = (
+        workspace_layout(
+            num_queries,
+            num_kv,
+            topk,
+            backward=backward,
+            num_dst=num_dst if backward else None,
+            region=storage == "workspace",
+            dq_scratch=dq_scratch,
+            redo_in_output=redo_in_output,
+            per_call=per_call,
+        )
+        for per_call in (False, True)
     )
     fold_mode = FOLD_ACCUMULATE if accumulate else FOLD_FP32 if dkv_fp32 else FOLD_BF16
     has_topk_length = topk_length is not None
@@ -1572,6 +1677,9 @@ def _plan(
         num_dst=num_dst,
         storage=storage,
         region=region,
+        dq_scratch=dq_scratch,
+        redo_in_output=redo_in_output,
+        call_layout=call_layout,
         fold_mode=fold_mode,
     )
 
@@ -1597,7 +1705,8 @@ def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
     a workspace region): ``acc`` (int32 ``[R, 576 | 512]``, absent for a fresh NoPE ``dkv``), the overflow counters
     ``cnt64`` (u64 ``[R, 4]``) with their u32 view ``cnt``, the grid words ``e_lat`` / ``e_rope`` (int32 ``[R]``;
     NoPE ``e_lat`` only, ``e_rope`` aliases it), the pair counts ``row_pairs`` (u32), the redo marks and list
-    ``redo_mark`` / ``redo_rows`` (int32 ``[R]``) and the key norms ``knorm`` (FP32 ``[S]``)."""
+    ``redo_mark`` / ``redo_rows`` (int32 ``[R]``) and the key norms ``knorm`` (FP32 ``[S]``) -- the last three when
+    the region holds them (else :func:`_carve_moved` places them)."""
     R, S, region = plan.num_dst, plan.num_kv, plan.region
     parts = 2 if plan.program == cake_jit.PROGRAM else 1
     t: dict[str, torch.Tensor] = {}
@@ -1616,10 +1725,36 @@ def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
     t["row_pairs"] = _carve(flat, region, "row_pairs", torch.int32, (R,)).view(
         torch.uint32
     )
-    t["redo_mark"] = _carve(flat, region, "redo_mark", torch.int32, (R,))
-    t["redo_rows"] = _carve(flat, region, "redo_rows", torch.int32, (R,))
-    t["knorm"] = _carve(flat, region, "knorm", torch.float32, (S,))
+    if "redo_mark" in region:
+        t["redo_mark"] = _carve(flat, region, "redo_mark", torch.int32, (R,))
+        t["redo_rows"] = _carve(flat, region, "redo_rows", torch.int32, (R,))
+    if "knorm" in region:
+        t["knorm"] = _carve(flat, region, "knorm", torch.float32, (S,))
     return t
+
+
+def _carve_moved(plan: _Plan, t: dict[str, torch.Tensor]) -> None:
+    """Place the scratch the plan keeps in dead output storage: ``qstat`` and ``knorm`` at the front of dQ
+    (``dq_latent``; :func:`dq_scratch_layout`) and the redo marks and list at the front of the fresh dK/dV output
+    (``dkv_latent`` or ``dkv_latent_fp32``; :func:`redo_lists_fit`).  Called once the outputs are bound."""
+    if not plan.backward:
+        return
+    if plan.dq_scratch:
+        dq = t["dq_latent"].view(-1).view(torch.uint8)
+        layout = dq_scratch_layout(plan.num_queries, plan.num_kv)
+        assert layout is not None and dq.data_ptr() % 16 == 0
+        t["qstat"] = _carve(
+            dq, layout, "qstat", torch.float32, (plan.num_queries, QSTAT_WORDS)
+        )
+        t["knorm"] = _carve(dq, layout, "knorm", torch.float32, (plan.num_kv,))
+    if plan.redo_in_output:
+        out = t["dkv_latent_fp32"] if plan.dkv_fp32 else t["dkv_latent"]
+        flat = out.view(-1).view(torch.uint8)
+        assert flat.data_ptr() % 16 == 0
+        R = plan.num_dst
+        layout = _layout_of([("redo_mark", R * 4), ("redo_rows", R * 4)])
+        t["redo_mark"] = _carve(flat, layout, "redo_mark", torch.int32, (R,))
+        t["redo_rows"] = _carve(flat, layout, "redo_rows", torch.int32, (R,))
 
 
 def _region_bytes(
@@ -1648,18 +1783,20 @@ def _scratch(
     *,
     layout: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """The backward scratch of ``plan``: ``delta``, ``qstat`` and ``det_globals`` from the workspace ``flat`` (laid
-    out as ``layout``, ``plan.layout`` by default) and the accumulator region (:func:`_region_bytes`: the workspace's
-    ``region`` when ``layout`` holds one and ``o_lo`` is not carved, else one allocation)."""
+    """The backward scratch of ``plan``: ``delta``, ``qstat`` (unless it lives in dQ) and ``det_globals`` from the
+    workspace ``flat`` (laid out as ``layout``, ``plan.layout`` by default) and the accumulator region
+    (:func:`_region_bytes`: the workspace's ``region`` when ``layout`` holds one and ``o_lo`` is not carved, else
+    one allocation).  :func:`_carve_moved` places the rest once the outputs are bound."""
     T = plan.num_queries
     layout = plan.layout if layout is None else layout
     t = dict(
         delta=_carve(flat, layout, "delta", torch.float32, (T, NUM_HEADS)),
-        qstat=_carve(flat, layout, "qstat", torch.float32, (T, QSTAT_WORDS)),
         det_globals=_carve(flat, layout, "globals", torch.int32, (GLOBAL_WORDS,)).view(
             torch.uint32
         ),
     )
+    if "qstat" in layout:
+        t["qstat"] = _carve(flat, layout, "qstat", torch.float32, (T, QSTAT_WORDS))
     region = _region_bytes(plan, o_lo, flat, layout, flat.device)
     t.update(_carve_region(plan, region))
     return t
@@ -1673,10 +1810,13 @@ def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     fold as ``dst_packed``; the redo reads its flagged-row count from the global words (``redo_count``).  Every
     pointer a stage's scalars tell it not to touch is a zero-size placeholder of its dtype."""
     indices, _ = _pointer_operand(t["indices"])
+    # a forward launch binds no backward scratch
+    backward = plan.backward and "det_globals" in t
+    if backward:
+        _carve_moved(plan, t)
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
-    # a forward launch binds no backward scratch
-    if not plan.backward or "det_globals" not in t:
+    if not backward:
         return values
     device = t["indices"].device
     f32 = _inert_operand(device, torch.float32)
@@ -2266,10 +2406,11 @@ class _Binding:
             dq_latent=fresh((T, NUM_HEADS, D_LATENT), torch.bfloat16),
             dq_rope=fresh((T, NUM_HEADS, D_ROPE), torch.bfloat16),
         )
-        # One per-call allocation of the workspace layout (delta, qstat, global words and, unless the plan carves
-        # o_lo, the accumulator region); nothing is filled here: the stages zero what they read.
-        flat = _alloc((plan.layout["total"],), torch.uint8, device)
-        t.update(_scratch(plan, flat, o_lo))
+        # One per-call allocation of the per-call layout (delta, the global words, qstat unless it lives in dQ and,
+        # unless the plan carves o_lo, the accumulator region); nothing is filled here: the stages zero what they
+        # read.
+        flat = _alloc((plan.call_layout["total"],), torch.uint8, device)
+        t.update(_scratch(plan, flat, o_lo, layout=plan.call_layout))
         if plan.accumulate_dkv:
             if dkv_acc is None:
                 raise RuntimeError(
@@ -3125,8 +3266,15 @@ def _plan_nope(
     )
     _check_output(outputs.get("dkv"), "dkv", (num_kv, D_LATENT), torch.float32)
     num_dst = _num_dst(num_kv, dkv_acc, dkv_dst_map) if backward else 0
-    # a fresh dkv is its own integer accumulator: the region holds the counters, bounds, grids and key norms only
+    # a fresh dkv is its own integer accumulator: the region holds the per-row words only (the bound terms and
+    # key norms in dQ, dead storage there; the redo lists stay in the region)
     own_accumulator = bool(accumulate)
+    dq_scratch = (
+        backward
+        and dq_scratch_layout(num_queries, num_kv) is not None
+        and _starts_aligned(outputs.get("dq_latent"))
+    )
+    redo_in_output = False
     storage = (
         _storage(
             num_queries,
@@ -3135,27 +3283,37 @@ def _plan_nope(
             program=program,
             accumulator=own_accumulator,
             o_lo_scratch=o_lo_scratch,
+            dq_scratch=dq_scratch,
         )
         if backward
         else "workspace"
     )
     region = (
         accumulator_region_layout(
-            num_kv, num_dst, program=program, accumulator=own_accumulator
+            num_kv,
+            num_dst,
+            program=program,
+            accumulator=own_accumulator,
+            knorm=not dq_scratch,
         )
         if backward
         else {"total": 0}
     )
     if backward:
         _check_accumulator_span(num_dst, D_LATENT, dst_row_stride)
-    layout = workspace_layout_nope(
-        num_queries,
-        num_kv,
-        topk,
-        backward=backward,
-        num_dst=num_dst if backward else None,
-        region=storage == "workspace",
-        accumulator=own_accumulator,
+    layout, call_layout = (
+        workspace_layout_nope(
+            num_queries,
+            num_kv,
+            topk,
+            backward=backward,
+            num_dst=num_dst if backward else None,
+            region=storage == "workspace",
+            accumulator=own_accumulator,
+            dq_scratch=dq_scratch,
+            per_call=per_call,
+        )
+        for per_call in (False, True)
     )
     fold_mode = FOLD_ACCUMULATE if accumulate else FOLD_IN_PLACE
     has_topk_length = topk_length is not None
@@ -3244,6 +3402,9 @@ def _plan_nope(
         num_dst=num_dst,
         storage=storage,
         region=region,
+        dq_scratch=dq_scratch,
+        redo_in_output=redo_in_output,
+        call_layout=call_layout,
         fold_mode=fold_mode,
         forward_stages=cake_jit.NOPE_FORWARD_STAGES,
         program=program,
@@ -3643,13 +3804,13 @@ class _NopeBinding(_Binding):
         plan = self.plan
         T, S, device = plan.num_queries, plan.num_kv, dout.device
         dq = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
-        flat = _alloc((plan.layout["total"],), torch.uint8, device)
+        flat = _alloc((plan.call_layout["total"],), torch.uint8, device)
         t = dict(operands, dout=dout, dq_latent=dq)
         dkv = None
         if not plan.accumulate_dkv:
             # the fresh natural dkv: the integer accumulator of the main stage, rewritten as FP32 by the fold
             t["dkv"] = dkv = _alloc((S, D_LATENT), torch.float32, device)
-        t.update(_scratch(plan, flat, t["o_lo"]))
+        t.update(_scratch(plan, flat, t["o_lo"], layout=plan.call_layout))
         self._run(_bound_values_nope(plan, t), plan.backward_order)
         return dq, dkv
 
