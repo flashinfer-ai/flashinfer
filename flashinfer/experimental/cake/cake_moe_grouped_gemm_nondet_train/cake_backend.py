@@ -76,10 +76,8 @@ split and the raster follow from host-known scalars (tensor shapes, the SM
 count, the architecture) so a prepared launch is CUDA-graph capturable and
 stays valid for any ``offs`` written later.  The host planner below makes the
 deterministic package's decisions from ``HOST_PLAN_CONSTANTS`` with its rules;
-the constants are the deterministic package's but for
-``k512_min_rows_per_group``, from which the weight gradient takes this
-package's own 512-wide k tile builds, and the keys of the one-launch tail
-(``unordered_tail_archs``, empty; ``ordered_tail_archs``; and
+the constants are the deterministic package's but for the keys of the
+one-launch tail (``unordered_tail_archs``, empty; ``ordered_tail_archs``; and
 ``atomic_tail_plan``, which its split follows: ``wgrad_atomic_tail_plan``).
 
 Program choice.  ``fwd`` and ``dgrad`` launch the 512-column output tile (the

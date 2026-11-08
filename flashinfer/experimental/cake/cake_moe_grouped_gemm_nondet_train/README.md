@@ -346,10 +346,6 @@ domain-scheduled twin; sm_107a, the A-collector twin) from the architecture's
 `fwd_evict_first_archs` (sm_100a, sm_103a) for `K >= fwd_evict_first_min_k`
 (`fwd_evict_first`). The eviction priority changes no arithmetic. Differences:
 
-- `HOST_PLAN_CONSTANTS["k512_min_rows_per_group"]` is this package's own:
-  the rows per group from which the weight gradient takes the 512-wide k
-  tile's ordered one-launch tail builds (4096 on every architecture).
-
 - Ordered one-launch tail (`plan_wgrad(..., ordered_tail=True)`): the
   512-wide k tile on the architectures of
   `HOST_PLAN_CONSTANTS["ordered_tail_archs"]` (`wgrad_ordered_tail`; sm_100a,

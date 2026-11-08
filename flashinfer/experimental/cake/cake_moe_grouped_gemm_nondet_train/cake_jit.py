@@ -85,9 +85,7 @@ from . import cake_build
 #
 # The host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``,
 # with the deterministic package's rules and constants (``cake_backend``,
-# program choice), but for ``k512_min_rows_per_group``, the rows per group from
-# which the weight gradient takes this package's own 512-wide k tile builds;
-# ``ordered_tail_archs`` lists the architectures whose 512-wide k
+# program choice); ``ordered_tail_archs`` lists the architectures whose 512-wide k
 # tile routes bind the ordered one-launch tail builds -- every architecture of
 # those routes; ``unordered_tail_archs`` is empty (the registry holds no build
 # that adds its split tail with unordered reductions); and
@@ -911,7 +909,7 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "k256_tail_archs": ["sm_107a"],
     "k256_tail_max_k": 2048,
     "k256_tail_min_rows": 8192,
-    "k512_min_rows_per_group": {"sm_100a": 4096, "sm_103a": 4096, "sm_107a": 4096},
+    "k512_min_rows_per_group": {"sm_100a": 3072, "sm_103a": 3072, "sm_107a": 4096},
     "wave_sync_min_k": 4096,
     "wave_sync_archs": {
         256: ["sm_100a", "sm_103a"],
