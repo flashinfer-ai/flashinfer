@@ -29,12 +29,6 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
-)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -214,6 +208,17 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
     "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
     "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
+    # The deterministic Cake fused SwiGLU + MXFP8 quantization: its module and
+    # the names of its module (the backend package loads on first use).
+    "cake_gated_act_mxfp8_det_train": (".cake_gated_act_mxfp8_det_train", None),
+    **{
+        name: (".cake_gated_act_mxfp8_det_train", name)
+        for name in (
+            "cake_gated_act_mxfp8_det_train_backward",
+            "cake_gated_act_mxfp8_det_train_forward",
+            "is_cake_gated_act_mxfp8_det_train_supported",
+        )
+    },
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
     "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
     # The deterministic Cake MoE grouped GEMM: the names of its module.

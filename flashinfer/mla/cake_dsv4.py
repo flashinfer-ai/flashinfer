@@ -100,7 +100,12 @@ Host contract (flashinfer#4671 hardening)
 * **Split-KV pieces (SM107).** A split launch of the FP8/H128 uniform-gather
   route (:func:`_k64_split_plan`) runs its ``W`` whole rows first and each
   later row ``t`` as ``s`` pieces of its sparse tiles, then merges the
-  pieces into ``O`` (one ``run_sequence`` call). It carves
+  pieces into ``O`` (one ``run_sequence`` call) with the merge their rule's
+  ``merge_by_splits`` names for ``s`` and their rows
+  (:func:`_k64_split_merge`): on SM107, for 128 heads, a merge built for
+  ``s`` pieces alone, one CTA per row and head (nine and five pieces) or one
+  warp per row and head and two heads per CTA (three pieces at 16-20 rows),
+  else the merge of any ``s``, one CTA per row and head. It carves
   ``cake_dsv4_workspace_layout(R, H, s)`` for its ``R = T - W`` split rows
   and stores the pieces in token-major order: piece ``j`` of row ``t`` is
   ``p = (t - W) * s + j``, its BF16 partial O the rows ``[p, :, :]`` of
@@ -2227,6 +2232,30 @@ _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_ti
 # (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
 _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 
+# The TMEM-batch sibling ``<route>_kv4_bcl`` of the four-stage sibling on
+# SM107: the four-stage program whose correction warps rescale each output
+# stage in two 64-column TMEM load / multiply / store passes in place of eight
+# 16-column steps and whose softmax waits once for its two max-reduction loads,
+# with the four-stage program's arguments, grid, launch and shared memory and
+# the same output bits.  It takes the four-stage launches of one window and
+# every other launch keeps the four-stage program (:func:`_kv4_bcl_variant`):
+# 64-head MTP decode launches of calls whose longest request has 2-4 query
+# tokens, of at least 108 rows and at most two rows per SM of the device (432
+# at 216 SMs, 424 at 212, 416 at 208), over items of at most six tiles.  R200
+# (216 SMs) and VR200 (212 SMs), eight calls per CUDA graph over distinct
+# inputs behind an L2 flush / over one input, four-stage program -> TMEM-batch
+# program: q_len 2-4, widths 384-768, 108 rows to two per SM 0.996-1.011x /
+# 1.000-1.012x, no row slower beyond the spread of two runs of the same
+# program.  The window leaves out the launches on which the TMEM-batch program
+# trailed: one-token requests, 96-row launches over items 768 wide, items 1152
+# wide and 257- to 1024-token prefill.
+_KV4_BCL_HEADS = 64  # query heads
+_KV4_BCL_MIN_Q = 2  # query tokens of the call's longest request
+_KV4_BCL_MAX_Q = 4
+_KV4_BCL_MIN_TOKENS = 108  # query rows of the launch
+_KV4_BCL_MAX_TOKENS_PER_SM = 2  # query rows of the launch per SM of the device
+_KV4_BCL_MAX_TOPK = 768  # item width (sparse_topk), six tiles
+
 # The routes with an early-PV sibling ``<route>_overlap`` on SM107: the route's
 # program whose P x V MMAs start once the softmax has written the low half of
 # P and whose epilogues drain the output of the first V block while the MMA of
@@ -2402,6 +2431,48 @@ def _fp8_h64_kv4_edges(
     )
 
 
+def _kv4_bcl_variant(
+    variant: str,
+    *,
+    arch: str,
+    num_heads: int,
+    max_q_len: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    device: torch.device,
+) -> str:
+    """The variant a launch over ``num_query_tokens`` rows of a call whose
+    longest request has ``max_q_len`` tokens runs once :func:`_kv4_variant`
+    chose ``variant``: its TMEM-batch sibling ``<variant>_bcl`` when
+    ``variant`` is the four-stage sibling of a route in
+    ``_KV4_SIBLING_ROUTES``, the call has ``_KV4_BCL_HEADS`` heads,
+    ``max_q_len`` is from ``_KV4_BCL_MIN_Q`` to ``_KV4_BCL_MAX_Q``, the items
+    are at most ``_KV4_BCL_MAX_TOPK`` wide, the launch has at least
+    ``_KV4_BCL_MIN_TOKENS`` rows, ``arch`` routes the TMEM-batch sibling to a
+    program other than the four-stage one and the launch has at most
+    ``_KV4_BCL_MAX_TOKENS_PER_SM`` rows per SM of ``device``, else
+    ``variant``.  The four-stage launch check :func:`_kv4_variant` applied
+    covers the TMEM-batch sibling, which takes the same shared memory."""
+    route = variant.removesuffix("_kv4")
+    if route == variant or route not in _KV4_SIBLING_ROUTES:
+        return variant
+    if num_heads != _KV4_BCL_HEADS:
+        return variant
+    if not _KV4_BCL_MIN_Q <= max_q_len <= _KV4_BCL_MAX_Q:
+        return variant
+    if sparse_topk > _KV4_BCL_MAX_TOPK or num_query_tokens < _KV4_BCL_MIN_TOKENS:
+        return variant
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{variant}_bcl"
+    if programs.get(sibling, programs.get(variant)) == programs.get(variant):
+        return variant
+    if num_query_tokens > _KV4_BCL_MAX_TOKENS_PER_SM * _device_sm_count(device):
+        return variant
+    return sibling
+
+
 def _overlap_variant(
     route: str, *, arch: str, num_query_tokens: int, device: torch.device
 ) -> str:
@@ -2466,14 +2537,29 @@ def _pdl_variant(
 # per row; the split form of the K=64 program (``_K64_SPLIT_VARIANT``) runs
 # each row as ``s`` pieces of its sparse tiles, two CTAs per piece, and writes
 # partial O and LSE (module docstring, "Split-KV pieces"); the merge program
-# (``_K64_SPLIT_MERGE``, one CTA per row and head) writes O from them.  Both
-# launch back to back in one FFI call with the call's PDL setting.
+# (``_K64_SPLIT_MERGE``, one CTA per row and head, any ``s``) writes O from
+# them, or, for the 128-head launches whose rule's ``merge_by_splits`` names
+# a merge built for their ``s`` pieces alone at their rows, that merge
+# (``_K64_SPLIT_COUNT_MERGES``, :func:`_k64_split_merge`).  Both launch back
+# to back in one FFI call with the call's PDL setting.
 _K64_SPLIT_ROUTE = "fp8_h128_prefill_source_persistent_uniform"
 _K64_SPLIT_VARIANT = "fp8_h128_prefill_source_persistent_uniform_k64_split"
 # A launch splits only where the registry routes both keys to programs of
 # their own (:func:`_k64_split`).
 _K64_SPLIT_MERGE = "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce"
 _K64_SPLIT_HEADS = 128
+# The merges built for one piece count s, each with the heads one of its CTAs
+# serves: ``_c{s}`` is the copy of ``_K64_SPLIT_MERGE`` for s pieces alone
+# (one CTA per row and head, the same per-element operations; the merge of
+# any count holds the copies for 1-9 pieces and picks one at run time) and
+# ``_s3`` the three-piece merge with one warp per row and head (two heads per
+# CTA).  A 128-head launch of s pieces takes the one its rule's
+# ``merge_by_splits`` names for s at its rows (:func:`_k64_split_merge`).
+_K64_SPLIT_COUNT_MERGES: Mapping[str, int] = {
+    f"{_K64_SPLIT_MERGE}_c9": 1,
+    f"{_K64_SPLIT_MERGE}_c5": 1,
+    f"{_K64_SPLIT_MERGE}_s3": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -2489,27 +2575,66 @@ class _K64SplitRule:
     # ``s`` pieces per row with ``s`` at most ``num_tiles`` and rows x ``s``
     # at most that count's ``most pieces``.
     splits: tuple[tuple[int, int], ...]
+    # ``(s, fewest rows, merge)``: a launch of ``s`` pieces per row merges
+    # with the ``merge`` (``_K64_SPLIT_MERGE`` or a key of
+    # ``_K64_SPLIT_COUNT_MERGES``) of the entry for ``s`` with the most
+    # ``fewest rows`` at most its rows, and with ``_K64_SPLIT_MERGE`` where no
+    # entry is (128 heads only).
+    merge_by_splits: tuple[tuple[int, int, str], ...] = ()
 
 
 # Per architecture.  R200 (sm_107a, 208 SMs), eight back-to-back calls per
 # CUDA graph with PDL, items 1152 wide (nine tiles) whose rows use all of
-# them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows (nine
-# pieces), 1.43x at 4, 1.34x at 8 (five), 1.23x at 12 (three), 1.18x at 14
-# and 1.11-1.12x at 15 (three) and 1.05-1.07x at 16-17 (two).  Three pieces
-# run up to 45 pieces: at 14-15 rows they measured 1.06-1.11x of two, and at
-# 16 rows (48 pieces) 0.91-0.92x.  Nine pieces at 5 rows (45 pieces) measured
-# 0.97x of five, so the other counts stay at 40.  A launch whose every row
-# fits in one piece (at most ceil(9 / s) tiles: short requests, piece 0
-# writes O itself) still runs the merge kernel and measured 0.81-0.86x (0.97x
-# of two pieces at 15 rows of at most three tiles); the host does not read
-# row lengths, so those launches split as well.  Without PDL the 17-row
-# launch measured 0.98x: no launch without PDL splits.
+# them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows and 1.43x
+# at 4 (nine pieces), 1.34x at 8 (five).  Nine pieces at 5 rows (45 pieces)
+# measured 0.97x of five, so nine and five stay at 40 pieces.  Three pieces
+# run every launch of 9-20 rows (at most 20 x 3 = 60 pieces, so no launch
+# takes two).  With the merge of any count, three pieces measured 1.23x of
+# the K=32 program at 12 rows and 1.11-1.12x at 15, but 0.91-0.92x of two
+# pieces at 16 rows (48 pieces).  The launches of 16-20 rows merge with
+# the three-piece merge (``merge_by_splits``: one warp per row and head, two
+# heads per CTA, the per-element operations of the merge of any count): in a
+# test harness on a 216-SM R200, three pieces with a merge of the three-piece
+# merge's geometry ran a median 0.80-0.93 us per call faster than two pieces
+# with the merge of any count at 16 and 17 rows, and at least 0.3 us faster
+# in each of 8 rounds.  At 18-20 rows, three pieces with the three-piece
+# merge ran 0.84-1.07 us per call faster than the K=32 program (1.09-1.11x)
+# in a test harness on a 216-SM R200 (CUDA graph of 8 calls, PDL, rows that
+# use all nine tiles), 1.08-1.13x on a 208-SM R200 and 1.05-1.11x on a
+# 212-SM VR200, faster beyond the A/A difference in every round on each.
+# The launches of 9-15 rows do not take the three-piece
+# merge: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
+# lengths ran slower with it in every round.  The launches of nine and five
+# pieces merge with the merge built for their count alone
+# (``merge_by_splits``: ``_c9``, ``_c5``), the merge of any count's code for
+# that count, so the output bits do not change: in a test harness on a
+# 216-SM R200 (CUDA graph of 8 calls, PDL) the launches of 4, 7 and 8 rows
+# ran 0.12-0.37 us per call faster with it (1.01-1.05x), faster beyond the
+# A/A difference in each of 8 rounds, and the launches of 1-3, 5 and 6 rows
+# differed by at most 0.06 us; on a 208-SM R200 and a 212-SM VR200 no launch
+# of 1-8 rows ran slower beyond the A/A difference.  The three-piece launches
+# of 9-15 rows keep the merge of any count: the merge built for three pieces
+# alone ran slower than it on a 208-SM R200 and on a 212-SM VR200.  With the
+# merge of any count, a launch whose every row fits in one piece (at most
+# ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
+# merge kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at
+# most three tiles); the host does not read row lengths, so those launches
+# split as well.  At 18-20 rows, with the three-piece merge, such a launch
+# measured 0.78-0.81x (1.57-1.83 us per call slower) and one whose every row
+# uses at most five tiles 0.86-0.89x (0.97-1.33 us slower) on those three
+# boards.  Without PDL the 17-row launch measured 0.98x with two pieces:
+# no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
-        max_tokens_pdl=17,
+        max_tokens_pdl=20,
         max_tokens_no_pdl=0,
-        splits=((9, 40), (5, 40), (3, 45), (2, 40)),
+        splits=((9, 40), (5, 40), (3, 60)),
+        merge_by_splits=(
+            (9, 1, f"{_K64_SPLIT_MERGE}_c9"),
+            (5, 5, f"{_K64_SPLIT_MERGE}_c5"),
+            (3, 16, f"{_K64_SPLIT_MERGE}_s3"),
+        ),
     ),
 }
 
@@ -2579,6 +2704,37 @@ def _k64_split_plan(
         if splits <= rule.num_tiles and num_query_tokens * splits <= max_pieces:
             return (0, num_query_tokens, splits)
     return None
+
+
+def _k64_split_merge(
+    *, arch: str, num_heads: int, rows: int, num_splits: int
+) -> tuple[str, int]:
+    """The merge variant of a split launch and its heads per CTA: the
+    per-count merge the 128-head rule of ``arch`` names for ``num_splits``
+    pieces and ``rows`` rows (``merge_by_splits``) where the registry routes
+    it to a program of its own (not the route's, not ``_K64_SPLIT_MERGE``'s),
+    else ``_K64_SPLIT_MERGE`` (one CTA per row and head).  A per-count merge
+    runs its own count of pieces only, and the three-piece merge serves two
+    heads per CTA with no head bound: each must launch with its count and
+    over ``H`` divided by its heads per CTA, which a registry entry pointing
+    its key at either of those programs (a retired key) never does."""
+    key, fewest = _K64_SPLIT_MERGE, 0
+    if num_heads == _K64_SPLIT_HEADS and arch in _K64_SPLIT_RULES:
+        for s, at_least, merge in _K64_SPLIT_RULES[arch].merge_by_splits:
+            if s == num_splits and fewest < at_least <= rows:
+                key, fewest = merge, at_least
+    heads_per_cta = _K64_SPLIT_COUNT_MERGES.get(key)
+    if heads_per_cta is not None:
+        from ..jit.cake_dsv4 import VARIANTS
+
+        programs = VARIANTS.get(arch, {})
+        own = programs.get(key)
+        if own is not None and own not in (
+            programs.get(_K64_SPLIT_ROUTE),
+            programs.get(_K64_SPLIT_MERGE),
+        ):
+            return key, heads_per_cta
+    return _K64_SPLIT_MERGE, 1
 
 
 def _k64_split_workspace_bytes(
@@ -2774,16 +2930,24 @@ def run_cake_dsv4(
     rows per launch and on SM100 when the longest request has at least 257
     query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
     rows run a split-KV producer and a merge when the workspace holds their
-    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``) and
-    FP8/H64 over items of four to nine tiles (``_K64_SPLIT_RULES_H64``)
-    (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes
-    it).
+    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; their
+    launches of nine and five pieces and of three pieces at 16-20 rows
+    merge with a merge built for their piece count where the registry has
+    it, :func:`_k64_split_merge`) and FP8/H64 over items of four to nine
+    tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
+    :func:`cake_dsv4_workspace_requirement` includes it).
 
     On SM107 the FP8 low-head prefill route runs launches of at most 64 query
     rows (fewer on a part with fewer than 216 SMs) on its early-PV sibling and
     the larger ones on its own program (``_overlap_variant``).  Each program
     builds and loads its module on its first launch: warm up launches on both
     sides of that ceiling eagerly before a capture.
+
+    On SM107 the four-stage multi-tile M64 program runs the 64-head launches of
+    108 query rows up to two per SM over items at most 768 wide, of calls whose
+    longest request has 2-4 query tokens, on its TMEM-batch sibling and every
+    other launch on its own program (``_kv4_bcl_variant``); warm up launches on
+    both sides of that window eagerly before a capture as well.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -3228,7 +3392,8 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         if L.split is not None:
             # SM107 split-KV launch (_k64_split): W whole rows, then R rows of
             # s pieces each (two CTAs per item); the merge writes the split
-            # rows' O, one CTA per (row, head).  One run_sequence call.
+            # rows' O, one CTA per (row, head) or, for the three-piece merge,
+            # per (row, two heads) (_k64_split_merge).  One run_sequence call.
             num_whole, rows, num_splits = L.split
             items = num_whole + rows * num_splits
             pieces = L.pieces(rows, num_splits)
@@ -3239,9 +3404,12 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
                 num_whole_items=num_whole,
                 **pieces,
             )
+            merge, heads_per_cta = _k64_split_merge(
+                arch=L.arch, num_heads=H, rows=rows, num_splits=num_splits
+            )
             merge_launch = L.variant(
-                _K64_SPLIT_MERGE,
-                grid=(rows, H, 1),
+                merge,
+                grid=(rows, H // heads_per_cta, 1),
                 O=v["O"][num_whole:],
                 **pieces,
             )
@@ -3269,9 +3437,20 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # runs the multi-tile program's launches on its four-stage sibling
         # where this process can launch it (_kv4_variant); run_cake_dsv4
         # routed the FP8/H64 decode rows by the same check (_fp8_h64_kv4_edges).
+        # The four-stage launches of the TMEM-batch window (64-head MTP decode)
+        # run its TMEM-batch sibling (_kv4_bcl_variant).
         parts = L.partials(1)
-        program = _pdl_variant(
+        program = _kv4_bcl_variant(
             _kv4_variant(route, arch=L.arch, device=v["Q"].device),
+            arch=L.arch,
+            num_heads=H,
+            max_q_len=v["max_q_len"],
+            num_query_tokens=T,
+            sparse_topk=topk,
+            device=v["Q"].device,
+        )
+        program = _pdl_variant(
+            program,
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,

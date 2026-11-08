@@ -25,30 +25,36 @@ otherwise through FlashInfer's JIT from the sources and flags of
 ``build.json``; the prebuilt route imports nothing from ``flashinfer``.
 
 Every launch is a plain stream-ordered launch on the current torch stream:
-nothing cooperative, no PDL, no co-residency requirement.  Nothing here reads
+nothing cooperative, no PDL, no co-residency requirement.  The backward
+builds its tile tables (``bwd_plan``) and the row-map fold order on a
+high-priority side stream of the device, forked from the current stream and
+joined back by CUDA events before their first read, so they overlap
+``bwd_pre`` and the main kernels.  Nothing here reads
 an environment variable, reads device memory or synchronizes; grids and
 scratch sizes come from tensor shapes, ``len(cu_seqlens) - 1`` and the SM
 count.  The segment boundaries ``cu_seqlens_q`` / ``cu_seqlens_k`` (int32 on
 the device, ``cu[0] == 0``, non-decreasing, ``cu_q[-1] == T_q``,
 ``cu_k[-1] == T_k``) are read by the kernels only.
 
-The package is the non-deterministic one of its family (``nondet``): the
-forward is fixed-order, but the backward adds the dQ partials of the key
-blocks (and, with a row map, the dK / dV window rows into the caller's
-destinations) with atomic FP32 reductions, so its gradients are not bitwise
-reproducible run to run.  Under ``torch.use_deterministic_algorithms(True)``
-:func:`cake_gqa_nondet_train_backward` raises PyTorch's alert before it
-launches (``warn_only=True``: it warns and runs this backward); nothing falls
-back to a deterministic implementation.
+The package is the non-deterministic one of its family (``nondet``; the name
+keeps the mode word), yet every sum of the forward and the backward has one
+fixed order: ``out``, ``lse``, dQ and every dK / dV form are bitwise
+reproducible run to run for one shape, one ``max_seqlen_k``, one workspace
+budget and the same host boundaries (the budget and the optional host copies
+of the boundaries set the chunks and with them the dQ rounding).
+The backward main kernel stores dS^T into a workspace and computes dK and dV
+in tensor memory; dQ is a GEMM over the workspace.  Nothing adds with
+atomics, so the package raises no PyTorch determinism alert.  The row-map
+form adds the FP32 window rows into their destination rows in ascending
+window order through a stable sort of the row map.
 """
 
 from __future__ import annotations
 
 import functools
 import math
-import warnings
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Optional, Union
 
 import torch
@@ -89,8 +95,12 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = dict(cake_jit.ARCH_BY_CAPABILIT
 HEAD_DIM: int = cake_jit.HEAD_DIM
 LOG2_E = math.log2(math.e)
 
-# The three dK / dV outputs of the backward main kernel, by stage.
-_BWD_STAGE = {"bf16": "bwd_bf16", "fp32": "bwd_fp32", "rowmap": "bwd_rowmap"}
+# The main kernel of each dK / dV output (the row-map form runs the FP32 window, then the fold).
+_MAIN_STAGE = {
+    "bf16": "bwd_main_bf16",
+    "fp32": "bwd_main_fp32",
+    "rowmap": "bwd_main_fp32",
+}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -195,6 +205,26 @@ def parameters(name: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+@functools.cache
+def _entry(name: str, arch: str) -> Any:
+    """The FFI entry of record ``name`` in its ``arch`` library (looked up once per process)."""
+    return getattr(load(name, arch), record(name)["ffi_entry"])
+
+
+def _run(
+    name: str, values: Mapping[str, Any], grid: tuple[int, int, int], arch: str
+) -> None:
+    """Launch record ``name`` on the current device and torch stream: the caller holds
+    ``torch.cuda.device(device_index)`` and ``tvm_ffi.use_torch_stream()`` (once per forward or backward call)."""
+    args = []
+    for key in parameters(name):
+        try:
+            args.append(values[key])
+        except KeyError:
+            raise ValueError(f"record {name} needs argument {key!r}") from None
+    _entry(name, arch)(*args, int(grid[0]), int(grid[1]), int(grid[2]))
+
+
 def run_record(
     name: str,
     values: Mapping[str, Any],
@@ -204,51 +234,145 @@ def run_record(
 ) -> None:
     """Launch record ``name`` with its kernel parameters named in ``values`` on ``grid``, on the current torch
     stream of device ``device_index`` (the operands' device, made current for the launch)."""
-    args = []
-    for key in parameters(name):
-        try:
-            args.append(values[key])
-        except KeyError:
-            raise ValueError(f"record {name} needs argument {key!r}") from None
-    entry = getattr(load(name, device_arch(device_index)), record(name)["ffi_entry"])
+    arch = device_arch(device_index)
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
-        entry(*args, int(grid[0]), int(grid[1]), int(grid[2]))
+        _run(name, values, grid, arch)
 
 
 def _launch(
-    stage: str, values: Mapping[str, Any], dims: Mapping[str, int], device_index: int
+    stage: str,
+    values: Mapping[str, Any],
+    dims: Mapping[str, int],
+    device_index: int,
+    **chunk: int,
 ) -> None:
-    grid = cake_jit.grid(stage, sm_count=sm_count(device_index), **dims)
-    run_record(
-        stage_record(stage, device_arch(device_index)),
-        values,
-        grid=grid,
-        device_index=device_index,
-    )
+    """Launch ``stage`` inside the caller's device and stream context (see :func:`_run`)."""
+    arch = device_arch(device_index)
+    grid = cake_jit.grid(stage, sm_count=sm_count(device_index), **dims, **chunk)
+    _run(stage_record(stage, arch), values, grid, arch)
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Workspace
 
 
+def _budget(budget_bytes: Optional[int]) -> int:
+    """The dS^T workspace budget of one backward call (``None``: :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`)."""
+    if budget_bytes is None:
+        return cake_jit.DEFAULT_WORKSPACE_BUDGET
+    if int(budget_bytes) <= 0:
+        raise ValueError(f"budget_bytes must be positive, got {budget_bytes}")
+    return int(budget_bytes)
+
+
+HostBoundaries = Union[Sequence[int], torch.Tensor]
+
+
+def _host_lists(
+    cu_seqlens_q_host: Optional[HostBoundaries],
+    cu_seqlens_k_host: Optional[HostBoundaries],
+) -> Optional[tuple[list[int], list[int]]]:
+    """The host boundaries as two lists of ints, or ``None`` when neither is given.  A tensor must be on the CPU:
+    nothing here reads device memory."""
+    if cu_seqlens_q_host is None and cu_seqlens_k_host is None:
+        return None
+    if cu_seqlens_q_host is None or cu_seqlens_k_host is None:
+        raise ValueError("cu_seqlens_q_host and cu_seqlens_k_host are given together")
+    lists = []
+    for name, cu in (
+        ("cu_seqlens_q_host", cu_seqlens_q_host),
+        ("cu_seqlens_k_host", cu_seqlens_k_host),
+    ):
+        if isinstance(cu, torch.Tensor):
+            if cu.device.type != "cpu" or cu.dim() != 1:
+                raise ValueError(
+                    f"{name} must be a 1-D host tensor or a sequence of ints, got {tuple(cu.shape)} on {cu.device}"
+                )
+            cu = cu.tolist()
+        lists.append([int(x) for x in cu])
+    return lists[0], lists[1]
+
+
+def _host_seqlens(
+    cu_seqlens_q_host: Optional[HostBoundaries],
+    cu_seqlens_k_host: Optional[HostBoundaries],
+    total_q: int,
+    total_k: int,
+    num_segments: int,
+) -> Optional[tuple[list[int], list[int]]]:
+    """``(q_lens, k_lens)`` of the host boundaries (:func:`.cake_jit.host_seqlens`), or ``None`` when neither is
+    given."""
+    lists = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)
+    if lists is None:
+        return None
+    return cake_jit.host_seqlens(lists[0], lists[1], total_q, total_k, num_segments)
+
+
 def cake_gqa_nondet_train_workspace_bytes(
-    total_q: int, num_heads_q: int, num_segments: int
+    total_q: int,
+    num_heads_q: int,
+    num_segments: int,
+    *,
+    total_k: int = 0,
+    num_heads_kv: int = 0,
+    max_seqlen_k: Optional[int] = None,
+    row_map: bool = False,
+    budget_bytes: Optional[int] = None,
+    cu_seqlens_q_host: Optional[HostBoundaries] = None,
+    cu_seqlens_k_host: Optional[HostBoundaries] = None,
 ) -> int:
-    """Bytes of the backward scratch one call of these sizes needs (FP32 ``dq_accum [H_q / 2, rows_pad, 256]``,
-    ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``, ``rows_pad = round_up(2 T_q + 128 B, 128)``)."""
-    return cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
+    """Bytes of device memory one backward call of these sizes needs beside its operands and outputs: the scratch a
+    workspace keeps (FP32 ``dq_accum [H_q / 2, rows_pad, 256]``, ``lse_log2`` and ``dpsum [H_q / 2, rows_pad]``,
+    ``rows_pad = round_up(2 T_q + 128 B, 128)``), with ``total_k`` / ``num_heads_kv`` given plus the dS^T chunk of
+    ``budget_bytes`` (:func:`.cake_jit.chunk_plan`; default 16 GiB; exact with the host boundaries
+    ``cu_seqlens_q_host`` / ``cu_seqlens_k_host``, else a bound) and with ``row_map`` plus the two FP32 window
+    gradients ``[T_k, H_kv, 256]``; the call allocates those two from PyTorch's caching allocator and frees them when
+    it returns."""
+    # The host boundaries come both or neither, at every size.
+    host = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)
+    need = cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
+    if total_q and total_k and num_heads_kv:
+        plan = cake_jit.chunk_plan(
+            total_q=int(total_q),
+            total_k=int(total_k),
+            num_heads_q=int(num_heads_q),
+            num_heads_kv=int(num_heads_kv),
+            num_segments=int(num_segments),
+            max_seqlen_k=max_seqlen_k,
+            budget_bytes=_budget(budget_bytes),
+            seqlens=None
+            if host is None
+            else cake_jit.host_seqlens(
+                *host, int(total_q), int(total_k), int(num_segments)
+            ),
+        )
+        need += plan["ws_tiles"] * cake_jit.DS_TILE_BYTES
+        if row_map:
+            need += 2 * 4 * int(total_k) * int(num_heads_kv) * HEAD_DIM
+    return need
 
 
 class CakeGQANondetWorkspace:
     """Device scratch of the GQA training attention, reused across calls and shapes.
 
     It holds the forward's tile counter (one ``uint32``, zeroed once; every launch leaves it zero) and the backward
-    scratch, grown to the largest shape seen and never shrunk.  One workspace serves one stream at a time: two
+    scratch (the FP32 dQ accumulator, ``LSE * log2(e)`` and ``dPsum``), grown to the largest shape seen and never
+    shrunk.  ``budget_bytes`` bounds the dS^T workspace of one backward call (default
+    :data:`.cake_jit.DEFAULT_WORKSPACE_BUDGET`, 16 GiB): a call whose dS^T exceeds it runs in chunks (KV heads first,
+    then key-block ranges).  The dS^T workspace and the row-map window gradients are allocated per call from
+    PyTorch's caching allocator on the current stream and freed when the call returns; the workspace does not hold
+    them.  The chunks depend on the shape, ``max_seqlen_k``, the budget and the host boundaries a call passes (given
+    or not) only, so one budget gives the same bits on every run; a different budget may round dQ differently.  One workspace serves one stream at a time: two
     launches running concurrently on different streams need two workspaces.  Autograd keeps only a weak reference
     to it, so a checkpointed forward retains nothing through it.
     """
 
-    def __init__(self, device: Union[torch.device, str, int, None] = None) -> None:
+    def __init__(
+        self,
+        device: Union[torch.device, str, int, None] = None,
+        *,
+        budget_bytes: Optional[int] = None,
+    ) -> None:
         if device is None:
             resolved = torch.device("cuda", torch.cuda.current_device())
         elif isinstance(device, int):
@@ -260,6 +384,7 @@ class CakeGQANondetWorkspace:
         if resolved.index is None:
             resolved = torch.device("cuda", torch.cuda.current_device())
         self.device = resolved
+        self.budget_bytes = _budget(budget_bytes)
         self._counter: Optional[torch.Tensor] = None
         self._scratch: Optional[torch.Tensor] = None
         self._views: Optional[tuple[tuple[int, int, int], tuple[torch.Tensor, ...]]] = (
@@ -308,6 +433,16 @@ class CakeGQANondetWorkspace:
         """Drop the backward scratch (the tile counter stays)."""
         self._views = None
         self._scratch = None
+
+
+def _ds_tiles(tiles: int, device: torch.device) -> torch.Tensor:
+    """The dS^T workspace of one call as BF16 ``[tiles * 256, 64]`` (``tiles`` 32 KiB tiles; the last one, the
+    all-zero tile the GEMMs read past a segment's tiles, zeroed here), from the caching allocator on the current
+    stream."""
+    lines = tiles * cake_jit.DS_TILE_LINES
+    ds = torch.empty(lines, 64, dtype=torch.bfloat16, device=device)
+    ds[lines - cake_jit.DS_TILE_LINES :].zero_()
+    return ds
 
 
 _DEFAULT_WORKSPACES: dict[tuple[int, int], CakeGQANondetWorkspace] = {}
@@ -407,29 +542,6 @@ def _scale(softmax_scale: Optional[float]) -> float:
     return HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
 
 
-def _alert_nondeterministic(entry: str) -> None:
-    """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic algorithms
-    are enabled: a ``RuntimeError``, or a ``UserWarning`` under ``torch.use_deterministic_algorithms(True,
-    warn_only=True)``; nothing otherwise.  :func:`cake_gqa_nondet_train_backward` calls it once per call that has a
-    (query, key) pair, after its checks and before it allocates or launches anything (PyTorch exposes no public Python
-    entry for the alert)."""
-    if not torch.are_deterministic_algorithms_enabled():
-        return
-    if torch.is_deterministic_algorithms_warn_only_enabled():
-        warnings.warn(
-            f"{entry} does not have a deterministic implementation, but you set "
-            "'torch.use_deterministic_algorithms(True, warn_only=True)'; it adds the dQ partials with atomic "
-            "FP32 reductions",
-            stacklevel=3,
-        )
-        return
-    raise RuntimeError(
-        f"{entry} does not have a deterministic implementation, but you set "
-        "'torch.use_deterministic_algorithms(True)': it adds the dQ partials with atomic FP32 reductions; "
-        "you can use the 'warn_only=True' option if that is acceptable for your application"
-    )
-
-
 # ----------------------------------------------------------------------------------------------------------------
 # Forward and backward
 
@@ -484,7 +596,8 @@ def cake_gqa_nondet_train_forward(
         "total_q": total_q,
         "softmax_scale_log2": scale * LOG2_E,
     }
-    _launch("fwd", values, dims, device_index)
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        _launch("fwd", values, dims, device_index)
     return out, lse
 
 
@@ -508,32 +621,47 @@ def cake_gqa_nondet_train_backward(
     row_map: Optional[torch.Tensor] = None,
     max_seqlen_k: Optional[int] = None,
     workspace: Optional[CakeGQANondetWorkspace] = None,
+    cu_seqlens_q_host: Optional[HostBoundaries] = None,
+    cu_seqlens_k_host: Optional[HostBoundaries] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Backward: ``(dq, dk, dv)``.  ``dq`` is BF16 ``[T_q, H_q, 256]``.  dK / dV are summed over the query heads of
-    each key head in FP32 and leave the kernel as:
+    """Backward: ``(dq, dk, dv)``, bitwise reproducible run to run.  ``dq`` is BF16 ``[T_q, H_q, 256]``.  dK / dV
+    are summed over the query heads of each key head in FP32 and leave the kernels as:
 
     - ``dkv_dtype=torch.bfloat16`` (default): BF16 ``[T_k, H_kv, 256]``, rounded once;
     - ``dkv_dtype=torch.float32``: FP32 window gradients ``[T_k, H_kv, 256]``, stored (``dk`` / ``dv`` overwritten
       when given);
     - ``row_map`` given: FP32 adds into the caller's ``dk_acc`` / ``dv_acc`` ``[N_dst, H_kv, 256]``: window row ``j``
       adds into destination row ``row_map[j]`` (int32 ``[T_k]``, rows may repeat; out-of-range rows are not
-      checked), and the destinations are returned as ``dk`` / ``dv``.
+      checked); a destination row becomes ``((dst + w_j1) + w_j2) + ...`` over its window rows in ascending ``j``,
+      and the destinations are returned as ``dk`` / ``dv``.
 
     ``max_seqlen_k`` (host int, optional) must be at least every segment's key count (the caller's contract, as
-    FlashAttention's ``max_seqlen_k``: a smaller value leaves key blocks out); it sizes the backward grid, one CTA pair
-    per 128 keys of the longest segment, per key head and segment.  ``None`` bounds it by ``T_k``: always correct,
-    with more CTAs that retire at once.  It is never read from the device.
+    FlashAttention's ``max_seqlen_k``: a smaller value leaves key blocks out); it sizes the backward grids and the
+    workspace chunks.  ``None`` bounds it by ``T_k``: always correct, with more (mostly empty) chunks.  It is never
+    read from the device.
 
-    Not bitwise reproducible run to run: the dQ partials (and the row-map adds) are atomic FP32 reductions.  Under
-    ``torch.use_deterministic_algorithms(True)`` a call with a (query, key) pair raises PyTorch's alert (a
-    ``RuntimeError``; with ``warn_only=True`` a ``UserWarning``, and the backward runs) after the checks and before
-    anything is allocated or launched.
+    ``cu_seqlens_q_host`` / ``cu_seqlens_k_host`` (optional, together): host copies of the boundaries (sequences of
+    ints or 1-D CPU tensors; never copied to the device).  With them the workspace chunks follow each key block's
+    exact dS^T tile count (:func:`.cake_jit.exact_tiles`): fewer, fuller chunks and a dS^T workspace of the exact
+    size.  The key blocks come from the longest host key segment.  The kernels still read the device boundaries:
+    host boundaries that disagree only move the chunks (and the dQ rounding) as long as every device key segment fits
+    the key blocks and every chunk holds its device tiles; otherwise a device-side assert fires before the main kernel
+    runs (reported at the next synchronization; the CUDA context is unusable after it).
+
+    Every sum has one fixed order: dS^T goes to the workspace, dK and dV are summed in tensor memory by the CTA pair
+    that owns their key block, dQ is a GEMM over the workspace with each output tile summed in one order by one CTA
+    pair, and the row-map destinations are folded in window order.  The bits depend on the shape, ``max_seqlen_k``,
+    the workspace's ``budget_bytes`` and the host boundaries (given or not, and their values) only; no PyTorch
+    determinism alert is raised.
     """
     dims = _check_operands(q, k, v, cu_seqlens_q, cu_seqlens_k)
     if max_seqlen_k is not None and int(max_seqlen_k) < 0:
         raise ValueError(f"max_seqlen_k must be >= 0, got {max_seqlen_k}")
     total_q, total_k = dims["total_q"], dims["total_k"]
     heads_q, heads_kv = dims["num_heads_q"], dims["num_heads_kv"]
+    seqlens = _host_seqlens(
+        cu_seqlens_q_host, cu_seqlens_k_host, total_q, total_k, dims["num_segments"]
+    )
     device = q.device
     _check_out("out", out, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
     _check_out("dout", dout, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
@@ -572,11 +700,6 @@ def cake_gqa_nondet_train_backward(
             _check_out("dv", dv, kv_shape, dkv_dtype, device)
     if dq is not None:
         _check_out("dq", dq, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
-    if total_q and total_k:
-        # The kernels below add the dQ partials (and the row-map rows) with atomic FP32 reductions.
-        _alert_nondeterministic(
-            "cake_gqa_nondet_train_backward (the backward of cake_gqa_nondet)"
-        )
     if mode != "rowmap":
         if dk is None:
             dk = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
@@ -596,58 +719,355 @@ def cake_gqa_nondet_train_backward(
         return dq, dk_out, dv_out
     device_index = device.index
     ws = workspace if workspace is not None else default_workspace(device_index)
-    dq_accum, lse_log2, dpsum = ws.scratch(total_q, heads_q, dims["num_segments"])
+    segments = dims["num_segments"]
+    dq_accum, lse_log2, dpsum = ws.scratch(total_q, heads_q, segments)
     scale = _scale(softmax_scale)
-    rows = cake_jit.rows_pad(total_q, dims["num_segments"])
+    rows = cake_jit.rows_pad(total_q, segments)
+    group = heads_q // heads_kv
+    plan = cake_jit.chunk_plan(
+        total_q=total_q,
+        total_k=total_k,
+        num_heads_q=heads_q,
+        num_heads_kv=heads_kv,
+        num_segments=segments,
+        max_seqlen_k=None if max_seqlen_k is None else int(max_seqlen_k),
+        budget_bytes=ws.budget_bytes,
+        seqlens=seqlens,
+    )
     common = {
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
-        "num_segments": dims["num_segments"],
+        "num_segments": segments,
         "rows_pad": rows,
         "T_q": total_q,
         "H_q": heads_q,
         "softmax_scale": scale,
     }
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        # The tile tables and the fold order read cu_seqlens and row_map only.  Their buffers come from the current
+        # stream; a side stream fills them while the current stream runs bwd_pre (and, for the fold order, the main
+        # kernels), and the current stream waits for it before their first read: the same kernels write the same
+        # integers, off the critical path.
+        stream = torch.cuda.current_stream(device_index)
+        tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
+        fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
+        planned = side = None
+        try:
+            if tables is not None or fold is not None:
+                side = _side_stream(device_index, stream.stream_id)
+                side.wait_stream(stream)
+                with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
+                    if tables is not None:
+                        _launch_plan(
+                            cu_seqlens_q,
+                            cu_seqlens_k,
+                            plan["key_blocks"],
+                            total_q,
+                            tables,
+                            dims,
+                            device_index,
+                        )
+                        if seqlens is not None:
+                            _check_ranges(
+                                tables[0], cu_seqlens_k, plan, segments, total_q
+                            )
+                        planned = side.record_event()
+                    if fold is not None:
+                        _fold_index(row_map, *fold)
+            _launch(
+                "bwd_pre",
+                {
+                    **common,
+                    "O": out,
+                    "dO": dout,
+                    "LSE": lse,
+                    "LSE_log2": lse_log2,
+                    "dPsum": dpsum,
+                    "dQ_accum": dq_accum,
+                },
+                dims,
+                device_index,
+            )
+            if tables is None:
+                tables = _tile_plan(
+                    cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
+                )
+                if seqlens is not None:
+                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
+            tile_base, pair_base, pair_order = tables
+            # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
+            # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
+            ds = _ds_tiles(plan["ws_tiles"], device)
+            if mode == "rowmap":
+                win_k = torch.empty(kv_shape, dtype=torch.float32, device=device)
+                win_v = torch.empty(kv_shape, dtype=torch.float32, device=device)
+            else:
+                win_k, win_v = dk_out, dv_out
+            values = {
+                **common,
+                "Q": q,
+                "dO": dout,
+                "K": k,
+                "V": v,
+                "lse_log2": lse_log2,
+                "dpsum": dpsum,
+                "ds_ws": ds.view(-1),
+                "dsw": ds,
+                "tile_base": tile_base,
+                "pair_base": pair_base,
+                "pair_order": pair_order,
+                "dq_accum": dq_accum,
+                "dk_out": win_k,
+                "dv_out": win_v,
+                "row_map": None,
+                "h_kv": heads_kv,
+                "group": group,
+                "softmax_scale_log2": scale * LOG2_E,
+                "tile_stride": plan["tile_stride"],
+                "zero_tile": plan["zero_tile"],
+            }
+            h_chunk = plan["h_chunk"]
+            if planned is not None:
+                stream.wait_event(planned)
+            for h0 in range(0, heads_kv, h_chunk):
+                hc = min(h_chunk, heads_kv - h0)
+                for index, (n0, n1) in enumerate(plan["ranges"]):
+                    chunk = {"chunk_blocks": n1 - n0, "chunk_heads": hc}
+                    at = {
+                        **values,
+                        "n0": n0,
+                        "n1": n1,
+                        "h0": h0,
+                        "hc": hc,
+                        "accumulate": 1 if index else 0,
+                    }
+                    _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
+                    _launch("bwd_dq", at, dims, device_index, **chunk)
+        finally:
+            # Joined on every path (an exception included): the side stream reads and writes buffers of this call.
+            if side is not None:
+                stream.wait_stream(side)
+        if fold is not None:
+            dst_rows, _order, perm, run_end = fold
+            _launch(
+                "bwd_fold",
+                {
+                    "dk_win": win_k,
+                    "dv_win": win_v,
+                    "perm": perm,
+                    "dst_rows": dst_rows,
+                    "run_end": run_end,
+                    "dk_out": dk_out,
+                    "dv_out": dv_out,
+                    "T_k": total_k,
+                    "h_kv": heads_kv,
+                },
+                dims,
+                device_index,
+            )
+        _launch(
+            "bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index
+        )
+    return dq, dk_out, dv_out
+
+
+def _plan_buffer(
+    key_blocks: int, total_q: int, segments: int, device: torch.device
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``(tile_base, pair_base, pair_order)`` views of one int32 buffer for :func:`_launch_plan`, from the caching
+    allocator on the current stream; ``None`` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions (the PyTorch ops
+    of :func:`_tile_plan` build those tables)."""
+    bound = cake_jit.pair_bound(total_q, segments)
+    if bound > cake_jit.PLAN_MAX_PAIRS:
+        return None
+    tiles = (key_blocks + 1) * segments
+    tables = torch.empty(tiles + segments + 1 + bound, dtype=torch.int32, device=device)
+    return (
+        tables[:tiles],
+        tables[tiles : tiles + segments + 1],
+        tables[tiles + segments + 1 :],
+    )
+
+
+def _launch_plan(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
+    tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    dims: Mapping[str, int],
+    device_index: int,
+) -> None:
+    """One ``bwd_plan`` launch (one CTA) writing the integers of :func:`_tile_plan` into ``tables``."""
+    segments = dims["num_segments"]
+    tile_base, pair_base, pair_order = tables
     _launch(
-        "bwd_pre",
+        "bwd_plan",
         {
-            **common,
-            "O": out,
-            "dO": dout,
-            "LSE": lse,
-            "LSE_log2": lse_log2,
-            "dPsum": dpsum,
-            "dQ_accum": dq_accum,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "tile_base": tile_base,
+            "pair_base": pair_base,
+            "pair_order": pair_order,
+            "num_segments": segments,
+            "key_blocks": key_blocks,
+            "pair_bound": cake_jit.pair_bound(total_q, segments),
         },
         dims,
         device_index,
     )
-    _launch(
-        _BWD_STAGE[mode],
-        {
-            **common,
-            "Q": q,
-            "dO": dout,
-            "K": k,
-            "V": v,
-            "lse_log2": lse_log2,
-            "dpsum": dpsum,
-            "dq_accum": dq_accum,
-            "dk_out": dk_out,
-            "dv_out": dv_out,
-            "h_kv": heads_kv,
-            "group": heads_q // heads_kv,
-            "softmax_scale_log2": scale * LOG2_E,
-            "row_map": row_map,
-        },
-        {
-            **dims,
-            "max_seqlen_k": None if max_seqlen_k is None else int(max_seqlen_k),
-        },
-        device_index,
+
+
+def _check_ranges(
+    tile_base: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    plan: Mapping[str, Any],
+    segments: int,
+    total_q: int,
+) -> None:
+    """Queue a device-side assert, on the current stream, that a host-boundary plan covers the device boundaries:
+    every device segment's keys within the plan's ``key_blocks`` and every key-block range holding at most
+    ``tile_stride`` dS^T tiles of one head pair in the device tile table (``tile_base[n * B]`` is the count before key
+    block ``n``).  The kernels read the device boundaries; host boundaries within both bounds give the device
+    boundaries' gradients (only the chunks, and with them the dQ rounding, may differ).  Past them the main kernel
+    would leave key blocks out or write beyond its chunk: the assert fires first, and the process's CUDA context is
+    unusable after it (PyTorch reports it at the next synchronization).  The counts come from :func:`_range_marks`,
+    exact past 2^31 tiles: a range past ``tile_stride`` fails the check instead of wrapping into it."""
+    ranges = plan["ranges"]
+    marks = _range_marks(tile_base, segments, total_q, plan["key_blocks"])
+    edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
+    fits = torch.diff(edges).max() <= plan["tile_stride"]
+    keys = torch.diff(cu_seqlens_k).max() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
+    torch._assert_async(
+        fits & keys,
+        "cake_gqa_nondet_train: cu_seqlens_q_host / cu_seqlens_k_host disagree with the device boundaries",
     )
-    _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
-    return dq, dk_out, dv_out
+
+
+def _range_marks(
+    tile_base: torch.Tensor, segments: int, total_q: int, key_blocks: int
+) -> torch.Tensor:
+    """The tile count before each key block ``n <= key_blocks`` (``tile_base[n * B]``), exact.  ``tile_base`` is int32
+    and wraps modulo 2^32 past 2^31 tiles (both table builders).  One key block holds at most
+    :func:`.cake_jit.tiles_per_key_block` tiles (below 2^32), so when ``key_blocks + 1`` such blocks can reach 2^31
+    the marks are rebuilt in int64 from their differences modulo 2^32; below that they are the int32 entries."""
+    marks = tile_base[::segments]
+    if (key_blocks + 1) * cake_jit.tiles_per_key_block(total_q, segments) < 1 << 31:
+        return marks
+    counts = torch.diff(marks.to(torch.int64)).remainder_(1 << 32)
+    return torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+
+
+def _plan_tables(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
+    dims: Mapping[str, int],
+    device_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The tables of :func:`_tile_plan` on the current stream of device ``device_index``: from one ``bwd_plan``
+    launch, or from the PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions.
+    Both write the same integers."""
+    tables = _plan_buffer(
+        key_blocks, total_q, dims["num_segments"], cu_seqlens_q.device
+    )
+    if tables is None:
+        return _tile_plan(cu_seqlens_q, cu_seqlens_k, key_blocks, total_q)
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        _launch_plan(
+            cu_seqlens_q, cu_seqlens_k, key_blocks, total_q, tables, dims, device_index
+        )
+    return tables
+
+
+def _fold_buffers(total_k: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """``(dst_rows, order, perm, run_end)`` for :func:`_fold_index`, from the caching allocator on the current
+    stream."""
+    return (
+        torch.empty(total_k, dtype=torch.int32, device=device),
+        torch.empty(total_k, dtype=torch.int64, device=device),
+        torch.empty(total_k, dtype=torch.int32, device=device),
+        torch.empty(total_k, dtype=torch.int32, device=device),
+    )
+
+
+def _fold_index(
+    row_map: torch.Tensor,
+    dst_rows: torch.Tensor,
+    order: torch.Tensor,
+    perm: torch.Tensor,
+    run_end: torch.Tensor,
+) -> None:
+    """The fold order: the window rows sorted by destination row with ties in window order (``dst_rows``, ``perm``
+    as int32), and ``run_end[j]`` = one past the last sorted position of ``dst_rows[j]``; each destination row adds
+    its run in order."""
+    torch.sort(row_map, stable=True, out=(dst_rows, order))
+    torch.searchsorted(dst_rows, dst_rows, right=True, out_int32=True, out=run_end)
+    perm.copy_(order)
+
+
+@functools.cache
+def _side_stream(device_index: int, stream_id: int) -> torch.cuda.Stream:
+    """The high-priority side stream that builds the backward's tile tables and fold order for the caller stream
+    ``stream_id`` of device ``device_index`` (one per caller stream: two caller streams, or two graph captures, never
+    share one; high priority: its one-CTA kernels take the first SMs the main kernels free)."""
+    return torch.cuda.Stream(device_index, priority=-1)
+
+
+def _tile_plan(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The workspace tile numbering on the device, from the segment boundaries (no host read):
+
+    - ``tile_base`` int32 ``[(key_blocks + 1) * B]``: the exclusive prefix sum, in (key block ``n``, segment ``b``)
+      order, of ``cnt(b, n) = max(0, ceil(q_b / 64) - m_min(b, n))`` for ``n < ceil(k_b / 128)`` (else 0), ``m_min(b,
+      n) = max(128 n - (k_b - q_b), 0) // 64`` the first Q tile key block ``n`` sees;
+    - ``pair_base`` int32 ``[B + 1]``: the exclusive prefix sum of the segments' Q-tile pairs ``ceil(ceil(q_b / 64) /
+      2)``, the total last;
+    - ``pair_order`` int32 ``[ceil(total_q / 128) + B]`` (a bound of the pairs): the dQ GEMM's work order, the pairs by
+      the key blocks their later Q tile sees, most first (stable), the positions past the total last.  The order only
+      balances the work; it does not change any result bit.
+    """
+    cq = cu_seqlens_q.to(torch.int64)
+    ck = cu_seqlens_k.to(torch.int64)
+    q_len = cq[1:] - cq[:-1]
+    k_len = ck[1:] - ck[:-1]
+    n = torch.arange(key_blocks + 1, device=cq.device, dtype=torch.int64)[:, None]
+    m_min = (
+        torch.clamp(n * cake_jit.BWD_TILE_KEYS - (k_len - q_len)[None, :], min=0)
+        // cake_jit.BWD_TILE_ROWS
+    )
+    tiles = (q_len + cake_jit.BWD_TILE_ROWS - 1) // cake_jit.BWD_TILE_ROWS
+    blocks = (k_len + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
+    cnt = torch.where(
+        n < blocks[None, :], torch.clamp(tiles[None, :] - m_min, min=0), 0
+    ).reshape(-1)
+    tile_base = (torch.cumsum(cnt, 0) - cnt).to(torch.int32)
+    pair_base = torch.zeros(q_len.numel() + 1, dtype=torch.int64, device=cq.device)
+    torch.cumsum((tiles + 1) // 2, 0, out=pair_base[1:])
+    pair = torch.arange(
+        (total_q + cake_jit.BWD_TILE_KEYS - 1) // cake_jit.BWD_TILE_KEYS
+        + q_len.numel(),
+        device=cq.device,
+    )
+    seg = torch.searchsorted(pair_base[1:].contiguous(), pair, right=True).clamp(
+        max=q_len.numel() - 1
+    )
+    last = torch.minimum(2 * (pair - pair_base[seg]) + 2, tiles[seg])
+    seen = (
+        cake_jit.BWD_TILE_ROWS * last
+        + (k_len - q_len)[seg]
+        + cake_jit.BWD_TILE_KEYS
+        - 1
+    ) // cake_jit.BWD_TILE_KEYS
+    seen = torch.minimum(seen.clamp(min=0), blocks[seg])
+    seen = torch.where(pair < pair_base[-1], seen, -1)
+    pair_order = torch.sort(-seen, stable=True).indices.to(torch.int32)
+    return tile_base, pair_base.to(torch.int32), pair_order
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -683,8 +1103,8 @@ def _resolve_dkv_acc(
 
 class CakeGQANondetFunction(torch.autograd.Function):
     """``(out, lse) = attention(q, k, v)``; the saved set is ``(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)``
-    through ``ctx.save_for_backward`` alone, with scalars, the ``dkv_acc`` callable and a weak reference to the
-    workspace on ``ctx`` (a checkpointed forward keeps no tensor alive through ``ctx``)."""
+    through ``ctx.save_for_backward`` alone, with scalars, the host boundaries as lists, the ``dkv_acc`` callable
+    and a weak reference to the workspace on ``ctx`` (a checkpointed forward keeps no tensor alive through ``ctx``)."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -698,6 +1118,7 @@ class CakeGQANondetFunction(torch.autograd.Function):
         dkv_acc: Optional[CakeGQANondetDkvAccSource],
         max_seqlen_k: Optional[int],
         workspace: Optional[CakeGQANondetWorkspace],
+        host_boundaries: Optional[tuple[list[int], list[int]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out, lse = cake_gqa_nondet_train_forward(
             q,
@@ -711,6 +1132,7 @@ class CakeGQANondetFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.host_boundaries = host_boundaries
         ctx.dkv_acc = dkv_acc
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
         ctx.mark_non_differentiable(lse)
@@ -731,11 +1153,17 @@ class CakeGQANondetFunction(torch.autograd.Function):
             "max_seqlen_k": ctx.max_seqlen_k,
             "workspace": workspace,
         }
+        if ctx.host_boundaries is not None:
+            kwargs["cu_seqlens_q_host"], kwargs["cu_seqlens_k_host"] = (
+                ctx.host_boundaries
+            )
+        # One gradient per forward argument: nine or ten (``host_boundaries`` may be left out).
+        rest = (None,) * (len(ctx.needs_input_grad) - 3)
         if ctx.dkv_acc is None:
             dq, dk, dv = cake_gqa_nondet_train_backward(
                 q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
             )
-            return dq, dk, dv, None, None, None, None, None, None
+            return (dq, dk, dv, *rest)
         dk_t, dv_t, row_map = _resolve_dkv_acc(ctx.dkv_acc)
         if row_map is None:
             kwargs.update(dk=dk_t, dv=dv_t, dkv_dtype=torch.float32)
@@ -744,7 +1172,7 @@ class CakeGQANondetFunction(torch.autograd.Function):
         dq = cake_gqa_nondet_train_backward(
             q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
         )[0]
-        return dq, None, None, None, None, None, None, None, None
+        return (dq, None, None, *rest)
 
 
 def cake_gqa_nondet(
@@ -760,15 +1188,18 @@ def cake_gqa_nondet(
     max_seqlen_k: Optional[int] = None,
     workspace: Optional[CakeGQANondetWorkspace] = None,
     return_lse: bool = False,
+    cu_seqlens_q_host: Optional[HostBoundaries] = None,
+    cu_seqlens_k_host: Optional[HostBoundaries] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Packed-varlen causal GQA attention with autograd (see :func:`cake_gqa_nondet_train_forward` /
     :func:`cake_gqa_nondet_train_backward`).
 
     ``dkv_acc=None``: autograd returns BF16 gradients for ``k`` / ``v``.  A ``dkv_acc`` callable is called in
     backward; it returns ``(dk_acc, dv_acc, row_map)`` (FP32 adds into the destinations) or ``(dk_win, dv_win)`` (FP32
-    window gradients stored into them), and ``k`` / ``v`` then get no gradient.  ``max_seqlen_k``: see
-    :func:`cake_gqa_nondet_train_backward`.  Under ``torch.use_deterministic_algorithms(True)`` the forward runs and
-    the backward raises PyTorch's alert (see :func:`cake_gqa_nondet_train_backward`).
+    window gradients stored into them), and ``k`` / ``v`` then get no gradient.  ``max_seqlen_k`` and the host
+    boundaries ``cu_seqlens_q_host`` / ``cu_seqlens_k_host`` (checked here, kept as lists for the backward): see
+    :func:`cake_gqa_nondet_train_backward`.  Both halves are bitwise reproducible run to run and raise no PyTorch
+    determinism alert.
     """
     if not causal:
         raise NotImplementedError(
@@ -777,6 +1208,15 @@ def cake_gqa_nondet(
     if dkv_acc is not None and not callable(dkv_acc):
         raise TypeError(
             "dkv_acc must be None or a zero-argument callable (see CakeGQANondetDkvAccSource)"
+        )
+    host = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)
+    if host is not None:
+        cake_jit.host_seqlens(
+            host[0],
+            host[1],
+            int(q.shape[0]),
+            int(k.shape[0]),
+            int(cu_seqlens_q.shape[0]) - 1,
         )
     out, lse = CakeGQANondetFunction.apply(
         q,
@@ -788,5 +1228,6 @@ def cake_gqa_nondet(
         dkv_acc,
         None if max_seqlen_k is None else int(max_seqlen_k),
         workspace,
+        host,
     )
     return (out, lse) if return_lse else out

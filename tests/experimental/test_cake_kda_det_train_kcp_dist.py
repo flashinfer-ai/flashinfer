@@ -925,8 +925,9 @@ def test_module_imports_only_torch_and_its_package() -> None:
     path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
     module; ``operator.itemgetter`` for the trimmed local launch plan's argument fetch -- stdlib, no new module;
     ``sys.modules`` for the backward's mode check, which recognizes the non-deterministic package's workspace type
-    without importing that package -- stdlib, no new module); ``importlib`` in ``_single_rank``, through which it
-    imports its single-rank sibling by name (README "Vendoring")."""
+    without importing that package -- stdlib, no new module; ``threading.Lock`` guarding the module-level pool of
+    ``workspace=None`` default workspaces against concurrent Python threads -- stdlib, no new module); ``importlib`` in
+    ``_single_rank``, through which it imports its single-rank sibling by name (README "Vendoring")."""
     import ast
 
     package = Path(cake_kcp.__file__).parent
@@ -950,6 +951,7 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "operator",
         "sys",  # sys.modules: the non-deterministic package's types are found without importing that package
         "importlib",
+        "threading",  # threading.Lock: the workspace=None default-workspace pool's lock (stdlib)
     }  # importlib: _single_rank resolves the single-rank sibling package by name (README "Vendoring"); operator: itemgetter of the trimmed local launch plan's arguments; weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
     for name in ("cake_kcp.py", "_single_rank.py"):
         for node in ast.walk(ast.parse((package / name).read_text())):

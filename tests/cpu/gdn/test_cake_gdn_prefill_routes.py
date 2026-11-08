@@ -562,7 +562,15 @@ def test_sm107a_bf16_state_hq2_hv8_gate_stream_twin_and_its_prefetch_twin():
         assert shipped == {
             (record["host_binding"]["cuda_symbol"], json.dumps(record["outputs"]))
         }
+    # Long sequences (mean above 512 tokens) leave the gate-stream twins: up to 2048 tokens per
+    # sequence the key's vec2-full twin of the base record, above that the base record itself.
     long = cake_gdn.select_cake_gdn_prefill_variant(
         **_bf16_state_key("sm_107a", 2, 8, (2048,) * 64)
     )
-    assert long.variant_name == base["name"]
+    assert long.variant_name == base["name"].replace(
+        "_sm107a_i64meta_", "_sm107a_vec2full_i64meta_"
+    )
+    longer = cake_gdn.select_cake_gdn_prefill_variant(
+        **_bf16_state_key("sm_107a", 2, 8, (8192,) * 64)
+    )
+    assert longer.variant_name == base["name"]

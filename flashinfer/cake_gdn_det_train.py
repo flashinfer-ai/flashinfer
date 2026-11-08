@@ -15,8 +15,8 @@ limitations under the License.
 
 Deterministic packed GDN (Gated DeltaNet) chunked training forward and
 backward on one rank, no context parallelism (SM100 / SM103 / SM107), the
-Cake backend.  The same inputs, hardware, layout and plan give bitwise the
-same outputs and gradients run to run.
+Cake backend.  With the same inputs, hardware, layout and plan, the outputs
+and gradients repeat bit for bit from run to run.
 
 Mode and dispatch rules: every name here carries the mode word ``det``; no
 entry takes a ``deterministic`` keyword (passing one raises ``TypeError``);

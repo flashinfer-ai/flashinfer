@@ -827,12 +827,14 @@ def _bf16_flag_form_box(target, causal, pack, batch, heads, q_len, kv_len):
     boxes = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOXES.get(target, {})
     return any(
         (box_batch is None or batch <= box_batch)
+        and (box_min_q is None or q_len >= box_min_q)
+        and (box_q is None or q_len <= box_q)
         and (box_keys is None or kv_len <= box_keys)
         and (box_area is None or q_len * kv_len <= box_area)
         and (box_work is None or batch * heads * q_len * kv_len <= box_work)
-        for box_batch, box_keys, box_area, box_work in boxes.get(causal, {}).get(
-            pack, ()
-        )
+        for box_batch, box_min_q, box_q, box_keys, box_area, box_work in boxes.get(
+            causal, {}
+        ).get(pack, ())
     )
 
 
@@ -938,15 +940,21 @@ def test_cake_fmha_context_bf16_flag_forms_take_the_runtime_program_of_their_for
 _BF16_FLAG_BOUND_ROWS = [
     (True, 2, 6144, 6144, 32, 4, True, True),
     (True, 16, 512, 5120, 64, 4, True, True),
-    (True, 16, 512, 6144, 64, 4, False, True),
+    (True, 16, 512, 6144, 64, 4, True, True),
+    (True, 64, 256, 6144, 64, 4, False, True),
+    (True, 32, 1024, 6144, 64, 4, False, True),
     (True, 8, 2048, 5120, 32, 8, True, True),
-    (True, 8, 2048, 6144, 32, 8, False, True),
+    (True, 8, 2048, 6144, 32, 8, True, True),
     (True, 1, 8192, 8192, 32, 4, True, True),
     (True, 1, 8192, 8192, 64, 8, True, True),
     (True, 1, 2048, 8192, 32, 4, True, True),
     (True, 2, 8192, 8192, 32, 4, False, True),
     (True, 1, 8192, 8192, 128, 16, False, True),
-    (True, 1, 8192, 8192, 64, 4, False, True),
+    (True, 1, 8192, 8192, 64, 4, True, True),
+    (True, 16, 512, 8192, 32, 4, True, True),
+    (True, 32, 512, 8192, 32, 4, False, True),
+    (True, 4, 1024, 8192, 32, 4, False, True),
+    (True, 16, 128, 8192, 40, 8, True, True),
     (True, 16, 512, 8192, 64, 4, False, True),
     (True, 1, 12288, 12288, 32, 4, False, False),
     (True, 1, 16384, 16384, 32, 4, False, False),
@@ -1050,10 +1058,11 @@ def test_cake_fmha_context_bf16_flag_form_boxes_lie_past_the_bounds() -> None:
                         assert (pack, None) in tables[target], (target, form, pack)
                 bound = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOUNDS[target][causal][pack]
                 for box in boxes:
-                    assert len(box) == 4, box
+                    assert len(box) == 6, box
+                    # (keys, query x keys, work) of the box against the bound's
                     assert any(
                         limit is not None and (size is None or size > limit)
-                        for size, limit in zip(box[1:], bound, strict=True)
+                        for size, limit in zip(box[3:], bound, strict=True)
                     ), (target, causal, pack, box)
 
 
@@ -1577,23 +1586,23 @@ _FP8_CAUSAL_FORMS = ("LSE", "SINK")
 
 
 # Per target, the packs whose form programs have a one-stage build.
-_FORM_ONE_STAGE_PACKS = {"sm103a": (1, 2, 4, 8)}
+_FORM_ONE_STAGE_PACKS = {"sm100a": (1, 2, 4, 8), "sm103a": (1, 2, 4, 8)}
 
 
 def _form_program(target, pack, form, max_kv, max_q):
     """The program of an FP8 call of ``form`` at ``pack`` over at most
-    ``max_kv`` keys and ``max_q`` query tokens: sm103a runs the swapped build
-    (``_RUNTIME_SUFFIX``) but over at most 128 keys, where it keeps P in its
-    own S columns, and its one-stage build where every tile holds at most one
-    stage of query tokens (``max_q <= 128 / pack``) at packs 1, 2, 4 and 8."""
+    ``max_kv`` keys and ``max_q`` query tokens: sm103a over at most 128 keys
+    keeps P in its own S columns; else, where every tile holds at most one
+    stage of query tokens (``max_q <= 128 / pack``) at packs 1, 2, 4 and 8,
+    the swapped one-stage build (both targets), and otherwise the target's
+    two-stage build (sm103a: the swapped one, ``_RUNTIME_SUFFIX``)."""
 
     program = f"RUNTIME_PACK{pack}_{form}"
-    if max_kv <= 128:
+    if max_kv <= 128 and target == "sm103a":
         return program
-    program += _RUNTIME_SUFFIX[target]
     if pack in _FORM_ONE_STAGE_PACKS.get(target, ()) and max_q <= 128 // pack:
-        program += "_Q1"
-    return program
+        return program + "_PX_Q1"
+    return program + _RUNTIME_SUFFIX[target]
 
 
 def _form_m_blocks(program, pack, max_q):
@@ -1667,7 +1676,7 @@ def test_cake_fmha_context_fp8_form_programs_are_pinned() -> None:
     assert set(one_stage) == set(_FORM_ONE_STAGE_PACKS)
     for target, packs in _FORM_ONE_STAGE_PACKS.items():
         assert one_stage[target] == {
-            (form, pack, None): f"RUNTIME_PACK{pack}_{form}{_RUNTIME_SUFFIX[target]}_Q1"
+            (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
             for form in _FP8_FORMS
             for pack in packs
         }
@@ -1779,7 +1788,8 @@ def test_cake_fmha_context_fp8_form_short_kv_routes(monkeypatch, target, form) -
     """An sm103a call of another form over at most 128 keys takes the form
     program with each stage's P tile in its own S columns (the same pack,
     m-blocks and arguments), one key more the swapped one; sm100a runs the
-    program with P in its own S columns at every length."""
+    same program at every length (its one-stage calls the swapped one-stage
+    build)."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     monkeypatch.setattr(
@@ -1827,11 +1837,12 @@ def _row_shape(row, batch, max_q, max_kv):
 def test_cake_fmha_context_fp8_form_one_stage_routes(
     monkeypatch, target, form, pack
 ) -> None:
-    """An sm103a call of another form whose tiles hold at most one stage of
-    query tokens (``max_q <= 128 / pack``) over more than 128 keys takes the
-    one-stage build of its form program (one m-block of one stage, host and
-    device scales); one query token past 128 / pack, the two-stage one; over
-    at most 128 keys, the short-KV one; sm100a keeps the two-stage program."""
+    """A call of another form whose tiles hold at most one stage of query
+    tokens (``max_q <= 128 / pack``) over more than 128 keys takes the swapped
+    one-stage build of its form program on both targets (one m-block of one
+    stage, host and device scales); one query token past 128 / pack, the
+    two-stage one; over at most 128 keys, sm103a the program with P in its own
+    S columns and sm100a the one-stage build."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     monkeypatch.setattr(
@@ -1856,11 +1867,11 @@ def test_cake_fmha_context_fp8_form_one_stage_routes(
             assert route.num_m_blocks == _form_m_blocks(program, route.pack_g, q)
             if (q, kv) == (max_q, max_kv):
                 assert route.pack_g == pack, (shape, form, route)
-                one_stage = target == "sm103a"
-                assert program.endswith("_Q1") is one_stage, (shape, form, route)
+                assert program.endswith("_PX_Q1"), (shape, form, route)
                 assert route.num_m_blocks == 1
             elif route.pack_g == pack:
-                assert not program.endswith("_Q1"), (shape, form, route)
+                one_stage = target == "sm100a" and q <= 128 // pack
+                assert program.endswith("_Q1") is one_stage, (shape, form, route)
 
 
 # --- The FP8 split-KV route (host-only) --------------------------------------
@@ -5447,9 +5458,9 @@ def test_cake_context_fp8_form_programs_match_the_jit_route_on_rows_without_keys
 def test_cake_context_fp8_form_one_stage_programs_match_the_jit_route_bitwise(
     monkeypatch, served_programs, pack, form
 ) -> None:
-    """A call of another form whose tiles hold one stage of query tokens
-    (sm103a: the one-stage build) writes the JIT module's output and LSE bit
-    for bit, host and device scales."""
+    """A call of another form whose tiles hold one stage of query tokens (the
+    swapped one-stage build) writes the JIT module's output and LSE bit for
+    bit, host and device scales."""
 
     row, batch, max_q = _FP8_FORM_ONE_STAGE_ROWS[pack]
     case = _context_case(row, batch, max_q)
