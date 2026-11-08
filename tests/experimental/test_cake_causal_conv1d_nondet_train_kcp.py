@@ -354,20 +354,19 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
-def test_forward_grid_per_architecture(monkeypatch) -> None:
-    """The forward launches the record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one
-    SM, the deterministic KCP forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and
-    ``hist`` are bitwise the deterministic KCP forward's either way."""
+def _forward_record(device: torch.device) -> tuple[str, dict, tuple[int, int, int]]:
+    """``(arch, the forward's record, its full co-resident grid)`` on ``device``."""
 
-    device = torch.device("cuda")
     arch = conv_kcp._loader.device_arch(device.index)
     (name,) = conv_kcp.route_modules(arch, conv_kcp.KCP_FWD)
     record = conv_kcp._loader.MODULES[name]
-    full = conv_kcp.launch_grid(record, device_index=device.index)
-    reserved = conv_kcp.FWD_RESERVE_SMS.get(arch, 0) * int(
-        record["grid_rule"]["ctas_per_sm"]
-    )
-    expected = (full[0] - reserved, full[1], full[2])
+    return arch, record, conv_kcp.launch_grid(record, device_index=device.index)
+
+
+def _record_forward_grids(monkeypatch) -> list:
+    """The grid of every forward launch from here on (the trimmed path's argument plan or the untrimmed path's
+    ``run_module`` call), in order."""
+
     seen = []
     launch_plan, run_module = conv_kcp._launch_plan, conv_kcp.run_module
 
@@ -383,8 +382,16 @@ def test_forward_grid_per_architecture(monkeypatch) -> None:
 
     monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
     monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    return seen
+
+
+def _check_forward_grid(seen: list, expected: tuple, Cs: tuple, arch: str) -> None:
+    """For each ``C`` of ``Cs`` and both host paths: one forward launch of grid ``expected``, ``y`` and ``hist``
+    bitwise the deterministic KCP forward's."""
+
+    device = torch.device("cuda")
     try:
-        for C in (1024, 10240):
+        for C in Cs:
             p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
             y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
                 p.x_local, p.w, p.ctx
@@ -402,6 +409,49 @@ def test_forward_grid_per_architecture(monkeypatch) -> None:
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+
+
+def test_forward_grid_per_architecture(monkeypatch) -> None:
+    """The forward launches the record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one
+    SM, the deterministic KCP forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and
+    ``hist`` are bitwise the deterministic KCP forward's either way."""
+
+    arch, record, full = _forward_record(torch.device("cuda"))
+    assert conv_kcp.FWD_RESERVE_SMS == {"sm_107a": 1}
+    reserved = conv_kcp.FWD_RESERVE_SMS.get(arch, 0) * int(
+        record["grid_rule"]["ctas_per_sm"]
+    )
+    seen = _record_forward_grids(monkeypatch)
+    _check_forward_grid(seen, (full[0] - reserved, full[1], full[2]), (1024, 10240), arch)
+
+
+def test_forward_grid_reserve_falls_back_to_the_full_grid(monkeypatch) -> None:
+    """A reserve that leaves fewer CTAs than the call's channel tiles launches the full grid; one that leaves exactly
+    as many launches the shorter grid; more channel tiles than the full grid holds raise ``ValueError``.  The
+    fallback launch (C = 10240, one SM of CTAs left: fewer CTAs than its channel tiles) keeps ``y`` / ``hist``
+    bitwise the deterministic KCP forward's on both host paths."""
+
+    device = torch.device("cuda")
+    arch, record, full = _forward_record(device)
+    per_sm = int(record["grid_rule"]["ctas_per_sm"])
+    monkeypatch.setattr(conv_kcp, "FWD_RESERVE_SMS", {arch: full[0] // per_sm - 1})
+
+    def grid(n_ch_tiles):
+        return conv_kcp._forward_grid(
+            record, arch=arch, device_index=device.index, C=10240, n_ch_tiles=n_ch_tiles
+        )
+
+    assert grid(per_sm) == (per_sm, full[1], full[2])
+    assert grid(per_sm + 1) == full
+    assert grid(full[0]) == full
+    with pytest.raises(ValueError):
+        grid(full[0] + 1)
+    n_ch_tiles = conv_kcp.plan(
+        5000, 10240, 2, geometry=record["grid_rule"]["geometry"], legacy=True
+    )["n_ch_tiles"]
+    assert n_ch_tiles > per_sm, (n_ch_tiles, per_sm)
+    seen = _record_forward_grids(monkeypatch)
+    _check_forward_grid(seen, full, (10240,), arch)
 
 
 @pytest.mark.parametrize("form", ["knob", "keyword"])
