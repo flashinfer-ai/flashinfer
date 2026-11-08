@@ -70,7 +70,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_h64_det_train_d580918f8e0cbb39f3be(unsigned long long* bound, unsigned int* __restrict__ det_globals, int* __restrict__ e_lat, int* __restrict__ e_rope, int* dkv_acc, int* dkr_acc, unsigned long long* __restrict__ cnt64, unsigned int* __restrict__ row_pairs, int num_rows, int bound_stride, int part_stride, int dkv_stride, int dkr_stride, int dkr_col0, int zero_acc, int shift)
+kernel_cake_dsa_h64_det_nope_train_983a1842d246e99cf5f0(unsigned long long* bound, unsigned int* __restrict__ det_globals, int* __restrict__ e_lat, int* dkv_acc, unsigned long long* __restrict__ cnt64, unsigned int* __restrict__ row_pairs, int num_rows, int bound_stride, int part_stride, int dkv_stride, int zero_acc, int shift)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -86,80 +86,97 @@ kernel_cake_dsa_h64_det_train_d580918f8e0cbb39f3be(unsigned long long* bound, un
     int row = blockIdx.x * 8 + warp;
     int lane_1 = lane;
     if (row < num_rows) {
-        int exps[2];
-        unsigned long long pairs = bound[(long long)row * (long long)bound_stride + (long long)part_stride * 2ll];
+        int exps[1];
+        long long bbase = (long long)row * (long long)bound_stride;
+        unsigned long long pairs = bound[bbase + (long long)part_stride];
+        unsigned long long b0 = bound[bbase];
+        int blen0 = 0;
+        int use_packed = 0;
+        use_packed = (int)(det_globals[10] != 0);
+        if (use_packed == 0) {
+            unsigned long long _max_0 = ((b0) > (1ull) ? (b0) : (1ull));
+            unsigned int hi = (unsigned int)(_max_0 - 1ull >> 32ull);
+            unsigned long long _max_1 = ((b0) > (1ull) ? (b0) : (1ull));
+            unsigned int lo = (unsigned int)(_max_1 - 1ull & 4294967295ull);
+            int _count_leading_zeros_2 = __clz(lo);
+            int bits = 32 - _count_leading_zeros_2;
+            if (hi != 0) {
+                int _count_leading_zeros_3 = __clz(hi);
+                bits = 64 - _count_leading_zeros_3;
+            }
+            blen0 = bits;
+        } else {
+            unsigned long long fine = pairs;
+            pairs = b0 & 67108863ull;
+            unsigned long long coarse = b0 >> 26ull;
+            unsigned long long b_lo = (coarse << 28ull) + fine;
+            unsigned long long b_hi = coarse >> 36ull;
+            if (b_lo < fine) {
+                b_hi = b_hi + 1ull;
+            }
+            if (b_hi == 0ull && b_lo == 0ull) {
+                b_lo = 1ull;
+            }
+            if (b_lo == 0ull) {
+                b_hi = b_hi - 1ull;
+            }
+            b_lo = b_lo - 1ull;
+            if (b_hi != 0ull) {
+                unsigned int hi_1 = (unsigned int)(b_hi >> 32ull);
+                unsigned int lo_1 = (unsigned int)(b_hi & 4294967295ull);
+                int _count_leading_zeros_4 = __clz(lo_1);
+                int bits_1 = 32 - _count_leading_zeros_4;
+                if (hi_1 != 0) {
+                    int _count_leading_zeros_5 = __clz(hi_1);
+                    bits_1 = 64 - _count_leading_zeros_5;
+                }
+                blen0 = 64 + bits_1;
+            } else {
+                unsigned int hi_2 = (unsigned int)(b_lo >> 32ull);
+                unsigned int lo_2 = (unsigned int)(b_lo & 4294967295ull);
+                int _count_leading_zeros_6 = __clz(lo_2);
+                int bits_2 = 32 - _count_leading_zeros_6;
+                if (hi_2 != 0) {
+                    int _count_leading_zeros_7 = __clz(hi_2);
+                    bits_2 = 64 - _count_leading_zeros_7;
+                }
+                blen0 = bits_2;
+            }
+        }
         int touched = (int)(pairs != 0ull);
         int skip = 0;
         if (touched != 0) {
-            unsigned int hi = (unsigned int)(pairs - 1ull >> 32ull);
-            unsigned int lo = (unsigned int)(pairs - 1ull & 4294967295ull);
-            int _count_leading_zeros_0 = __clz(lo);
-            int bits = 32 - _count_leading_zeros_0;
-            if (hi != 0) {
-                int _count_leading_zeros_1 = __clz(hi);
-                bits = 64 - _count_leading_zeros_1;
+            unsigned int hi_3 = (unsigned int)(pairs - 1ull >> 32ull);
+            unsigned int lo_3 = (unsigned int)(pairs - 1ull & 4294967295ull);
+            int _count_leading_zeros_8 = __clz(lo_3);
+            int bits_3 = 32 - _count_leading_zeros_8;
+            if (hi_3 != 0) {
+                int _count_leading_zeros_9 = __clz(hi_3);
+                bits_3 = 64 - _count_leading_zeros_9;
             }
-            int _max_2 = ((30 - bits) > (0) ? (30 - bits) : (0));
-            skip = _max_2;
+            int _max_10 = ((30 - bits_3) > (0) ? (30 - bits_3) : (0));
+            skip = _max_10;
         }
-        float a_max = __uint_as_float(det_globals[0]);
-        float b_max = __uint_as_float(det_globals[1]);
-        float k_max = __uint_as_float(det_globals[4]);
-        float top = __fmaf_rn(b_max, k_max, a_max);
-        int exponent = (int)(__as_u32(top) >> 23 & 255) - 127;
-        int _max_4 = ((exponent) > (-86) ? (exponent) : (-86));
-        int _min_3 = ((_max_4) < (127) ? (_max_4) : (127));
-        exponent = _min_3;
-        unsigned long long bp_0 = bound[(long long)row * (long long)bound_stride];
+        int blen_p_0 = blen0;
         int e_p_0 = 127;
         if (touched != 0) {
-            unsigned long long _max_5 = ((bp_0) > (1ull) ? (bp_0) : (1ull));
-            unsigned int hi_1 = (unsigned int)(_max_5 - 1ull >> 32ull);
-            unsigned long long _max_6 = ((bp_0) > (1ull) ? (bp_0) : (1ull));
-            unsigned int lo_1 = (unsigned int)(_max_6 - 1ull & 4294967295ull);
-            int _count_leading_zeros_7 = __clz(lo_1);
-            int bits_1 = 32 - _count_leading_zeros_7;
-            if (hi_1 != 0) {
-                int _count_leading_zeros_8 = __clz(hi_1);
-                bits_1 = 64 - _count_leading_zeros_8;
-            }
-            e_p_0 = bits_1 + exponent - 39 - 30 - shift;
-            int _max_10 = ((e_p_0) > (-126) ? (e_p_0) : (-126));
-            int _min_9 = ((_max_10) < (126) ? (_max_10) : (126));
-            e_p_0 = _min_9;
+            float a_max = __uint_as_float(det_globals[0]);
+            float b_max = __uint_as_float(det_globals[1]);
+            float k_max = __uint_as_float(det_globals[4]);
+            float top = __fmaf_rn(b_max, k_max, a_max);
+            int exponent = (int)(__as_u32(top) >> 23 & 255) - 127;
+            int _max_12 = ((exponent) > (-86) ? (exponent) : (-86));
+            int _min_11 = ((_max_12) < (127) ? (_max_12) : (127));
+            exponent = _min_11;
+            e_p_0 = blen_p_0 + exponent - 39 - 30 - shift;
+            int _max_14 = ((e_p_0) > (-126) ? (e_p_0) : (-126));
+            int _min_13 = ((_max_14) < (126) ? (_max_14) : (126));
+            e_p_0 = _min_13;
         }
         exps[0] = e_p_0;
-        float a_max_0 = __uint_as_float(det_globals[2]);
-        float b_max_0 = __uint_as_float(det_globals[3]);
-        float k_max_0 = __uint_as_float(det_globals[4]);
-        float top_0 = __fmaf_rn(b_max_0, k_max_0, a_max_0);
-        int exponent_0 = (int)(__as_u32(top_0) >> 23 & 255) - 127;
-        int _max_12 = ((exponent_0) > (-86) ? (exponent_0) : (-86));
-        int _min_11 = ((_max_12) < (127) ? (_max_12) : (127));
-        exponent_0 = _min_11;
-        unsigned long long bp_1 = bound[(long long)row * (long long)bound_stride + (long long)part_stride];
-        int e_p_1 = 127;
-        if (touched != 0) {
-            unsigned long long _max_13 = ((bp_1) > (1ull) ? (bp_1) : (1ull));
-            unsigned int hi_2 = (unsigned int)(_max_13 - 1ull >> 32ull);
-            unsigned long long _max_14 = ((bp_1) > (1ull) ? (bp_1) : (1ull));
-            unsigned int lo_2 = (unsigned int)(_max_14 - 1ull & 4294967295ull);
-            int _count_leading_zeros_15 = __clz(lo_2);
-            int bits_2 = 32 - _count_leading_zeros_15;
-            if (hi_2 != 0) {
-                int _count_leading_zeros_16 = __clz(hi_2);
-                bits_2 = 64 - _count_leading_zeros_16;
-            }
-            e_p_1 = bits_2 + exponent_0 - 39 - 30 - shift;
-            int _max_18 = ((e_p_1) > (-126) ? (e_p_1) : (-126));
-            int _min_17 = ((_max_18) < (126) ? (_max_18) : (126));
-            e_p_1 = _min_17;
-        }
-        exps[1] = e_p_1;
         __syncwarp();
         if (lane_1 == 0) {
             e_lat[row] = exps[0] & 65535 | skip << 16;
-            e_rope[row] = exps[1];
             row_pairs[row] = (unsigned int)pairs;
         }
         if (zero_acc == 2 || zero_acc == 1 && touched != 0) {
@@ -184,13 +201,6 @@ kernel_cake_dsa_h64_det_train_d580918f8e0cbb39f3be(unsigned long long* bound, un
             {
                 int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
                 *reinterpret_cast<int4*>(dkv_acc + lbase + (long long)(384 + lane_1 * 4)) = _iv4;
-            }
-            if (lane_1 < 16) {
-                long long rbase = (long long)row * (long long)dkr_stride + (long long)dkr_col0;
-                {
-                    int4 _iv4 = make_int4(zero4[0 + 0], zero4[0 + 1], zero4[0 + 2], zero4[0 + 3]);
-                    *reinterpret_cast<int4*>(dkr_acc + rbase + (long long)(lane_1 * 4)) = _iv4;
-                }
             }
             if (lane_1 < 4) {
                 cnt64[(long long)row * 4ll + (long long)lane_1] = 0ull;
