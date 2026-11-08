@@ -36,8 +36,9 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   other ``num_splits - 1`` partials with IEEE round-to-nearest adds, rounds once and stores (:func:`k1_plan` reads the
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
-  bit; three or more add in the order the splits finish (no row of the tables runs three or more: only a caller's
-  explicit ``splits``).  The one-split rows store whole tiles, and the rows of :data:`K1_WGRAD_DET_RULES_BY_SM` run
+  bit; three or more add in the order the splits finish (in the tables only the four-split rows of
+  :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts; else a caller's explicit ``splits``).  The one-split rows
+  store whole tiles, and the rows of :data:`K1_WGRAD_DET_RULES_BY_SM` run
   another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
   ``sm_100a`` and 152-SM ``sm_103a`` parts, in that table's token ranges), before every other K1 table: a cluster
@@ -76,9 +77,9 @@ forward program and the input-gradient rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_
 program: both add each output element's whole K in one ascending FP32 chain, with the deterministic plan's bits.
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
-of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials; in the
-shipped tables only a caller's explicit split count and the K2 ``"waves"`` windows on a part without a router table of
-its SM count -- raises
+of CTA pairs at three or more splits in the arrival order, a K2 stream-K partition that gives an element more than two
+partials; in the shipped tables only the four-split rows of :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts, a
+caller's explicit split count and the K2 ``"waves"`` windows on a part without a router table of its SM count -- raises
 PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
 and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
 launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
@@ -273,8 +274,9 @@ ROUTES: dict[str, str] = {
     "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split (the rows of
     # K1_DGRAD_RULES_BY_SM: another program of the deterministic package, the same bits)
     "k1_nk": "det",
-    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; every row of the tables repeats bit
-    # for bit (two splits, the cluster program, one split), the others run the deterministic program
+    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; the rows of the tables repeat bit for
+    # bit (two splits, the cluster program, one split, a fixed split order) but the four-split arrival-order rows of
+    # K1_ORDERED_RANGES_BY_SM, the others run the deterministic program
     "k2_kk": "atomic",  # router forward: the cluster SIMT program in its token windows; an explicit split count <= 2
     "k2_kn": "atomic",  # router input gradient: the SIMT program in its token windows, else one split
     "k2_nn_t": "atomic",  # router weight gradient: the SIMT program in its token windows, else the deterministic
@@ -1058,28 +1060,32 @@ K1_DSM_RANGES_BY_SM: dict[
 #: ``j + num_splits // 2`` first and then the pair sums in split order (``((p_0 + p_h) + (p_1 + p_{h+1})) + ...``,
 #: the last split of an odd count at the end): the same bits on every run.
 K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
-#: Token ranges at which a row runs a fixed-order program of this package's CTA pairs on the parts of exactly one SM
-#: count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, splits, chains, order)), ...)}`` (keys as in
-#: :data:`K1_SPLIT_RULES`; ``order`` one of :data:`K1_SPLIT_ORDERS`; more than one chain at one split only): a token
-#: count from ``min_tokens`` to ``max_tokens`` runs that program (:func:`k1_ordered_plan`) in place of the routing of
-#: every other K1 table except :data:`K1_DSM_RANGES_BY_SM`; every other token count, part and row keeps that routing.
-#: These rows' programs of the other tables missed the accuracy check of :data:`K1_DSM_RANGES_BY_SM` (within 1.1
-#: times the reference's median error on six input kinds) on mirrored cancelling inputs, and these programs met it on
-#: all six kinds, the same bits on every repeat, on a 212-SM R200 part.  On 212-SM sm_107a parts the thin FP32 weight
-#: gradients ``4096 -> 32`` (16172 to 16384 tokens) and ``4096 -> 48`` (16172 tokens) run four splits of 64-wide tiles
-#: in the mirror order (where the other tables run two splits or the deterministic program; three splits in the
-#: arrival order and three CTAs of the cluster program missed the check), faster than that routing; ``4096 -> 1024``
-#: (16231 to 16384 tokens, where the other tables run one chain) runs two chains of the 192-wide row-major program, bit
-#: for bit two splits of one chain, within 1 % of the one-chain program's time (three chains missed the check at 16172
-#: tokens there).
+#: Token ranges at which a row runs a given program of this package's CTA pairs, split order included, on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, splits, chains, order)),
+#: ...)}`` (keys as in :data:`K1_SPLIT_RULES`; ``order`` one of :data:`K1_SPLIT_ORDERS`; more than one chain at one
+#: split only): a token count from ``min_tokens`` to ``max_tokens`` runs that program (:func:`k1_ordered_plan`) in place
+#: of the routing of every other K1 table except :data:`K1_DSM_RANGES_BY_SM`; every other token count, part and row
+#: keeps that routing.  These rows' programs of the other tables were either slower, or missed the accuracy check of
+#: :data:`K1_DSM_RANGES_BY_SM` (within 1.1 times the reference's median error on six input kinds) on mirrored cancelling
+#: inputs, and these programs met it on all six kinds on a 212-SM R200 part.  On 212-SM sm_107a parts the thin FP32
+#: weight gradients ``4096 -> 32`` (16231 to 16384 tokens), ``4096 -> 48`` (16172 to 16384 tokens) and ``4096 -> 64``
+#: (16231 to 16384 tokens) run four splits of 64-wide tiles in the arrival order: the fastest program that met the
+#: check there (the other tables run two splits or the deterministic program; three splits in the arrival order and
+#: three CTAs of the cluster program missed it), its worst kind 0.58 to 0.92 times the reference's error; the partials
+#: add in the order the splits finish, so the bits can vary run to run (:func:`_alert_order_varying`).  ``4096 -> 32``
+#: at 16172 tokens runs the four splits in the mirror order (the same bits on every repeat).  ``4096 -> 1024`` (16231 to
+#: 16384 tokens, where the other tables run one chain) runs two chains of the 192-wide row-major program, bit for bit
+#: two splits of one chain, within 1 % of the one-chain program's time (three chains missed the check at 16172 tokens
+#: there).
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int, int, str]], ...]],
 ] = {
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
-        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16172, (64, 4, 1, "mirror")),),
+        ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16172, (64, 4, 1, "mirror")), (16231, 16384, (64, 4, 1, "arrival"))),
+        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
+        ("sm_107a", 1, 4096, 64, "f32"): ((16231, 16384, (64, 4, 1, "arrival")),),
         ("sm_107a", 1, 4096, 1024, "f32"): ((16231, 16384, (192, 1, 2, "arrival")),),
     },
 }
@@ -1096,7 +1102,7 @@ def k1_ordered_plan(
     out_f32: bool,
     sm_count: int,
 ) -> Optional[tuple[int, int, int, str]]:
-    """``(block_n, splits, chains, order)`` of the fixed-order program the row runs at ``K`` on a device of exactly
+    """``(block_n, splits, chains, order)`` of the program the row runs at ``K`` on a device of exactly
     ``sm_count`` SMs (its range in :data:`K1_ORDERED_RANGES_BY_SM`), or ``None``: the row keeps the routing of
     :func:`k1_plan` -- outside those ranges, or at a ``K`` too short for the splits or chains (:func:`k1_splits_fit`,
     :func:`k1_chains_fit`).  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
@@ -2111,7 +2117,7 @@ def plan_atomic_gemm(
     that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
     registry allow it.  The planner's choice is first :func:`k1_dsm_plan`'s cluster program where the row has a
     range of :data:`K1_DSM_RANGES_BY_SM` (a plan with ``dsm``; ``None`` when this checkout does not register its
-    template for ``arch``), then :func:`k1_ordered_plan`'s fixed-order program where the row has a range of
+    template for ``arch``), then :func:`k1_ordered_plan`'s program where the row has a range of
     :data:`K1_ORDERED_RANGES_BY_SM`, then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s accumulation chains
     where it has them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names
     more, at one split, in the arrival order, and never the cluster program.

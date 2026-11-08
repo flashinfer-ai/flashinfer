@@ -5986,8 +5986,12 @@ K1_WGRAD_SK_ROWS = {
 }
 K1_ORDERED_ROWS = {
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
-        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16172, (64, 4, 1, "mirror")),),
+        ("sm_107a", 1, 4096, 32, "f32"): (
+            (16172, 16172, (64, 4, 1, "mirror")),
+            (16231, 16384, (64, 4, 1, "arrival")),
+        ),
+        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
+        ("sm_107a", 1, 4096, 64, "f32"): ((16231, 16384, (64, 4, 1, "arrival")),),
         ("sm_107a", 1, 4096, 1024, "f32"): ((16231, 16384, (192, 1, 2, "arrival")),),
     },
 }
@@ -5995,9 +5999,9 @@ K1_ORDERED_ROWS = {
 
 def test_k1_program_tables():
     """The forward, input-gradient and stream-K weight-gradient program tables hold exactly the measured rows, each
-    naming a template this checkout registers for the table's architecture; the fixed-order ranges hold the measured
-    rows and plan their program (:func:`k1_ordered_plan`) at their token counts only, on their part only, before
-    :func:`k1_plan`'s routing, and their programs repeat (``reproducible``)."""
+    naming a template this checkout registers for the table's architecture; the ranges of
+    :data:`K1_ORDERED_RANGES_BY_SM` hold the measured rows and plan their program (:func:`k1_ordered_plan`) at their
+    token counts only, on their part only, before :func:`k1_plan`'s routing."""
     for table, want in (
         (cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM, K1_FORWARD_PROGRAM_ROWS),
         (cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM, K1_DGRAD_PROGRAM_ROWS),
@@ -6051,9 +6055,10 @@ def test_k1_program_tables():
 
 
 def test_k1_ordered_ranges_plan_their_program(monkeypatch):
-    """A token count of :data:`K1_ORDERED_RANGES_BY_SM` plans its fixed-order program (``split_order``, the template's
-    suffix, the split and chain counts; the split workspace with more than one split) in place of the split tables'
-    choice, and the plan repeats; one token outside the range keeps that choice."""
+    """A token count of :data:`K1_ORDERED_RANGES_BY_SM` plans its program (``split_order``, the template's suffix, the
+    split and chain counts; the split workspace with more than one split) in place of the split tables' choice, a plan
+    that repeats unless it adds three or more splits in the arrival order; one token outside the range keeps that
+    choice."""
     arch = "sm_107a"
     _register_k1(monkeypatch, arch)
     kw = dict(transposed_out=True, arch=arch, sm_count=212)
@@ -6064,8 +6069,10 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
         return X.t(), G, torch.zeros(d_out, d_in, dtype=torch.float32)
 
     for d_in, d_out, T, template, splits, chains, order in (
-        (4096, 32, 16231, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
-        (4096, 48, 16172, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
+        (4096, 32, 16172, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
+        (4096, 32, 16231, "dense_proj_gemm_atomic_nn_n64_f32_t", 4, 1, "arrival"),
+        (4096, 48, 16172, "dense_proj_gemm_atomic_nn_n64_f32_t", 4, 1, "arrival"),
+        (4096, 64, 16384, "dense_proj_gemm_atomic_nn_n64_f32_t", 4, 1, "arrival"),
         (4096, 1024, 16384, "dense_proj_gemm_atomic_nn_n192_f32_c2", 1, 2, "arrival"),
     ):
         plan, *_, reason = cake_backend.plan_atomic_gemm(
@@ -6078,9 +6085,25 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
             chains,
             order,
         )
-        assert plan.reproducible and plan.workspace == (splits > 1)
-    # outside the ranges: the split tables' choice (4096 -> 32 at 16171 tokens, 4096 -> 48 at 16231 tokens)
-    for d_in, d_out, T in ((4096, 32, 16171), (4096, 48, 16231), (4096, 1024, 16230)):
+        assert plan.reproducible == (order != "arrival" or splits <= 2)
+        assert plan.workspace == (splits > 1)
+        # the plan is deterministic per shape, also where its bits are not
+        again = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)[0]
+        assert (
+            again.template,
+            again.block_n,
+            again.splits,
+            again.chains,
+            again.split_order,
+        ) == (plan.template, plan.block_n, plan.splits, plan.chains, plan.split_order)
+    # outside the ranges: the split tables' choice
+    for d_in, d_out, T in (
+        (4096, 32, 16171),
+        (4096, 32, 16200),
+        (4096, 48, 16385),
+        (4096, 64, 16230),
+        (4096, 1024, 16230),
+    ):
         plan = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)[0]
         assert plan is None or plan.split_order == "arrival", (d_in, d_out, T)
 
@@ -8771,7 +8794,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
         for bn in cake_backend.K1_BLOCK_N_CHOICES
         for chains in cake_backend.K1_CHAINS_CHOICES
     }
-    # the fixed-order programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient / stream-K
+    # the programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient / stream-K
     # weight-gradient tables name, each registered for the architecture of its table
     named = {}
     for (arch, _), rows in cake_backend.K1_ORDERED_RANGES_BY_SM.items():
@@ -9368,7 +9391,7 @@ def test_gpu_k1_chain_programs(shape, monkeypatch):
         {(arch, sm_count): {key: ((T, T, (block_n, 3)),)}},
     )
     monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
-    # the stream-K rows and the fixed-order ranges come before the chain ranges
+    # the stream-K rows and the ranges of K1_ORDERED_RANGES_BY_SM come before the chain ranges
     monkeypatch.setattr(cake_backend, "K1_WGRAD_SK_RULES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ORDERED_RANGES_BY_SM", {})
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
@@ -10837,7 +10860,7 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
     """Unforced (no split count): every K1 weight-gradient row with a verdict for this
     architecture and every measured router row prepares the program its verdict names on this device (by kernel
     name, at ``T = 16231``; a row with a range of :data:`K1_DSM_RANGES_BY_SM` there the range's cluster program, else
-    one with a range of :data:`K1_ORDERED_RANGES_BY_SM` there that range's fixed-order program), and
+    one with a range of :data:`K1_ORDERED_RANGES_BY_SM` there that range's program), and
     a row whose verdict is ``None`` -- or that this device's SM count leaves to the deterministic program -- prepares
     the deterministic launch."""
     device, arch = _atomic_device_or_skip()
@@ -10861,7 +10884,7 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
         )
         kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=sm_count)
         dsm = cake_backend.k1_dsm_plan(**kw)
-        # a token count of a fixed-order range runs that range's program in place of the verdict
+        # a token count of a K1_ORDERED_RANGES_BY_SM range runs that range's program in place of the verdict
         ordered = None if dsm else cake_backend.k1_ordered_plan(**kw)
         want = dsm or (tuple(ordered[:2]) if ordered else cake_backend.k1_plan(**kw))
         if want is None:
@@ -13427,8 +13450,8 @@ K1_WGRAD_CHANGED_ROWS = {
         (5120, 32, "f32", 16231): ("pair", 64, 2), (5120, 32, "f32", 16384): ("pair", 64, 2),
         (5120, 48, "f32", 16384): ("pair", 64, 2),
         (4096, 48, "f32", 16172): ("ordered", 64, 4),
-        (4096, 48, "f32", 16231): ("det", None, None), (4096, 48, "f32", 16384): ("det", None, None),
-        (4096, 64, "f32", 16231): ("det", None, None), (4096, 64, "f32", 16384): ("det", None, None),
+        (4096, 48, "f32", 16231): ("ordered", 64, 4), (4096, 48, "f32", 16384): ("ordered", 64, 4),
+        (4096, 64, "f32", 16231): ("ordered", 64, 4), (4096, 64, "f32", 16384): ("ordered", 64, 4),
         (5120, 64, "f32", 16384): ("det", None, None),
         (4096, 1024, "f32", 16231): ("ordered", 192, 1), (4096, 1024, "f32", 16384): ("ordered", 192, 1),
     },
@@ -13438,8 +13461,8 @@ K1_WGRAD_CHANGED_ROWS = {
 
 def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
     """``(kind, block_n, splits)`` of the planner's weight-gradient route of a row: the stream-K table first
-    (``"sk"``), then the cluster tables (``"dsm"``), the fixed-order ranges (``"ordered"``) and the split tables
-    (``"pair"`` / ``"det"``)."""
+    (``"sk"``), then the cluster tables (``"dsm"``), the ranges of :data:`K1_ORDERED_RANGES_BY_SM` (``"ordered"``)
+    and the split tables (``"pair"`` / ``"det"``)."""
     sk = cake_backend.K1_WGRAD_SK_RULES_BY_SM.get((arch, sms), {})
     template = sk.get((d_in, d_out, T, "f32" if f32 else "bf16"))
     if template is not None:
@@ -13477,11 +13500,26 @@ K1_ROUTE_PARTS = (
 )
 
 
+#: The bench's weight-gradient rows that may plan an order-varying program, ``(arch, sm_count, d_in, d_out, dtype,
+#: T)``: the four-split arrival-order ranges of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a thin FP32 rows, the
+#: fastest program that met all six input kinds of the accuracy check there).
+K1_ORDER_VARYING_ROWS = {
+    ("sm_107a", 212, 4096, d_out, "f32", T)
+    for d_out, tokens in (
+        (32, (16231, 16384)),
+        (48, (16172, 16231, 16384)),
+        (64, (16231, 16384)),
+    )
+    for T in tokens
+}
+
+
 def test_k1_no_order_varying_plan_on_bench_rows():
     """On every part of :data:`K1_ROUTE_PARTS`, no weight-gradient row of the bench's ``small-output`` class (BF16
-    and FP32 out, its token counts) plans the CTA-pair program at three or more splits (partials added in the order
-    they finish): the planner gives the stream-K program, the cluster program, a fixed split order, one or two splits,
-    or the deterministic program.  The router
+    and FP32 out, its token counts) plans the CTA-pair program at three or more splits in the arrival order (partials
+    added in the order they finish) but the rows of :data:`K1_ORDER_VARYING_ROWS`: the planner gives the stream-K
+    program, the cluster program, a fixed split order, one or two splits, or the deterministic program.  The tables
+    hold no other such range.  The router
     weight gradient of the bench's ``router`` class plans no stream-K partition with more than two partials per
     element: its row runs the SIMT program, the deterministic program (at the split count of its ``"det_s<n>"``
     window or the deterministic package's), or a partition of at most two partials."""
@@ -13515,8 +13553,33 @@ def test_k1_no_order_varying_plan_on_bench_rows():
                     spec["out_dtype"] == "f32",
                 )
                 assert route[0] != "pair" or route[2] <= 2, (arch, sms, spec, route)
+                if route[0] == "ordered" and route[2] > 2:
+                    order = cake_backend.k1_ordered_plan(
+                        arch=arch,
+                        L=1,
+                        M=spec["K"],
+                        N=spec["N"],
+                        K=spec["T"],
+                        out_f32=spec["out_dtype"] == "f32",
+                        sm_count=sms,
+                    )[3]
+                    row = (
+                        arch,
+                        sms,
+                        spec["K"],
+                        spec["N"],
+                        spec["out_dtype"],
+                        spec["T"],
+                    )
+                    assert order != "arrival" or row in K1_ORDER_VARYING_ROWS, row
             checked += 1
     assert checked == len(rows) * len(K1_ROUTE_PARTS)
+    for (arch, sms), rows_ in cake_backend.K1_ORDERED_RANGES_BY_SM.items():
+        for (_, _, d_in, d_out, dt), ranges in rows_.items():
+            for lo, hi, (_, splits, _, order) in ranges:
+                if order == "arrival" and splits > 2:
+                    for T in (lo, hi):
+                        assert (arch, sms, d_in, d_out, dt, T) in K1_ORDER_VARYING_ROWS
     # nor at any token count of a table on its part: the tables carry no CTA-pair verdict of three or more splits
     for choice in cake_backend.K1_SPLIT_RULES.values():
         assert choice is None or choice[1] <= 2
@@ -13653,6 +13716,16 @@ def _repeats_into_nan(run, out, what, reruns=RERUNS):
         run(again)
         torch.cuda.synchronize()
         assert torch.equal(again, out), what
+
+
+def _meets_the_budget_into_nan(run, out, ref, what, reruns=RERUNS):
+    """``reruns`` more calls of ``run(dst)`` into NaN-poisoned outputs each meet the K1 budget against ``ref`` (an
+    order-varying program: its bits may differ from ``out``'s)."""
+    for _ in range(reruns):
+        again = torch.full_like(out, float("nan"))
+        run(again)
+        torch.cuda.synchronize()
+        _k1_check(again, ref, what)
 
 
 def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
@@ -13801,11 +13874,12 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
 def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
     """On a part of :data:`K1_WGRAD_CHANGED_ROWS`: the weight gradient of every changed row takes its route (the
     stream-K program of :data:`K1_WGRAD_SK_RULES_BY_SM` with no cached plan, or its :data:`_K1_ATOMIC_CACHE` entry:
-    the cluster program, the CTA-pair program at one or two splits or in a fixed split order, or the
-    deterministic program -- then the deterministic package's weight gradient bit for bit; a row of
-    :data:`K1_WGRAD_DET_RULES_BY_SM` the bits of the deterministic package's prepared launch of the table's program),
-    meets the deterministic package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into
-    NaN-poisoned outputs.  A part without changed rows skips."""
+    the cluster program, the CTA-pair program at one or two splits or in the split order of its range of
+    :data:`K1_ORDERED_RANGES_BY_SM`, or the deterministic program -- then the deterministic package's weight gradient
+    bit for bit; a row of :data:`K1_WGRAD_DET_RULES_BY_SM` the bits of the deterministic package's prepared launch of
+    the table's program), meets the deterministic package's budget against FP64 and repeats bit for bit over
+    ``RERUNS`` calls into NaN-poisoned outputs -- a four-split arrival-order range meets the budget on each of those
+    calls instead (its bits may vary).  A part without changed rows skips."""
     device, arch, sms = _part_or_skip()
     rows = K1_WGRAD_CHANGED_ROWS.get((arch, sms), {})
     if not rows:
@@ -13860,16 +13934,29 @@ def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
                 launch.launch()
             torch.cuda.synchronize()
             assert torch.equal(out, ref), what
-        else:
+        varying = False
+        if kind != "det":
             plan = entry.plan
-            assert plan is not None and plan.reproducible, what
+            assert plan is not None, what
+            ordered = cake_backend.k1_ordered_plan(
+                arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms
+            )
+            if ordered is not None:
+                assert (plan.chains, plan.split_order) == tuple(ordered[2:]), what
+            # only a range of K1_ORDERED_RANGES_BY_SM adds three or more splits in the arrival order
+            varying = ordered is not None and not plan.reproducible
+            assert plan.reproducible or varying, what
             assert (plan.dsm, plan.block_n, plan.splits) == (
                 kind == "dsm",
                 block_n,
                 splits,
             ), what
-        _k1_check(out, G.double().t() @ X.double(), what)
-        _repeats_into_nan(run, out, what)
+        ref64 = G.double().t() @ X.double()
+        _k1_check(out, ref64, what)
+        if varying:
+            _meets_the_budget_into_nan(run, out, ref64, what)
+        else:
+            _repeats_into_nan(run, out, what)
 
 
 def test_gpu_router_det_split_rows_run_the_det_program():
