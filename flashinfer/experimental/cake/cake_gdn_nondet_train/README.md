@@ -11,7 +11,9 @@ budgets, not bitwise: where the backward runs the package tail or a cluster
 tail of a value-head group of two or three (see Chain), `dq` and `dk` are
 rounded to BF16 once, after the FP32 sum of the value heads' partials, where the
 deterministic package rounds each partial.  The output and the final state have
-the deterministic package's bits.  `dv`, `dg`, `dbeta` and the initial-state
+the deterministic package's bits where the forward runs that package's
+kernels; where it runs a forward of its own they match within the same
+budgets.  `dv`, `dg`, `dbeta` and the initial-state
 gradient have them too, except where the backward runs the tcgen05 adjoint
 scan, which rounds `dv2` once on `sm_100a`, `sm_103a` and `sm_107a`, or takes
 the adjoint table priced for `dhu_tc2` (see Chain); they then match within the
@@ -36,19 +38,19 @@ Every output repeats bit for bit: two identical calls on one device (the same
 inputs, arguments, layout and route, plain or under activation checkpointing)
 give the same bits, and a second backward into the same leaves adds exactly
 the first one's gradients.  No output of this version may vary.  The outputs
-are not bitwise equal to the deterministic package's (see above).  The table
+need not be bitwise equal to the deterministic package's (see above).  The table
 gives the error of each output against an FP64 reference next to the error of
 the deterministic package of FlashInfer commit `2e989556` on the same inputs.
 
 | output | run to run | FP64 error at the `(2, 6)` pack of 131,071 + 87,531 + 43,385 tokens, this package / the deterministic package: rel-L2; worst | largest ratio to the deterministic package over 53 cases: rel-L2; worst |
 |---|---|---|---|
-| `o` | repeats bit for bit | 5.095e-3 / 5.095e-3; 5.783e-3 / 5.783e-3 | 1.010; 1.037 |
-| final state | repeats bit for bit | 4.211e-3 / 4.211e-3; 4.591e-3 / 4.591e-3 | 1.016; 1.052 |
-| `dq` | repeats bit for bit | 4.823e-3 / 5.100e-3; 5.167e-3 / 5.800e-3 | 1.000; 1.000 |
-| `dk` | repeats bit for bit | 5.904e-3 / 6.201e-3; 6.351e-3 / 6.745e-3 | 0.999; 1.000 |
-| `dv` | repeats bit for bit | 4.731e-3 / 4.826e-3; 6.119e-3 / 6.272e-3 | 1.009; 1.043 |
-| `dg` | repeats bit for bit | 5.879e-3 / 5.888e-3; 6.006e-3 / 5.924e-3 | 1.029; 1.058 |
-| `dbeta` | repeats bit for bit | 5.095e-3 / 5.182e-3; 5.451e-3 / 5.375e-3 | 1.015; 1.046 |
+| `o` | repeats bit for bit | 5.148e-3 / 5.095e-3; 5.684e-3 / 5.783e-3 | 1.012; 1.037 |
+| final state | repeats bit for bit | 4.278e-3 / 4.211e-3; 4.715e-3 / 4.591e-3 | 1.017; 1.062 |
+| `dq` | repeats bit for bit | 4.879e-3 / 5.100e-3; 5.232e-3 / 5.800e-3 | 1.001; 1.001 |
+| `dk` | repeats bit for bit | 5.939e-3 / 6.201e-3; 6.338e-3 / 6.745e-3 | 0.999; 1.000 |
+| `dv` | repeats bit for bit | 4.789e-3 / 4.826e-3; 6.202e-3 / 6.272e-3 | 1.009; 1.080 |
+| `dg` | repeats bit for bit | 5.962e-3 / 5.888e-3; 5.886e-3 / 5.924e-3 | 1.034; 1.090 |
+| `dbeta` | repeats bit for bit | 5.164e-3 / 5.182e-3; 5.436e-3 / 5.375e-3 | 1.015; 1.046 |
 | initial-state gradient | repeats bit for bit | not measured: the measured calls start every sequence from a zero state | not measured |
 
 rel-L2 is `||out - ref|| / ||ref||` and worst is `max |out - ref| / max |ref|`;
@@ -70,6 +72,10 @@ one-token, empty and 1,500 short sequences, value bursts, mirrored heads whose
 `dq` / `dk` are a small difference, and the unnormalized path.  A ratio is the
 median of this package's error over the seeds divided by the median of the
 deterministic package's error over the same seeds; every ratio is at most 1.1.
+The forward splits the sequences of a long-piece layout (the pack column's
+layout among them) and keeps them whole otherwise; every case was measured
+both with and without the split where its layout allows one, and the last
+column is the largest ratio of either.
 
 ## Mode rules
 
