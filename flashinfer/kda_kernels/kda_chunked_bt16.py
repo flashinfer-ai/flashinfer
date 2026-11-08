@@ -6913,7 +6913,6 @@ def _plan(cu_seqlens: torch.Tensor) -> dict:
         for c in chunks:
             cu_chunks.append(cu_chunks[-1] + c)
         total_chunks = cu_chunks[-1]
-        # A pageable host-to-device copy would block until the stream drains.
         host_cu_chunks = torch.tensor(cu_chunks, dtype=torch.int32).pin_memory()
         plan = {
             "total_chunks": total_chunks,
