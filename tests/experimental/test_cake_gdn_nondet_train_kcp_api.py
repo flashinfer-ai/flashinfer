@@ -2276,6 +2276,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "bwd_prep",
         "kcp_dhu_offset",
         "kcp_dhu_tape",
+        "kcp_dhu_cut_start",
         "bwd_dqkg",
         "gate_epilogue",
         "fwd_prep_l2n",
@@ -2313,6 +2314,8 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_out",
         "kcp_fwdh_out_tape",
         "fwd_prep_replay_l2n",
+        "kcp_dhu_offset",  # the cut walk (gdn_chunk_dhu_cut_v1_kcp)
+        "kcp_dhu_cut_start",
     )
     for name, module in kcp.TART_MODULE_OF.items():
         if name not in own:

@@ -2482,6 +2482,103 @@ def test_dhu_offset_walk_defers_the_dh_tape_to_the_first_tape_walk() -> None:
     )  # a tape live by then: saved (full) or replayed (light)
 
 
+def test_dhu_offset_walk_reads_the_cut_table_its_start_launch_writes() -> None:
+    """Every #7 offset walk is issued right after one ``kcp_dhu_cut_start`` launch over the same walk list and reads
+    the ``c_start`` table that launch wrote (each entry in ``-1 .. nc - 1``); the gradients equal those of the same
+    backward with every offset walk given a null table (every chunk walked).  CP = 1 with two segments per fragment
+    (P = 2) in the normal gate regime of ``_inputs`` (some chains cut), fake backend on the CPU."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.cake_gdn_nondet_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.cake_gdn_nondet_train_kcp_build_context(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    seen: list[dict] = []
+
+    class Recording(kcp.FakeBackend):
+        whole = False
+
+        def run(self, name, args):
+            if name == "kcp_dhu_offset" and self.whole:
+                args = {**args, "c_start": None}
+            super().run(name, args)
+            if name in ("kcp_dhu_cut_start", "kcp_dhu_offset"):
+                table = args.get("c_start")
+                seen.append(
+                    {
+                        "name": name,
+                        "walk": args["walk_seg"].tolist(),
+                        "seg": args["seg_chunk_start"].tolist(),
+                        "ptr": None if table is None else table.data_ptr(),
+                        "table": None if table is None else table.tolist(),
+                    }
+                )
+
+    def backward(whole: bool):
+        backend = Recording()
+        backend.whole = whole
+        previous = kcp._BACKENDS.get("fake")
+        kcp._BACKENDS["fake"] = backend
+        try:
+            _, saved = kcp.cake_gdn_nondet_train_kcp_forward(
+                ops["q"],
+                ops["k"],
+                ops["v"],
+                ops["g"],
+                ops["beta"],
+                ctx,
+                backend="fake",
+                segments=2,
+            )
+            return kcp.cake_gdn_nondet_train_kcp_backward(
+                ops["q"],
+                ops["k"],
+                ops["v"],
+                ops["g"],
+                ops["beta"],
+                ctx,
+                ops["dout"],
+                saved=saved,
+                backend="fake",
+                segments=2,
+            )
+        finally:
+            if previous is None:
+                kcp._BACKENDS.pop("fake", None)
+            else:
+                kcp._BACKENDS["fake"] = previous
+
+    cut_grads = backward(whole=False)
+    cut_seen = list(seen)
+    seen.clear()
+    whole_grads = backward(whole=True)
+    offsets = [i for i, s in enumerate(cut_seen) if s["name"] == "kcp_dhu_offset"]
+    assert offsets, [s["name"] for s in cut_seen]
+    cut = 0
+    for i in offsets:
+        start, walk = cut_seen[i - 1], cut_seen[i]
+        assert i > 0 and start["name"] == "kcp_dhu_cut_start", i
+        assert start["walk"] == walk["walk"], (start["walk"], walk["walk"])
+        assert walk["ptr"] is not None and start["ptr"] == walk["ptr"], (
+            "the walk reads another table"
+        )
+        for s in walk["walk"]:
+            nc = walk["seg"][s + 1] - walk["seg"][s]
+            for h in range(HV):
+                c_start = walk["table"][s * HV + h]
+                assert -1 <= c_start <= nc - 1, (s, h, c_start, nc)
+                cut += int(c_start + 1 < nc)
+    assert cut > 0, (
+        "no chain was cut: the seeded normal regime of _inputs should cut some on the fake"
+    )
+    for a, b in zip(cut_grads, whole_grads, strict=True):
+        assert torch.equal(a, b), (
+            "the cut walk's gradients differ from the whole walk's"
+        )
+
+
 @pytest.mark.parametrize("fused_o", (0, 1))
 def test_fwdh_offset_walk_defers_its_tapes_to_the_first_tape_walk(fused_o: int) -> None:
     """The #2 offset walk hands the kernel ``u`` as its never-dereferenced ``h_tape`` / ``v_new`` pointers
@@ -8332,17 +8429,27 @@ def _mr_harvest(kcp, part, ops, ctxs, monkeypatch, *, bypass: bool):
     return seen, res
 
 
+# int tensors a launch writes rather than reads: the #7 cut table ``c_start`` (written by
+# ``kcp_dhu_cut_start``, read by its walk; a context-cached buffer whose unwalked entries
+# are never written), a buffer and not a plan table
+_LAUNCH_WRITTEN_INT_ARGS = frozenset({"c_start"})
+
+
 def _same_args(a: dict, b: dict, *, same_plan: bool) -> list[str]:
     """The keys whose values differ: plan / context int tables (int32 / int64) must be the very same tensor within
-    one plan and equal across plans; every other tensor (operands, pools, tapes, outputs, tickets) must agree in
-    dtype, shape and stride; every other value must be equal."""
+    one plan and equal across plans; every other tensor (operands, pools, tapes, outputs, tickets, the launch-written
+    int tables of ``_LAUNCH_WRITTEN_INT_ARGS``) must agree in dtype, shape and stride; every other value must be
+    equal."""
     bad = []
     if a.keys() != b.keys():
         return ["<keys>"]
     for k in a:
         x, y = a[k], b[k]
         if isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor):
-            if x.dtype in (torch.int32, torch.int64):
+            if (
+                x.dtype in (torch.int32, torch.int64)
+                and k not in _LAUNCH_WRITTEN_INT_ARGS
+            ):
                 ok = (
                     (x is y)
                     if same_plan

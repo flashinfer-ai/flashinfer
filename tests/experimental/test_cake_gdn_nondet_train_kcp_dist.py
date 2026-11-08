@@ -3816,7 +3816,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 #   its eight #1 tapes == v1 #1 on the materialized rows; ``qk_apply`` on its ``r`` == its rows; the backward's rows
 #   and regenerated ``r`` == the forward's (``record_qk``);
 # * norm off unchanged: the v1 records keep their library names and the norm-off route launches only them (the sha256
-#   of their 36 sources is reported; the render's SASS identity against the previous package decides the bits);
+#   of their 32 sources is reported; the render's SASS identity against the previous package decides the bits);
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``cake_gdn_nondet_train_kcp_packed_qkv_views`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
@@ -3843,8 +3843,6 @@ V1_LIBRARIES = {
     "gate_epilogue": "cake_gdn_train_b902b0b0bef82d9f7c53",
     "kcp_affine_merge_c16": "cake_gdn_train_89f5ff59f03eb170e3bf_kcp",
     "kcp_affine_merge_c8": "cake_gdn_train_c6958a0a4ed5cb55a9a1_kcp",
-    "kcp_dhu_offset": "cake_gdn_train_665649ff924fda17ec3f_kcp",
-    "kcp_dhu_offset_vh64": "cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp",
     "kcp_dhu_tape": "cake_gdn_train_8b193b1101cc03b7d704_kcp",
     "kcp_dhu_tape_vh64": "cake_gdn_train_a44997811b71d9d83fb4_kcp",
     "kcp_fwdh_offset": "cake_gdn_train_eb58759a50e781620aed_kcp",
@@ -3855,8 +3853,15 @@ V1_LIBRARIES = {
     "kcp_transfer_walk_three_mma": "cake_gdn_train_2f42874614b85ffc14fe_kcp",
     "kcp_transfer_walk_plain_tf32": "cake_gdn_train_efbba796414578cbd8b5_kcp",
 }
-# The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
-NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
+# The output walk (#2 with #5 folded in) and the cut adjoint offset walk with its table program: no v1 record,
+# launched by the norm-off and the norm-on routes alike.
+NORM_OFF_EXTRA_RECORDS = (
+    "kcp_fwdh_out",
+    "kcp_fwdh_out_vh64",
+    "kcp_dhu_offset",
+    "kcp_dhu_offset_vh64",
+    "kcp_dhu_cut_start",
+)
 L2N_SKIP = (
     "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
     "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
@@ -3876,7 +3881,7 @@ def _skip_unless_l2n(backend: str) -> None:
 
 
 def _v1_csrc_digest() -> str:
-    """sha256 over the sorted lines ``"<file> <sha256>\\n"`` of the 36 csrc files of the 18 v1 records (reported)."""
+    """sha256 over the sorted lines ``"<file> <sha256>\\n"`` of the 32 csrc files of the 16 v1 records (reported)."""
     import hashlib
 
     lines = []
