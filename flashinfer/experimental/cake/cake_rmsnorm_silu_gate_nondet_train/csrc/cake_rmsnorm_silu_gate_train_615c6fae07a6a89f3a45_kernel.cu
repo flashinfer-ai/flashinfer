@@ -325,8 +325,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                         (&zs_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
                     }
                 }
-#if __CUDA_ARCH__ == 1070
-#else
             }
             if (i + 1 < 1) {
                 int nrow_0 = (((u + 1) * 16 + group) < (rows - 1) ? ((u + 1) * 16 + group) : (rows - 1));
@@ -335,7 +333,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)nq_0 * dy_tok + (long long)nh_0 * dy_head + (long long)col))));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)nq_0 * x_tok + (long long)nh_0 * x_head + (long long)col))));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)nq_0 * z_tok + (long long)nh_0 * z_head + (long long)col))));
-#endif
             }
             float wv[8];
             #pragma unroll
@@ -1115,8 +1112,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                         }
                     }
                 }
-#if __CUDA_ARCH__ == 1070
-#else
                 if (i_1 + 1 < chunk_n) {
                     int nrow_1 = (((u_1 + 1) * 16 + group) < (rows - 1) ? ((u_1 + 1) * 16 + group) : (rows - 1));
                     uint32_t nq_1 = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)nrow_1), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)nrow_1);
@@ -1125,7 +1120,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)nq_1 * x_tok + (long long)nh_1 * x_head + (long long)col))));
                     asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)nq_1 * z_tok + (long long)nh_1 * z_head + (long long)col))));
                 }
-#endif
                 if (tid == 0) {
                     if (i_1 == claim_at) {
                         uint32_t _atomic_fetch_inc_114;
