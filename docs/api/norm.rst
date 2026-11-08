@@ -372,7 +372,7 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
   of several modules chosen by bands of rows per SM: where ``x`` and ``z``
   hold packed rows (row ``n`` at element ``128 n``, as contiguous inputs do;
-  fewer than 2^24 rows) a tiny forward up to 38 rows per SM on SM100, 85 on
+  fewer than 2^24 rows) a tiny forward up to 38 rows per SM on SM100, 39 on
   SM103 and 65 on SM107, one 128-thread CTA per 8-row block; for other
   layouts a short forward up to 12 rows per SM on SM100 and SM103 (59 on
   SM107), one CTA per 16-row block.  Past them the bands run the mid forward

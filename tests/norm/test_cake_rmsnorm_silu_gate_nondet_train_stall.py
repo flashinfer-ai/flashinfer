@@ -22,7 +22,7 @@ of ``FORWARD_BANDS`` where ``x`` and ``z`` hold packed rows (row ``n`` at
 element ``128 n``, fewer than ``PACKED_ROWS`` rows), else of
 ``STRIDED_FORWARD_BANDS``.  The plain forward launches a grid of independent
 CTAs, one 64-thread CTA per block of 8 rows.  Packed rows up to 38 rows per SM
-on SM100, 85 on SM103 and 65 on SM107 run the tiny forward, one 128-thread CTA
+on SM100, 39 on SM103 and 65 on SM107 run the tiny forward, one 128-thread CTA
 per block of 8 rows.  Other layouts up to 12 rows per SM on SM100 and SM103
 (59 on SM107) run the short forward, one 256-thread CTA per block of 16 rows
 (with 64 SMs or more on SM100 and SM103, as with 148 or 152, fewer CTAs than
@@ -148,7 +148,7 @@ at its first and last rows per SM and at the deterministic package's probes
 the band holds: 85 blocks of 16 rows per slot (the most below 8192 rows per
 SM, where a CTA runs one block), 86 (the fewest whole waves from there) and
 344.  The forwards of the first band, the tiny forward of packed rows (at 1,
-12, 31 and 38 rows per SM on SM100, 1, 12, 41, 81 and 85 on SM103, 1, 10, 30,
+12, 31 and 38 rows per SM on SM100, 1, 12, 31 and 39 on SM103, 1, 10, 30,
 43 and 65 on SM107) and
 the short forward of the strided layout (at 1 and 12 rows per SM on SM100 and
 SM103, at 1, 10, 30 and 59 on SM107), each up to the end of its band, keep
@@ -1355,7 +1355,7 @@ def test_pipelined_forward_slows_in_proportion_to_the_sms_held(
 # the short forward (other layouts, here ``z`` the gate columns of a wider
 # projection).  The rows per SM of their token counts on each architecture
 # (one row per SM, rows between, and the end of the band, the largest, up to
-# which the architecture runs the module: the tiny forward 38 on sm_100a, 85
+# which the architecture runs the module: the tiny forward 38 on sm_100a, 39
 # on sm_103a and 65 on sm_107a; the short forward 12 on sm_100a and sm_103a
 # and 59 on sm_107a), and the side kernels of the item 1 test beside
 # them, the issue's three with the default carveout and 16 CTAs of 1024
@@ -1363,7 +1363,7 @@ def test_pipelined_forward_slows_in_proportion_to_the_sms_held(
 FIRST_FORWARD_ROWS_PER_SM = {
     "fwd_tiny": {
         "sm_100a": (1, 12, 31, 38),
-        "sm_103a": (1, 12, 41, 81, 85),
+        "sm_103a": (1, 12, 31, 39),
         "sm_107a": (1, 10, 30, 43, 65),
     },
     "fwd_short": {

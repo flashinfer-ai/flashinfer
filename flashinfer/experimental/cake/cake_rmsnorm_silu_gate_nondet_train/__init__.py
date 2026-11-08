@@ -145,7 +145,7 @@ Host design (the input layout rules are the deterministic package's):
   pipelined forward.  The plain forward (the call role ``fwd``: one
   64-thread CTA per block of 8 rows) is routed by no band; it stays in
   ``ROUTES`` because the support query needs every role routed.  The tiny
-  forward (packed rows, up to 38 rows per SM on sm_100a, 85 on sm_103a and
+  forward (packed rows, up to 38 rows per SM on sm_100a, 39 on sm_103a and
   65 on sm_107a) launches one 128-thread CTA per block of 8 rows, with the
   short forward's arithmetic, so the same ``y`` bits; the short forward
   (other layouts, up to 12 rows per SM on sm_100a and sm_103a, 59 on

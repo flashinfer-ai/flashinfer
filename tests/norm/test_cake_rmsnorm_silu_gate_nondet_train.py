@@ -1818,8 +1818,10 @@ def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
 # role) in increasing rows per SM (``None``: no end), a call of ``rows`` rows on
 # ``sm_count`` SMs running the first band's role with ``rows <= last *
 # sm_count`` (on sm_100a and sm_107a the program of the fastest checkpointed
-# training step at each rows per SM, on sm_103a the fastest forward).  The
-# forward's band roles; the backward's are ``BACKWARD_BANDS``.
+# training step at each rows per SM, on sm_103a the fastest forward; the tiny
+# forward ends where beside a kernel holding 16 SMs it still ends no later
+# than the deterministic package's forward).  The forward's band roles; the
+# backward's are ``BACKWARD_BANDS``.
 FORWARD_BANDS = {
     "sm_100a": (
         (38, "fwd_tiny"),
@@ -1831,7 +1833,7 @@ FORWARD_BANDS = {
         (None, "fwd_mid"),
     ),
     "sm_103a": (
-        (85, "fwd_tiny"),
+        (39, "fwd_tiny"),
         (6000, "fwd_pipe"),
         (8192, "fwd_mid"),
         (None, "fwd_pipe"),
@@ -2073,7 +2075,7 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         assert got == routes[packed], (rows, packed)
         got = loader.module_for_rows("sm_100a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
-    # the forward on sm_103a: packed rows the tiny forward up to 85 rows per
+    # the forward on sm_103a: packed rows the tiny forward up to 39 rows per
     # SM, the pipelined forward up to 6000, the mid forward up to 8192, the
     # pipelined forward past it; other layouts the short forward up to 12, the
     # pipelined forward up to 100, the mid forward up to 250, the extra-long
@@ -2084,8 +2086,8 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         (1, "fwd_tiny", "fwd_short"),
         (12 * sm_count, "fwd_tiny", "fwd_short"),
         (12 * sm_count + 1, "fwd_tiny", "fwd_pipe"),
-        (85 * sm_count, "fwd_tiny", "fwd_pipe"),
-        (85 * sm_count + 1, "fwd_pipe", "fwd_pipe"),
+        (39 * sm_count, "fwd_tiny", "fwd_pipe"),
+        (39 * sm_count + 1, "fwd_pipe", "fwd_pipe"),
         (100 * sm_count + 1, "fwd_pipe", "fwd_mid"),
         (250 * sm_count + 1, "fwd_pipe", "fwd_xlong"),
         (550 * sm_count + 1, "fwd_pipe", "fwd_mid"),
@@ -2437,7 +2439,7 @@ PIPE_FORWARD_GRIDS = [
     (8192 * 148 - 1, 148, 75776),  # below 8192 rows per SM: a CTA a block
     (8192 * 148, 148, 38184),  # from 8192 rows per SM: 75776 blocks, 43 waves
     (32737 * 48, 148, 49728),  # 98211 blocks, 56 waves of 888
-    (85 * 152 + 1, 152, 808),  # GB300 packed band's first row: 808 blocks
+    (39 * 152 + 1, 152, 371),  # GB300 packed band's first row: 371 blocks
     (6000 * 152, 152, 57000),  # its last row: 57000 blocks
     (8192 * 152 + 1, 152, 39216),  # GB300 last band's first row: 43 waves
     (350 * 212 + 1, 212, 4638),  # R200 pipelined band's first row: 4638 blocks

@@ -1710,11 +1710,12 @@ ROUTES: dict[str, dict[str, str]] = {
 # tiny forward, but the mid forward from 6001 to 8192 rows per SM, where the
 # pipelined forward still launches a CTA per block.  The tiny forward ends
 # where beside a kernel holding 16 SMs it still ends no later than the
-# deterministic package's forward: 38 rows per SM on sm_100a (from 39,
-# beside 16 CTAs of 1024 threads with the max-shared carveout, it ends up to
-# 2 microseconds later; the pipelined forward, which is that forward, runs
-# from there up to 85), 85 on sm_103a and 65 on sm_107a.  Host plan only: a
-# new cut needs no new program.
+# deterministic package's forward: 38 rows per SM on sm_100a and 39 on
+# sm_103a (from there, beside 16 CTAs of 1024 threads with the max-shared
+# carveout, it ends up to 2 microseconds later; the pipelined forward, which
+# is that forward, runs from there, up to 85 rows per SM on sm_100a and 6000
+# on sm_103a), and 65 on sm_107a.  Host plan only: a new cut needs no new
+# program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (38, "fwd_tiny"),
@@ -1726,7 +1727,7 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
         (None, "fwd_mid"),
     ),
     "sm_103a": (
-        (85, "fwd_tiny"),
+        (39, "fwd_tiny"),
         (6000, "fwd_pipe"),
         (8192, "fwd_mid"),
         (None, "fwd_pipe"),
