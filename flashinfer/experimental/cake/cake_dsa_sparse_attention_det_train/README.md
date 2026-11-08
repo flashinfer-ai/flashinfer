@@ -130,7 +130,8 @@ The accumulator region of one backward holds, per destination row, the int32
 accumulator (576 columns; 512 for NoPE; the row-bound words live in the row
 until the grid stage reads them), 32 B of overflow counters, the grid words
 (8 B; 4 B for NoPE) and the pair count (4 B).  `delta` and the global words
-are separate.  The rest lives in output storage that is dead while it is used:
+are never part of the region.  The rest lives in output storage that is dead
+while it is used:
 
 * `qstat` (`[T, 4]` FP32) and the key norms (4 B per key row) at the front of
   dQ (`dq_latent`; the NoPE `dq`; 64 KiB per query token) when they fit (`S`
@@ -142,9 +143,29 @@ are separate.  The rest lives in output storage that is dead while it is used:
   `bwd_redo` reads them, and the fold writes the output last
   (`cake_backend.redo_lists_fit`).  Otherwise (`dkv_acc`, NoPE) they are part
   of the region.
+* After them, when they fit too, `delta` (`[T, 64]` FP32) and the global
+  words: `bwd_delta` writes them (it reads neither output), the redo is their
+  last reader (`cake_backend.output_scratch_layout`,
+  `cake_backend.delta_fits_output`: `2 * align(R * 4) + align(T * 256) + 256`
+  bytes within `dkv_latent`).
 * Otherwise those parts stay in the workspace or the region.  The eager and
-  autograd entries allocate per call only `delta`, the global words and the
-  region (no `topk_length` vector).
+  autograd entries allocate per call only what stays there of `delta`, the
+  global words and the region (no `topk_length` vector).
+
+Peak memory against the non-deterministic package (same binding, allocated
+bytes).  A prepared rope runner with fresh outputs holds the int32
+accumulator where that package holds its FP32 accumulator (2304 B per row)
+plus the counters, grid words and pair counts (44 B per destination row), and
+no `delta`: it needs `align(R * 32) + align(R * 8) + align(R * 4) -
+align(T * 256)` bytes more, which is less whenever `R <= ~5.8 T`.  A prepared
+NoPE runner needs 48 B per destination row and the global words (one 256-byte
+part) more: its fresh `dkv` is the integer accumulator through the fold, the
+main stage writes dQ before the redo, and the redo reads `delta`, so no output
+storage is dead while the counters, grid words, pair counts and redo lists
+are live.  The NoPE autograd entry that adds into `dkv_acc` carves the region
+from `o_lo` and allocates the global words (64 B) beside `delta` per call;
+the global words may not alias `o_lo` (`bwd_delta` zeroes them while it reads
+`o_lo`).
 
 * The autograd entries use the storage of their saved `o_lo` (64 KiB per query
   token) for the region when it fits: `bwd_delta` is the only stage that reads

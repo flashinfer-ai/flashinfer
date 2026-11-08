@@ -117,8 +117,9 @@ limitations under the License.
 # words are never carved from ``o_lo`` (``bwd_delta`` writes them).  ``qstat``
 # and the key norms live at the front of dQ when they fit (the main stage
 # writes every dQ element after their last reader, :func:`dq_scratch_layout`),
-# the redo lists at the front of a fresh RoPE dK/dV output (the fold writes it
-# after the redo, :func:`redo_lists_fit`).  Otherwise the
+# the redo lists, and ``delta`` and the global words when they fit too, at the
+# front of a fresh RoPE dK/dV output (the fold writes it after the redo, their
+# last reader; :func:`output_scratch_layout`).  Otherwise the
 # region is a workspace region (prepared runner) or one allocation per call
 # (eager entries).  A fresh NoPE ``dkv`` is its own integer accumulator: the
 # fold turns it into FP32 in place.  The autograd entries always consume their
@@ -739,6 +740,32 @@ def redo_lists_fit(num_kv: int, num_dst: int, *, dkv_fp32: bool = False) -> bool
     return _align(int(num_dst) * 4) * 2 <= int(num_kv) * row_bytes
 
 
+def output_scratch_layout(num_queries: int, num_dst: int, *, delta: bool = True) -> dict:
+    """Byte ``(offset, size)`` of the backward scratch at the front of a fresh RoPE dK/dV output (``dkv_latent`` or
+    ``dkv_latent_fp32``), plus ``"total"``: the redo marks and the redo list (``[num_dst]`` int32 each) and, with
+    ``delta``, ``delta`` (``[T, 64]`` FP32) and the global words.  ``bwd_delta`` writes ``delta`` and zeroes the
+    global words (it reads neither output), the redo is the last reader of all four, and the fold, the one stage
+    that writes the output, runs after it."""
+    R = int(num_dst)
+    sizes = [("redo_mark", R * 4), ("redo_rows", R * 4)]
+    if delta:
+        sizes += [
+            ("delta", int(num_queries) * NUM_HEADS * 4),
+            ("globals", GLOBAL_WORDS * 4),
+        ]
+    return _layout_of(sizes)
+
+
+def delta_fits_output(
+    num_queries: int, num_kv: int, num_dst: int, *, dkv_fp32: bool = False
+) -> bool:
+    """Whether the redo lists, ``delta`` and the global words (:func:`output_scratch_layout`) fit the front of a
+    fresh RoPE dK/dV output (``[num_kv, 512]``, BF16 or FP32): ``2 * align(R * 4) + align(T * 256) + 256 <=
+    num_kv * 1024`` (BF16), so the workspace or the per-call allocation holds neither."""
+    row_bytes = D_LATENT * (4 if dkv_fp32 else 2)
+    return output_scratch_layout(num_queries, num_dst)["total"] <= int(num_kv) * row_bytes
+
+
 def carve_fits(
     num_queries: int,
     num_kv: int,
@@ -779,6 +806,7 @@ def workspace_layout(
     accumulator: bool = True,
     dq_scratch: bool = False,
     redo_in_output: bool = False,
+    delta_in_output: bool = False,
     per_call: bool = False,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region of a prepared runner plus ``"total"``.
@@ -786,16 +814,20 @@ def workspace_layout(
     The ``topk_length`` region backs a full-length vector when the caller passes none (absent with ``per_call``:
     the per-call allocation of an eager or autograd backward, whose lengths are the caller's or the binding's
     own); ``delta`` (``[T, 64]`` FP32), ``qstat`` (``[T, 4]`` FP32; absent with ``dq_scratch``: it lives in dQ,
-    :func:`dq_scratch_layout`) and the global words exist for the backward, and the accumulator region
+    :func:`dq_scratch_layout`) and the global words exist for the backward (``delta`` and the global words absent
+    with ``delta_in_output``: they live in the fresh dK/dV output, :func:`output_scratch_layout`), and the
+    accumulator region
     (:func:`accumulator_region_layout` over ``num_dst`` destination rows, ``num_kv`` by default; without the key
     norms with ``dq_scratch``, without the redo lists with ``redo_in_output``) unless the runner carves it from
     ``o_lo`` (``region=False``)."""
     sizes = [] if per_call else [("topk_length", int(num_queries) * 4)]
     if backward:
-        sizes.append(("delta", int(num_queries) * NUM_HEADS * 4))
+        if not delta_in_output:
+            sizes.append(("delta", int(num_queries) * NUM_HEADS * 4))
         if not dq_scratch:
             sizes.append(("qstat", int(num_queries) * QSTAT_WORDS * 4))
-        sizes.append(("globals", GLOBAL_WORDS * 4))
+        if not delta_in_output:
+            sizes.append(("globals", GLOBAL_WORDS * 4))
         if region:
             R = int(num_kv) if num_dst is None else int(num_dst)
             sizes.append(
@@ -888,7 +920,8 @@ def dsa_train_workspace_size(
     ``num_dst`` is the number of destination rows of the accumulator (the rows of ``dkv_acc`` when the binding adds
     through a ``dkv_dst_map``; ``num_kv`` by default); ``o_lo_scratch=True`` (see :func:`prepare_dsa_train`) leaves
     the accumulator region out when it fits ``o_lo``; ``dkv_acc=False`` (fresh dK/dV outputs) puts the redo lists
-    in the output (:func:`redo_lists_fit`).  The size assumes ``dq_latent`` and ``dkv_latent`` start 16-byte
+    in the output (:func:`redo_lists_fit`), and ``delta`` and the global words with them when they fit
+    (:func:`delta_fits_output`).  The size assumes ``dq_latent`` and ``dkv_latent`` start 16-byte
     aligned (any the runner allocates); a caller's output that does not needs the larger layout of
     :func:`prepare_dsa_train`'s plan.  ``key_passes``, ``num_segments`` and ``dkv_direct`` are accepted for parity
     with the non-deterministic package; the layout does not depend on them."""
@@ -899,6 +932,7 @@ def dsa_train_workspace_size(
     R = int(num_kv) if num_dst is None else int(num_dst)
     dq_scratch = dq_scratch_layout(num_queries, num_kv) is not None
     redo_in_output = not dkv_acc and redo_lists_fit(num_kv, R)
+    delta_in_output = redo_in_output and delta_fits_output(num_queries, num_kv, R)
     storage = _storage(
         num_queries,
         num_kv,
@@ -919,6 +953,7 @@ def dsa_train_workspace_size(
             region=storage == "workspace",
             dq_scratch=dq_scratch,
             redo_in_output=redo_in_output,
+            delta_in_output=delta_in_output,
         )["total"]
     )
 
@@ -1379,6 +1414,8 @@ class _Plan:
     dq_scratch: bool = False
     # The redo marks and list live in the fresh dK/dV output (:func:`redo_lists_fit`), not in the region.
     redo_in_output: bool = False
+    # ``delta`` and the global words live there too (:func:`delta_fits_output`), not in the workspace.
+    delta_in_output: bool = False
     # The layout of the per-call workspace of an eager or autograd backward (no ``topk_length`` region).
     call_layout: dict = field(default_factory=dict, repr=False)
     fold_mode: int = FOLD_BF16
@@ -1594,6 +1631,9 @@ def _plan(
         and redo_lists_fit(num_kv, num_dst, dkv_fp32=dkv_fp32)
         and _starts_aligned(outputs.get("dkv_latent"))
     )
+    delta_in_output = redo_in_output and delta_fits_output(
+        num_queries, num_kv, num_dst, dkv_fp32=dkv_fp32
+    )
     storage = (
         _storage(
             num_queries,
@@ -1627,6 +1667,7 @@ def _plan(
             region=storage == "workspace",
             dq_scratch=dq_scratch,
             redo_in_output=redo_in_output,
+            delta_in_output=delta_in_output,
             per_call=per_call,
         )
         for per_call in (False, True)
@@ -1713,6 +1754,7 @@ def _plan(
         region=region,
         dq_scratch=dq_scratch,
         redo_in_output=redo_in_output,
+        delta_in_output=delta_in_output,
         call_layout=call_layout,
         fold_mode=fold_mode,
     )
@@ -1769,8 +1811,9 @@ def _carve_region(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
 
 def _carve_moved(plan: _Plan, t: dict[str, torch.Tensor]) -> None:
     """Place the scratch the plan keeps in dead output storage: ``qstat`` and ``knorm`` at the front of dQ
-    (``dq_latent``; :func:`dq_scratch_layout`) and the redo marks and list at the front of the fresh dK/dV output
-    (``dkv_latent`` or ``dkv_latent_fp32``; :func:`redo_lists_fit`).  Called once the outputs are bound."""
+    (``dq_latent``; :func:`dq_scratch_layout`) and the redo marks and list -- with ``delta`` and the global words
+    when the plan keeps them there -- at the front of the fresh dK/dV output (``dkv_latent`` or ``dkv_latent_fp32``;
+    :func:`output_scratch_layout`).  Called once the outputs are bound."""
     if not plan.backward:
         return
     if plan.dq_scratch:
@@ -1786,9 +1829,18 @@ def _carve_moved(plan: _Plan, t: dict[str, torch.Tensor]) -> None:
         flat = out.view(-1).view(torch.uint8)
         assert flat.data_ptr() % 16 == 0
         R = plan.num_dst
-        layout = _layout_of([("redo_mark", R * 4), ("redo_rows", R * 4)])
+        layout = output_scratch_layout(
+            plan.num_queries, R, delta=plan.delta_in_output
+        )
         t["redo_mark"] = _carve(flat, layout, "redo_mark", torch.int32, (R,))
         t["redo_rows"] = _carve(flat, layout, "redo_rows", torch.int32, (R,))
+        if plan.delta_in_output:
+            t["delta"] = _carve(
+                flat, layout, "delta", torch.float32, (plan.num_queries, NUM_HEADS)
+            )
+            t["det_globals"] = _carve(
+                flat, layout, "globals", torch.int32, (GLOBAL_WORDS,)
+            ).view(torch.uint32)
 
 
 def _region_bytes(
@@ -1817,18 +1869,19 @@ def _scratch(
     *,
     layout: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """The backward scratch of ``plan``: ``delta``, ``qstat`` (unless it lives in dQ) and ``det_globals`` from the
-    workspace ``flat`` (laid out as ``layout``, ``plan.layout`` by default) and the accumulator region
-    (:func:`_region_bytes`: the workspace's ``region`` when ``layout`` holds one and ``o_lo`` is not carved, else
-    one allocation).  :func:`_carve_moved` places the rest once the outputs are bound."""
+    """The backward scratch of ``plan``: ``delta`` and ``det_globals`` (unless they live in the fresh dK/dV output)
+    and ``qstat`` (unless it lives in dQ) from the workspace ``flat`` (laid out as ``layout``, ``plan.layout`` by
+    default) and the accumulator region (:func:`_region_bytes`: the workspace's ``region`` when ``layout`` holds
+    one and ``o_lo`` is not carved, else one allocation).  :func:`_carve_moved` places the rest once the outputs
+    are bound."""
     T = plan.num_queries
     layout = plan.layout if layout is None else layout
-    t = dict(
-        delta=_carve(flat, layout, "delta", torch.float32, (T, NUM_HEADS)),
-        det_globals=_carve(flat, layout, "globals", torch.int32, (GLOBAL_WORDS,)).view(
-            torch.uint32
-        ),
-    )
+    t: dict[str, torch.Tensor] = {}
+    if "delta" in layout:
+        t["delta"] = _carve(flat, layout, "delta", torch.float32, (T, NUM_HEADS))
+        t["det_globals"] = _carve(
+            flat, layout, "globals", torch.int32, (GLOBAL_WORDS,)
+        ).view(torch.uint32)
     if "qstat" in layout:
         t["qstat"] = _carve(flat, layout, "qstat", torch.float32, (T, QSTAT_WORDS))
     region = _region_bytes(plan, o_lo, flat, layout, flat.device)
@@ -1844,8 +1897,8 @@ def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     fold as ``dst_packed``; the redo reads its flagged-row count from the global words (``redo_count``).  Every
     pointer a stage's scalars tell it not to touch is a zero-size placeholder of its dtype."""
     indices, _ = _pointer_operand(t["indices"])
-    # a forward launch binds no backward scratch
-    backward = plan.backward and "det_globals" in t
+    # a forward launch binds no backward operands (no dout, no scratch)
+    backward = plan.backward and "dout" in t
     if backward:
         _carve_moved(plan, t)
     values: dict[str, Any] = dict(plan.constants)
