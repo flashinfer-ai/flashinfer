@@ -284,8 +284,18 @@ full-length `topk_length` vector it materializes when the caller passes none)
 and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
 through the generated positional launchers of `cake_launch.py`.  During
-CUDA-graph capture the eager entry points plan privately and leave the cache
-untouched.  The bindings encode the tensor maps by value, so a step is its
+CUDA-graph capture the eager entry points never store a plan in the cache;
+they reuse a cached plan only when it owns no `topk_length` vector (the call
+passes its own lengths, as the autograd entries do), since such a plan holds
+no storage, and otherwise plan privately.  A cache hit of that kind also skips
+the capture query.  The rope varlen entry decides its index route on every
+call; on the stage route its cached binding is keyed by the geometry of the
+activations, the per-document rows, both prefix sums and a caller cut, plus
+`causal` and the scale, and holds the forward plan with the stage's resolved
+entry and the launch values that follow from that geometry -- no tensor.  The
+entry launches the stage and hands the binding to the autograd function, whose
+forward launches over it without a second lookup.  The bindings encode the
+tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
 (`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x chunks x passes` for the
 key-range-pass backward (`bwd_delta`, then `bwd_compact` + `bwd_main_pass` per

@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3960,8 +3961,15 @@ def _stand_in_nope_program(monkeypatch, calls: list) -> dict:
     monkeypatch.setattr(cake_jit, "load_cake_dsa_train_module", load)
     # the recording entries take the host tensors as they are: the tvm-ffi conversion stands in as identity
     monkeypatch.setattr(cake_backend, "_ffi_tensor", lambda tensor: tensor)
-    cake_backend.BINDING_CACHE.clear()
+    _private_binding_cache(monkeypatch)
     return record
+
+
+def _private_binding_cache(monkeypatch):
+    """Give the binding cache empty entries for the test: the stand-in bindings (their stage entries hold the
+    recording ``run`` and the stood-in launchers) are dropped when the test ends, and the entries of earlier tests
+    come back."""
+    monkeypatch.setattr(cake_backend.BINDING_CACHE, "_entries", OrderedDict())
 
 
 def _nope_device_inputs(T, S, K, *, seed=0):
@@ -7114,7 +7122,7 @@ def _stand_in_rope_program(monkeypatch, calls: list):
 
     monkeypatch.setattr(cake_jit, "load_cake_dsa_train_module", load)
     monkeypatch.setattr(cake_backend, "_ffi_tensor", lambda tensor: tensor)
-    cake_backend.BINDING_CACHE.clear()
+    _private_binding_cache(monkeypatch)
 
 
 def _rope_device_inputs(T, S, K, *, seed=0):
@@ -7421,6 +7429,324 @@ def test_rope_varlen_fallback_routes_give_the_stage_route_results_on_hole_rows()
     )
     torch.cuda.synchronize()
     assert torch.equal(out, stage[0]) and torch.equal(lse, stage[1])
+
+
+def _tensor_free(*values) -> bool:
+    """Whether none of ``values`` -- nor a value of a dict among them -- is a tensor."""
+    flat = []
+    for value in values:
+        flat.extend(value.values() if isinstance(value, dict) else (value,))
+    return not any(isinstance(value, torch.Tensor) for value in flat)
+
+
+def _assert_launch_values(got, want, *, fresh=()):
+    """``got`` launches what ``want`` does: the same argument names, equal scalars and, for every tensor argument
+    not in ``fresh``, the same pointer, shape and strides."""
+    assert set(got) == set(want), sorted(set(got) ^ set(want))
+    for name, value in want.items():
+        if name in fresh:
+            continue
+        if isinstance(value, torch.Tensor):
+            mine = got[name]
+            assert (mine.data_ptr(), tuple(mine.shape), mine.stride()) == (
+                value.data_ptr(),
+                tuple(value.shape),
+                value.stride(),
+            ), name
+        else:
+            assert got[name] == value, name
+
+
+def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry(
+    monkeypatch,
+):
+    """The rope varlen entry's stage route keeps one cached binding per call geometry (tag ``"rope_varlen_fwd"``): the
+    forward plan, the stage's resolved entry and its geometry-derived launch values, and no tensor (no
+    ``topk_length`` vector either).  A call of the same geometry with other storage and contents hits it and binds
+    its own tensors; the stage's launch values are those of the uncached stage launch and the forward's those of
+    the flat entry over the stage's rows and counts.  ``causal``, a caller cut, a column slice and a misaligned start
+    of the rows are other keys; a strided prefix sum of a cached shape takes the torch twin, since the route is
+    decided on every call."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    acts = _rope_device_inputs(T, S, K)[:4]
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
+
+    def launched(*args, **kwargs):
+        del calls[:]
+        varlen(*args, **kwargs)
+        return [c[0] for c in calls], [c[1] for c in calls]
+
+    stages, (prep, fwd) = launched(*acts, local, cu_q, cu_k, causal=True)
+    assert stages == [NOPE_INDEX_PREP_STAGE, "fwd"]
+    (key,) = list(cache._entries)
+    binding = cache._entries[key]
+    assert key[0] == "rope_varlen_fwd" and isinstance(
+        binding, cake_backend._RopeVarlenBinding
+    )
+    assert binding.topk_length is None
+    assert binding.plan.has_topk_length and not binding.plan.derive_length
+    assert _tensor_free(
+        binding.plan.constants,
+        binding.plan.scalars,
+        binding.plan.layout,
+        binding.prep.constants,
+        binding.prep.span,
+        binding.prep.offset,
+    )
+    # the stage's values are those of the uncached launch over the same tensors
+    ref = cake_backend._index_prep_launch(
+        cake_backend.arch_for(local.device),
+        local,
+        cu_q,
+        cu_k,
+        causal=True,
+        out=prep["out"],
+        topk_length=prep["topk_length"],
+        compact=True,
+    )
+    _assert_launch_values(
+        {name: prep[name] for name in ref.values}, ref.values, fresh=()
+    )
+    assert (prep["grid_x"], prep["grid_y"], prep["grid_z"]) == tuple(ref.grid)
+    # the same geometry over other storage and contents: a hit that binds the call's own tensors
+    acts2 = [t.clone() for t in acts]
+    local2, cu_q2, cu_k2 = local.roll(1, 0), cu_q.clone(), cu_k.clone()
+    stages2, (prep2, fwd2) = launched(*acts2, local2, cu_q2, cu_k2, causal=True)
+    assert stages2 == stages and list(cache._entries) == [key]
+    assert cache._entries[key] is binding
+    assert prep2["indices"].data_ptr() == local2.data_ptr()
+    assert prep2["cu_seqlens_q"] is cu_q2 and prep2["cu_seqlens_k"] is cu_k2
+    assert fwd2["q_latent"] is acts2[0] and fwd2["k_rope"] is acts2[3]
+    assert (
+        fwd2["indices"] is prep2["out"] and fwd2["topk_length"] is prep2["topk_length"]
+    )
+    assert prep2["out"].data_ptr() != prep["out"].data_ptr()
+    _assert_launch_values(
+        prep2,
+        prep,
+        fresh=(
+            "indices",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+            "out",
+            "topk_length",
+            "length_in",
+        ),
+    )
+    _assert_launch_values(
+        fwd2,
+        fwd,
+        fresh=(
+            "q_latent",
+            "q_rope",
+            "kv_latent",
+            "k_rope",
+            "out",
+            "o_lo",
+            "lse",
+            "indices",
+            "topk_length",
+        ),
+    )
+    # the forward's values are those of the flat entry over the stage's rows and counts
+    del calls[:]
+    cake_backend.forward(*acts, prep["out"], topk_length=prep["topk_length"])
+    (flat_stage, flat), *_ = calls
+    assert flat_stage == "fwd"
+    _assert_launch_values(fwd, flat, fresh=("out", "o_lo", "lse"))
+    flat_keys = [k for k in cache._entries if k[0] == "fwd"]
+    assert len(flat_keys) == 1
+    # other keys: causal, a caller cut, a column slice and a misaligned start of the rows
+    mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
+    wide[:, 3 : 3 + K] = local
+    flat_rows = torch.zeros(T * K + 1, dtype=torch.int32, device="cuda")
+    shifted = flat_rows[1:].view(T, K)
+    shifted.copy_(local)
+    cases = (
+        (local, {"causal": False}, {"causal": 0}),
+        (local, {"causal": True, "topk_length": mine}, {"has_length_in": 1}),
+        (wide[:, 3 : 3 + K], {"causal": True}, {"idx_stride": K + 8}),
+        (shifted, {"causal": True}, {"indices_offset": 1}),
+    )
+    for count, (rows, kwargs, expect) in enumerate(cases, start=2):
+        for _ in range(2):  # the second call of each geometry is a hit
+            stages_c, (prep_c, fwd_c) = launched(*acts, rows, cu_q, cu_k, **kwargs)
+            assert stages_c == [NOPE_INDEX_PREP_STAGE, "fwd"]
+            keys = [k for k in cache._entries if k[0] == "rope_varlen_fwd"]
+            assert len(keys) == count, kwargs
+            assert {name: prep_c[name] for name in expect} == expect
+            assert fwd_c["indices"] is prep_c["out"]
+    assert prep_c["indices"].data_ptr() == flat_rows.data_ptr()
+    # a strided prefix sum of a cached shape: the torch twin and the flat forward, no stage launch
+    strided = torch.stack([cu_q, cu_q], 1)[:, 0]
+    assert not strided.is_contiguous() and strided.shape == cu_q.shape
+    stages_s, (fwd_s,) = launched(*acts, local, strided, cu_k, causal=True)
+    assert stages_s == ["fwd"]
+    rows, counts = compact_rows(
+        offset_gather_kv_indices(local, cu_q, cu_k, causal=True), S
+    )
+    assert torch.equal(fwd_s["indices"], rows) and torch.equal(
+        fwd_s["topk_length"], counts
+    )
+    assert len([k for k in cache._entries if k[0] == "rope_varlen_fwd"]) == 5
+
+
+def test_rope_varlen_binding_serves_captured_calls_and_a_capture_miss_stays_private(
+    monkeypatch,
+):
+    """The rope varlen binding owns no storage: during capture a hit serves the call without the capture query
+    (stage and forward launched as in eager mode), and a miss is planned privately and not stored.  The flat entry's
+    binding without caller lengths owns its ``topk_length`` vector: each call queries the capture state and a
+    captured call plans privately."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    queries = []
+    capturing = [False]
+
+    def query():
+        queries.append(capturing[0])
+        return capturing[0]
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", query)
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    q_latent, q_rope, kv_latent, k_rope, idx, _ = _rope_device_inputs(
+        T, int(cu_k[-1]), K
+    )
+    args = (q_latent, q_rope, kv_latent, k_rope, local, cu_q, cu_k)
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
+    varlen(*args, causal=True)
+    assert queries == [False] and len(cache) == 1
+    (binding,) = cache._entries.values()
+    capturing[0] = True
+    del queries[:], calls[:]
+    varlen(*args, causal=True)
+    assert queries == [] and len(cache) == 1
+    assert next(iter(cache._entries.values())) is binding
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
+    del queries[:], calls[:]
+    varlen(*args, causal=False)
+    assert queries == [True] and len(cache) == 1
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
+    assert calls[0][1]["causal"] == 0
+    capturing[0] = False
+    del queries[:]
+    cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, idx)
+    assert queries == [False] and len(cache) == 2
+    flat = next(b for k, b in cache._entries.items() if k[0] == "fwd")
+    assert flat.topk_length is not None
+    cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, idx)
+    assert queries == [False, False]
+    capturing[0] = True
+    del queries[:], calls[:]
+    cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, idx)
+    assert queries == [True] and len(cache) == 2
+    assert calls[0][1]["topk_length"] is not flat.topk_length
+
+
+def test_rope_varlen_routes_return_the_flat_function_with_its_saved_list(monkeypatch):
+    """Both routes of the rope varlen entry return outputs of ``CakeDSASparseAttentionNondetFunction`` with its nine
+    saved tensors in their fixed order -- the stage's fresh rows and counts at positions 4 and 8 on the stage route
+    -- and keep neither the binding nor another tensor on the node beyond the caller's accumulator."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    q_latent, q_rope, kv_latent, k_rope, _, _ = _rope_device_inputs(T, S, K)
+    q_latent.requires_grad_()
+    acc = torch.zeros(S, D_QK, device="cuda")
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
+    strided = torch.stack([cu_q, cu_q], 1)[:, 0]
+    for cu_arg, stages in (
+        (cu_q, [NOPE_INDEX_PREP_STAGE, "fwd"]),
+        (strided, ["fwd"]),
+    ):
+        del calls[:]
+        out, lse = varlen(
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            local,
+            cu_arg,
+            cu_k,
+            causal=True,
+            dkv_acc=acc,
+            return_lse=True,
+        )
+        assert [c[0] for c in calls] == stages
+        node = out.grad_fn
+        assert type(node).__name__ == "CakeDSASparseAttentionNondetFunctionBackward"
+        saved = node.saved_tensors
+        fwd = calls[-1][1]
+        assert len(saved) == 9
+        assert saved[0].data_ptr() == q_latent.data_ptr()
+        assert saved[4].data_ptr() == fwd["indices"].data_ptr()
+        assert saved[5].data_ptr() == out.data_ptr()
+        assert saved[8].data_ptr() == fwd["topk_length"].data_ptr()
+        if len(stages) == 2:
+            assert saved[4].data_ptr() == calls[0][1]["out"].data_ptr()
+            assert saved[8].data_ptr() == calls[0][1]["topk_length"].data_ptr()
+        assert node.dkv_acc is acc and not hasattr(node, "binding")
+        assert node.has_topk_length and node.num_segments == int(cu_k.numel()) - 1
+
+
+def test_rope_varlen_repeated_calls_reuse_the_binding_bitwise_and_pin_nothing():
+    """Repeated steps of the rope varlen entry on the stage route reuse one forward and one backward binding, give the
+    first step's ``out``, ``lse`` and ``dq`` bitwise, and leave nothing allocated once their results are released:
+    neither binding owns a tensor (not even a ``[T]`` vector)."""
+    _require_program(backward=True)
+    _require_nope_compacting_stage()
+    cache = cake_backend.BINDING_CACHE
+    cache.clear()
+    inp = make_inputs([1024, 1024], [2048, 4096], seed=SEED + 120, topk=64)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    assert (
+        cake_backend._rope_varlen_index_mode(
+            inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, inp.total_q
+        )
+        == "index_prep"
+    )
+
+    def step():
+        leaves = [t.detach().clone().requires_grad_() for t in args]
+        out, lse = cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+            *leaves,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            causal=True,
+            return_lse=True,
+        )
+        dq_latent, dq_rope = torch.autograd.grad(out, leaves[:2], inp.dout)
+        return out.detach(), lse.detach(), dq_latent, dq_rope
+
+    first = step()
+    torch.cuda.synchronize()
+    entries = dict(cache._entries)
+    assert sorted(key[0] for key in entries) == ["bwd", "rope_varlen_fwd"]
+    assert all(binding.topk_length is None for binding in entries.values())
+    live = torch.cuda.memory_allocated()
+    for _ in range(3):
+        again = step()
+        torch.cuda.synchronize()
+        assert all(torch.equal(a, b) for a, b in zip(again, first, strict=True))
+        assert len(cache) == 2
+        assert all(cache._entries[key] is binding for key, binding in entries.items())
+    del again
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() - live < inp.total_q * 4
 
 
 # --- activation checkpointing (flashinfer-ai/flashinfer#7039): the autograd entries keep nothing alive after a
@@ -7774,3 +8100,18 @@ def test_ckpt_eager_peak_memory_is_not_above_the_reference_package(name):
     assert peak <= want + CKPT_RETAINED_LIMIT_MIB, (
         f"{name}: eager peak {peak:.1f} MiB above the inputs vs {want:.1f} MiB with the reference package"
     )
+
+
+@pytest.mark.parametrize("name", CKPT_ENTRIES)
+def test_save_on_cpu_outputs_and_gradients_match_the_eager_pair(name):
+    """Under ``torch.autograd.graph.save_on_cpu`` -- every saved tensor packed to host memory once the forward returns
+    and unpacked in the backward -- each autograd entry gives the eager call's ``out`` and query gradients bitwise
+    and its key gradients within the atomics spread."""
+    inp = _ckpt_inputs()
+    fn, leaves, _acc = _ckpt_entry(name, inp)
+    want = _eager_step(fn, leaves, inp.dout, None)
+    with torch.autograd.graph.save_on_cpu():
+        out = fn(*leaves)
+    grads = torch.autograd.grad(out, leaves, inp.dout, allow_unused=True)
+    torch.cuda.synchronize()
+    _assert_same_results((out.detach(), grads), want[:2])
