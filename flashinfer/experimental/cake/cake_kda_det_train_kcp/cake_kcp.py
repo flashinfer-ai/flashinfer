@@ -596,6 +596,9 @@ WY_DIRECT_RECORDS = {"wy_fwd": "wy_fwd", "wy": "wy_bwd_replay"}
 # dispatch one is refused (:meth:`KernelBackend.stage`), never skipped as an optional stage the plan fuses away.
 L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
 SCRATCH_TABLES_ATTR = "_kcp_scratch_tables"  # the arena attribute holding the table set the intra record writes
+# the arena attribute holding a flag-on backward's moved-views copy per arena view (_l2n_bwd_rows)
+L2N_MOVED_ATTR = "_kcp_l2n_moved"
+L2N_MOVED_MAX = 16  # arena views (and per view, (buffer, T_r) row heads) one such cache keeps (cleared when full)
 COLLECTIVES = ("c1", "c2", "b1", "b2")
 
 
@@ -2245,6 +2248,7 @@ def _plan_view(arena: Any, plan: Any) -> Any:
     view = arena._view(plan)
     view.__dict__.pop(TEMPLATE_CACHE_ATTR, None)
     view.__dict__.pop(SCRATCH_TABLES_ATTR, None)
+    view.__dict__.pop(L2N_MOVED_ATTR, None)
     return view
 
 
@@ -7354,7 +7358,14 @@ def _bwd_body(
         moved["v_new"] = call.grads[hosts["v_new"][0]]
     if call.l2n:
         _qk_l2norm_begin(call, None if saved is None else saved.qk_rstd, hosts=moved)
-    _backward(call, saved)
+        try:
+            _backward(call, saved)
+        finally:
+            # the record: made by _late_grads unless the backward raised before it
+            _l2n_record(call)
+            _l2n_restore_views(call)
+    else:
+        _backward(call, saved)
     _late_grads(call)  # nothing left once the first local stage ran
     return tuple(call.grads[n] for n in names)
 
@@ -7370,6 +7381,7 @@ def _finalize_scratch(call: CakeKDADetKcpCall, nc_pad: int) -> None:
 def _late_grads(call: CakeKDADetKcpCall) -> None:
     """Allocate the outputs and scratch :func:`_bwd_body` deferred (:func:`_l2n_late_grads`); nothing when none is
     pending.  :func:`_bwd_rows` calls it right after the backward's first local stage."""
+    _l2n_record(call)
     pending = call.scratch.pop("late_grads", None)
     if pending is None:
         return
@@ -7394,8 +7406,8 @@ _L2N_LATE_GRADS = (
     "ddt_bias",
 )
 # The logical names the first local stage of a fused flag-on backward binds, per plan: {id(plan): (a weak reference
-# to it, the registry it read, the names or None)}
-_L2N_FIRST_BOUND: dict[int, tuple[Any, Any, frozenset[str] | None]] = {}
+# to it, the registry it read, the names or None, {id(hosts) or None: (hosts or None, the deferred names)})}
+_L2N_FIRST_BOUND: dict[int, tuple[Any, Any, frozenset[str] | None, dict[int, Any]]] = {}
 
 
 def _l2n_late_grads(
@@ -7425,15 +7437,25 @@ def _l2n_late_grads(
         if stage not in KCP_LOCAL_RECORDS and p.dispatched(stage, LOCAL_PATH_BWD):
             record = p.record(stage, LOCAL_PATH_BWD)
             bound = frozenset(cake_jit.MODULES[record]["logical"].values())
-        kept = (weakref.ref(p), cake_jit.MODULES, bound)
+        kept = (weakref.ref(p), cake_jit.MODULES, bound, {})
         _L2N_FIRST_BOUND[id(p)] = kept
     bound = kept[2]
     if bound is None:
         return frozenset()
+    # per hosts dict (_l2n_row_hosts keeps each non-empty one per plan, gate mode and output dtypes; an empty one is
+    # fresh per call): the same set every call
+    key = id(hosts) if hosts else None
+    hit = kept[3].get(key)
+    if hit is not None and hit[0] is (hosts if hosts else None):
+        return hit[1]
     carriers = {out for outs in hosts.values() for out in outs}
-    return frozenset(
+    late = frozenset(
         name for name in _L2N_LATE_GRADS if name not in bound and name not in carriers
     )
+    if len(kept[3]) >= L2N_MOVED_MAX:
+        kept[3].clear()
+    kept[3][key] = (hosts if hosts else None, late)
+    return late
 
 
 # The in-kernel Q / K L2 norm's backward keeps its token-layout normalized rows in the local arena where it can (issue
@@ -7557,9 +7579,11 @@ def _qk_l2norm_begin(
         return _alloc((2, T, H), dt["qk_rstd"], call.device) if keep else None
     if rstd is not None:  # a saved-mode backward
         rw = (1, 0)
-        if rstd.is_cuda and not torch.cuda.is_current_stream_capturing():
-            # the design note's switch-only record: the caching allocator ignores a record on the allocating stream
-            rstd.record_stream(torch.cuda.current_stream(rstd.device))
+        if rstd.is_cuda:
+            # the design note's switch-only record (the caching allocator ignores a record on the allocating stream),
+            # made by _l2n_record (from _late_grads) right after the first local launch: host work off the pre-launch path (the set
+            # holds the rstd past the call, so the record still precedes its release)
+            call.scratch["l2n_record"] = rstd
     elif call.backward or keep or call.l2n_mode == "fallback":
         rw = (0, 1)
         rstd = _alloc((2, T, H), dt["qk_rstd"], call.device)
@@ -7612,21 +7636,44 @@ def _l2n_bwd_rows(
     rows: dict[str, torch.Tensor] = {}
     if hosts:
         views = call.scratch["views"]
-        # the arena's views are cached per layout: never rebind them
-        moved = types.SimpleNamespace(**vars(views))
+        # the arena's views are cached per layout: never rebind them.  Their copy with the moved buffers is kept per
+        # view on the call's arena (L2N_MOVED_ATTR, built once), its moved buffers set here and put back to the
+        # arena's by _l2n_restore_views at the call's end, with the first T_r rows of each moved buffer per T_r
+        local = call.local
+        cache = local.__dict__.get(L2N_MOVED_ATTR)
+        if cache is None:
+            cache = {}
+            setattr(local, L2N_MOVED_ATTR, cache)
+        hit = cache.get(id(views))
+        if hit is None or hit[0] is not views:
+            if len(cache) >= L2N_MOVED_MAX:
+                cache.clear()
+            hit = (views, types.SimpleNamespace(**vars(views)), {})
+            cache[id(views)] = hit
+        moved, heads = hit[1], hit[2]
         for buf, out in _L2N_ROW_HOSTS:
             host = hosts.get(buf)
             if host is None:
                 continue
             arena = getattr(views, buf)
-            rows[out] = arena[:T]
+            head = heads.get((buf, T))
+            if head is None:
+                if len(heads) >= L2N_MOVED_MAX:
+                    heads.clear()
+                head = heads[(buf, T)] = (
+                    arena[:T],
+                    tuple(arena.shape),
+                    _contiguous_strides(arena.shape),
+                )
+            rows[out] = head[0]
             # the buffer's contiguous shape on the host's leading bytes (the host is a fresh contiguous output)
             if host.dtype != arena.dtype:
                 host = host.view(arena.dtype)
-            there = host.as_strided(arena.shape, _contiguous_strides(arena.shape))
+            there = host.as_strided(head[1], head[2])
             setattr(moved, buf, there)
             call.local_values[buf] = there
         call.scratch["views"] = moved
+        call.scratch["l2n_moved"] = hit
     if not rows:
         qk = _alloc((2, T, H, D), dt["q"], call.device)
         return qk[0], qk[1]
@@ -7634,6 +7681,23 @@ def _l2n_bwd_rows(
         if out not in rows:
             rows[out] = _alloc((T, H, D), dt["q" if out == "qn" else "k"], call.device)
     return rows["qn"], rows["kn"]
+
+
+def _l2n_record(call: CakeKDADetKcpCall) -> None:
+    """The saved rstd's stream record :func:`_qk_l2norm_begin` deferred past the backward's first launch (once)."""
+    rstd = call.scratch.pop("l2n_record", None)
+    if rstd is not None and not torch.cuda.is_current_stream_capturing():
+        rstd.record_stream(torch.cuda.current_stream(rstd.device))
+
+
+def _l2n_restore_views(call: CakeKDADetKcpCall) -> None:
+    """The end of a flag-on backward that moved arena buffers (:func:`_l2n_bwd_rows`): the kept moved-views copy gets
+    the arena's buffers back, so it holds no output of the call."""
+    hit = call.scratch.pop("l2n_moved", None)
+    if hit is not None:
+        views, moved = hit[0], hit[1]
+        for buf, _ in _L2N_ROW_HOSTS:
+            setattr(moved, buf, getattr(views, buf))
 
 
 @functools.lru_cache(maxsize=64)
