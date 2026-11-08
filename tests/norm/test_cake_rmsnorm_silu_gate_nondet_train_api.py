@@ -1786,6 +1786,7 @@ def test_forward_around_its_bands_within_the_deterministic_error(
 GATE_TAIL = (-87.5, -88.0, -88.5)
 
 
+@requires_device
 @pytest.mark.parametrize("band", range(8))
 @pytest.mark.parametrize("kind", ["flat", "strided"])
 def test_forward_keeps_the_gate_tail_in_every_band(
