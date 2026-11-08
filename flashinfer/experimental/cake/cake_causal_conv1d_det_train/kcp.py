@@ -108,8 +108,9 @@ tail row again: it recomputes their ``dpre`` from ``x``, the history rows and ``
 instructions and folds the received rows with the main program's FMAs in its order, before the one BF16 rounding.  So
 ``dx`` is bitwise the waiting launch's, and ``dweight`` keeps its bits: the received rows enter ``dx`` only, and the
 partial rows and their reduction are the same.  The exchange, its wait and the collectives are unchanged; the call
-launches one more program when the rank receives tail rows.  The multi entry overlaps its first tensor this way and
-launches the other tensors' programs after the wait, so it too adds one program, not one per tensor.
+launches one more program when the rank receives tail rows.  On sm_103a and sm_107a the multi entry overlaps its
+first tensor this way and launches the other tensors' programs after the wait, so it too adds one program, not one
+per tensor; on sm_100a it waits first (``MULTI_BWD_OVERLAP_ARCHS``).
 ``cooperative=True`` waits before its launch as before
 (a cooperative grid waits for the communication kernel anyway).  The private test knob ``bwd_overlap`` (``1``
 shipped, ``0`` = wait before the main program) selects the previous order for the A/B record.
@@ -137,10 +138,10 @@ Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d
 the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per direction
 instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied out into
 each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with the
-single call's arguments.  In the overlapped backward only the first tensor takes the overlapped form (its main
-programs before the wait, its tail-row program after it); the other tensors run the waiting form's main programs
-after the wait, whose ``dx`` and ``dweight`` are bitwise the overlapped form's.  So outputs and gradients
-(``dweight`` included) are bitwise one single call per tensor.
+single call's arguments.  In the overlapped backward (sm_103a and sm_107a, ``MULTI_BWD_OVERLAP_ARCHS``) only the
+first tensor takes the overlapped form (its main programs before the wait, its tail-row program after it); the other
+tensors run the waiting form's main programs after the wait, whose ``dx`` and ``dweight`` are bitwise the overlapped
+form's.  So outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
 uses the trimmed host path's per-context cache (the ``host_trim`` test knob selects the single call's path only).
 """
@@ -596,6 +597,11 @@ HOST_TRIM_DEFAULT = (
 # exchange's wait and the tail-row program after it; 0 = the wait before the main program, via _set_test_knobs only.
 BWD_OVERLAPS = (0, 1)
 BWD_OVERLAP_DEFAULT = 1
+# The architectures whose multi entry takes the overlapped backward (its first tensor's main programs before the
+# exchange's wait).  On sm_100a the overlapped multi backward measured no robust gain over the waiting one (B200,
+# 3 x C = 8192 at CP4 and CP8: -0.9% to +0.8% per shape; CP4 zigzag 0.5% slower with only the knob changed), so its
+# multi entry waits first.  The single call overlaps on every architecture.
+MULTI_BWD_OVERLAP_ARCHS = frozenset(("sm_103a", "sm_107a"))
 _TEST_KNOBS: dict[str, Any] = {
     "graph": "off",
     "host_trim": HOST_TRIM_DEFAULT,
@@ -2088,7 +2094,10 @@ def _kcp_backward_multi(
         for dw in dw_out:
             dw.zero_()
         return dx_out, dw_out
-    overlap = _overlapped(cooperative, work)
+    overlap = (
+        _overlapped(cooperative, work)
+        and _device_arch(device) in MULTI_BWD_OVERLAP_ARCHS
+    )
     if overlap:
         # the first tensor's main programs while the exchange is in flight (its head pool: a valid, unread
         # dpre_tail); the others wait, so that the call adds one tail-row program, not one per tensor

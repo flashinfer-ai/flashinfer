@@ -22,9 +22,10 @@ single-GPU suites, on both host paths:
 
 - the order of the launches and the wait: head program (when the rank has head rows), split program, reduce program,
   wait, tail-row program (when the rank receives tail rows); with the ``bwd_overlap`` knob ``0`` the wait comes first
-  and no tail-row program runs; ``cooperative=True`` waits first as before; the multi entry: every tensor's head
-  program, the first tensor's split and reduce programs, wait, its tail-row program, then the other tensors' split
-  and reduce programs;
+  and no tail-row program runs; ``cooperative=True`` waits first as before; the multi entry, with the device's
+  architecture in ``MULTI_BWD_OVERLAP_ARCHS`` (shipped: sm_103a and sm_107a): every tensor's head program, the first
+  tensor's split and reduce programs, wait, its tail-row program, then the other tensors' split and reduce programs;
+  without it, the waiting order (both are run on every architecture);
 - ``dx`` and ``dweight`` of each of ``REPEATS`` overlapped calls are bitwise those of the waiting split launch, and
   ``dx`` is bitwise the cooperative launch's;
 - the trimmed host path's shared all ``-1`` ``tail_row_off`` rows outlive the host cache, and a new buffer of them is
@@ -184,12 +185,21 @@ def test_overlapped_backward_order_and_bits(
         conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
 
 
+def test_multi_overlap_architectures() -> None:
+    assert set(conv_kcp.MULTI_BWD_OVERLAP_ARCHS) == {"sm_103a", "sm_107a"}
+
+
+@pytest.mark.parametrize("overlap", [True, False])
 @pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])
 def test_overlapped_multi_backward_order_and_bits(
-    monkeypatch, name, lens, cuts, Cs
+    monkeypatch, name, lens, cuts, Cs, overlap
 ) -> None:
-    """The multi entry has one host path (the trimmed one; the ``host_trim`` knob selects the single call's path)."""
+    """The multi entry has one host path (the trimmed one; the ``host_trim`` knob selects the single call's path).
+    ``overlap`` puts the device's architecture into ``MULTI_BWD_OVERLAP_ARCHS`` or takes it out."""
     device = torch.device("cuda")
+    arch = conv_kcp._device_arch(device)
+    archs = conv_kcp.MULTI_BWD_OVERLAP_ARCHS
+    archs = archs | {arch} if overlap else archs - {arch}
     ctx, xs, ws, dys = _multi_problem(lens, cuts, Cs, device)
     _, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
     ref_dx, ref_dw = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
@@ -198,15 +208,16 @@ def test_overlapped_multi_backward_order_and_bits(
     torch.cuda.synchronize()
     two = _TwoRanks(ctx)
     try:
+        monkeypatch.setattr(conv_kcp, "MULTI_BWD_OVERLAP_ARCHS", frozenset(archs))
         order = _recorder(monkeypatch)
-        want = _want(ctx, overlap=True, cooperative=False, n=len(Cs))
+        want = _want(ctx, overlap=overlap, cooperative=False, n=len(Cs))
         for repeat in range(REPEATS):
             order.clear()
             dxs, dws = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_backward(
                 xs, ws, two, dys, hists
             )
             torch.cuda.synchronize()
-            label = f"{name} #{repeat}"
+            label = f"{name} overlap={overlap} #{repeat}"
             assert order == want, (label, order)
             for i in range(len(Cs)):
                 assert torch.equal(_bits(dxs[i]), _bits(ref_dx[i])), (label, i)

@@ -142,9 +142,11 @@ fragment with a tail row again, recomputing their `dpre` with the main
 program's instructions and folding the received rows with its FMAs in its
 order.  `dx` and `dweight` keep the bits of the waiting launch; the exchange
 and its wait are unchanged, and one more program runs when the rank receives
-tail rows.  The multi entry overlaps only its first tensor this way and runs
-the other tensors' programs after the wait, so it also adds one program per
-call.  `cooperative=True` waits before its launch.
+tail rows.  On sm_103a and sm_107a the multi entry overlaps only its first
+tensor this way and runs the other tensors' programs after the wait, so it
+also adds one program per call; on sm_100a, where this measured no gain, the
+multi entry waits first (`MULTI_BWD_OVERLAP_ARCHS`).  `cooperative=True` waits
+before its launch.
 
 ### Halo exchange
 
@@ -164,10 +166,10 @@ One `all_to_all_single` per direction and call:
 The multi entry exchanges the rows of its `n` tensors side by side in one
 collective per direction and copies each tensor's rows into its own pool after
 the wait; each tensor then runs the single call's programs (in the overlapped
-backward only the first tensor takes the overlapped form; the others run the
-waiting form, whose `dx` and `dweight` are bitwise the same), so its outputs and
-gradients are bitwise those of one single call per tensor with the same
-`cooperative`.  With one rank no collective is issued.
+backward of sm_103a and sm_107a only the first tensor takes the overlapped
+form; the others run the waiting form, whose `dx` and `dweight` are bitwise the
+same), so its outputs and gradients are bitwise those of one single call per
+tensor with the same `cooperative`.  With one rank no collective is issued.
 
 ### Recompute handle
 
