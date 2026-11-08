@@ -2126,15 +2126,39 @@ _SM107A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
 }
 
 
+# SM100a / SM103a masked_m setup twins (148 / 152 SMs), the same form: an N=512
+# K=128 key with at least ``b_min`` groups whose route picks the BLOCK_N 192
+# masked stage runs its twin (measured faster on B200 and GB300).
+_SM100A_SM103A_MMSETUP_NK = (512, 128)
+_SM100A_SM103A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
+    # BLOCK_N 192, four stages, K tile 128.
+    "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9": (
+        "cake_batch_deepgemm_fp8_f11e92be540f2e9e1ca1",
+        64,
+        None,
+    ),
+}
+
+# Per architecture: the (N, K) of its masked_m setup twins and their table.
+_MMSETUP_TABLES: dict[
+    str, tuple[tuple[int, int], dict[str, tuple[str, int, int | None]]]
+] = {
+    "sm_100a": (_SM100A_SM103A_MMSETUP_NK, _SM100A_SM103A_MMSETUP_TWINS),
+    "sm_103a": (_SM100A_SM103A_MMSETUP_NK, _SM100A_SM103A_MMSETUP_TWINS),
+    "sm_107a": (_SM107A_MMSETUP_NK, _SM107A_MMSETUP_TWINS),
+}
+
+
 def _mmsetup_twin(
     arch: str, B: int, N: int, K: int, stages: tuple[tuple[Any, ...], ...]
 ) -> tuple[tuple[Any, ...], ...] | None:
     """``stages`` with the masked_m setup twin in place of its parent
-    (``_SM107A_MMSETUP_TWINS``), or ``None`` when the key keeps the parent."""
-    if arch != "sm_107a" or (N, K) != _SM107A_MMSETUP_NK or len(stages) != 1:
+    (``_MMSETUP_TABLES``), or ``None`` when the key keeps the parent."""
+    table = _MMSETUP_TABLES.get(arch)
+    if table is None or table[0] != (N, K) or len(stages) != 1:
         return None
     stage = stages[0]
-    twin = _SM107A_MMSETUP_TWINS.get(stage[0]) if stage[1] == "masked_bn" else None
+    twin = table[1].get(stage[0]) if stage[1] == "masked_bn" else None
     if twin is None:
         return None
     program, b_min, b_max = twin
@@ -2706,8 +2730,8 @@ def select(
     """The first table row of ``arch`` that matches, as a :class:`RoutePlan`; ``None`` = named gap.
 
     ``sm_count`` is the SM count the table was exported for (the ``DISPATCH_TABLES``
-    key); it only enters the launch grids.  An SM107a masked_m setup twin
-    (``_SM107A_MMSETUP_TWINS``) takes its parent's stage on its keys.
+    key); it only enters the launch grids.  A masked_m setup twin
+    (``_MMSETUP_TABLES``) takes its parent's stage on its keys.
     """
     for row in _TABLE[arch]:
         if _matches(row, arch, B, M, N, K, expected_m):
