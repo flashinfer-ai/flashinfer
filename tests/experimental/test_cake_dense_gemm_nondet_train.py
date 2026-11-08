@@ -9014,9 +9014,15 @@ BENCH_PATH = (
 
 @functools.cache
 def _bench() -> ModuleType:
-    """The benchmark script as a module (its functions only: nothing runs on import)."""
+    """The benchmark script as a module (its functions only: nothing runs on import).  A vendored run
+    (``scripts/check_cake_build_manifests.py --vendored-gate``, which blocks flashinfer with
+    ``sys.modules["flashinfer"] = None``) skips: the script imports flashinfer."""
     import importlib.util
 
+    if sys.modules.get("flashinfer", False) is None:
+        pytest.skip(
+            "the benchmark script imports flashinfer, which the vendored gate blocks"
+        )
     spec = importlib.util.spec_from_file_location(
         "bench_cake_dense_gemm_nondet_train", BENCH_PATH
     )
