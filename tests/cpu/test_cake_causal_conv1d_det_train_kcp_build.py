@@ -328,7 +328,8 @@ def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
 def test_forward_launches_one_sm_short(monkeypatch) -> None:
     """The forward record carries no ``reserve_sms`` (the non-deterministic package runs the same record); the host
     launches it ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs wide (:func:`kcp._launch_grid`), one SM short of the
-    co-resident count, and the head program's grid is not touched."""
+    co-resident count, while that grid holds every channel tile of ``C``, else the full co-resident grid
+    (:func:`kcp._forward_grid`), and the head program's grid is not touched."""
 
     kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
     assert kcp.FWD_RESERVE_SMS == 1
@@ -345,5 +346,20 @@ def test_forward_launches_one_sm_short(monkeypatch) -> None:
             1,
             1,
         )
+        # kcp._forward_grid: the shorter grid while it holds every channel tile, the full one when a tile needs the
+        # reserved SM (C launched with the full grid before the reservation), a ValueError past the full grid
+        short = (ctas_per_sm * (148 - kcp.FWD_RESERVE_SMS), 1, 1)
+        for n_ch_tiles, grid in (
+            (1, short),
+            (short[0], short),
+            (short[0] + 1, full),
+            (full[0], full),
+        ):
+            assert (
+                kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=n_ch_tiles)
+                == grid
+            ), (name, n_ch_tiles)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=full[0] + 1)
         seen.add(name)
     assert seen, "no kcp_fwd program in the table"

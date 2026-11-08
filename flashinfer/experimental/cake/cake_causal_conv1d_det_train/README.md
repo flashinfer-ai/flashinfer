@@ -119,8 +119,11 @@ argument; the backend reads no environment variable.
 The keyword selects the launch form of the backward's main program; the
 forward and the backward's head program are the same in both forms.  The
 forward is also an ordinary launch one SM short of the co-resident CTA count
-(`kcp.FWD_RESERVE_SMS`), so it starts at once beside a small kernel resident
-on another stream; `y` does not depend on its grid.
+(`kcp.FWD_RESERVE_SMS`) whenever that grid holds every channel tile of `C`
+(else it takes the full grid).  Beside one small kernel of another stream that
+occupies a single SM, all its CTAs can then start at once; a kernel on more
+SMs still makes some of them wait for a later wave.  `y` does not depend on
+its grid.
 
 | `cooperative` | program | behavior |
 |---|---|---|

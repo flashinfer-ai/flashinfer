@@ -452,6 +452,81 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     assert torch.isfinite(dw).all() and dx.shape == p.x_local.shape
 
 
+@pytest.mark.parametrize("host_trim", [0, 1])
+def test_forward_grid_is_one_sm_short_unless_a_channel_tile_needs_the_sm(
+    monkeypatch, host_trim
+) -> None:
+    """On both host paths the forward launches ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs when that grid holds
+    every channel tile of ``C``, else the record's full co-resident grid (``kcp._forward_grid``): with the device's
+    full grid made exactly ``C``'s channel tile count (``_record_launch_grid`` patched), the forward launches that full
+    grid instead of refusing ``C``, and ``y`` stays bitwise the unpartitioned forward's in both cases."""
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
+
+    device = torch.device("cuda")
+    (name,) = conv_kcp.route_modules(conv_kcp._device_arch(device), conv_kcp.KCP_FWD)
+    record = conv_kcp._loader.MODULES[name]
+    ctas_per_sm = int(record["grid_rule"]["ctas_per_sm"])
+    geometry = record["grid_rule"]["geometry"]
+    reserved = conv_kcp.FWD_RESERVE_SMS * ctas_per_sm
+
+    def tiles(C: int) -> int:
+        return conv_kcp.plan(1, C, 1, geometry=geometry, legacy=True)["n_ch_tiles"]
+
+    # the smallest C (a multiple of 1024) with more channel tiles than the reserved CTAs, so that a full grid of
+    # exactly its tile count can still reserve them
+    C = 1024
+    while tiles(C) <= reserved:
+        C += 1024
+    n_ch_tiles = tiles(C)
+    grids = []
+    run, launch_plan = conv_kcp.run_module, conv_kcp._launch_plan
+
+    def recording_run(module, values, **kwargs):
+        if module == name:
+            grids.append(tuple(kwargs["grid"]))
+        return run(module, values, **kwargs)
+
+    def recording_launch_plan(module, grid, device_index):
+        if module == name:
+            grids.append(tuple(grid))
+        return launch_plan(module, grid, device_index)
+
+    monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    monkeypatch.setattr(conv_kcp, "_launch_plan", recording_launch_plan)
+    device_full = conv_kcp._record_launch_grid(
+        record, device_index=conv_kcp._device_index(device)
+    )
+    conv_kcp._set_test_knobs({"host_trim": host_trim})
+    try:
+        for full, launched in (
+            (device_full, (device_full[0] - reserved,) + tuple(device_full[1:])),
+            ((n_ch_tiles, 1, 1), (n_ch_tiles, 1, 1)),
+        ):
+            assert full[0] - reserved < n_ch_tiles or full is device_full
+            monkeypatch.setattr(
+                conv_kcp, "_record_launch_grid", lambda record, _full=full, **_kw: _full
+            )
+            grids.clear()
+            p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+            y, _hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+            assert grids == [launched], (host_trim, full, grids)
+            y_full = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
+            assert torch.equal(y, y_full[p.l2g]), (host_trim, full)
+        monkeypatch.setattr(
+            conv_kcp,
+            "_record_launch_grid",
+            lambda record, **_kw: (n_ch_tiles - 1, 1, 1),
+        )
+        p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    finally:
+        conv_kcp._set_test_knobs(None)
+
+
 @pytest.mark.parametrize("form", ["knob", "keyword"])
 def test_graph_replay_knob_is_bitwise(form) -> None:
     """The graph-replay option: under ``_set_test_knobs({"graph": "replay"})`` (form ``knob``) or the public keyword
