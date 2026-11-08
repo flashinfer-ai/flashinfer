@@ -43,6 +43,7 @@ cake_launch = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_lau
 nondet_backend = cake_package(
     "cake.cake_dsa_sparse_attention_nondet_train", "cake_backend"
 )
+nondet_jit = cake_package("cake.cake_dsa_sparse_attention_nondet_train", "cake_jit")
 
 NUM_HEADS = cake_backend.NUM_HEADS
 D_LATENT = cake_backend.D_LATENT
@@ -124,6 +125,94 @@ def test_backward_stage_order_is_fixed():
         backward = [s for s in registered if s in cake_jit.BACKWARD_STAGES_OF[program]]
         # either no backward stage yet, or all of them, in the declared order
         assert backward in ([], list(cake_jit.BACKWARD_STAGES_OF[program])), backward
+    # the RoPE program's key-range-pass stages (in place of bwd_main on a multi-pass backward), after the others
+    assert cake_jit.KEY_PASS_STAGES == ("bwd_compact", "bwd_main_pass")
+    rope = cake_jit.registered_stages(cake_jit.PROGRAM)
+    extra = [s for s in rope if s not in cake_jit.STAGES]
+    assert extra in ([], list(cake_jit.KEY_PASS_STAGES)), extra
+    assert not set(cake_jit.KEY_PASS_STAGES) & set(
+        cake_jit.registered_stages(cake_jit.NOPE_PROGRAM)
+    )
+
+
+# The rows of the A/B whose key row exceeds the L2 formula's one pass, and their pass counts under the
+# non-deterministic package's rules (one-chunk rows: T <= 4224 at top-k 2048).
+KEY_PASS_ROWS = {
+    (2123, 67923): {"sm_100a": 2, "sm_103a": 2, "sm_107a": 1},
+    (4096, 268757): {"sm_100a": 1, "sm_103a": 1, "sm_107a": 2},
+}
+
+
+def test_key_pass_policy_is_the_nondet_policy():
+    """The record's ``key_pass_policy`` is the non-deterministic package's, and the pass count of every row whose
+    pass scratch fits one token chunk is that package's; a longer row takes one pass (every pass runs all tokens
+    in one launch here)."""
+    record = cake_jit.record(cake_jit.PROGRAM)
+    det = cake_backend.KeyPassPolicy.from_record(record)
+    nondet_record = nondet_jit.record(nondet_jit.PROGRAM)
+    nd = nondet_backend.KeyPassPolicy.from_record(nondet_record)
+    assert det is not None and nd is not None
+    for name in cake_backend.KEY_PASS_POLICY_FIELDS:
+        assert getattr(det, name) == getattr(nd, name), name
+    assert det.rules == nd.rules
+    assert cake_backend.KEY_PASS_RULE_FIELDS == nondet_backend.KEY_PASS_RULE_FIELDS
+    assert cake_backend.DQ_PARTIAL_BYTES_PER_TOKEN == nd.dq_partial_bytes_per_token
+    stages = cake_jit.STAGES + cake_jit.KEY_PASS_STAGES
+    nd_stages = nondet_jit.registered_stages(nondet_jit.PROGRAM)
+    chunk = det.token_chunk(2048)
+    assert chunk == nd.token_chunk(2048) == 4224
+    shapes = [(T, S) for T in (1, 512, 2123, 4096, chunk, chunk + 1, 16384) for S in
+              (4096, 45511, 45512, 67923, 131071, 131072, 182044, 182045, 268757)]  # fmt: skip
+    for arch in ("sm_100a", "sm_103a", "sm_107a", None):
+        for T, S in shapes:
+            got = cake_backend.plan_key_passes(record, stages, T, S, 2048, arch=arch)
+            want = nondet_backend.plan_key_passes(
+                nondet_record, nd_stages, T, S, 2048, arch=arch
+            )
+            assert got == (want if T <= chunk else 1), (arch, T, S, got, want)
+            assert cake_backend.plan_key_passes(
+                record, stages, T, S, 2048, arch=arch, num_segments=2
+            ) == 1
+            # without the pass stages: one pass; key_passes overrides the policy
+            assert cake_backend.plan_key_passes(
+                record, cake_jit.STAGES, T, S, 2048, arch=arch
+            ) == 1
+            assert cake_backend.plan_key_passes(
+                record, stages, T, S, 2048, 3, arch=arch
+            ) == 3
+    for (T, S), passes in KEY_PASS_ROWS.items():
+        for arch, want in passes.items():
+            assert cake_backend.plan_key_passes(record, stages, T, S, 2048, arch=arch) == want
+    with pytest.raises(NotImplementedError):
+        cake_backend.plan_key_passes(record, cake_jit.STAGES, 64, 4096, 2048, 2)
+    with pytest.raises(ValueError):
+        cake_backend.plan_key_passes(record, stages, 64, 4096, 2048, num_segments=0)
+
+
+@pytest.mark.parametrize("S, passes", [(4096, 2), (4097, 3), (268757, 2), (5, 5)])
+def test_key_pass_ranges_and_dq_modes(S, passes):
+    ranges = cake_backend.key_pass_ranges(S, passes)
+    assert ranges == nondet_backend.key_pass_ranges(S, passes)
+    assert ranges[0][0] == 0 and ranges[-1][1] == S
+    assert all(a[1] == b[0] for a, b in zip(ranges, ranges[1:]))
+    modes = [cake_backend.key_pass_dq_mode(i, passes) for i in range(passes)]
+    assert modes == [1] + [2] * (passes - 2) + [3]
+    assert cake_backend.key_pass_dq_mode(0, 1) == 0
+
+
+def test_workspace_layout_of_key_passes():
+    """A multi-pass backward adds its pass scratch (FP32 dQ partial, compacted keys, pass counts of every token)."""
+    T, S, topk = 2123, 67923, 2048
+    one = cake_backend.workspace_layout(T, S, topk)
+    two = cake_backend.workspace_layout(T, S, topk, key_passes=2)
+    assert "dq_partial" not in one
+    assert two["dq_partial"][1] == T * NUM_HEADS * D_QK * 4
+    assert two["key_scratch"][1] == T * topk * 4
+    assert two["pass_counts"][1] == T * 4
+    extra = sum(_align(two[n][1]) for n in ("dq_partial", "key_scratch", "pass_counts"))
+    assert two["total"] - one["total"] == extra
+    per_call = cake_backend.workspace_layout(T, S, topk, key_passes=2, per_call=True)
+    assert per_call["dq_partial"][1] == two["dq_partial"][1]
 
 
 @pytest.mark.parametrize(
@@ -247,7 +336,7 @@ def test_scratch_layouts_in_dead_output_storage():
     assert not cake_backend.carve_fits(T, 8350, 8350)
 
 
-def test_parity_keywords_are_validated_and_inert():
+def test_parity_keywords_are_validated():
     for bad in (0, -1, 1.5, True):
         with pytest.raises(ValueError):
             cake_backend._check_key_passes(bad, 8)
@@ -1225,6 +1314,80 @@ def test_redo_persistent_grid_gives_the_bits_of_a_cta_per_token(monkeypatch, nop
     assert tuple(per_token.launches[stage].grid) == (T, 1, 1)
     for a, b in zip(got, want, strict=True):
         assert _same_bits(a, b)
+
+
+def _require_key_passes():
+    _require_program(backward=True)
+    stages = cake_jit.registered_stages(cake_jit.PROGRAM)
+    if not all(s in stages for s in cake_jit.KEY_PASS_STAGES):
+        pytest.skip("the registered program has no key-range-pass stages")
+
+
+@pytest.mark.parametrize("dkv", ["bf16", "acc"])
+@pytest.mark.parametrize("redo", [False, True], ids=["no_redo", "redo"])
+def test_key_passes_give_the_bits_of_one_launch(monkeypatch, dkv, redo):
+    """A backward of P key-range passes (``bwd_compact`` + ``bwd_main_pass`` per pass, in place of ``bwd_main``)
+    gives the dK/dV, overflow-counter and global-word bits of one main launch -- with most rows recomputed by the
+    redo too (``GRID_SHIFT = 24``) -- and the dQ bits of the non-deterministic package's backward of the same
+    passes; the eager backward with the same ``key_passes`` gives the runner's bits."""
+    _require_key_passes()
+    inp = make_inputs([384], [4096], seed=SEED + 33, topk=512)
+    args, tl, S = _rope_args(inp), inp.topk_length, inp.total_k
+    if redo:
+        monkeypatch.setattr(cake_backend, "GRID_SHIFT", 24)
+        monkeypatch.setattr(cake_backend, "MIN_BUMP", 25)
+
+    def run(passes):
+        acc = torch.zeros(S, D_QK, device="cuda") if dkv == "acc" else None
+        runner = cake_backend.prepare_dsa_train(
+            *args, topk_length=tl, dout=inp.dout, dkv_acc=acc, key_passes=passes
+        )
+        assert runner.key_passes == passes
+        main = [k for k in runner.backward_order if "main" in (k[0] if isinstance(k, tuple) else k)]
+        if passes == 1:
+            assert main == ["bwd_main"]
+        else:
+            assert main == [("bwd_main_pass", i) for i in range(passes)]
+            assert "dq_partial" in runner.layout
+        runner.forward()
+        grads = [g.clone() for g in runner.backward() if g is not None]
+        if acc is not None:
+            grads.append(acc.clone())
+        t = runner.tensors
+        words = _globals(runner)
+        state = [t["cnt64"].clone(), t["row_pairs"].clone()]
+        return grads, state, words
+
+    one, one_state, one_words = run(1)
+    if redo:
+        assert one_words[cake_backend.REDO_WORD] > S // 4
+    n = nondet_backend.forward(*args, topk_length=tl)
+    for passes in (2, 3):
+        grads, state, words = run(passes)
+        # dK/dV (or the accumulated rows), the counters and the global words: the bits of one launch
+        for a, b in zip(grads[2:], one[2:], strict=True):
+            assert _same_bits(a, b)
+        for a, b in zip(state, one_state, strict=True):
+            assert torch.equal(a, b)
+        assert words[cake_backend.REDO_WORD] == one_words[cake_backend.REDO_WORD]
+        assert words[cake_backend.NONFINITE_WORD] == one_words[cake_backend.NONFINITE_WORD] == 0
+        # dQ: the non-deterministic package's dQ of the same passes
+        nd = nondet_backend.backward(
+            *args, n[0], n[2], n[1], inp.dout, topk_length=tl, key_passes=passes
+        )
+        assert _same_bits(grads[0], nd[0])
+        assert _same_bits(grads[1], nd[1])
+        print(
+            "KEY_PASSES", dkv, "redo" if redo else "no_redo", passes,
+            "dq rel-L2 vs one launch", rel_l2(grads[0], one[0]),
+        )  # fmt: skip
+        if dkv == "bf16":
+            out, lse, o_lo = cake_backend.forward(*args, topk_length=tl)
+            eager = cake_backend.backward(
+                *args, out, o_lo, lse, inp.dout, topk_length=tl, key_passes=passes
+            )
+            for a, b in zip(eager, grads, strict=True):
+                assert _same_bits(a, b)
 
 
 def _inside(x: torch.Tensor, y: torch.Tensor) -> bool:

@@ -36,9 +36,9 @@ entry falls back to another package.
 | `cake_dsa_sparse_attention_det_nope_varlen` | `CakeDSASparseAttentionDetNopeVarlenFunction` |
 
 The entries take the arguments of the non-deterministic entries.
-`key_passes` and `dkv_direct` are accepted and validated as there and have no
-effect: the backward's main stage always runs once over all keys, and the
-accumulation into `dkv_acc` has one form.  The facade reads
+`key_passes` and `num_segments` select the key-range passes of the rope
+backward (see below); `dkv_direct` is accepted and validated as there and has
+no effect: the accumulation into `dkv_acc` has one form.  The facade reads
 `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` and
 `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` (as the non-deterministic
 facade does, for this package's own cache); the backend reads no environment
@@ -102,6 +102,19 @@ program prefixes the names with `nope_`); no stage is chosen by a tensor value:
 Repeated destination rows of `dkv_dst_map` add into the same integers, so they
 combine exactly before the one FP32 addition.
 
+Key-range passes (rope program).  When the key row is much larger than the
+L2, the backward splits every token's keys into `P` equal key ranges and runs,
+per range and in place of `bwd_main`, the non-deterministic package's
+compaction of the token's keys in the range (`bwd_compact`) and the pass build
+of the main kernel over the compacted keys (`bwd_main_pass`).  dQ goes through
+an FP32 partial (147,456 B per token) between passes.  The integer sums and
+the overflow counters do not depend on the split, so dK/dV keep the bits of one
+launch; dQ is the non-deterministic package's dQ of the same passes.  `P`
+follows that package's policy (`cake_backend.plan_key_passes`); a row of more
+than one token chunk (4224 tokens at top-k 2048) takes one pass here, because
+every pass runs all tokens in one launch.  `key_passes` overrides `P`.  The
+redo stays one launch, and the NoPE program always runs one pass.
+
 Non-finite values: a pair whose contribution is NaN or infinite has no integer
 image, so the counters flag its destination row, the redo flags it again, and
 the fold writes every element of that row as NaN (fresh outputs and `dkv_acc`
@@ -163,10 +176,12 @@ NoPE runner needs 48 B per destination row and the global words (one 256-byte
 part) more: its fresh `dkv` is the integer accumulator through the fold, the
 main stage writes dQ before the redo, and the redo reads `delta`, so no output
 storage is dead while the counters, grid words, pair counts and redo lists
-are live.  The NoPE autograd entry that adds into `dkv_acc` carves the region
-from `o_lo` and allocates the global words (64 B) beside `delta` per call;
-the global words may not alias `o_lo` (`bwd_delta` zeroes them while it reads
-`o_lo`).
+are live.  A backward of `P > 1` key-range passes adds the same pass scratch
+as the non-deterministic package (the FP32 dQ partial, the compacted keys and
+the pass counts of every token).  The NoPE autograd entry that adds into
+`dkv_acc` carves the region from `o_lo` and allocates the global words (64 B)
+beside `delta` per call; the global words may not alias `o_lo` (`bwd_delta`
+zeroes them while it reads `o_lo`).
 
 * The autograd entries use the storage of their saved `o_lo` (64 KiB per query
   token) for the region when it fits: `bwd_delta` is the only stage that reads

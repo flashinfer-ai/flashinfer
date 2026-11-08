@@ -60,7 +60,9 @@ limitations under the License.
 #
 # Deterministic dK / dV.  The backward launches the registered stages of
 # ``cake_jit.BACKWARD_STAGES_OF[program]`` in that order, every one of them on
-# every call (no stage is chosen by a tensor value):
+# every call (no stage is chosen by a tensor value; a RoPE backward of P > 1
+# key-range passes runs ``bwd_compact`` + ``bwd_main_pass`` P times in place of
+# ``bwd_main``, see :func:`plan_key_passes`):
 #
 # * ``bwd_delta``: ``delta = rowsum(dout * (out + o_lo))`` ``[T, 64]`` FP32 (the
 #   non-deterministic package's bits) and the per-query bound terms ``qstat
@@ -199,9 +201,9 @@ O_LO_BYTES_PER_TOKEN = NUM_HEADS * D_LATENT * 2  # BF16 o_lo: 64 KiB per query t
 
 
 def _check_key_passes(key_passes: Optional[int], num_kv: int) -> None:
-    """``key_passes`` is accepted for parity with the non-deterministic package and validated as there (``None`` or a
-    positive integer no larger than ``num_kv``); it is a scheduling hint that this package does not need: every
-    backward runs its main stage once over all keys."""
+    """``key_passes`` is validated as in the non-deterministic package (``None`` or a positive integer no larger than
+    ``num_kv``).  The RoPE backward runs that many key-range passes (:func:`plan_key_passes`; the dK/dV bits do not
+    depend on it); the NoPE backward runs its main stage once over all keys."""
     if key_passes is None:
         return
     if isinstance(key_passes, bool) or int(key_passes) != key_passes:
@@ -212,6 +214,183 @@ def _check_key_passes(key_passes: Optional[int], num_kv: int) -> None:
         raise ValueError(
             f"key_passes ({int(key_passes)}) must not exceed the number of keys ({int(num_kv)})"
         )
+
+
+# Key-range passes of the RoPE backward.  A backward whose key row is far larger than the L2 can split every token's
+# keys into P ranges [pass_lo, pass_hi) (:func:`key_pass_ranges`) and run, per range and in place of ``bwd_main``, the
+# non-deterministic package's compaction of the token's keys inside the range (``bwd_compact``: ``key_scratch``
+# [T, topk] int32 and ``pass_counts`` [T]) and the pass build of the main stage (``bwd_main_pass``, which reads
+# ``indices = key_scratch`` and ``topk_length = pass_counts``).  Its dQ goes through the FP32 partial ``dq_partial``
+# [T, 64 * 576] between passes: ``dq_mode`` 1 stores it, 2 adds and stores, 3 adds and writes the BF16 dQ (0: one
+# launch, :func:`key_pass_dq_mode`).  dK/dV and the overflow counters are integer sums, so they keep the bits of one
+# launch; dQ is the non-deterministic package's dQ of the same passes.  The redo stays one launch over all keys.
+# The pass count is the non-deterministic package's policy (the record's ``key_pass_policy``, :class:`KeyPassPolicy`),
+# with one difference: every pass runs all T tokens in one launch (``token_base = 0``), so a row the policy would run
+# in several token chunks (T above :meth:`KeyPassPolicy.token_chunk`) takes one pass.  ``key_passes`` overrides it.
+DQ_PARTIAL_BYTES_PER_TOKEN = NUM_HEADS * D_QK * 4  # one FP32 dQ / dQ_rope partial row (147,456 B)
+KEY_PASS_POLICY_FIELDS = (
+    "l2_budget_bytes",
+    "key_bytes",
+    "workspace_budget_bytes",
+    "token_chunk_multiple",
+    "max_passes",
+)
+# The per-target rule fields of ``key_pass_policy["rules"][arch]`` (an architecture without a rule: the R1 rule).
+KEY_PASS_RULE_FIELDS = (
+    "tail_rows",
+    "fixed_passes",
+    "min_kv",
+    "tail_min_kv",
+    "tail_cap",
+)
+_R1_RULE: dict[str, int] = dict.fromkeys(KEY_PASS_RULE_FIELDS, 0)
+
+
+@dataclass(frozen=True)
+class KeyPassPolicy:
+    """The record's key-range-pass policy: the non-deterministic package's (see the comment above)."""
+
+    l2_budget_bytes: int  # FP32 accumulator bytes one pass may touch (100 MiB)
+    key_bytes: int  # FP32 accumulator bytes per key row (576 * 4 = 2304)
+    workspace_budget_bytes: int  # pass scratch one token chunk may need at most (640 MiB)
+    token_chunk_multiple: int  # the token chunk is a multiple of this and at least this (128)
+    max_passes: int  # the formula's count is taken only up to this many passes, else one pass (4)
+    # the per-target rules: ((arch, (tail_rows, fixed_passes, min_kv, tail_min_kv, tail_cap)), ...)
+    rules: tuple[tuple[str, tuple[int, ...]], ...] = ()
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> Optional["KeyPassPolicy"]:
+        raw = record.get("key_pass_policy")
+        if raw is None:
+            return None
+        missing = [name for name in KEY_PASS_POLICY_FIELDS if name not in raw]
+        if missing:
+            raise ValueError(f"registry record: key_pass_policy lacks {missing}")
+        values = {name: int(raw[name]) for name in KEY_PASS_POLICY_FIELDS}
+        if any(v <= 0 for v in values.values()):
+            raise ValueError(
+                f"registry record: key_pass_policy needs positive values, got {raw}"
+            )
+        rules = []
+        for arch, rule in (raw.get("rules") or {}).items():
+            if not isinstance(rule, dict) or set(rule) != set(KEY_PASS_RULE_FIELDS):
+                raise ValueError(
+                    f"registry record: key_pass_policy.rules[{arch!r}] must map exactly "
+                    f"{KEY_PASS_RULE_FIELDS}, got {rule!r}"
+                )
+            for name in KEY_PASS_RULE_FIELDS:
+                value = rule[name]
+                if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                    raise ValueError(
+                        f"registry record: key_pass_policy.rules[{arch!r}].{name} must be "
+                        f"a non-negative integer, got {value!r}"
+                    )
+            rules.append(
+                (str(arch), tuple(int(rule[name]) for name in KEY_PASS_RULE_FIELDS))
+            )
+        return cls(**values, rules=tuple(rules))
+
+    def rule_for(self, arch: Optional[str]) -> dict[str, int]:
+        """The rule of ``arch`` (an architecture without one, or ``None``: the R1 rule)."""
+        for name, fields in self.rules:
+            if name == arch:
+                return dict(zip(KEY_PASS_RULE_FIELDS, fields, strict=True))
+        return dict(_R1_RULE)
+
+    def formula_passes(self, num_kv: int) -> int:
+        return max(1, -(-int(num_kv) * self.key_bytes // self.l2_budget_bytes))
+
+    def token_chunk(self, topk: int) -> int:
+        """Tokens whose pass scratch (dQ partial, key scratch, pass count) fits the workspace budget."""
+        per_token = DQ_PARTIAL_BYTES_PER_TOKEN + 4 * int(topk) + 4
+        m = self.token_chunk_multiple
+        return max(m, (self.workspace_budget_bytes // per_token) // m * m)
+
+    def passes(
+        self,
+        num_queries: int,
+        num_kv: int,
+        topk: int,
+        *,
+        num_segments: int = 1,
+        arch: Optional[str] = None,
+    ) -> int:
+        """The non-deterministic package's pass count under the rule of ``arch``: 1 for a multi-segment key row, a
+        formula of 1, a row that is neither one token chunk nor (with ``tail_rows``) ``2 T <= S``, or fewer keys
+        than the row's floor (``min_kv`` for a one-chunk row, ``tail_min_kv`` for a tail row of more than one
+        chunk); else ``fixed_passes`` or the formula, capped at ``tail_cap`` for a tail row of more than one chunk;
+        a count above ``max_passes`` is one pass."""
+        if int(num_segments) < 1:
+            raise ValueError(f"num_segments must be >= 1, got {num_segments}")
+        if int(num_segments) > 1:
+            return 1
+        T, S = int(num_queries), int(num_kv)
+        formula = self.formula_passes(S)
+        if formula == 1:
+            return 1
+        rule = self.rule_for(arch)
+        one_chunk = self.token_chunk(topk) >= T
+        tail = bool(rule["tail_rows"]) and 2 * T <= S
+        if not (one_chunk or tail):
+            return 1
+        if (rule["min_kv"] if one_chunk else rule["tail_min_kv"]) > S:
+            return 1
+        passes = rule["fixed_passes"] or formula
+        if tail and not one_chunk and rule["tail_cap"]:
+            passes = min(passes, rule["tail_cap"])
+        return passes if passes <= self.max_passes else 1
+
+
+def plan_key_passes(
+    record: dict[str, Any],
+    stages: tuple[str, ...],
+    num_queries: int,
+    num_kv: int,
+    topk: int,
+    key_passes: Optional[int] = None,
+    *,
+    num_segments: int = 1,
+    arch: Optional[str] = None,
+) -> int:
+    """Key-range passes of one RoPE backward.  ``key_passes`` (validated by :func:`_check_key_passes`) overrides the
+    policy; a program without the pass stages (``cake_jit.KEY_PASS_STAGES`` in ``stages``) serves one pass only.
+    Otherwise the record's policy (:meth:`KeyPassPolicy.passes`) decides for a row whose pass scratch fits one token
+    chunk (``T`` within :meth:`KeyPassPolicy.token_chunk`); a longer row, or a record without a policy, takes one
+    pass."""
+    multi_pass = all(stage in stages for stage in cake_jit.KEY_PASS_STAGES)
+    if key_passes is not None:
+        _check_key_passes(key_passes, num_kv)
+        if int(key_passes) > 1 and not multi_pass:
+            raise NotImplementedError(
+                "the registered DSA training program has no key-range-pass stages "
+                f"({cake_jit.KEY_PASS_STAGES}); key_passes > 1 is unavailable"
+            )
+        return int(key_passes)
+    if int(num_segments) < 1:
+        raise ValueError(f"num_segments must be >= 1, got {num_segments}")
+    if not multi_pass:
+        return 1
+    policy = KeyPassPolicy.from_record(record)
+    if policy is None or int(num_queries) > policy.token_chunk(topk):
+        return 1
+    return policy.passes(
+        num_queries, num_kv, topk, num_segments=num_segments, arch=arch
+    )
+
+
+def key_pass_ranges(num_kv: int, passes: int) -> tuple[tuple[int, int], ...]:
+    """``[pass_lo, pass_hi)`` of every pass: ``R = ceil(S / P)`` keys, the last one clipped to ``S``."""
+    S, P = int(num_kv), int(passes)
+    R = -(-S // P)
+    return tuple((p * R, min(S, (p + 1) * R)) for p in range(P))
+
+
+def key_pass_dq_mode(index: int, passes: int) -> int:
+    """``dq_mode`` of pass ``index``: 1 first (store the FP32 partial), 2 middle, 3 last (BF16 output); 0 for one
+    launch."""
+    if passes == 1:
+        return 0
+    return 1 if index == 0 else (2 if index < passes - 1 else 3)
 
 
 def _check_dkv_direct(dkv_direct: Optional[bool]) -> None:
@@ -808,6 +987,7 @@ def workspace_layout(
     dq_scratch: bool = False,
     redo_in_output: bool = False,
     delta_in_output: bool = False,
+    key_passes: int = 1,
     per_call: bool = False,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region of a prepared runner plus ``"total"``.
@@ -816,11 +996,11 @@ def workspace_layout(
     the per-call allocation of an eager or autograd backward, whose lengths are the caller's or the binding's
     own); ``delta`` (``[T, 64]`` FP32), ``qstat`` (``[T, 4]`` FP32; absent with ``dq_scratch``: it lives in dQ,
     :func:`dq_scratch_layout`) and the global words exist for the backward (``delta`` absent with
-    ``delta_in_output``: it lives in the fresh dK/dV output, :func:`output_scratch_layout`), and the accumulator
-    region
-    (:func:`accumulator_region_layout` over ``num_dst`` destination rows, ``num_kv`` by default; without the key
-    norms with ``dq_scratch``, without the redo lists with ``redo_in_output``) unless the runner carves it from
-    ``o_lo`` (``region=False``)."""
+    ``delta_in_output``: it lives in the fresh dK/dV output, :func:`output_scratch_layout`), the scratch of a
+    backward of ``key_passes > 1`` key-range passes (``dq_partial``, 147,456 B per token; ``key_scratch``, ``topk``
+    int32 per token; ``pass_counts``) and the accumulator region (:func:`accumulator_region_layout` over
+    ``num_dst`` destination rows, ``num_kv`` by default; without the key norms with ``dq_scratch``, without the
+    redo lists with ``redo_in_output``) unless the runner carves it from ``o_lo`` (``region=False``)."""
     sizes = [] if per_call else [("topk_length", int(num_queries) * 4)]
     if backward:
         if not delta_in_output:
@@ -828,6 +1008,13 @@ def workspace_layout(
         if not dq_scratch:
             sizes.append(("qstat", int(num_queries) * QSTAT_WORDS * 4))
         sizes.append(("globals", GLOBAL_WORDS * 4))
+        if int(key_passes) > 1:
+            T = int(num_queries)
+            sizes += [
+                ("dq_partial", T * DQ_PARTIAL_BYTES_PER_TOKEN),
+                ("key_scratch", T * int(topk) * 4),
+                ("pass_counts", T * 4),
+            ]
         if region:
             R = int(num_kv) if num_dst is None else int(num_dst)
             sizes.append(
@@ -922,12 +1109,26 @@ def dsa_train_workspace_size(
     the accumulator region out when it fits ``o_lo``; ``dkv_acc=False`` (fresh dK/dV outputs) puts the redo lists
     in the output (:func:`redo_lists_fit`), and ``delta`` with them when it fits (:func:`delta_fits_output`).  The
     size assumes ``dq_latent`` and ``dkv_latent`` start 16-byte aligned (any the runner allocates); a caller's output
-    that does not needs the larger layout of :func:`prepare_dsa_train`'s plan.  ``key_passes``, ``num_segments`` and
-    ``dkv_direct`` are accepted for parity with the non-deterministic package; the layout does not depend on them."""
-    record_for(device)
+    that does not needs the larger layout of :func:`prepare_dsa_train`'s plan.  ``key_passes`` and ``num_segments``
+    select the key-range passes as there (:func:`plan_key_passes`; their scratch is part of the workspace);
+    ``dkv_direct`` is accepted for parity with the non-deterministic package."""
+    _module_name, record = record_for(device)
     _check_key_passes(key_passes, num_kv)
     _check_dkv_direct(dkv_direct)
-    del num_segments
+    passes = (
+        plan_key_passes(
+            record,
+            cake_jit.registered_stages(),
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+            arch=arch_for(device),
+        )
+        if backward
+        else 1
+    )
     R = int(num_kv) if num_dst is None else int(num_dst)
     dq_scratch = dq_scratch_layout(num_queries, num_kv) is not None
     redo_in_output = not dkv_acc and redo_lists_fit(num_kv, R)
@@ -953,6 +1154,7 @@ def dsa_train_workspace_size(
             dq_scratch=dq_scratch,
             redo_in_output=redo_in_output,
             delta_in_output=delta_in_output,
+            key_passes=passes,
         )["total"]
     )
 
@@ -1415,6 +1617,10 @@ class _Plan:
     redo_in_output: bool = False
     # ``delta`` lives there too (:func:`delta_fits_output`), not in the workspace.
     delta_in_output: bool = False
+    # Key-range passes of the backward (:func:`plan_key_passes`) and the ``(pass_lo, pass_hi, dq_mode)`` of every
+    # pass; ``backward_order`` keys the pass launches ``(stage, pass index)``.
+    key_passes: int = 1
+    pass_overrides: tuple[dict[str, int], ...] = ()
     # The layout of the per-call workspace of an eager or autograd backward (no ``topk_length`` region).
     call_layout: dict = field(default_factory=dict, repr=False)
     fold_mode: int = FOLD_BF16
@@ -1542,9 +1748,9 @@ def _plan(
     check_dst_map: bool = False,
     o_lo_scratch: bool = False,
 ) -> _Plan:
-    """Validate one geometry and resolve its plan (no allocation, no launch).  ``key_passes``, ``num_segments`` and
-    ``dkv_direct`` are validated and otherwise unused; ``check_dst_map`` / ``o_lo_scratch`` as in
-    :func:`prepare_dsa_train`."""
+    """Validate one geometry and resolve its plan (no allocation, no launch).  ``key_passes`` and ``num_segments``
+    select the key-range passes (:func:`plan_key_passes`); ``dkv_direct`` is validated and otherwise unused;
+    ``check_dst_map`` / ``o_lo_scratch`` as in :func:`prepare_dsa_train`."""
     if derive_topk_length and topk_length is None:
         raise ValueError(
             "derive_topk_length=True needs a topk_length [T] int32 tensor for the forward to fill"
@@ -1554,7 +1760,6 @@ def _plan(
     )
     _check_key_passes(key_passes, num_kv)
     _check_dkv_direct(dkv_direct)
-    del num_segments
     if backward and dout is None:
         raise ValueError("a backward binding needs dout")
     accumulate = dkv_acc is not None
@@ -1583,7 +1788,7 @@ def _plan(
     tensors += list(outputs.values())
     if not all(t.is_cuda and t.device == device for t in tensors if t is not None):
         raise ValueError("Expected all tensors on one CUDA device")
-    module_name, _record = record_for(device)
+    module_name, record = record_for(device)
     arch = arch_for(device)
     stages = cake_jit.registered_stages()
     if backward and not generated_program_available(device, backward=True):
@@ -1656,6 +1861,20 @@ def _plan(
     )
     if backward:
         _check_accumulator_span(num_dst, D_QK, dst_row_stride)
+    passes = (
+        plan_key_passes(
+            record,
+            stages,
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+            arch=arch,
+        )
+        if backward
+        else 1
+    )
     layout, call_layout = (
         workspace_layout(
             num_queries,
@@ -1667,6 +1886,7 @@ def _plan(
             dq_scratch=dq_scratch,
             redo_in_output=redo_in_output,
             delta_in_output=delta_in_output,
+            key_passes=passes,
             per_call=per_call,
         )
         for per_call in (False, True)
@@ -1702,6 +1922,9 @@ def _plan(
         token_step=1,
     )
     if backward:
+        # main / redo of one launch: dq_mode 0, the dQ partial unread (a placeholder of its dtype at bind time);
+        # bwd_compact runs every token of the row in each pass
+        constants.update(dq_mode=0, num_tokens=T)
         # bwd_delta: dout's token / head strides and the pointer's element offset (the strided delta kernel reads
         # a head-major or any other admissible view in place)
         constants.update(_dout_stride_constants(dout))
@@ -1720,12 +1943,29 @@ def _plan(
             )
         )
     entries: dict[str, _StageEntry] = {"fwd": _stage_entry("fwd", arch, scalars)}
-    backward_order: tuple[str, ...] = ()
+    backward_order: tuple = ()
+    pass_overrides: tuple[dict[str, int], ...] = ()
     if backward:
-        # every registered backward stage, in the record's order, on every call
-        backward_order = cake_jit.BACKWARD_STAGES
+        # every registered backward stage, in the record's order, on every call; a multi-pass backward runs the
+        # compaction and the pass build of the main stage per key range in place of bwd_main
+        stage_list: list = list(cake_jit.BACKWARD_STAGES)
+        if passes > 1:
+            pass_overrides = tuple(
+                dict(pass_lo=lo, pass_hi=hi, dq_mode=key_pass_dq_mode(index, passes))
+                for index, (lo, hi) in enumerate(key_pass_ranges(S, passes))
+            )
+            main = stage_list.index("bwd_main")
+            stage_list[main : main + 1] = [
+                (stage, index)
+                for index in range(passes)
+                for stage in cake_jit.KEY_PASS_STAGES
+            ]
+        backward_order = tuple(stage_list)
         sm_count = _sm_count(_device_index(device))
-        for stage in backward_order:
+        for key in backward_order:
+            stage = key[0] if isinstance(key, tuple) else key
+            if stage in entries:
+                continue
             rule = PERSISTENT_GRIDS.get(stage)
             grid = (rule(T, S, sm_count), 1, 1) if rule is not None else None
             entries[stage] = _stage_entry(stage, arch, scalars, grid=grid)
@@ -1754,6 +1994,8 @@ def _plan(
         dq_scratch=dq_scratch,
         redo_in_output=redo_in_output,
         delta_in_output=delta_in_output,
+        key_passes=passes,
+        pass_overrides=pass_overrides,
         call_layout=call_layout,
         fold_mode=fold_mode,
     )
@@ -1863,8 +2105,8 @@ def _scratch(
     *,
     layout: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """The backward scratch of ``plan``: ``det_globals``, ``delta`` (unless it lives in the fresh dK/dV output) and
-    ``qstat`` (unless it lives in dQ) from the workspace ``flat`` (laid out as ``layout``, ``plan.layout`` by
+    """The backward scratch of ``plan``: ``det_globals``, ``delta`` (unless it lives in the fresh dK/dV output),
+    ``qstat`` (unless it lives in dQ) and the key-range-pass scratch of a multi-pass plan from the workspace ``flat`` (laid out as ``layout``, ``plan.layout`` by
     default) and the accumulator region (:func:`_region_bytes`: the workspace's ``region`` when ``layout`` holds
     one and ``o_lo`` is not carved, else one allocation).  :func:`_carve_moved` places the rest once the outputs
     are bound."""
@@ -1879,6 +2121,18 @@ def _scratch(
         t["delta"] = _carve(flat, layout, "delta", torch.float32, (T, NUM_HEADS))
     if "qstat" in layout:
         t["qstat"] = _carve(flat, layout, "qstat", torch.float32, (T, QSTAT_WORDS))
+    if "dq_partial" in layout:
+        t["dq_partial"] = _carve(
+            flat,
+            layout,
+            "dq_partial",
+            torch.float32,
+            (T, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
+        )
+        t["key_scratch"] = _carve(
+            flat, layout, "key_scratch", torch.int32, (T, plan.topk)
+        )
+        t["pass_counts"] = _carve(flat, layout, "pass_counts", torch.int32, (T,))
     region = _region_bytes(plan, o_lo, flat, layout, flat.device)
     t.update(_carve_region(plan, region))
     return t
@@ -1918,16 +2172,51 @@ def _bound_values(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
         dst_rope=t.get("dk_rope", bf16),
         dst_latent_f32=t.get("dkv_latent_fp32", f32),
         dst_rope_f32=t.get("dk_rope_fp32", f32),
+        # the dQ partial of a multi-pass plan (the one-launch stages, dq_mode 0, never read it)
+        dq_partial=t.get("dq_partial", f32),
     )
     return values
 
 
-def _launches(plan: _Plan, values: dict[str, Any]) -> dict[str, _Launch]:
-    """The launches of ``plan`` over ``values``, keyed by stage name."""
-    launches: dict[str, _Launch] = {}
-    for stage in plan.launch_keys():
+def _pass_values(
+    plan: _Plan, stage: str, index: int, values: dict[str, Any]
+) -> dict[str, Any]:
+    """The launch values of pass ``index`` of ``stage`` (``bwd_compact`` / ``bwd_main_pass``): the key range of the
+    pass for the compaction (over the caller's indices and lengths); the compacted keys for the main stage
+    (``indices = key_scratch`` with row stride ``topk``, ``topk_length = pass_counts``) and the pass's
+    ``dq_mode``."""
+    override = plan.pass_overrides[index]
+    if stage == "bwd_compact":
+        return dict(values, pass_lo=override["pass_lo"], pass_hi=override["pass_hi"])
+    return dict(
+        values,
+        indices=values["key_scratch"],
+        idx_stride=plan.topk,
+        indices_offset=0,
+        topk_length=values["pass_counts"],
+        has_topk_length=1,
+        dq_mode=override["dq_mode"],
+    )
+
+
+def _stage_values(
+    plan: _Plan, key: Any, values: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """``(stage, launch values)`` of the launch ``key`` of ``plan``: a stage name, or ``(stage, pass index)``."""
+    if isinstance(key, tuple):
+        stage, index = key
+        return stage, _pass_values(plan, stage, index, values)
+    return key, values
+
+
+def _launches(plan: _Plan, values: dict[str, Any]) -> dict[Any, _Launch]:
+    """The launches of ``plan`` over ``values``, keyed as ``plan.launch_keys()`` (a stage name, or
+    ``(stage, pass index)`` for the launches of a key-range pass)."""
+    launches: dict[Any, _Launch] = {}
+    for key in plan.launch_keys():
+        stage, stage_values = _stage_values(plan, key, values)
         e = plan.entries[stage]
-        launches[stage] = _Launch(stage, e.launcher, e.run, values, e.grid)
+        launches[key] = _Launch(stage, e.launcher, e.run, stage_values, e.grid)
     return launches
 
 
@@ -1987,9 +2276,12 @@ class DSATrainRunner:
     Prepare a new runner when a shape, dtype or tensor binding changes; values
     may change freely.
 
-    ``launches`` is keyed by stage name and ``backward_order`` lists the
-    backward stages in launch order (every registered backward stage, see
-    ``cake_jit.BACKWARD_STAGES``).  ``storage`` tells where the integer
+    ``launches`` is keyed by stage name (``(stage, pass index)`` for the
+    launches of a key-range pass) and ``backward_order`` lists the backward
+    launches in order (every registered backward stage, see
+    ``cake_jit.BACKWARD_STAGES``; with ``key_passes > 1`` the compaction and
+    the pass build of the main stage per pass in place of ``bwd_main``).
+    ``storage`` tells where the integer
     accumulator region lives: ``"o_lo"`` (prepared with ``o_lo_scratch=True``
     and the region fits: the backward consumes ``o_lo``, so every
     ``backward()`` must follow its own ``forward()``) or ``"workspace"``.
@@ -2009,7 +2301,7 @@ class DSATrainRunner:
     # The flat workspace the scratch regions of ``tensors`` are carved from, and their byte layout.
     workspace: torch.Tensor = field(repr=False)
     layout: dict = field(repr=False)
-    # Accepted for parity with the non-deterministic package: every backward runs its main stage once.
+    # Key-range passes of the backward (:func:`plan_key_passes`; 1: the main stage runs once over all keys).
     key_passes: int = 1
     backward_order: tuple = ()
     # True when the dK/dV gradients are added into the caller's packed FP32 rows (``tensors["dkv_acc"]``).
@@ -2178,9 +2470,12 @@ def prepare_dsa_train(
     captured backward replayed without a forward replay in between is not
     supported).  The default ``False`` keeps the region in the workspace.
 
-    ``key_passes``, ``num_segments`` and ``dkv_direct`` are accepted for parity
-    with the non-deterministic package and validated as there; every backward
-    runs its main stage once over all keys and accumulates in one form.
+    ``key_passes`` and ``num_segments`` select the key-range passes of the
+    backward (:func:`plan_key_passes`: the non-deterministic package's policy
+    for a row of one token chunk, ``key_passes`` overriding it); the dK/dV bits
+    do not depend on them, and dQ is the non-deterministic package's dQ of the
+    same passes.  ``dkv_direct`` is accepted for parity with that package and
+    validated as there; the accumulation has one form here.
 
     Row lengths: with ``topk_length`` the kernels use the caller's lengths.
     Without it the forward kernel derives them itself (last valid slot + 1 per
@@ -2291,6 +2586,7 @@ def prepare_dsa_train(
         device_index=plan.device_index,
         workspace=flat,
         layout=layout,
+        key_passes=plan.key_passes,
         backward_order=plan.backward_order,
         accumulate_dkv=plan.accumulate_dkv,
         num_dst=plan.num_dst,
@@ -2380,9 +2676,10 @@ def backward_binding_key(
     """Cache key of a backward plan: the forward key's inputs plus the saved forward
     outputs, ``dout``, the ``dkv_fp32`` option, the geometry of the packed accumulator /
     destination map (``None`` when absent; their row count and stride are baked into
-    the plan) and whether the call consumes ``o_lo``.  ``key_passes``, ``num_segments``
-    and ``dkv_direct`` do not change the plan and are not part of the key."""
-    del key_passes, num_segments, dkv_direct
+    the plan), whether the call consumes ``o_lo`` and what selects the key-range passes
+    (``key_passes``; whether ``num_segments`` exceeds 1).  ``dkv_direct`` does not change
+    the plan and is not part of the key."""
+    del dkv_direct
     return (
         "bwd",
         _geometry(q_latent),
@@ -2400,6 +2697,8 @@ def backward_binding_key(
         _geometry(dkv_acc),
         _geometry(dkv_dst_map),
         bool(o_lo_scratch),
+        None if key_passes is None else int(key_passes),
+        int(num_segments) > 1,
     )
 
 
@@ -2416,8 +2715,9 @@ class _Binding:
         plan = self.plan
         with _ffi_stream_context(plan.device_index):
             for key in keys:
-                e = plan.entries[key]
-                e.launcher(e.run, values, e.grid)
+                stage, stage_values = _stage_values(plan, key, values)
+                e = plan.entries[stage]
+                e.launcher(e.run, stage_values, e.grid)
 
     def forward(
         self,
@@ -2781,8 +3081,9 @@ def backward(
     lets the backward use the storage of ``o_lo`` for its integer accumulator
     region (when it fits, :func:`carve_fits`): ``o_lo`` no longer holds the
     forward's residual afterwards.  The default ``False`` allocates the region.
-    ``key_passes``, ``num_segments`` and ``dkv_direct`` are accepted for parity
-    with the non-deterministic package (validated, otherwise unused).  An
+    ``key_passes`` and ``num_segments`` select the key-range passes as in
+    :func:`prepare_dsa_train`; ``dkv_direct`` is accepted for parity with the
+    non-deterministic package (validated, otherwise unused).  An
     admissible strided ``dout`` (the head-major ``[512, T * 512, 1]`` view an
     output projection hands back, or any view under the layout rules of
     ``q_latent``) is read in place; a view the TMA descriptor cannot address is
@@ -2832,6 +3133,8 @@ def backward(
         topk_length,
         scale,
         dkv_fp32,
+        key_passes=key_passes,
+        num_segments=num_segments,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
         o_lo_scratch=o_lo_scratch,
@@ -2890,7 +3193,8 @@ class CakeDSASparseAttentionDetFunction(torch.autograd.Function):
     ``kv_latent`` / ``k_rope``; ``dkv_acc`` is a tensor (caller-owned: validated here and kept on ``ctx``, free to be
     zeroed in place between the forward and the backward) or a zero-argument callable producing it (or an
     ``(accumulator, dkv_dst_map)`` pair) at backward time (:data:`DkvAccSource`; a callable's result is validated in
-    the backward).  ``key_passes``, ``num_segments`` and ``dkv_direct`` are validated and otherwise unused;
+    the backward).  ``key_passes`` and ``num_segments`` are handed to :func:`backward` (the key-range passes);
+    ``dkv_direct`` is validated and otherwise unused;
     ``check_dst_map`` (default ``False``; ``True`` validates the map's values in the backward) is handed to
     :func:`backward`.
     """
@@ -2932,6 +3236,8 @@ class CakeDSASparseAttentionDetFunction(torch.autograd.Function):
         ctx.has_topk_length = topk_length is not None
         ctx.derive_topk_length = bool(derive_topk_length)
         ctx.check_dst_map = check_dst_map
+        ctx.key_passes = key_passes
+        ctx.num_segments = num_segments
         ctx.o_lo_spent = False
         if dkv_dst_map is not None and dkv_acc is None:
             raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
@@ -3014,6 +3320,8 @@ class CakeDSASparseAttentionDetFunction(torch.autograd.Function):
             dout,
             topk_length=topk_length,
             softmax_scale=ctx.softmax_scale,
+            key_passes=ctx.key_passes,
+            num_segments=ctx.num_segments,
             dkv_acc=dkv_acc,
             dkv_dst_map=dkv_dst_map,
             check_dst_map=ctx.check_dst_map,
@@ -3055,9 +3363,10 @@ def cake_dsa_sparse_attention_det(
     saved through ``ctx.save_for_backward``; a checkpointed forward retains
     nothing of this call.  ``check_dst_map`` (default ``False``; ``True``
     validates the values of ``dkv_dst_map`` in the backward, one device
-    synchronization) is handed to the backward.  ``key_passes``,
-    ``num_segments`` and ``dkv_direct`` are accepted for parity with the
-    non-deterministic package (validated, otherwise unused).  Without
+    synchronization) is handed to the backward, as are ``key_passes`` and
+    ``num_segments`` (the key-range passes, see :func:`prepare_dsa_train`);
+    ``dkv_direct`` is accepted for parity with the non-deterministic package
+    (validated, otherwise unused).  Without
     ``topk_length`` the per-row lengths (last valid slot + 1 under the rule ``0
     <= idx < num_kv``, 0 if none) are derived once per step by the forward
     kernel itself into a fresh ``[T]`` tensor that is saved for the backward.

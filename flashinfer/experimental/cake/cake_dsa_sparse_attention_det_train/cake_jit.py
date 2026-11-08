@@ -33,7 +33,9 @@ from . import cake_build
 # (fixed order: bitwise reproducible), compiled under program names of this
 # package.  The backward stages run in the record's order, every one of them on
 # every backward (``BACKWARD_STAGES``): no stage is selected by a tensor value
-# or by the device's SM count.  What each library compiles -- translation
+# or by the device's SM count.  A backward of P > 1 key-range passes (the
+# record's ``key_pass_policy``, or the caller's ``key_passes``) runs the
+# ``KEY_PASS_STAGES`` P times in place of ``bwd_main``.  What each library compiles -- translation
 # units, nvcc flags, digests -- is recorded in ``build.json`` only; the
 # positional argument order of every stage lives in the generated
 # ``cake_launch`` module.  The records are populated by the generated-program
@@ -52,7 +54,40 @@ MODULES: dict[str, dict[str, Any]] = {
             "bwd_redo_prep",
             "bwd_redo",
             "bwd_fold",
+            "bwd_compact",
+            "bwd_main_pass",
         ],
+        # The key-range-pass policy: the non-deterministic package's record values (``cake_backend.KeyPassPolicy``).
+        "key_pass_policy": {
+            "l2_budget_bytes": 104857600,
+            "key_bytes": 2304,
+            "workspace_budget_bytes": 671088640,
+            "token_chunk_multiple": 128,
+            "max_passes": 4,
+            "rules": {
+                "sm_100a": {
+                    "tail_rows": 0,
+                    "fixed_passes": 0,
+                    "min_kv": 0,
+                    "tail_min_kv": 0,
+                    "tail_cap": 0,
+                },
+                "sm_103a": {
+                    "tail_rows": 1,
+                    "fixed_passes": 0,
+                    "min_kv": 0,
+                    "tail_min_kv": 131072,
+                    "tail_cap": 3,
+                },
+                "sm_107a": {
+                    "tail_rows": 1,
+                    "fixed_passes": 2,
+                    "min_kv": 131072,
+                    "tail_min_kv": 131072,
+                    "tail_cap": 0,
+                },
+            },
+        },
         "fwd": {
             "library": "cake_dsa_h64_det_train_c949a885132a772bdb53",
             "ffi_entry": "run",
@@ -149,6 +184,28 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_compact": {
+            "library": "cake_dsa_h64_det_train_19c560118a407f5473fe",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [128, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_main_pass": {
+            "library": "cake_dsa_h64_det_train_1893ca02d59bc5e3383a",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 231680,
                 "use_pdl": False,
             },
         },
@@ -307,13 +364,18 @@ BACKWARD_STAGES = (
     "bwd_fold",
 )
 STAGES = FORWARD_STAGES + BACKWARD_STAGES
+# The key-range passes of the RoPE program: a backward that splits every token's keys into ``P > 1`` key ranges
+# runs, per pass and in place of ``bwd_main``, the compaction of the token's keys in the range (``bwd_compact``)
+# and the pass build of the main stage (``bwd_main_pass``; its dQ goes through an FP32 partial between passes).
+# The redo stays one launch.  The NoPE program has no pass stages.
+KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
 # The NoPE program names its stages ``nope_<stage>`` (globally unique: the
 # generated launch tables are keyed by stage name across both programs).
 STAGE_PREFIX = {PROGRAM: "", NOPE_PROGRAM: "nope_"}
 NOPE_STAGES = tuple(f"{STAGE_PREFIX[NOPE_PROGRAM]}{stage}" for stage in STAGES)
 NOPE_FORWARD_STAGES = NOPE_STAGES[:1]
 NOPE_BACKWARD_STAGES = NOPE_STAGES[1:]
-STAGES_OF = {PROGRAM: STAGES, NOPE_PROGRAM: NOPE_STAGES}
+STAGES_OF = {PROGRAM: STAGES + KEY_PASS_STAGES, NOPE_PROGRAM: NOPE_STAGES}
 BACKWARD_STAGES_OF = {PROGRAM: BACKWARD_STAGES, NOPE_PROGRAM: NOPE_BACKWARD_STAGES}
 
 
