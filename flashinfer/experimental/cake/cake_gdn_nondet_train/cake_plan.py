@@ -74,12 +74,12 @@ TAPE_LEVELS: Mapping[str, str] = MappingProxyType(
 # The backward form of a call where a measurement on the device fixes it instead of the split's pricing, by
 # (architecture, SM count, H, HV).  ``"nosplit"``: the planner's tables (no one-wave split of the adjoint walk; a group
 # of three keeps its pre-scan R-form table) with the pre-scans' warm-up cut, which skips the steps whose decay has
-# fallen below the threshold: the split's price does not depend on the gates, the planner's time does.  sm_100a on
-# GB200 (152 SMs) at H 1 / HV 3 and H 2 / HV 6: faster at the pair rows (three sequences of about 11k tokens) with the
-# gates of the FI bench and of FLA's model init.  From H 4 / HV 12 on the split stays: its smallest margin to the best
-# FROST arm over the FI-bench and log-spaced gates is the larger one there.
+# fallen below the threshold: the split's price does not depend on the gates, the planner's time does.  An entry is
+# the form whose worst time relative to the best FROST arm, over the FI-bench and log-spaced gates, is the lower one:
+# sm_100a on GB200 (152 SMs) at H 1 / HV 3, measured at the pair rows (three sequences of about 11k tokens).  From
+# H 2 / HV 6 on the split stays: its worst ratio is the lower one there, set by the long H 2 / HV 6 packs.
 ADJOINT_FORMS: Mapping[tuple[str, int, int, int], str] = MappingProxyType(
-    {("sm_100a", 152, 1, 3): "nosplit", ("sm_100a", 152, 2, 6): "nosplit"}
+    {("sm_100a", 152, 1, 3): "nosplit"}
 )
 
 

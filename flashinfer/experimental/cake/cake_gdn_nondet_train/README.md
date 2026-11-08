@@ -318,7 +318,7 @@ Grace hosts of GB200 and GB300, 0 elsewhere), wave 1 runs on the caller's
 stream, summaries first, with the same bits.  `cake_plan.ADJOINT_FORMS` fixes
 the backward form of a device and head shape where a measurement decided it:
 `nosplit` keeps the planner's tables without the split, whose pre-scans skip
-the steps the warm-up cut allows (GB200, H 1 / HV 3 and H 2 / HV 6).
+the steps the warm-up cut allows (GB200, H 1 / HV 3).
 
 ## Speed against the deterministic package
 
