@@ -41,16 +41,22 @@ it.
 The backward cuts the rows into blocks of 8 rows and the blocks into
 ``C = ceil(blocks / B)`` chunks of ``B = max(1, ceil(blocks / 8192))``
 consecutive blocks, and launches ``G = min(C, 8 * SMs)`` CTAs of 128 threads,
-at most one wave (8 CTAs per SM).  While ``C <= 8 * SMs`` the static backward
-gives every chunk its own CTA.  Past that the claimed backward runs: its CTAs
-claim runs of consecutive chunks from the workspace's claim counter, in
-halving rounds and then single chunks, each CTA its next run as the last block
-of its current run starts, so a CTA that starts late takes fewer chunks (one
-that becomes resident after every run was claimed takes none).  Each CTA adds
-the FP32 weight-gradient partials of its chunks exactly into 64-bit integer
+at most one wave (8 CTAs per SM).  Its programs run in the rows of their
+``BACKWARD_BANDS`` bands.  Past the small-row band, on SM100 and SM103 the
+static backward runs up to 49488 rows, the second static backward (the same
+schedule, each CTA warming its next block in L2) up to 245760 rows and the
+claimed backward past it; on SM107 the static backward runs while
+``C <= 8 * SMs`` (every chunk its own CTA), the second static backward up to
+98352 rows and the claimed backward past it.  A static backward's CTA ``b``
+runs the chunks ``b``, ``b + G``, ...  The claimed backward's CTAs claim runs
+of consecutive chunks from the workspace's claim counter, in halving rounds
+and then single chunks, each CTA its next run as the last block of its
+current run starts, so a CTA that starts late takes fewer chunks (one that
+becomes resident after every run was claimed takes none).  Each CTA adds the
+FP32 weight-gradient partials of its chunks exactly into 64-bit integer
 windows of the workspace and takes a ticket on the arrival word; whichever CTA
 arrives last rounds the exact sum once into ``dw``, and no CTA waits for
-another.  In the rows of its ``BACKWARD_BANDS`` bands the weight gradient
+another.  In the rows of its small-row band the weight gradient
 comes from a small-row backward: one cluster of 16 CTAs, scheduled together
 on the SMs of one GPC, whose CTAs each wait for the other CTAs' FP32 partials
 of their columns and finish them, with no workspace.  Beside a
@@ -61,11 +67,12 @@ or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
 pairs, so host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the static and the claimed backward needs 15616 bytes of dynamic shared
-memory (the launch record's ``dynamic_smem_bytes``: the two halves of the
-8 x 128 FP32 fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128
-columns, 7168 bytes, and the run cell, the arrival flag and the 8-entry claim
-table, 160 bytes, 15520 bytes rounded up), so a side kernel holding every SM
+CTA of the static, the second static and the claimed backward needs 15616
+bytes of dynamic shared memory (the launch record's ``dynamic_smem_bytes``:
+the two halves of the 8 x 128 FP32 fold buffer, 8192 bytes, the 7 64-bit
+windows of each of the 128 columns, 7168 bytes, and the run cell, the arrival
+flag and the 8-entry claim table, 160 bytes, 15520 bytes rounded up), so a
+side kernel holding every SM
 with a small carveout can delay its start until the side kernel exits (no test
 here asserts that delay; documented in
 :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The documented remedy
@@ -88,10 +95,14 @@ The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 the share in the call of one row block of each CTA of the one-wave grid, plus
 ``PROPORTIONAL_SLACK``.  The token counts give each CTA of that grid
 (``8 * N`` CTAs) 16, 32 and 160 row blocks: ``T = 3157``, ``6314`` and
-``31573`` on a 148-SM B200, whose rows have more chunks than the grid has
-CTAs, so the claimed backward runs all three (there in chunks of 3, 5 and 24
-blocks).  The persistent forwards beside the same side kernels: busy / alone
-is at most ``N / (N - k)``, plus the share of one CTA's blocks in the call (a
+``31573`` on a 148-SM B200 (151536, 303072 and 1515504 rows, in chunks of 3, 5
+and 24 blocks), whose rows have more chunks than the grid has CTAs.  The
+backward of their ``BACKWARD_BANDS`` band runs them under the same bound: on
+SM100 and SM103 the second static backward the first (up to 245760 rows) and
+the claimed backward the others, on SM107 the claimed backward all three
+(past 98352 rows).  The persistent forwards beside the same side kernels:
+busy / alone is at most ``N / (N - k)``, plus the share of one CTA's blocks
+in the call (a
 CTA whose slot the side kernel holds walks all of its blocks once it starts),
 plus ``PROPORTIONAL_SLACK``, in each band of the module, at the token counts
 that give the module's CTA slots the fewest whole row blocks each past the
@@ -683,28 +694,33 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     )
 
 
-def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int]:
-    """``(T, block_share, blocks_per_chunk, chunks)``: the most tokens ``T``
-    whose ``T * H`` rows give each CTA of the BF16 weight-gradient backward's
-    one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM, all
-    resident at once) at most ``blocks_per_cta`` row blocks, rows with more
-    chunks than that grid has CTAs, which the claimed backward runs; the share
-    of one row block of each of its CTAs in the call alone; and the chunks of
-    those rows (``backward_chunks``)."""
+def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int, str]:
+    """``(T, block_share, blocks_per_chunk, chunks, module)``: the most tokens
+    ``T`` whose ``T * H`` rows give each CTA of the BF16 weight-gradient
+    backward's one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM,
+    all resident at once) at most ``blocks_per_cta`` row blocks, rows with
+    more chunks than that grid has CTAs; the share of one row block of each of
+    its CTAs in the call alone; the chunks of those rows
+    (``backward_chunks``); and the module that runs them (``module_for_rows``:
+    the claimed backward, or on SM100 and SM103 up to 245760 rows the second
+    static backward)."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    name = loader.route_module(arch, "bwd_bf16_mid")
+    claimed = loader.route_module(arch, "bwd_bf16_mid")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
-    rows_per_block = int(loader.MODULES[name]["grid_rule"]["rows_per_block"])
+    wave = loader.backward_ctas(claimed, loader.INT32_MAX, sms)
+    rows_per_block = int(loader.MODULES[claimed]["grid_rule"]["rows_per_block"])
     tokens = blocks_per_cta * wave * rows_per_block // H
     rows = tokens * H
-    assert loader.module_for_rows(arch, "bwd_bf16", rows, sms) == name
+    name = loader.module_for_rows(arch, "bwd_bf16", rows, sms)
+    role = loader.MODULES[name]["role"]
+    assert role in ("bwd_bf16_long", "bwd_bf16_mid"), (arch, rows, role)
     ctas = loader.backward_ctas(name, rows, sms)
     assert ctas == wave
     blocks_per_chunk, chunks = loader.backward_chunks(name, rows)
+    assert chunks > ctas, (rows, chunks, ctas)
     blocks = -(-rows // rows_per_block)
-    return tokens, ctas / blocks, blocks_per_chunk, chunks
+    return tokens, ctas / blocks, blocks_per_chunk, chunks, role
 
 
 @pytest.mark.parametrize(
@@ -714,7 +730,7 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int]:
 def test_backward_slows_in_proportion_to_the_sms_held(
     blocks_per_cta: int, ctas: int, threads: int
 ) -> None:
-    tokens, block_share, blocks_per_chunk, chunks = _claim_tokens(blocks_per_cta)
+    tokens, block_share, blocks_per_chunk, chunks, role = _claim_tokens(blocks_per_cta)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
 
@@ -727,7 +743,7 @@ def test_backward_slows_in_proportion_to_the_sms_held(
     bound = ideal + block_share + PROPORTIONAL_SLACK
     ratio = busy_ms / alone_ms
     print(
-        f"HELD stage=backward tokens={tokens} heads={H} "
+        f"HELD stage=backward role={role} tokens={tokens} heads={H} "
         f"blocks_per_cta={blocks_per_cta} blocks_per_chunk={blocks_per_chunk} "
         f"chunks={chunks} side={ctas}x{threads} "
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
@@ -737,7 +753,7 @@ def test_backward_slows_in_proportion_to_the_sms_held(
     _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     assert ratio <= bound, (
-        f"tokens={tokens} ({blocks_per_cta} row blocks per CTA): backward alone "
+        f"tokens={tokens} ({blocks_per_cta} row blocks per CTA): {role} alone "
         f"{alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs on {ctas} SMs "
         f"{busy_ms:.4f} ms: ratio {ratio:.3f} > {bound:.3f} (proportional "
         f"{ideal:.3f} + one row block {block_share:.4f} + {PROPORTIONAL_SLACK})"
@@ -1175,9 +1191,10 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 # five tokens of H heads (48 and 240 rows, in the BACKWARD_BANDS band of each
 # role on every architecture), beside the short forward's side kernels; their
 # held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD.
-# And "past": the first whole tokens of H heads past the role's last band (11
-# tokens, 528 rows), where the static backward takes over from the small-row
-# backward; it runs in the keeps-speed and the max-shared start tests only.
+# And "past": the first whole tokens of H heads past the role's last
+# small-row band (11 tokens, 528 rows), where the static backward takes over
+# from the small-row backward; it runs in the keeps-speed and the max-shared
+# start tests only.
 SHORT_BACKWARD_PROBES = ("1x48", "5x48", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
@@ -1215,10 +1232,10 @@ def _short_backward(
     """``(tokens, the probed backward, the backward it replaces)`` of the
     ``SHORT_BACKWARD_PROBES`` entry ``probe`` for a ``dw_dtype`` weight
     gradient: the tokens of H heads (for ``past`` the first whole tokens past
-    the role's last ``BACKWARD_BANDS`` band), the module that runs their rows
-    and the role's module, the static backward.  ``past`` probes run the
-    static backward and skip unless ``past`` is set; the others skip where no
-    band holds their rows."""
+    the role's last small-row ``BACKWARD_BANDS`` band), the module that runs
+    their rows and the role's module, the static backward.  ``past`` probes
+    run the static backward and skip unless ``past`` is set; the others skip
+    where no small-row band holds their rows."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -1228,7 +1245,8 @@ def _short_backward(
         if not past:
             pytest.skip(PAST_PROBE_SKIP)
         bands = loader.BACKWARD_BANDS.get(arch, {}).get(role, ())
-        tokens = (int(bands[-1][0]) if bands else 0) // H + 1
+        small = [last for last, band in bands if band in loader.BAND_ROLES]
+        tokens = (int(small[-1]) if small else 0) // H + 1
         name = loader.module_for_rows(arch, role, tokens * H, sms)
         assert name == static, (arch, role, tokens, name)
         return tokens, name, static

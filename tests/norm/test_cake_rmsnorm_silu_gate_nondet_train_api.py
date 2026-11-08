@@ -75,9 +75,16 @@ package's public forward and backward only.  This module checks:
   the ends of the forward's ``FORWARD_BANDS`` bands (packed rows) and
   ``STRIDED_FORWARD_BANDS`` bands (other layouts) and
   at the first and last rows of each backward program, each call launching
-  ``module_for_rows``' module: the small-row backwards (one cluster each, in
-  the rows of their ``BACKWARD_BANDS`` bands), the static backward (at most 8
-  chunks of rows per SM) and the claimed backward (more chunks); gate inputs at and past the packed
+  ``module_for_rows``' module: the programs of the ``BACKWARD_BANDS`` bands,
+  the small-row backwards (one cluster each), the static backward, the second
+  static backward and the claimed backward (on sm_100a and sm_103a up to 49488
+  rows, up to 245760 rows and past it; on sm_107a while every chunk has a CTA
+  of 8 per SM, up to 98352 rows and past it), and where their chunks grow by a
+  block; so do strided inputs (``dy``, ``x`` and ``z`` not of one packed row
+  stride) in the bands of the second static and the claimed backward, whose
+  sm_100a and sm_103a programs warm packed rows in L2 with a bulk prefetch and
+  other layouts with a prefetch per thread, launching the strides of their
+  layout; gate inputs at and past the packed
   gate's range (around FP32 ``expf``'s overflow too), in the forward and the
   backward, and infinite upstream gradients give the FP64 reference's
   ``NaN``, ``+inf`` and ``-inf`` positions and finite elements within the
@@ -669,8 +676,9 @@ def test_no_call_alerts_under_deterministic_algorithms(
     """Under ``torch.use_deterministic_algorithms(True)``, strict or with
     ``warn_only=True``, every call runs with no warning and no error: the
     forward and the backward into a BF16 and an FP32 weight gradient at the
-    first rows of the static and of the claimed backward past the small-row
-    bands (``_backward_tiers``), and the autograd backward, with the weight
+    first rows of the static, of the second static and of the claimed
+    backward past the small-row bands (``_backward_tiers``), and the autograd
+    backward, with the weight
     gradient, of :func:`cake_rmsnorm_silu_gate_nondet`, of
     :class:`CakeRMSNormSiLUGateNondetFunction` and of a non-reentrant
     checkpoint.  The functional calls launch ``module_for_rows``' modules."""
@@ -680,7 +688,7 @@ def test_no_call_alerts_under_deterministic_algorithms(
     calls = []
     for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
         tiers = _backward_tiers(arch, role, sms)
-        for tier in ("static", "claimed"):
+        for tier in ("static", "long", "claimed"):
             name, first, _ = tiers[tier]
             rows = max(first, least)
             assert loader.module_for_rows(arch, role, rows, sms) == name, (role, tier)
@@ -1045,11 +1053,13 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
 
 @requires_device
 def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
-    """A workspace with nonzero bytes in every buffer (the integer windows,
-    the class words, the arrival ticket and the claim counter) zeroed by
+    """A workspace of the architecture's bytes (``suite.WORKSPACE_BYTES``)
+    with nonzero bytes in every buffer (the integer windows, the class words,
+    the arrival ticket and the claim counter) zeroed by
     ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``, then reused
-    without a reset over the backend suite's sequence of shapes,
-    weight-gradient dtypes and accumulation: every output repeats bit for bit
+    without a reset over the backend suite's sequence of shapes (every
+    backward program of the architecture among them), weight-gradient dtypes
+    and accumulation: every output repeats bit for bit
     (an accumulated ``dw`` from the same starting value too), ``dx`` and
     ``dz`` are the deterministic package's bits, ``dx``, ``dz`` and ``dw`` lie
     within the error budget of the deterministic package's,
@@ -1060,6 +1070,8 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     assert ws.dtype == torch.uint8
     assert ws.numel() == nd_workspace_bytes(1, device)
     assert nd_workspace_bytes(1, device) == nd_workspace_bytes(10**7, device)
+    arch = loader.device_arch(torch.cuda.current_device())
+    assert ws.numel() == suite.WORKSPACE_BYTES[arch], (arch, ws.numel())
     generator = torch.Generator(device="cuda").manual_seed(70)
     ws.copy_(
         torch.randint(
@@ -1077,6 +1089,7 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
         (1, 1, torch.float32, True),
         (30193, 48, torch.bfloat16, False),
         (33, 7, torch.float32, True),
+        (129, 48, torch.float32, False),
     )
     for i, (T, H, dtype, accumulate) in enumerate(cases):
         x, z, w, dy = suite.make(T, H, seed=20 + i)
@@ -1314,14 +1327,16 @@ def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
     """The fewest rows the routed module ``name`` runs for on ``arch`` with
     ``sms`` SMs: for a forward module the first row of its first
     ``FORWARD_BANDS`` band (``STRIDED_FORWARD_BANDS`` where the rows are not
-    ``packed``; one more than the previous band's ``last * SMs``), for the
-    claimed backward the first row of more than ``more_chunks_than_per_sm *
-    SMs`` chunks of one block (its grid rule)."""
-    rule = loader.MODULES[name]["grid_rule"]
-    if "more_chunks_than_per_sm" in rule:
-        chunks = int(rule["more_chunks_than_per_sm"]) * sms
-        return chunks * int(rule["rows_per_block"]) + 1
+    ``packed``; one more than the previous band's ``last * SMs``), for a
+    backward module the first row of its ``BACKWARD_BANDS`` band
+    (``_backward_tiers``)."""
     role = loader.MODULES[name]["role"]
+    if role.startswith("bwd"):
+        call_role = "bwd_f32" if role.startswith("bwd_f32") else "bwd_bf16"
+        for module, first, _ in _backward_tiers(arch, call_role, sms).values():
+            if module == name:
+                return first
+        raise AssertionError(f"{arch} has no backward band of {role}")
     first = 1
     table = loader.FORWARD_BANDS if packed else loader.STRIDED_FORWARD_BANDS
     for last, band in table[arch]:
@@ -1332,26 +1347,49 @@ def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
     raise AssertionError(f"{arch} has no forward band of {role}")
 
 
+def _band_last(arch: str, last, band: str, sms: int) -> int | None:
+    """The last rows of the ``loader.BACKWARD_BANDS`` band ``(last, band)`` on
+    ``arch`` with ``sms`` SMs: ``last`` for a row count, for
+    ``loader.ONE_WAVE`` the most rows whose chunks (``backward_chunks``) each
+    have a CTA of the module's ``ctas_per_sm * sms``, ``None`` for the last
+    band, which has no end."""
+    if last is None:
+        return None
+    if last != loader.ONE_WAVE:
+        return int(last)
+    name = loader.ROUTES[arch][band]
+    rule = loader.MODULES[name]["grid_rule"]
+    ctas = int(rule["ctas_per_sm"]) * sms
+    rows = ctas * int(rule["rows_per_block"])  # chunks of one block
+    chunks = loader.backward_chunks(name, rows)[1]
+    assert chunks <= ctas < loader.backward_chunks(name, rows + 1)[1], (arch, sms)
+    return rows
+
+
 def _backward_tiers(
     arch: str, role: str, sms: int
 ) -> dict[str, tuple[str, int, int | None]]:
     """``tier -> (module, first rows, last rows or None)`` of the backward
     ``role`` (``bwd_bf16`` or ``bwd_f32``) on ``arch`` with ``sms`` SMs, from
-    the loader's routes, bands and grid rules: ``band<i>`` the module of the
-    role's ``i``-th ``BACKWARD_BANDS`` band (a small-row backward) over its
-    rows, the static backward from the next row while the rows have at most
-    ``more_chunks_than_per_sm`` chunks per SM, and the claimed backward past
-    that, with no last row."""
+    the loader's routes and ``BACKWARD_BANDS`` bands (``_band_last``):
+    ``band<i>`` the module of the role's ``i``-th small-row band, then
+    ``static`` (the role's module), ``long`` (the second static backward,
+    ``<role>_long``) and ``claimed`` (``<role>_mid``, the last band, with no
+    last row), each over the rows of its band."""
     routes = loader.ROUTES[arch]
+    names = {role: "static", f"{role}_long": "long", f"{role}_mid": "claimed"}
     tiers: dict[str, tuple[str, int, int | None]] = {}
     first = 1
-    for i, (last, band) in enumerate(loader.BACKWARD_BANDS.get(arch, {}).get(role, ())):
-        tiers[f"band{i}"] = (routes[band], first, int(last))
-        first = int(last) + 1
-    claimed = routes[f"{role}_mid"]
-    start = _start_rows(arch, claimed, sms)
-    tiers["static"] = (routes[role], first, start - 1)
-    tiers["claimed"] = (claimed, start, None)
+    for last, band in loader.BACKWARD_BANDS[arch][role]:
+        if band in loader.BAND_ROLES:
+            tier = f"band{sum(t.startswith('band') for t in tiers)}"
+        else:
+            tier = names[band]
+        end = _band_last(arch, last, band, sms)
+        tiers[tier] = (routes[band], first, end)
+        if end is not None:
+            first = end + 1
+    assert list(tiers)[-3:] == ["static", "long", "claimed"], (arch, role, tiers)
     return tiers
 
 
@@ -1573,8 +1611,10 @@ def test_forward_gate_edges_keep_the_fp64_classes(
 # Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
 # first GATE_EDGE_BACKWARD_COLUMNS columns, so every output keeps finite
 # elements (``dw`` in the other columns): 48 and 240 rows (the small-row
-# band), 1008 rows (the static backward past it) and 6192 and 49488 rows (the
-# static or the claimed backward, by the SM count).
+# band), 1008 and 6192 rows (the static backward past it), 49488 rows (the
+# static backward's last on sm_100a and sm_103a, the second static backward on
+# sm_107a), 49536 rows (the second static backward) and 245808 rows (the
+# claimed backward).
 GATE_EDGE_BACKWARD_COLUMNS = 96
 GATE_EDGE_BACKWARD_CASES = [
     pytest.param(1, 48, id="1x48"),
@@ -1582,6 +1622,8 @@ GATE_EDGE_BACKWARD_CASES = [
     pytest.param(21, 48, id="21x48"),
     pytest.param(129, 48, id="129x48"),
     pytest.param(1031, 48, id="1031x48"),
+    pytest.param(1032, 48, id="1032x48"),
+    pytest.param(5121, 48, id="5121x48"),
 ]
 
 
@@ -1700,19 +1742,25 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
 # The most small-row bands any architecture routes for a backward role
 # (``loader.BACKWARD_BANDS``), so no tier below is a band no architecture has.
 BACKWARD_BAND_COUNT = max(
-    len(bands) for roles in loader.BACKWARD_BANDS.values() for bands in roles.values()
+    sum(band in loader.BAND_ROLES for _, band in bands)
+    for roles in loader.BACKWARD_BANDS.values()
+    for bands in roles.values()
 )
 # The backward's small-row bands (``_backward_tiers``: ``band0`` ... up to
-# ``BACKWARD_BAND_COUNT``), then its static and claimed backward.
+# ``BACKWARD_BAND_COUNT``), then its static, second static and claimed
+# backward.
 BACKWARD_TIERS = [
     *(f"band{i}" for i in range(BACKWARD_BAND_COUNT)),
     "static",
+    "long",
     "claimed",
 ]
 # The edges of the backward's programs on this device (``_backward_tiers``):
-# (tier, edge).  ``chunks`` is the claimed backward's last rows of one-block
-# chunks (``rows_per_block * chunk_limit``), ``chunks+1`` its first rows of
-# two-block chunks.
+# (tier, edge).  ``chunks`` is a program's last rows of chunks of ``k``
+# blocks, ``rows_per_block * chunk_limit * k`` for the fewest ``k`` in its
+# band, ``chunks+1`` its first rows of ``k + 1`` blocks (from one block to two
+# in the second static backward's band; in the claimed backward's band from 4
+# to 5 on sm_100a and sm_103a, from 2 to 3 on sm_107a).
 BACKWARD_TIER_EDGES = [
     *(
         pytest.param(f"band{i}", edge, id=f"band{i}-{edge}")
@@ -1721,9 +1769,13 @@ BACKWARD_TIER_EDGES = [
     ),
     pytest.param("static", "first", id="static-first"),
     pytest.param("static", "last", id="static-last"),
+    pytest.param("long", "first", id="long-first"),
+    pytest.param("long", "last", id="long-last"),
+    pytest.param("long", "chunks", id="long-chunks-grow-last"),
+    pytest.param("long", "chunks+1", id="long-chunks-grow-first"),
     pytest.param("claimed", "first", id="claimed-first"),
-    pytest.param("claimed", "chunks", id="claimed-one-block-chunks-last"),
-    pytest.param("claimed", "chunks+1", id="claimed-two-block-chunks-first"),
+    pytest.param("claimed", "chunks", id="claimed-chunks-grow-last"),
+    pytest.param("claimed", "chunks+1", id="claimed-chunks-grow-first"),
 ]
 
 
@@ -1736,13 +1788,13 @@ def test_backward_tier_edges_within_the_deterministic_error(
     tier, edge, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """At the first and the last rows of each backward program on this
-    device's SM count (``_backward_tiers``: the small-row backwards in their
-    bands, the static backward while the rows
-    have at most ``more_chunks_than_per_sm`` chunks per SM, the claimed
-    backward past that) and where the claimed backward's chunks grow from one
-    block to two (``backward_chunks``): ``module_for_rows`` runs the program
-    from its first to its last rows only, and ``_check_backward`` holds on
-    flat [rows, 128] inputs."""
+    device's SM count (``_backward_tiers``: the programs of the
+    ``BACKWARD_BANDS`` bands, the small-row backwards, then the static, the
+    second static and the claimed backward; on sm_107a the static backward
+    while every chunk has a CTA) and where a program's chunks grow by a block
+    (``backward_chunks``): ``module_for_rows`` runs the program from its first
+    to its last rows only, and ``_check_backward`` holds on flat [rows, 128]
+    inputs."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
@@ -1756,10 +1808,12 @@ def test_backward_tier_edges_within_the_deterministic_error(
         rows = last
     else:
         rule = loader.MODULES[name]["grid_rule"]
-        blocks_per_chunk = 2 if edge == "chunks+1" else 1
-        rows = int(rule["rows_per_block"]) * int(rule["chunk_limit"])
-        rows += blocks_per_chunk - 1
-        assert loader.backward_chunks(name, rows)[0] == blocks_per_chunk
+        span = int(rule["rows_per_block"]) * int(rule["chunk_limit"])
+        k = -(-first // span)
+        rows = k * span + (edge == "chunks+1")
+        if last is not None and rows > last:
+            pytest.skip(f"the {tier} band ({first}-{last} rows) has no such edge")
+        assert loader.backward_chunks(name, rows)[0] == k + (edge == "chunks+1")
     assert loader.module_for_rows(arch, role, rows, sms) == name, (rows, sms)
     if edge == "first" and first > 1:
         assert loader.module_for_rows(arch, role, rows - 1, sms) != name, rows
@@ -1818,6 +1872,53 @@ def test_backward_shapes_within_the_deterministic_error(
 
 
 @requires_device
+@pytest.mark.parametrize("tokens,heads,layout,tier", suite.BULK_BAND_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_layouts_in_the_long_and_claimed_backward_bands_within_the_deterministic_error(
+    tokens,
+    heads,
+    layout,
+    tier,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backend suite's ``BULK_BAND_CASES`` (strided and packed inputs in
+    the bands of the second static and the claimed backward):
+    ``module_for_rows`` runs that program, the launch passes the strides of
+    the layout, which pass the kernels' packed-rows test (``_packed``: ``dy``,
+    ``x`` and ``z`` of one packed row stride, the rows the sm_100a and sm_103a
+    programs warm with a bulk prefetch) for packed rows of more than one token
+    only, and ``_check_backward`` holds (on the other layouts those programs
+    warm the rows with a prefetch per thread)."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    sms = _sm_count()
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=26)
+    rows = x.numel() // D
+    name = loader.module_for_rows(arch, role, rows, sms)
+    assert name == loader.ROUTES[arch][role + tier], (rows, name)
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_strides(monkeypatch)
+    nd_backward(
+        dy,
+        x,
+        z,
+        w,
+        EPS,
+        grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device),
+        workspace=ws,
+    )
+    assert [n for n, _ in launched] == [name], launched
+    packed = layout == "contiguous" and tokens > 1
+    assert _packed(launched[0][1]) == packed, (layout, launched[0][1])
+    assert not bool(ws.any()), "the workspace is not zero"
+    _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch)
+
+
+@requires_device
 @pytest.mark.parametrize("tier", BACKWARD_TIERS)
 @pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
@@ -1827,7 +1928,8 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 ) -> None:
     """Infinite ``grad_out`` in rows that are not the last, on each backward
     program (``_backward_tiers``: each small-row band's last rows, the static
-    backward's last rows, 4097 rows past the claimed backward's first): the
+    and the second static backward's last rows, 4097 rows past the claimed
+    backward's first): the
     weight gradient of the columns holding them is not finite and has the
     FP64 reference's class (an infinity its sign, a ``NaN`` a ``NaN``), every
     other column lies within the error budget of the deterministic package's
@@ -1894,7 +1996,8 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 
 def _block_rows(name: str) -> int:
     """The rows of one row block of the backward module ``name``: 8 for the
-    exact tiny backward's teams and the static and the claimed backward."""
+    exact tiny backward's teams and the static, the second static and the
+    claimed backward."""
     assert name in loader.MODULES, name
     return 8
 
@@ -2002,7 +2105,8 @@ def _packed(strides: dict) -> bool:
     """The kernels' packed-rows test over the strides of one launch: every
     input's head stride is 128 and its token stride ``heads * 128``.  The mid
     and the extra-long forward warm row blocks in L2 with a bulk prefetch only
-    when it holds."""
+    when it holds, and so do the second static and the claimed backward of
+    sm_100a and sm_103a (``dy``, ``x`` and ``z`` of one packed row stride)."""
     heads = int(strides["heads"])
     inputs = [k[: -len("_head")] for k in strides if k.endswith("_head")]
     return bool(inputs) and all(
@@ -2107,12 +2211,17 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 
 
 # The modules that warm rows in L2, by role: the mid and the extra-long
-# forward (row blocks of packed rows) and the claimed backward (the rows of
-# the block two ahead).  The one-head inputs take one row past each one's
-# start (``_start_rows``).
+# forward (row blocks of packed rows), the second static and the claimed
+# backward (on sm_100a and sm_103a a CTA's next block, with a bulk prefetch
+# per tensor where the rows are packed; the claimed backward on sm_107a the
+# rows of the block two ahead; its second static backward warms none and runs
+# here too).  The one-head inputs take one row past each one's start
+# (``_start_rows``).
 ONE_HEAD_ROUTES = [
     pytest.param("fwd", "fwd_mid", id="fwd_mid"),
     pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
+    pytest.param("bwd_bf16", "bwd_bf16_long", id="bwd_bf16_long"),
+    pytest.param("bwd_f32", "bwd_f32_long", id="bwd_f32_long"),
     pytest.param("bwd_bf16", "bwd_bf16_mid", id="bwd_bf16_claimed"),
     pytest.param("bwd_f32", "bwd_f32_mid", id="bwd_f32_claimed"),
 ]
@@ -2124,10 +2233,11 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     role, tier, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One row past the start of the mid and the extra-long forward and of the
-    claimed backward: a one-head input of every layout (``ONE_HEAD_LAYOUTS``)
-    launches ``module_for_rows``' module with head stride 128, passes the
-    packed-rows test exactly when its rows follow one another (or the host
-    copied it), and returns the same ``y``, or ``dx``, ``dz`` and ``dw``, bits
+    second static and the claimed backward: a one-head input of every layout
+    (``ONE_HEAD_LAYOUTS``) launches ``module_for_rows``' module with head
+    stride 128, passes the packed-rows test exactly when its rows follow one
+    another (or the host copied it), and returns the same ``y``, or ``dx``,
+    ``dz`` and ``dw``, bits
     for every layout and repeat, with the workspace zero after every call,
     ``dx`` and ``dz`` the deterministic package's bits on the flat rows; those
     lie within the error budget of the deterministic package's on the flat
@@ -2197,11 +2307,12 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
 # below FP32's smallest subnormal, 2^-149 (``x`` 1, ``z`` 2^-133, the smallest
 # BF16 subnormal, so ``silu(z)`` is 2^-134 exactly; ``dy`` 2^-16 .. 2^-14 by
 # column): each term rounds to 0 or 2^-149 in FP32, the same in every row, so
-# the error grows with the rows.  Row counts of the short (a BF16 weight
-# gradient), the static and the claimed backward.
+# the error grows with the rows.  Row counts of the small-row, the static, the
+# second static (65536 rows) and the claimed backward (262144 rows).
 SUBNORMAL_SHAPES = [
     pytest.param(16, 1, id="16x1"),
     pytest.param(4096, 1, id="4096x1"),
+    pytest.param(2048, 32, id="2048x32"),
     pytest.param(8192, 32, id="8192x32"),
 ]
 
