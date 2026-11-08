@@ -9705,6 +9705,35 @@ def test_device_budget_frozen_inputs_and_retained_graph(glm_weight):
         loss.backward()
 
 
+@pytest.mark.parametrize("compact", [True, False])
+def test_device_budget_recompute_saves_its_labels(glm_weight, compact):
+    """A loss call whose budget form recomputes ``dW`` saves its labels through the autograd context (an uncompacted
+    call's recompute reads the caller's labels tensor itself): an in-place write to them between the forward and the
+    backward raises PyTorch's saved-tensor version error.  A backward under ``create_graph=True`` (its recompute
+    gathers the compacted rows of an ``X`` that requires a gradient into ``out=`` buffers) gives the fast form's
+    bits."""
+    _require_program(entry="loss")
+    _require_recompute()
+    inp = make_inputs(
+        8700, seed=SEED + 8700, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    kw = dict(backend="cake", memory_mode="budget", compact_rows=compact)
+    if not compact:
+        kw["num_valid_rows"] = int(inp.valid.sum())
+    fast = _run(inp, 4096, backend="cake", compact_rows=compact)
+    X, W, loss = _loss_graph(inp, 4096, **kw)
+    assert loss.grad_fn.memory_plan is not None and loss.grad_fn.memory_plan.recompute
+    dX, dW = torch.autograd.grad(loss, (X, W), create_graph=True)
+    assert torch.equal(_bits(dX), _bits(fast["dX"]))
+    assert torch.equal(_bits(dW), _bits(fast["dW"]))
+    labels = inp.labels.clone()
+    X, W, loss = _loss_graph(replace(inp, labels=labels), 4096, **kw)
+    assert loss.grad_fn.memory_plan is not None and loss.grad_fn.memory_plan.recompute
+    labels.add_(0)  # the same values, a new version
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        loss.backward()
+
+
 def test_device_given_count_is_bitwise_and_does_not_synchronize(glm_weight):
     """``num_valid_rows`` on the device: bitwise (integer views) the counted call's outputs -- one and three chunks,
     some rows ignored and none, both objectives and the log-probability entry, fast, the default automatic form and

@@ -701,8 +701,10 @@ def _clear_binding_caches():
 def measure_perf(arm, steps):
     """Median forward / backward / step milliseconds (``step_ms`` from the remembered bindings, ``step_miss_ms`` with
     the binding caches cleared before every step: the miss a new valid-row count takes, usually every training
-    batch), the peak allocation above the live tensors during the forward and during the backward (the timed
-    backward, which retains the graph), the bytes the forward leaves alive for the backward, and the step peak of a
+    batch; a step's backward frees the graph where the arm has :meth:`ArmAutograd.free_backward`, as a training step
+    does, so the entries that release their saved state early do), the peak allocation above the live tensors during
+    the forward and during the backward (the timed backward, which retains the graph), the bytes the forward leaves
+    alive for the backward, and the step peak of a
     step whose backward frees the graph (:func:`_step_peak`) from the remembered bindings (``step_peak_hit_*``) and
     after the caches were cleared (``step_peak_miss_*``), each with its ratio to ``B`` (:func:`_head_bytes`);
     ``step_peak_gib`` / ``step_peak_over_b``: the larger of the two."""
@@ -713,9 +715,11 @@ def measure_perf(arm, steps):
     fwd_ms = median_ms(arm.forward, steps)
     bwd_ms = median_ms(lambda: arm.backward(saved[0]), steps)
 
+    step_backward = getattr(arm, "free_backward", arm.backward)
+
     def full():
         s = arm.forward()
-        arm.backward(s)
+        step_backward(s)
 
     step_ms = median_ms(full, steps)
 
@@ -990,6 +994,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
+    if args.ignore_frac is not None and not 0 <= args.ignore_frac <= 1:
+        parser.error("--ignore-frac must be between 0 and 1")
     ArmCake.memory_mode = None if args.memory_mode == "default" else args.memory_mode
     args.arms = [a for a in args.arms.split(",") if a]
     unknown = sorted(set(args.arms) - set(ARMS))

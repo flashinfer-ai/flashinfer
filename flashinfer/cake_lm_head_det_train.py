@@ -242,9 +242,10 @@ def cake_lm_head_det_train_loss(
         buffer lifetimes, stays within ``B`` less the 2 % margin below, else
         the ``"budget"`` form the planner picks when one fits, else the
         fastest form (``cake_backend_opt_in.auto_memory_plan``).  A call whose
-        valid rows fit one chunk keeps the fastest form: it holds no FP32
-        ``[V, H]`` accumulator, and its step peak can exceed ``B`` by its
-        outputs (see the package README).  It plans on
+        valid rows fit one chunk keeps the fastest form: with the fused
+        weight-gradient cast (``fuse_dw_cast``, on by default) it holds no
+        FP32 ``[V, H]`` accumulator (without it, it does), and its step peak
+        can exceed ``B`` (see the package README).  It plans on
         the valid rows of the forward's count or of ``num_valid_rows``; an
         uncompacted call without ``num_valid_rows`` keeps the fastest form,
         as does every call without such a ``dW``.  ``"fast"``: always the

@@ -5850,6 +5850,9 @@ def _dw_vocab_blocks(
     ``d_rows``, the log-probability entry's ``dlogp``), ``grad`` the upstream scalar (``None`` = 1)."""
     p = plan.problem
     H, V = int(p.hidden), int(p.vocab)
+    # detached views (same storage): the row gather writes ``out=`` buffers, which a backward under
+    # ``create_graph=True`` rejects for an input that requires a gradient; the recompute records no graph either way
+    X, W = X.detach(), W.detach()
     device = X.device
     module_name, record = record_for(device)
     geometry = Geometry.from_record(record)
@@ -6057,6 +6060,9 @@ def _dw_vocab_blocks_temperature(
     ``d_rows``, the log-probability entry's ``dlogp``), ``grad`` the upstream scalar (``None`` = 1)."""
     p = plan.problem
     H, V = int(p.hidden), int(p.vocab)
+    # detached views (same storage): the row gather writes ``out=`` buffers, which a backward under
+    # ``create_graph=True`` rejects for an input that requires a gradient; the recompute records no graph either way
+    X, W = X.detach(), W.detach()
     device = X.device
     module_name, record = record_for(device)
     geometry = Geometry.from_record(record)
@@ -7366,14 +7372,21 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
         # input X (or X itself with the chunk's row index when compacted) -- saved through the autograd context so an
         # in-place write to X between the forward and the backward raises PyTorch's saved-tensor version error
         # instead of yielding a stale dW.  ``memory_mode="budget"``: the picked form (``None`` = the fast form); a
-        # recompute form also saves X and W likewise and keeps the row state and plan its recompute reads
+        # recompute form also saves X, W and labels likewise (an uncompacted call's row-state labels are the caller's
+        # tensor itself) and keeps the row state and plan its recompute reads
         if result.memory_plan is None or not result.memory_plan.recompute:
             ctx.save_for_backward(
                 result.dz_last, result.x_last, result.x_src, result.x_idx
             )
         else:
             ctx.save_for_backward(
-                result.dz_last, result.x_last, result.x_src, result.x_idx, X, W
+                result.dz_last,
+                result.x_last,
+                result.x_src,
+                result.x_idx,
+                X,
+                W,
+                labels,
             )
         CakeLMHeadDetLossFunction._keep(ctx, result)
         ctx.mark_non_differentiable(result.logp)
@@ -7475,7 +7488,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
         if saved is None:
             saved = ctx.saved_tensors
         if mplan is not None and mplan.recompute:
-            dz_last, x_last, x_src, x_idx, X, W = saved
+            # (the saved labels only version-check the row state's labels; a checkpointed call saves its inputs)
+            dz_last, x_last, x_src, x_idx, X, W = saved[:6]
         else:
             mplan = None  # the fast form, or a budget form without a recompute: the weight gradient as before
             dz_last, x_last, x_src, x_idx = saved

@@ -385,9 +385,11 @@ keyword.
   A checkpointed default call learns its form from the recomputation in its
   backward and releases the same way.  In the fast form the saved state
   lives until the graph is freed.  In every form, `cake_backend.py`'s and
-  `cake_backend_opt_in.py`'s, `backward_logprob` drops its runner (the chunk
-  workspace) before the `dX` output is allocated.  Lifetimes only: every
-  output is bitwise the same.
+  `cake_backend_opt_in.py`'s, a compacted `backward_logprob` drops its runner
+  (the chunk workspace) before it allocates the `[T, H]` `dX` output (the
+  finalize or scatter); an uncompacted call's `dX` is the runner's own cast
+  output, allocated with its workspace.  Lifetimes only: every output is
+  bitwise the same.
 * Memory budget (`memory_mode`, keyword of `cake_lm_head_det_train_loss` /
   `cake_lm_head_det_train_logprob`, default `None`, the automatic form below;
   `"fast"` always runs the fast form; `"budget"` is opt-in, `cake` backend and
@@ -412,9 +414,9 @@ keyword.
   `dW[v0:v1]`.  Every element of `dW` sees the same FP32 operations in the same
   order as in the fast form, so `loss`, `logp`, `dX` and `dW` are bitwise the
   fast form's; the recompute forms run up to one more logits GEMM per chunk,
-  so they are slower.  The loss entry saves `X` and `W` for the recompute (an
-  in-place write between the forward and the backward raises PyTorch's
-  saved-tensor version error); the log-probability entry plans its backward
+  so they are slower.  The loss entry saves `X`, `W` and the labels for the
+  recompute (an in-place write between the forward and the backward raises
+  PyTorch's saved-tensor version error); the log-probability entry plans its backward
   only.  `T_v` counts the valid rows also when `compact_rows=False` (the
   chunk loop then runs over all `T` rows, the budget still covers the logits
   of the valid rows only).  Without a caller's count, a `"budget"` call counts
@@ -459,8 +461,9 @@ keyword.
   valid rows at `H = 6144`, `V = 154880`, `C = 4096`, about 13 500 at
   `H = 4096`.  A one-chunk call always exceeds `B` in the fast form (its
   deferred chunk holds the logits of every valid row beside both gradient
-  outputs and the FP32 `dX` accumulator), but it holds no FP32 `[V, H]`
-  accumulator, so its excess is small; with the shipped value 2 it keeps
+  outputs and the FP32 `dX` accumulator), but with the fused weight-gradient
+  cast (the default) it holds no FP32 `[V, H]` accumulator, so its excess is
+  small; with the shipped value 2 it keeps
   the fast form and its step peak exceeds `B` (measured 1.02-1.12 `B` at
   `H = 6144` and `H = 4096`, `T` 2048-4097, 5 % of the labels ignored),
   while a budget form there recomputes most of the vocabulary and costs
@@ -955,7 +958,10 @@ at their backend defaults (no variable), reaches the kept logits through
 variable either) and the non-switch keywords `num_valid_rows` /
 `check_num_valid_rows` through unchanged; it routes a call whose
 `memory_mode` is `None` (the automatic form) to `cake_backend_opt_in.py` when
-grad mode is on and `W` requires a gradient.  The switch variables are inputs
+`W` requires a gradient, whatever the grad mode: with grad mode on its
+automatic form can pick a budget backward, with grad mode off (a reentrant
+checkpoint's first pass) its hidden valid-row count is still checked against
+the step's bound.  The switch variables are inputs
 of the automatic form's rule, so they can change its chosen form.  The gradient placement of the loss
 entry is a process setting of the backend
 (`cake_backend.set_gradient_placement`, see "Public entry points"), neither a

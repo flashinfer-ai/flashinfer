@@ -46,7 +46,8 @@ rounds.  ``speedup`` is ``det / nondet`` of the medians (above 1: the non-determ
 ``--det-memory-mode`` selects the deterministic mode's memory form in its public entries (``step``, ``ckpt``, the
 memory and sanity records): ``fast`` (the default; ``memory_mode="fast"``, the form of the non-deterministic mode's
 default and of the explicit ``fwd`` / ``bwd`` pair) or ``auto`` (``memory_mode=None``, the deterministic default,
-which switches to a budget form where the fast form's step peak would exceed the logits-materializing head's bytes).
+which switches a call of two or more chunks to a budget form, when one fits, where the fast form's predicted step peak
+would exceed the logits-materializing head's bytes less a 2 % margin; a one-chunk call keeps the fast form).
 The report records it (``env.det_memory_mode``).
 
 Example::
