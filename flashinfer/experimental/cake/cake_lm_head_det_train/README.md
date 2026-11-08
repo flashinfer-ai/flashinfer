@@ -320,7 +320,9 @@ keyword.
 * Memory rule (except the opt-in kept logits above): no logits, probability or
   `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
-  an empty `logp` and zero gradients without binding or launching.
+  an empty `logp` and zero gradients without binding or launching (`dW` is
+  the FP32 product `0 * g` of the upstream scalar `g` cast once, as for a
+  launched call: `-0` for a negative `g`, NaN for a non-finite one).
   `cake_backend.memory_report` reports the peak temporary bytes separately
   from the weights, the outputs and the FP32 accumulators.
 * Opt-in forms (`cake_backend_opt_in.py`): a call that passes `memory_mode`

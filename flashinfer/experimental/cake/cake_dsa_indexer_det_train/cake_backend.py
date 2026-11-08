@@ -30,8 +30,10 @@ Contract (the issue text is authoritative)
   >= 1``; ``max_seqlen_q`` is an accepted host mirror that no launch decision
   reads; ``max_seqlen_k`` (the caller's bound on every key segment, optional)
   sizes the rank finalize's bitmap pool and so selects its program variant
-  (``rank_seg_window``) -- never a result; a value above ``Tkv`` or below
-  ``ceil(Tkv / S)`` is rejected.
+  (``rank_seg_window``), and where the record ships ``lsf_programs`` it runs a
+  packed call whose key segments all have that length (``Tkv == S *
+  max_seqlen_k``) without the ``:lsf`` copy -- never a result; a value above
+  ``Tkv`` or below ``ceil(Tkv / S)`` is rejected.
 * Outputs ``indices [T, top_k]`` int32 segment-local key ids and ``scores [T,
   top_k]`` FP32, both in ascending id order with the tail padded by ``-1`` /
   ``-inf``; an entirely empty row holds only padding.

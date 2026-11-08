@@ -3987,7 +3987,8 @@ def _empty_forward(
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
     report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
     result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
-    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype."""
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype, and the
+    memory report counts the accumulator's one FP32 element."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -4004,6 +4005,9 @@ def _empty_forward(
         fuse_dw_cast=fuse_dw_cast,
         dx_finalize=dx_finalize,
     )
+    if problem.entry == "loss" and "dW_acc" in memory["accumulators"]:
+        memory["accumulators"]["dW_acc"] = 4  # the zero accumulator's one element
+        memory["accumulator_bytes"] = sum(memory["accumulators"].values())
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
@@ -4217,6 +4221,7 @@ def forward_loss(
             need_dw=need_dw,
             fuse_dw_cast=fuse_dw_cast,
             dx_finalize=dx_finalize,
+            backend=backend,
         )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
@@ -6803,12 +6808,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
             dw = (
                 None
                 if ctx.dw_acc is None
-                else torch.zeros(
-                    ctx.dw_acc.shape,
-                    dtype=ctx.grad_weight_dtype,
-                    device=ctx.dw_acc.device,
-                )
-            )
+                else _zero_gradient(ctx.dw_acc, grad_loss, ctx.grad_weight_dtype)
+            )  # cast(g * 0), as ForwardResult.backward forms it
             if not keep:
                 CakeLMHeadDetLossFunction._release(ctx)
             return (dx, dw) + none[2:]

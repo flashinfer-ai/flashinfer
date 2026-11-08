@@ -7,7 +7,8 @@ caller-owned FP32 destination rows through a row map: the Cake arm adds them in 
 FlashAttention arm (``flash_attn.cute``, when installed) returns BF16 window gradients and the step then zeroes the
 destinations and adds them with ``index_add_`` (the issue's packed-CP adapter), so initialization counts on both
 sides.  Both arms see identical generated inputs; the arms alternate within each repetition and the median of the
-repetitions is reported, per stage and per step, with the workspace bytes.
+repetitions is reported, per stage and per step, with the workspace bytes (the scratch a workspace keeps plus the
+backward's per-call dS^T chunk and FP32 window gradients at the workspace budget, ``--budget-gib``, default 16).
 
 Layouts are context-parallel zigzag packs: each document is cut into ``2 CP`` chunks; rank ``r`` holds chunks ``r``
 and ``2 CP - 1 - r``, and a chunk's key window is the document's prefix up to the chunk's end (bottom-right causal).
@@ -178,8 +179,10 @@ def make_inputs(lay, device: torch.device, seed: int = 0) -> dict[str, Any]:
 class CakeArm:
     name = "cake"
 
-    def __init__(self, x: dict[str, Any]) -> None:
-        self.ws = cake_gqa_nondet_train_workspace(x["q"].device)
+    def __init__(self, x: dict[str, Any], budget_bytes: int | None = None) -> None:
+        self.ws = cake_gqa_nondet_train_workspace(
+            x["q"].device, budget_bytes=budget_bytes
+        )
 
     def stages(self, x: dict[str, Any]) -> list[tuple[str, Callable[[], Any]]]:
         state: dict[str, Any] = {}
@@ -278,7 +281,14 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--budget-gib",
+        type=float,
+        default=None,
+        help="dS^T workspace budget of the Cake backward in GiB (default: the package's, 16)",
+    )
     args = parser.parse_args()
+    budget = None if args.budget_gib is None else int(args.budget_gib * 2**30)
     device = torch.device("cuda", torch.cuda.current_device())
     rows = []
     for name in args.layouts.split(","):
@@ -287,7 +297,9 @@ def main() -> int:
         arms = []
         for arm in args.arms.split(","):
             try:
-                arms.append(CakeArm(x) if arm == "cake" else FlashAttentionArm(x))
+                arms.append(
+                    CakeArm(x, budget) if arm == "cake" else FlashAttentionArm(x)
+                )
             except ImportError as exc:
                 print(f"{name}: arm {arm} unavailable ({exc})", file=sys.stderr)
         samples: dict[str, list[dict[str, float]]] = {arm.name: [] for arm in arms}
@@ -306,7 +318,14 @@ def main() -> int:
             "max_q": max(lay[0]),
             "max_k": max(lay[1]),
             "workspace_bytes": cake_gqa_nondet_train_workspace_bytes(
-                sum(lay[0]), H_Q, len(lay[0])
+                sum(lay[0]),
+                H_Q,
+                len(lay[0]),
+                total_k=sum(lay[1]),
+                num_heads_kv=H_KV,
+                max_seqlen_k=max(lay[1]),
+                row_map=True,
+                budget_bytes=budget,
             ),
             "gpu": torch.cuda.get_device_name(device),
             "cuda": torch.version.cuda,

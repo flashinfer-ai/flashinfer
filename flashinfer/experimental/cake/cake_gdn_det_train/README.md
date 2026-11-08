@@ -28,8 +28,8 @@ DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  Every launch is a plain
 stream-ordered kernel: no atomic on a value (the wavefront pair below counts
 stored tiles with atomic counters, whose order no value depends on), no
-data-dependent ordering, so the outputs and every gradient are bitwise the same
-run to run for one layout and one plan.  Some stages run as two groups of sequences on the caller's stream and a
+data-dependent ordering, so the outputs and every gradient repeat bit for bit
+from run to run for one layout and one plan.  Some stages run as two groups of sequences on the caller's stream and a
 side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 

@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -132,8 +129,8 @@ __device__ __noinline__ unsigned int band_pair(__nv_bfloat16* src, int index, in
     }
     float2 cvt_f32 = cake_bf16x2_to_f32x2(__as_bf16x2(_vec_load_0[0]));
     float2 cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(_vec_load_1[0]));
-    float e0 = approx_exp2((-cvt_f32.x) * 1.442695f);
-    float e1 = approx_exp2((-cvt_f32.y) * 1.442695f);
+    float e0 = approx_exp2(-cvt_f32.x * 1.442695f);
+    float e1 = approx_exp2(-cvt_f32.y * 1.442695f);
     float d0 = 1.0f + e0;
     float d1 = 1.0f + e1;
     float r0 = approx_rcp(d0);
@@ -340,8 +337,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
     if (_warp_vote_4 != 0) {
         float2 cvt_f32 = cake_bf16x2_to_f32x2(__as_bf16x2(words[0]));
         float2 cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[0]));
-        float e0 = approx_exp2((-cvt_f32.x) * 1.442695f);
-        float e1 = approx_exp2((-cvt_f32.y) * 1.442695f);
+        float e0 = approx_exp2(-cvt_f32.x * 1.442695f);
+        float e1 = approx_exp2(-cvt_f32.y * 1.442695f);
         float d0 = 1.0f + e0;
         float d1 = 1.0f + e1;
         float r0 = approx_rcp(d0);
@@ -360,8 +357,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[0] = __as_u32(__float22bfloat162_rn(make_float2(mul.x, mul.y)));
         float2 cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(words[1]));
         float2 cvt_f32_1_0 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[1]));
-        float e0_0 = approx_exp2((-cvt_f32_0.x) * 1.442695f);
-        float e1_0 = approx_exp2((-cvt_f32_0.y) * 1.442695f);
+        float e0_0 = approx_exp2(-cvt_f32_0.x * 1.442695f);
+        float e1_0 = approx_exp2(-cvt_f32_0.y * 1.442695f);
         float d0_0 = 1.0f + e0_0;
         float d1_0 = 1.0f + e1_0;
         float r0_0 = approx_rcp(d0_0);
@@ -380,8 +377,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[1] = __as_u32(__float22bfloat162_rn(make_float2(mul_0.x, mul_0.y)));
         float2 cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(words[2]));
         float2 cvt_f32_1_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[2]));
-        float e0_1 = approx_exp2((-cvt_f32_2.x) * 1.442695f);
-        float e1_1 = approx_exp2((-cvt_f32_2.y) * 1.442695f);
+        float e0_1 = approx_exp2(-cvt_f32_2.x * 1.442695f);
+        float e1_1 = approx_exp2(-cvt_f32_2.y * 1.442695f);
         float d0_1 = 1.0f + e0_1;
         float d1_1 = 1.0f + e1_1;
         float r0_1 = approx_rcp(d0_1);
@@ -400,8 +397,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[2] = __as_u32(__float22bfloat162_rn(make_float2(mul_1.x, mul_1.y)));
         float2 cvt_f32_3 = cake_bf16x2_to_f32x2(__as_bf16x2(words[3]));
         float2 cvt_f32_1_2 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[3]));
-        float e0_2 = approx_exp2((-cvt_f32_3.x) * 1.442695f);
-        float e1_2 = approx_exp2((-cvt_f32_3.y) * 1.442695f);
+        float e0_2 = approx_exp2(-cvt_f32_3.x * 1.442695f);
+        float e1_2 = approx_exp2(-cvt_f32_3.y * 1.442695f);
         float d0_2 = 1.0f + e0_2;
         float d1_2 = 1.0f + e1_2;
         float r0_2 = approx_rcp(d0_2);
@@ -420,8 +417,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[3] = __as_u32(__float22bfloat162_rn(make_float2(mul_2.x, mul_2.y)));
         float2 cvt_f32_4 = cake_bf16x2_to_f32x2(__as_bf16x2(words[4]));
         float2 cvt_f32_1_3 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[4]));
-        float e0_3 = approx_exp2((-cvt_f32_4.x) * 1.442695f);
-        float e1_3 = approx_exp2((-cvt_f32_4.y) * 1.442695f);
+        float e0_3 = approx_exp2(-cvt_f32_4.x * 1.442695f);
+        float e1_3 = approx_exp2(-cvt_f32_4.y * 1.442695f);
         float d0_3 = 1.0f + e0_3;
         float d1_3 = 1.0f + e1_3;
         float r0_3 = approx_rcp(d0_3);
@@ -440,8 +437,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[4] = __as_u32(__float22bfloat162_rn(make_float2(mul_3.x, mul_3.y)));
         float2 cvt_f32_5 = cake_bf16x2_to_f32x2(__as_bf16x2(words[5]));
         float2 cvt_f32_1_4 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[5]));
-        float e0_4 = approx_exp2((-cvt_f32_5.x) * 1.442695f);
-        float e1_4 = approx_exp2((-cvt_f32_5.y) * 1.442695f);
+        float e0_4 = approx_exp2(-cvt_f32_5.x * 1.442695f);
+        float e1_4 = approx_exp2(-cvt_f32_5.y * 1.442695f);
         float d0_4 = 1.0f + e0_4;
         float d1_4 = 1.0f + e1_4;
         float r0_4 = approx_rcp(d0_4);
@@ -460,8 +457,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[5] = __as_u32(__float22bfloat162_rn(make_float2(mul_4.x, mul_4.y)));
         float2 cvt_f32_6 = cake_bf16x2_to_f32x2(__as_bf16x2(words[6]));
         float2 cvt_f32_1_5 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[6]));
-        float e0_5 = approx_exp2((-cvt_f32_6.x) * 1.442695f);
-        float e1_5 = approx_exp2((-cvt_f32_6.y) * 1.442695f);
+        float e0_5 = approx_exp2(-cvt_f32_6.x * 1.442695f);
+        float e1_5 = approx_exp2(-cvt_f32_6.y * 1.442695f);
         float d0_5 = 1.0f + e0_5;
         float d1_5 = 1.0f + e1_5;
         float r0_5 = approx_rcp(d0_5);
@@ -480,8 +477,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[6] = __as_u32(__float22bfloat162_rn(make_float2(mul_5.x, mul_5.y)));
         float2 cvt_f32_7 = cake_bf16x2_to_f32x2(__as_bf16x2(words[7]));
         float2 cvt_f32_1_6 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[7]));
-        float e0_6 = approx_exp2((-cvt_f32_7.x) * 1.442695f);
-        float e1_6 = approx_exp2((-cvt_f32_7.y) * 1.442695f);
+        float e0_6 = approx_exp2(-cvt_f32_7.x * 1.442695f);
+        float e1_6 = approx_exp2(-cvt_f32_7.y * 1.442695f);
         float d0_6 = 1.0f + e0_6;
         float d1_6 = 1.0f + e1_6;
         float r0_6 = approx_rcp(d0_6);
@@ -500,8 +497,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[7] = __as_u32(__float22bfloat162_rn(make_float2(mul_6.x, mul_6.y)));
         float2 cvt_f32_8 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[0]));
         float2 cvt_f32_1_7 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[0]));
-        float e0_7 = approx_exp2((-cvt_f32_8.x) * 1.442695f);
-        float e1_7 = approx_exp2((-cvt_f32_8.y) * 1.442695f);
+        float e0_7 = approx_exp2(-cvt_f32_8.x * 1.442695f);
+        float e1_7 = approx_exp2(-cvt_f32_8.y * 1.442695f);
         float d0_7 = 1.0f + e0_7;
         float d1_7 = 1.0f + e1_7;
         float r0_7 = approx_rcp(d0_7);
@@ -520,8 +517,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[0] = __as_u32(__float22bfloat162_rn(make_float2(mul_7.x, mul_7.y)));
         float2 cvt_f32_9 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[1]));
         float2 cvt_f32_1_8 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[1]));
-        float e0_8 = approx_exp2((-cvt_f32_9.x) * 1.442695f);
-        float e1_8 = approx_exp2((-cvt_f32_9.y) * 1.442695f);
+        float e0_8 = approx_exp2(-cvt_f32_9.x * 1.442695f);
+        float e1_8 = approx_exp2(-cvt_f32_9.y * 1.442695f);
         float d0_8 = 1.0f + e0_8;
         float d1_8 = 1.0f + e1_8;
         float r0_8 = approx_rcp(d0_8);
@@ -540,8 +537,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[1] = __as_u32(__float22bfloat162_rn(make_float2(mul_8.x, mul_8.y)));
         float2 cvt_f32_10 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[2]));
         float2 cvt_f32_1_9 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[2]));
-        float e0_9 = approx_exp2((-cvt_f32_10.x) * 1.442695f);
-        float e1_9 = approx_exp2((-cvt_f32_10.y) * 1.442695f);
+        float e0_9 = approx_exp2(-cvt_f32_10.x * 1.442695f);
+        float e1_9 = approx_exp2(-cvt_f32_10.y * 1.442695f);
         float d0_9 = 1.0f + e0_9;
         float d1_9 = 1.0f + e1_9;
         float r0_9 = approx_rcp(d0_9);
@@ -560,8 +557,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[2] = __as_u32(__float22bfloat162_rn(make_float2(mul_9.x, mul_9.y)));
         float2 cvt_f32_11 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[3]));
         float2 cvt_f32_1_10 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[3]));
-        float e0_10 = approx_exp2((-cvt_f32_11.x) * 1.442695f);
-        float e1_10 = approx_exp2((-cvt_f32_11.y) * 1.442695f);
+        float e0_10 = approx_exp2(-cvt_f32_11.x * 1.442695f);
+        float e1_10 = approx_exp2(-cvt_f32_11.y * 1.442695f);
         float d0_10 = 1.0f + e0_10;
         float d1_10 = 1.0f + e1_10;
         float r0_10 = approx_rcp(d0_10);
@@ -580,8 +577,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[3] = __as_u32(__float22bfloat162_rn(make_float2(mul_10.x, mul_10.y)));
         float2 cvt_f32_12 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[4]));
         float2 cvt_f32_1_11 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[4]));
-        float e0_11 = approx_exp2((-cvt_f32_12.x) * 1.442695f);
-        float e1_11 = approx_exp2((-cvt_f32_12.y) * 1.442695f);
+        float e0_11 = approx_exp2(-cvt_f32_12.x * 1.442695f);
+        float e1_11 = approx_exp2(-cvt_f32_12.y * 1.442695f);
         float d0_11 = 1.0f + e0_11;
         float d1_11 = 1.0f + e1_11;
         float r0_11 = approx_rcp(d0_11);
@@ -600,8 +597,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[4] = __as_u32(__float22bfloat162_rn(make_float2(mul_11.x, mul_11.y)));
         float2 cvt_f32_13 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[5]));
         float2 cvt_f32_1_12 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[5]));
-        float e0_12 = approx_exp2((-cvt_f32_13.x) * 1.442695f);
-        float e1_12 = approx_exp2((-cvt_f32_13.y) * 1.442695f);
+        float e0_12 = approx_exp2(-cvt_f32_13.x * 1.442695f);
+        float e1_12 = approx_exp2(-cvt_f32_13.y * 1.442695f);
         float d0_12 = 1.0f + e0_12;
         float d1_12 = 1.0f + e1_12;
         float r0_12 = approx_rcp(d0_12);
@@ -620,8 +617,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[5] = __as_u32(__float22bfloat162_rn(make_float2(mul_12.x, mul_12.y)));
         float2 cvt_f32_14 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[6]));
         float2 cvt_f32_1_13 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[6]));
-        float e0_13 = approx_exp2((-cvt_f32_14.x) * 1.442695f);
-        float e1_13 = approx_exp2((-cvt_f32_14.y) * 1.442695f);
+        float e0_13 = approx_exp2(-cvt_f32_14.x * 1.442695f);
+        float e1_13 = approx_exp2(-cvt_f32_14.y * 1.442695f);
         float d0_13 = 1.0f + e0_13;
         float d1_13 = 1.0f + e1_13;
         float r0_13 = approx_rcp(d0_13);
@@ -640,8 +637,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[6] = __as_u32(__float22bfloat162_rn(make_float2(mul_13.x, mul_13.y)));
         float2 cvt_f32_15 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[7]));
         float2 cvt_f32_1_14 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[7]));
-        float e0_14 = approx_exp2((-cvt_f32_15.x) * 1.442695f);
-        float e1_14 = approx_exp2((-cvt_f32_15.y) * 1.442695f);
+        float e0_14 = approx_exp2(-cvt_f32_15.x * 1.442695f);
+        float e1_14 = approx_exp2(-cvt_f32_15.y * 1.442695f);
         float d0_14 = 1.0f + e0_14;
         float d1_14 = 1.0f + e1_14;
         float r0_14 = approx_rcp(d0_14);
@@ -662,8 +659,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         int band = 0;
         float2 cvt_f32_16 = cake_bf16x2_to_f32x2(__as_bf16x2(words[0]));
         float2 cvt_f32_1_15 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[0]));
-        float e0_15 = approx_exp2((-cvt_f32_16.x) * 1.442695f);
-        float e1_15 = approx_exp2((-cvt_f32_16.y) * 1.442695f);
+        float e0_15 = approx_exp2(-cvt_f32_16.x * 1.442695f);
+        float e1_15 = approx_exp2(-cvt_f32_16.y * 1.442695f);
         float d0_15 = 1.0f + e0_15;
         float d1_15 = 1.0f + e1_15;
         float r0_15 = approx_rcp(d0_15);
@@ -685,8 +682,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[0] = __as_u32(__float22bfloat162_rn(make_float2(mul_15.x, mul_15.y)));
         float2 cvt_f32_16_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words[1]));
         float2 cvt_f32_1_15_1 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[1]));
-        float e0_15_1 = approx_exp2((-cvt_f32_16_1.x) * 1.442695f);
-        float e1_15_1 = approx_exp2((-cvt_f32_16_1.y) * 1.442695f);
+        float e0_15_1 = approx_exp2(-cvt_f32_16_1.x * 1.442695f);
+        float e1_15_1 = approx_exp2(-cvt_f32_16_1.y * 1.442695f);
         float d0_15_1 = 1.0f + e0_15_1;
         float d1_15_1 = 1.0f + e1_15_1;
         float r0_15_1 = approx_rcp(d0_15_1);
@@ -708,8 +705,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[1] = __as_u32(__float22bfloat162_rn(make_float2(mul_15_1.x, mul_15_1.y)));
         float2 cvt_f32_17 = cake_bf16x2_to_f32x2(__as_bf16x2(words[2]));
         float2 cvt_f32_1_16 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[2]));
-        float e0_16 = approx_exp2((-cvt_f32_17.x) * 1.442695f);
-        float e1_16 = approx_exp2((-cvt_f32_17.y) * 1.442695f);
+        float e0_16 = approx_exp2(-cvt_f32_17.x * 1.442695f);
+        float e1_16 = approx_exp2(-cvt_f32_17.y * 1.442695f);
         float d0_16 = 1.0f + e0_16;
         float d1_16 = 1.0f + e1_16;
         float r0_16 = approx_rcp(d0_16);
@@ -731,8 +728,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[2] = __as_u32(__float22bfloat162_rn(make_float2(mul_16.x, mul_16.y)));
         float2 cvt_f32_18 = cake_bf16x2_to_f32x2(__as_bf16x2(words[3]));
         float2 cvt_f32_1_17 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[3]));
-        float e0_17 = approx_exp2((-cvt_f32_18.x) * 1.442695f);
-        float e1_17 = approx_exp2((-cvt_f32_18.y) * 1.442695f);
+        float e0_17 = approx_exp2(-cvt_f32_18.x * 1.442695f);
+        float e1_17 = approx_exp2(-cvt_f32_18.y * 1.442695f);
         float d0_17 = 1.0f + e0_17;
         float d1_17 = 1.0f + e1_17;
         float r0_17 = approx_rcp(d0_17);
@@ -754,8 +751,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[3] = __as_u32(__float22bfloat162_rn(make_float2(mul_17.x, mul_17.y)));
         float2 cvt_f32_19 = cake_bf16x2_to_f32x2(__as_bf16x2(words[4]));
         float2 cvt_f32_1_18 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[4]));
-        float e0_18 = approx_exp2((-cvt_f32_19.x) * 1.442695f);
-        float e1_18 = approx_exp2((-cvt_f32_19.y) * 1.442695f);
+        float e0_18 = approx_exp2(-cvt_f32_19.x * 1.442695f);
+        float e1_18 = approx_exp2(-cvt_f32_19.y * 1.442695f);
         float d0_18 = 1.0f + e0_18;
         float d1_18 = 1.0f + e1_18;
         float r0_18 = approx_rcp(d0_18);
@@ -777,8 +774,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[4] = __as_u32(__float22bfloat162_rn(make_float2(mul_18.x, mul_18.y)));
         float2 cvt_f32_20 = cake_bf16x2_to_f32x2(__as_bf16x2(words[5]));
         float2 cvt_f32_1_19 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[5]));
-        float e0_19 = approx_exp2((-cvt_f32_20.x) * 1.442695f);
-        float e1_19 = approx_exp2((-cvt_f32_20.y) * 1.442695f);
+        float e0_19 = approx_exp2(-cvt_f32_20.x * 1.442695f);
+        float e1_19 = approx_exp2(-cvt_f32_20.y * 1.442695f);
         float d0_19 = 1.0f + e0_19;
         float d1_19 = 1.0f + e1_19;
         float r0_19 = approx_rcp(d0_19);
@@ -800,8 +797,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[5] = __as_u32(__float22bfloat162_rn(make_float2(mul_19.x, mul_19.y)));
         float2 cvt_f32_21 = cake_bf16x2_to_f32x2(__as_bf16x2(words[6]));
         float2 cvt_f32_1_20 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[6]));
-        float e0_20 = approx_exp2((-cvt_f32_21.x) * 1.442695f);
-        float e1_20 = approx_exp2((-cvt_f32_21.y) * 1.442695f);
+        float e0_20 = approx_exp2(-cvt_f32_21.x * 1.442695f);
+        float e1_20 = approx_exp2(-cvt_f32_21.y * 1.442695f);
         float d0_20 = 1.0f + e0_20;
         float d1_20 = 1.0f + e1_20;
         float r0_20 = approx_rcp(d0_20);
@@ -823,8 +820,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed[6] = __as_u32(__float22bfloat162_rn(make_float2(mul_20.x, mul_20.y)));
         float2 cvt_f32_22 = cake_bf16x2_to_f32x2(__as_bf16x2(words[7]));
         float2 cvt_f32_1_21 = cake_bf16x2_to_f32x2(__as_bf16x2(words_0[7]));
-        float e0_21 = approx_exp2((-cvt_f32_22.x) * 1.442695f);
-        float e1_21 = approx_exp2((-cvt_f32_22.y) * 1.442695f);
+        float e0_21 = approx_exp2(-cvt_f32_22.x * 1.442695f);
+        float e1_21 = approx_exp2(-cvt_f32_22.y * 1.442695f);
         float d0_21 = 1.0f + e0_21;
         float d1_21 = 1.0f + e1_21;
         float r0_21 = approx_rcp(d0_21);
@@ -847,8 +844,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         int band_hi = 0;
         float2 cvt_f32_23 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[0]));
         float2 cvt_f32_1_22 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[0]));
-        float e0_22 = approx_exp2((-cvt_f32_23.x) * 1.442695f);
-        float e1_22 = approx_exp2((-cvt_f32_23.y) * 1.442695f);
+        float e0_22 = approx_exp2(-cvt_f32_23.x * 1.442695f);
+        float e1_22 = approx_exp2(-cvt_f32_23.y * 1.442695f);
         float d0_22 = 1.0f + e0_22;
         float d1_22 = 1.0f + e1_22;
         float r0_22 = approx_rcp(d0_22);
@@ -870,8 +867,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[0] = __as_u32(__float22bfloat162_rn(make_float2(mul_22.x, mul_22.y)));
         float2 cvt_f32_24 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[1]));
         float2 cvt_f32_1_23 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[1]));
-        float e0_23 = approx_exp2((-cvt_f32_24.x) * 1.442695f);
-        float e1_23 = approx_exp2((-cvt_f32_24.y) * 1.442695f);
+        float e0_23 = approx_exp2(-cvt_f32_24.x * 1.442695f);
+        float e1_23 = approx_exp2(-cvt_f32_24.y * 1.442695f);
         float d0_23 = 1.0f + e0_23;
         float d1_23 = 1.0f + e1_23;
         float r0_23 = approx_rcp(d0_23);
@@ -893,8 +890,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[1] = __as_u32(__float22bfloat162_rn(make_float2(mul_23.x, mul_23.y)));
         float2 cvt_f32_25 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[2]));
         float2 cvt_f32_1_24 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[2]));
-        float e0_24 = approx_exp2((-cvt_f32_25.x) * 1.442695f);
-        float e1_24 = approx_exp2((-cvt_f32_25.y) * 1.442695f);
+        float e0_24 = approx_exp2(-cvt_f32_25.x * 1.442695f);
+        float e1_24 = approx_exp2(-cvt_f32_25.y * 1.442695f);
         float d0_24 = 1.0f + e0_24;
         float d1_24 = 1.0f + e1_24;
         float r0_24 = approx_rcp(d0_24);
@@ -916,8 +913,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[2] = __as_u32(__float22bfloat162_rn(make_float2(mul_24.x, mul_24.y)));
         float2 cvt_f32_26 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[3]));
         float2 cvt_f32_1_25 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[3]));
-        float e0_25 = approx_exp2((-cvt_f32_26.x) * 1.442695f);
-        float e1_25 = approx_exp2((-cvt_f32_26.y) * 1.442695f);
+        float e0_25 = approx_exp2(-cvt_f32_26.x * 1.442695f);
+        float e1_25 = approx_exp2(-cvt_f32_26.y * 1.442695f);
         float d0_25 = 1.0f + e0_25;
         float d1_25 = 1.0f + e1_25;
         float r0_25 = approx_rcp(d0_25);
@@ -939,8 +936,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[3] = __as_u32(__float22bfloat162_rn(make_float2(mul_25.x, mul_25.y)));
         float2 cvt_f32_27 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[4]));
         float2 cvt_f32_1_26 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[4]));
-        float e0_26 = approx_exp2((-cvt_f32_27.x) * 1.442695f);
-        float e1_26 = approx_exp2((-cvt_f32_27.y) * 1.442695f);
+        float e0_26 = approx_exp2(-cvt_f32_27.x * 1.442695f);
+        float e1_26 = approx_exp2(-cvt_f32_27.y * 1.442695f);
         float d0_26 = 1.0f + e0_26;
         float d1_26 = 1.0f + e1_26;
         float r0_26 = approx_rcp(d0_26);
@@ -962,8 +959,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[4] = __as_u32(__float22bfloat162_rn(make_float2(mul_26.x, mul_26.y)));
         float2 cvt_f32_28 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[5]));
         float2 cvt_f32_1_27 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[5]));
-        float e0_27 = approx_exp2((-cvt_f32_28.x) * 1.442695f);
-        float e1_27 = approx_exp2((-cvt_f32_28.y) * 1.442695f);
+        float e0_27 = approx_exp2(-cvt_f32_28.x * 1.442695f);
+        float e1_27 = approx_exp2(-cvt_f32_28.y * 1.442695f);
         float d0_27 = 1.0f + e0_27;
         float d1_27 = 1.0f + e1_27;
         float r0_27 = approx_rcp(d0_27);
@@ -985,8 +982,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[5] = __as_u32(__float22bfloat162_rn(make_float2(mul_27.x, mul_27.y)));
         float2 cvt_f32_29 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[6]));
         float2 cvt_f32_1_28 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[6]));
-        float e0_28 = approx_exp2((-cvt_f32_29.x) * 1.442695f);
-        float e1_28 = approx_exp2((-cvt_f32_29.y) * 1.442695f);
+        float e0_28 = approx_exp2(-cvt_f32_29.x * 1.442695f);
+        float e1_28 = approx_exp2(-cvt_f32_29.y * 1.442695f);
         float d0_28 = 1.0f + e0_28;
         float d1_28 = 1.0f + e1_28;
         float r0_28 = approx_rcp(d0_28);
@@ -1008,8 +1005,8 @@ kernel_cake_gated_act_mxfp8_75c68471d8a4921f432a(__nv_bfloat16* __restrict__ gat
         packed_hi[6] = __as_u32(__float22bfloat162_rn(make_float2(mul_28.x, mul_28.y)));
         float2 cvt_f32_30 = cake_bf16x2_to_f32x2(__as_bf16x2(words_1[7]));
         float2 cvt_f32_1_29 = cake_bf16x2_to_f32x2(__as_bf16x2(words_2[7]));
-        float e0_29 = approx_exp2((-cvt_f32_30.x) * 1.442695f);
-        float e1_29 = approx_exp2((-cvt_f32_30.y) * 1.442695f);
+        float e0_29 = approx_exp2(-cvt_f32_30.x * 1.442695f);
+        float e1_29 = approx_exp2(-cvt_f32_30.y * 1.442695f);
         float d0_29 = 1.0f + e0_29;
         float d1_29 = 1.0f + e1_29;
         float r0_29 = approx_rcp(d0_29);
