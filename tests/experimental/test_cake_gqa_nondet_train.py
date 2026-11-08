@@ -1225,8 +1225,10 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
     h_q, h_kv = 24, 4
     device_lens = ((2990, 10), (2990, 10))
     swapped = ((10, 2990), (10, 2990))  # other boundaries, the same tiles per key block
-    short_keys = ((1500, 1500), (1500, 1500))  # 12 key blocks; the device's 2990-key segment needs 24
-    fewer_tiles = ((1500, 1500), (2990, 10))  # 24 key blocks, fewer tiles per range than the device's
+    # 12 key blocks; the device's 2990-key segment needs 24
+    short_keys = ((1500, 1500), (1500, 1500))
+    # 24 key blocks, fewer tiles per range than the device's
+    fewer_tiles = ((1500, 1500), (2990, 10))
     plan = cake_jit.chunk_plan(
         total_q=3000,
         total_k=3000,
@@ -1251,7 +1253,12 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
     _assert_dq_close(got["dq"], base["dq"])
     dev = (_cu(device_lens[0]), _cu(device_lens[1]))
     cases = {
-        "keys past the key blocks": (*dev, _cu(short_keys[0]), _cu(short_keys[1]), None),
+        "keys past the key blocks": (
+            *dev,
+            _cu(short_keys[0]),
+            _cu(short_keys[1]),
+            None,
+        ),
         # A 1024-key device segment against 544-key host segments (6 key blocks), at the default budget.
         "keys past the key blocks, one chunk": (
             [0, 64, 128],
@@ -1305,7 +1312,9 @@ def test_a_cuda_graph_replays_the_eager_bits(form, host, device) -> None:
     for replay in range(3):
         graph.replay()
         torch.cuda.synchronize()
-        _assert_outputs_same_bits(captured, eager, f"{form} host={host} replay {replay}")
+        _assert_outputs_same_bits(
+            captured, eager, f"{form} host={host} replay {replay}"
+        )
 
 
 @pytest.mark.parametrize("map_name", ("windows", "scattered"))

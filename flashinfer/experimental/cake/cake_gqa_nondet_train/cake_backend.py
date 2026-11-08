@@ -211,7 +211,9 @@ def _entry(name: str, arch: str) -> Any:
     return getattr(load(name, arch), record(name)["ffi_entry"])
 
 
-def _run(name: str, values: Mapping[str, Any], grid: tuple[int, int, int], arch: str) -> None:
+def _run(
+    name: str, values: Mapping[str, Any], grid: tuple[int, int, int], arch: str
+) -> None:
     """Launch record ``name`` on the current device and torch stream: the caller holds
     ``torch.cuda.device(device_index)`` and ``tvm_ffi.use_torch_stream()`` (once per forward or backward call)."""
     args = []
@@ -756,7 +758,15 @@ def cake_gqa_nondet_train_backward(
                 side.wait_stream(stream)
                 with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
                     if tables is not None:
-                        _launch_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q, tables, dims, device_index)
+                        _launch_plan(
+                            cu_seqlens_q,
+                            cu_seqlens_k,
+                            plan["key_blocks"],
+                            total_q,
+                            tables,
+                            dims,
+                            device_index,
+                        )
                         if seqlens is not None:
                             _check_ranges(tables[0], cu_seqlens_k, plan, segments)
                         planned = side.record_event()
@@ -777,7 +787,9 @@ def cake_gqa_nondet_train_backward(
                 device_index,
             )
             if tables is None:
-                tables = _tile_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q)
+                tables = _tile_plan(
+                    cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
+                )
                 if seqlens is not None:
                     _check_ranges(tables[0], cu_seqlens_k, plan, segments)
             tile_base, pair_base, pair_order = tables
@@ -851,7 +863,9 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
-        _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
+        _launch(
+            "bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index
+        )
     return dq, dk_out, dv_out
 
 
@@ -1122,7 +1136,9 @@ class CakeGQANondetFunction(torch.autograd.Function):
             "workspace": workspace,
         }
         if ctx.host_boundaries is not None:
-            kwargs["cu_seqlens_q_host"], kwargs["cu_seqlens_k_host"] = ctx.host_boundaries
+            kwargs["cu_seqlens_q_host"], kwargs["cu_seqlens_k_host"] = (
+                ctx.host_boundaries
+            )
         if ctx.dkv_acc is None:
             dq, dk, dv = cake_gqa_nondet_train_backward(
                 q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs

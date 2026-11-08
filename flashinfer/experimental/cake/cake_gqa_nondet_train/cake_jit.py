@@ -437,19 +437,26 @@ def tiles_per_key_block(total_q: int, num_segments: int) -> int:
 
 
 def host_seqlens(
-    cu_seqlens_q: Sequence[int], cu_seqlens_k: Sequence[int], total_q: int, total_k: int, num_segments: int
+    cu_seqlens_q: Sequence[int],
+    cu_seqlens_k: Sequence[int],
+    total_q: int,
+    total_k: int,
+    num_segments: int,
 ) -> tuple[list[int], list[int]]:
     """``(q_lens, k_lens)`` from host copies of the segment boundaries, checked against the operands' sizes:
     ``B + 1`` ints each, starting at 0, non-decreasing, ending at ``T_q`` / ``T_k``."""
     lens = []
-    for name, cu, total in (("cu_seqlens_q_host", cu_seqlens_q, total_q), ("cu_seqlens_k_host", cu_seqlens_k, total_k)):
+    for name, cu, total in (
+        ("cu_seqlens_q_host", cu_seqlens_q, total_q),
+        ("cu_seqlens_k_host", cu_seqlens_k, total_k),
+    ):
         cu = [int(x) for x in cu]
         if len(cu) != num_segments + 1 or cu[0] != 0 or cu[-1] != total:
             raise ValueError(
                 f"{name} must hold {num_segments + 1} boundaries from 0 to {total}, got {len(cu)} ending at "
                 f"{cu[-1] if cu else None}"
             )
-        seg = [b - a for a, b in zip(cu, cu[1:])]
+        seg = [b - a for a, b in zip(cu, cu[1:], strict=False)]
         if min(seg, default=0) < 0:
             raise ValueError(f"{name} must be non-decreasing")
         lens.append(seg)
@@ -464,7 +471,7 @@ def exact_tiles(q_lens: Sequence[int], k_lens: Sequence[int], blocks: int) -> li
     linear piece per segment, summed through first differences."""
     flat = [0] * (blocks + 1)
     slope = [0] * (blocks + 1)
-    for q, k in zip(q_lens, k_lens):
+    for q, k in zip(q_lens, k_lens, strict=True):
         if q <= 0 or k <= 0:
             continue
         end = min(-(-k // BWD_TILE_KEYS), blocks)
@@ -538,7 +545,10 @@ def chunk_plan(
     else:
         q_lens, k_lens = seqlens
         longest = max(k_lens, default=0)
-        blocks = key_blocks(total_k, longest if max_seqlen_k is None else min(int(max_seqlen_k), longest))
+        blocks = key_blocks(
+            total_k,
+            longest if max_seqlen_k is None else min(int(max_seqlen_k), longest),
+        )
         prefix = [0]
         for count in exact_tiles(q_lens, k_lens, blocks):
             prefix.append(prefix[-1] + count)
