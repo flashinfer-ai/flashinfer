@@ -254,13 +254,20 @@ def test_mm_bf16_tinygemm_pdl_waits_for_bias(monkeypatch):
         if cc_num == 90:
             program = routergemm._tinygemm2_wgmma_program(a, weight, True, True)
             assert program is not None
-        else:
+        elif cc_num in (100, 103, 107):
             program = routergemm._tinygemm2_tcgen05_program(a, weight, out, True, True)
             if (m, n, k) == (28, 2048, 3072):
                 assert program == "PACKED_PDL"
             else:
                 assert program is None
                 assert routergemm._use_tinygemm2_sm100(a.device)
+        else:
+            assert cc_num in (110, 120, 121)
+            assert (
+                routergemm._tinygemm2_tcgen05_program(a, weight, out, True, True)
+                is None
+            )
+            assert not routergemm._use_tinygemm2_sm100(a.device)
         torch.cuda.synchronize()
 
         # late_store takes an int32 destination.  The alias updates the first two
