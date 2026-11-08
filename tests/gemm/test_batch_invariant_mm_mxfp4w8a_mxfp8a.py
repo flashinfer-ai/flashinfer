@@ -425,9 +425,18 @@ def test_block_scaled_spaces_and_acceptance():
         assert set(ref) < set(dec) and all(k.swap_ab for k in set(dec) - set(ref))
         c4 = enumerate_space(16, 128, 8192, chunks=4, b_major="k", in_fmt=fmt)
         assert any(k.cluster_k == 4 for k in c4) and any(k.cta_chunks for k in c4)
-        assert [dataclasses.replace(k, k_block=0) for k in c4] == enumerate_space(
-            16, 128, 8192, chunks=4, b_major="k", in_fmt=twin
+        # the split classes of the mixed formats take the swapped records (the workspace split only); the MXFP8 twin's do not
+        sw4 = [k for k in c4 if k.swap_ab]
+        assert sw4 and all(
+            k.cluster_k == 1 and not k.cta_chunks and k.tile_n >= 16 for k in sw4
         )
+        assert not any(
+            k.swap_ab
+            for k in enumerate_space(16, 128, 8192, chunks=4, b_major="k", in_fmt=twin)
+        )
+        assert [
+            dataclasses.replace(k, k_block=0) for k in c4 if not k.swap_ab
+        ] == enumerate_space(16, 128, 8192, chunks=4, b_major="k", in_fmt=twin)
         dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
         for K in (128, 256, 3968, 4096, 65536):
             assert can_implement(dense, 64, 256, K, "k", 1, fmt), (fmt, K)
@@ -767,6 +776,95 @@ def test_split_implementations_agree(M, N, K, od):
         bits(mm(a, b, sfa, sfb, alpha, out_dtype=torch.float32, config=ws, chunks=1)),
         acc,
     )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "M,N,K,C",
+    [
+        (1, 4096, 4096, 4),
+        (16, 2048, 16384, 4),
+        (8, 128, 8192, 4),
+        (37, 4096, 32768, 8),
+        (64, 512, 32768, 4),
+    ],
+)
+def test_swapped_split_records_agree(M, N, K, C):
+    """The swapped records of the split classes (the exchanged operands' chunk partials through the workspace, then the same
+    fixup): every swapped record of the split shape's space (sampled) gives the dense workspace split's bits (bf16 output and
+    fp32 accumulator); the token tile holds all M rows; sub-batches reproduce their rows; the dispatcher's pick is a member."""
+    for fmt in device_fmts():
+        if K % k_granule(fmt) or (K // C) % k_granule(fmt):
+            continue
+        a, sfa = adv_mx8(M, K, 91)
+        b, sfb = weight(N, K, 92)
+        alpha = alpha_t(0.37)
+        ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
+        ref = bits(mm(a, b, sfa, sfb, alpha, config=ws, chunks=C, in_fmt=fmt))
+        acc_ref = bits(
+            mm(
+                a,
+                b,
+                sfa,
+                sfb,
+                alpha,
+                out_dtype=torch.float32,
+                config=ws,
+                chunks=C,
+                in_fmt=fmt,
+            )
+        )
+        space = enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
+        recs = [k for k in space if k.swap_ab]
+        assert recs and all(
+            k.cluster_k == 1 and not k.cta_chunks and k.tile_n >= M for k in recs
+        ), fmt
+        for k in recs[::5] + recs[-1:]:
+            assert torch.equal(
+                bits(mm(a, b, sfa, sfb, alpha, config=k, chunks=C, in_fmt=fmt)), ref
+            ), (fmt, k.describe())
+            assert torch.equal(
+                bits(
+                    mm(
+                        a,
+                        b,
+                        sfa,
+                        sfb,
+                        alpha,
+                        out_dtype=torch.float32,
+                        config=k,
+                        chunks=C,
+                        in_fmt=fmt,
+                    )
+                ),
+                acc_ref,
+            ), (fmt, k.describe())
+        for fam, sm in (
+            ("sm_107", 212),
+            ("sm_100", 148),
+        ):  # the dispatcher's pick at the split shape is a member of the space
+            assert default_config(M, N, K, C, "k", sm, fam, fmt) in set(space), (
+                fmt,
+                fam,
+            )
+        if M > 1:
+            idx = torch.randperm(M, generator=torch.Generator().manual_seed(7))[
+                : max(1, M // 2)
+            ]
+            rows = sf_bytes_of(sfa, M, K)
+            sub = bits(
+                mm(
+                    a[idx.cuda()].contiguous(),
+                    b,
+                    swizzle_sf(rows[idx]),
+                    sfb,
+                    alpha,
+                    config=recs[0],
+                    chunks=C,
+                    in_fmt=fmt,
+                )
+            )
+            assert torch.equal(sub, ref[idx.cuda()])
 
 
 @needs_device

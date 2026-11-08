@@ -91,7 +91,11 @@ def compile_blockscaled(
     scaled = (
         in_fmt in ALPHA_GIVEN and direct
     )  # the partials of the workspace split are unscaled (the fixup applies alpha)
-    assert not (swap_ab and not direct), "the swapped decode record stores directly"
+    # a swapped record in the split classes writes its chunk partials like the dense one: the kernel's (N, M, C) view of the
+    # fp32 workspace with the kernel's M contiguous (the same M-major store as its direct output), then the fixup
+    assert not (swap_ab and (in_cluster or in_cta)), (
+        "the swapped record splits through the workspace only"
+    )
     out_dt = OUT_DT[out_fmt] if direct else cutlass.Float32
     oal = ALIGN[out_fmt] if direct else ALIGN["f32"]
     L = (

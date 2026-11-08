@@ -319,7 +319,7 @@ def can_implement(
         # the block-scaled instruction takes K-major A and B only; K is a whole number of scale blocks (whole 128-element
         # runs for the sm_100 mixed class: `spec.k_granule`); a chunk is a whole number of steps AND of scale-factor atom
         # columns (`spec.chunk_unit`: 128 elements for the MX classes)
-        from ..spec import chunk_unit
+        from ..spec import MX_MIXED_FMTS, chunk_unit
 
         if (
             b_major != "k"
@@ -331,9 +331,15 @@ def can_implement(
             return False  # a chunk is whole k-tiles of the record's k-block
         if knobs.swap_ab:
             # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one
-            # tile (the scale-factor atom read from its start); the M-major output needs N aligned
+            # tile (the scale-factor atom read from its start); the M-major output needs N aligned. The mixed classes'
+            # split classes take it too (one chunk's partial through the workspace like the dense record's; not the
+            # in-cluster / in-CTA folds); the other block-scaled classes keep their unsplit-only swapped records
+            split_ok = chunks == 1 or (
+                in_fmt in MX_MIXED_FMTS
+                and not (knobs.cluster_k > 1 or knobs.cta_chunks)
+            )
             return (
-                chunks == 1
+                split_ok
                 and knobs.tile_n >= M
                 and N % ALIGN["bf16"] == 0
                 and Kc % al_in == 0

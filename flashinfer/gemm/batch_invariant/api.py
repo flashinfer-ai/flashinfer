@@ -1137,7 +1137,7 @@ def _run_mx(
     Kb_a = K * A_ELEM_BITS_OF[in_fmt] // 8
     Kb_b = K * B_ELEM_BITS_OF[in_fmt] // 8
     extra = (alpha,) if alpha is not None else ()
-    if config.swap_ab:
+    if config.swap_ab and C == 1:
         # the decode specialisation: C^T = B^T A^T with the operands exchanged; the kernel's A is the weight (N rows), its B
         # the tokens (any count, one tile), its C the M-major (N, M) view of the output
         _require_disjoint(
@@ -1178,8 +1178,15 @@ def _run_mx(
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
         _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+    if config.swap_ab:
+        # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
+        # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
+        kernel(b3, a3, sfb, sfa, ws.permute(2, 1, 0))
+    else:
+        kernel(
+            a3, b3, sfa, sfb, ws.permute(1, 2, 0)
+        )  # the unscaled body: raw fp32 partials
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
-    kernel(a3, b3, sfa, sfb, ws)  # the unscaled body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
     get_fixup(C, out_fmt, alpha_given=alpha is not None)(ws, out, *extra, M, N, rows)
     return out
