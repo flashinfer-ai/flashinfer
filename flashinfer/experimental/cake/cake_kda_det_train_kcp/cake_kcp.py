@@ -494,13 +494,17 @@ FWD_O_FUSE_DEFAULT = 1
 # backward from its saved set uses them in place of its own intra launch.  The saved set does not carry them (its
 # type, tensors and meta are those of every other forward: torch's checkpoint keeps the original forward's autograd
 # node, its saved-tensor count and its meta): the forward leaves them in :data:`_CKPT_ROWS` under its ``S_in``, and
-# the backward of a set with that very ``S_in`` takes them.  They add nothing to the backward's peak: with the in-kernel
-# L2 norm off they lie in the first bytes of the backward's ``dq`` / ``dk`` pair (one BF16 [2, T_r, H, 128] tensor the
-# forward allocates and the backward returns as its two halves: only the GLM intra program writes them, after the
-# rows' last reader, :func:`_rows_carrier_ok`), otherwise the backward copies them into its arena's own ``aqk_int`` /
-# ``akk_int`` rows before it allocates any output and drops them (the copy replaces the intra launch).  Both forms
-# need ``R <= 2 T_r`` (the rows fit the pair, and outputs at least that large are allocated after the copy).  Every
-# other forward keeps none, so the saved set and cake_kda_det_train_kcp_saved_bytes are unchanged.
+# the backward of a set with that very ``S_in`` takes them.  They add nothing to the backward's peak: they lie in the
+# first bytes of the backward's ``dq`` / ``dk`` pair (one BF16 [2, T_r, H, 128] tensor the forward allocates and the
+# backward returns as its two halves).  With the in-kernel L2 norm off the backward's programs read them there (only
+# the GLM intra program writes the pair, after the rows' last reader, :func:`_rows_carrier_ok`); otherwise the
+# backward first copies them into its arena's own ``aqk_int`` / ``akk_int`` rows (the copy replaces the intra launch)
+# and then takes the tensor as its pair (with the in-kernel L2 norm, the bytes its ``dv2`` rides on).  Either way the
+# backward allocates no pair of its own, so the kept rows leave no block of another size between the forward and the
+# backward (a separate rows tensor, freed after the copy, raised the caching allocator's reserved peak: +258 MiB per
+# rank on the four-pack CP16 workload with a workspace, +4.1 GiB with workspace=None).  Both forms need
+# ``R <= 2 T_r`` (the rows fit the pair).  Every other forward keeps none, so the saved set and
+# cake_kda_det_train_kcp_saved_bytes are unchanged.
 # "always" = every saving forward keeps them, "never" = none (the previous form); both via _kcp_test_knobs only (the
 # A/B record).  Not on a lean arena, under graph replay or a capture, with the SPEC-3 probe, nor where the backward's
 # intra program is its first q / k reader (the in-kernel L2 norm's segmented rows): those keep or use none.  The rows
@@ -6052,18 +6056,14 @@ def _intra_rows_keep(call: CakeKDADetKcpCall) -> bool:
 
 def _keep_intra_rows(call: CakeKDADetKcpCall) -> None:
     """The kept rows of a saving forward (:data:`INTRA_ROWS`), bound in place of the arena's ``aqk_int`` / ``akk_int``:
-    with the in-kernel L2 norm off (and the plan's later stages leaving the pair alone, :func:`_rows_carrier_ok`) in
-    the first ``256 R H`` bytes of a fresh BF16 ``[2, T_r, H, 128]`` tensor, the backward's ``dq`` / ``dk``; otherwise
-    a fresh BF16 ``[2, R, H, 64]`` tensor (the backward copies them into its arena).  :func:`_fwd_body` hands them to
+    in the first ``256 R H`` bytes of a fresh BF16 ``[2, T_r, H, 128]`` tensor, the backward's ``dq`` / ``dk`` pair
+    (its programs read them there or it copies them into its arena first, :func:`_ckpt_rows_bind`); a fresh
+    ``[2, R, H, 64]`` tensor where ``dq`` / ``dk`` are not of the rows' dtype.  :func:`_fwd_body` hands them to
     :data:`_CKPT_ROWS`."""
     views = call.scratch["views"]
     shape, dtype = tuple(views.aqk_int.shape), views.aqk_int.dtype
     dt = call.backend.dtypes
-    if (
-        not call.l2n
-        and dt["dq"] == dt["dk"] == dtype
-        and _rows_carrier_ok(call.local.plan)
-    ):
+    if dt["dq"] == dt["dk"] == dtype:
         holder = _alloc((2, call.T_r, call.H, D), dtype, call.device)
         rows = holder.view(-1)[: 2 * views.aqk_int.numel()].view(2, *shape)
     else:
@@ -6138,19 +6138,22 @@ def _ckpt_rows_take(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved) -> None:
 def _ckpt_rows_bind(
     call: CakeKDADetKcpCall, hosts: dict[str, tuple[str, ...]]
 ) -> torch.Tensor | None:
-    """The taken rows (:func:`_ckpt_rows_take`), first in :func:`_bwd_body`: the ``dq`` / ``dk`` carrier the forward
-    allocated (returned: the backward's two outputs, its intra rows bound by :func:`_bwd_rows`) where the in-kernel
-    L2 norm's rows do not ride on that pair (``hosts``) and the plan allows it (:func:`_rows_carrier_ok`); otherwise
-    the rows are copied into the arena's ``aqk_int`` / ``akk_int`` (no other program writes those bytes before their
-    readers) and dropped before any output is allocated (``None``)."""
+    """The taken rows (:func:`_ckpt_rows_take`), first in :func:`_bwd_body`.  Returned: the ``dq`` / ``dk`` pair the
+    forward allocated (the backward's two outputs; with the in-kernel L2 norm, the bytes its ``dv2`` rides on), or
+    ``None`` (the backward allocates its outputs).  The carrier form, where the in-kernel L2 norm's rows do not ride
+    on that pair (``hosts``) and the plan allows it (:func:`_rows_carrier_ok`): the backward's intra rows are bound
+    on the pair's first bytes (:func:`_bwd_rows`).  Otherwise the copy form: the rows are copied into the arena's
+    ``aqk_int`` / ``akk_int`` (no other program writes those bytes before their readers), enqueued on the call's
+    stream before any program that writes the pair; the pair is returned all the same (``None`` for a
+    ``[2, R, H, 64]`` rows tensor, and under the ``rows_probe`` test knob, which compares the backward's own rows
+    with them after its intra launch)."""
     holder, rows = call.scratch.pop("ckpt_rows")
     dt = call.backend.dtypes
-    if (
-        "dv2" not in hosts
-        and tuple(holder.shape) == (2, call.T_r, call.H, D)
+    pair = (
+        tuple(holder.shape) == (2, call.T_r, call.H, D)
         and holder.dtype == dt["dq"] == dt["dk"]
-        and _rows_carrier_ok(call.local.plan)
-    ):
+    )
+    if pair and "dv2" not in hosts and _rows_carrier_ok(call.local.plan):
         call.scratch["intra_rows_form"] = "carrier"
         call.scratch["intra_rows_v"] = rows
         return holder
@@ -6159,7 +6162,8 @@ def _ckpt_rows_bind(
     if call.opts.rows_probe:
         # the probe compares the backward's own rows with them (_bwd_rows)
         call.scratch["intra_rows_v"] = rows
-    return None
+        return None
+    return holder if pair else None
 
 
 def _copy_intra_rows(call: CakeKDADetKcpCall, rows: torch.Tensor) -> None:
@@ -7564,8 +7568,9 @@ def _bwd_body(
     )
     # (name, shape, dtype) of the outputs allocated after the first local stage's launch
     pending: list[tuple[str, tuple[int, ...], torch.dtype]] = []
-    # the intra rows of the forward (INTRA_ROWS) before any output: the dq / dk carrier, or copied into the arena
-    carrier = _ckpt_rows_bind(call, hosts) if "ckpt_rows" in call.scratch else None
+    # the intra rows of the forward (INTRA_ROWS) before any output: on the dq / dk pair it allocated (the carrier),
+    # or copied into the arena (the pair is then this backward's all the same)
+    pair = _ckpt_rows_bind(call, hosts) if "ckpt_rows" in call.scratch else None
 
     def grad(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
         if name in late:
@@ -7576,10 +7581,12 @@ def _bwd_body(
     # the moved arena buffer -> the output tensor whose bytes carry it
     moved: dict[str, torch.Tensor] = {}
     if "dv2" in hosts:
-        moved["dv2"] = _alloc((2, T, H, D), dt["dq"], call.device)
+        moved["dv2"] = (
+            pair if pair is not None else _alloc((2, T, H, D), dt["dq"], call.device)
+        )
         dq, dk = moved["dv2"][0], moved["dv2"][1]
-    elif carrier is not None:
-        dq, dk = carrier[0], carrier[1]
+    elif pair is not None:
+        dq, dk = pair[0], pair[1]
     else:
         dq = _alloc((T, H, D), dt["dq"], call.device)
         dk = _alloc((T, H, D), dt["dk"], call.device)

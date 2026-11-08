@@ -6962,6 +6962,71 @@ def test_gpu_kcp_dav_always_is_bitwise_auto(device, monkeypatch, lengths, H) -> 
         assert ra["sequence"] == rb["sequence"] and ra["n_launches"] == rb["n_launches"]
 
 
+CKPT_PAIR_ROWS = [((300, 724, 476), 16), ((3000,), 16), ((300, 724, 476), 64)]
+
+
+@pytest.mark.parametrize("l2n", (False, True), ids=("l2n_off", "l2n_on"))
+@pytest.mark.parametrize(
+    "lengths,H",
+    CKPT_PAIR_ROWS,
+    ids=[f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_PAIR_ROWS],
+)
+def test_gpu_ckpt_rows_ride_on_the_backward_pair(
+    device, monkeypatch, lengths, H, l2n
+) -> None:
+    """INTRA_ROWS, one rank, ``workspace=None``: a checkpoint recompute keeps its intra rows in the first bytes of a
+    BF16 ``[2, T_r, H, 128]`` tensor, and the backward of its saved set takes that very tensor as its ``dq`` / ``dk``
+    pair in both forms (carrier: its programs read the rows there; copy, the in-kernel L2 norm's: it copies them into
+    its arena first), so it allocates no pair of its own and no rows tensor of another size is freed in between.  The
+    output and every gradient are bitwise those of ``intra_rows="never"`` (the backward launches its intra program)."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    T = int(ctx.T_r)
+    opts = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    kept: list = []
+    taken: list = []
+    real_keep = cake_kcp._keep_intra_rows
+    real_bind = cake_kcp._ckpt_rows_bind
+
+    def keep(call):
+        real_keep(call)
+        kept.append(call.scratch["intra_rows_t"][0])
+
+    def bind(call, hosts):
+        pair = real_bind(call, hosts)
+        taken.append((call.scratch["intra_rows_form"], pair))
+        return pair
+
+    monkeypatch.setattr(cake_kcp, "_keep_intra_rows", keep)
+    monkeypatch.setattr(cake_kcp, "_ckpt_rows_bind", bind)
+    ck, (_rec_o, rec_f, rec_b) = _ckpt_pass(ctx, ops, **opts)
+    torch.cuda.synchronize(device)
+    if l2n and rec_f["intra_rows"] is None:
+        # the plan's backward intra program normalizes (its first q / k reader) or the architecture is not probed
+        pytest.skip(
+            f"no kept rows with the in-kernel L2 norm here (arch {cake_jit.device_arch(device.index)})"
+        )
+    assert rec_f["intra_rows"] == "kept", rec_f["intra_rows"]
+    assert rec_b["intra_rows"] == "bound", rec_b["intra_rows"]
+    assert len(kept) == 1 and len(taken) == 1, (len(kept), len(taken))
+    form, pair = taken[0]
+    assert form == ("copy" if l2n else rec_b["intra_rows_form"]), form
+    assert pair is kept[0], form
+    assert tuple(pair.shape) == (2, T, H, 128) and pair.dtype == torch.bfloat16
+    assert rec_f["intra_rows_bytes"] == pair.numel() * pair.element_size()
+    kept.clear()
+    taken.clear()
+    ref, (_o, rec_fn, rec_bn) = _ckpt_pass(
+        ctx, ops, _kcp_test_knobs={"intra_rows": "never"}, **opts
+    )
+    torch.cuda.synchronize(device)
+    assert rec_fn["intra_rows"] is None and rec_bn["intra_rows"] is None and not kept
+    assert sorted(ck) == sorted(ref)
+    for n in sorted(ck):
+        assert ck[n].shape == ref[n].shape and ck[n].dtype == ref[n].dtype, n
+        assert torch.equal(_bits(ck[n]), _bits(ref[n])), n
+
+
 def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:
     """Template-cache ownership (KDA module, one rank): a training loop that builds a NEW context and
     workspace per step must not grow device memory -- after each step's objects are dropped the workspace, its
