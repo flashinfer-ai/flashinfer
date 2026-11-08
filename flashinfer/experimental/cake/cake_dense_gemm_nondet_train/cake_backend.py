@@ -1688,7 +1688,7 @@ def _launch_k1_program(module: str, values: dict[str, Any], items: int, out: tor
     per SM pair up to ``items`` work items) with ``values`` in its argument order, the PDL flag of ``enable_pdl`` for
     ``out``'s device, on the current stream of that device."""
     det = deterministic_backend()
-    index = out.get_device()
+    index = _k1_index(out, out, out)
     facts = det.device_facts(out.device)
     stream = det._current_raw_stream(index)
     grid = (2 * max(1, min(int(facts.sm_count) // 2, int(items))), 1, 1)
@@ -1808,7 +1808,7 @@ def _launch_wgrad_sk(module: str, G: torch.Tensor, X: torch.Tensor, out: torch.T
     FP32 partial slots and flag words from the arena of the (device, stream) (``k1_slots`` / ``k1_tickets``: the flag
     words are zero before and after every complete launch)."""
     det = deterministic_backend()
-    index = out.get_device()
+    index = _k1_index(out, out, out)
     stream = det._current_raw_stream(index)
     facts = det.device_facts(out.device)
     block_n = int(MODULES[module]["build"]["kwargs"]["block_n"])

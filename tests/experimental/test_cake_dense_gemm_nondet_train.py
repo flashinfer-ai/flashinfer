@@ -5925,6 +5925,193 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
         assert bound_plan(X, W, out) == det_plan(X, W, out, ()), sms
 
 
+#: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables).
+K1_FORWARD_PROGRAM_ROWS = {
+    part: {(K, 512, T): "dense_proj_gemm_wave_kk_n224" for K in (4096, 5120) for T in (16172, 16231, 16384)}
+    for part in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152))
+}
+_KD, _KD_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef", "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
+K1_DGRAD_PROGRAM_ROWS = {
+    ("sm_100a", 148): {
+        **{(K, 1024, T, "f32"): _KD for K in (4096, 5120) for T in (16172, 16231, 16384)},
+        **{(K, 512, T, "f32"): _KD_TMA for K in (4096, 5120) for T in (16172, 16231, 16384)},
+    },
+    ("sm_100a", 152): {(K, N, T, "f32"): _KD_TMA for K in (4096, 5120) for N in (512, 1024) for T in (16172, 16231, 16384)},
+    ("sm_103a", 152): {
+        **{(K, 1024, T, "f32"): _KD for K in (4096, 5120) for T in (16172, 16231, 16384)},
+        **{(K, 512, T, "f32"): _KD_TMA for K in (4096, 5120) for T in (16172, 16231, 16384)},
+    },
+}
+K1_WGRAD_SK_ROWS = {
+    ("sm_100a", 148): {
+        (5120, 1024, T, dt): "dense_proj_gemm_sk_nn_n256" + ("_f32" if dt == "f32" else "") + "_t"
+        for T in (16172, 16231, 16384)
+        for dt in ("bf16", "f32")
+    },
+}
+K1_ORDERED_ROWS = {
+    ("sm_107a", 212): {
+        ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
+        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16172, (64, 4, 1, "mirror")),),
+        ("sm_107a", 1, 4096, 1024, "f32"): ((16231, 16384, (192, 1, 2, "arrival")),),
+    },
+}
+
+
+def test_k1_program_tables():
+    """The forward, input-gradient and stream-K weight-gradient program tables hold exactly the measured rows, each
+    naming a template this checkout registers for the table's architecture; the fixed-order ranges hold the measured
+    rows and plan their program (:func:`k1_ordered_plan`) at their token counts only, on their part only, before
+    :func:`k1_plan`'s routing, and their programs repeat (``reproducible``)."""
+    for table, want in (
+        (cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM, K1_FORWARD_PROGRAM_ROWS),
+        (cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM, K1_DGRAD_PROGRAM_ROWS),
+        (cake_backend.K1_WGRAD_SK_RULES_BY_SM, K1_WGRAD_SK_ROWS),
+    ):
+        assert table == want
+        for (arch, _), rows in table.items():
+            for template in rows.values():
+                assert template in cake_jit.KERNELS[arch], (arch, template)
+    assert cake_backend.wave_forward_template(224) == "dense_proj_gemm_wave_kk_n224"
+    assert cake_backend.dgrad_program_template(False) == _KD
+    assert cake_backend.dgrad_program_template(True) == _KD_TMA
+    assert cake_backend.wgrad_sk_template(256, True) == "dense_proj_gemm_sk_nn_n256_f32_t"
+    assert cake_backend.K1_ORDERED_RANGES_BY_SM == K1_ORDERED_ROWS
+    assert cake_backend.atomic_k1_template(64, True, 1, "mirror") == "dense_proj_gemm_atomic_nn_n64_f32_t_mirror"
+    assert cake_backend.atomic_k1_template(192, True, 2) == "dense_proj_gemm_atomic_nn_n192_f32_c2"
+    with pytest.raises(ValueError, match="split_order"):
+        cake_backend.atomic_k1_template(64, True, 1, "index")
+    for (arch, sms), rows in K1_ORDERED_ROWS.items():
+        for key, ranges in rows.items():
+            _, L, M, N, dt = key
+            kw = dict(arch=arch, L=L, M=M, N=N, out_f32=dt == "f32", sm_count=sms)
+            for lo, hi, value in ranges:
+                bn, splits, chains, order = value
+                assert cake_backend.atomic_k1_template(bn, True, chains, order) in cake_jit.KERNELS[arch]
+                for T in sorted({lo, hi, (lo + hi) // 2}):
+                    assert cake_backend.k1_ordered_plan(K=T, **kw) == value, (key, T)
+                for T in (lo - 1, hi + 1):
+                    assert cake_backend.k1_ordered_plan(K=T, **kw) is None, (key, T)
+                for other in (208, 211, 213, 216):
+                    assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, sm_count=other)) is None
+                assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, out_f32=False)) is None
+                assert cake_backend.k1_ordered_plan(K=lo, **dict(kw, L=2)) is None
+
+
+def test_k1_ordered_ranges_plan_their_program(monkeypatch):
+    """A token count of :data:`K1_ORDERED_RANGES_BY_SM` plans its fixed-order program (``split_order``, the template's
+    suffix, the split and chain counts; the split workspace with more than one split) in place of the split tables'
+    choice, and the plan repeats; one token outside the range keeps that choice."""
+    arch = "sm_107a"
+    _register_k1(monkeypatch, arch)
+    kw = dict(transposed_out=True, arch=arch, sm_count=212)
+
+    def operands(T, d_in, d_out):
+        G = torch.zeros(T, d_out, dtype=torch.bfloat16)
+        X = torch.zeros(T, d_in, dtype=torch.bfloat16)
+        return X.t(), G, torch.zeros(d_out, d_in, dtype=torch.float32)
+
+    for d_in, d_out, T, template, splits, chains, order in (
+        (4096, 32, 16231, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
+        (4096, 48, 16172, "dense_proj_gemm_atomic_nn_n64_f32_t_mirror", 4, 1, "mirror"),
+        (4096, 1024, 16384, "dense_proj_gemm_atomic_nn_n192_f32_c2", 1, 2, "arrival"),
+    ):
+        plan, *_, reason = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)
+        assert plan is not None and reason == "", (d_in, d_out, T, reason)
+        assert (plan.template, plan.splits, plan.chains, plan.split_order) == (template, splits, chains, order)
+        assert plan.reproducible and plan.workspace == (splits > 1)
+    # outside the ranges: the split tables' choice (4096 -> 32 at 16171 tokens, 4096 -> 48 at 16231 tokens)
+    for d_in, d_out, T in ((4096, 32, 16171), (4096, 48, 16231), (4096, 1024, 16230)):
+        plan = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)[0]
+        assert plan is None or plan.split_order == "arrival", (d_in, d_out, T)
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_k1_program_rows_bind_their_program(monkeypatch, arch):
+    """The forward and input-gradient entry points run, for a row of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` /
+    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` on its part, the table's program of this package with the program's argument
+    order (no cached deterministic plan); one token off the row, an FP32 forward output and an operand without a unit
+    inner stride keep the deterministic routing (``_k1_*_program_of`` is ``None``)."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16, f32 = torch.bfloat16, torch.float32
+    for (K, N, T), template in sorted(K1_FORWARD_PROGRAM_ROWS[(arch, 152)].items()):
+        X, W, out = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, N, dtype=bf16)
+        module = cake_jit.KERNELS[arch][template]
+        assert cake_backend._k1_forward_program_of(X, W, out) == module
+        n = len(entry_fn.calls)
+        assert cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, out) is out
+        assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_DET_CACHE
+        record = cake_jit.MODULES[module]
+        items = -(-N // 512) * -(-T // record["build"]["kwargs"]["tile_n"])
+        grid = (2 * min(76, items), 1, 1)
+        values = dict(A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=N, N=T, K=K, L=1, enable_pdl=0)
+        plan = cake_jit.arg_plan_of(record)
+        want = cake_backend._order_atomic_arguments(module, plan, values, grid)
+        _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
+        assert cake_backend._k1_forward_program_of(X[:-1], W, out[:-1]) is None
+        assert cake_backend._k1_forward_program_of(X, W, torch.empty(T, N, dtype=f32)) is None
+        assert cake_backend._k1_forward_program_of(torch.empty(K, T, dtype=bf16).t(), W, out) is None
+    for (K, N, T, _), template in sorted(K1_DGRAD_PROGRAM_ROWS[(arch, 152)].items()):
+        G, W, out = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, K, dtype=f32)
+        module = cake_jit.KERNELS[arch][template]
+        assert cake_backend._k1_dgrad_program_of(G, W, out) == module
+        n = len(entry_fn.calls)
+        assert cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out) is out
+        assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_DET_CACHE
+        record = cake_jit.MODULES[module]
+        grid = (2 * min(76, -(-T // 256) * -(-K // 256)), 1, 1)
+        spare = det_backend._dummy_map(out.device, bf16)
+        values = dict(A=G, B=W.unsqueeze(0), out=det_backend._dummy(out.device, bf16), out32=out, C16=spare,
+                      C32=out.unsqueeze(0), M=T, N=K, K=N, ldo=K, enable_pdl=0)  # fmt: skip
+        plan = cake_jit.arg_plan_of(record)
+        want = cake_backend._order_atomic_arguments(module, plan, values, grid)
+        _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
+        assert cake_backend._k1_dgrad_program_of(G[:-1], W, out[:-1]) is None
+        assert cake_backend._k1_dgrad_program_of(G, W, torch.empty(T, K, dtype=bf16)) is None
+    # another SM count: the deterministic routing
+    facts = dataclasses.replace(det_backend.device_facts(), sm_count=151)
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+    K, N, T = 4096, 512, 16231
+    X, W, out = torch.empty(T, K, dtype=bf16), torch.empty(N, K, dtype=bf16), torch.empty(T, N, dtype=bf16)
+    assert cake_backend._k1_forward_program_of(X, W, out) is None
+
+
+def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch):
+    """The weight-gradient entry point runs, for a row of :data:`K1_WGRAD_SK_RULES_BY_SM` on a 148-SM sm_100a part,
+    the stream-K program with one unit per CTA pair (74), the unit length the line's K blocks over the units, the
+    arena's slots and flag words, and the program's argument order; a non-default ``sk`` or ``cta_rows``, another SM
+    count and one token off the row keep the other tables."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_100a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    facts = dataclasses.replace(det_backend.device_facts(), sm_count=148)
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+    bf16 = torch.bfloat16
+    for (d_in, d_out, T, dt), template in sorted(K1_WGRAD_SK_ROWS[("sm_100a", 148)].items()):
+        G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
+        out = torch.empty(d_out, d_in, dtype=torch.float32 if dt == "f32" else bf16)
+        module = cake_jit.KERNELS["sm_100a"][template]
+        assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) == module
+        assert cake_backend._k1_wgrad_sk_program_of(G, X, out, True, None) is None
+        assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", 128) is None
+        assert cake_backend._k1_wgrad_sk_program_of(G[:-1], X[:-1], out, "auto", None) is None
+        n = len(entry_fn.calls)
+        assert cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out) is out
+        assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_ATOMIC_CACHE
+        line = (d_in // 256) * (d_out // 256) * -(-T // 64)
+        arena = cake_backend._ATOMIC_ARENAS[(0, 0)]
+        values = dict(A=X.unsqueeze(0), B=G.unsqueeze(0), out=out, ws=arena.buffers["k1_slots"],
+                      flags=arena.buffers["k1_tickets"], M=d_in, N=d_out, K=T, num_l=1, num_units=74,
+                      unit_len=-(-line // 74), ldo=d_in, out_l=d_out * d_in, enable_pdl=0)  # fmt: skip
+        plan = cake_jit.arg_plan_of(cake_jit.MODULES[module])
+        want = cake_backend._order_atomic_arguments(module, plan, values, (148, 1, 1))
+        _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
+    assert int(arena.buffers["k1_tickets"].count_nonzero()) == 0
+    facts = dataclasses.replace(facts, sm_count=152)
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+    assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) is None
+
+
 def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
     """Once a key is bound, the K1 entry points launch it straight from the key
     (``_k1_cached_launch``): neither ``_det_k1`` nor ``_atomic_k1`` runs, and the launch gets the arguments their
@@ -8457,6 +8644,25 @@ def test_registered_templates_are_the_ones_the_planners_name():
         for bn in cake_backend.K1_BLOCK_N_CHOICES
         for chains in cake_backend.K1_CHAINS_CHOICES
     }
+    # the fixed-order programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient / stream-K
+    # weight-gradient tables name, each registered for the architecture of its table
+    named = {}
+    for (arch, _), rows in cake_backend.K1_ORDERED_RANGES_BY_SM.items():
+        for key, ranges in rows.items():
+            for _, _, (bn, _, chains, order) in ranges:
+                t = cake_backend.atomic_k1_template(bn, key[4] == "f32", chains, order)
+                named.setdefault(arch, set()).add(t)
+    for table in (
+        cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM,
+        cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM,
+        cake_backend.K1_WGRAD_SK_RULES_BY_SM,
+    ):
+        for (arch, _), rows in table.items():
+            named.setdefault(arch, set()).update(rows.values())
+    assert set(named) == {"sm_100a", "sm_103a", "sm_107a"}
+    for arch, templates in named.items():
+        assert templates <= set(cake_jit.KERNELS[arch]), (arch, sorted(templates - set(cake_jit.KERNELS[arch])))
+        wanted |= templates
     dsm = {
         arch: {
             cake_backend.dsm_k1_template(bn, s)
@@ -13057,7 +13263,9 @@ K1_WGRAD_CHANGED_ROWS = {
         (4096, 64, "f32", 16231): ("dsm", 64, 2), (4096, 64, "f32", 16384): ("dsm", 64, 2),
         (4096, 1024, "bf16", 16172): ("pair", 256, 1), (4096, 1024, "bf16", 16231): ("pair", 256, 1),
         (4096, 1024, "bf16", 16384): ("pair", 256, 1),
-        (5120, 1024, "bf16", 16231): ("det", None, None), (5120, 1024, "f32", 16384): ("det", None, None),
+        (5120, 1024, "bf16", 16172): ("sk", 256, None), (5120, 1024, "bf16", 16231): ("sk", 256, None),
+        (5120, 1024, "bf16", 16384): ("sk", 256, None), (5120, 1024, "f32", 16172): ("sk", 256, None),
+        (5120, 1024, "f32", 16231): ("sk", 256, None), (5120, 1024, "f32", 16384): ("sk", 256, None),
     },
     ("sm_100a", 152): {
         (4096, 48, "f32", 16384): ("dsm", 64, 2),
@@ -13072,31 +13280,43 @@ K1_WGRAD_CHANGED_ROWS = {
         (5120, 128, "f32", 16231): ("det", None, None), (5120, 128, "f32", 16384): ("det", None, None),
     },
     ("sm_107a", 212): {
-        (4096, 32, "f32", 16231): ("pair", 64, 2), (4096, 32, "f32", 16384): ("pair", 64, 2),
+        (4096, 32, "f32", 16172): ("ordered", 64, 4),
+        (4096, 32, "f32", 16231): ("ordered", 64, 4), (4096, 32, "f32", 16384): ("ordered", 64, 4),
         (5120, 32, "f32", 16231): ("pair", 64, 2), (5120, 32, "f32", 16384): ("pair", 64, 2),
         (5120, 48, "f32", 16384): ("pair", 64, 2),
+        (4096, 48, "f32", 16172): ("ordered", 64, 4),
         (4096, 48, "f32", 16231): ("det", None, None), (4096, 48, "f32", 16384): ("det", None, None),
         (4096, 64, "f32", 16231): ("det", None, None), (4096, 64, "f32", 16384): ("det", None, None),
         (5120, 64, "f32", 16384): ("det", None, None),
-        (4096, 1024, "f32", 16384): ("det", None, None),
+        (4096, 1024, "f32", 16231): ("ordered", 192, 1), (4096, 1024, "f32", 16384): ("ordered", 192, 1),
     },
 }
 # fmt: on
 
 
 def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
-    """``(kind, block_n, splits)`` of the planner's weight-gradient route of a row (the cluster tables first)."""
+    """``(kind, block_n, splits)`` of the planner's weight-gradient route of a row: the stream-K table first
+    (``"sk"``), then the cluster tables (``"dsm"``), the fixed-order ranges (``"ordered"``) and the split tables
+    (``"pair"`` / ``"det"``)."""
+    sk = cake_backend.K1_WGRAD_SK_RULES_BY_SM.get((arch, sms), {})
+    template = sk.get((d_in, d_out, T, "f32" if f32 else "bf16"))
+    if template is not None:
+        return ("sk", int(template.split("_n")[1].split("_")[0]), None)
     kw = dict(arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms)
     dsm = cake_backend.k1_dsm_plan(**kw)
     if dsm is not None:
         return ("dsm", *dsm)
+    ordered = cake_backend.k1_ordered_plan(**kw)
+    if ordered is not None:
+        return ("ordered", ordered[0], ordered[1])
     plan = cake_backend.k1_plan(**kw)
     return ("det", None, None) if plan is None else ("pair", *plan)
 
 
 def test_k1_wgrad_changed_rows_take_their_route():
-    """The weight-gradient rows whose route changed (:data:`K1_WGRAD_CHANGED_ROWS`) take it on their part: two CTAs
-    of the cluster program, two splits (or one) of the CTA-pair program, or the deterministic program."""
+    """The weight-gradient rows whose route changed (:data:`K1_WGRAD_CHANGED_ROWS`) take it on their part: the
+    stream-K program, two CTAs of the cluster program, the CTA-pair program in a fixed split order or at two splits (or
+    one), or the deterministic program."""
     for (arch, sms), rows in K1_WGRAD_CHANGED_ROWS.items():
         for (d_in, d_out, dt, T), want in rows.items():
             got = _k1_wgrad_route(arch, sms, d_in, d_out, T, dt == "f32")
@@ -13332,19 +13552,20 @@ def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
 
 
 def test_gpu_k1_forward_named_rows_keep_the_det_bits():
-    """On a part whose table of :data:`K1_FORWARD_RULES_BY_SM` names a program: the forward of every such row binds
-    it, gives the deterministic package's forward bit for bit, meets the BF16 budget against FP64 and repeats bit for
+    """On a part whose table of :data:`K1_FORWARD_RULES_BY_SM` names a program: the forward of every such row (not a row
+    of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM`, which runs this package's program) binds it, gives the deterministic package's forward bit for bit, meets the BF16 budget against FP64 and repeats bit for
     bit over ``RERUNS`` calls into NaN-poisoned outputs.  A part without such rows skips."""
     device, arch, sms = _part_or_skip()
+    own = cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
     rows = {
         key: value
         for key, value in cake_backend.K1_FORWARD_RULES_BY_SM.get(
             (arch, sms), {}
         ).items()
-        if isinstance(value, str)
+        if isinstance(value, str) and key not in own
     }
     if not rows:
-        pytest.skip(f"no named K1 forward row of {arch} on {sms} SMs")
+        pytest.skip(f"no named K1 forward row of {arch} on {sms} SMs outside the program table")
     g = torch.Generator(device=device).manual_seed(SEED + 171)
     for (K, N, T), program in sorted(rows.items()):
         what = f"forward {K} {N} {T} {program}"
@@ -13368,9 +13589,62 @@ def test_gpu_k1_forward_named_rows_keep_the_det_bits():
         _repeats_into_nan(run, out, what)
 
 
+def test_gpu_k1_program_rows_keep_the_det_bits():
+    """On a part of a table of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` / :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`: the
+    forward / input gradient of every row runs this package's program (no cached deterministic plan), gives the
+    deterministic package's result bit for bit, meets the deterministic package's budget against FP64 and repeats bit
+    for bit over ``RERUNS`` calls into NaN-poisoned outputs.  A part without rows skips."""
+    device, arch, sms = _part_or_skip()
+    fwd = cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
+    dgrad = cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
+    if not fwd and not dgrad:
+        pytest.skip(f"no K1 program row of {arch} on {sms} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 173)
+    for (K, N, T), template in sorted(fwd.items()):
+        what = f"forward {K} {N} {T} {template}"
+        X, W = _bf16((T, K), device, g), _bf16((N, K), device, g)
+        cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+        out = torch.full((T, N), float("nan"), device=device, dtype=torch.bfloat16)
+
+        def run(dst, X=X, W=W):
+            cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, dst)
+
+        run(out)
+        torch.cuda.synchronize()
+        assert not cake_backend._K1_DET_CACHE, what
+        assert cake_backend._k1_forward_program_of(X, W, out) == cake_jit.KERNELS[arch][template], what
+        ref = torch.full_like(out, float("nan"))
+        det_backend.cake_dense_gemm_det_train_projection_forward(X, W, ref)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref), what
+        _k1_check(out, X.double() @ W.double().t(), what)
+        _repeats_into_nan(run, out, what)
+    for (K, N, T, dt), template in sorted(dgrad.items()):
+        what = f"dgrad {K} {N} {T} {dt} {template}"
+        G, W = _bf16((T, N), device, g), _bf16((N, K), device, g)
+        cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+        dtype = torch.float32 if dt == "f32" else torch.bfloat16
+        out = torch.full((T, K), float("nan"), device=device, dtype=dtype)
+
+        def run(dst, G=G, W=W):
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, dst)
+
+        run(out)
+        torch.cuda.synchronize()
+        assert not cake_backend._K1_DET_CACHE, what
+        assert cake_backend._k1_dgrad_program_of(G, W, out) == cake_jit.KERNELS[arch][template], what
+        ref = torch.full_like(out, float("nan"))
+        det_backend.cake_dense_gemm_det_train_projection_dgrad(G, W, ref)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref), what
+        _k1_check(out, G.double() @ W.double(), what)
+        _repeats_into_nan(run, out, what)
+
+
 def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
-    """On a part of :data:`K1_WGRAD_CHANGED_ROWS`: the weight gradient of every changed row takes its route (its
-    :data:`_K1_ATOMIC_CACHE` entry: the cluster program, the CTA-pair program at one or two splits, or the
+    """On a part of :data:`K1_WGRAD_CHANGED_ROWS`: the weight gradient of every changed row takes its route (the
+    stream-K program of :data:`K1_WGRAD_SK_RULES_BY_SM` with no cached plan, or its :data:`_K1_ATOMIC_CACHE` entry:
+    the cluster program, the CTA-pair program at one or two splits or in a fixed split order, or the
     deterministic program -- then the deterministic package's weight gradient bit for bit; a row of
     :data:`K1_WGRAD_DET_RULES_BY_SM` the bits of the deterministic package's prepared launch of the table's program),
     meets the deterministic package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into
@@ -13397,6 +13671,13 @@ def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
 
         run(out)
         torch.cuda.synchronize()
+        if kind == "sk":
+            # the stream-K program runs straight from its table: no cached plan of the split tables
+            assert not cake_backend._K1_ATOMIC_CACHE, what
+            assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None), what
+            _k1_check(out, G.double().t() @ X.double(), what)
+            _repeats_into_nan(run, out, what)
+            continue
         ((_, entry),) = cake_backend._K1_ATOMIC_CACHE.items()
         if kind == "det":
             assert entry.plan is None and entry.k1 is not None, what
