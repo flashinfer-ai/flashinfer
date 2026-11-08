@@ -5603,9 +5603,10 @@ FWD_SPLIT_A_STAGES = ["wy_a", "fwd_summary_a", "fwd_ho_a", "stitch", "fwd_ho_a"]
 
 
 def _split_a() -> bool:
-    """Whether the split forward of the current device runs on wy_a's A (FWD_SPLIT_A_ARCHS)."""
+    """Whether the split forward of the current device runs on wy_a's A on the test rows (FWD_SPLIT_A_ARCHS; their
+    pieces are shorter than every FWD_SPLIT_A_MIN_PIECE entry, test_fwd_split_tables_follow_the_plan)."""
     return cake_chain._fwd_split_a(
-        cake_backend.device_arch(torch.cuda.current_device())
+        cake_backend.device_arch(torch.cuda.current_device()), FWD_SPLIT_TEST_MIN_PIECE
     )
 
 
@@ -5697,7 +5698,7 @@ def test_fwd_split_lists() -> None:
 def test_fwd_split_route_rule(monkeypatch) -> None:
     # the split forward takes a table that carries its split tables and the inputs of the forward on wy_a's A
     monkeypatch.setattr(cake_chain, "_available", lambda _stage, _arch: True)
-    split = types.SimpleNamespace()
+    split = types.SimpleNamespace(length=63)
 
     def meta(fwd_split):
         return types.SimpleNamespace(
@@ -5729,12 +5730,19 @@ def test_fwd_split_route_rule(monkeypatch) -> None:
     )
 
 
+# the split rows whose split forward keeps the waves on the WY stage's w / u, per architecture (FWD_SPLIT_A_MIN_PIECE):
+# on sm_103a the pair row of HV 24 (63-chunk pieces); every other split row runs on wy_a's A
+FWD_SPLIT_W_FORM_ROWS = {"sm_103a": frozenset({"pair_hv24"})}
+
+
 @pytest.mark.parametrize("sm_count", [148, 152])
 @pytest.mark.parametrize("row", sorted(FWD_SPLIT_CLASS_ROWS))
-def test_fwd_split_shape_class(row, sm_count) -> None:
+def test_fwd_split_shape_class(row, sm_count, monkeypatch) -> None:
     # the forward runs the split on the long rows and on the pair row of HV 24 at the SM counts of B200 (148) and
-    # GB200 / GB300 (152); the pair rows of HV 12, 6 and 3 keep the prep forward's split scan.  The class is read from
-    # the host piece table (lengths, HV, SM count) alone.
+    # GB200 / GB300 (152); the pair rows of HV 12, 6 and 3 keep the prep forward's split scan.  The class and the
+    # split's form (on wy_a's A, or the waves on the WY stage's w / u) are read from the host piece table (lengths,
+    # HV, SM count) alone.
+    monkeypatch.setattr(cake_chain, "_available", lambda _stage, _arch: True)
     heads, seq_lens, split = FWD_SPLIT_CLASS_ROWS[row]
     table = cake_plan.pieces(seq_lens, heads[1], sm_count)
     assert table.split, table
@@ -5742,6 +5750,9 @@ def test_fwd_split_shape_class(row, sm_count) -> None:
         got = cake_plan.forward_split_length(arch, table)
         assert (got is not None) is split, (arch, table.length)
         assert got in (None, table.length)
+        if got is not None:
+            a_form = row not in FWD_SPLIT_W_FORM_ROWS.get(arch, frozenset())
+            assert cake_chain._fwd_split_a(arch, got) is a_form, (arch, got)
 
 
 @pytest.mark.usefixtures("fwd_split_test_class")
@@ -5761,6 +5772,13 @@ def test_fwd_split_tables_follow_the_plan(device) -> None:
     got = meta(heads, seq_lens).fwd_split
     assert got is not None and got.length == plan.pieces.length
     assert got.length >= cake_plan.FORWARD_SPLIT_MIN_PIECE[arch]
+    # the test rows cut pieces shorter than every FWD_SPLIT_A_MIN_PIECE entry (_split_a)
+    for case_heads, case_lens in FWD_SPLIT_CASES.values():
+        length = meta(case_heads, case_lens).fwd_split.length
+        assert length < min(
+            cake_chain.FWD_SPLIT_A_MIN_PIECE.values(), default=length + 1
+        )
+        assert cake_chain._fwd_split_a(arch, length) is _split_a(), (arch, length)
     assert got.num_segments == sum(plan.pieces.counts)
     assert got.num_first + got.num_middle + len(seq_lens) == got.num_segments
     assert meta(heads, seq_lens, segment_chunks=0).fwd_split is None
@@ -6037,7 +6055,8 @@ def test_fwd_split_a_tape_matches_the_w_form(device, monkeypatch) -> None:
     # on wy_a's A the waves write the T_full tape themselves (fwd_ho_a word 11): w the bits of the WY stage's w on the
     # same A, h and v_new within a relative L2 of 1e-2 of the waves on the WY stage's w / u, u a placeholder
     arch = _fwd_split_or_skip(device)
-    if not cake_chain._fwd_split_a(arch):
+    monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_MIN_PIECE", types.MappingProxyType({}))
+    if not cake_chain._fwd_split_a(arch, 0):
         pytest.skip(f"the split forward on wy_a's A is not routed on {arch}")
     heads, seq_lens = FWD_SPLIT_CASES["g3"]
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=437)
@@ -6107,6 +6126,9 @@ def _route_or_skip(route, device, monkeypatch):
         if not all(cake_chain._available(stage, arch) for stage in stages):
             pytest.skip(f"the split forward on wy_a's A is not delivered for {arch}")
         monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", (arch,))
+        monkeypatch.setattr(
+            cake_chain, "FWD_SPLIT_A_MIN_PIECE", types.MappingProxyType({})
+        )
         return FWD_SPLIT_CASES["g3"], "fwd_summary_a"
     monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", ())
     return FWD_SPLIT_CASES["g3"], "fwd_fused"
@@ -6120,30 +6142,49 @@ def _unaligned(t: torch.Tensor, offset: int) -> torch.Tensor:
     return out
 
 
-def _run_rows(inputs, seq_lens, h0, dht, offset: int = 0) -> dict:
-    """Forward and backward with v, the initial state, the output gradient and the final state's gradient as fresh
-    copies (``offset`` 0) or as contiguous tensors whose base is not 16-byte aligned: BF16 v and do ``offset``
-    elements, FP32 h0 and dht 1..3 elements past an allocation's base."""
+# the byte offsets past a 16-byte boundary the unaligned operands take: each operand at the nearest whole element
+# (BF16 1, 2, 4, 7 elements; FP32 1, 1, 2, 3)
+ROW_BYTE_OFFSETS = (2, 4, 8, 14)
+# the operands placed past the boundary: the row operands (v, g, beta, the initial state, do, the final state's
+# gradient), and q / k (the forwards on wy_a's A take 16-byte aligned q / k only, the plain prep 8-byte aligned rows)
+ROW_OPERANDS = {
+    "rows": ("v", "g", "beta", "h0", "do", "dht"),
+    "qk": ("q", "k"),
+}
 
-    def place(t, fp32=False):
-        if not offset:
+
+def _run_rows(inputs, seq_lens, h0, dht, *, offset=0, names=(), ckpt=False, **pins) -> dict:  # fmt: skip
+    """Forward and backward with the operands of ``names`` (of q, k, v, g, beta, h0, do, dht) as contiguous tensors
+    ``offset`` bytes past a 16-byte boundary (the nearest whole element past it), the others as fresh copies;
+    ``ckpt``: the forward under non-reentrant ``torch.utils.checkpoint``."""
+
+    def place(name, t):
+        if name not in names:
             return t.detach().clone()
-        got = _unaligned(t, 1 + (offset - 1) % 3 if fp32 else offset)
-        assert got.is_contiguous() and got.data_ptr() % 16, (offset, got.data_ptr())
+        size = t.element_size()
+        got = _unaligned(t, max(1, offset // size))
+        assert (
+            got.is_contiguous() and got.data_ptr() % 16 == max(1, offset // size) * size
+        ), (name, offset)
         return got
 
     leaves = {
-        n: inputs[n].detach().clone().requires_grad_(True)
-        for n in ("q", "k", "g", "beta")
+        n: place(n, inputs[n]).requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
     }
-    leaves["v"] = place(inputs["v"]).requires_grad_(True)
-    h = place(h0, fp32=True).requires_grad_(True)
+    h = place("h0", h0).requires_grad_(True)
     cu = _cu(seq_lens)
-    o, final = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
-                               scale=1.0 / math.sqrt(HEAD_DIM), initial_state=h, output_final_state=True,
-                               cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=h0.device),
-                               cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True)  # fmt: skip
-    torch.autograd.backward((o, final), (place(inputs["do"]), place(dht, fp32=True)))
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=h0.device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+
+    def layer(q, k, v, g, beta, h):
+        return cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), initial_state=h,
+                               output_final_state=True, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+                               use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
+
+    args = (*leaves.values(), h)
+    o, final = checkpoint(layer, *args, use_reentrant=False) if ckpt else layer(*args)
+    torch.autograd.backward((o, final), (place("do", inputs["do"]), place("dht", dht)))
     torch.cuda.synchronize()
     return {
         "o": o.detach(),
@@ -6153,10 +6194,16 @@ def _run_rows(inputs, seq_lens, h0, dht, offset: int = 0) -> dict:
     }
 
 
+@pytest.mark.parametrize("operands", sorted(ROW_OPERANDS))
 @pytest.mark.parametrize("route", ROW_ROUTES)
-def test_unaligned_rows_give_the_aligned_bits(route, device, monkeypatch) -> None:
-    # a contiguous v (and do, h0, dht) whose base is not 16-byte aligned is copied before a stage reads it with
-    # 16-byte loads: on every forward route and the backward, the bits of the aligned copies at each offset
+def test_unaligned_rows_give_the_aligned_bits(
+    route, operands, device, monkeypatch
+) -> None:
+    # contiguous operands whose base is 2, 4, 8 or 14 bytes past a 16-byte boundary are copied before a stage reads
+    # them in words: v, g, beta, h0, do and dht keep the route and give the bits of aligned copies on every forward
+    # route, the backward and a checkpointed step; q / k take the prep forward (the plain prep reads 8-byte aligned
+    # rows in place, others are copied) with the bits of aligned q / k on the plain prep (the two preps give the
+    # same bits)
     (heads, seq_lens), marker = _route_or_skip(route, device, monkeypatch)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=451)
     gen = torch.Generator().manual_seed(452)
@@ -6167,14 +6214,27 @@ def test_unaligned_rows_give_the_aligned_bits(route, device, monkeypatch) -> Non
         device
     )
     names = OUTPUT_NAMES + ("final_state", "dh0")
+    placed = ROW_OPERANDS[operands]
+    pins = {"prep": "plain"} if operands == "qk" else {}
     stages = _record_launches(monkeypatch)
-    want = _run_rows(inputs, seq_lens, h0, dht)
-    if marker == "prep":
-        assert _preps(stages) and "fwd_ho_a" not in stages, (route, stages)
-    else:
-        assert marker in stages, (route, stages)
-    for offset in range(1, 8):
-        _assert_same_bits(_run_rows(inputs, seq_lens, h0, dht, offset), want, names)
+    for ckpt in (False, True):
+        stages.clear()
+        want = _run_rows(inputs, seq_lens, h0, dht, ckpt=ckpt, **pins)
+        if marker == "prep" or operands == "qk":
+            assert _preps(stages) and "fwd_ho_a" not in stages, (route, stages)
+        else:
+            assert marker in stages, (route, stages)
+        for offset in ROW_BYTE_OFFSETS:
+            stages.clear()
+            got = _run_rows(
+                inputs, seq_lens, h0, dht, offset=offset, names=placed, ckpt=ckpt
+            )
+            if operands == "qk":
+                assert _preps(stages) and "fwd_ho_a" not in stages, (offset, stages)
+                assert "fwd_fused" not in stages, (offset, stages)
+            elif marker != "prep":
+                assert marker in stages, (route, offset, stages)
+            _assert_same_bits(got, want, names)
 
 
 @pytest.mark.parametrize("route", ("a", "split"))

@@ -129,12 +129,13 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import cache, lru_cache
 from operator import itemgetter
-from types import CodeType, FunctionType
+from types import CodeType, FunctionType, MappingProxyType
 from typing import Any, cast
 
 import torch
@@ -2433,6 +2434,8 @@ def _host_adjoint_split(
 # the plain prep reads contiguous rows, so a view it runs on is copied first (:func:`_prep_inputs`).
 PREP_TMA_CONSTANTS = ("ctas_per_sm", "window")
 TMA_ALIGN_BYTES = 16
+# the plain prep reads q / k rows in 8-byte words: a contiguous q / k at a base off that alignment is copied first
+PLAIN_PREP_ALIGN_BYTES = 8
 # q / k views that prep_tma reads in place run prep_tma inside the rule's plain band too (no copy of q / k); a
 # ``prep`` pin still decides
 VIEWS_TAKE_PREP_TMA = True
@@ -2599,14 +2602,18 @@ def _prep_inputs(
 ):
     """``(q, k, prep)``: the q / k the prep reads and its stage.  Strided views that ``prep_tma`` reads in place stay
     views when it runs (:data:`VIEWS_TAKE_PREP_TMA`: without the rule; a ``prep`` pin still decides); otherwise q / k
-    become contiguous rows (:func:`_dense`) and :func:`_prep_stage` picks the stage, as for contiguous inputs."""
+    become contiguous rows (:func:`_dense`; a fresh copy when the base is off :data:`PLAIN_PREP_ALIGN_BYTES`) and
+    :func:`_prep_stage` picks the stage, as for contiguous inputs."""
     if not (q.is_contiguous() and k.is_contiguous()) and _tma_rows(q) and _tma_rows(k):
         prep = _prep_stage(
             q, k, num_chunks, num_heads, arch, options, views=VIEWS_TAKE_PREP_TMA
         )
         if prep == "prep_tma":
             return q, k, prep
-    q, k = _dense(q), _dense(k)
+    q, k = (
+        _aligned_rows(t) if t.data_ptr() % PLAIN_PREP_ALIGN_BYTES else _dense(t)
+        for t in (q, k)
+    )
     return q, k, _prep_stage(q, k, num_chunks, num_heads, arch, options)
 
 
@@ -3441,8 +3448,16 @@ FWD_FUSED_TAPE = {"h": 1, "v_new": 2}
 # state of each first piece as its sequence's final state, which is copied into the B half of the segment state, the
 # first pieces' flags zeroed, before the stitch.  B200 (148 SMs, CUPTI, cold L2, the issue row of three sequences of
 # 131071 / 87531 / 43385 tokens at HV 6): 145-193 us less per taped forward and 193-238 us less per forward without a
-# tape than the waves on the WY stage's w / u; sm_103a keeps those until a GB300 measurement.
-FWD_SPLIT_A_ARCHS = ("sm_100a",)
+# tape than the waves on the WY stage's w / u.
+FWD_SPLIT_A_ARCHS = ("sm_100a", "sm_103a")
+# the shortest piece (chunks, the planned piece length) whose split forward runs on wy_a's A, per architecture (none
+# listed: every split forward).  GB300 (sm_103a, 152 SMs, CUPTI, cold L2, A-form / W-form time, four fresh processes):
+# the rows of 152- and 155-chunk pieces (the issue row, P3) take 0.91 per forward, 0.97 per forward and backward and
+# 0.94 per checkpointed step, the row of 132-chunk pieces (P1) 0.90 / 0.97 / 0.96; the 63-chunk pieces of the
+# pair_h8_hv24 row take 0.88 / 0.97 but 1.028 (gL) / 1.032 (gB) per checkpointed step, so pieces below 96 chunks keep
+# the waves on the WY stage's w / u there.  B200 (sm_100a) takes the A form on every split row, 63-chunk pieces
+# included (pair_h8_hv24: 0.85 / 0.95 / 0.98).
+FWD_SPLIT_A_MIN_PIECE: Mapping[str, int] = MappingProxyType({"sm_103a": 96})
 # the stages of the split forward on wy_a's A, and of the split forward on the WY stage's w / u
 FWD_SPLIT_A_STAGES = ("wy_a", "fwd_ho_a", "fwd_summary_a", "stitch")
 FWD_SPLIT_W_STAGES = ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch")
@@ -3617,15 +3632,19 @@ def fwd_split_route(
         return False
     if not _fwd_a_inputs(meta, q, k, v, beta, normalize_qk, options):
         return False
-    return _fwd_split_a(arch) or all(
+    return _fwd_split_a(arch, meta.fwd_split.length) or all(
         _available(stage, arch) for stage in FWD_SPLIT_W_STAGES
     )
 
 
-def _fwd_split_a(arch: str) -> bool:
-    """Whether the split forward on ``arch`` runs on wy_a's A (:data:`FWD_SPLIT_A_ARCHS`, its stages delivered)."""
-    return arch in FWD_SPLIT_A_ARCHS and all(
-        _available(stage, arch) for stage in FWD_SPLIT_A_STAGES
+def _fwd_split_a(arch: str, length: int) -> bool:
+    """Whether the split forward on ``arch`` at piece length ``length`` (chunks) runs on wy_a's A
+    (:data:`FWD_SPLIT_A_ARCHS`, pieces of at least :data:`FWD_SPLIT_A_MIN_PIECE` chunks, its stages delivered): a
+    shape-only choice, from the host plan's piece length."""
+    return (
+        arch in FWD_SPLIT_A_ARCHS
+        and int(length) >= FWD_SPLIT_A_MIN_PIECE.get(arch, 0)
+        and all(_available(stage, arch) for stage in FWD_SPLIT_A_STAGES)
     )
 
 
@@ -3633,11 +3652,11 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
                    tape) -> dict[str, Any]:  # fmt: skip
     """The forward of :func:`fwd_split_route`'s calls (:data:`FWD_SPLIT_ARCHS`); the tape of
     :func:`cake_gdn_nondet_train_forward`."""
-    if _fwd_split_a(arch):
+    split = cast("ForwardSplit", meta.fwd_split)
+    if _fwd_split_a(arch, split.length):
         return _forward_split_a(q, k, v, g32, beta32, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                                 output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
                                 tape=tape)  # fmt: skip
-    split = cast("ForwardSplit", meta.fwd_split)
     num_heads, num_v_heads = q.shape[-2], v.shape[-2]
     total_tokens = q.numel() // (num_heads * HEAD_DIM)
     device = q.device
@@ -4059,10 +4078,11 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     if scale is None:
         scale = 1.0 / math.sqrt(key_dim)
     device = q.device
-    g32 = g.contiguous()
+    # g and beta as contiguous rows at a 16-byte aligned base (a copy otherwise): the stages read them in words
+    g32 = _aligned_rows(g)
     if g32.dtype != torch.float32:
         g32 = g32.float()
-    beta = beta.contiguous()
+    beta = _aligned_rows(beta)
     if fwd_split_route(meta, arch, q, k, v, beta, normalize_qk, options):
         return _forward_split(q, k, v, g32, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                               output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
