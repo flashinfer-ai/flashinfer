@@ -10,13 +10,11 @@ top-k 2048.  Tracking issue: flashinfer-ai/flashinfer#5676.
 This package runs the deterministic package's BF16 scan programs and its plain
 split merge unchanged.  It leaves out the ordering pass, which is the
 deterministic package's finalize / rank finalize that sorts every row into
-ascending id order.  One more change is on `sm_107a`: the l6 and CTA-pair l6
-scan programs draw every work unit from a ticket word instead of keeping the
-deterministic programs' static unit enumeration (see "Ticket tail").  The
-scores are the same, and each row holds the same selected set in a different
-slot order.  The package implements the set-equality semantics of
-flashinfer-ai/flashinfer#8946 (point 4): per row, the set of selected
-`(id, score bits)` pairs repeats bit for bit, but the slot order does not.
+ascending id order.  The scores are the same, and each row holds the same
+selected set in a different slot order.  The package implements the
+set-equality semantics of flashinfer-ai/flashinfer#8946 (point 4): per row,
+the set of selected `(id, score bits)` pairs repeats bit for bit, but the slot
+order does not.
 
 The entry points of `flashinfer.cake_dsa_indexer_nondet_train` are stable
 APIs.  This backend package under `flashinfer/experimental/cake/` is
@@ -267,8 +265,7 @@ The choice goes through the registry's per-architecture `POLICY` record
 deterministic package's rules without its finalize, rank and FP8 rules.  A
 call therefore gets the same scan program, candidate capacity, check period,
 split count, CTA pair and ticket plan that the deterministic package picks for
-it.  Two exceptions are on `sm_107a`.  The l6 and CTA-pair l6 keys run the
-ticket twins of the deterministic programs.  The sampled tile count and rank
+it.  One exception is on `sm_107a`: the sampled tile count and rank
 shift follow this package's own `sample_class_rule` and `sample_long_rule`
 (whether a call samples does not change).  Most rules use one estimate, the
 mean key tiles per work unit: `(Tkv - T / (2 ratio)) / S / 128`.
@@ -335,14 +332,11 @@ before the record is frozen.
 * **Ticket tail**.  On all three architectures (`TICKET_TAIL_ARCHES`), the
   scan programs draw every work unit from a ticket word.  A record's
   `static_scan_kinds` would name the kinds whose programs keep the static
-  unit enumeration and get no tail; no record names one.  The deterministic
-  package keeps the static enumeration in its `sm_107a` l6 and CTA-pair l6
-  programs.  Here those keys run ticket twins: the same scans, built to draw
-  every unit from their ticket block.  So a call that shares the GPU with
-  another stream slows with the SMs that stream holds, not by a whole extra
-  wave of work units (flashinfer-ai/flashinfer#7548).  Every completed scan
-  launch leaves the word at 0.  How the word is reset depends on the
-  workspace:
+  unit enumeration and get no tail; no record names one.  So a call that
+  shares the GPU with another stream slows with the SMs that stream holds,
+  not by a whole extra wave of work units (flashinfer-ai/flashinfer#7548).
+  Every completed scan launch leaves the word at 0.  How the word is reset
+  depends on the workspace:
   * Backend-owned workspace: the tail is zeroed once, when the runner is
     prepared.  The eager entry prepares a one-shot runner, so this happens
     once per eager call.
@@ -379,9 +373,6 @@ registry `cake_jit.py` and `build.json`.  Every program is one of the
 deterministic package's BF16 scan programs or its plain split merge.  It is
 exported under this package's prefix as `cake_dsa_indexer_nondet_topk_<20 hex>`
 and keeps the twenty-hex identity of the deterministic program it comes from.
-The exceptions are the six `sm_107a` ticket twins of the deterministic l6 and
-CTA-pair l6 programs.  Each is a program of its own, with its own twenty-hex
-identity.
 Programs that differ only in a few constants share one kernel translation
 unit.  Programs whose launchers differ only in the kernel symbol, the
 host-shim namespace and the launch constants share one binding.  Each
