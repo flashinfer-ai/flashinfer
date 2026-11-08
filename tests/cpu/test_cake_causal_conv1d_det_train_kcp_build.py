@@ -18,7 +18,8 @@ kernel ABIs and the identity rule, the routes and the selection by channel count
 the KCP programs.  Each backward program ships twice: the cooperative build (route ``kcp_bwd``) and its ``split``
 build (route ``kcp_bwd_split``, FlashInfer issue #8365, built with ``pair=True``: the token arithmetic on packed
 ``f32x2`` channel pairs), an ordinary launch one SM short of co-resident (``reserve_sms``) whose ``dweight`` partial
-rows the zero-history package's fixed-order reduce program sums.  No device is needed; nothing is built or launched.
+rows the zero-history package's fixed-order reduce program sums.  The tail-row program (route ``kcp_bwd_halo``) of the
+overlapped backward is a route of its own, outside ``KINDS``.  No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ _W = "sm100_sm103_sm107"
 FWD = f"tart.causal_conv1d_kcp_fwd_bf16_silu.{_W}.causal_conv1d_kcp_fwd"
 BWD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd"
 HEAD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd_head"
+# the tail-row program's identity: its kernel's key (the twenty hex digits of the nondet tail-row program)
+HALO = "causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo"
 
 FWD_PLAN = [
     ["buffer", "x"], ["buffer", "w"], ["buffer", "cu"], ["buffer", "y"], ["buffer", "hist"], ["buffer", "hist_row_off"],
@@ -70,6 +73,11 @@ HEAD_PLAN = [
     ["buffer", "dpre_head"], ["buffer", "head_row_off"], ["parameter", "S"], ["parameter", "C"],
     ["parameter", "num_docs"], *GRID,
 ]  # fmt: skip
+HALO_PLAN = [
+    ["buffer", "x"], ["buffer", "w"], ["buffer", "cu"], ["buffer", "dy"], ["buffer", "dx"], ["buffer", "hist"],
+    ["buffer", "hist_row_off"], ["buffer", "dpre_tail"], ["buffer", "tail_row_off"], ["parameter", "C"],
+    ["parameter", "num_docs"], *GRID,
+]  # fmt: skip
 
 REDUCE = "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5"
 FALLBACK = "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
@@ -78,6 +86,7 @@ BIG = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
 SPLIT_FALLBACK = "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp"
 SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp"
 SPLIT_BIG = "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp"
+TAIL = "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp"
 BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
 
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
@@ -153,6 +162,7 @@ PROGRAMS = {
         HEAD_PLAN,
         5,
     ),
+    TAIL: (HALO, {}, ARCHES, "kcp_bwd_halo", HALO_PLAN, 5),
 }
 BIG_C_MIN = {"sm_100a": 512, "sm_103a": 512, "sm_107a": 1024}
 
@@ -224,7 +234,10 @@ def test_routes_and_selection() -> None:
         "kcp_bwd",
         "kcp_bwd_split",
         "kcp_bwd_head",
+        "kcp_bwd_halo",
     )
+    assert kcp_jit.HALO_KIND == "kcp_bwd_halo"
+    assert kcp_jit.HALO_KIND not in kcp_jit.KINDS
     assert kcp_jit.BWD_KINDS == BWD_ROLES
     for arch in ARCHES:
         routes = kcp_jit.ROUTES[arch]
@@ -235,6 +248,8 @@ def test_routes_and_selection() -> None:
         assert routes["kcp_bwd_head"] == [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"
         ]
+        assert routes["kcp_bwd_halo"] == [TAIL]
+        assert kcp_jit.selected_modules(arch, "kcp_bwd_halo", C=8192) == (TAIL,)
         for kind, fallback, big in (
             ("kcp_bwd", R200_FALLBACK if arch == "sm_107a" else FALLBACK, BIG),
             (
@@ -265,6 +280,10 @@ def test_routes_and_selection() -> None:
     head = kcp_jit.MODULES["cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"]
     assert kcp_jit.head_grid(head, n_frag=3, C=4096) == (3 * 4, 1, 1)
     assert kcp_jit.head_grid(head, n_frag=0, C=4096) == (1, 1, 1)
+    # the tail-row program: the head program's geometry and grid rule (one CTA per fragment and 1024 channels)
+    tail = kcp_jit.MODULES[TAIL]
+    assert tail["grid_rule"]["geometry"] == head["grid_rule"]["geometry"]
+    assert kcp_jit.head_grid(tail, n_frag=3, C=10240) == (3 * 10, 1, 1)
 
 
 @pytest.mark.cpu_only

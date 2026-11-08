@@ -31,7 +31,7 @@ next to this file (its entries sit beside the zero-history entries);
 ``aot/`` file when a builder compiled it and otherwise through FlashInfer's JIT
 from the same sources and flags, verifying every source digest first.
 
-The routes of an architecture are the four KCP kinds: ``kcp_fwd`` (one
+The routes of an architecture are the five KCP kinds: ``kcp_fwd`` (one
 program: ``y`` and the fragments' history rows ``hist`` from ``x``, ``weight``,
 ``cu_seqlens`` and the context's history tables), ``kcp_bwd`` (the fallback
 program and the big-channel ``_st8`` program, selected by the channel count
@@ -45,11 +45,23 @@ co-resident -- ``grid_rule.reserve_sms`` -- writing per-CTA ``dweight`` partial
 rows, followed on the same stream by the record's ``reduce`` program, the
 zero-history package's fixed-order reduction; a launch that no grid-wide
 barrier holds back starts beside kernels of other streams, FlashInfer issue
-#8365) and ``kcp_bwd_head`` (one program: the head-row derivatives
+#8365), ``kcp_bwd_head`` (one program: the head-row derivatives
 ``dpre_head`` every consumer fragment sends back; its grid is
 ``max(1, n_frag x ceil(C / (threads x vec)))``, computed by :mod:`.kcp` from
 the record's ``grid_rule.geometry`` and launched through the record's
-``arg_plan`` / ``logical`` / ``ffi_entry`` and :func:`load`).
+``arg_plan`` / ``logical`` / ``ffi_entry`` and :func:`load`) and
+``kcp_bwd_halo`` (one program, :data:`HALO_KIND`: the tail-row program of the
+overlapped backward.  At more than one rank the host launches the
+``kcp_bwd_split`` program before the backward halo exchange is waited, with
+every ``tail_row_off`` entry ``-1``, so it writes a fragment's last rows as at
+a document end; after the wait this program writes ``dx`` of the last
+``min(3, len)`` rows of every fragment with a tail row again, recomputing their
+``dpre`` from ``x``, ``hist`` and ``dy`` and folding the received
+``dpre_tail`` rows with the main program's FMAs in its order, so ``dx`` is the
+single launch's bits; it reads no ``dweight`` term.  Its grid is the head
+program's rule, :func:`head_grid`).  :data:`KINDS` stays the three launch roles
+the non-deterministic KCP registry mirrors; the ``split`` and tail-row routes
+are this package's alone.
 
 The host plan reuses :mod:`.cake_jit`'s functions over a record (:func:`plan`,
 :func:`launch_grid`, :func:`partial_rows`, :func:`partial_bytes`,
@@ -72,7 +84,10 @@ keywords; the backward with ``vec=8, copy="tma2d"`` on sm_100a and sm_103a,
 with ``vec=8, min_blocks=2`` on sm_107a, and the big-channel backward with
 ``vec=8, copy="tma2d", stage_tokens=8, min_blocks=2`` -- the builds of the
 zero-history backward, which the KCP kernels extend; the ``kcp_bwd_split``
-programs add ``split=True`` to those keywords.
+programs add ``split=True`` to those keywords.  The tail-row program's module
+is its kernel's key ``causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo``
+with no keyword, so its twenty hex digits are those of the non-deterministic
+package's tail-row program.
 """
 
 from __future__ import annotations
@@ -783,12 +798,78 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "kcp_bwd_head",
         "workspace_rule": None,
     },
+    "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The tail-row program of the overlapped backward (route ``kcp_bwd_halo``): ``dx`` of the last ``min(3,
+        # len)`` rows of every fragment with a tail row, written again after the backward halo exchange's wait with
+        # the received ``dpre_tail`` rows (``tail_row_off``, ``-1`` = none) folded in.  The ``kcp_bwd_split`` program
+        # ran before the wait with every ``tail_row_off`` entry ``-1``; this program recomputes the rows' ``dpre``
+        # from ``x``, the history rows and ``dy`` with the main program's instructions in its order, so ``dx`` is the
+        # single launch's bits.  It writes no ``dweight`` term.  One CTA per (fragment, block of ``threads x vec``
+        # channels) work item, the head program's rule (:func:`head_grid`); ``ctas_per_sm`` records the occupancy
+        # query's answer (5 CTAs per SM at 128 threads and no shared memory).
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 5,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
+        "logical": {
+            "C": "C",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dx": "dx",
+            "dy": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "num_docs": "num_docs",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+        },
+        "role": "kcp_bwd_halo",
+        "workspace_rule": None,
+    },
 }
 
 # architecture -> KCP kind -> the records the route may launch, in launch
-# order.  The forward and the head route carry one program; each backward
-# route (``kcp_bwd``: the cooperative programs; ``kcp_bwd_split``: their
-# ``split`` builds, ordinary launches followed by the ``reduce`` program)
+# order.  The forward, the head and the tail-row route carry one program; each
+# backward route (``kcp_bwd``: the cooperative programs; ``kcp_bwd_split``:
+# their ``split`` builds, ordinary launches followed by the ``reduce`` program)
 # carries the architecture's fallback program first and the big-channel
 # ``_st8`` program second (:func:`selected_modules` launches one).
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -800,6 +881,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "kcp_bwd_split": [
             "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
             "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
+        ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
@@ -817,6 +901,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
             "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
+        ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
@@ -832,6 +919,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "kcp_bwd_split": [
             "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
             "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
+        ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
@@ -849,9 +939,13 @@ KINDS = ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
 # host (:mod:`.kcp`) runs the backward through ``kcp_bwd`` or
 # ``kcp_bwd_split`` per call (its ``cooperative`` argument).
 SPLIT_KIND = "kcp_bwd_split"
+# The route of the overlapped backward's tail-row program: after a
+# ``kcp_bwd_split`` launch made before the halo exchange's wait, it writes the
+# last rows of every fragment with a tail row again (module docstring).
+HALO_KIND = "kcp_bwd_halo"
 # Every route of ``ROUTES[arch]``, and the backward routes (those that select
 # one record by the channel count).
-ROUTE_KINDS = ("kcp_fwd", "kcp_bwd", SPLIT_KIND, "kcp_bwd_head")
+ROUTE_KINDS = ("kcp_fwd", "kcp_bwd", SPLIT_KIND, "kcp_bwd_head", HALO_KIND)
 BWD_KINDS = ("kcp_bwd", SPLIT_KIND)
 # The history / halo rows every fragment carries (the convolution width minus one).
 HALO = WIDTH - 1
@@ -1005,13 +1099,14 @@ def workspace_record(arch: str) -> dict[str, Any]:
 
 
 def head_grid(record: dict[str, Any], *, n_frag: int, C: int) -> tuple[int, int, int]:
-    """The head program's grid: ``max(1, n_frag x ceil(C / (threads x vec)))`` work items over the record's geometry."""
+    """The grid of the head program and of the tail-row program: ``max(1, n_frag x ceil(C / (threads x vec)))`` work
+    items over the record's geometry."""
 
     geometry = record["grid_rule"]["geometry"]
     channels_per_cta = int(geometry["threads"]) * int(geometry["vec"])
     if channels_per_cta <= 0:
         raise ValueError(
-            "the head record's geometry must cover at least one channel per CTA"
+            "the head or tail-row record's geometry must cover at least one channel per CTA"
         )
     items = int(n_frag) * (-(-int(C) // channels_per_cta))
     return (max(1, items), 1, 1)
@@ -1102,6 +1197,7 @@ __all__ = [
     "BWD_KINDS",
     "CHANNEL_MULTIPLE",
     "HALO",
+    "HALO_KIND",
     "INT32_MAX",
     "KINDS",
     "LOGICAL_SCALARS",

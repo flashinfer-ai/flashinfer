@@ -134,6 +134,16 @@ Every rank of a group passes the same `cooperative` value.  The form changes
 no collective, so a mismatch does not hang, but the ranks' `dweight` partials
 would then mix two reduction orders.
 
+With `cooperative=False` at more than one rank the backward overlaps its halo
+exchange: the `kcp_bwd_split` program and its reduce program run while the
+exchange is in flight, as if no tail row had arrived, and after the wait the
+`kcp_bwd_halo` program writes `dx` of the last `min(3, len)` rows of every
+fragment with a tail row again, recomputing their `dpre` with the main
+program's instructions and folding the received rows with its FMAs in its
+order.  `dx` and `dweight` keep the bits of the waiting launch; the exchange
+and its wait are unchanged, and one more program runs when the rank receives
+tail rows.  `cooperative=True` waits before its launch.
+
 ### Halo exchange
 
 One `all_to_all_single` per direction and call:
