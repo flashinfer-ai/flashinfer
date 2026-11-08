@@ -61,6 +61,7 @@ import importlib.util
 import inspect
 import os
 import shutil
+import sys
 import types
 import warnings
 
@@ -945,14 +946,47 @@ def test_acc_library_loadable_is_the_loader_rule(name, stage, arch, monkeypatch)
         monkeypatch.setattr(cb, "_jit_cuda_version", lambda toolkit=toolkit: toolkit)
         assert cb.acc_library_loadable(name, stage, arch) is want, (prebuilt, toolkit)
     with pytest.MonkeyPatch.context() as mp:
-
-        def no_jit(name):
-            raise RuntimeError(
-                f"{name} is not prebuilt and flashinfer's JIT is not available"
-            )
-
-        mp.setattr(cb, "_jit_toolchain", no_jit)
+        # FlashInfer's JIT is not importable (a prebuilt-only or vendored copy): the real
+        # ``cake_build._jit_toolchain`` path, whose error names a manifest library.
+        mp.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+        mp.setitem(sys.modules, "flashinfer.jit.core", None)
         assert toolkit_of_process.__wrapped__() is None
+
+
+def test_jit_toolkit_needs_nvcc_and_the_jit_enabled(tmp_path, monkeypatch):
+    """FlashInfer's JIT toolkit counts only where it can build: with ``FLASHINFER_DISABLE_JIT``
+    set, without ``bin/nvcc`` under FlashInfer's CUDA path (where its version query falls
+    back to PyTorch's CUDA version), or when that path cannot be resolved (an ``OSError``),
+    ``_jit_cuda_version`` is None and an accumulate build that is not prebuilt cannot load
+    (the call composes, ``"min_cuda"``)."""
+    cpp_ext = pytest.importorskip("flashinfer.jit.cpp_ext")
+    toolkit = cb._jit_cuda_version.__wrapped__
+    monkeypatch.setattr(
+        cpp_ext, "get_cuda_version", lambda: types.SimpleNamespace(major=99, minor=0)
+    )
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(tmp_path))
+    monkeypatch.setattr(cb, "_jit_cuda_version", toolkit)
+    monkeypatch.setattr(cb, "prebuilt_path", lambda lib: _Path(False))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    shipped = _shipped_bindings()
+    assert toolkit() is None  # no bin/nvcc
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
+    nvcc = tmp_path / "bin" / "nvcc"
+    nvcc.parent.mkdir()
+    nvcc.write_text("")
+    assert toolkit() == (99, 0)
+    assert all(cb.acc_library_loadable(*binding) for binding in shipped)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    assert toolkit() is None
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT")
+
+    def no_which():
+        raise FileNotFoundError("which")
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", no_which)
+    assert toolkit() is None
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
 
 
 def test_generated_program_available_with_accumulate(monkeypatch):
@@ -1265,6 +1299,42 @@ def test_accumulate_refuses_unsafe_outputs(tile, monkeypatch):
     else:
         assert launch.plan["accumulate"] == "composed"
         assert launch.add_from.shape == (1, n, k) and launch.add_from.is_contiguous()
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_out_span_is_bounded_by_32_bit_addressing(accumulate, monkeypatch):
+    """The kernels address ``out`` with 32-bit element offsets over its whole span, so the
+    preparation bounds ``1 + sum((size - 1) * stride)``, not ``E`` times the expert stride: a
+    one-group ``out`` with an expert stride of 0 and a row pitch of ``2 K`` whose span passes
+    the limit is refused (``ValueError``, before any program is bound), as the overwrite and
+    as the fused accumulate; at the limit it is accepted, unless its expert stride (which the
+    binding takes as a 32-bit value but adds nothing to a one-group span) passes the limit."""
+    arch = "sm_100a"
+    _fake_device(monkeypatch, arch, 148)
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS["k512_min_rows_per_group"], arch, 1)
+    bound = _record_binds(monkeypatch)
+    n, k = 256, 512
+    g, x, offs, _ = _operands([128], n, k, torch.float32, torch.device("cpu"))
+    out = torch.zeros(n * 2 * k).as_strided((1, n, k), (0, 2 * k, 1))
+    span = (n - 1) * 2 * k + k
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "int32_elems", span - 1)
+    with pytest.raises(ValueError, match="exceeds the 32-bit element addressing"):
+        cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+            g, x, offs, out=out, accumulate=accumulate
+        )
+    assert bound == []
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "int32_elems", span)
+    wide = out.as_strided(out.shape, (span + 1, 2 * k, 1))
+    with pytest.raises(ValueError, match="exceeds the 32-bit element addressing"):
+        cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+            g, x, offs, out=wide, accumulate=accumulate
+        )
+    assert bound == []
+    launch = cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        g, x, offs, out=out, accumulate=accumulate
+    )
+    assert launch.out is out
+    assert launch.plan["accumulate"] == ("fused" if accumulate else "off")
 
 
 def test_sum_m_zero_accumulates_nothing(monkeypatch):
@@ -1973,7 +2043,7 @@ def _device_route(device, plan, stage, out_dtype):
         if not cb.acc_library_loadable(route, build, arch):
             pytest.skip(
                 f"the {build} library of {route} cannot load here (not prebuilt, and "
-                "FlashInfer's JIT toolkit is below its build.json min_cuda): the call composes"
+                "FlashInfer's JIT cannot build it at its build.json min_cuda): the call composes"
             )
     return "fused"
 

@@ -336,6 +336,9 @@ def test_five_repeats_under_copy_streams(case, monkeypatch, record_property):
 
     traffic = _Traffic(device)
     mismatches = torch.zeros((), dtype=torch.int64, device=device)
+    # Order the reference copy, the traffic buffers and the counter (current stream) before
+    # the gemm and traffic streams use them.
+    torch.cuda.synchronize(device)
     launches = 0
     for fill in (0, FILL_BYTE):
         for _ in range(REPEATS):
@@ -432,6 +435,9 @@ def test_changing_offsets_cycle(case, monkeypatch, record_property):
     mismatches = {
         name: torch.zeros((), dtype=torch.int64, device=device) for name in layouts
     }
+    # Order the traffic buffers and the counters (current stream) before the gemm and
+    # traffic streams use them.
+    torch.cuda.synchronize(device)
     launches = 0
     for cycle in range(REPEATS):
         for name in layouts:
@@ -526,6 +532,7 @@ def test_error_vs_fp64_per_output(case, monkeypatch, record_property):
         torch.cat([g.flatten() for g in got]),
         torch.cat([r.flatten() for r in ref]),
     )
+    assert bool(torch.isfinite(got).all()), f"{label}: non-finite sampled outputs"
     err = (got - ref).abs()
     max_abs = float(err.max())
     max_rel = float((err / ref.abs().clamp_min(1e-30)).max())
@@ -539,7 +546,7 @@ def test_error_vs_fp64_per_output(case, monkeypatch, record_property):
     )
     if dtype == torch.bfloat16:
         bound = base.ATOL + base.RTOL * ref.abs()
-        bad = int((err > bound).sum())
+        bad = int((~(err <= bound)).sum())  # a NaN counts as beyond the budget
         assert bad == 0, f"{label}: {bad} bf16 elements beyond 1e-2 + 1e-2 |ref64|"
     else:
         assert rel_l2 <= base.FP32_REL_L2, f"{label}: fp32 rel-L2 {rel_l2:.3e}"
