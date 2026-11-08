@@ -2553,6 +2553,55 @@ def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
+    "name, offset",
+    [("v", 1), ("v", 4), ("q", 1), ("k", 1), ("do", 1), ("do", 4)],
+    ids=["v-2B", "v-8B", "q-2B", "k-2B", "do-2B", "do-8B"],
+)
+def test_unaligned_operands_take_an_aligned_copy(name, offset, device) -> None:
+    # a contiguous view 2 or 8 bytes past a 16-byte boundary: .contiguous() keeps it where it is, and the 16-byte rows
+    # of v / do and the plain prep's 8-byte q / k loads would fault there (misaligned address); the package copies
+    # such an operand to an aligned buffer, so the run gives the bits of the aligned one
+    seq_lens = (300, 77)
+    inputs = _inputs(seq_lens, (2, 4), torch.float32, device, seed=29)
+    t = inputs[name]
+    buf = torch.empty(t.numel() + 16, dtype=t.dtype, device=device)
+    lead = (-buf.data_ptr() // t.element_size()) % (16 // t.element_size())
+    shifted = buf[lead + offset : lead + offset + t.numel()].view(t.shape).copy_(t)
+    assert (
+        shifted.is_contiguous() and shifted.data_ptr() % 16 == offset * t.element_size()
+    )
+    align = (
+        cake_chain.PREP_ALIGN_BYTES
+        if name in ("q", "k")
+        else cake_chain.ROW_ALIGN_BYTES
+    )
+    assert (
+        cake_chain._aligned(t, align) is t
+        and cake_chain._aligned(shifted, align) is not shifted
+    )
+
+    def run(ops):
+        leaves = {
+            n: ops[n].detach().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        cu = _cu(seq_lens)
+        o, _ = cake_gdn_det(
+            leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], scale=1.0 / math.sqrt(HEAD_DIM),
+            cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+            cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+        o.backward(ops["do"])
+        torch.cuda.synchronize()
+        return {
+            "o": o.detach(),
+            **{f"d{n}": leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+        }
+
+    _assert_bitwise(run({**inputs, name: shifted}), run(inputs), OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize(
     "preps", [(None, None), ("tma", "plain")], ids=["rule", "tma-vs-plain"]
 )
 def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:

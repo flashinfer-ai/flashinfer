@@ -687,8 +687,8 @@ def test_shared_binding_sources_keep_distinct_namespaces():
 
 def test_policy_records_round_trip_and_reject_foreign_fields():
     """Every architecture's registry record carries exactly ``POLICY_FIELDS`` and round-trips through
-    ``DispatchPolicy``; a record with a field of the deterministic package's ordering pass or FP8 form, or without one
-    of its own fields, is rejected."""
+    ``DispatchPolicy``; a record with a field of the deterministic package's ordering pass or FP8 form, without one
+    of its own fields, or with a malformed ``sample_long_rule`` is rejected."""
     for arch, raw in cake_jit.POLICY.items():
         policy = policy_for(arch)
         record = policy.record()
@@ -708,6 +708,10 @@ def test_policy_records_round_trip_and_reject_foreign_fields():
             )
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, far_sample=2))
+        # a malformed long rule (kinds not a flat list of physical kind names) is a ValueError, not a TypeError
+        for kinds in ([["l6"]], ["l6", 6], ["no_such_kind"], []):
+            with pytest.raises(ValueError):
+                DispatchPolicy.from_record(dict(record, sample_long_rule=[kinds, 500]))
 
 
 def test_split_calls_run_the_plain_merge_and_unsplit_calls_the_scan_alone():

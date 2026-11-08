@@ -9002,9 +9002,13 @@ FWD_MAP_CLAIM = {
 # 0.982 and 0.983 / 0.985, checkpoint 0.983 / 0.983 and 0.989 / 0.990 (identical-program control 0.999-1.000); at
 # 7680 forward reads 0.998 / 0.998 there but 1.000 / 1.002 against main in two record sessions, so the band stops
 # at 7168.
+# On sm_103a the band runs on to 6656 tokens: against the 6144-token band (GB300, two sessions, CUPTI active) every
+# path reads faster in both sessions -- forward 0.979 / 0.978 at 6145, 0.977 / 0.975 at 6400 and 0.976 / 0.978 at
+# 6656, forward_pf 0.976 / 0.977, 0.977 / 0.979 and 0.978 / 0.978, checkpoint 0.980 / 0.982, 0.981 / 0.980 and
+# 0.982 / 0.982 (identical-program control 0.999-1.001).
 FWD_MAP_XNRM = {
     "sm_100a": ((64, 7168),),
-    "sm_103a": ((64, 6144),),
+    "sm_103a": ((64, 6656),),
     "sm_107a": ((64, 14928), (15288, 65536)),
 }
 # FWD_MAP_XNRM_PATHS: extra _xn bands per architecture and call path (as PDL_PATHS);

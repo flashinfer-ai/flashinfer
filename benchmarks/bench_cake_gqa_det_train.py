@@ -156,11 +156,14 @@ def make_inputs(lay, device: torch.device, seed: int = 0) -> dict[str, Any]:
     def randn(*shape):
         return torch.randn(*shape, generator=g, device=device).to(torch.bfloat16)
 
-    def cu(lens):
+    def host_cu(lens):
         out = [0]
         for n in lens:
             out.append(out[-1] + n)
-        return torch.tensor(out, dtype=torch.int32, device=device)
+        return out
+
+    def cu(lens):
+        return torch.tensor(host_cu(lens), dtype=torch.int32, device=device)
 
     rows = [s + j for s, k in zip(starts, k_lens, strict=True) for j in range(k)]
     # Per segment: (first destination row, first window row, end window row); the windows in segment order.
@@ -175,6 +178,8 @@ def make_inputs(lay, device: torch.device, seed: int = 0) -> dict[str, Any]:
         "dout": randn(t_q, H_Q, D),
         "cu_q": cu(q_lens),
         "cu_k": cu(k_lens),
+        "cq": host_cu(q_lens),
+        "ck": host_cu(k_lens),
         "row_map": torch.tensor(rows, dtype=torch.int32, device=device),
         "dk_dst": torch.empty(n_dst, H_KV, D, device=device),
         "dv_dst": torch.empty(n_dst, H_KV, D, device=device),
@@ -188,9 +193,15 @@ def make_inputs(lay, device: torch.device, seed: int = 0) -> dict[str, Any]:
 class CakeArm:
     name = "cake"
 
-    def __init__(self, x: dict[str, Any], budget_bytes: int) -> None:
+    def __init__(
+        self, x: dict[str, Any], budget_bytes: int, host: bool = False
+    ) -> None:
         self.ws = cake_gqa_det_train_workspace(x["q"].device, budget_bytes=budget_bytes)
         self._fwd, self._bwd = cake_gqa_det_train_forward, cake_gqa_det_train_backward
+        # The host boundaries: the backward plans its workspace chunks from the exact tile counts.
+        self.host = (
+            {"cu_seqlens_q_host": x["cq"], "cu_seqlens_k_host": x["ck"]} if host else {}
+        )
 
     def stages(self, x: dict[str, Any]) -> list[tuple[str, Callable[[], Any]]]:
         state: dict[str, Any] = {}
@@ -224,6 +235,7 @@ class CakeArm:
                 row_map=x["row_map"],
                 max_seqlen_k=x["max_k"],
                 workspace=self.ws,
+                **self.host,
             )
 
         return [("fwd", fwd), ("fwd_replay", fwd), ("bwd", bwd)]
@@ -232,7 +244,9 @@ class CakeArm:
 class CakeNondetArm(CakeArm):
     name = "cake_nondet"
 
-    def __init__(self, x: dict[str, Any], budget_bytes: int) -> None:
+    def __init__(
+        self, x: dict[str, Any], budget_bytes: int, host: bool = False
+    ) -> None:
         from flashinfer.cake_gqa_nondet_train import (
             cake_gqa_nondet_train_backward,
             cake_gqa_nondet_train_forward,
@@ -244,13 +258,18 @@ class CakeNondetArm(CakeArm):
             cake_gqa_nondet_train_forward,
             cake_gqa_nondet_train_backward,
         )
+        self.host = (
+            {"cu_seqlens_q_host": x["cq"], "cu_seqlens_k_host": x["ck"]} if host else {}
+        )
 
 
 class FlashAttentionArm:
     name = "fa4"
     deterministic = False
 
-    def __init__(self, x: dict[str, Any], budget_bytes: int) -> None:
+    def __init__(
+        self, x: dict[str, Any], budget_bytes: int, host: bool = False
+    ) -> None:
         from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
         self._fwd, self._bwd = _flash_attn_fwd, _flash_attn_bwd
@@ -345,6 +364,11 @@ def main() -> int:
         default=8.0,
         help="dS^T workspace budget of the cake arm in GiB (default 8)",
     )
+    parser.add_argument(
+        "--host-boundaries",
+        action="store_true",
+        help="pass the host copies of cu_seqlens to the Cake backwards (exact workspace chunks)",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--out", default="")
@@ -363,7 +387,7 @@ def main() -> int:
         arms = []
         for arm in args.arms.split(","):
             try:
-                arms.append(ARMS[arm](x, budget))
+                arms.append(ARMS[arm](x, budget, args.host_boundaries))
             except ImportError as exc:
                 print(f"{name}: arm {arm} unavailable ({exc})", file=sys.stderr)
         samples: dict[str, list[dict[str, float]]] = {arm.name: [] for arm in arms}
@@ -391,6 +415,8 @@ def main() -> int:
                 max_seqlen_k=max(lay[1]),
                 row_map=True,
                 budget_bytes=budget,
+                cu_seqlens_q_host=x["cq"] if args.host_boundaries else None,
+                cu_seqlens_k_host=x["ck"] if args.host_boundaries else None,
             ),
             "gpu": torch.cuda.get_device_name(device),
             "cuda": torch.version.cuda,

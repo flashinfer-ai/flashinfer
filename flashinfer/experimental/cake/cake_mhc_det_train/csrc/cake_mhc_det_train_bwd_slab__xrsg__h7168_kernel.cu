@@ -1027,7 +1027,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                         rowa = T - 1;
                                     }
                                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 80 + wq_q4[kq_2] * 16)), "l"(tokp + ((unsigned long long)rowa * 24 + (unsigned long long)(wq_q4[kq_2] * 4))));
+                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 80 + wq_q4[kq_2] * 16)), "l"(tokp + ((unsigned long long)rowa * 24ull + (unsigned long long)(wq_q4[kq_2] * 4))));
                                 }
                             } else {
                                 #pragma unroll
@@ -1043,10 +1043,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                             "setp.ne.b32 p, %0, 0;\n\t"
                                             "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                             "}"
-                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)(wq_q5[kq_3] * 4))));
+                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)(wq_q5[kq_3] * 4))));
                                     } else {
                                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24 + (unsigned long long)(wq_q5[kq_3] * 4))));
+                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)(wq_q5[kq_3] * 4))));
                                     }
                                 }
                             }
@@ -2484,7 +2484,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                     rowa_2 = T - 1;
                                 }
                                 asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 80 + wq_q4[kq_4] * 16)), "l"(tokp + ((unsigned long long)rowa_2 * 24 + (unsigned long long)(wq_q4[kq_4] * 4))));
+                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 80 + wq_q4[kq_4] * 16)), "l"(tokp + ((unsigned long long)rowa_2 * 24ull + (unsigned long long)(wq_q4[kq_4] * 4))));
                             }
                         } else {
                             #pragma unroll
@@ -2500,10 +2500,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)(wq_q5[kq_5] * 4))));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)(wq_q5[kq_5] * 4))));
                                 } else {
                                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24 + (unsigned long long)(wq_q5[kq_5] * 4))));
+                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)(wq_q5[kq_5] * 4))));
                                 }
                             }
                         }
@@ -2535,7 +2535,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                             rowa_4 = T - 1;
                                         }
                                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 80 + wq_q4[kq_6] * 16)), "l"(tokp + ((unsigned long long)rowa_4 * 24 + (unsigned long long)(wq_q4[kq_6] * 4))));
+                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 80 + wq_q4[kq_6] * 16)), "l"(tokp + ((unsigned long long)rowa_4 * 24ull + (unsigned long long)(wq_q4[kq_6] * 4))));
                                     }
                                 } else {
                                     #pragma unroll
@@ -2551,10 +2551,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                                                 "setp.ne.b32 p, %0, 0;\n\t"
                                                 "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                                 "}"
-                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)(wq_q5[kq_7] * 4))));
+                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)(wq_q5[kq_7] * 4))));
                                         } else {
                                             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24 + (unsigned long long)(wq_q5[kq_7] * 4))));
+                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)(wq_q5[kq_7] * 4))));
                                         }
                                     }
                                 }
@@ -2641,7 +2641,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
                     if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x ^= 1; }
                 }
                 unsigned long long kcol = (unsigned long long)(i_str * 7168 + s_2 * 64 + dl);
-                unsigned long long pbase = (unsigned long long)p_2 * 688128;
+                unsigned long long pbase = (unsigned long long)p_2 * 688128ull;
                 #pragma unroll
                 for (int n_3 = 0; n_3 < 24; n_3++) {
                     float _sub_4;

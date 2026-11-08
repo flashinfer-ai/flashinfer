@@ -51,13 +51,13 @@ SHIPPED_SLABS = (4, 16, 32, 64)
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
     1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 25, 26, 31, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153,
-    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 576, 577, 768, 769, 960, 961, 1023, 1024, 1025,
-    1280, 1281, 1664, 1665, 1680, 1681, 2048, 2049, 3072, 3073, 4096, 4097, 5120, 5121, 6144, 6145, 12288, 12289, 14928,
-    14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968, 19969, 20480, 20481, 24064, 24065, 32768,
-    32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50176,
-    50177, 50688, 50689, 51200, 51201, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896,
-    80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864,
-    1572865,
+    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 368, 369, 576, 577, 768, 769, 960, 961, 1023, 1024,
+    1025, 1152, 1153, 1216, 1217, 1280, 1281, 1664, 1665, 1680, 1681, 2048, 2049, 3072, 3073, 4096, 4097, 5120, 5121,
+    6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968, 19969, 20480,
+    20481, 24064, 24065, 24576, 24577, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032,
+    44033, 45056, 45057, 48640, 48641, 50176, 50177, 50688, 50689, 51200, 51201, 52736, 52737, 55296, 55297, 58880,
+    58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 720896,
+    720897, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -624,8 +624,9 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
 # The SM counts of devices per architecture at or above the guard's: the measured boards (B200 148, GB300 152,
 # R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
 BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
-# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 -> their block-compensated forms,
-# the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs compensated programs only).
+# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 and of the residual H = 6144 ->
+# their block-compensated forms, the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs
+# compensated programs only).
 ACCURACY_EDGES = {
     "sm_100a": {
         "h1536": 36352,
@@ -634,6 +635,7 @@ ACCURACY_EDGES = {
         "h4096": 44032,
         "h5120": 6144,
         "h6144": 42496,
+        "residual_h6144": 42496,
     },
     "sm_103a": {
         "h1536": 40448,
@@ -642,6 +644,7 @@ ACCURACY_EDGES = {
         "h4096": 48640,
         "h5120": 5120,
         "h6144": 48640,
+        "residual_h6144": 48640,
     },
     "sm_107a": {
         "h1536": 45056,
@@ -650,6 +653,7 @@ ACCURACY_EDGES = {
         "h4096": 24064,
         "h5120": 19968,
         "h6144": 19456,
+        "residual_h6144": 19456,
     },
 }
 
@@ -672,8 +676,8 @@ def _launched_library(arch: str, route: str, rows: int) -> str:
 
 def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
     """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight
-    backward routes with a compensated program (every one but H = 512 and the residual H = 6144), the edge where the
-    route's compensated programs start."""
+    backward routes with a compensated program (every one but H = 512), the edge where the route's compensated
+    programs start."""
     assert windows.ACCURACY_MIN_SMS == {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
     assert set(windows.ACCURACY_EDGES) == set(loader.ROUTES)
     for arch, edges in ACCURACY_EDGES.items():

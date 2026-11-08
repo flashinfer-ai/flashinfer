@@ -104,6 +104,17 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
+#if __CUDA_ARCH__ == 1030
+
+__device__ __forceinline__ void cp_async_bulk_gmem2smem(
+    unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1], %2, [%3];"
+        :: "r"(smem_addr), "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
+        : "memory");
+}
+#endif
 
 extern "C" {
 
@@ -341,6 +352,10 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
                     int row_g = first_2 + rg;
                     long long g_srcg = (long long)row_g * g_stride;
                     long long x_srcg = (long long)row_g * x_stride;
+#if __CUDA_ARCH__ == 1030
+                    cp_async_bulk_gmem2smem(sbase + rg * 4096, reinterpret_cast<const uint8_t*>(g + g_srcg), 4096, bars_addr + (gstage) * 8);
+                    cp_async_bulk_gmem2smem(sbase + (rg + 4) * 4096, reinterpret_cast<const uint8_t*>(x + x_srcg), 4096, bars_addr + (gstage) * 8);
+#else
                     asm volatile(
                         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1], %2, [%3], %4;"
@@ -351,6 +366,7 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
                         " [%0], [%1], %2, [%3], %4;"
                         :: "r"(sbase + (rg + 4) * 4096), "l"(reinterpret_cast<const uint8_t*>(x + x_srcg)), "r"((unsigned)(4096)), "r"(bars_addr + (gstage) * 8),
                            "l"(0x14F0000000000000ULL) : "memory");
+#endif
                 } else {
                     mbarrier_arrive(bars_addr + (gstage) * 8);
                 }
@@ -450,7 +466,7 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
     float out[16];
     if (cb >= ce) {
         if (c0 < n_chunks) {
-            unsigned long long pbase0 = (unsigned long long)c0 * 2048;
+            unsigned long long pbase0 = (unsigned long long)c0 * 2048ull;
             float fold0[4];
             #pragma unroll
             for (int e0 = 0; e0 < 4; e0++) {
@@ -549,6 +565,10 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
                         int row_g_1 = first_3 + rg;
                         long long g_srcg_1 = (long long)row_g_1 * g_stride;
                         long long x_srcg_1 = (long long)row_g_1 * x_stride;
+#if __CUDA_ARCH__ == 1030
+                        cp_async_bulk_gmem2smem(sbase_1 + rg * 4096, reinterpret_cast<const uint8_t*>(g + g_srcg_1), 4096, bars_addr + (gstage_1) * 8);
+                        cp_async_bulk_gmem2smem(sbase_1 + (rg + 4) * 4096, reinterpret_cast<const uint8_t*>(x + x_srcg_1), 4096, bars_addr + (gstage_1) * 8);
+#else
                         asm volatile(
                             "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1], %2, [%3], %4;"
@@ -559,6 +579,7 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
                             " [%0], [%1], %2, [%3], %4;"
                             :: "r"(sbase_1 + (rg + 4) * 4096), "l"(reinterpret_cast<const uint8_t*>(x + x_srcg_1)), "r"((unsigned)(4096)), "r"(bars_addr + (gstage_1) * 8),
                                "l"(0x14F0000000000000ULL) : "memory");
+#endif
                     } else {
                         mbarrier_arrive(bars_addr + (gstage_1) * 8);
                     }
@@ -644,7 +665,7 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
             float kx = rq * rq * rq * cq;
             float nkx = -kx;
             if (row < ce) {
-                unsigned long long dx_base = (unsigned long long)row * 2048;
+                unsigned long long dx_base = (unsigned long long)row * 2048ull;
                 #pragma unroll
                 for (int v_3 = 0; v_3 < 2; v_3++) {
                     #pragma unroll
@@ -705,7 +726,7 @@ kernel_cake_rmsnorm_det_train_c73074cf44f07fcf3bb6(__nv_bfloat16* __restrict__ g
         asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_26) : "r"(w2_1));
         nd[2] = _warp_redux_26;
         int cid_f = nd[0];
-        unsigned long long pbase = (unsigned long long)cid_f * 2048;
+        unsigned long long pbase = (unsigned long long)cid_f * 2048ull;
         __syncthreads();
         #pragma unroll
         for (int v_4 = 0; v_4 < 2; v_4++) {

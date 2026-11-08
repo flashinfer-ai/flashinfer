@@ -2412,6 +2412,101 @@ class _RecordingLauncher:
         return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
+# The source-exact routes on a padded ragged call: (route, heads, dtype,
+# request lengths, sparse width, compressed page size).
+_SOURCE_EXACT_PADDED = [
+    ("bf16_h8_h16_source_exact", 16, torch.bfloat16, [5, 3, 4], 260, 2),
+    ("fp8_h8_h16_source_exact", 8, torch.float8_e4m3fn, [5, 3, 4], 192, 64),
+    ("fp8_h64_source_exact", 64, torch.float8_e4m3fn, [257, 100], 640, 64),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,sparse_topk,page", _SOURCE_EXACT_PADDED
+)
+def test_source_exact_programs_bind_the_metadata_rows(
+    monkeypatch, arch, route, num_heads, dtype, q_lens, sparse_topk, page
+):
+    """The source-exact programs launch one CTA per request position: the grid
+    is ``max_q_len`` x ``batch_size`` whatever the metadata rows ``T``.  A
+    padded ragged call (``cum_seq_lens_q`` describing more rows than ``T``)
+    through run_cake_dsv4, bound by the route's registered plan, passes
+    ``num_query_tokens = T``, the first ``T`` rows of the query and of
+    ``out`` and the caller's ``cum_seq_lens_q``: the program runs every
+    position at or past ``T`` as padding."""
+    plan = get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    names = [name for _, name in plan]
+    recorder = _install_fake_variants(monkeypatch, {route: plan})
+    monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
+    query_rows, batch_size, max_q_len = sum(q_lens), len(q_lens), max(q_lens)
+    cum = torch.tensor([0, *q_lens], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    grid_y = 1 if route == "fp8_h64_source_exact" else num_heads // 8 * 4
+    for rows in (1, query_rows - 1):
+        table, lens = _combined_metadata(rows, sparse_topk - 128)
+        out = (
+            _aligned_u8(query_rows * num_heads * 512 * 2)
+            .view(torch.bfloat16)
+            .view(query_rows, num_heads, 512)
+        )
+        recorder.calls.clear()
+        cake.run_cake_dsv4(
+            query=torch.zeros((query_rows, num_heads, 512), dtype=dtype),
+            swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=dtype),
+            compressed_kv_cache=torch.zeros((8, 1, page, 512), dtype=dtype),
+            workspace_buffer=_aligned_u8(
+                get_cake_dsv4_workspace_bytes(
+                    rows, num_heads, sparse_topk, dtype, num_splits=1
+                )
+            ),
+            out=out,
+            bmm1_scale=0.5,
+            bmm2_scale=1.0,
+            sinks=None,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum,
+            seq_lens=torch.full((batch_size,), 1000, dtype=torch.int32),
+            backend="cake",
+            sparse_indices=table,
+            sparse_topk_lens=lens,
+        )
+        (call,) = recorder.calls
+        bound = dict(zip(names, call, strict=True))
+        assert bound["num_query_tokens"] == rows
+        assert bound["tmap_q"].shape[0] == rows
+        assert bound["O"].shape[0] == rows
+        assert bound["O"].data_ptr() == out.data_ptr()
+        assert bound["cum_seq_lens_q"].data_ptr() == cum.data_ptr()
+        assert (bound["max_q_len"], bound["batch_size"]) == (max_q_len, batch_size)
+        grid = (bound["grid_x"], bound["grid_y"], bound["grid_z"])
+        assert grid == (max_q_len, grid_y, batch_size)
+        if route == "fp8_h64_source_exact":
+            assert bound["total_work_items"] == max_q_len * batch_size
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("route", [route for route, *_ in _SOURCE_EXACT_PADDED])
+def test_source_exact_bindings_take_their_arg_plans(arch, route):
+    """The binding ``Run`` of each source-exact program takes the route's
+    registered plan, name for name and in order (``a_<name>`` for a kernel
+    argument, then ``grid_x``, ``grid_y``, ``grid_z``).  The host binds the
+    plan by name and calls ``Run`` positionally, so a plan naming
+    ``num_query_tokens`` that its program's binding does not take, or the
+    reverse, shifts every later argument."""
+    import re
+
+    from flashinfer.jit.cake_dsv4 import _get_csrc_dir
+
+    spec = get_cake_dsv4_spec(route, arch=arch)
+    (binding,) = [name for name in spec["sources"] if name.endswith("_binding.cu")]
+    text = (_get_csrc_dir() / binding).read_text(encoding="utf-8")
+    (params,) = re.findall(r"^void Run\(([^)]*)\)", text, re.MULTILINE)
+    taken = [param.split()[-1].removeprefix("a_") for param in params.split(",")]
+    assert taken == [name for _, name in spec["arg_plan"]], binding
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
@@ -5282,11 +5377,11 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
 
 # Pieces per row of the split launches SM107 runs with PDL (128 heads, items
 # 1025-1152 wide): the first of 9, 5 and 3 that keeps rows x pieces <= 40
-# (<= 51 for three).
+# (<= 60 for three).
 _SPLIT_PIECES = {
     **dict.fromkeys(range(1, 5), 9),
     **dict.fromkeys(range(5, 9), 5),
-    **dict.fromkeys(range(9, 18), 3),
+    **dict.fromkeys(range(9, 21), 3),
 }
 # The merges built for one piece count: the merge for nine and five pieces
 # alone (``_c{s}``, one CTA per row and head) and the three-piece merge
@@ -5298,12 +5393,12 @@ _SPLIT_COUNT_MERGES = (_SPLIT_MERGE_C9, _SPLIT_MERGE_C5, _SPLIT_MERGE_S3)
 # The merge and its heads per CTA of each row count's 128-head split launch
 # where the registry routes the per-count merges to programs of their own:
 # the merge for nine pieces at 1-4 rows and for five at 5-8, the merge of any
-# count at 9-15 and the three-piece merge at 16-17.
+# count at 9-15 and the three-piece merge at 16-20.
 _SPLIT_MERGES = {
     **dict.fromkeys(range(1, 5), (_SPLIT_MERGE_C9, 1)),
     **dict.fromkeys(range(5, 9), (_SPLIT_MERGE_C5, 1)),
     **dict.fromkeys(range(9, 16), (f"{_UNIFORM_ROUTE}_k64_split_reduce", 1)),
-    **dict.fromkeys(range(16, 18), (_SPLIT_MERGE_S3, 2)),
+    **dict.fromkeys(range(16, 21), (_SPLIT_MERGE_S3, 2)),
 }
 
 
@@ -5326,9 +5421,9 @@ def _split_plan(**shape):
 @pytest.mark.cpu_only
 def test_k64_split_rule_is_sm107a_only():
     """Only SM107 splits, and only with PDL, the uniform route's 128-head
-    launches of at most 17 rows over nine-tile items, at most 40 pieces (51
+    launches of at most 20 rows over nine-tile items, at most 40 pieces (60
     for three per row); the launches of nine and five pieces merge with the
-    merge for their count alone, those of three at 16 and 17 rows with the
+    merge for their count alone, those of three at 16-20 rows with the
     three-piece merge."""
     assert _UNIFORM_ROUTE == cake._K64_SPLIT_ROUTE
     assert f"{_UNIFORM_ROUTE}_k64_split" == cake._K64_SPLIT_VARIANT
@@ -5340,9 +5435,9 @@ def test_k64_split_rule_is_sm107a_only():
     } == cake._K64_SPLIT_COUNT_MERGES
     rule = cake._K64SplitRule(
         num_tiles=9,
-        max_tokens_pdl=17,
+        max_tokens_pdl=20,
         max_tokens_no_pdl=0,
-        splits=((9, 40), (5, 40), (3, 51)),
+        splits=((9, 40), (5, 40), (3, 60)),
         merge_by_splits=(
             (9, 1, _SPLIT_MERGE_C9),
             (5, 5, _SPLIT_MERGE_C5),
@@ -5370,6 +5465,8 @@ def test_k64_split_rule_is_sm107a_only():
         (15, ""),
         (16, "_s3"),
         (17, "_s3"),
+        (18, "_s3"),
+        (20, "_s3"),
     ],
 )
 def test_k64_split_merge_at_the_rule_boundaries(monkeypatch, tokens, suffix):
@@ -5377,9 +5474,9 @@ def test_k64_split_merge_at_the_rule_boundaries(monkeypatch, tokens, suffix):
     registry routing every per-count merge to a program of its own, a split
     launch merges with the merge for nine pieces at 1 and 4 rows and for five
     at 5 and 8 (one head per CTA), with the merge of any count at 9, 14 and
-    15 and with the three-piece merge at 16 and 17 (two heads per CTA); the
-    same launch with 64 heads, or on SM100 / SM103, merges with the merge of
-    any count."""
+    15 and with the three-piece merge at 16, 17, 18 and 20 (two heads per
+    CTA); the same launch with 64 heads, or on SM100 / SM103, merges with the
+    merge of any count."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _fake_split_variants(routed=True))
@@ -5399,15 +5496,15 @@ def test_k64_split_merge_at_the_rule_boundaries(monkeypatch, tokens, suffix):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [*range(1, 19), 24, 48, 127])
+@pytest.mark.parametrize("tokens", [*range(1, 22), 24, 48, 127])
 @pytest.mark.parametrize("sparse_topk", [1028, 1088, 1152])
 def test_k64_split_plan_pins(tokens, sparse_topk):
-    """Rows 1-4 split into nine pieces, 5-8 into five and 9-17 into three; no
-    whole rows; 18 rows and more keep the route."""
+    """Rows 1-4 split into nine pieces, 5-8 into five and 9-20 into three; no
+    whole rows; 21 rows and more keep the route."""
     expected = (0, tokens, _SPLIT_PIECES[tokens]) if tokens in _SPLIT_PIECES else None
     assert _split_plan(num_query_tokens=tokens, sparse_topk=sparse_topk) == expected
     if expected is not None:
-        assert tokens * expected[2] <= (51 if expected[2] == 3 else 40)
+        assert tokens * expected[2] <= (60 if expected[2] == 3 else 40)
 
 
 @pytest.mark.cpu_only
@@ -5430,7 +5527,7 @@ def test_k64_split_plan_pins(tokens, sparse_topk):
         {"sparse_topk": 1156},
         {"enable_pdl": False},
         {"num_query_tokens": 0},
-        {"num_query_tokens": 18},
+        {"num_query_tokens": 21},
     ],
     ids=lambda change: ",".join(f"{k}={v}" for k, v in change.items()),
 )
@@ -5451,7 +5548,7 @@ def test_k64_split_plan_without_pdl_follows_its_own_ceiling(monkeypatch):
         "_K64_SPLIT_RULES",
         {"sm_107a": dataclasses.replace(rule, max_tokens_no_pdl=13)},
     )
-    for tokens in range(1, 19):
+    for tokens in range(1, 22):
         split = (0, tokens, _SPLIT_PIECES[tokens]) if tokens in _SPLIT_PIECES else None
         assert _split_plan(num_query_tokens=tokens, enable_pdl=True) == split
         assert _split_plan(num_query_tokens=tokens, enable_pdl=False) == (
@@ -5510,7 +5607,7 @@ def test_k64_split_checks_the_workspace_registry_and_gate(monkeypatch):
     assert asked == [("sm_107a", _DEVICE)]
     assert split(workspace_bytes=carve - 1) is None
     assert split(enable_pdl=False) is None
-    assert split(num_query_tokens=18) is None
+    assert split(num_query_tokens=21) is None
     assert len(asked) == 1
     assert split(workspace_bytes=carve + 4096) == (0, 8, 5)
     assert _SPLIT_MERGE_C5 not in sm107
@@ -5546,11 +5643,11 @@ def _split_merge(tokens, num_heads=128):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 15, 16, 17])
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20])
 def test_split_launch_runs_the_producer_then_the_merge(monkeypatch, tokens):
     """A split launch issues the split producer over 2 CTAs per piece and the
     merge, in one run, both on the piece views: the three-piece merge over one
-    CTA per (row, two heads) at three pieces per row and 16 or 17 rows, the
+    CTA per (row, two heads) at three pieces per row and 16-20 rows, the
     merge for its count alone (nine and five pieces) and the merge of any
     count (three pieces at 9-15 rows) over one CTA per (row, head)."""
     import flashinfer.jit.cake_dsv4 as jit
@@ -5807,13 +5904,13 @@ def _launch_record(calls):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 15, 16, 17])
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20])
 def test_run_cake_dsv4_split_launch_binds_the_piece_views(monkeypatch, tokens):
     """The split launch carves cake_dsv4_workspace_layout(T, H, s): the
     producer stores its pieces through the [T * s, H, 512] partial-O view at
     byte 263168 and the LSE right after it, final O of single-piece rows
     through O; the merge (the three-piece merge over (T, H / 2) at three
-    pieces per row and 16 or 17 rows, else the merge for its count alone, nine
+    pieces per row and 16-20 rows, else the merge for its count alone, nine
     and five pieces, or the merge of any count, three pieces at 9-15 rows,
     over (T, H)) reads the same views and writes O; both bind the call's PDL
     and run in one run_sequence call."""
@@ -5857,7 +5954,7 @@ def test_run_cake_dsv4_split_launch_binds_the_piece_views(monkeypatch, tokens):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 8, 17])
+@pytest.mark.parametrize("tokens", [1, 8, 17, 20])
 @pytest.mark.parametrize(
     "fallback", ["workspace", "no_pdl", "sm_103a", "gate", "unrouted"]
 )
@@ -5907,7 +6004,7 @@ _GRID = ("grid_x", "grid_y", "grid_z")
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 14, 15, 16, 17])
+@pytest.mark.parametrize("tokens", [1, 4, 5, 8, 9, 14, 15, 16, 17, 18, 20])
 @pytest.mark.parametrize("count_merge", ["unrouted", "route", "merge"])
 def test_split_without_the_count_merge_merges_with_the_merge_of_any_count(
     monkeypatch, tokens, count_merge
@@ -5917,7 +6014,7 @@ def test_split_without_the_count_merge_merges_with_the_merge_of_any_count(
     merge's program) still splits a launch and merges it with the merge of
     any count over (T, 128): the same producer launch and the same merge
     arguments as with the per-count merges routed, under which a launch of
-    16 or 17 rows differs only in its merge key and its grid (T, 64), one of
+    16-20 rows differs only in its merge key and its grid (T, 64), one of
     1-8 rows only in its merge key and one of 9-15 rows not at all."""
     inputs = _split_inputs(tokens)
     got = _run_split(monkeypatch, inputs, count_merge=count_merge)
@@ -5939,7 +6036,7 @@ def test_split_without_the_count_merge_merges_with_the_merge_of_any_count(
 @pytest.mark.parametrize(
     "tokens,num_heads,sparse_topk",
     [
-        (18, 128, 1152),
+        (21, 128, 1152),
         (24, 128, 1152),
         (8, 128, 1024),
         (8, 128, 640),
@@ -5951,7 +6048,7 @@ def test_split_without_the_count_merge_merges_with_the_merge_of_any_count(
 def test_split_keeps_the_route_outside_its_rule(
     monkeypatch, tokens, num_heads, sparse_topk
 ):
-    """Uniform-route launches outside the rules (128 heads: more than 17 rows
+    """Uniform-route launches outside the rules (128 heads: more than 20 rows
     or items of fewer than nine tiles; 64 heads: rows past those of the rule
     of their item width) keep the route's single launch on SM107 with the
     split programs registered."""
@@ -6010,7 +6107,7 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
     SMs some 64-head split shapes take an M64 route, which never splits);
     elsewhere and in the one-row minimum it reports the route's own numbers,
     and get_cake_dsv4_workspace_bytes bounds every split carve."""
-    for tokens in (*range(1, 19), 24, 48):
+    for tokens in (*range(1, 22), 24, 48):
         for sparse_topk in (1024, 1028, 1152):
             for num_heads in (64, 128):
                 req = cake.cake_dsv4_workspace_requirement(
@@ -6042,16 +6139,16 @@ def test_workspace_requirement_covers_the_split_launch(arch, sm_count):
                     own,
                     cake._launch_workspace_bytes(req.plan, 1, num_heads, tokens + 1),
                 )
-    # The largest carve: 17 rows of three pieces (51 pieces).
+    # The largest carve: 20 rows of three pieces (60 pieces).
     assert (
         max(
             cake._k64_split_workspace_bytes(
                 _UNIFORM_ROUTE, num_heads=128, num_query_tokens=tokens, sparse_topk=1152
             )
-            for tokens in range(1, 18)
+            for tokens in range(1, 22)
         )
-        == 6_973_952
-        == 263168 + 51 * (131072 + 512)
+        == 8_158_208
+        == 263168 + 60 * (131072 + 512)
     )
 
 
@@ -6144,11 +6241,11 @@ def _h64_plans(enable_pdl=True):
 
 
 def _h128_plans(enable_pdl=True):
-    """SM107 plans of nine-tile 128-head launches of 0-18 rows."""
+    """SM107 plans of nine-tile 128-head launches of 0-21 rows."""
     return [
         _split_plan(num_query_tokens=tokens, sparse_topk=width, enable_pdl=enable_pdl)
         for width in (1028, 1152)
-        for tokens in range(0, 19)
+        for tokens in range(0, 22)
     ]
 
 
@@ -6768,7 +6865,7 @@ def test_k64_split_merge_pairs_each_key_with_its_grid(monkeypatch, arch, count_m
     every width class), the per-count merges are chosen exactly for the
     128-head launches on SM107 that ``_SPLIT_MERGES`` gives them (nine pieces
     at 1-4 rows, five at 5-8 and, the three-piece merge with two heads per
-    CTA, 16-17) where the registry routes them to programs of their own;
+    CTA, 16-20) where the registry routes them to programs of their own;
     every other launch (64 heads, three pieces at 9-15 rows, another
     architecture, the keys unrouted or retired onto the uniform route's or
     the merge's program) merges with the merge of any count, one head per
@@ -6782,7 +6879,7 @@ def test_k64_split_merge_pairs_each_key_with_its_grid(monkeypatch, arch, count_m
     plans = [
         (128, _split_plan(num_query_tokens=tokens, sparse_topk=width))
         for width in (1028, 1152)
-        for tokens in range(1, 19)
+        for tokens in range(1, 22)
     ]
     plans += [
         (64, _split_plan(num_heads=64, num_query_tokens=tokens, sparse_topk=width))
@@ -6812,12 +6909,12 @@ def test_k64_split_merge_follows_the_fewest_rows(monkeypatch):
     """``merge_by_splits`` bounds the rows from below, and the entry for the
     launch's pieces with the most fewest rows at most its rows wins in any
     order: with ((3, 1, three-piece),) every three-piece launch takes the
-    three-piece merge, with ((3, 17, three-piece),) only the 17-row launch,
-    with the three-piece merge from 1 row and the merge of any count from 12
-    the launches of 9-11 rows the first and of 12-17 the second, and with ()
-    none.  Removing one per-count entry of the SM107 rule returns exactly
-    the launches it serves to the merge of any count; the split plans do not
-    change."""
+    three-piece merge, with ((3, 17, three-piece),) the launches of 17-20
+    rows, with the three-piece merge from 1 row and the merge of any count
+    from 12 the launches of 9-11 rows the first and of 12-20 the second, and
+    with () none.  Removing one per-count entry of the SM107 rule returns
+    exactly the launches it serves to the merge of any count; the split plans
+    do not change."""
     import dataclasses
 
     import flashinfer.jit.cake_dsv4 as jit
@@ -6848,7 +6945,7 @@ def test_k64_split_merge_follows_the_fewest_rows(monkeypatch):
 
     assert merges(((3, 1, _SPLIT_MERGE_S3),)) == three_pieces(lambda t: s3)
     assert merges(((3, 17, _SPLIT_MERGE_S3),)) == three_pieces(
-        lambda t: s3 if t == 17 else any_count
+        lambda t: s3 if t >= 17 else any_count
     )
     two = ((3, 1, _SPLIT_MERGE_S3), (3, 12, cake._K64_SPLIT_MERGE))
     for entries in (two, two[::-1]):
