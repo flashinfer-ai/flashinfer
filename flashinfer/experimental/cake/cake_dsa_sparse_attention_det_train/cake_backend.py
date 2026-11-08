@@ -191,6 +191,9 @@ BUMP_MARGIN = 1
 # The overflow counters of a destination row (4 x u64, one per reduce warp of the main kernel).
 COUNTER_BYTES_PER_ROW = 32
 QSTAT_WORDS = 4  # FP32 per-query bound terms of bwd_delta (a_lat, b_lat, a_rope, b_rope; NoPE uses the first two)
+# The stages whose ``sm_scale`` only scales those bound terms: they take its magnitude, so a negative softmax_scale
+# cannot cancel them into a bound below the gradient (the gradient stages keep the signed scale).
+BOUND_SCALE_STAGES = frozenset({"bwd_delta", "nope_bwd_delta"})
 GLOBAL_WORDS = 16  # u32 words of the backward's global state (maxima, the flagged-row count); bwd_delta zeroes them
 REDO_WORD = 8  # the global word that counts the rows the redo preparation flags (the redo's ``redo_count``)
 # the global word that counts the rows with a non-finite contribution
@@ -2212,6 +2215,8 @@ def _stage_values(
     if isinstance(key, tuple):
         stage, index = key
         return stage, _pass_values(plan, stage, index, values)
+    if key in BOUND_SCALE_STAGES and values["sm_scale"] < 0:
+        return key, {**values, "sm_scale": -values["sm_scale"]}
     return key, values
 
 
@@ -5028,8 +5033,11 @@ def _index_storage_alias(indices: torch.Tensor) -> tuple[torch.Tensor, int, int]
     ``indices_offset + t * idx_stride``): the stride-1 view of the storage span the rows occupy, from the
     vector-aligned element at or below the tensor's start (:data:`POINTER_GRANULE`), and the offset of row 0 within
     it.  Any row stride is read in place -- a column slice of a wider index buffer included -- and the view is
-    contiguous by construction (the FFI boundary takes contiguous tensors)."""
+    contiguous by construction (the FFI boundary takes contiguous tensors); each row itself must be contiguous
+    (``stride(1) == 1``: a strided slot view such as ``[:, ::2]`` raises ``ValueError``)."""
     num_rows, topk = (int(d) for d in indices.shape)
+    if topk > 1 and indices.stride(1) != 1:
+        raise ValueError("gather_kv_indices rows must be contiguous (any row stride)")
     stride = int(indices.stride(0)) if num_rows > 1 else topk
     offset = indices.storage_offset() % POINTER_GRANULE
     span = offset + (num_rows - 1) * stride + topk
@@ -5049,14 +5057,17 @@ def _check_gather_kv_indices(
     cu_seqlens_k: torch.Tensor,
     num_rows: Optional[int] = None,
 ) -> None:
-    """Structure of the packed entry's index operands: int32 ``[T, K_slots]`` rows (``T == num_rows`` when given)
-    and contiguous int32 ``[num_docs + 1]`` prefix sums of one length."""
+    """Structure of the packed entry's index operands: int32 ``[T, K_slots]`` rows (``T == num_rows`` when given),
+    each row contiguous (any row stride), and contiguous int32 ``[num_docs + 1]`` prefix sums of one length."""
     if (
         gather_kv_indices.ndim != 2
         or gather_kv_indices.dtype != torch.int32
         or (num_rows is not None and int(gather_kv_indices.shape[0]) != num_rows)
     ):
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
+    if gather_kv_indices.shape[1] > 1 and gather_kv_indices.stride(1) != 1:
+        # the index preparation reads row t at indices_offset + t * idx_stride, one element per slot
+        raise ValueError("gather_kv_indices rows must be contiguous (any row stride)")
     for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
         if cu.ndim != 1 or cu.dtype != torch.int32 or cu.numel() < 2:
             raise ValueError(f"{name} must be an int32 [num_docs + 1] tensor")

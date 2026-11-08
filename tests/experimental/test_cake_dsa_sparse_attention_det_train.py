@@ -340,6 +340,21 @@ def test_scratch_layouts_in_dead_output_storage():
     assert not cake_backend.carve_fits(T, 8350, 8350)
 
 
+def test_strided_index_slots_are_rejected():
+    """The packed entry's index preparation reads one element per slot from the row start, so a slot view with a
+    non-unit stride (``[:, ::2]``) is refused before any launch; a column slice of a wider buffer (any row stride)
+    is admitted."""
+    wide = torch.zeros((4, 16), dtype=torch.int32)
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    cake_backend._check_gather_kv_indices(wide[:, :8], cu, cu)
+    assert cake_backend._index_storage_alias(wide[:, :8])[2] == 16
+    for view in (wide[:, ::2], wide.t()[:4]):
+        with pytest.raises(ValueError, match="rows must be contiguous"):
+            cake_backend._check_gather_kv_indices(view, cu, cu)
+        with pytest.raises(ValueError, match="rows must be contiguous"):
+            cake_backend._index_storage_alias(view)
+
+
 def test_parity_keywords_are_validated():
     for bad in (0, -1, 1.5, True):
         with pytest.raises(ValueError):
@@ -656,6 +671,7 @@ def test_no_alert_under_torch_deterministic_mode():
     inp = make_inputs([128], [512], seed=SEED + 9, topk=128)
     outside = _autograd_step(inp)
     previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True)
     try:
         import warnings
@@ -664,7 +680,7 @@ def test_no_alert_under_torch_deterministic_mode():
             warnings.simplefilter("error")
             inside = _autograd_step(inp)
     finally:
-        torch.use_deterministic_algorithms(previous)
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
     for a, b in zip(inside, outside, strict=True):
         assert _same_bits(a, b)
 
@@ -778,6 +794,7 @@ def test_nope_checkpoint_retain_graph_and_no_alert():
     assert _same_bits(q.grad, first[0]) and _same_bits(kv.grad, first[1])
     assert _same_bits(first[0], plain[1]) and _same_bits(first[1], plain[2])
     previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True)
     try:
         import warnings
@@ -786,7 +803,7 @@ def test_nope_checkpoint_retain_graph_and_no_alert():
             warnings.simplefilter("error")
             inside = _nope_autograd_step(inp)
     finally:
-        torch.use_deterministic_algorithms(previous)
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
     for a, b in zip(inside, plain, strict=True):
         assert _same_bits(a, b)
 
@@ -1656,6 +1673,59 @@ def test_backward_skewed_magnitudes(nope):
     p99_floor = floor_rows[touched].quantile(0.99).item()
     print("SKEWED", "nope" if nope else "rope", "row p99", p99, "floor p99", p99_floor)
     assert p99 <= FLOOR_MARGIN * p99_floor + FLOOR_ABS
+
+
+@pytest.mark.parametrize("nope", [False, True], ids=["rope", "nope"])
+def test_negative_softmax_scale(nope):
+    """A negative ``softmax_scale``, admitted as in the non-deterministic package: the bound stages
+    (``BOUND_SCALE_STAGES``) take its magnitude, so a per-query bound term cannot cancel below the gradient it
+    bounds, and the gradient stages keep its sign.  ``dout`` follows ``out`` (a large ``delta``, the term a signed
+    scale subtracts); the gradients are within the floors of the FP64 reference at that scale and repeat bit for
+    bit."""
+    program = cake_jit.NOPE_PROGRAM if nope else cake_jit.PROGRAM
+    _require_program(backward=True, program=program)
+    inp = make_inputs([512], [1024], seed=SEED + 31, topk=256)
+    tl = inp.topk_length
+    seen = None
+    for _ in range(2):
+        if nope:
+            scale = -cake_backend.NOPE_SOFTMAX_SCALE
+            args = (inp.q_latent, inp.kv_latent, inp.idx_global)
+            out, lse, o_lo = cake_backend.forward_nope(
+                *args, topk_length=tl, softmax_scale=scale
+            )
+            dout = (out.float() * 8 + inp.dout.float()).bfloat16()
+            grads = cake_backend.backward_nope(
+                *args, out, o_lo, lse, dout, topk_length=tl, softmax_scale=scale
+            )
+        else:
+            scale = -cake_backend.default_softmax_scale()
+            args = _rope_args(inp)
+            out, lse, o_lo = cake_backend.forward(
+                *args, topk_length=tl, softmax_scale=scale
+            )
+            dout = (out.float() * 8 + inp.dout.float()).bfloat16()
+            grads = cake_backend.backward(
+                *args,
+                out,
+                o_lo,
+                lse,
+                dout,
+                topk_length=tl,
+                softmax_scale=scale,
+                dkv_fp32=True,
+            )
+        if seen is None:
+            seen = grads
+        else:
+            for a, b in zip(grads, seen, strict=True):
+                assert _same_bits(a, b)
+    if nope:
+        ref = reference_fp64_nope(*args, dout=dout, topk_length=tl, softmax_scale=scale)
+        _check_nope_accuracy("negative_scale_nope", grads[0], grads[1], ref)
+    else:
+        ref = reference_fp64(*args, dout=dout, topk_length=tl, softmax_scale=scale)
+        _check_rope_accuracy("negative_scale_rope", grads, ref, canonical=False)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")], ids=["nan", "inf"])

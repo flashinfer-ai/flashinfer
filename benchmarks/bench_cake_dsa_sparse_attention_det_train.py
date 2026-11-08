@@ -355,6 +355,7 @@ def measure(arm, steps, before_arm=None):
         perf["step_ms"] = nb.median_ms(step, steps)
         perf["recompute_step_ms"] = nb.median_ms(recompute_step, steps)
         perf["bwd_ms"] = perf["step_ms"] - perf["fwd_ms"]
+    st = None  # release the timed forward: its tensors must not count in the peak below
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
@@ -519,6 +520,8 @@ def main():
     if unknown or unknown_rows:
         parser.error(f"unknown arms {unknown} / rows {unknown_rows}")
     device = torch.device(args.device)
+    # the synchronizations and memory statistics of measure() read the current device
+    torch.cuda.set_device(device)
     results = dict(
         device=torch.cuda.get_device_name(device),
         capability=list(torch.cuda.get_device_capability(device)),

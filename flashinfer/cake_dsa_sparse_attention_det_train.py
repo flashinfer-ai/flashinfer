@@ -45,8 +45,10 @@ entries), ``CakeDSASparseAttentionDetNopeFunction`` and
 ``CakeDSASparseAttentionDetNopeVarlenFunction``, resolve from the backend
 package on first access.  The signatures match the non-deterministic package's
 entries; ``key_passes`` and ``dkv_direct`` are accepted there and validated
-here, and every backward of this package runs its main stage once over all keys
-and accumulates in one form.
+here.  The rope backward may split its main stage into key-range passes (as the
+non-deterministic package's policy does, or as ``key_passes`` asks); the NoPE
+backward runs its main stage once over all keys.  Every backward accumulates in
+one form, and its results do not depend on the pass count.
 
 Usage::
 
@@ -212,10 +214,12 @@ def cake_dsa_sparse_attention_det(
         Also return the natural-log logsumexp ``[T, 64]`` FP32 of the scaled
         scores over the valid keys (``-inf`` for fully masked rows).
     key_passes : Optional[int]
-        Accepted for signature parity with the non-deterministic package and
-        validated as there (``None`` or ``1 <= key_passes <= S``).  It is a
-        scheduling hint this package does not need: the backward's main stage
-        always runs once over all keys, and the results do not depend on it.
+        Validated as in the non-deterministic package (``None`` or
+        ``1 <= key_passes <= S``).  ``None`` lets that package's key-pass policy
+        choose; a count above 1 runs the backward's main stage as that many
+        key-range passes (a compaction and a main pass each, with their scratch
+        in the backward's workspace).  A scheduling choice only: the gradients
+        are bit for bit those of one pass.
     backend : str
         Only ``"cake"``.
     dkv_acc : Optional[torch.Tensor | Callable]
