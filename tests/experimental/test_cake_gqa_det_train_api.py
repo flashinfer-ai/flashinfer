@@ -19,7 +19,8 @@ packed-varlen GQA training attention (head dimension 256).
 Without a device: no entry point is an experimental API (no ``ExperimentalWarning``), importing the module imports no
 backend, the re-exported classes and types are the backend's objects (resolved on first access), the module reads no
 environment variable, every keyword of an entry point is the backend's keyword of the same name (the workspace
-budget's ``None`` standing for the backend's 16 GiB default), the extras of ``cake_gqa_det_train_workspace_bytes`` are
+budget's ``None`` standing for the backend's 16 GiB default), every entry point takes the parameters of the
+non-deterministic package's entry of the same role, the extras of ``cake_gqa_det_train_workspace_bytes`` are
 keyword-only, and every entry point forwards every argument, ``budget_bytes`` included, to the backend unchanged.
 On SM100 / SM103 / SM107: the entry points return the backend's results bit for bit, the workspace helpers, and
 autograd with each ``dkv_acc`` form, without an ``ExperimentalWarning``.
@@ -70,6 +71,8 @@ WORKSPACE_BYTES_EXTRAS = (
     "max_seqlen_k",
     "row_map",
     "budget_bytes",
+    "cu_seqlens_q_host",
+    "cu_seqlens_k_host",
 )
 D = 256
 SCALE = 0.0625
@@ -156,6 +159,39 @@ def test_keywords_match_the_backend() -> None:
                 assert theirs[name].default == cake_jit.DEFAULT_WORKSPACE_BUDGET, facade
             elif param.default is not inspect.Parameter.empty:
                 assert param.default == theirs[name].default, (facade, name)
+
+
+# The one default that differs from the non-deterministic package: ``total_k`` / ``num_heads_kv`` of the workspace-bytes
+# entry are ``None`` here (not given: the scratch alone; one without the other raises ``ValueError``) and ``0`` there
+# (the scratch alone).  (ours, theirs) per (entry, parameter).
+NONDET_DEFAULT_DIFFERENCES = {
+    ("cake_gqa_det_train_workspace_bytes", "total_k"): (None, 0),
+    ("cake_gqa_det_train_workspace_bytes", "num_heads_kv"): (None, 0),
+}
+
+
+def test_the_interface_matches_the_nondet_package() -> None:
+    """Each entry point takes the parameters of the non-deterministic package's entry of the same role, in order,
+    with the same kinds and defaults (``cu_seqlens_q_host`` / ``cu_seqlens_k_host`` included; the defaults of
+    ``NONDET_DEFAULT_DIFFERENCES`` aside), so a caller switches the mode by the module name alone."""
+    import flashinfer.cake_gqa_nondet_train as nondet
+
+    for name in ENTRY_POINTS:
+        other = name.replace("cake_gqa_det", "cake_gqa_nondet")
+        ours, theirs = (
+            inspect.signature(inspect.unwrap(fn)).parameters
+            for fn in (getattr(api, name), getattr(nondet, other))
+        )
+        assert [(p.name, p.kind) for p in ours.values()] == [
+            (p.name, p.kind) for p in theirs.values()
+        ], name
+        for key, param in ours.items():
+            pair = (param.default, theirs[key].default)
+            want = NONDET_DEFAULT_DIFFERENCES.get((name, key))
+            if want is None:
+                assert pair[0] == pair[1], (name, key, pair)
+            else:
+                assert pair == want, (name, key, pair)
 
 
 def test_workspace_bytes_extras_are_keyword_only() -> None:

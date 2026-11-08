@@ -57,29 +57,49 @@ IMBALANCE_DEVICE_THRESHOLDS = {
 IMBALANCE_THRESHOLD = IMBALANCE_THRESHOLDS["bf16"]
 
 # Fixed (forward, backward) communication-SM split for ``fwd_num_comm_sms="auto"``
-# / ``bwd_num_comm_sms="auto"``, keyed by device compute capability, SM count,
-# routed precision and EP group size. Only devices and group sizes with a
-# measured gain have a row; "auto" resolves to the factory split (40 / 40)
-# elsewhere, and the factory defaults themselves are unchanged (the row is
-# opt-in). GB300 (compute capability (10, 3), 152 SMs) MXFP8 EP8 row 44 / 36
-# against the fixed 40 / 32: EP8 complete training steps on two nodes (4 GPUs
-# each), two rounds on the same nodes, hottest-rank step time. Hottest rank at
-# 3.0x the mean routed load: -2.0 / -2.2 % (full step), -2.0 / -1.8 %
-# (checkpoint step); at 5.6x: -3.1 / -3.2 %; at 7.4x: -3.2 / -3.3 %; balanced
-# steps +0.7 / +0.5 % (full) and +0.1 / +0.2 % (checkpoint) - the balanced
-# full step sits at the edge of the ~0.6 % spread of identical arms, which is
-# why the row is opt-in rather than the default. GB300 EP4 (one node) measured
-# no unconditional gain (balanced steps +0.7 ... +1.0 % slower) and has no row;
-# B200 keeps its imbalance switch above. Rubin (compute capability (10, 7), 212
-# SMs) MXFP8 EP8 row 60 / 60 against the factory 40 / 40: EP8 on two nodes (4
-# GPUs each, one NVLink domain), H 4096 / I 2048 / 288 experts / top 8,
-# configurations rotated on one workspace, four rounds, hottest-rank medians.
-# Balanced routing, forward / backward: 8192 tokens per rank -7.4 / -4.6 %,
-# 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 %; round spread at most 1.2 %.
-# Rubin BF16 measured no consistent gain (36 / 36 and 28 / 32 within the
-# +-3 % round spread or slower) and has no row.
+# / ``bwd_num_comm_sms="auto"`` (the default), keyed by device compute
+# capability, SM count, routed precision and EP group size. Only devices,
+# precisions and group sizes with a measured gain have a row; "auto" resolves to
+# the factory split (40 / 40) elsewhere. The split never changes a bit of any
+# output (see the README), only time.
+#
+# GB300 (compute capability (10, 3), 152 SMs), H 6144 / I 2048 / 256 experts /
+# top 8 at EP4/8/16/64 and H 4096 / I 2048 / 288 experts / top 8 with clamped
+# SwiGLU at EP8/32, 16384 tokens per rank, FP32 weight-gradient accumulators,
+# checkpointed training step (schedule, forward, context recompute, backward)
+# captured in CUDA Graphs, the row and 40 / 40 interleaved in one process on the
+# same nodes, slowest-rank median of 12 steps. BF16 row 20 / 24 against the
+# factory 40 / 40: balanced routing EP4 -6.6 %, EP8 -7.7 % (H 6144) and -8.8 %
+# (H 4096), EP16 -8.5 %, EP32 -10.7 %, EP64 -2.6 %; ragged source counts EP32
+# -9.6 %, EP64 -3.5 %; hottest rank at 1.5x the mean routed load EP32 -10.2 %,
+# EP64 -6.6 %. MXFP8 row 44 / 36 at EP32 / EP64 against 40 / 40: balanced
+# -3.6 % / -1.8 %, ragged -1.4 % / -1.6 %, 1.5x hot rank -1.8 % / +0.7 %; EP4
+# and EP16 measured no gain (within +-0.5 %) and have no row. The GB300 MXFP8
+# EP8 row 44 / 36 (against the fixed 40 / 32, two nodes, two rounds,
+# hottest-rank step time): hottest rank at 3.0x the mean routed load -2.0 /
+# -2.2 % (full step), -2.0 / -1.8 % (checkpoint step); at 5.6x -3.1 / -3.2 %;
+# at 7.4x -3.2 / -3.3 %; balanced steps within -0.4 ... +0.4 % of 40 / 40
+# (five comparisons, both shapes). B200 keeps its imbalance switch above.
+# Rubin (compute capability (10, 7), 212 SMs) MXFP8 EP8 row 60 /
+# 60 against the factory 40 / 40: EP8 on two nodes (4 GPUs each, one NVLink
+# domain), H 4096 / I 2048 / 288 experts / top 8, configurations rotated on one
+# workspace, four rounds, hottest-rank medians. Balanced routing, forward /
+# backward: 8192 tokens per rank -7.4 / -4.6 %, 27116 -13.3 / -8.7 %, 32768
+# -18.1 / -2.4 %; round spread at most 1.2 %. Rubin BF16 measured no consistent
+# gain at EP8 (36 / 36 and 28 / 32 within the +-3 % round spread or slower).
 COMM_SMS = {
-    (10, 3): {152: {"mxfp8": {8: (44, 36)}}},
+    (10, 3): {
+        152: {
+            "bf16": {
+                4: (20, 24),
+                8: (20, 24),
+                16: (20, 24),
+                32: (20, 24),
+                64: (20, 24),
+            },
+            "mxfp8": {8: (44, 36), 32: (44, 36), 64: (44, 36)},
+        }
+    },
     (10, 7): {212: {"mxfp8": {8: (60, 60)}}},
 }
 _FACTORY_COMM_SMS = (40, 40)
@@ -203,8 +223,8 @@ def create_mok_bf16_workspace(
     hidden_size,
     topk,
     source_capacity=None,
-    fwd_num_comm_sms=40,
-    bwd_num_comm_sms=40,
+    fwd_num_comm_sms="auto",
+    bwd_num_comm_sms="auto",
     minibatch_size=4096,
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
@@ -224,11 +244,12 @@ def create_mok_bf16_workspace(
     Call outside CUDA Graph capture; retain the workspace for every replay.
 
     ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` are the fixed (forward, backward)
-    communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
-    for both takes the measured row of the device, ``precision`` and EP group
-    size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
-    Rubin (212 SMs) MXFP8 at EP8: 60 / 60, no row elsewhere, so the factory
-    split stays in force there).
+    communication-SM counts of every launch. ``"auto"`` (default, for both)
+    takes the measured row of the device, ``precision`` and EP group size
+    (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 BF16 at EP4-64: 20 / 24,
+    GB300 MXFP8 at EP8/32/64: 44 / 36, Rubin (212 SMs) MXFP8 at EP8: 60 / 60)
+    and the factory split 40 / 40 where there is no row; a pair of integers
+    fixes the split. The split changes time only, never an output bit.
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the
@@ -258,13 +279,28 @@ def create_mok_bf16_workspace(
         raise ValueError(
             f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
         )
+    # Validate every argument before resolving "auto" (which reads the group
+    # size and the device), so malformed arguments fail before any collective.
     auto = (fwd_num_comm_sms == "auto", bwd_num_comm_sms == "auto")
-    if any(auto):
-        if not all(auto):
+    if any(auto) and not all(auto):
+        raise ValueError(
+            'fwd_num_comm_sms and bwd_num_comm_sms must both be "auto" or both '
+            "be communication-SM counts"
+        )
+    if isinstance(imbalance_comm_sms, str):
+        if imbalance_comm_sms != "auto":
             raise ValueError(
-                'fwd_num_comm_sms and bwd_num_comm_sms must both be "auto" or both '
-                "be communication-SM counts"
+                'imbalance_comm_sms must be "auto", None or a (forward, backward) pair'
             )
+    elif imbalance_comm_sms is not None:
+        imbalance_comm_sms = tuple(imbalance_comm_sms)
+        if len(imbalance_comm_sms) != 2:
+            raise ValueError(
+                "imbalance_comm_sms must be a (forward, backward) pair of counts"
+            )
+    if isinstance(imbalance_threshold, str) and imbalance_threshold != "auto":
+        raise ValueError('imbalance_threshold must be "auto" or a number')
+    if all(auto):
         import torch.distributed as dist
 
         fwd_num_comm_sms, bwd_num_comm_sms = (
@@ -272,20 +308,8 @@ def create_mok_bf16_workspace(
             or _FACTORY_COMM_SMS
         )
     if isinstance(imbalance_comm_sms, str):
-        if imbalance_comm_sms != "auto":
-            raise ValueError(
-                'imbalance_comm_sms must be "auto", None or a (forward, backward) pair'
-            )
         imbalance_comm_sms = resolve_imbalance_comm_sms(precision, device)
-    elif imbalance_comm_sms is not None:
-        imbalance_comm_sms = tuple(imbalance_comm_sms)
-        if len(imbalance_comm_sms) != 2:
-            raise ValueError(
-                "imbalance_comm_sms must be a (forward, backward) pair of counts"
-            )
     if isinstance(imbalance_threshold, str):
-        if imbalance_threshold != "auto":
-            raise ValueError('imbalance_threshold must be "auto" or a number')
         import torch
 
         imbalance_threshold = resolve_imbalance_threshold(
