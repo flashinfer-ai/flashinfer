@@ -1010,6 +1010,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_permille": 250,
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
+        "sample_long_rule": None,
         "lsf_programs": True,
         "lsf_single_rule": None,
         "static_scan_kinds": [],
@@ -1097,6 +1098,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_permille": 250,
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
+        "sample_long_rule": None,
         "lsf_programs": True,
         "lsf_single_rule": None,
         "static_scan_kinds": [],
@@ -1199,7 +1201,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
         "sample_shift_rule": None,
-        "sample_class_rule": None,
+        "sample_class_rule": [32, 500],
+        "sample_long_rule": [["l6"], 500],
         "lsf_programs": False,
         "lsf_single_rule": None,
         "static_scan_kinds": ["l6", "pair_l6"],
@@ -1268,7 +1271,9 @@ POLICY: dict[str, dict[str, Any]] = {
 # (snake_packed_rule, snake_l6_fallback_waves), so the FP8 plans keep their
 # own measured rules.  Each FP8 record names every split field itself, so the
 # FP8 split counts stay as measured (no split-resident rule) whatever the BF16
-# split rule becomes.
+# split rule becomes.  The sm_107a FP8 record keeps no sampling class or
+# long-unit rule (sample_class_rule, sample_long_rule): the BF16 record's
+# #7549 rules were measured on the BF16 ticket programs.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {
         "static_scan_kinds": [],
@@ -1317,6 +1322,8 @@ POLICY_FP8: dict[str, dict[str, Any]] = {
     },
     "sm_107a": {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
+        "sample_class_rule": None,
+        "sample_long_rule": None,
         "split_max": 16,
         "split_min_range_tiles": 32,
         "split_wave_rule": [1000, 0.12],
