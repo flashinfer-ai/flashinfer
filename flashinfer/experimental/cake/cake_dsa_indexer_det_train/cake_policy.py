@@ -160,7 +160,7 @@ POLICY_FIELDS = (
     "rank_t16_slots",  # sort-slot counts (threads x finalize_items) whose staged form runs as 16-item threads (half the threads), ascending
     "rank_persist_max_k",  # the persistent two-row pipelined rank finalize serves the staged bulk calls with top_k <= this on the architecture (lever FRP-K; 0 = the one-row program everywhere; program key tag :persist)
     "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x (SM count - rank_persist_spare_sms)) CTAs, each walking rows bid, bid + grid, ...
-    "rank_persist_spare_sms",  # SMs the persistent rank grid leaves out: a block of another stream on up to this many SMs adds no wave to its walk (#7548)
+    "rank_persist_spare_sms",  # SMs the persistent rank grid is sized without: the grid is a multiple of the other SMs, so a block of another stream on up to this many SMs adds no partial wave to its walk (#7548)
     "merge_rank",  # a split call whose finalize is the slab rank form (window <= rank_slab_window_max, top_k <= MERGE_RANK_MAX_TOP_K) runs the merge with the rank finalize fused in (key merge:rank:w<window>) and launches no finalize program
 )
 
@@ -1630,8 +1630,10 @@ def merge_key(rank_window: Optional[int] = None) -> str:
 def finalize_grid(choice: "ProgramChoice", num_sms: int) -> int:
     """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x (SM count - rank_persist_spare))`` for the
     persistent rank program (lever FRP-K; every CTA walks the rows ``bid, bid + grid, ...``; at least one SM), one CTA per row
-    otherwise (at least one CTA).  The spare SMs keep a static walk from a whole extra wave when another stream holds a
-    block on that many SMs (#7548): the grid then still fills a whole number of the remaining waves."""
+    otherwise (at least one CTA).  The grid is a multiple of the SMs that remain after the spare ones: where the CTAs one
+    SM holds at a time divide ``rank_persist_ctas`` (sm_107a: 4 of the 256-thread program on a 1024-thread SM, 8 per
+    SM), a block of another stream on up to ``rank_persist_spare`` SMs leaves the static row walk whole waves of the
+    other SMs instead of a short extra wave (#7548)."""
     rows = max(1, int(choice.num_queries))
     if choice.rank_persistent:
         sms = max(1, int(num_sms) - int(choice.rank_persist_spare))

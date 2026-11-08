@@ -5384,9 +5384,11 @@ _MERGE_RANK_CALLS = (
 
 
 def test_persistent_rank_grid_spares_sms_for_another_stream():
-    """#7548: where the record spares SMs (sm_107a: one), the persistent rank finalize of a call with enough rows puts
-    ``rank_persist_ctas_per_sm`` CTAs on every SM but the spare ones, so a block of another stream on up to that many SMs
-    leaves the static row walk a whole number of waves on the SMs that remain instead of a second wave of a few CTAs."""
+    """#7548: where the record spares SMs (sm_107a: one), the persistent rank grid of a call with enough rows is
+    ``rank_persist_ctas_per_sm x (SMs - spare)``, a multiple of the SMs that remain.  The :persist programs run 256 threads
+    per CTA, so a 1024-thread SM107 SM holds 4 of them at a time; with ``rank_persist_ctas_per_sm`` a multiple of 4, a block
+    of another stream on the spare SM leaves the static row walk whole waves of the other SMs instead of a short extra
+    wave."""
     assert policy_for("sm_107a").rank_persist_spare_sms == 1
     for arch in cake_jit.ARCHES:
         policy = policy_for(arch)
@@ -5407,7 +5409,12 @@ def test_persistent_rank_grid_spares_sms_for_another_stream():
             spare = policy.rank_persist_spare_sms
             grid = finalize_grid(choice, sms)
             assert grid == policy.rank_persist_ctas_per_sm * (sms - spare), (arch, sms)
-            assert grid % (sms - spare) == 0, (arch, sms)
+            assert grid < policy.rank_persist_ctas_per_sm * sms, (arch, sms)
+            # CTAs one 1024-thread SM107 SM holds at a time divide the CTAs per SM: whole waves
+            assert choice.rank_threads == 256, (arch, choice.finalize_key)
+            assert (
+                policy.rank_persist_ctas_per_sm % (1024 // choice.rank_threads) == 0
+            ), arch
         # a device of no more SMs than the spare count keeps one SM's grid
         assert (
             finalize_grid(choice, policy.rank_persist_spare_sms)

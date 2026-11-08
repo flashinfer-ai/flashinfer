@@ -1308,7 +1308,7 @@ def _prepare_runner(
                 bind_program(programs["merge"], arch, "merge", values, row_grid)
             )
             stages.append("merge")
-        # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x SMs) CTAs, each walking rows bid, bid + grid, ...
+        # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x (SMs - spare SMs)) CTAs, each walking rows bid, bid + grid, ...
         fin_grid = (finalize_grid(choice, _num_sms(device)), 1, 1)
         if fin_role in programs:
             launches.append(
