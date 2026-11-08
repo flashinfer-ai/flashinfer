@@ -3629,6 +3629,7 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
         "output": o, "final_state": final_state if output_final_state else None, "initial_state": initial_state,
         "h": h, "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_split",
         "m_share": seg_state if m_share else None,
+        "m_share_shape": tuple(seg_state.shape) if meta.m_share else None,
     }  # fmt: skip
 
 
@@ -4900,11 +4901,15 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
         else cake_plan.placeholder(fwd[name].shape, fwd[name].dtype, fwd[name].device)
         for name in cake_plan.STATE_NAMES
     )
-    # the M-share segment state (:data:`M_SHARE_ARCHS`) is the saved list's last entry, a placeholder without it
+    # the M-share segment state (:data:`M_SHARE_ARCHS`) is the saved list's last entry, a placeholder without it:
+    # metadata-equal to the segment state where the call plans M-share but keeps no tape (a non-reentrant
+    # checkpoint's first pass saves what its recompute saves), else empty
     m_share = fwd.get("m_share")
     ctx.m_share = m_share is not None
     if m_share is None:
-        m_share = cake_plan.placeholder((0,), torch.float32, fwd["qn"].device)
+        m_share = cake_plan.placeholder(
+            fwd.get("m_share_shape") or (0,), torch.float32, fwd["qn"].device
+        )
     ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
                           fwd["beta32"], fwd["A"], initial_state, *state_tensors, m_share)  # fmt: skip
     ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
