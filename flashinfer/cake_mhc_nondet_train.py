@@ -13,61 +13,52 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake four-stream mHC training forward / backward, non-deterministic mode
+Cake four-stream mHC training forward / backward, ``nondet`` mode
 (4 streams; hidden 4096 on SM100 / SM103 / SM107, and 5120 / 7168 on SM100 /
 SM103; another hidden size raises ``ValueError``): every entry point runs the
-non-deterministic package ``flashinfer.experimental.cake.cake_mhc_nondet_train``,
-imported on the first call or attribute access (importing this module imports
-no backend).  The function, the tensor contracts and the autograd wiring are
+package ``flashinfer.experimental.cake.cake_mhc_nondet_train``, imported on
+the first call or attribute access (importing this module imports no
+backend).  The function, the tensor contracts and the autograd wiring are
 those of the deterministic module :mod:`flashinfer.cake_mhc_det_train`
 (documented there); the workspaces are described below.
 
 Mode: the mode is part of the names (``cake_mhc_nondet_train_*``,
 ``CakeMHCNondet*Function``).  No entry point takes a ``deterministic``
 keyword (passing one is a ``TypeError``), and nothing falls back to the
-deterministic package: for deterministic results call
-``flashinfer.cake_mhc_det_train``.
+deterministic package ``flashinfer.cake_mhc_det_train``.
 
-Numerical contract: ``backward_finish`` has no final reduction kernel: the
-column-slab pass adds the ``dfn`` sum of every (column slab, token chunk) unit
-into ``dfn`` with FP32 reductions and folds ``dscale`` / ``dbase`` in the same
-grid.  Only the summation order of ``dfn`` varies from run to run: each element
-adds its per-chunk partials (``P <= 32`` token chunks; the chunk sizes are the
-host rule's per token count and device, so the low-order bits can also differ
-from the deterministic ``dfn``) onto its starting value (zero, or the caller's
-``dfn`` under ``accumulate=True``) with at most ``P`` FP32 additions, so two
-runs differ by at most about ``2 P u (|start| + sum |partial|)`` per element
-(``u = 2^-24``; under cancellation, many ulps of the result), and the FP32
-reduction flushes subnormal addends and results to zero.  ``dX`` is bitwise the
-deterministic value, and so are the
-forward, the statistics replay and ``backward_prepare`` (copies of the
-deterministic programs).  ``dscale`` and ``dbase`` are bitwise the
-deterministic package's per-CTA reduction; in the token-count bands where the
-deterministic package sums them over 8-token group rows instead (hidden 4096
-on SM100 / SM103; see the backend's ``cake_jit``), their low-order bits can
-differ from the deterministic result.
-
-With ``torch.use_deterministic_algorithms(True)``,
-:func:`cake_mhc_nondet_train_backward_finish` and the backward of a
-:func:`cake_mhc_nondet_train_prepare` node raise PyTorch's alert for an operation
-without a deterministic implementation right before they launch the ``dfn``
-reduction (after their operands pass, and only for ``T > 0``): a
-``RuntimeError``, or under ``warn_only=True`` a ``UserWarning``, after which
-the non-deterministic kernels run.  The prepare node alerts also when the mode
-was enabled between its forward and its backward.  ``forward_prepare``,
-``forward_stats``, ``forward_finish``, ``backward_prepare``, the workspace
-helpers and :func:`is_cake_mhc_nondet_train_supported` are bitwise the same
-from run to run and raise no such alert or warning.
+Numerical contract: every output repeats bit for bit from run to run on one
+device (each sum runs in an order fixed by the token count and the device).
+``backward_finish`` has no final reduction kernel: the column-slab pass
+stores the compensated ``dfn`` sum of every (column slab, token chunk) unit,
+the deterministic package's FP32 partial of that unit bit for bit, in its
+chunk's slots of the backward workspace, and once every unit has stored its
+sums the grid folds the slots (``P <= 32`` token chunks, the deterministic
+package's chunks per token count and device) into ``dfn`` in ascending chunk
+order as a compensated FP32 sum, the caller's ``dfn`` last under
+``accumulate=True``, with one rounding: within one FP32 rounding of the exact
+sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` per element (``x_p`` the
+partials, ``u = 2^-24``).  The deterministic package sums the same partials
+in FP64 and rounds once, so ``dfn`` is the deterministic ``dfn`` except where
+the exact sum lies within that last term of an FP32 rounding boundary.  ``dX``, ``dscale`` and ``dbase`` are
+bitwise the deterministic values (the column-slab pass folds the parameter
+gradients in the deterministic reduction's order), and so are the forward,
+the statistics replay and ``backward_prepare`` (copies of the deterministic
+programs).  Under ``torch.use_deterministic_algorithms(True)`` no entry point
+raises PyTorch's alert or warning.
 
 Workspaces: the forward workspace has one layout in both packages.  The
-backward workspace is the deterministic one at the same offsets without the
-per-chunk FP32 ``dfn`` partials (``P x 24 x 4H x 4`` bytes at hidden size
-``H``).  The backward accepts any valid workspace of at least its size, so a
-deterministic backward workspace of the same hidden size
-(``flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace``)
-serves it too.  The records of either package (``stats``, ``grad_stats``) feed
-the other's entry points (the same bits); a prepare handle feeds only the
-finish of its own package (``TypeError`` otherwise).
+backward workspace has this package's own layout: a 256-byte ticket region
+and 512 bytes of column-slab arrival counts first (zero on first use), the
+deterministic package's regions without its per-chunk FP32 ``dfn`` partials,
+then the column slab's per-chunk FP32 ``dfn`` slots
+(``min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at hidden size ``H``).  A
+deterministic backward workspace does not serve this backward: a buffer the
+deterministic package's backward used must be zeroed
+(:func:`cake_mhc_nondet_train_reset_workspace`) before this package uses it.
+The records of either package (``stats``, ``grad_stats``) feed the other's
+entry points (the same bits); a prepare handle feeds only the finish of its
+own package (``TypeError`` otherwise).
 
 Default workspaces (``workspace=None``): one buffer per device, hidden size and
 power-of-two token-count bucket, shared by every stream and every graph replay
@@ -75,9 +66,9 @@ on that device; calls that can run concurrently on different streams pass
 caller-owned workspaces.  No default buffer is created while the current stream
 of the buffer's device is capturing a CUDA graph (``ValueError``): warm up with
 the same token count and hidden size before the capture.  Every completed
-launch leaves the ticket words of its workspace at zero, so a replay needs no
-reset; :func:`cake_mhc_nondet_train_reset_workspace` zeroes the buffer it is
-given.
+launch leaves the ticket words and the arrival counts of its workspace at
+zero, so a replay needs no reset; :func:`cake_mhc_nondet_train_reset_workspace`
+zeroes the buffer it is given.
 
 Name map (the same verbs in both modes)::
 
@@ -111,7 +102,7 @@ Usage::
     )
 
     U, handle = cake_mhc_nondet_train_prepare(X, fn, scale, base)
-    Y = cake_mhc_nondet_train_finish(X, branch(U), handle)  # backward: atomic dfn
+    Y = cake_mhc_nondet_train_finish(X, branch(U), handle)  # backward: folded dfn
 
     ws_b = cake_mhc_nondet_train_backward_workspace(T, X.device, hidden=X.shape[2])
     dX, dfn, dscale, dbase = cake_mhc_nondet_train_backward_finish(
@@ -143,7 +134,7 @@ def _pkg():
 
 # ----------------------------------------------------------------------------
 # Entry points (real ``def``s: public-API tooling reads the decorated
-# signatures of this module; the bodies live in the non-deterministic package)
+# signatures of this module; the bodies live in the backend package)
 
 
 @flashinfer_api
@@ -151,7 +142,7 @@ def is_cake_mhc_nondet_train_supported(
     device: torch.device,
     hidden: Optional[int] = None,
 ) -> bool:
-    """Whether ``device`` (and optionally ``hidden``) has every exported route of the non-deterministic package.
+    """Whether ``device`` (and optionally ``hidden``) has every exported route of the backend package.
 
     Parameters
     ----------
@@ -213,12 +204,14 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
-    The non-deterministic backward's layout: the deterministic package's
-    regions at the same offsets without the per-chunk FP32 ``dfn`` partials
-    (``P x 24 x 4H x 4`` bytes at hidden size ``H``, ``P <= 32``).  A
-    deterministic backward workspace of the same hidden size
+    This package's backward layout: a 256-byte ticket region and 512 bytes of
+    column-slab arrival counts first (zero on first use; every completed
+    launch leaves them zero), the deterministic package's regions without its
+    per-chunk FP32 ``dfn`` partials, then the column slab's per-chunk FP32
+    ``dfn`` slots (``min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at hidden
+    size ``H``).  A deterministic backward workspace
     (:func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace`)
-    also serves the non-deterministic backward.
+    does not serve this backward.
 
     Parameters
     ----------
@@ -271,7 +264,7 @@ def cake_mhc_nondet_train_backward_workspace(
     *,
     hidden: int = _HIDDEN,
 ) -> torch.Tensor:
-    """Allocate a zero-initialized backward workspace of the non-deterministic layout (see
+    """Allocate a zero-initialized backward workspace of this package's layout (see
     :func:`cake_mhc_nondet_train_backward_workspace_bytes`).
 
     Parameters
@@ -305,8 +298,8 @@ def cake_mhc_nondet_train_forward_prepare(
 
     The arguments and outputs are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_prepare`.
-    The call runs the non-deterministic package, whose forward runs copies of
-    the deterministic programs, so ``U`` and ``stats`` are the deterministic
+    The call runs the backend package, whose forward runs copies of the
+    deterministic programs, so ``U`` and ``stats`` are the deterministic
     package's bits.
 
     Parameters
@@ -365,7 +358,7 @@ def cake_mhc_nondet_train_forward_stats(
 
     The arguments and output are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_stats`;
-    the call runs the non-deterministic package (the deterministic package's
+    the call runs the backend package (the deterministic package's
     bits).
 
     Parameters
@@ -411,7 +404,7 @@ def cake_mhc_nondet_train_forward_finish(
 
     The arguments and output are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_finish`;
-    the call runs the non-deterministic package (the deterministic package's
+    the call runs the backend package (the deterministic package's
     bits).
 
     Parameters
@@ -448,7 +441,7 @@ def cake_mhc_nondet_train_backward_prepare(
 
     The arguments and outputs are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_prepare`;
-    the call runs the non-deterministic package (the deterministic package's
+    the call runs the backend package (the deterministic package's
     bits: this pass has no cross-token reduction).
 
     Parameters
@@ -503,21 +496,18 @@ def cake_mhc_nondet_train_backward_finish(
 
     The arguments and outputs are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_finish`;
-    the call runs the non-deterministic backward.  ``dfn`` is summed with FP32
-    reductions in a run-to-run varying order: each element adds its
-    ``P <= 32`` per-chunk partials onto its starting value (zero, or the
-    caller's ``dfn`` under ``accumulate=True``) with at most ``P`` FP32
-    additions, so two runs differ by at most about
-    ``2 P u (|start| + sum |partial|)`` (``u = 2^-24``; the chunk sizes are the
-    host rule's per token count and device, so the low-order bits can also
-    differ from the deterministic ``dfn``); ``dX`` is
-    bitwise the deterministic value; ``dscale`` and ``dbase`` are bitwise the
-    deterministic package's per-CTA reduction (in its group-row bands their
-    low-order bits can differ from the deterministic result; see the module
-    docstring); ``accumulate=True`` adds onto the caller's values the same way.  Under
-    ``torch.use_deterministic_algorithms(True)`` the call raises PyTorch's
-    alert right before its launches (``RuntimeError``; under
-    ``warn_only=True`` a ``UserWarning``, and the call runs).
+    the call runs the backend package's backward, with no final reduction
+    kernel.  Every output repeats bit for bit from run to run on one device.
+    ``dX``, ``dscale`` and ``dbase`` are bitwise the deterministic values.
+    Each element of ``dfn`` folds its ``P <= 32`` per-chunk FP32 partials
+    ``x_p`` (bitwise the deterministic package's) in ascending chunk order as
+    a compensated FP32 sum, the caller's ``dfn`` last under
+    ``accumulate=True``, with one rounding: within one FP32 rounding of the
+    exact sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` (``u = 2^-24``).  The
+    deterministic package sums the same partials in FP64 and rounds once, so
+    ``dfn`` is the deterministic ``dfn`` except where the exact sum lies
+    within that last term of an FP32 rounding boundary (see the module
+    docstring).
 
     Parameters
     ----------
@@ -544,9 +534,7 @@ def cake_mhc_nondet_train_backward_finish(
         ``True``: the caller passes all three and the sums are added to their
         current values.
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_nondet_train_backward_workspace`,
-        or a deterministic backward workspace of the same hidden size
-        (:func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace`);
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_nondet_train_backward_workspace`;
         a per-device default when omitted.
     dX : torch.Tensor, optional
         Preallocated BF16 ``[T, 4, H]`` contiguous output.
@@ -600,13 +588,9 @@ def cake_mhc_nondet_train_prepare(
 
     The arguments and outputs are those of
     :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_prepare`; the call
-    makes the non-deterministic package's prepare node.  Its forward and its
-    checkpoint replay are the deterministic package's bits; its backward runs
-    the non-deterministic ``backward_finish`` (see
-    :func:`cake_mhc_nondet_train_backward_finish`) and raises PyTorch's alert
-    when the deterministic algorithms are enabled at that time, also when they
-    were enabled after the forward (``RuntimeError``; under ``warn_only=True`` a
-    ``UserWarning``, and the backward runs).
+    makes the backend package's prepare node.  Its forward and its checkpoint
+    replay are the deterministic package's bits; its backward runs
+    ``backward_finish`` (see :func:`cake_mhc_nondet_train_backward_finish`).
 
     Parameters
     ----------
@@ -623,9 +607,8 @@ def cake_mhc_nondet_train_prepare(
         Caller-owned forward workspace (``hidden=X.shape[2]``); a per-device
         default when omitted.
     backward_workspace : torch.Tensor, optional
-        Caller-owned backward workspace of :func:`cake_mhc_nondet_train_backward_workspace`,
-        or a deterministic backward workspace of the same hidden size; a
-        per-device default when omitted.
+        Caller-owned backward workspace of :func:`cake_mhc_nondet_train_backward_workspace`;
+        a per-device default when omitted.
 
     Returns
     -------
