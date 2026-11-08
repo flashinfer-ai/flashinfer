@@ -2601,21 +2601,21 @@ class _K64SplitRule:
 # merge: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
 # lengths ran slower with it in every round.  The launches of nine and five
 # pieces merge with the merge built for their count alone
-# (``merge_by_splits``: ``_c9``, ``_c5``): in a test harness on a 216-SM
-# R200 that ran FlashInfer's launches with the merge program replaced, it
-# ran 0.065-0.340 us per call faster than the merge of any count at 4-8
-# rows, faster beyond the A/A difference in each of 8 rounds, with bitwise
-# identical output (at 1 row it measured -0.034 us, within the A/A
-# difference); on a 212-SM VR200 no launch differed beyond the A/A
-# difference.  The three-piece launches of 9-15 rows keep the merge of any
-# count: the merge built for three pieces alone ran slower than it on a
-# 208-SM R200 and on a 212-SM VR200.  With the merge of any count, a launch
-# whose every row fits in one piece (at most ceil(9 / s) tiles: short
-# requests, piece 0 writes O itself) still runs the merge kernel and measured
-# 0.81-0.86x (0.97x of two pieces at 15 rows of at most three tiles); the
-# host does not read row lengths, so those launches split as well.  Without
-# PDL the 17-row launch measured 0.98x with two pieces: no launch without
-# PDL splits.
+# (``merge_by_splits``: ``_c9``, ``_c5``), the merge of any count's code for
+# that count, so the output bits do not change: in a test harness on a
+# 216-SM R200 (CUDA graph of 8 calls, PDL) the launches of 4, 7 and 8 rows
+# ran 0.12-0.37 us per call faster with it (1.01-1.05x), faster beyond the
+# A/A difference in each of 8 rounds, and the launches of 1-3, 5 and 6 rows
+# differed by at most 0.06 us; on a 208-SM R200 and a 212-SM VR200 no launch
+# of 1-8 rows ran slower beyond the A/A difference.  The three-piece launches
+# of 9-15 rows keep the merge of any count: the merge built for three pieces
+# alone ran slower than it on a 208-SM R200 and on a 212-SM VR200.  With the
+# merge of any count, a launch whose every row fits in one piece (at most
+# ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
+# merge kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at
+# most three tiles); the host does not read row lengths, so those launches
+# split as well.  Without PDL the 17-row launch measured 0.98x with two pieces:
+# no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
