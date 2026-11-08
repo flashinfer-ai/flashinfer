@@ -249,13 +249,13 @@ def _window_records(
 
 
 def _form(names: list[str]) -> str:
-    """``single`` (one ``claim_sum_f64`` kernel) or ``pair`` (a deterministic
-    pair: ``chunk_partials`` main kernel, then its dw reduce) of one backward
-    window's records."""
+    """``single`` (one ``claim_sum_f64`` kernel, or one ``claim_part_f32``
+    pair-row single kernel) or ``pair`` (a deterministic pair: ``chunk_partials``
+    main kernel, then its dw reduce) of one backward window's records."""
     records = [loader.MODULES[name] for name in names]
     owners = [r["workspace_rule"]["kind"] for r in records if r["workspace_rule"]]
     reduces = [r for r in records if r["role"] == "bwd_reduce"]
-    if len(records) == 1 and owners == ["claim_sum_f64"]:
+    if len(records) == 1 and owners in (["claim_sum_f64"], ["claim_part_f32"]):
         return "single"
     if len(records) == 2 and owners == ["chunk_partials"] and len(reduces) == 1:
         return "pair"
