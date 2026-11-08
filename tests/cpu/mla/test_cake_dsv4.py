@@ -7789,3 +7789,57 @@ def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
         cum_seq_lens_q=offsets,
     )
     assert programs == [_KV4_SIBLING]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm_count,width,tokens,chunk,program",
+    [
+        (216, 640, 96, 32, _L2PF_SIBLING),
+        (212, 512, 120, 40, _L2PF_SIBLING),
+        (216, 1152, 384, 192, _BCL_SIBLING),
+        (212, 1152, 384, 192, _BCL_SIBLING),
+        (208, 640, 96, 32, _KV4_SIBLING),
+        (208, 1152, 384, 192, _KV4_SIBLING),
+    ],
+)
+def test_row_tiled_one_token_chunks_take_the_rule_siblings(
+    monkeypatch, sm_count, width, tokens, chunk, program
+):
+    """A workspace of ``chunk`` rows tiles a dense FP8/H64 one-token decode
+    call outside both one-token rules (items 640 and 512 wide past the L2
+    prefetch ceilings, items 1152 wide past the decode window) into chunks
+    inside one: on 212 and 216 SMs every chunk launches the rule's sibling, on
+    208 SMs the four-stage sibling, one CTA per row, each bound to one-token
+    requests and the call's batch size (chunks after the first are ragged
+    launches over all the call's requests)."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _l2pf_variants())
+    plan = cake._route_plan(
+        _M64_MULTI_TILE_ROUTE, num_query_tokens=tokens, num_heads=64, sparse_topk=width
+    )
+    chunk_bytes = cake._launch_workspace_bytes(plan, chunk, 64, tokens + 1)
+    rows = cake._rows_per_launch(
+        plan,
+        num_query_tokens=tokens,
+        num_heads=64,
+        batch_size=tokens,
+        workspace_bytes=chunk_bytes,
+    )
+    assert rows == chunk
+    programs, calls, _ = _run_fake_h64_decode_fp8(
+        monkeypatch,
+        arch="sm_107a",
+        width=width,
+        tokens=tokens,
+        sm_count=sm_count,
+        workspace=_aligned_u8(chunk_bytes),
+    )
+    shape = (sm_count, width, tokens, chunk)
+    assert programs == [program] * (tokens // chunk), shape
+    for bound in calls:
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (chunk, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == chunk
+        assert bound["max_q_len"] == 1, shape
+        assert bound["batch_size"] == tokens, shape
