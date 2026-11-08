@@ -6226,10 +6226,15 @@ def _alloc_grads(call: CakeGDNDetKcpCall) -> None:
         # layer below (the convolution's backward) reads one contiguous [T, (2 H_qk + HV) * 128] gradient with no
         # concatenation (:func:`cake_gdn_det_train_kcp_packed_qkv_views`)
         qkv = _alloc((T, (2 * H_qk + HV) * D), dt["dq"], call.device)
-        a, b = H_qk * D, 2 * H_qk * D
-        dq = qkv[:, :a].view(T, H_qk, D)
-        dk = qkv[:, a:b].view(T, H_qk, D)
-        dv = qkv[:, b:].view(T, HV, D)
+        if T:
+            # the views of qkv[:, :a] / [:, a:b] / [:, b:] (same storage offset, shape and strides) in two view ops
+            # instead of three slices and three views
+            dq, dk, dv = _qkv_views(qkv, H_qk, HV)
+        else:
+            a, b = H_qk * D, 2 * H_qk * D
+            dq = qkv[:, :a].view(T, H_qk, D)
+            dk = qkv[:, a:b].view(T, H_qk, D)
+            dv = qkv[:, b:].view(T, HV, D)
     else:
         dq = _alloc((T, H_qk, D), dt["dq"], call.device)
         dk = _alloc((T, H_qk, D), dt["dk"], call.device)
