@@ -4561,7 +4561,7 @@ def forward_loss(
             # (else the fast call, the hidden count kept)
             C = int(problem.chunk)
             if _auto_plans(grad_rows if split_ok else valid_total, C):
-                shape = dict(
+                shape: dict[str, Any] = dict(
                     num_rows=T,
                     hidden=problem.hidden,
                     vocab=problem.vocab,
@@ -5344,7 +5344,7 @@ def _auto_loss_plan(
     else the plan of ``min(chunk, rows)``-row buffers -- an explicit budget call's -- drops it (only once that plan is
     known to fit: a fast fallback keeps the count's queued chunk-0 work)."""
     C = int(problem.chunk)
-    common = dict(
+    common: dict[str, Any] = dict(
         num_rows=int(problem.num_rows),
         rows=int(rows),
         hidden=int(problem.hidden),

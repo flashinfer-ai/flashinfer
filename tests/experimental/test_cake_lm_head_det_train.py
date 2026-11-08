@@ -13284,8 +13284,9 @@ def test_auto_memory_plan_decisions(monkeypatch):
 
 def test_auto_memory_plan_is_the_fast_form_or_a_fitting_budget_form():
     """Over the issue's shapes (two thirds of the rows valid and every row valid, both entries, with and without the
-    fused cast): the automatic form is the fast form (``None``) exactly when the fast form fits with its own lifetimes
-    or no budget form fits, else the fitting form of the budget rule."""
+    fused cast): the automatic form is the fast form (``None``) exactly when the call runs fewer than
+    ``_AUTO_MIN_CHUNKS`` chunks, the fast form fits with its own lifetimes or no budget form fits, else the fitting form
+    of the budget rule."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     for H, V, T in _ISSUE_SHAPES:
         for R in (round(0.67 * T), T):
@@ -13304,8 +13305,9 @@ def test_auto_memory_plan_is_the_fast_form_or_a_fitting_budget_form():
                     auto = opt_in.auto_memory_plan(entry, **kw)
                     plan = opt_in.memory_plan(entry, **kw)
                     fast = opt_in.fast_form_fits(entry, **kw)
-                    key = (H, V, T, R, entry, fuse, auto, plan, fast)
-                    assert (auto is None) == (fast or not plan.fits), key
+                    short = not opt_in._auto_plans(R, 4096)
+                    key = (H, V, T, R, entry, fuse, auto, plan, fast, short)
+                    assert (auto is None) == (short or fast or not plan.fits), key
                     if auto is not None:
                         assert auto == plan and auto.fits, key
 
@@ -13514,6 +13516,19 @@ def _record_auto_logprob_plans(monkeypatch) -> list:
 
     monkeypatch.setattr(opt_in, "_auto_logprob_plan", recording)
     return plans
+
+
+def _record_fast_fits(monkeypatch) -> list:
+    """Record each fit check of the automatic form's fast call (:func:`_fast_fits`: ``True`` = it fits)."""
+    fits: list = []
+    real = opt_in._fast_fits
+
+    def recording(*args, **kwargs):
+        fits.append(real(*args, **kwargs))
+        return fits[-1]
+
+    monkeypatch.setattr(opt_in, "_fast_fits", recording)
+    return fits
 
 
 def _record_hidden_counts(monkeypatch) -> list:
@@ -14110,8 +14125,10 @@ def test_device_default_zero_weight_split_follows_the_default_entry(monkeypatch)
 def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
     """The runtime gates follow ``_AUTO_MIN_CHUNKS``: set to 2, a one-chunk default call (T 4096, a third of the
     labels ignored) of both entries keeps the fast form -- no loss plan, a ``None`` from the log-probability
-    backward's rule -- and so does a policy call with zero-weight rows whose split's chunk loop spans one chunk; every
-    output is the explicit fast form's bits.  Set to 1, the same calls run a budget form that fits (the policy call
+    backward's rule -- and so does a policy call with zero-weight rows whose split's chunk loop spans one chunk; none of
+    them checks the fast form's fit, and every output is the explicit fast form's bits.  Set to 1, the two calls
+    without zero-weight rows run a budget form that fits; the policy call checks its fast call's fit once and runs the
+    fast form exactly when that call fits or neither of its two budget plans does, else the fitting one of them (it
     decides its split as ``"budget"`` does: ``loss`` / ``logp`` bits only)."""
     _require_program(entry="loss")
     _require_program(entry="logprob")
@@ -14133,6 +14150,8 @@ def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
     cases = (("loss", ce), ("logprob", ce), ("loss", policy))
     fast = [_budget_step(inp, C, entry, memory_mode="fast")[0] for entry, inp in cases]
     logprob_plans = _record_auto_logprob_plans(monkeypatch)
+    fast_checks = _record_fast_fits(monkeypatch)
+    budget_plans = _record_budget_plans(monkeypatch)
     for minimum in (2, 1):
         monkeypatch.setattr(opt_in, "_AUTO_MIN_CHUNKS", minimum)
         for (entry, inp), want in zip(cases, fast, strict=True):
@@ -14142,19 +14161,31 @@ def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
                 else ("logp", "dX", "dW")
             )
             logprob_plans.clear()
+            fast_checks.clear()
+            budget_plans.clear()
             result, _, mplan = _budget_step(inp, C, entry)
             if entry == "logprob":
                 assert len(logprob_plans) == 1, logprob_plans
                 mplan = logprob_plans[0]
-            case = (minimum, entry, inp.objective, mplan)
+            case = (minimum, entry, inp.objective, mplan, fast_checks, budget_plans)
             if minimum == 2:
-                assert mplan is None, case
+                assert mplan is None and fast_checks == [], case
                 _assert_same_bits(want, result, keys=keys)
                 continue
-            assert mplan is not None and mplan.fits, case
-            _assert_same_bits(
-                want, result, keys=keys if inp is ce else ("loss", "logp")
-            )
+            if inp is ce:
+                assert mplan is not None and mplan.fits, case
+                _assert_same_bits(want, result, keys=keys)
+                continue
+            # the zero-weight split's rule: one fit check of the fast call, then (when it does not fit) the budget
+            # call's plans with the split and without it
+            assert len(fast_checks) == 1, case
+            fits = [p for p in budget_plans if p.fits]
+            if fast_checks[0] or not fits:
+                assert mplan is None, case
+                _assert_same_bits(want, result, keys=keys)
+            else:
+                assert len(budget_plans) == 2 and mplan in fits, case
+                _assert_same_bits(want, result, keys=("loss", "logp"))
 
 
 @pytest.mark.parametrize("entry", ["loss", "logprob"])
