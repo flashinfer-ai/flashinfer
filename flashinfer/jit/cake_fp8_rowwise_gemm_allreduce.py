@@ -444,7 +444,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "main_ws4_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
         "main_ws8_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
         "main_ws8_p2p_g4": "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa",
-        "main_ws8_p2p_g4_ls2": "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa",
         "main_ws8_p2p_g4_r6": "cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6",
         "main_ws8_p2p_ls2": "cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc",
         "main_ws8_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
@@ -582,8 +581,9 @@ CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {
 # reducer warps (it also needs ``K_l * world_size <= N`` and, for a world size in
 # ``mn_limit``, ``M * N`` below that limit). ``LOCKSTEP``: route suffix, the
 # smallest raster group and the smallest tile count of the program that throttles its
-# producers to the grid's progress. Both suffixes apply in that order; an absent lever is
-# never selected.
+# producers to the grid's progress, and the program variants (``""``: the default
+# capacity) whose calls may take it. Both suffixes apply in that order; an absent lever
+# is never selected.
 LEVER_DISPATCH: dict[str, dict[str, Any]] = {
     "sm_90a": {
         "REDUCERS": {
@@ -591,7 +591,12 @@ LEVER_DISPATCH: dict[str, dict[str, Any]] = {
             "max_k_l": {2: 4096, 4: 1536, 8: 1536},
             "mn_limit": {2: 1073741824},
         },
-        "LOCKSTEP": {"suffix": "_ls2", "min_raster_group": 2, "min_tiles": 12288},
+        "LOCKSTEP": {
+            "suffix": "_ls2",
+            "min_raster_group": 2,
+            "min_tiles": 12288,
+            "variants": [""],
+        },
     },
     "sm_100a": {},
     "sm_103a": {},
@@ -901,14 +906,23 @@ def lever_suffixes(arch: str) -> tuple[str, ...]:
 
 
 def lever_variant(
-    world_size: int, m: int, n: int, k_l: int, arch: str, *, sm_count: int
+    world_size: int,
+    m: int,
+    n: int,
+    k_l: int,
+    arch: str,
+    *,
+    sm_count: int,
+    variant: str = "",
 ) -> str:
     """The lever suffix of one call on ``arch`` (empty: the route's program).
 
     Reducers: ``K_l`` at most the world size's bound, ``K_l * world_size <= N`` and
     ``M * N`` below the world size's ``mn_limit`` (when it has one).
-    Lockstep: a raster group of at least ``min_raster_group``, at least ``min_tiles``
-    tiles and a grid below ``MAX_CTAS`` (the throttle counts in the last arrival word).
+    Lockstep: a program ``variant`` of the capacity (``program_variant``) among the
+    lever's ``variants``, a raster group of at least ``min_raster_group``, at least
+    ``min_tiles`` tiles and a grid below ``MAX_CTAS`` (the throttle counts in the last
+    arrival word).
     """
 
     table = LEVER_DISPATCH.get(arch, {})
@@ -927,6 +941,7 @@ def lever_variant(
     lockstep = table.get("LOCKSTEP")
     if (
         lockstep is not None
+        and str(variant) in lockstep["variants"]
         and 0 < int(sm_count) < int(geometry(arch)["MAX_CTAS"])
         and raster_group_m(m, n, k_l, arch) >= int(lockstep["min_raster_group"])
         and tiles(m, n, arch) >= int(lockstep["min_tiles"])
@@ -948,7 +963,13 @@ def call_program(
     """The program one call of ``(m, n, k_l)`` runs in a workspace of ``max_rows`` rows."""
 
     key = route_key(world_size, arch, max_rows) + lever_variant(
-        world_size, m, n, k_l, arch, sm_count=sm_count
+        world_size,
+        m,
+        n,
+        k_l,
+        arch,
+        sm_count=sm_count,
+        variant=program_variant(world_size, max_rows, arch),
     )
     table = ROUTES.get(arch, {})
     if key not in table:
