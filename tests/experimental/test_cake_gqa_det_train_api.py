@@ -161,22 +161,37 @@ def test_keywords_match_the_backend() -> None:
                 assert param.default == theirs[name].default, (facade, name)
 
 
+# The one default that differs from the non-deterministic package: ``total_k`` / ``num_heads_kv`` of the workspace-bytes
+# entry are ``None`` here (not given: the scratch alone; one without the other raises ``ValueError``) and ``0`` there
+# (the scratch alone).  (ours, theirs) per (entry, parameter).
+NONDET_DEFAULT_DIFFERENCES = {
+    ("cake_gqa_det_train_workspace_bytes", "total_k"): (None, 0),
+    ("cake_gqa_det_train_workspace_bytes", "num_heads_kv"): (None, 0),
+}
+
+
 def test_the_interface_matches_the_nondet_package() -> None:
     """Each entry point takes the parameters of the non-deterministic package's entry of the same role, in order,
-    with the same kinds and defaults (``cu_seqlens_q_host`` / ``cu_seqlens_k_host`` included), so a caller switches
-    the mode by the module name alone."""
+    with the same kinds and defaults (``cu_seqlens_q_host`` / ``cu_seqlens_k_host`` included; the defaults of
+    ``NONDET_DEFAULT_DIFFERENCES`` aside), so a caller switches the mode by the module name alone."""
     import flashinfer.cake_gqa_nondet_train as nondet
 
     for name in ENTRY_POINTS:
         other = name.replace("cake_gqa_det", "cake_gqa_nondet")
         ours, theirs = (
-            [
-                (p.name, p.kind, p.default)
-                for p in inspect.signature(inspect.unwrap(fn)).parameters.values()
-            ]
+            inspect.signature(inspect.unwrap(fn)).parameters
             for fn in (getattr(api, name), getattr(nondet, other))
         )
-        assert ours == theirs, name
+        assert [(p.name, p.kind) for p in ours.values()] == [
+            (p.name, p.kind) for p in theirs.values()
+        ], name
+        for key, param in ours.items():
+            pair = (param.default, theirs[key].default)
+            want = NONDET_DEFAULT_DIFFERENCES.get((name, key))
+            if want is None:
+                assert pair[0] == pair[1], (name, key, pair)
+            else:
+                assert pair == want, (name, key, pair)
 
 
 def test_workspace_bytes_extras_are_keyword_only() -> None:

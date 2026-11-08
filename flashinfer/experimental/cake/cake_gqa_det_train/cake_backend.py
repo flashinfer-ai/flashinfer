@@ -953,7 +953,9 @@ def _check_ranges(
     edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
     # ``amax``, not ``max``: its result is never filled under ``torch.use_deterministic_algorithms(True)``.
     fits = torch.diff(edges).amax() <= plan["tile_stride"]
-    keys = torch.diff(cu_seqlens_k).amax() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
+    keys = (
+        torch.diff(cu_seqlens_k).amax() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
+    )
     torch._assert_async(
         fits & keys,
         "cake_gqa_det_train: cu_seqlens_q_host / cu_seqlens_k_host disagree with the device boundaries",
