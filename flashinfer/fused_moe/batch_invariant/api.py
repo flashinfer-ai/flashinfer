@@ -318,12 +318,16 @@ def route_plan(
     bias: Optional[torch.Tensor] = None,
     scaling_factor: Optional[Union[float, torch.Tensor]] = None,
     align: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dual: bool = False,
+    pad_align: int = 128,
+) -> Tuple[torch.Tensor, ...]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
     route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``.
     ``align > 1``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing) and ``src`` of the
-    padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them."""
+    padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them. ``dual`` (with ``align = 1``):
+    ``(..., dest_pad [T, k] int32, pos_pad [T k] int32)`` follow -- the positions with the groups padded to ``pad_align`` rows and
+    the padded position of every dense row, ``permute_plan_dual``'s integers (the block-scaled classes' dense packing)."""
     from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
 
@@ -365,6 +369,10 @@ def route_plan(
         s = _const(dev, 1, float(scaling_factor))
     if align < 1 or align & (align - 1):
         raise ValueError(f"route_plan: align {align} must be a power of two")
+    if dual and (align > 1 or pad_align < 2):
+        raise ValueError(
+            "route_plan: the dual form takes align 1 and a padded alignment above 1"
+        )
     n = T * top_k
     n_src = n if align == 1 else -(-(n + (align - 1) * min(E, n)) // align) * align
     experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
@@ -372,12 +380,24 @@ def route_plan(
     counts = torch.empty(E, dtype=torch.int32, device=dev)
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.empty(n_src, dtype=torch.int32, device=dev)
+    dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
+    pos_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
     if T:
         get_compiled_route_plan(
-            expert_bucket(E), top_k, method, _IN[logits.dtype], align
-        )(logits, b, s, experts, weights, counts, dest, src, T, E)
+            expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
+        )(logits, b, s, experts, weights, counts, dest, src, dest_pad, pos_pad, T, E)
     else:
         counts.zero_()
+    if dual:
+        return (
+            experts,
+            weights,
+            counts,
+            dest.view(T, top_k),
+            src,
+            dest_pad.view(T, top_k),
+            pos_pad,
+        )
     return experts, weights, counts, dest.view(T, top_k), src
 
 

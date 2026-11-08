@@ -1254,6 +1254,34 @@ def test_alternating_inputs_under_programmatic_dependent_launch():
 
 
 @needs_device
+@pytest.mark.parametrize(
+    "T,k,E", [(3, 8, 64), (16, 16, 128), (16, 8, 1024), (0, 4, 16)]
+)
+def test_route_plan_dual_equals_route_and_the_dual_plan(T, k, E):
+    """``api.route_plan(dual=True)``: the dense positions and the padded ones in one launch equal ``route`` followed by the
+    block-scaled classes' ``permute_plan_dual`` (experts, weights, counts, dest, src, dest_pad, pos_pad)."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    permute_plan_dual = pytest.importorskip(
+        "flashinfer.fused_moe.batch_invariant.api_nvfp4"
+    ).permute_plan_dual  # the block-scaled package: a later PR
+
+    g = torch.Generator().manual_seed(T * 3 + E)
+    logits = (torch.randn(max(T, 1), E, generator=g) * 2).float()[:T].cuda()
+    ex, w = api.route(logits, k, S.SOFTMAX_RENORM)
+    counts, dest, src, dest_pad, pos_pad = permute_plan_dual(ex, E)
+    ex2, w2, counts2, dest2, src2, dest_pad2, pos_pad2 = api.route_plan(
+        logits, k, S.SOFTMAX_RENORM, dual=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2))
+    assert torch.equal(counts, counts2) and torch.equal(dest, dest2)
+    assert torch.equal(src, src2)
+    assert torch.equal(dest_pad, dest_pad2) and torch.equal(pos_pad, pos_pad2)
+
+
+@needs_device
 def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
     (the same ids and weights from ``route``) bit for bit."""
