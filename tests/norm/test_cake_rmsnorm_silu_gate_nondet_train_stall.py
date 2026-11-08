@@ -144,7 +144,8 @@ their speed beside the one-thread kernel, start beside the all-SM kernel with
 the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
 item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
 end no later than the deterministic forward (the deterministic package's
-plain forward module, whatever the rows) beside the same side kernel: the busy
+forward as it routes the rows, ``cake_jit.forward_module``) beside the same
+side kernel: the busy
 median is at most the deterministic forward's busy median times ``1 +
 PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of the
 event timer (about 1 microsecond on SM103) and a half, the calls taking a few
@@ -268,21 +269,23 @@ def _timed(call, *, side: torch.cuda.Stream | None):
     return start.elapsed_time(end), tuple(t.clone() for t in out)
 
 
-def _launched(call) -> list[str]:
-    """The modules one ``call`` alone launches."""
+def _launched(call, registry=None) -> list[str]:
+    """The modules one ``call`` alone launches through ``registry`` (this
+    package's ``cake_jit`` unless another package's is given)."""
+    registry = loader if registry is None else registry
     names: list[str] = []
-    run = loader.run_module
+    run = registry.run_module
 
     def spy(name, *args, **kwargs):
         names.append(name)
         return run(name, *args, **kwargs)
 
-    loader.run_module = spy
+    registry.run_module = spy
     try:
         call()
         torch.cuda.synchronize()
     finally:
-        loader.run_module = run
+        registry.run_module = run
     return names
 
 
@@ -1333,10 +1336,6 @@ SHORT_MAX_ALONE_SPREAD = 1.7
 SHORT_EXTRA_ATTEMPTS = 2
 
 
-def _det_plain(arch, role, rows, sm_count):
-    return det_loader.route_module(arch, role)
-
-
 def _first_forward(role: str, rows_per_sm: int) -> tuple[int, str, str]:
     """``(T, layout, module)``: the most tokens ``T`` whose ``T * H`` rows stay
     within ``rows_per_sm`` rows per SM, one of the architecture's
@@ -1442,19 +1441,24 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
         return (forward(x, z, w, EPS, out=y),)
 
     def call_det():
-        # the deterministic package's plain forward module whatever the rows
-        routed = det_loader.module_for_rows
-        det_loader.module_for_rows = _det_plain
-        try:
-            return (
-                det_pkg.cake_rmsnorm_silu_gate_det_train_forward(
-                    x, z, w, EPS, out=y_det
-                ),
-            )
-        finally:
-            det_loader.module_for_rows = routed
+        # the deterministic package's forward as it routes these rows
+        # (cake_jit.forward_module)
+        return (
+            det_pkg.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y_det),
+        )
 
     assert _launched(call) == [name], (role, layout, tokens)
+    arch, sms = _device()
+
+    def strides(t):
+        # as the deterministic package passes them: a single token's stride
+        # as 0, a single head's as 128
+        return (t.stride(0) if tokens > 1 else 0, t.stride(1) if H > 1 else D)
+
+    det_name = det_loader.forward_module(
+        arch, tokens * H, H, sms, *strides(x), *strides(z)
+    )
+    assert _launched(call_det, det_loader) == [det_name], (role, layout, tokens)
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
     attempts = 1 + SHORT_EXTRA_ATTEMPTS
@@ -1477,8 +1481,10 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
-        # each module's y repeats its own bits (two programs may associate a
-        # row's sum of squares differently)
+        # each module's and each package's y repeats its own bits: two programs
+        # may associate a row's sum of squares differently, and the
+        # deterministic forward's approximate gate and rstd need not give this
+        # package's bits
         _check_outputs("forward", tokens, alone, busy)
         _check_outputs("forward", tokens, det_alone, det_busy)
         if counts:

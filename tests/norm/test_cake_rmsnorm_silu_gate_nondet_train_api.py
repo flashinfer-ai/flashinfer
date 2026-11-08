@@ -81,7 +81,8 @@ package's public forward and backward only.  This module checks:
   output repeats bit for bit (an accumulated ``dw`` from the same starting
   value too) but a BF16 ``dw`` in the row-claims bands, ``dx`` and ``dz`` are
   the deterministic package's bits, ``y``, ``dx``, ``dz`` and ``dw`` lie
-  within the error budget, and ``dw`` within the weight-gradient budget of
+  within the error budget (``y`` also within one BF16 ulp of FP64,
+  :func:`assert_y_within_fp64`), and ``dw`` within the weight-gradient budget of
   the deterministic ``dw`` (in the row-claims bands on every launch); so do
   they around the ends of the forward's ``FORWARD_BANDS`` bands (packed rows)
   and ``STRIDED_FORWARD_BANDS`` bands (other layouts) and at the first and
@@ -190,6 +191,36 @@ nd_gated_rmsnorm = cake_rmsnorm_silu_gate_nondet
 # The deterministic package, through its public forward and backward only.
 det_forward = deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward
 det_backward = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward
+
+
+def assert_y_within_fp64(y, x, z, w, eps, *, what):
+    """``y`` NaN where the FP64 forward is NaN, its infinity where it is
+    infinite and elsewhere within one BF16 ulp of it plus a floor of 1/64 ulp of
+    its row's largest finite ungated magnitude ``|x * rstd * w|``, times the
+    gate's magnitude where that exceeds one.  The deterministic package's
+    forward computes its gate and ``rstd`` with approximate instructions, so its
+    ``y`` need not be this package's bits; each package holds its own ``y`` to
+    FP64."""
+    xd, zd, wd = (t.double().reshape(-1, D) for t in (x, z, w))
+    rstd = 1.0 / torch.sqrt(xd.square().mean(dim=-1, keepdim=True) + eps)
+    ungated = xd * rstd * wd
+    scale = torch.where(ungated.isfinite(), ungated.abs(), 0.0).amax(
+        dim=-1, keepdim=True
+    )
+    silu = zd * torch.sigmoid(zd)
+    want = ungated * silu
+    got = y.detach().double().reshape(-1, D)
+    assert torch.equal(got.isnan(), want.isnan()), f"{what}: NaN elements"
+    inf = want.isinf()
+    assert torch.equal(got.isinf(), inf), f"{what}: infinite elements"
+    assert torch.equal(got[inf], want[inf]), f"{what}: infinite elements"
+    floor = scale * silu.abs().clamp_min(1.0) * suite.BF16_RTOL / 64
+    err = (got - want).abs()
+    bad = want.isfinite() & ~(err <= want.abs() * suite.BF16_RTOL + floor)
+    assert not bad.any(), (
+        f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond one BF16 ulp "
+        f"of FP64; worst err {err[bad].max().item():.3e}"
+    )
 
 
 def _supported() -> bool:
@@ -916,6 +947,7 @@ def test_nondet_entry_points_run_this_package(
         loader.module_for_rows(arch, "bwd_bf16", T * H, sms),
     ], launched
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
     again = nd_backward(dy, x, z, w, EPS)
     for what, got, want in zip(("dx", "dz"), again[:2], (dx, dz), strict=True):
         assert_same_bits(what, got, want)
@@ -951,11 +983,17 @@ def test_nondet_entry_points_run_this_package(
             dy, x, z, w, EPS, workspace=fp32_workspace
         )
     _assert_refusal(info.value)
-    # the deterministic backward's requirement names its own dtype (FP32)
+    # the deterministic backward refuses this package's workspace, naming both
+    # modes' workspaces
     with pytest.raises(
         ValueError,
         match=re.escape(
-            f"workspace must be a contiguous FP32 tensor on {x.device} with at least "
+            "workspace is uint8, a workspace of the non-deterministic mode "
+            "(flashinfer.cake_rmsnorm_silu_gate_nondet_train."
+            "cake_rmsnorm_silu_gate_nondet_train_backward_workspace); the "
+            "deterministic backward needs its own zero-filled FP32 workspace "
+            "(flashinfer.cake_rmsnorm_silu_gate_det_train."
+            "cake_rmsnorm_silu_gate_det_train_backward_workspace)"
         ),
     ):
         det_backward(dy, x, z, w, EPS, workspace=nd_workspace(T * H, x.device))
@@ -1063,13 +1101,14 @@ def test_accuracy_matrix_within_the_deterministic_error(
     :func:`assert_dw_repeats_within_det`) and ``dx`` and ``dz`` the
     deterministic package's; each output lies within
     the error budget of the deterministic package's output against the FP64
-    reference, and ``dw`` within the weight-gradient budget of the
-    deterministic ``dw``."""
+    reference (``y`` also within one BF16 ulp of FP64), and ``dw`` within the
+    weight-gradient budget of the deterministic ``dw``."""
     x, z, w, dy = suite.make(*shape, **make_kwargs)
     y64, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, eps)
     y = nd_forward(x, z, w, eps)
     assert_same_bits("y", nd_forward(x, z, w, eps), y)
     assert_error_within_det("y", y, det_forward(x, z, w, eps), y64)
+    assert_y_within_fp64(y, x, z, w, eps, what="y")
     mag = suite.magnitudes(dy, x, z, eps)
     varies = suite._dw_varies(x.numel() // D, dw_dtype)
 
@@ -1396,6 +1435,7 @@ def test_side_stream_repeats_the_current_stream_bits(determinism_setting) -> Non
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     assert_same_bits("y", y, want_y)
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
     varies = suite._dw_varies(x.numel() // D)
     mag = suite.magnitudes(dy, x, z, EPS)
     for outputs in (got, fresh):
@@ -1451,6 +1491,7 @@ def test_cuda_graph_replay_repeats_the_eager_bits(determinism_setting) -> None:
         eager = (nd_forward(xn, zn, w, EPS), *nd_backward(dyn, xn, zn, w, EPS))
         for what, got, want in zip(names[:3], (y, dx, dz), eager[:3], strict=True):
             assert_same_bits(f"replay {k}: {what}", got, want)
+        assert_y_within_fp64(y, xn, zn, w, EPS, what=f"y, replay {k}")
         dets = (det_forward(xn, zn, w, EPS), *det_backward(dyn, xn, zn, w, EPS))
         assert_det_bits(f"replay {k}: dx", dx, dets[1])
         assert_det_bits(f"replay {k}: dz", dz, dets[2])
@@ -1494,6 +1535,7 @@ def test_autograd_and_checkpoint_repeat_the_functional_bits(
     varies = suite._dw_varies(513 * 48)
 
     def check(y, xg, zg, wg, what):
+        assert_y_within_fp64(y, x, z, w, EPS, what=f"{what} y")
         assert wg.dtype == torch.bfloat16, what
         for name, got, w_ in zip(names[:3], (y, xg, zg), want[:3], strict=True):
             assert_same_bits(f"{what}: {name}", got, w_)
@@ -1658,7 +1700,8 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     band where the rows are not packed) with ``rows <= last * SMs`` (the
     tiny, short, mid, long and extra-long forwards and the forward, each where
     the architecture's bands name it).  ``y`` repeats bit for bit and lies
-    within the error budget of the deterministic package's ``y``."""
+    within the error budget of the deterministic package's ``y`` and within
+    one BF16 ulp of FP64."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
@@ -1688,6 +1731,7 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     assert name == want, (arch, rows, sms)
     y64 = suite.fp64_reference(dy, x, z, w, EPS)[0]
     assert_error_within_det("y", y, det_forward(x, z, w, EPS), y64)
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # Gate inputs at and past the edges of the packed gate's range: below -41,
@@ -1815,6 +1859,7 @@ def test_forward_gate_edges_keep_the_fp64_classes(
     assert_error_within_det(
         "finite y", y, det_forward(x, z, w, EPS), y64, mask=torch.isfinite(y64)
     )
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
@@ -2534,6 +2579,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
         return torch.empty(D, dtype=dw_dtype, device=x0.device)
 
     if role == "fwd":
+        assert_y_within_fp64(nd_forward(x0, z0, w, EPS), x0, z0, w, EPS, what="flat y")
         names = ("y",)
         dets = (det_forward(x0, z0, w, EPS),)
         refs = (y64,)

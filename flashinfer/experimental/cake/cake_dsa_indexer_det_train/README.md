@@ -9,8 +9,9 @@ flashinfer-ai/flashinfer#5676.
 The public entry points live in the module `flashinfer.cake_dsa_indexer_det_train`;
 this backend package under `flashinfer/experimental/cake/` is their implementation
 and carries no compatibility guarantee of its own.  The non-deterministic
-counterpart `flashinfer.cake_dsa_indexer_nondet_train` is a reserved name for a
-planned package (flashinfer-ai/flashinfer#8928).
+counterpart is `flashinfer.cake_dsa_indexer_nondet_train`
+(flashinfer-ai/flashinfer#8928), which leaves the slot order of each row
+unspecified.
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
 comparison architecture, SM103 (B300 / GB300) the third target.  The feature
 does not participate in automatic backend selection, autotuning or
@@ -59,7 +60,7 @@ the package paths `flashinfer.experimental.cake_dsa_indexer_det` and
 | `k_scale` | optional `[Tkv]` FP32, contiguous | the FP8 form's per-key scales (see "FP8 form"); BF16 calls take none |
 | `ratio` | positive int | key compression ratio (normally 1) |
 | `max_seqlen_q` | optional int | host mirror of the longest query segment; accepted, not read by any launch decision |
-| `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
+| `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`); on `sm_100a` and `sm_103a` it also shows the host whether every key segment of a packed call has the same length (`Tkv == S * max_seqlen_k`), and such a call runs its scan program without the longest-segment-first unit order (the `:lsf` copy) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
 | `workspace_buffer` | optional uint8 tensor | at least `cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, top_k=..., ratio=..., device=...)` bytes, 8-byte aligned |
 | `indices`, `scores` (outputs) | `[T, top_k]` int32 and FP32 | selected segment-local ids in ascending order and their aligned scores; tail padding `-1` / `-inf` |
 
@@ -67,6 +68,20 @@ the package paths `flashinfer.experimental.cake_dsa_indexer_det` and
 training calls have `T = 16231` and `16172`); nothing needs caller-side
 padding.  `T = 0` returns empty outputs; a call without keys returns all
 padding.
+
+## Outputs
+
+The "repeats bit for bit" column holds for identical inputs and configuration:
+the same device, the same SM count and the same arguments.  The bits may change
+between package versions.
+
+| output | contents | repeats bit for bit | not specified |
+|---|---|---|---|
+| `indices [T, top_k]` int32 | segment-local key ids: per row, the `min(top_k, visible)` selected ids in ascending order, then `-1` in every other slot | every slot: the selected ids, their order and the `-1` tail | nothing |
+| `scores [T, top_k]` FP32 | aligned slot by slot with `indices`: the computed FP32 score of the id in the same slot (a selected `-0.0` stays `-0.0`); `-inf` in every padding slot; `None` with `return_scores=False` | every slot's bits | nothing |
+
+Neither the program that the host dispatches nor the partition knobs of the
+backend change these bits (see "Selection, ties, output order, padding").
 
 ## Scoring and the reduction scheme
 

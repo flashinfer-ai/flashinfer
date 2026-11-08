@@ -295,7 +295,7 @@ def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
     ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp._launch_grid`), the cooperative ones the co-resident count."""
 
     kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
-    assert kcp.COOPERATIVE_DEFAULT is True
+    assert kcp.COOPERATIVE_DEFAULT is False
     assert kcp._cooperative(None) is kcp.COOPERATIVE_DEFAULT
     assert kcp._cooperative(True) is True and kcp._cooperative(False) is False
     for bad in (0, 1, "split", 1.0):
