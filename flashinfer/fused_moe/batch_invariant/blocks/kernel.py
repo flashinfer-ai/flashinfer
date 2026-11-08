@@ -166,10 +166,6 @@ class GroupedBlockGemm:
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-        # programmatic dependent launch: wait for the predecessor grid before any dependent read (counts, the operands), and
-        # let the successor start its prologue at once (this grid is one persistent wave)
-        cute.arch.griddepcontrol_wait()
-        pdl.trigger_early()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         use_2cta_instrs = atom_thr_size == 2
         bidx, _, _ = cute.arch.block_idx()
@@ -232,6 +228,11 @@ class GroupedBlockGemm:
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         cluster_rows = st.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
+        # programmatic dependent launch: the prologue above (descriptor prefetch, barrier init, the pipelines) depends on no
+        # predecessor; the wait sits before the first dependent read (counts: the group tables, then the operands), and the
+        # trigger placement (pdl.py) follows it
+        cute.arch.griddepcontrol_wait()
+        pdl.trigger_early()
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(counts, E, cluster_rows, s_off, s_pre)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
