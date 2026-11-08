@@ -1639,7 +1639,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+        "kernel_symbol": "kernel_cake_gdn_det_train_ca5488020bef49bf474b_kcp",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1647,7 +1647,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 199680,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+        "library": "cake_gdn_det_train_ca5488020bef49bf474b_kcp",
         "logical": {
             "chunk_bos": "chunk_bos",
             "gamma": "gamma",

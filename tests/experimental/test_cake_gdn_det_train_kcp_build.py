@@ -97,8 +97,8 @@ IDENTITIES = {
         {"vh": 64},
     ),
     "kcp_transfer_walk": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
-        {"precision_mode": 0, "compute_warps": 8},
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_ez_v1_kcp",
+        {},
     ),
     "kcp_transfer_walk_three_mma": (
         f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",

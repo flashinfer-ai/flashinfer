@@ -196,7 +196,7 @@ TART_MODULE_OF = {
     "kcp_fwdh_offset": "gdn_chunk_det_fwdh_v1_kcp",
     "kcp_fwdh_tape": "gdn_chunk_det_fwdh_v1_kcp",
     "kcp_fwdh_out": "gdn_chunk_fwdh_out_v2_kcp",  # the v2 output walk (o bitwise v1), the module the non-det package ships
-    "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_v1_kcp",
+    "kcp_transfer_walk": "gdn_chunk_det_transfer_walk_ez_v1_kcp",
     "kcp_affine_merge": "kda_chunk_kcp_affine_merge_fp32_v1",
     "fwd_o": "gdn_chunk_det_train_fwd_o_v1",
     "bwd_prep": "gdn_chunk_det_train_bwd_prep_v1",
