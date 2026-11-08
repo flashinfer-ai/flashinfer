@@ -1948,8 +1948,11 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     # the serpentine K walk over blocks of 76 items (``kser`` 76: see the 12288 -> 4096 forward at T 16172)
     ('sm_103a', False, True, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
-    ('sm_103a', True, True, False, False, False, 5120, 16172, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
-    ('sm_103a', True, True, False, False, False, 17408, 16172, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    #      (the two weight gradients carry ht_min_tail 16, a FlashInfer-only planner refinement: their 680-tile rows keep
+    #      a tail under 16 tiles whole - 148 SMs, 14 tiles, measured slower as 28 half items than FI main - and plan as
+    #      before on 152 SMs (no half-item fit) and 160 SMs (40 tiles, 80 half items))
+    ('sm_103a', True, True, False, False, False, 5120, 16172, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12, "ht_min_tail": 16},
+    ('sm_103a', True, True, False, False, False, 17408, 16172, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12, "ht_min_tail": 16},
     # ---- sm_103a: the GB T-exact rules of round 13 - the 17408 -> 5120 fp32 weight gradient at T 16231 / 16384 in
     #      12-row raster groups (the program the row runs without them: its own 128-row fp32 program is not generated
     #      on sm_103a, so the registry's knob fallback runs the 256-row tiles through the one-slot TMA store; the rule
@@ -3416,7 +3419,13 @@ def cake_dense_gemm_det_train_projection_plan(
     htail_plan = False
     if htail:
         tail_h = pair_tiles % units if pair_tiles > units else pair_tiles
-        htail_plan = bool(tail_h) and 2 * tail_h <= units
+        # FlashInfer-only refinement (like ROW_RULE_MIN_T): a rule's ``ht_min_tail`` keeps a tail of fewer tiles whole
+        # (the ``_ht`` program then runs its whole-tile plan); no field means any tail that fits
+        htail_plan = (
+            bool(tail_h)
+            and 2 * tail_h <= units
+            and tail_h >= int(rule.get("ht_min_tail", 1))
+        )
     if exact_plan is not None:
         num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
     elif sync_plan is not None:

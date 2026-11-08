@@ -4923,7 +4923,11 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     and sync_plan is None
                 )
                 # the fit of the half items selects the plan, never the program the rule names
-                htail_plan = htail and 0 < 2 * tail <= plan.sm_pairs
+                htail_plan = (
+                    htail
+                    and 0 < 2 * tail <= plan.sm_pairs
+                    and tail >= int(rule.get("ht_min_tail", 1))
+                )
                 parts = rule.get("sk_parts") if sync_plan is None else None
                 sk_rule = (
                     sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
@@ -9529,7 +9533,9 @@ def test_gb_t_exact_kser_rows_match_fp64_and_repeat_bitwise(key, monkeypatch):
 # keys' rule of the row; round 11: the sm_103a 5120 -> 17408 and 17408 -> 5120 weight gradients at T 16172 with the
 # rule of their T 16231 / 16384 keys): ROW_RULES key -> the program it plans at its T (K = T, in the direct
 # orientation the row plans without it, G[T, M].T @ X[T, N]), with the per-tile K partitions of the row's plan without it
-# (whole K per output tile on both), so every output is bitwise equal to that plan's.
+# (whole K per output tile on both), so every output is bitwise equal to that plan's.  The two sm_103a keys at T 16172
+# carry ht_min_tail 16: on 148 SMs their 14-tile tail stays whole (sk_units 0, not 28 half items), on 152 / 160 SMs
+# they plan as before (test_gb_t_exact_wgrad_ht_min_tail_keeps_the_148_sm_tail_whole).
 GB_T_EXACT_WGRAD_ROWS = {
     (
         "sm_100a",
@@ -9731,6 +9737,63 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
                 ragged.N,
                 ragged.K,
             )
+
+
+def test_gb_t_exact_wgrad_ht_min_tail_keeps_the_148_sm_tail_whole(monkeypatch):
+    """The sm_103a 5120 -> 17408 / 17408 -> 5120 weight-gradient keys at T 16172 (680 pair tiles) carry
+    ``ht_min_tail`` 16: on 148 SMs (74 pairs) the 14-tile tail stays in whole tiles - the ``_ht`` program runs its
+    whole-tile plan, where the 28 half items measured slower than FI main - while 152 SMs (tail 72, no half-item fit)
+    and 160 SMs (tail 40, 80 half items) plan exactly as without the field; no other rule carries it."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(key for key, rule in ROW_RULES.items() if "ht_min_tail" in rule)
+    assert keys == sorted(
+        [
+            ("sm_103a", True, True, False, False, False, 5120, 16172, 17408),
+            ("sm_103a", True, True, False, False, False, 17408, 16172, 5120),
+        ]
+    ), keys
+    for key in keys:
+        arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        assert ROW_RULES[key]["ht_min_tail"] == 16 and ROW_RULES[key]["htail"], key
+        G, X, out = _gb_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch=arch)
+        assert not transposed, key
+        for sm_count, half, units in (
+            (148, False, 0),
+            (152, False, 0),
+            (160, True, 80),
+        ):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+            with monkeypatch.context() as m:
+                m.setitem(
+                    ROW_RULES,
+                    key,
+                    {k: v for k, v in ROW_RULES[key].items() if k != "ht_min_tail"},
+                )
+                plain, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+            assert plan.template == plain.template == GB_T_EXACT_WGRAD_ROWS[key], (
+                key,
+                sm_count,
+                plan.template,
+            )
+            assert plan.htail and plan.htail_plan == half and plan.sk_units == units, (
+                key,
+                sm_count,
+                plan.sk_units,
+            )
+            if sm_count == 148:
+                assert plain.htail_plan and plain.sk_units == 28, (key, plain.sk_units)
+                assert (plan.num_full, plan.tail_tiles) == (plan.pair_tiles, 0), key
+                sig, base = _plan_signature(plan), _plan_signature(plain)
+                assert {f for f in sig if sig[f] != base[f]} <= {
+                    "num_full",
+                    "tail_tiles",
+                    "sk_units",
+                    "htail_plan",
+                }, key
+            else:
+                assert _plan_signature(plan) == _plan_signature(plain), (key, sm_count)
 
 
 @pytest.mark.parametrize(
