@@ -53,7 +53,9 @@ rstd_k / g_cs / qn / kn bits, one persistent CTA per SM), the forward
 register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
 segment-parallel route; the serial and split scans serve the backward's
 recompute), ``fwd_summary`` (the affine map ``[B | M]`` of each middle piece
-of the split forward, tcgen05, beside its first wave), ``stitch``
+of the split forward, tcgen05, beside its first wave), ``fwd_summary_a``
+(the same map from ``wy_a``'s A, kn, v and beta, u and w formed in the CTA:
+the split forward whose waves are ``fwd_ho_a``), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
 output in one tcgen05 kernel), ``fwd_ho_vh2`` (the same scan and output split
 over the two value halves, two CTAs per segment and value head; the same
@@ -120,6 +122,7 @@ STAGES = (
     "fwd_h_r32k2_split",
     "fwd_h_r64k1_split",
     "fwd_summary",
+    "fwd_summary_a",
     "stitch",
     "fwd_ho",
     "fwd_ho_vh2",
@@ -776,6 +779,45 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_6db0d789ecd47ef8e98e",
         "stage": "fwd_summary",
+    },
+    "fwd_summary_a": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kn_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "a_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "b_out"],
+            ["buffer", "m_out"],
+            ["buffer", "seg_flag"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "walk"],
+            ["buffer", "m_slot"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "b_head"],
+            ["parameter", "b_row"],
+            ["parameter", "m_head"],
+            ["parameter", "m_row"],
+            ["parameter", "m_col"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_fwd_summary_a",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_fwd_summary_a",
+        "stage": "fwd_summary_a",
     },
     "stitch": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

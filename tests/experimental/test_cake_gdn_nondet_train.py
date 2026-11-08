@@ -5168,8 +5168,35 @@ FWD_SPLIT_CLASS_ROWS = {
     "pair_hv6": ((2, 6), PAIR_SEQ_LENS, False),
     "pair_hv3": ((1, 3), PAIR_SEQ_LENS, False),
 }
-# the host launch order: the middle pieces' summary (side stream) is issued before wave 1
+# the host launch order: the middle pieces' summary (side stream) is issued before wave 1; on wy_a's A
+# (FWD_SPLIT_A_ARCHS) both waves are fwd_ho_a and the copy of wave 1's end states into the segment state is a torch op
 FWD_SPLIT_STAGES = ["wy_a", "wy_tc2", "fwd_summary", "fwd_fused", "stitch", "fwd_fused"]
+FWD_SPLIT_A_STAGES = ["wy_a", "fwd_summary_a", "fwd_ho_a", "stitch", "fwd_ho_a"]
+
+
+def _split_a() -> bool:
+    """Whether the split forward of the current device runs on wy_a's A (FWD_SPLIT_A_ARCHS)."""
+    return cake_chain._fwd_split_a(
+        cake_backend.device_arch(torch.cuda.current_device())
+    )
+
+
+def _split_stages() -> list[str]:
+    return FWD_SPLIT_A_STAGES if _split_a() else FWD_SPLIT_STAGES
+
+
+def _split_wave() -> str:
+    """The stage of the split forward's two waves on the current device."""
+    return "fwd_ho_a" if _split_a() else "fwd_fused"
+
+
+def _split_taped_word() -> int:
+    """The tape word of a taped wave of the split forward on the current device (its waves' tape table)."""
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    words = cake_chain.FWD_A_TAPE if _split_a() else cake_chain.FWD_FUSED_TAPE
+    return sum(
+        words[name] for name in cake_plan.tape_state(arch, True) if name in words
+    )
 
 
 def _fwd_split_or_skip(device) -> str:
@@ -5202,16 +5229,15 @@ def _forward_stages(stages) -> list[str]:
 
 
 def _fused_tape_words(launches) -> list[int]:
-    """The tape word of every fwd_fused launch."""
+    """The tape word of every launch of the split forward's waves (:func:`_split_wave`)."""
+    wave = _split_wave()
     names = cake_backend.parameters(
         cake_backend.stage_record(
-            "fwd_fused", cake_backend.device_arch(torch.cuda.current_device())
+            wave, cake_backend.device_arch(torch.cuda.current_device())
         )
     )
     return [
-        int(values[names.index("tape")])
-        for stage, values in launches
-        if stage == "fwd_fused"
+        int(values[names.index("tape")]) for stage, values in launches if stage == wave
     ]
 
 
@@ -5331,7 +5357,7 @@ def test_fwd_split_matches_the_fp64_recurrence(case, device, monkeypatch) -> Non
     )
     stages = _record_launches(monkeypatch)
     got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
-    assert _forward_stages(stages) == FWD_SPLIT_STAGES, stages
+    assert _forward_stages(stages) == _split_stages(), stages
     ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
@@ -5386,13 +5412,13 @@ def test_fwd_split_short_pieces_keep_the_prep_forward(row, device, monkeypatch) 
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=427)
     stages = _record_launches(monkeypatch)
     _run(inputs, seq_lens)
-    assert "fwd_fused" not in stages and "fwd_summary" not in stages, stages
+    assert not {"fwd_fused", "fwd_summary", "fwd_summary_a"} & set(stages), stages
 
 
 @pytest.mark.usefixtures("fwd_split_test_class")
 def test_fwd_split_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
-    # a call that records no backward writes no h / v_new tape (word 0 on both waves); o and the final state are the
-    # bits of the taped call (word 3: h and v_new; w is the WY stage's)
+    # a call that records no backward writes no tape (word 0 on both waves); o and the final state are the bits of the
+    # taped call (fwd_fused word 3: h and v_new, w is the WY stage's; fwd_ho_a word 11: h, v_new and w)
     _fwd_split_or_skip(device)
     heads, seq_lens = FWD_SPLIT_CASES["g3"]
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=429)
@@ -5416,7 +5442,8 @@ def test_fwd_split_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
         *(inputs[n] for n in ("q", "k", "v", "g", "beta")), **kwargs
     )
     torch.cuda.synchronize()
-    assert _fused_tape_words(launches) == [3, 3, 0, 0, 0, 0], _fused_tape_words(
+    word = _split_taped_word()
+    assert _fused_tape_words(launches) == [word, word, 0, 0, 0, 0], _fused_tape_words(
         launches
     )
     for got in (no_grad, plain):
@@ -5438,10 +5465,11 @@ def test_fwd_split_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -
     )
     stages = _record_launches(monkeypatch)
     _run(inputs, seq_lens)
-    assert "fwd_fused" in stages, stages
+    assert _forward_stages(stages) == _split_stages(), stages
     stages.clear()
     got = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
-    assert not {"fwd_fused", "fwd_summary", "wy_a"} & set(stages), stages
+    split_stages = {"fwd_fused", "fwd_summary", "fwd_summary_a", "fwd_ho_a", "wy_a"}
+    assert not split_stages & set(stages), stages
     monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
     monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     want = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
@@ -5477,7 +5505,10 @@ def test_fwd_split_checkpoint_writes_the_tape_once(
     o = checkpoint(layer, *leaves.values(), use_reentrant=reentrant)
     (o.float() * inputs["do"].float()).sum().backward()
     torch.cuda.synchronize()
-    assert _fused_tape_words(launches) == [0, 0, 3, 3], _fused_tape_words(launches)
+    word = _split_taped_word()
+    assert _fused_tape_words(launches) == [0, 0, word, word], _fused_tape_words(
+        launches
+    )
     got = {
         "o": o.detach(),
         **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
@@ -5490,8 +5521,8 @@ def test_fwd_split_checkpoint_writes_the_tape_once(
 def test_fwd_split_packed_views_give_the_contiguous_bits(
     case, device, monkeypatch
 ) -> None:
-    # q / k / v as head views of one packed row: wy_a reads q / k and wy_tc2 reads v in place (no copy launch), the
-    # bits of contiguous inputs on every output and gradient
+    # q / k / v as head views of one packed row: wy_a reads q / k and wy_tc2 (on wy_a's A: the waves) reads v in place
+    # (no copy launch), the bits of contiguous inputs on every output and gradient
     _fwd_split_or_skip(device)
     heads, seq_lens = FWD_SPLIT_CASES[case]
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=435)
@@ -5499,15 +5530,57 @@ def test_fwd_split_packed_views_give_the_contiguous_bits(
     launches = _record_launch_values(monkeypatch)
     got = _run_packed(inputs, seq_lens, heads)
     _assert_same_bits(got, want, OUTPUT_NAMES)
-    assert "fwd_fused" in [stage for stage, _ in launches]
+    assert _split_wave() in [stage for stage, _ in launches]
     wy_a = next(values for stage, values in launches if stage == "wy_a")
     assert any(not t.is_contiguous() for t in wy_a if isinstance(t, torch.Tensor)), (
         "q / k were copied"
     )
-    wy = next(values for stage, values in launches if stage == "wy_tc2")
+    reader = _split_wave() if _split_a() else "wy_tc2"
+    wy = next(values for stage, values in launches if stage == reader)
     assert any(not t.is_contiguous() for t in wy if isinstance(t, torch.Tensor)), (
         "v was copied"
     )
+
+
+@pytest.mark.usefixtures("fwd_split_test_class")
+def test_fwd_split_a_tape_matches_the_w_form(device, monkeypatch) -> None:
+    # on wy_a's A the waves write the T_full tape themselves (fwd_ho_a word 11): w the bits of the WY stage's w on the
+    # same A, h and v_new within a relative L2 of 1e-2 of the waves on the WY stage's w / u, u a placeholder
+    arch = _fwd_split_or_skip(device)
+    if not cake_chain._fwd_split_a(arch):
+        pytest.skip(f"the split forward on wy_a's A is not routed on {arch}")
+    heads, seq_lens = FWD_SPLIT_CASES["g3"]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=437)
+    cu = _cu(seq_lens)
+
+    def saved_state() -> dict:
+        leaves = [
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        o, _ = cake_gdn_nondet(*leaves, scale=1.0 / math.sqrt(HEAD_DIM), use_qk_l2norm_in_kernel=True,
+                               cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                               cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64))  # fmt: skip
+        saved = _saved_list(o)
+        return {
+            "o": o.detach(),
+            **dict(zip(cake_plan.STATE_NAMES, saved[9:-1], strict=True)),
+        }
+
+    stages = _record_launches(monkeypatch)
+    got = saved_state()
+    assert _forward_stages(stages) == FWD_SPLIT_A_STAGES, stages
+    monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", ())
+    stages.clear()
+    want = saved_state()
+    assert _forward_stages(stages) == FWD_SPLIT_STAGES, stages
+    assert all(s == 0 for s in got["u"].stride()), got["u"].stride()
+    assert torch.equal(got["w"], want["w"])
+    for name in ("o", "h", "v_new"):
+        a, b = got[name].float(), want[name].float()
+        assert bool(torch.isfinite(a).all()), name
+        rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
+        assert rel <= 1e-2, (name, rel)
 
 
 # --------------------------------------------------------------------------- M-share: the backward on the forward's maps
@@ -5676,7 +5749,7 @@ def test_m_share_matches_the_fp64_recurrence(case, device, monkeypatch) -> None:
     )
     stages = _record_launches(monkeypatch)
     got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
-    assert _forward_stages(stages) == FWD_SPLIT_STAGES, stages
+    assert _forward_stages(stages) == _split_stages(), stages
     walk = _adjoint_walk(stages)
     assert walk == [
         "dhu_tc2_dvl32_modes",
