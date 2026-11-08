@@ -155,6 +155,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
     int group = tid >> 4;
     int col = (tid & 15) * 8;
     int nblocks = (rows + 15) / 16;
+    int padded_block = ((rows % 16 != 0) ? nblocks - 1 : -1);
     int bound = 0;
     if (nblocks <= num_bids) {
         bound = nblocks;
@@ -397,7 +398,9 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
             float _sqrt_11;
             asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_11) : "f"(total_0 * 0.0078125f + eps));
             float rstd_0 = __frcp_rn(_sqrt_11);
-            float live_0 = ((row_0 < rows) ? 1.0f : 0.0f);
+            unsigned int keep_0 = 4294967295u;
+            unsigned int sign_0 = 2147483648u;
+            keep_0 = ((row_0 < rows) ? keep_0 : sign_0);
             float dot_0 = 0.0f;
             int fast_0 = 0;
             float _neg_12;
@@ -533,7 +536,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
             }
             if (fast_0 != 0) {
                 float2 rstd2_0 = make_float2(rstd_0, rstd_0);
-                float2 live2_0 = make_float2(live_0, live_0);
                 float2 z2_0 = make_float2(zs_0[0], zs_0[1]);
                 float ta_0;
                 asm("fma.rn.sat.f32 %0, %1, %2, %3;" : "=f"(ta_0) : "f"(zs_0[0]), "f"(-0.00572498f), "f"(0.5f));
@@ -574,7 +576,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_0) : "l"(*(const unsigned long long*)&g2_0), "l"(*(const unsigned long long*)&gate2_0));
                 float2 dn2_0;
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_0) : "l"(*(const unsigned long long*)&a2_0), "l"(*(const unsigned long long*)&w2_0));
-                float2 acc2_0 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_0, live2_0), n2_0, make_float2(acc[0], acc[1]));
+                float2 acc2_0 = make_float2(acc[0], acc[1]);
+                acc2_0 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_0.x) & keep_0), __uint_as_float(__as_u32(a2_0.y) & keep_0)), make_float2(__uint_as_float(__as_u32(n2_0.x) & keep_0), __uint_as_float(__as_u32(n2_0.y) & keep_0)), acc2_0);
                 acc[0] = acc2_0.x;
                 acc[1] = acc2_0.y;
                 zs_0[0] = dz2_0.x;
@@ -621,7 +624,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_1) : "l"(*(const unsigned long long*)&g2_1), "l"(*(const unsigned long long*)&gate2_1));
                 float2 dn2_1;
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_1) : "l"(*(const unsigned long long*)&a2_1), "l"(*(const unsigned long long*)&w2_1));
-                float2 acc2_1 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_1, live2_0), n2_1, make_float2(acc[2], acc[3]));
+                float2 acc2_1 = make_float2(acc[2], acc[3]);
+                acc2_1 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_1.x) & keep_0), __uint_as_float(__as_u32(a2_1.y) & keep_0)), make_float2(__uint_as_float(__as_u32(n2_1.x) & keep_0), __uint_as_float(__as_u32(n2_1.y) & keep_0)), acc2_1);
                 acc[2] = acc2_1.x;
                 acc[3] = acc2_1.y;
                 zs_0[2] = dz2_1.x;
@@ -668,7 +672,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_2) : "l"(*(const unsigned long long*)&g2_2), "l"(*(const unsigned long long*)&gate2_2));
                 float2 dn2_2;
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_2) : "l"(*(const unsigned long long*)&a2_2), "l"(*(const unsigned long long*)&w2_2));
-                float2 acc2_2 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_2, live2_0), n2_2, make_float2(acc[4], acc[5]));
+                float2 acc2_2 = make_float2(acc[4], acc[5]);
+                acc2_2 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_2.x) & keep_0), __uint_as_float(__as_u32(a2_2.y) & keep_0)), make_float2(__uint_as_float(__as_u32(n2_2.x) & keep_0), __uint_as_float(__as_u32(n2_2.y) & keep_0)), acc2_2);
                 acc[4] = acc2_2.x;
                 acc[5] = acc2_2.y;
                 zs_0[4] = dz2_2.x;
@@ -715,7 +720,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_3) : "l"(*(const unsigned long long*)&g2_3), "l"(*(const unsigned long long*)&gate2_3));
                 float2 dn2_3;
                 asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_3) : "l"(*(const unsigned long long*)&a2_3), "l"(*(const unsigned long long*)&w2_3));
-                float2 acc2_3 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_3, live2_0), n2_3, make_float2(acc[6], acc[7]));
+                float2 acc2_3 = make_float2(acc[6], acc[7]);
+                acc2_3 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_3.x) & keep_0), __uint_as_float(__as_u32(a2_3.y) & keep_0)), make_float2(__uint_as_float(__as_u32(n2_3.x) & keep_0), __uint_as_float(__as_u32(n2_3.y) & keep_0)), acc2_3);
                 acc[6] = acc2_3.x;
                 acc[7] = acc2_3.y;
                 zs_0[6] = dz2_3.x;
@@ -740,7 +746,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_0 = gs_0[0] * (nj_0 * wv[0]) * sig_0 * __fmaf_rn(zs_0[0], 1.0f - sig_0, 1.0f);
                 float dnj_0 = aj_0 * wv[0];
                 dot_0 = __fmaf_rn(dnj_0, xs_0[0], dot_0);
-                acc[0] = __fmaf_rn(aj_0 * live_0, nj_0, acc[0]);
+                acc[0] = __fmaf_rn(__uint_as_float(__as_u32(aj_0) & keep_0), __uint_as_float(__as_u32(nj_0) & keep_0), acc[0]);
                 zs_0[0] = dzj_0;
                 gs_0[0] = dnj_0;
                 float _exp_98 = __nv_expf(zs_0[1] * -1.0f);
@@ -752,7 +758,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_1 = gs_0[1] * (nj_1 * wv[1]) * sig_1 * __fmaf_rn(zs_0[1], 1.0f - sig_1, 1.0f);
                 float dnj_1 = aj_1 * wv[1];
                 dot_0 = __fmaf_rn(dnj_1, xs_0[1], dot_0);
-                acc[1] = __fmaf_rn(aj_1 * live_0, nj_1, acc[1]);
+                acc[1] = __fmaf_rn(__uint_as_float(__as_u32(aj_1) & keep_0), __uint_as_float(__as_u32(nj_1) & keep_0), acc[1]);
                 zs_0[1] = dzj_1;
                 gs_0[1] = dnj_1;
                 float _exp_99 = __nv_expf(zs_0[2] * -1.0f);
@@ -764,7 +770,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_2 = gs_0[2] * (nj_2 * wv[2]) * sig_2 * __fmaf_rn(zs_0[2], 1.0f - sig_2, 1.0f);
                 float dnj_2 = aj_2 * wv[2];
                 dot_0 = __fmaf_rn(dnj_2, xs_0[2], dot_0);
-                acc[2] = __fmaf_rn(aj_2 * live_0, nj_2, acc[2]);
+                acc[2] = __fmaf_rn(__uint_as_float(__as_u32(aj_2) & keep_0), __uint_as_float(__as_u32(nj_2) & keep_0), acc[2]);
                 zs_0[2] = dzj_2;
                 gs_0[2] = dnj_2;
                 float _exp_100 = __nv_expf(zs_0[3] * -1.0f);
@@ -776,7 +782,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_3 = gs_0[3] * (nj_3 * wv[3]) * sig_3 * __fmaf_rn(zs_0[3], 1.0f - sig_3, 1.0f);
                 float dnj_3 = aj_3 * wv[3];
                 dot_0 = __fmaf_rn(dnj_3, xs_0[3], dot_0);
-                acc[3] = __fmaf_rn(aj_3 * live_0, nj_3, acc[3]);
+                acc[3] = __fmaf_rn(__uint_as_float(__as_u32(aj_3) & keep_0), __uint_as_float(__as_u32(nj_3) & keep_0), acc[3]);
                 zs_0[3] = dzj_3;
                 gs_0[3] = dnj_3;
                 float _exp_101 = __nv_expf(zs_0[4] * -1.0f);
@@ -788,7 +794,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_4 = gs_0[4] * (nj_4 * wv[4]) * sig_4 * __fmaf_rn(zs_0[4], 1.0f - sig_4, 1.0f);
                 float dnj_4 = aj_4 * wv[4];
                 dot_0 = __fmaf_rn(dnj_4, xs_0[4], dot_0);
-                acc[4] = __fmaf_rn(aj_4 * live_0, nj_4, acc[4]);
+                acc[4] = __fmaf_rn(__uint_as_float(__as_u32(aj_4) & keep_0), __uint_as_float(__as_u32(nj_4) & keep_0), acc[4]);
                 zs_0[4] = dzj_4;
                 gs_0[4] = dnj_4;
                 float _exp_102 = __nv_expf(zs_0[5] * -1.0f);
@@ -800,7 +806,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_5 = gs_0[5] * (nj_5 * wv[5]) * sig_5 * __fmaf_rn(zs_0[5], 1.0f - sig_5, 1.0f);
                 float dnj_5 = aj_5 * wv[5];
                 dot_0 = __fmaf_rn(dnj_5, xs_0[5], dot_0);
-                acc[5] = __fmaf_rn(aj_5 * live_0, nj_5, acc[5]);
+                acc[5] = __fmaf_rn(__uint_as_float(__as_u32(aj_5) & keep_0), __uint_as_float(__as_u32(nj_5) & keep_0), acc[5]);
                 zs_0[5] = dzj_5;
                 gs_0[5] = dnj_5;
                 float _exp_103 = __nv_expf(zs_0[6] * -1.0f);
@@ -812,7 +818,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_6 = gs_0[6] * (nj_6 * wv[6]) * sig_6 * __fmaf_rn(zs_0[6], 1.0f - sig_6, 1.0f);
                 float dnj_6 = aj_6 * wv[6];
                 dot_0 = __fmaf_rn(dnj_6, xs_0[6], dot_0);
-                acc[6] = __fmaf_rn(aj_6 * live_0, nj_6, acc[6]);
+                acc[6] = __fmaf_rn(__uint_as_float(__as_u32(aj_6) & keep_0), __uint_as_float(__as_u32(nj_6) & keep_0), acc[6]);
                 zs_0[6] = dzj_6;
                 gs_0[6] = dnj_6;
                 float _exp_104 = __nv_expf(zs_0[7] * -1.0f);
@@ -824,7 +830,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float dzj_7 = gs_0[7] * (nj_7 * wv[7]) * sig_7 * __fmaf_rn(zs_0[7], 1.0f - sig_7, 1.0f);
                 float dnj_7 = aj_7 * wv[7];
                 dot_0 = __fmaf_rn(dnj_7, xs_0[7], dot_0);
-                acc[7] = __fmaf_rn(aj_7 * live_0, nj_7, acc[7]);
+                acc[7] = __fmaf_rn(__uint_as_float(__as_u32(aj_7) & keep_0), __uint_as_float(__as_u32(nj_7) & keep_0), acc[7]);
                 zs_0[7] = dzj_7;
                 gs_0[7] = dnj_7;
             }
@@ -1148,7 +1154,9 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 float _sqrt_119;
                 asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_119) : "f"(total_1 * 0.0078125f + eps));
                 float rstd_1 = __frcp_rn(_sqrt_119);
-                float live_1 = ((row_1 < rows) ? 1.0f : 0.0f);
+                unsigned int keep_1 = 4294967295u;
+                unsigned int sign_1 = 2147483648u;
+                keep_1 = ((row_1 < rows) ? keep_1 : sign_1);
                 float dot_1 = 0.0f;
                 int fast_1 = 0;
                 float _neg_120;
@@ -1284,7 +1292,6 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                 }
                 if (fast_1 != 0) {
                     float2 rstd2_1 = make_float2(rstd_1, rstd_1);
-                    float2 live2_1 = make_float2(live_1, live_1);
                     float2 z2_4 = make_float2(zs_1[0], zs_1[1]);
                     float ta_4;
                     asm("fma.rn.sat.f32 %0, %1, %2, %3;" : "=f"(ta_4) : "f"(zs_1[0]), "f"(-0.00572498f), "f"(0.5f));
@@ -1325,7 +1332,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_4) : "l"(*(const unsigned long long*)&g2_4), "l"(*(const unsigned long long*)&gate2_4));
                     float2 dn2_4;
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_4) : "l"(*(const unsigned long long*)&a2_4), "l"(*(const unsigned long long*)&w2_4));
-                    float2 acc2_4 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_4, live2_1), n2_4, make_float2(acc[0], acc[1]));
+                    float2 acc2_4 = make_float2(acc[0], acc[1]);
+                    acc2_4 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_4.x) & keep_1), __uint_as_float(__as_u32(a2_4.y) & keep_1)), make_float2(__uint_as_float(__as_u32(n2_4.x) & keep_1), __uint_as_float(__as_u32(n2_4.y) & keep_1)), acc2_4);
                     acc[0] = acc2_4.x;
                     acc[1] = acc2_4.y;
                     zs_1[0] = dz2_4.x;
@@ -1372,7 +1380,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_5) : "l"(*(const unsigned long long*)&g2_5), "l"(*(const unsigned long long*)&gate2_5));
                     float2 dn2_5;
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_5) : "l"(*(const unsigned long long*)&a2_5), "l"(*(const unsigned long long*)&w2_5));
-                    float2 acc2_5 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_5, live2_1), n2_5, make_float2(acc[2], acc[3]));
+                    float2 acc2_5 = make_float2(acc[2], acc[3]);
+                    acc2_5 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_5.x) & keep_1), __uint_as_float(__as_u32(a2_5.y) & keep_1)), make_float2(__uint_as_float(__as_u32(n2_5.x) & keep_1), __uint_as_float(__as_u32(n2_5.y) & keep_1)), acc2_5);
                     acc[2] = acc2_5.x;
                     acc[3] = acc2_5.y;
                     zs_1[2] = dz2_5.x;
@@ -1419,7 +1428,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_6) : "l"(*(const unsigned long long*)&g2_6), "l"(*(const unsigned long long*)&gate2_6));
                     float2 dn2_6;
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_6) : "l"(*(const unsigned long long*)&a2_6), "l"(*(const unsigned long long*)&w2_6));
-                    float2 acc2_6 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_6, live2_1), n2_6, make_float2(acc[4], acc[5]));
+                    float2 acc2_6 = make_float2(acc[4], acc[5]);
+                    acc2_6 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_6.x) & keep_1), __uint_as_float(__as_u32(a2_6.y) & keep_1)), make_float2(__uint_as_float(__as_u32(n2_6.x) & keep_1), __uint_as_float(__as_u32(n2_6.y) & keep_1)), acc2_6);
                     acc[4] = acc2_6.x;
                     acc[5] = acc2_6.y;
                     zs_1[4] = dz2_6.x;
@@ -1466,7 +1476,8 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&a2_7) : "l"(*(const unsigned long long*)&g2_7), "l"(*(const unsigned long long*)&gate2_7));
                     float2 dn2_7;
                     asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&dn2_7) : "l"(*(const unsigned long long*)&a2_7), "l"(*(const unsigned long long*)&w2_7));
-                    float2 acc2_7 = fma_f32x2_rn_noftz(mul_f32x2_noftz(a2_7, live2_1), n2_7, make_float2(acc[6], acc[7]));
+                    float2 acc2_7 = make_float2(acc[6], acc[7]);
+                    acc2_7 = fma_f32x2_rn_noftz(make_float2(__uint_as_float(__as_u32(a2_7.x) & keep_1), __uint_as_float(__as_u32(a2_7.y) & keep_1)), make_float2(__uint_as_float(__as_u32(n2_7.x) & keep_1), __uint_as_float(__as_u32(n2_7.y) & keep_1)), acc2_7);
                     acc[6] = acc2_7.x;
                     acc[7] = acc2_7.y;
                     zs_1[6] = dz2_7.x;
@@ -1491,7 +1502,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_8 = gs_1[0] * (nj_8 * wclaim[0]) * sig_8 * __fmaf_rn(zs_1[0], 1.0f - sig_8, 1.0f);
                     float dnj_8 = aj_8 * wclaim[0];
                     dot_1 = __fmaf_rn(dnj_8, xs_1[0], dot_1);
-                    acc[0] = __fmaf_rn(aj_8 * live_1, nj_8, acc[0]);
+                    acc[0] = __fmaf_rn(__uint_as_float(__as_u32(aj_8) & keep_1), __uint_as_float(__as_u32(nj_8) & keep_1), acc[0]);
                     zs_1[0] = dzj_8;
                     gs_1[0] = dnj_8;
                     float _exp_206 = __nv_expf(zs_1[1] * -1.0f);
@@ -1503,7 +1514,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_9 = gs_1[1] * (nj_9 * wclaim[1]) * sig_9 * __fmaf_rn(zs_1[1], 1.0f - sig_9, 1.0f);
                     float dnj_9 = aj_9 * wclaim[1];
                     dot_1 = __fmaf_rn(dnj_9, xs_1[1], dot_1);
-                    acc[1] = __fmaf_rn(aj_9 * live_1, nj_9, acc[1]);
+                    acc[1] = __fmaf_rn(__uint_as_float(__as_u32(aj_9) & keep_1), __uint_as_float(__as_u32(nj_9) & keep_1), acc[1]);
                     zs_1[1] = dzj_9;
                     gs_1[1] = dnj_9;
                     float _exp_207 = __nv_expf(zs_1[2] * -1.0f);
@@ -1515,7 +1526,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_10 = gs_1[2] * (nj_10 * wclaim[2]) * sig_10 * __fmaf_rn(zs_1[2], 1.0f - sig_10, 1.0f);
                     float dnj_10 = aj_10 * wclaim[2];
                     dot_1 = __fmaf_rn(dnj_10, xs_1[2], dot_1);
-                    acc[2] = __fmaf_rn(aj_10 * live_1, nj_10, acc[2]);
+                    acc[2] = __fmaf_rn(__uint_as_float(__as_u32(aj_10) & keep_1), __uint_as_float(__as_u32(nj_10) & keep_1), acc[2]);
                     zs_1[2] = dzj_10;
                     gs_1[2] = dnj_10;
                     float _exp_208 = __nv_expf(zs_1[3] * -1.0f);
@@ -1527,7 +1538,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_11 = gs_1[3] * (nj_11 * wclaim[3]) * sig_11 * __fmaf_rn(zs_1[3], 1.0f - sig_11, 1.0f);
                     float dnj_11 = aj_11 * wclaim[3];
                     dot_1 = __fmaf_rn(dnj_11, xs_1[3], dot_1);
-                    acc[3] = __fmaf_rn(aj_11 * live_1, nj_11, acc[3]);
+                    acc[3] = __fmaf_rn(__uint_as_float(__as_u32(aj_11) & keep_1), __uint_as_float(__as_u32(nj_11) & keep_1), acc[3]);
                     zs_1[3] = dzj_11;
                     gs_1[3] = dnj_11;
                     float _exp_209 = __nv_expf(zs_1[4] * -1.0f);
@@ -1539,7 +1550,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_12 = gs_1[4] * (nj_12 * wclaim[4]) * sig_12 * __fmaf_rn(zs_1[4], 1.0f - sig_12, 1.0f);
                     float dnj_12 = aj_12 * wclaim[4];
                     dot_1 = __fmaf_rn(dnj_12, xs_1[4], dot_1);
-                    acc[4] = __fmaf_rn(aj_12 * live_1, nj_12, acc[4]);
+                    acc[4] = __fmaf_rn(__uint_as_float(__as_u32(aj_12) & keep_1), __uint_as_float(__as_u32(nj_12) & keep_1), acc[4]);
                     zs_1[4] = dzj_12;
                     gs_1[4] = dnj_12;
                     float _exp_210 = __nv_expf(zs_1[5] * -1.0f);
@@ -1551,7 +1562,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_13 = gs_1[5] * (nj_13 * wclaim[5]) * sig_13 * __fmaf_rn(zs_1[5], 1.0f - sig_13, 1.0f);
                     float dnj_13 = aj_13 * wclaim[5];
                     dot_1 = __fmaf_rn(dnj_13, xs_1[5], dot_1);
-                    acc[5] = __fmaf_rn(aj_13 * live_1, nj_13, acc[5]);
+                    acc[5] = __fmaf_rn(__uint_as_float(__as_u32(aj_13) & keep_1), __uint_as_float(__as_u32(nj_13) & keep_1), acc[5]);
                     zs_1[5] = dzj_13;
                     gs_1[5] = dnj_13;
                     float _exp_211 = __nv_expf(zs_1[6] * -1.0f);
@@ -1563,7 +1574,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_14 = gs_1[6] * (nj_14 * wclaim[6]) * sig_14 * __fmaf_rn(zs_1[6], 1.0f - sig_14, 1.0f);
                     float dnj_14 = aj_14 * wclaim[6];
                     dot_1 = __fmaf_rn(dnj_14, xs_1[6], dot_1);
-                    acc[6] = __fmaf_rn(aj_14 * live_1, nj_14, acc[6]);
+                    acc[6] = __fmaf_rn(__uint_as_float(__as_u32(aj_14) & keep_1), __uint_as_float(__as_u32(nj_14) & keep_1), acc[6]);
                     zs_1[6] = dzj_14;
                     gs_1[6] = dnj_14;
                     float _exp_212 = __nv_expf(zs_1[7] * -1.0f);
@@ -1575,7 +1586,7 @@ kernel_cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45(__nv_bfloat16* __restri
                     float dzj_15 = gs_1[7] * (nj_15 * wclaim[7]) * sig_15 * __fmaf_rn(zs_1[7], 1.0f - sig_15, 1.0f);
                     float dnj_15 = aj_15 * wclaim[7];
                     dot_1 = __fmaf_rn(dnj_15, xs_1[7], dot_1);
-                    acc[7] = __fmaf_rn(aj_15 * live_1, nj_15, acc[7]);
+                    acc[7] = __fmaf_rn(__uint_as_float(__as_u32(aj_15) & keep_1), __uint_as_float(__as_u32(nj_15) & keep_1), acc[7]);
                     zs_1[7] = dzj_15;
                     gs_1[7] = dnj_15;
                 }

@@ -92,12 +92,6 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
 
 
 
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
 
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
@@ -223,7 +217,10 @@ kernel_cake_rmsnorm_silu_gate_train_348a297be36a61e8f015(__nv_bfloat16* __restri
     if (weight_grad != 0) {
         if (warp == 0) {
             if (elect_sync()) {
-                mbarrier_arrive_expect_tx(recv_full_addr, nblocks * 32);
+                asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
+                asm volatile(
+                    "mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 _, [%0], %1;"
+                    :: "r"(recv_full_addr), "r"((uint32_t)(nblocks * 32)) : "memory");
             }
         }
     }
