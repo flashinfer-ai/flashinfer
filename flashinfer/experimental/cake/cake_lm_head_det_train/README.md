@@ -481,11 +481,17 @@ keyword.
   15-35 % of the step.  A two-chunk call holds the FP32 `[V, H]`
   accumulator beside a small `B` (measured 1.67-1.71 `B` at `T = 8117`)
   and runs a budget form.  Below
-  the threshold the budget forms run slower: the measured steps of the issue's
-  shapes (`T = 16384`, a third of the labels ignored, `C = 4096`) went from
-  6.971 to 5.020 GiB at `H = 6144` and from 5.041 to 3.888 GiB at
-  `H = 4096`, 1-3 % slower; a short call that recomputes most of the
-  vocabulary costs more.  The margin above was measured for the `"budget"`
+  the threshold the cost depends on the form the call gets (B200, step
+  medians of the default and `"fast"` calls in one process, `C = 4096`):
+  at the issue's shapes (`T = 16384`, a third of the labels ignored) the
+  step peak went from 6.971 to 5.020 GiB at `H = 6144` (`"partial"`, 42.5
+  against 40.3 ms, about 5 % slower) and from 5.041 to 3.838 GiB at
+  `H = 4096` (`"fused_ip"`, 27.3 against 27.2 ms, within the noise); with
+  5 % of the labels ignored, at `H = 6144`, from 7.081 to 5.430 GiB
+  (`"fused_ip"`, 57.0 against 56.9 ms, within the noise; a checkpointed step
+  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial"`)
+  from 6.811 to 4.005 GiB, 33.5 against 28.9 ms (about 15 % slower); a
+  short call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
   chunk's buffers before the count is known.  A call that misses the binding
