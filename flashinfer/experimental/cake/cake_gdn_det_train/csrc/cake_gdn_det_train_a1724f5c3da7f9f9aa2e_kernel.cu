@@ -240,7 +240,7 @@ kernel_cake_gdn_det_train_a1724f5c3da7f9f9aa2e(const __grid_constant__ CUtensorM
                 }
                 if (row < n_valid_r) {
                     long long rstd_index = (long long)(tok0_r + row) * (long long)num_heads + (long long)hq_r;
-                    long long base = rstd_index * 128 + (long long)(lane_r * 4);
+                    long long base = rstd_index * 128ll + (long long)(lane_r * 4);
                     reinterpret_cast<int2*>(qn + (base))[0] = reinterpret_cast<int2*>(_packed_0)[0];
                     reinterpret_cast<int2*>(kn + (base))[0] = reinterpret_cast<int2*>(_packed_1)[0];
                     if (lane_r == 0) {

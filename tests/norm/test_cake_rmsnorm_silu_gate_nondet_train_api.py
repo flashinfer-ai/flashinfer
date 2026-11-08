@@ -48,11 +48,12 @@ This module checks:
   of a call with rows), and on the backend suite's accuracy matrix
   and paths (accumulation, ``compute_grad_weight=False``, a reset workspace
   with nonzero scratch reused across shapes, two streams, a side stream, CUDA
-  Graph replays, autograd and non-reentrant checkpointing) its ``y``, ``dx``
-  and ``dz`` are the deterministic package's bits and its ``dw`` lies within
-  the weight-gradient budget of the deterministic ``dw``, on every repeat; so
-  are they for one-head inputs of several layouts past the start of each
-  module that warms packed rows in L2, which launch with the packed-rows test
+  Graph replays, autograd and non-reentrant checkpointing) its ``y`` lies
+  within one BF16 ulp of FP64, its ``dx`` and ``dz`` are the deterministic
+  package's bits and its ``dw`` lies within the weight-gradient budget of the
+  deterministic ``dw``, on every repeat; so are they for one-head inputs of
+  several layouts past the start of each module that warms packed rows in L2,
+  which launch with the packed-rows test
   passing exactly when their rows follow one another; and for weight
   gradients in the subnormal range (identical rows whose FP32 terms
   underflow) on the short, the mid and the long backward: ``dx`` and ``dz``
@@ -145,6 +146,36 @@ def det_forward(x, z, w, eps, **kwargs):
         return deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward(
             x, z, w, eps, **kwargs
         )
+
+
+def assert_y_within_fp64(y, x, z, w, eps, *, what):
+    """``y`` NaN where the FP64 forward is NaN, its infinity where it is
+    infinite and elsewhere within one BF16 ulp of it plus a floor of 1/64 ulp of
+    its row's largest finite ungated magnitude ``|x * rstd * w|``, times the
+    gate's magnitude where that exceeds one.  The deterministic package's
+    forward computes its gate and ``rstd`` with approximate instructions, so its
+    ``y`` need not be this package's bits; each package holds its own ``y`` to
+    FP64."""
+    xd, zd, wd = (t.double().reshape(-1, D) for t in (x, z, w))
+    rstd = 1.0 / torch.sqrt(xd.square().mean(dim=-1, keepdim=True) + eps)
+    ungated = xd * rstd * wd
+    scale = torch.where(ungated.isfinite(), ungated.abs(), 0.0).amax(
+        dim=-1, keepdim=True
+    )
+    silu = zd * torch.sigmoid(zd)
+    want = ungated * silu
+    got = y.detach().double().reshape(-1, D)
+    assert torch.equal(got.isnan(), want.isnan()), f"{what}: NaN elements"
+    inf = want.isinf()
+    assert torch.equal(got.isinf(), inf), f"{what}: infinite elements"
+    assert torch.equal(got[inf], want[inf]), f"{what}: infinite elements"
+    floor = scale * silu.abs().clamp_min(1.0) * suite.BF16_RTOL / 64
+    err = (got - want).abs()
+    bad = want.isfinite() & ~(err <= want.abs() * suite.BF16_RTOL + floor)
+    assert not bad.any(), (
+        f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond one BF16 ulp "
+        f"of FP64; worst err {err[bad].max().item():.3e}"
+    )
 
 
 def _supported() -> bool:
@@ -695,7 +726,7 @@ def test_nondet_entry_points_run_this_package(
     assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
-    assert torch.equal(y, det_forward(x, z, w, EPS))
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
     dx_d, dz_d, dw_d = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward(
         dy, x, z, w, EPS
     )
@@ -833,12 +864,13 @@ MATRIX = [
 def test_nondeterministic_matches_the_deterministic_package(
     shape, make_kwargs, eps, dw_dtype, determinism_setting
 ) -> None:
-    """``y`` and, on every one of ``suite.REPEATS`` backward launches, ``dx``
-    and ``dz`` are the deterministic package's bits; ``dw`` lies within the
-    weight-gradient budget of the deterministic ``dw``."""
+    """``y`` lies within one BF16 ulp of FP64; on every one of
+    ``suite.REPEATS`` backward launches, ``dx`` and ``dz`` are the
+    deterministic package's bits and ``dw`` lies within the weight-gradient
+    budget of the deterministic ``dw``."""
     x, z, w, dy = suite.make(*shape, **make_kwargs)
     y = nd_forward(x, z, w, eps)
-    assert torch.equal(y, det_forward(x, z, w, eps)), "y vs the deterministic package"
+    assert_y_within_fp64(y, x, z, w, eps, what="y")
     mag = suite.magnitudes(dy, x, z, eps)
 
     def out():
@@ -999,7 +1031,6 @@ def test_two_streams_match_the_deterministic_package(determinism_setting) -> Non
 @requires_device
 def test_side_stream_matches_the_deterministic_package(determinism_setting) -> None:
     x, z, w, dy = suite.make(2049, 48, seed=9)
-    want_y = det_forward(x, z, w, EPS)
     dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS)
     ws = nd_workspace(x.shape[0] * x.shape[1], x.device)
     stream = torch.cuda.Stream()
@@ -1010,7 +1041,7 @@ def test_side_stream_matches_the_deterministic_package(determinism_setting) -> N
         fresh = nd_backward(dy, x, z, w, EPS)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    assert torch.equal(y, want_y)
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
     for dx, dz, _ in (got, fresh):
         assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
 
@@ -1049,7 +1080,7 @@ def test_cuda_graph_replay_matches_the_deterministic_package(
         dys.copy_(dyn)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(y, det_forward(xn, zn, w, EPS)), k
+        assert_y_within_fp64(y, xn, zn, w, EPS, what=f"y, replay {k}")
         dx_d, dz_d, _ = det_backward(dyn, xn, zn, w, EPS)
         assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
 
@@ -1059,12 +1090,11 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     determinism_setting,
 ) -> None:
     x, z, w, dy = suite.make(513, 48, seed=8)
-    y_ref = det_forward(x, z, w, EPS)
     dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS)
     mag = suite.magnitudes(dy, x, z, EPS)
 
     def check(y, xg, zg, wg, what):
-        assert torch.equal(y, y_ref), what
+        assert_y_within_fp64(y, x, z, w, EPS, what=f"{what} y")
         assert torch.equal(xg, dx_d) and torch.equal(zg, dz_d), what
         assert wg.dtype == torch.bfloat16, what
         suite.assert_dw_within(
@@ -1159,7 +1189,7 @@ LONG_FORWARD_CASES = [
 def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``y`` is the deterministic package's bits on both sides of the mid and
+    """``y`` lies within one BF16 ulp of FP64 on both sides of the mid and
     the long forward's thresholds and past them, and the forward launches
     ``module_for_rows``' module: where the architecture routes them, the short
     forward up to ``SHORT_FORWARD_ROWS_PER_SM * SMs`` rows, the long forward
@@ -1198,7 +1228,7 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     elif "fwd_mid" in routes and rows >= mid_start * sms:
         want = routes["fwd_mid"]
     assert name == want, (arch, rows, sms)
-    assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # Gate inputs at and past the edges of the packed gate's range: below -41,
@@ -1259,8 +1289,8 @@ def test_forward_gate_edges_match_the_deterministic_package(
     """With gate inputs at and past the packed gate's range in two of every
     three rows (a quarter of their elements, so the range check fails for some
     threads of a row and holds for others) and ordinary ones in the rest,
-    ``y`` is the deterministic package's bits, NaN included, and the forward
-    launches ``module_for_rows``' module."""
+    ``y`` lies within one BF16 ulp of FP64, NaN and infinities included, and
+    the forward launches ``module_for_rows``' module."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     x, z, w, _ = suite.make(tokens, heads, seed=23)
@@ -1276,10 +1306,7 @@ def test_forward_gate_edges_match_the_deterministic_package(
     launched = _spy_launches(monkeypatch)
     y = nd_forward(x, z, w, EPS)
     assert launched == [loader.module_for_rows(arch, "fwd", tokens * heads, sms)]
-    want = det_forward(x, z, w, EPS)
-    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), (
-        "y vs the deterministic package"
-    )
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # The rows per SM from which each architecture runs the long backward.
@@ -1709,7 +1736,8 @@ def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
         return torch.empty(D, dtype=dw_dtype, device=x0.device)
 
     if role == "fwd":
-        y_d = det_forward(x0, z0, w, EPS)
+        y_d = nd_forward(x0, z0, w, EPS)
+        assert_y_within_fp64(y_d, x0, z0, w, EPS, what="flat y")
     else:
         dx_d, dz_d, dw_d = det_backward(dy0, x0, z0, w, EPS, grad_weight=out())
         mag = suite.magnitudes(dy0, x0, z0, EPS)

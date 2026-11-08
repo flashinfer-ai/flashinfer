@@ -39,10 +39,9 @@ Checkpoint hand-off: under ``torch.utils.checkpoint`` (reentrant or not),
 hand its state tapes to the node's backward, which then skips its recurrence
 recompute; the gradients do not change.  ``checkpoint_handoff="auto"`` (the
 default) engages on the verified devices and problem sizes the package README
-lists, ``"on"`` on every call it supports, ``"off"`` never.  The environment
-variable ``CAKE_KDA_CKPT_HANDOFF`` (``off`` / ``on``), read by the backend at
-each :func:`cake_kda_nondet` call, turns every call off or ``"auto"`` into
-``"on"``.  The raw gate mode and the in-kernel Q/K L2 norm never engage it.
+lists, ``"on"`` on every call it supports, ``"off"`` never; the keyword is the
+only switch (the package reads no environment variable).  The raw gate mode and
+the in-kernel Q/K L2 norm never engage it.
 
 Thin entry points.  The contract, the host plan, the workspace,
 the launch sequences, the autograd Function and the generated kernels live in
@@ -319,7 +318,7 @@ def cake_kda_nondet(
     ``k`` in, their gradients out) and :func:`cake_kda_nondet_train_backward` for the gradients.  The node's
     backward is this package's.  ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``; another value raises
     ``ValueError``) is the checkpoint hand-off under ``torch.utils.checkpoint`` (the module docstring; the raw gate
-    mode and the in-kernel Q/K L2 norm never engage it), overridden by ``CAKE_KDA_CKPT_HANDOFF``.
+    mode and the in-kernel Q/K L2 norm never engage it).
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 

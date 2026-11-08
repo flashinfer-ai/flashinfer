@@ -167,8 +167,7 @@ CASES = (
 # the route-specific code, which is the tap / bias load form and the store
 # form): the two new multi-sub-tile geometries, a whole-row tile, the
 # S = 5 row below one stage and a narrow single-tile row (C = 640: three
-# 32-vector tiles on the ``bwd`` / ``bwd_bias`` / ``fwd`` / ``fwd_bias``
-# routes, one 80-vector tile on the others).
+# 32-vector tiles on every route).
 ROUTE_CASES = (
     (1000, 512, "perf"),
     (4097, 1280, (1000, 0, 3, 3094)),
@@ -178,8 +177,15 @@ ROUTE_CASES = (
 )
 LARGE_CASE = (262401, 8192, "perf")
 LARGE_CASE_FREE_BYTES = 40 * 2**30
-# S 250340 x C 512 and 1280 (CONTRACT §4): the perf-size rows of the fp32 gate.
-PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
+# S 250340 x C 512 and 1280 (CONTRACT §4): the perf-size rows of the fp32 gate,
+# plus C 640 and 1016, whose fp32g backward runs the narrow 32-vector tiles
+# (three and four tiles, the last one partial).
+PRECISION_CASES = (
+    (250340, 512, "perf"),
+    (250340, 1280, "perf"),
+    (250340, 640, "perf"),
+    (250340, 1016, "perf"),
+)
 GRAPH_CASES = (
     (65, 256, (64, 1)),
     (5, 136, (2, 0, 3)),
@@ -231,12 +237,14 @@ NARROW_SPLIT_TABLE = {
         640: (32, 4, 3),
         648: (32, 4, 3),
         768: (32, 4, 3),
+        776: (32, 4, 4),
+        1016: (32, 4, 4),
     },
     "fwd": {576: (32, 4, 3), 640: (32, 4, 3), 768: (32, 4, 3)},
 }
 # Single-tile rows outside each role's narrow set (one tile on every route).
 ONE_TILE_ROWS = {
-    "bwd": (160, 192, 256, 512, 776, 1016, 1024),
+    "bwd": (160, 192, 256, 512, 1024),
     "fwd": (224, 520, 568, 776, 832),
 }
 # Rows whose plan, launch and gradients the narrow-tile tests check per route.
@@ -785,8 +793,8 @@ def test_channel_split_narrow_tiles_per_route() -> None:
 
     geometry = {"threads": 128, "vec": 8}
     assert loader.NARROW_TILE_ROUTES == {
-        "fwd": ("fwd", "fwd_bias"),
-        "bwd": ("bwd", "bwd_bias"),
+        "fwd": ("fwd", "fwd_dt", "fwd_bias"),
+        "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
     }
     for kind in loader.KINDS:
         role = loader.route_role(kind)
@@ -813,7 +821,7 @@ def test_channel_split_narrow_tiles_per_route() -> None:
             base = loader.channel_split(C, geometry=geometry, role=role)
             got = loader.channel_split(C, geometry=geometry, role=role, route=kind)
             if role == "bwd":
-                in_set = 64 < cv <= 96 or cv == 28
+                in_set = 64 < cv < 128 or cv == 28
             else:
                 in_set = 72 <= cv <= 96
             assert got == ((32, 4, -(-cv // 32)) if narrow and in_set else base), (
@@ -954,7 +962,7 @@ def test_main_grid_literal_table() -> None:
         loader.main_grid(304, arch="sm_103a", grid_mult=0)
 
 
-# The default backward route's program per ``(arch, S, C)`` below C = 512
+# The default backward route's program per ``(arch, S, C)`` up to C = 1024
 # (``cake_jit.selected_modules``): the ``stage_pair`` fallback of each arch,
 # except for 264 <= C < 512, where its ``straddle_rows`` build (the row-group
 # program) runs, and on sm_107a for 256 <= C < 264 from S = 262144 tokens,
@@ -966,6 +974,11 @@ def test_main_grid_literal_table() -> None:
 # 264 <= C < 296 and 344 <= C < 416 from S = 32768.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
+# From C = 512: sm_100a runs the eight-token-stage program, sm_103a the
+# fold-overlap program below 768 and the eight-token-stage program from 768,
+# sm_107a the fold-overlap program below 520, its fallback's build under the
+# 520 channel band's own name for 520 <= C < 1024, and the eight-token-stage
+# program from 1024.
 BWD_FALLBACK = {
     "sm_100a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
     "sm_103a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
@@ -990,6 +1003,10 @@ BWD_AT_512 = {
     "sm_103a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
     "sm_107a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
 }
+BWD_STAGE8 = "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b"
+# arch -> the channel count from which the eight-token-stage program runs.
+BWD_STAGE8_FROM = {"sm_100a": 512, "sm_103a": 768, "sm_107a": 1024}
+BWD_C520_R200 = "cake_causal_conv1d_det_train_0d99ef0e0ed10b11dfd5"
 BWD_SELECTION_TOKENS = (
     12287,
     12288,
@@ -1007,6 +1024,7 @@ BWD_SELECTION_TOKENS = (
 BWD_SELECTION_CHANNELS = (
     *(128, 248, 255, 256, 264, 272, 280, 288, 296, 336, 344, 384, 408, 416),
     *(432, 440, 464, 472, 480, 504, 511, 512),
+    *(516, 519, 520, 640, 760, 767, 768, 1016, 1023, 1024),
 )
 
 
@@ -1016,6 +1034,10 @@ def _sm_cta_band(arch: str, C: int) -> bool:
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
+    if BWD_STAGE8_FROM[arch] <= C:
+        return BWD_STAGE8
+    if arch == "sm_107a" and C >= 520:
+        return BWD_C520_R200
     if C >= 512:
         return BWD_AT_512[arch]
     if _sm_cta_band(arch, C):
@@ -1032,10 +1054,12 @@ def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
 
 
 def test_backward_selection_literal_table() -> None:
-    """The default backward route's program below C = 512 against the literal
+    """The default backward route's program up to C = 1024 against the literal
     table, per arch, S and C; a token floor needs S (``ValueError`` without
     it, on sm_107a for 256 <= C < 264 and on the SM-wide row-group program's
-    channel bands), and no other route has one."""
+    channel bands), and no other route has one.  The sm_107a 520 band's
+    record is the fallback's build under its own name: the same knobs plus
+    ``c_band``, the same launch, grid, workspace, arguments and reduce."""
 
     rule = loader.select_rule(loader.MODULES[BWD_R200_ST4])
     assert rule == {
@@ -1061,6 +1085,23 @@ def test_backward_selection_literal_table() -> None:
         "kind": "channels_at_least",
     }
     assert loader.MODULES[BWD_ROW_GROUP_R200]["arches"] == ["sm_107a"]
+    band, fallback = (
+        loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"])
+    )
+    assert loader.select_rule(band) == {
+        "channels": {"sm_107a": 520},
+        "kind": "channels_at_least",
+    }
+    assert band["arches"] == fallback["arches"] == ["sm_107a"]
+    for key in (
+        "launch",
+        "grid_rule",
+        "workspace_rule",
+        "arg_plan",
+        "logical",
+        "reduce",
+    ):
+        assert band[key] == fallback[key], key
     for arch in loader.ARCHES:
         for S in BWD_SELECTION_TOKENS:
             for C in BWD_SELECTION_CHANNELS:
@@ -1079,7 +1120,12 @@ def test_backward_selection_literal_table() -> None:
             for name in loader.route_modules(arch, kind):
                 rule = loader.select_rule(loader.MODULES[name])
                 channels_only = rule is None or rule["kind"] == "channels_at_least"
-                assert channels_only, (arch, kind, name)
+                # Besides ``bwd``, only the sm_107a forward routes' two-stage programs carry a token floor.
+                assert channels_only or (
+                    arch == "sm_107a"
+                    and loader.route_role(kind) == "fwd"
+                    and rule["tokens"] == {"sm_107a": 65536}
+                ), (arch, kind, name)
 
 
 def test_backward_launches_the_whole_rank_grid(monkeypatch) -> None:
@@ -1373,8 +1419,9 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
 @pytest.mark.parametrize("kind", ("fwd", "fwd_dt", "fwd_bias"))
 def test_forward_programs_switch_on_channel_count(kind) -> None:
     """Exactly one forward program of the route runs per call, every program of the route runs for some channel
-    count, and on both sides of each channel threshold ``y`` matches the reference and equals, bit for bit, the
-    route's fallback program launched on its own (every forward program rounds ``y`` as the static one does)."""
+    count, and on both sides of each channel threshold (at a floored program's token floor as well) ``y`` matches
+    the reference and equals, bit for bit, the route's fallback program launched on its own (every forward program
+    rounds ``y`` as the static one does)."""
 
     _require_route(kind)
     arch = _arch()
@@ -1388,50 +1435,59 @@ def test_forward_programs_switch_on_channel_count(kind) -> None:
     record = loader.MODULES[fallback]
     device = _device()
     channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    rows = [
+        (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
+    ]
+    # A program with a token floor runs from it: both sides of its channel threshold at the floor.
+    rows += [
+        (floor, "perf", C)
+        for floored, floor in _token_floors(arch, kind).values()
+        for T in floored
+        for C in (T - 8, T, T + 8)
+    ]
     launched = set()
-    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
-        for C in channels:
-            selected = loader.selected_modules(arch, kind, C=C, S=S)
-            assert len(selected) == 1, f"S={S} C={C}: {selected}"
-            launched.add(selected[0])
-            x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
-            label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
-            y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-            _assert_within(
-                y,
-                reference_forward(x, w, cu, b),
-                atol=Y_ATOL,
-                rtol=Y_RTOL,
-                label=f"y {label}",
-            )
-            scalars = loader.plan(
-                S,
-                C,
-                int(cu.numel()) - 1,
-                geometry=record["grid_rule"]["geometry"],
-                role=record["role"],
-            )
-            y_fallback = torch.full_like(y, float("nan"))
-            values = {
-                "x": x,
-                "w": w,
-                "cu": cu,
-                "y": y_fallback,
-                "work": torch.zeros(
-                    loader.counter_words(record, scalars["n_ch_tiles"]),
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
-                "flags": pkg._flags(w, b=b),
-            }
-            if b is not None:
-                values["b"] = b
-            loader.run_module(fallback, values, device_index=device.index)
-            torch.cuda.synchronize(device)
-            assert torch.equal(y, y_fallback), (
-                f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
-            )
+    for S, docs, C in rows:
+        selected = loader.selected_modules(arch, kind, C=C, S=S)
+        assert len(selected) == 1, f"S={S} C={C}: {selected}"
+        launched.add(selected[0])
+        x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
+        label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
+        y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+        _assert_within(
+            y,
+            reference_forward(x, w, cu, b),
+            atol=Y_ATOL,
+            rtol=Y_RTOL,
+            label=f"y {label}",
+        )
+        scalars = loader.plan(
+            S,
+            C,
+            int(cu.numel()) - 1,
+            geometry=record["grid_rule"]["geometry"],
+            role=record["role"],
+        )
+        y_fallback = torch.full_like(y, float("nan"))
+        values = {
+            "x": x,
+            "w": w,
+            "cu": cu,
+            "y": y_fallback,
+            "work": torch.zeros(
+                loader.counter_words(record, scalars["n_ch_tiles"]),
+                dtype=torch.int32,
+                device=device,
+            ),
+            **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
+            "flags": pkg._flags(w, b=b),
+        }
+        if b is not None:
+            values["b"] = b
+        loader.run_module(fallback, values, device_index=device.index)
+        torch.cuda.synchronize(device)
+        assert torch.equal(y, y_fallback), (
+            f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
+        )
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
@@ -1940,6 +1996,15 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int16) if t.dtype == BF16 else t.view(torch.int32)
 
 
+def _clear_tile_rule_caches() -> None:
+    """Forget every cached value derived from the channel-tile rule."""
+
+    loader._channel_split.cache_clear()
+    loader._channel_choice.cache_clear()
+    loader._workspace_owners_of.cache_clear()
+    pkg._backward_workspace_bytes.cache_clear()
+
+
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
     """On the narrow single-tile rows each route launches its route's plan
@@ -1986,14 +2051,19 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
         for got, first in zip(again, grads, strict=True):
             if first is not None:
                 assert torch.equal(_bits(got), _bits(first)), (kind, S, C)
+        # The one-tile plan is not the shipped rule's: forget every cached value
+        # the rule sizes (the channel split, the per-C program choice and
+        # workspace owners, and the backward workspace bytes the default
+        # workspace takes), so the forced plan gets the workspace the public
+        # bytes function gives its own rule, and the shipped rule's after.
         try:
             with monkeypatch.context() as m:
                 m.setattr(loader, "NARROW_TILE_ROUTES", {"fwd": (), "bwd": ()})
-                loader._channel_split.cache_clear()
+                _clear_tile_rule_caches()
                 y_one = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
                 one = _backward(x, w, cu, dy, b, policy)
         finally:
-            loader._channel_split.cache_clear()
+            _clear_tile_rule_caches()
         assert torch.equal(_bits(y), _bits(y_one)), (kind, S, C, "y")
         assert torch.equal(_bits(grads[0]), _bits(one[0])), (kind, S, C, "dx")
 
@@ -2997,13 +3067,13 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert "flags" in logical, name
         # The selection vocabulary: a forward or backward rule is ``channels_at_least`` with one positive
         # multiple-of-8 threshold (or an increasing list of them) per architecture it names, or
-        # ``channels_tokens_at_least`` (a backward rule) with a positive token floor beside each as well.
+        # ``channels_tokens_at_least`` with a positive token floor beside each as well (backward programs, and
+        # the sm_107a two-stage forward programs).
         rule = loader.select_rule(record)
         if rule is not None:
             assert record["role"] in ("fwd", "bwd"), name
             assert rule["kind"] in loader.SELECT_KINDS, name
             if rule["kind"] == "channels_tokens_at_least":
-                assert record["role"] == "bwd", name
                 assert set(rule) == {"kind", "channels", "tokens"}, name
                 assert set(rule["tokens"]) == set(rule["channels"]), name
                 assert all(tokens > 0 for tokens in rule["tokens"].values()), name
@@ -3053,8 +3123,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
     # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
     # rule names the architecture with its own thresholds (distinct thresholds but for one shared by a
-    # program with a token floor and one without, at most four routed programs without a token floor and at
-    # most two with one), one program selected per channel count and token count -- the highest threshold at
+    # program with a token floor and one without, at most five routed programs without a token floor -- the
+    # sm_107a backward has five since its 520 channel band's copy -- and at most two with one), one program
+    # selected per channel count and token count -- the highest threshold at
     # most C whose token floor (if any) S meets, the floored program first at a shared one, the fallback
     # below the lowest.
     for arch in loader.ARCHES:
@@ -3082,7 +3153,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
                     )
                     owners.setdefault(threshold, {})[floored] = name
             unfloored = {name for name in rules if rules[name] and name not in floors}
-            assert len(unfloored) <= 4, (arch, kind, unfloored)
+            assert len(unfloored) <= 5, (arch, kind, unfloored)
             assert len(floors) <= 2, (arch, kind, floors)
             for S in sorted({1, *(floor for _, floor in floors.values())}):
                 previous = fallbacks[0]

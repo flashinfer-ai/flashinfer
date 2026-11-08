@@ -68,11 +68,13 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | dense GEMM | det | single rank | `cake_dense_gemm_det_train` | `cake_dense_gemm_det_train_projection`, `cake_dense_gemm_det_train_router` | per entry, by rule 3 | `dense_projection_det_gemm`, `router_fp32_det_gemm` |
 | | nondet | single rank | `cake_dense_gemm_nondet_train` | `cake_dense_gemm_nondet_train_projection`, `cake_dense_gemm_nondet_train_router` | per entry, by rule 3 | `experimental.dense_projection_gemm` `cake_backend` |
 | DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | `cake_dsa_indexer_det_train_topk`, `cake_dsa_indexer_det_train_topk_workspace_size` | none (no autograd: top-k selection) | `experimental.cake_dsa_indexer_det` (+ alias `experimental.cake_dsa_indexer`) / `dsa_indexer.dsa_indexer_det_topk(backend="cake")`, `dsa_indexer_det_topk_workspace_size`, aliases `dsa_indexer_topk*` |
-| | nondet | single rank | `cake_dsa_indexer_nondet_train` | | | planned |
+| | nondet | single rank | `cake_dsa_indexer_nondet_train` | `cake_dsa_indexer_nondet_train_topk`, `cake_dsa_indexer_nondet_train_topk_workspace_size` | none (no autograd: top-k selection) | new; no former name |
 | DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | `cake_dsa_sparse_attention_det`, `cake_dsa_sparse_attention_det_varlen`, `cake_dsa_sparse_attention_det_nope`, `cake_dsa_sparse_attention_det_nope_varlen` | `CakeDSASparseAttentionDetFunction` (both rope entries), `CakeDSASparseAttentionDetNopeFunction`, `CakeDSASparseAttentionDetNopeVarlenFunction` | new |
 | | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | `cake_dsa_sparse_attention_nondet`, `cake_dsa_sparse_attention_nondet_varlen`, `cake_dsa_sparse_attention_nondet_nope`, `cake_dsa_sparse_attention_nondet_nope_varlen` | `CakeDSASparseAttentionNondetFunction` (both rope entries), `CakeDSASparseAttentionNondetNopeFunction`, `CakeDSASparseAttentionNondetNopeVarlenFunction` | `experimental.cake_dsa_train` / `dsa_sparse_attention.dsa_sparse_attention{,_varlen,_nope,_nope_varlen}` |
-| GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | planned |
+| GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | new; no former name |
 | | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
+| SwiGLU + MXFP8 quantization | det | single rank | `cake_gated_act_mxfp8_det_train` | `cake_gated_act_mxfp8_det_train_forward`, `cake_gated_act_mxfp8_det_train_backward` | none (no autograd: the forward and the backward are separate quantizing entries) | `gated_act_mxfp8` / `silu_and_mul_mxfp8_quantize`, `silu_and_mul_mxfp8_quantize_backward` |
+| | nondet | single rank | | | | not planned: elementwise, no reduction to reorder |
 
 ### KCP entries: KDA det as the example
 
@@ -92,7 +94,6 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
 - **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
 - **Causal conv1d KCP stays inside the single-rank backend packages.** `cake_causal_conv1d_det_train` and `cake_causal_conv1d_nondet_train` each carry a `kcp` submodule behind the top-level `cake_causal_conv1d_<mode>_train_kcp` facades (rule 1 exception).
-- **Missing versions keep their reserved names:** DSA indexer `nondet`, DSA sparse attention `det` and GQA `det`.
 
 ## Current names
 
@@ -228,6 +229,23 @@ Family rename PRs:
 | DSA indexer | det | #8936 |
 | GQA HD256 | nondet | #8939 |
 | KDA | nondet (single rank and KCP) | KDA family PR |
+| SwiGLU + MXFP8 quantization | det | #9100 |
+
+### SwiGLU + MXFP8 quantization: deterministic package
+
+| Old | New |
+| --- | --- |
+| module `flashinfer.gated_act_mxfp8` | `flashinfer.cake_gated_act_mxfp8_det_train` (stable API, `@flashinfer_api`; backend imported on first use) |
+| package `flashinfer.cake_gated_act_mxfp8_backend` | `flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train` |
+| `silu_and_mul_mxfp8_quantize` | `cake_gated_act_mxfp8_det_train_forward` |
+| `silu_and_mul_mxfp8_quantize_backward` | `cake_gated_act_mxfp8_det_train_backward` |
+| `get_gated_act_mxfp8_module` | `cake_gated_act_mxfp8_det_train_register_custom_ops` |
+| `GatedActMxfp8Outputs` | `CakeGatedActMXFP8DetOutputs` |
+| backend `is_cake_gated_act_mxfp8_supported` | `is_cake_gated_act_mxfp8_det_train_supported` (also on the facade) |
+| backend `check_inputs`, `empty_outputs`, `logical_outputs` | `cake_gated_act_mxfp8_det_train_check_inputs`, `_empty_outputs`, `_logical_outputs` |
+| custom ops `flashinfer::silu_and_mul_mxfp8_quantize`, `flashinfer::silu_and_mul_mxfp8_quantize_backward` | `flashinfer::cake_gated_act_mxfp8_det_train_forward`, `flashinfer::cake_gated_act_mxfp8_det_train_backward` |
+
+The JIT library names (`cake_gated_act_mxfp8_<hash>`) and the kernels are unchanged.
 
 ### GQA HD256: non-deterministic package
 
@@ -244,7 +262,7 @@ Family rename PRs:
 | backend `Workspace` | `CakeGQANondetWorkspace` |
 | backend `DkvAccSource` | `CakeGQANondetDkvAccSource` |
 
-No aliases: the old names fail at import. No entry takes `deterministic=`. Under `torch.use_deterministic_algorithms(True)` the forward (fixed order) runs and the backward raises PyTorch's alert before it launches, because it adds the dQ partials (and row-map dK / dV adds) with atomic FP32 reductions; with `warn_only=True` it warns once per backward call and runs the non-deterministic backward. Nothing falls back to a deterministic implementation; `flashinfer.cake_gqa_det_train` is reserved (planned).
+No aliases: the old names fail at import. No entry takes `deterministic=`. Every sum of the forward and the backward has one fixed order (the backward stores dS^T to a workspace, computes dQ as a GEMM over it and folds row-map destinations in window order; nothing adds with atomics), so every output repeats bit for bit run to run for one shape, `max_seqlen_k` and workspace budget, and nothing raises PyTorch's alert under `torch.use_deterministic_algorithms(True)`. `flashinfer.cake_gqa_det_train` is reserved (planned).
 
 Build identities keep their names: program / library stems `cake_gqa_train_<20 hex>[_<arch>]`, kernel symbols `kernel_cake_gqa_train_<20 hex>`, csrc file names and `cake_jit.LIBRARY_PREFIX`; `build.json` changes only `"package"`. Internal backend helpers (`default_workspace`, `load`, `record`, `stage_record`, `library_name`, ...) keep their names.
 

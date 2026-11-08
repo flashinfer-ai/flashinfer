@@ -14,7 +14,15 @@ plain ones bit for bit, that 257 + 257 tokens equal the dense twin bit for bit,
 that row-tiled launches equal the single launch, and that eager calls and CUDA
 graph replays are bitwise identical.  Both multi-tile programs run: the
 four-stage sibling (where this process can launch it) and the two-stage
-program.  Skips without an SM107 GPU.
+program.
+
+The 64-head MTP decode rows of the four-stage sibling's TMEM-batch window (a
+longest request of 2-4 tokens, 108 rows up to two per SM, items up to 768 wide;
+dense and ragged calls) run the TMEM-batch sibling: those tests check the
+launched program, the output against the same reference, that masked columns
+contribute nothing, that it equals the four-stage program's output bit for bit
+and that eager calls and CUDA graph replays are bitwise identical; rows just
+outside the window launch the four-stage program.  Skips without an SM107 GPU.
 """
 
 from __future__ import annotations
@@ -239,6 +247,191 @@ def test_ragged_prefill_row_is_deterministic(monkeypatch, program):
     torch.cuda.synchronize()
     # One launch per eager call and one captured; replays prepare nothing.
     assert launched == [expected] * (REPEATS + 2)
+    for repeat in range(REPEATS):
+        case.query.zero_()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.reshape(first.shape), first), (
+            f"graph replay {repeat} differs from the eager call"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# TMEM-batch sibling: 64-head MTP decode rows of the four-stage program       #
+# --------------------------------------------------------------------------- #
+
+KV4_VARIANT = f"{M64_ROUTE}_kv4"
+BCL_VARIANT = f"{KV4_VARIANT}_bcl"
+DECODE_CONTEXT = 1024
+# The context of the first request of a "mixed" row: shorter than the SWA
+# window, so its rows mask SWA slots.
+SHORT_CONTEXT = 61
+# (q_len, rows, width, compressed page) of rows inside the window; a tuple
+# q_len is the request lengths of a ragged call, cycled (the window reads the
+# longest); "2sm" is two rows per SM of the device, the window's upper edge.
+BCL_ROWS = [
+    pytest.param(4, 108, 640, 64, id="c4w640-q4-t108"),
+    pytest.param(4, 120, 384, 2, id="c128w384-q4-t120"),
+    pytest.param(4, 192, 640, 2, id="c128w640-q4-t192"),
+    pytest.param(4, 120, 768, 64, id="c4w768-q4-t120"),
+    pytest.param(4, 256, 640, 64, id="c4w640-q4-t256"),
+    pytest.param(3, 120, 640, 64, id="c4w640-q3-t120"),
+    pytest.param(3, 192, 768, 64, id="c4w768-q3-t192"),
+    pytest.param(2, 108, 640, 64, id="c4w640-q2-t108"),
+    pytest.param(2, 200, 640, 64, id="c4w640-q2-t200"),
+    pytest.param(4, "2sm", 640, 64, id="c4w640-q4-t2sm"),
+    pytest.param((4, 1, 3, 2), 120, 640, 64, id="c4w640-q4132-t120"),
+]
+# Rows just outside it: 107 rows and two rows per SM plus one (ragged calls
+# whose last request is shorter), 96 rows, items 772 wide, one- and five-token
+# requests.
+EDGE_ROWS = [
+    pytest.param(4, 107, 640, 64, id="c4w640-q4-t107"),
+    pytest.param(4, 96, 640, 64, id="c4w640-q4-t96"),
+    pytest.param(4, "2sm+1", 640, 64, id="c4w640-q4-t2sm+1"),
+    pytest.param(4, 108, 772, 64, id="c4w772-q4-t108"),
+    pytest.param(1, 108, 640, 64, id="c4w640-q1-t108"),
+    pytest.param(5, 110, 640, 64, id="c4w640-q5-t110"),
+]
+
+
+def _require_tmem_batch_program() -> None:
+    """Skip where this process cannot launch the four-stage program (the
+    TMEM-batch sibling takes its launch check); SM107 must route the sibling
+    to a program of its own."""
+    if not cake._kv4_sibling_launchable("sm_107a", torch.device("cuda:0")):
+        pytest.skip("this process cannot launch the four-stage M64 program")
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS["sm_107a"]
+    four_stage = programs[KV4_VARIANT]
+    assert programs.get(BCL_VARIANT, four_stage) != four_stage, (
+        "SM107 does not route the TMEM-batch sibling to a program of its own"
+    )
+
+
+def _decode_rows(rows) -> int:
+    """``rows``, with "2sm" / "2sm+1" read on the device."""
+    sm_count = cake._device_sm_count(torch.device("cuda:0"))
+    return {"2sm": 2 * sm_count, "2sm+1": 2 * sm_count + 1}.get(rows, rows)
+
+
+def _decode_case(q_len, rows, width: int, page: int, *, lengths: str = "full"):
+    """``rows`` query rows in requests of ``q_len`` tokens (a ragged call whose
+    last request is shorter where ``q_len`` does not divide them; a tuple
+    ``q_len`` gives the request lengths of a ragged call, cycled) over items
+    ``width`` wide, the compressed slots on pages of ``page`` rows.  "full"
+    attends every column; "mixed" masks columns of both kinds behind the
+    poison pages: the first request's context is shorter than the SWA window
+    (stale SWA slots beyond it) and the compressed active counts are mixed,
+    incl. 0 and the full width."""
+    rows = _decode_rows(rows)
+    pattern = q_len if isinstance(q_len, tuple) else (q_len,)
+    q_lens, left = [], rows
+    while left:
+        q_lens.append(min(pattern[len(q_lens) % len(pattern)], left))
+        left -= q_lens[-1]
+    seq_lens = [DECODE_CONTEXT + 37 * i for i in range(len(q_lens))]
+    compressed_width = width - hardening.SWA_WINDOW
+    mixed = lengths == "mixed"
+    if mixed:
+        seq_lens[0] = SHORT_CONTEXT
+    case = hardening._build_case(
+        num_heads=HEADS,
+        dtype=DTYPE,
+        seq_lens=seq_lens,
+        q_lens=q_lens,
+        layout="ragged" if len(set(q_lens)) > 1 else "dense",
+        compressed_width=compressed_width,
+        compressed_page=page,
+        compressed_lens=(
+            hardening._mixed_compressed_lens(rows, compressed_width) if mixed else None
+        ),
+        swa_tail="stale" if mixed else "minus_one",
+    )
+    assert case.rows == rows and case.max_q_len == max(pattern)
+    if mixed:
+        assert int((case.visible() < hardening.SWA_WINDOW).sum()) > 0
+        assert int((case.sparse_topk_lens < width).sum()) > 0
+    return case
+
+
+@pytest.mark.parametrize("lengths", ["full", "mixed"])
+@pytest.mark.parametrize("q_len,rows,width,page", BCL_ROWS)
+def test_mtp_decode_rows_in_the_window_run_the_tmem_batch_program(
+    monkeypatch, q_len, rows, width, page, lengths
+):
+    """The row runs the TMEM-batch sibling, matches the reference, is
+    bit-identical with the masked columns' pages poisoned, equals the launch
+    without PDL bit for bit and equals the four-stage program's output bit for
+    bit."""
+    _skip_unless_sm107()
+    _require_tmem_batch_program()
+    case = _decode_case(q_len, rows, width, page, lengths=lengths)
+    req = case.requirement()
+    assert (req.route, req.num_splits) == (M64_ROUTE, 1)
+    workspace = _workspace(case)
+    launched = _record_launches(monkeypatch)
+    pdl = hardening._assert_poison_inert(case, workspace, enable_pdl=True)
+    plain = case.run(workspace=workspace, out=case.nan_out())
+    torch.cuda.synchronize()
+    assert launched == [BCL_VARIANT] * 3
+    assert torch.equal(plain, pdl), "the PDL launch differs from the plain one"
+    monkeypatch.setattr(cake, "_kv4_bcl_variant", lambda variant, **kwargs: variant)
+    four_stage = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=True)
+    torch.cuda.synchronize()
+    assert launched == [BCL_VARIANT] * 3 + [KV4_VARIANT]
+    assert torch.equal(four_stage, pdl), (
+        "the TMEM-batch program differs from the four-stage program"
+    )
+
+
+@pytest.mark.parametrize("q_len,rows,width,page", EDGE_ROWS)
+def test_mtp_decode_rows_outside_the_window_run_the_four_stage_program(
+    monkeypatch, q_len, rows, width, page
+):
+    """The row runs the four-stage program and matches the reference."""
+    _skip_unless_sm107()
+    _require_tmem_batch_program()
+    case = _decode_case(q_len, rows, width, page)
+    assert case.requirement().route == M64_ROUTE
+    workspace = _workspace(case)
+    launched = _record_launches(monkeypatch)
+    out = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=True)
+    torch.cuda.synchronize()
+    assert launched == [KV4_VARIANT]
+    hardening._assert_valid(out, case)
+
+
+def test_tmem_batch_program_is_deterministic(monkeypatch):
+    """Eager calls and CUDA graph replays of the TMEM-batch program with PDL
+    (two rows per SM in 4-token requests over items 640 wide, masked columns
+    of both kinds) are bitwise identical; inside the graph the program reads
+    the query the copy right before it writes."""
+    _skip_unless_sm107()
+    _require_tmem_batch_program()
+    case = _decode_case(4, "2sm", 640, 64, lengths="mixed")
+    workspace = _workspace(case)
+    run = dict(workspace=workspace, float_scales=True, enable_pdl=True)
+    launched = _record_launches(monkeypatch)
+    first = case.run(out=case.nan_out(), **run)
+    torch.cuda.synchronize()
+    hardening._assert_valid(first, case)
+    for repeat in range(REPEATS):
+        again = case.run(out=case.nan_out(), **run)
+        torch.cuda.synchronize()
+        assert torch.equal(again, first), f"eager repeat {repeat} differs"
+
+    source = case.query.clone()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(out=out, **run)
+    torch.cuda.synchronize()
+    # One launch per eager call and one captured; replays prepare nothing.
+    assert launched == [BCL_VARIANT] * (REPEATS + 2)
     for repeat in range(REPEATS):
         case.query.zero_()
         out.fill_(float("nan"))

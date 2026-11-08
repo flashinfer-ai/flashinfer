@@ -399,8 +399,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_with_kcp,
     ),
     Package(
-        "flashinfer.cake_gated_act_mxfp8_backend",
-        "flashinfer/cake_gated_act_mxfp8_backend",
+        "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
+        "flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -479,6 +479,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
         "flashinfer/experimental/cake/cake_dsa_indexer_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_dsa_indexer_nondet_train",
+        "flashinfer/experimental/cake/cake_dsa_indexer_nondet_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -653,6 +659,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake.cake_gqa_nondet_train",
         "flashinfer/experimental/cake/cake_gqa_nondet_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_gqa_det_train",
+        "flashinfer/experimental/cake/cake_gqa_det_train",
         "cake_jit.py",
         refs_generic,
     ),

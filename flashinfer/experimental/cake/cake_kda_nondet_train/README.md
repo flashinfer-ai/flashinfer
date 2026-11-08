@@ -216,10 +216,7 @@ saved set do not change.
 - Elsewhere `"auto"` runs as `"off"`, also when the toolkit cannot be read.
   A new device, toolkit or registry needs the suite on that device before it
   enters `HANDOFF_VERIFIED`.
-- The environment variable `CAKE_KDA_CKPT_HANDOFF` (`off` / `on`) is read by
-  `cake_kda_nondet` at each call, not by `CakeKDANondetFunction.apply`.  `off` turns
-  every call off; `on` turns `"auto"` into `"on"`.  An explicit `"off"` stays
-  off.
+- The keyword is the only switch: the package reads no environment variable.
 - Row records: the registry maps each forward intra record to a twin
   (`cake_jit.HANDOFF_TWINS`: `fwd_intra_v19` for `fwd_intra_v14`,
   `fwd_intra_v20` for `fwd_intra`).  The twin is the same program and also

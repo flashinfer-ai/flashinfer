@@ -21,8 +21,9 @@ before each continuing fragment, received from the ranks that hold them by one
 derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_det_kcp(x_local,
 weight, ctx)`` is the autograd entry; the stable, ``@flashinfer_api``-decorated
-facade is :mod:`flashinfer.cake_causal_conv1d_det_train`.  This module imports
-only ``os``, torch, torch.distributed, tvm_ffi and its own package.
+facade is :mod:`flashinfer.cake_causal_conv1d_det_train_kcp`.  This module imports
+only torch, torch.distributed, tvm_ffi and its own package, and reads no environment variable: every switch is a
+keyword argument of a call.
 
 Registry contract (``kcp_jit``, the KCP records beside the zero-history
 registry ``cake_jit``, whose tables stay untouched): kinds ``kcp_fwd`` (one
@@ -73,27 +74,29 @@ context and the shapes of the call, never a tensor's contents; it holds at most
 device index.  The operand checks, the gather, the exchange, its wait and the
 kernel launches run as before with the same arguments on the same stream, so
 no bit changes; a replayed graph (``graph="replay"``) contains no host work.
-``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
-the previous host path for the A/B record.
+The private test hook ``_set_test_knobs({"host_trim": 0})`` selects the previous
+host path for the A/B record.
 
 Two launch forms of the main backward program (FlashInfer issue #8365), one per
 call through the ``cooperative`` argument of the backward and autograd entries
-(``None`` = :data:`COOPERATIVE_DEFAULT`).  ``cooperative=True`` runs the
-``kcp_bwd`` record: one cooperative launch whose grid barrier precedes the
-fixed-order ``dweight`` reduction; a cooperative grid starts only when all its
-CTAs fit at once, so it waits for every kernel of another stream that occupies
-an SM.  ``cooperative=False`` runs the ``kcp_bwd_split`` record: the same token
-loop as an ordinary launch ``ctas_per_sm x (SM count - reserve_sms)`` CTAs wide
+(``None`` = :data:`COOPERATIVE_DEFAULT`, ``False``: the ordinary launch).
+``cooperative=False`` runs the ``kcp_bwd_split`` record: the token loop as an
+ordinary launch ``ctas_per_sm x (SM count - reserve_sms)`` CTAs wide
 (:func:`_launch_grid`), writing per-CTA partial rows, then the record's ``reduce``
 program (the zero-history package's fixed-order reduction, programmatically
 dependent on the main program) on the same stream.  It starts beside one
 small-carveout kernel of another stream per reserved SM; more such kernels
-delay some CTAs, never the whole launch.  ``y`` and ``dx`` are bitwise equal
-in both forms.  ``dweight`` is reproducible in each form (a pure function of
-the device type and the call's shapes) and within the same FP64-oracle bound,
-but the two forms sum different partial rows, so their ``dweight`` bits differ.
-The form is fixed per call: every rank of a group may choose it on its own
-(it changes no collective).
+delay some CTAs, never the whole launch.  ``cooperative=True`` runs the
+``kcp_bwd`` record: one cooperative launch whose grid barrier precedes the
+fixed-order ``dweight`` reduction; a cooperative grid starts only when all its
+CTAs fit at once, so it waits for every kernel of another stream that occupies
+an SM.  ``y`` and ``dx`` are bitwise equal in both forms.  ``dweight`` is
+reproducible in each form (a pure function of the device type and the call's
+shapes) and within the same FP64-oracle bound, but the two forms sum different
+partial rows, so their ``dweight`` bits differ.  The form is fixed per call and
+changes no collective; every rank of a group passes the same ``cooperative``
+value (one launch form per layer of the group, so that the ranks' ``dweight``
+partials come from one reduction order).
 
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`CakeCausalConv1dDetKcpRecomputeHandle`, or any object
@@ -118,7 +121,6 @@ uses the trimmed host path's per-context cache (the ``host_trim`` test knob sele
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -147,10 +149,10 @@ KCP_FWD = "kcp_fwd"
 KCP_BWD = "kcp_bwd"
 KCP_BWD_SPLIT = "kcp_bwd_split"
 KCP_BWD_HEAD = "kcp_bwd_head"
-# The main backward's launch form when a call passes ``cooperative=None``: ``True`` = the cooperative ``kcp_bwd``
-# record, ``False`` = the ``kcp_bwd_split`` record and its reduce program (FlashInfer issue #8365).
-COOPERATIVE_DEFAULT = True
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"  # the KCP route's private test-hook gate (the variable the KDA host module reads too)
+# The main backward's launch form when a call passes ``cooperative=None``: ``False`` = the ``kcp_bwd_split`` record and
+# its reduce program, which starts beside kernels resident on other streams; ``True`` = the cooperative ``kcp_bwd``
+# record, which waits for them (FlashInfer issue #8365).
+COOPERATIVE_DEFAULT = False
 GRAPH_MODES = (
     "off",
     "replay",
@@ -494,8 +496,8 @@ def _handle_hist(
 # CUDA-graph replay of a call and the test knobs.
 #
 # The public keyword ``graph="replay"`` of :func:`cake_causal_conv1d_det_kcp` and of the forward / backward below (shipped
-# ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private ``_set_test_knobs({"graph": "replay"})`` (accepted
-# only with ``CAKE_KCP_TEST_KNOBS=1``; a keyword contradicting an active knob is a ``ValueError``) -- makes
+# ``GRAPH_DEFAULT = "off"``) -- or, for the A/B record, the private test hook ``_set_test_knobs({"graph": "replay"})``
+# (a keyword contradicting an active knob is a ``ValueError``) -- makes
 # :func:`cake_causal_conv1d_det_train_kcp_forward` / :func:`cake_causal_conv1d_det_train_kcp_backward` run their first call of a
 # validity key (kind, the context object, its world size, and the shape / stride / dtype / data pointer of every
 # operand and caller-owned output) eagerly, capture the second call into a ``torch.cuda.CUDAGraph`` (replayed once)
@@ -647,16 +649,12 @@ def _launch_trim(
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
     """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
     the trimmed host path of the eager call | ``0`` the previous host path); a knob
-    the dict does not name keeps its shipped default; ``None`` restores the defaults.  Refused without
-    ``CAKE_KCP_TEST_KNOBS=1`` in the environment.  Returns the active knobs."""
+    the dict does not name keeps its shipped default; ``None`` restores the defaults.  A private test hook, called by
+    the tests only (no environment variable opens or selects it).  Returns the active knobs."""
     if knobs is None:
         _TEST_KNOBS["graph"] = "off"
         _TEST_KNOBS["host_trim"] = HOST_TRIM_DEFAULT
         return dict(_TEST_KNOBS)
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
-        raise ValueError(
-            f"_set_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
-        )
     if not isinstance(knobs, dict):
         raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
     unknown = sorted(set(knobs) - {"graph", "host_trim"})
@@ -829,7 +827,8 @@ def cake_causal_conv1d_det_train_kcp_forward(
     device tables ``ctx.halo_tables`` and the process group ``ctx.group``).  Every rank of the group calls this
     function once per layer, in the same order: the forward halo exchange is a collective (a rank without tokens
     joins it with empty splits and returns empty outputs).  ``hist`` is a fresh ``[n_hist_rows, C]`` BF16 tensor
-    (``[1, C]`` when the rank receives no row).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
+    (``[0, C]`` when the rank receives no row; the program then reads a private one-row placeholder that is not
+    returned).  ``graph`` (``None`` = the shipped ``GRAPH_DEFAULT`` ``"off"`` |
     ``"replay"``): keyed CUDA-graph capture / replay of this call (the graph-replay option; see the section comment
     above: pointer-stable operands, private pools, eager fallback, :func:`cake_causal_conv1d_det_train_kcp_graph_cache_clear`).
     """
@@ -1068,9 +1067,10 @@ def cake_causal_conv1d_det_train_kcp_backward(
     tokens into the backward exchange's send layout, the exchange delivers them to the predecessors as ``dpre_tail``,
     and the main program folds them.  Every rank calls this function once per layer, in the same order.  ``graph`` as
     in the forward (the backward's key holds the forward's ``hist`` pointer, so its capture follows the forward's by
-    one call).  ``cooperative``: the main program's launch form (``None`` = :data:`COOPERATIVE_DEFAULT`; ``True`` the
-    cooperative launch, ``False`` the ordinary launch and the reduce program; see the module docstring); ``dx`` is
-    bitwise the same in both, ``dweight`` is reproducible in each but differs in its bits between them.
+    one call).  ``cooperative``: the main program's launch form (``None`` = :data:`COOPERATIVE_DEFAULT`, ``False``;
+    ``False`` the ordinary launch and the reduce program, ``True`` the cooperative launch; see the module docstring);
+    ``dx`` is bitwise the same in both, ``dweight`` is reproducible in each but differs in its bits between them.
+    Every rank of the group passes the same ``cooperative``.
     """
 
     coop = _cooperative(cooperative)
@@ -1602,12 +1602,15 @@ def cake_causal_conv1d_det_kcp(
         backward that needs it is pending.
     cooperative : bool, optional
         The launch form of the backward's main program (the forward is the same either way).  ``None`` (default):
-        :data:`COOPERATIVE_DEFAULT`.  ``True``: one cooperative launch; it starts only when every CTA fits at once,
-        so it waits for any kernel of another stream that occupies an SM.  ``False``: an ordinary launch one SM
-        short of co-resident plus a fixed-order reduce program on the same stream; it starts beside a small kernel
-        of another stream.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible and within the
-        same FP64-oracle bound in each form, but its bits differ between the forms (each form sums its own partial
-        rows), so keep one form for runs whose ``dweight`` bits must match.
+        :data:`COOPERATIVE_DEFAULT`, ``False``.  ``False``: an ordinary launch one SM short of co-resident plus a
+        fixed-order reduce program on the same stream; it starts beside a small kernel of another stream.
+        ``True``: one cooperative launch; it starts only when every CTA fits at once, so it waits for any kernel of
+        another stream that occupies an SM.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible
+        and within the same FP64-oracle bound in each form, but its bits differ between the forms (each form sums
+        its own partial rows), so keep one form for runs whose ``dweight`` bits must match.  Every rank of
+        ``ctx.group`` passes the same value (one launch form per layer of the group; the form changes no
+        collective, so a mismatch does not hang, but the ranks' ``dweight`` partials then mix two reduction
+        orders).
 
     Returns
     -------
@@ -2029,8 +2032,8 @@ def cake_causal_conv1d_det_kcp_multi(
         capture; every rank passes one or none).  The handle may also carry the ``"kda"`` entry of the layer's
         recurrence; a handle's ``"conv"`` entry serves either one multi call or one single call, never both.
     cooperative : bool, optional
-        As in :func:`cake_causal_conv1d_det_kcp`; one launch form for every tensor of the call.  The result is bitwise
-        the single calls with the same ``cooperative``.
+        As in :func:`cake_causal_conv1d_det_kcp` (default ``False``, the same value on every rank); one launch form
+        for every tensor of the call.  The result is bitwise the single calls with the same ``cooperative``.
 
     Returns
     -------

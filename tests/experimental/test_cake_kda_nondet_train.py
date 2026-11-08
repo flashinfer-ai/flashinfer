@@ -9811,9 +9811,9 @@ def test_raw_gate_autograd_and_checkpoint_match_the_deterministic_raw_mode(
     monkeypatch.setattr(cake_backend, "_handoff_publish", no_handoff)
     for env in (None, "on", "off"):
         if env is None:
-            monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+            monkeypatch.delenv("CAKE_KDA_CKPT_HANDOFF", raising=False)
         else:
-            monkeypatch.setenv(cake_backend.HANDOFF_ENV, env)
+            monkeypatch.setenv("CAKE_KDA_CKPT_HANDOFF", env)
         for mode in ("auto", "on", "off"):
             tag = (env, mode)
             leaves = _rg_leaves(inputs)
@@ -9832,7 +9832,7 @@ def test_raw_gate_autograd_and_checkpoint_match_the_deterministic_raw_mode(
                 )
                 o.backward(dout)
                 _rg_leaf_check(leaves, ref, tag=(*tag, "checkpoint", reentrant))
-    monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+    monkeypatch.delenv("CAKE_KDA_CKPT_HANDOFF", raising=False)
     # dt_bias as [H, 128]: the same values, its gradient in that shape (explicit and autograd)
     inputs_2d = dict(inputs, dt_bias=inputs["dt_bias"].view(heads, D).clone())
     got = _rg_bwd(inputs_2d, None)
