@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, unsigned int* claims, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map);
+extern "C" __global__ void kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, unsigned int* claims, unsigned int* __restrict__ departs, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map);
 
 namespace cake_binding_kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp {
 
@@ -157,7 +157,7 @@ CUtensorMap EncodeTma_dy_map(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_dw_acc, TensorView a_tile_tk, TensorView a_hist, TensorView a_hist_row_off, TensorView a_dpre_tail, TensorView a_tail_row_off, TensorView a_claims, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_M, int64_t a_NL, int64_t a_P, int64_t a_L, int64_t a_n_ctas, TensorView a_x_map, TensorView a_dy_map, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_dw_acc, TensorView a_tile_tk, TensorView a_hist, TensorView a_hist_row_off, TensorView a_dpre_tail, TensorView a_tail_row_off, TensorView a_claims, TensorView a_departs, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_M, int64_t a_NL, int64_t a_P, int64_t a_L, int64_t a_n_ctas, TensorView a_x_map, TensorView a_dy_map, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_x.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_x, "x");
@@ -186,6 +186,8 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
   check_dtype(a_tail_row_off, DLDataType{kDLInt, 32, 1}, "tail_row_off");
   check_cuda_tensor(a_claims, "claims");
   check_dtype(a_claims, DLDataType{kDLUInt, 32, 1}, "claims");
+  check_cuda_tensor(a_departs, "departs");
+  check_dtype(a_departs, DLDataType{kDLUInt, 32, 1}, "departs");
   TVM_FFI_CHECK(a_S >= -2147483648LL && a_S <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'S' = " << a_S
       << " is outside the i32 range [-2147483648, 2147483647]";
@@ -239,6 +241,8 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
   check_same_device(a_tail_row_off, a_x, "tail_row_off", "x");
   check_contiguous(a_claims, "claims");
   check_same_device(a_claims, a_x, "claims", "x");
+  check_contiguous(a_departs, "departs");
+  check_same_device(a_departs, a_x, "departs", "x");
   check_same_device(a_x_map, a_x, "x_map", "x");
   check_same_device(a_dy_map, a_x, "dy_map", "x");
   TVM_FFI_CHECK((a_L == CheckedMul(CDiv(CheckedSub(CheckedAdd(a_C, 2048LL), 1LL), 2048LL), a_P)), ValueError)
@@ -247,6 +251,10 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
       << KERNEL_NAME << ": requires (L <= 256)";
   TVM_FFI_CHECK((a_n_ctas >= a_L), ValueError)
       << KERNEL_NAME << ": requires (n_ctas >= L)";
+  TVM_FFI_CHECK((a_n_ctas >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (n_ctas >= 1)";
+  TVM_FFI_CHECK((a_n_ctas <= 65535LL), ValueError)
+      << KERNEL_NAME << ": requires (n_ctas <= 65535)";
   TVM_FFI_CHECK((a_P >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (P >= 1)";
   TVM_FFI_CHECK((a_P <= 512LL), ValueError)
@@ -301,6 +309,7 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
   void* v_dpre_tail = DataPtr(a_dpre_tail);
   void* v_tail_row_off = DataPtr(a_tail_row_off);
   void* v_claims = DataPtr(a_claims);
+  void* v_departs = DataPtr(a_departs);
   int32_t v_S = static_cast<int32_t>(a_S);
   int32_t v_C = static_cast<int32_t>(a_C);
   int32_t v_num_docs = static_cast<int32_t>(a_num_docs);
@@ -311,7 +320,7 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
   int32_t v_n_ctas = static_cast<int32_t>(a_n_ctas);
   CUtensorMap v_x_map = EncodeTma_x_map(a_x_map);
   CUtensorMap v_dy_map = EncodeTma_dy_map(a_dy_map);
-  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_dw_acc, &v_tile_tk, &v_hist, &v_hist_row_off, &v_dpre_tail, &v_tail_row_off, &v_claims, &v_S, &v_C, &v_num_docs, &v_M, &v_NL, &v_P, &v_L, &v_n_ctas, &v_x_map, &v_dy_map};
+  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_dw_acc, &v_tile_tk, &v_hist, &v_hist_row_off, &v_dpre_tail, &v_tail_row_off, &v_claims, &v_departs, &v_S, &v_C, &v_num_docs, &v_M, &v_NL, &v_P, &v_L, &v_n_ctas, &v_x_map, &v_dy_map};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(384, 1, 1);

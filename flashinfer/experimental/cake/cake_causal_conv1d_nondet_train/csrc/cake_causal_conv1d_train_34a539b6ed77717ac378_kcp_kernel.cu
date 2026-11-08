@@ -168,7 +168,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, unsigned int* claims, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
+kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, unsigned int* claims, unsigned int* __restrict__ departs, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
 {
     // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
     asm volatile("" : "+l"(dw_acc));
@@ -1238,7 +1238,6 @@ kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restri
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             unsigned int cv[1];
-            int ncan = 0;
             int g_own = -1;
             if (bid < L) {
                 g_own = bid;
@@ -1449,7 +1448,11 @@ kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restri
                 if (valid == 0) {
                     break;
                 }
-                ncan = ncan + 1;
+                if (lane == 0) {
+                    uint32_t gone;
+                    asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                        : "=r"(gone) : "l"(&departs[0]), "r"(static_cast<uint32_t>((unsigned int)n_ctas - 1)) : "memory");
+                }
                 if (cta < (unsigned int)L) {
                     g_own = (int)cta;
                 }
@@ -1616,13 +1619,14 @@ kernel_cake_causal_conv1d_train_34a539b6ed77717ac378_kcp(__nv_bfloat16* __restri
                 mbarrier_arrive(e_full_addr);
             }
             _phase_e_empty ^= 1;
+            __syncwarp();
             if (lane == 0) {
-                unsigned int done;
-                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                    : "=r"(done) : "l"(&claims[L]), "r"(static_cast<uint32_t>((unsigned int)(1 + ncan))) : "memory");
-                if (done + (unsigned int)(1 + ncan) == (unsigned int)n_ctas) {
+                uint32_t done;
+                asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                    : "=r"(done) : "l"(&departs[0]), "r"(static_cast<uint32_t>((unsigned int)n_ctas - 1)) : "memory");
+                if (done == (unsigned int)n_ctas - 1) {
                     #pragma unroll 1
-                    for (int zq = 0; zq < L + 1; zq++) {
+                    for (int zq = 0; zq < L; zq++) {
                         claims[zq] = 0;
                     }
                 }
