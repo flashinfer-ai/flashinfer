@@ -424,9 +424,10 @@ def dsa_indexer_det_topk_paged(
     # The cache as [num_pages, page bytes] at its page stride. Only the page
     # bytes need to exist: a page stride past them (padded pages, pages inside
     # larger blocks) leaves no storage after the last page.
+    # The kernel reads a page's first page_bytes bytes; padding may follow.
     page_bytes = page_rows * (row_bytes + 4)
     if kv_cache.shape[0] > 0 and (
-        kv_cache[0].numel() * kv_cache.element_size() != page_bytes
+        kv_cache[0].numel() * kv_cache.element_size() < page_bytes
         or not kv_cache[0].is_contiguous()
     ):
         raise ValueError(
@@ -458,19 +459,28 @@ def dsa_indexer_det_topk_paged(
             raise ValueError("candidate_out takes a candidate_block_size of 8 or 16")
         if (
             candidate_out.dtype != torch.int32
+            or candidate_out.device != dev
             or candidate_out.dim() != 2
             or candidate_out.shape[0] != num_rows
             or not 1 <= candidate_out.shape[1] <= _MAX_TOP_K
             or not candidate_out.is_contiguous()
         ):
             raise ValueError(
-                f"candidate_out must be a contiguous int32 [B * next_n, C] tensor, "
-                f"1 <= C <= {_MAX_TOP_K}"
+                f"candidate_out must be a contiguous int32 [B * next_n, C] tensor "
+                f"on q's device, 1 <= C <= {_MAX_TOP_K}"
             )
     if candidate_blocks is not None:
-        if candidate_blocks.dtype != torch.int32:
-            raise ValueError("candidate_blocks must be int32")
-        cand = candidate_blocks.reshape(num_rows, -1)
+        if candidate_blocks.dtype != torch.int32 or candidate_blocks.device != dev:
+            raise ValueError("candidate_blocks must be int32, on q's device")
+        if (
+            candidate_blocks.dim() not in (2, 3)
+            or math.prod(candidate_blocks.shape[:-1]) != num_rows
+            or candidate_blocks.shape[-1] < 1
+        ):
+            raise ValueError(
+                "candidate_blocks must be [B * next_n, C] or [B, next_n, C], C >= 1"
+            )
+        cand = candidate_blocks.reshape(num_rows, candidate_blocks.shape[-1])
         if cand.stride(1) != 1:
             cand = cand.contiguous()
         if cand.shape[1] * bs > _row_sel_keys():

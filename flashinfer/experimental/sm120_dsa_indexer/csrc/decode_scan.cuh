@@ -558,6 +558,9 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             v = qi ? (k1 ? vk[1][1] : vk[1][0]) : (k1 ? vk[0][1] : vk[0][0]);
           else
             v = k1 ? vk[0][1] : vk[0][0];
+          // A NaN score (only from non-finite inputs) ranks last, as -inf: the
+          // selection's bins and compares then agree on every key.
+          if (v != v) v = -__int_as_float(0x7f800000);
           if (key < (qi == 0 ? len0 : len1)) {
             if constexpr (kKeep)
               asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(

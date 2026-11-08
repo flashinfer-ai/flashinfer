@@ -491,7 +491,8 @@ __device__ __forceinline__ void longsel_body(const SelParams& p, LongShared& sh,
     sh.in_cut = in_cut;
   }
   __syncthreads();
-  longsel_rounds(sh, cx, score_order(lo), score_order(hi) - 1u);
+  // The bin of +inf (hi is NaN) reaches the largest order key.
+  longsel_rounds(sh, cx, score_order(lo), hi != hi ? 0xffffffffu : score_order(hi) - 1u);
 }
 
 // The selection after the logits scan, in one launch. CTA b < num_rows selects

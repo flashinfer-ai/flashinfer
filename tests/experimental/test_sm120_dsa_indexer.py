@@ -1021,6 +1021,24 @@ def test_paged_candidates_validation():
         )
     with pytest.raises(ValueError, match="int32"):
         _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand.long())
+    # Lists of another row count, or on another device.
+    for bad in (cand.view(2, 1024), cand.cpu()):
+        with pytest.raises(ValueError, match="candidate_blocks"):
+            _run_decode(q, w, ctx, paged, 512, candidate_blocks=bad)
+    # No rows: empty outputs.
+    idx, _ = dsa_indexer_det_topk(
+        q.data[:0],
+        paged.cache,
+        w[:0],
+        None,
+        None,
+        top_k=512,
+        backend="sm120",
+        block_table=paged.table[:0],
+        context_lens=ctx[:0],
+        candidate_blocks=cand[:0],
+    )
+    assert idx.shape == (0, 512)
     with pytest.raises(ValueError, match="paged form"):
         dsa_indexer_det_topk(
             q.data.view(1, 32, _D),
@@ -1174,6 +1192,7 @@ def test_paged_candidate_source_validation():
     with pytest.raises(ValueError, match="mutually exclusive"):
         _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand, candidate_out=out)
     for bad in (
+        torch.empty(1, 2048, dtype=torch.int32),
         torch.empty(1, 4097, dtype=torch.int32, device=dev),
         torch.empty(1, 2048, dtype=torch.int64, device=dev),
         torch.empty(2, 2048, dtype=torch.int32, device=dev),
@@ -1186,3 +1205,42 @@ def test_paged_candidate_source_validation():
             _run_decode(
                 q, w, ctx, paged, 512, candidate_out=out, candidate_block_size=bs
             )
+
+
+@pytest.mark.parametrize("kind", ["nan", "inf"])
+@pytest.mark.parametrize("C", [1, 2, 5])
+@pytest.mark.parametrize("lens", [[3000, 900], [140000, 50]], ids=["short", "long"])
+def test_paged_nonfinite_scores(kind, C, lens):
+    """Keys whose score is NaN or +inf (a non-finite key scale). A NaN key
+    ranks last, a +inf key first; a block holding either ranks first, as the
+    newest block does. With more such blocks than C, a row still publishes
+    exactly C of them, the larger first, and every row's ids stay in range."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(C * 7 + len(lens))
+    B, bs, top_k = len(lens), 8, 512
+    paged = _Paged(False, B, max(lens), 64, gen, dev)
+    q, w, ctx = _decode_inputs(False, B, 1, 32, lens, gen, dev)
+    q.data = q.data.float().abs().to(torch.float8_e4m3fn)  # every head counts
+    w = w.abs() + 0.5
+    scale = {"nan": [0, 0, 0xC0, 0x7F], "inf": [0, 0, 0x80, 0x7F]}[kind]
+    pinned = []
+    flat = paged.cache.view(paged.cache.shape[0], -1)
+    for b, n in enumerate(lens):
+        nb = (n + bs - 1) // bs
+        picks = torch.randperm(nb - 1, generator=gen, device=dev)[:4].tolist()
+        pinned.append(set(picks) | {nb - 1})
+        for blk in picks:
+            key = blk * bs + 3
+            page = int(paged.table[b, key // paged.P])
+            at = paged.P * _D + (key % paged.P) * 4
+            flat[page, at : at + 4] = torch.tensor(scale, dtype=torch.uint8, device=dev)
+    out = torch.full((B, C), 7, dtype=torch.int32, device=dev)
+    idx, _ = _run_decode(q, w, ctx, paged, top_k, candidate_out=out)
+    torch.cuda.synchronize()
+    for b, n in enumerate(lens):
+        got = idx[b][idx[b] >= 0]
+        assert bool((idx[b] >= -1).all() & (idx[b] < n).all()), f"row {b}: ids"
+        assert got.numel() == min(top_k, n) == got.unique().numel(), f"row {b}"
+        assert (
+            sorted(out[b].tolist(), reverse=True) == sorted(pinned[b], reverse=True)[:C]
+        )

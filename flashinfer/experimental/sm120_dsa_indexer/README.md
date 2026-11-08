@@ -71,7 +71,8 @@ and masking it:
    positions back to key ids. Because the blocks ascend, positions and key
    ids sort the same way, so ties still go to the larger key id.
 
-A row's work is thus bounded by its candidates, not by its context.
+A row's scan and selection are thus bounded by its candidates, not by its
+context; only the preparation, one bit a block, grows with the context.
 
 The source layer publishes those lists (`candidate_out`). Its rows are scanned
 and selected as usual, for their own top-k. In addition:

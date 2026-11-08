@@ -63,7 +63,9 @@ struct RowSelShared {
 
 // The smallest fp32 score whose rowsel_bin is at least `bin` (SGLang's
 // coarse_bin_lower_bound for 12 bits), so a pass classifies keys by fp32
-// compares instead of a conversion per key. fp16 rounds to nearest even: a
+// compares instead of a conversion per key. Past the bin of +inf no score
+// reaches it: NaN, so `x >= lo` is false for +inf too, which shares that bin
+// with the scores from 65520 up. fp16 rounds to nearest even: a
 // boundary is the midpoint of the fp16 values at the bin's low edge and
 // below, one ulp up where the edge's significand is odd.
 __device__ __forceinline__ float rowsel_bin_lo(uint32_t bin) {
@@ -81,7 +83,7 @@ __device__ __forceinline__ float rowsel_bin_lo(uint32_t bin) {
     return __int_as_float(b >= 0 ? b + 1 : b - 1);
   };
   if (bin == 0) return -__int_as_float(0x7f800000);
-  if (bin > (0xfc00u >> 4)) return __int_as_float(0x7f800000);
+  if (bin > (0xfc00u >> 4)) return __int_as_float(0x7fc00000);
   const float mid = 0.5f * (val(key) + val(key - 1));
   if (key - 0x0401u <= 0xfbffu - 0x0401u) {
     const uint32_t ob = (key & 0x8000u) ? (key ^ 0x8000u) : (~key & 0xffffu);
@@ -261,7 +263,7 @@ __device__ __noinline__ void rowsel_overflow(RowSelShared* sh, const float* src,
     const float y[4] = {f.x, f.y, f.z, f.w};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      act[v * 4 + j] = base + j < len && y[j] >= lo && y[j] < hi;
+      act[v * 4 + j] = base + j < len && y[j] >= lo && !(y[j] >= hi);
       k[v * 4 + j] = score_order(y[j]);
       ids[v * 4 + j] = base + j;
     }
