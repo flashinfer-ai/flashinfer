@@ -7176,7 +7176,7 @@ def test_bcl_decode_window_bounds():
     with compressed pages of 64 rows (the c4 layer), 176-208 rows, at most one
     row per SM, on devices of 212 or 216 SMs."""
     assert cake._KV4_BCL_DECODE_WINDOWS == {(1, 1152, 64): (176, 208)}
-    assert cake._KV4_BCL_DECODE_SM_COUNTS == frozenset({212, 216})
+    assert frozenset({212, 216}) == cake._KV4_BCL_DECODE_SM_COUNTS
 
 
 @pytest.mark.cpu_only
@@ -7426,7 +7426,7 @@ def test_l2pf_window_bounds():
     assert cake._KV4_L2PF_HEADS == 64
     assert cake._KV4_L2PF_PAGE == 64
     assert cake._KV4_L2PF_MAX_TOKENS == _L2PF_CEILINGS
-    assert cake._KV4_L2PF_SM_COUNTS == frozenset({212, 216})
+    assert frozenset({212, 216}) == cake._KV4_L2PF_SM_COUNTS
 
 
 @pytest.mark.cpu_only
