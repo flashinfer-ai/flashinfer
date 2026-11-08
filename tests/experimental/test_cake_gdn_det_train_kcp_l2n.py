@@ -1327,8 +1327,8 @@ def test_kept_rows_are_checked() -> None:
 
 def test_workspace_layout_counts_the_norm_rows() -> None:
     """The workspace query: ``qn`` / ``kn`` in the forward and every backward phase (the kept-tape form: hand-off
-    tensors, ``bwd.kept_tapes``, outside the workspace), the arena ``r`` only where #1 is re-run; flag off: the v1
-    layout exactly."""
+    tensors, ``bwd.kept_tapes``, outside the workspace), the arena ``r`` only where #1 is re-run, no ``akk`` /
+    ``gcum`` in the forward (the forward form of #1_l2n); flag off: the v1 layout exactly."""
     ctx, ops = _setup()
     H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
     T = ops["q"].shape[0]
@@ -1349,7 +1349,16 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
         assert on["fwd.qn"] == on["fwd.kn"] == row
         assert on["bwd.qn"] == on["bwd.kn"] == (0 if kept else row), kw
         assert on["bwd.kept_tapes"] - off["bwd.kept_tapes"] == (2 * row if kept else 0)
-        assert on["forward"] - off["forward"] == 2 * row
+        # the forward form of #1_l2n (shipped): the norm's forward binds no akk / gcum at #1 (a "full" save writes
+        # them into saved tensors: no arena term in either layout); the tape walk had dropped them already
+        assert gbytes._prep_form_shipped()
+        dead = sum(off.get(f"fwd.{k}", 0) for k in ("akk", "gcum"))
+        assert dead == (0 if kw.get("save_mode") == "full" else off["fwd.akk"] + off["fwd.gcum"]) and not (
+            {"fwd.akk", "fwd.gcum"} & set(on)
+        ), kw
+        assert on["fwd.phase.prep"] - off["fwd.phase.prep"] == 2 * row + on["fwd.qk_rstd"] - dead, kw
+        assert on["fwd.phase.walk"] - off["fwd.phase.walk"] == 2 * row, kw
+        assert on["forward"] == max(on["fwd.phase.prep"], on["fwd.phase.walk"]), kw
         replays = kw.get("boundary_mode") == "replay" or not (
             kw.get("save_mode") == "full" or kept
         )

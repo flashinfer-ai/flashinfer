@@ -109,7 +109,11 @@ travel on b1), ``Hg = ceil(HV / W)`` the heads per owner.
   a forward that keeps no saved set (``boundary_mode="replay"``,
   ``save_for_backward=False``).  The eager forward drops ``kn`` before its
   output, ``qn`` after #5 and the arena ``r`` after #1, so nothing of the norm
-  is left in the arena after a forward.
+  is left in the arena after a forward.  With the norm, a forward whose
+  ``akk`` / ``gcum`` go to no backward (every forward but a hand-off recompute
+  and a ``save_mode="full"`` save) runs the forward form of #1_l2n where the
+  registry ships it (``cake_kcp.prep_form_shipped``): its #1 binds neither
+  tape, so its arena never holds them.
 
 All sizes are exact integers of the shapes the host allocates (``R = 64
 NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates;
@@ -468,6 +472,21 @@ def _fwdh_out_shipped() -> bool:
     return forms >= {1, 2}
 
 
+def _prep_form_shipped() -> bool:
+    """Whether the registry ships the forward form of #1_l2n (``cake_kcp.prep_form_shipped``: a ``fwd_prep_l2n``
+    record selected by ``prep_form`` with ``backward_tapes`` False; it covers every architecture of the full
+    record): a forward whose ``akk`` / ``gcum`` go to no backward then binds neither tape at #1."""
+    try:
+        names = cake_jit.records_of_program("fwd_prep_l2n")
+    except ValueError:  # a registry that does not know the program
+        return False
+    return any(
+        cake_jit.MODULES[n].get("select_rule", {}).get("kind") == "prep_form"
+        and cake_jit.MODULES[n]["select_rule"].get("backward_tapes") is False
+        for n in names
+    )
+
+
 def cake_gdn_det_train_kcp_workspace_layout(
     ctx: CakeGDNDetKcpContext,
     *,
@@ -549,7 +568,9 @@ def cake_gdn_det_train_kcp_workspace_layout(
       ships it: no ``h`` / ``v_new`` tape), so its peak is #1; ``forward_split`` is the split form's (the
       ``fused_o=0`` test knob).  The eager forward binds its c2 send plane as a fresh tensor (``fwd.c2_send`` 0).
       ``save_mode="full"`` with a saved set writes its tapes into fresh saved tensors (no tape term); without one
-      they are arena tapes of the split form.
+      they are arena tapes of the split form.  With the norm every other forward runs the forward form of #1_l2n
+      where the registry ships it: #1 writes six tapes (no ``akk`` / ``gcum`` term in either moment); the kept form's
+      recompute forward (``bwd.phase.recompute_forward``) runs the full #1.
     * ``backward``: the largest of its phases -- the adjoint exchange (the backward pools, without the c1 send pool
       that a replayed forward has already released, plus the forward tapes of the form and the tapes #6 wrote), the
       adjoint tape walk (``carry``, ``b2_recv`` unless the fused walks at ``P > 1`` dropped it, and ``dh``) and the
@@ -685,29 +706,38 @@ def cake_gdn_det_train_kcp_workspace_layout(
         if fresh_tapes
         else {k: v for k, v in light_tapes.items() if k not in FUSED_FREE_TAPES}
     )
+    # the forward form of #1_l2n (cake_kcp._prep_backward_tapes): with the norm, a forward whose akk / gcum go to no
+    # backward -- here every first forward but a "full" save with a saved set (fresh saved tapes, no arena term) --
+    # binds neither tape; the kept form's recompute forward hands them over and runs the full #1
+    prep_fwd_form = l2n and T_r > 0 and not fresh_tapes and _prep_form_shipped()
 
     def forward_moments(
-        fuse: bool, drop_prep: bool
+        fuse: bool, drop_prep: bool, fwd_form: bool = False
     ) -> tuple[dict[str, int], dict[str, int]]:
-        walk_tapes = {
+        prep = {
             k: v
             for k, v in prep_tapes.items()
+            if not (fwd_form and k in FWD_TAPES_DEAD_AFTER_PREP)
+        }
+        walk_tapes = {
+            k: v
+            for k, v in prep.items()
             if not (drop_prep and k in FWD_TAPES_DEAD_AFTER_PREP)
         }
         if not (fuse or fresh_tapes):
             walk_tapes.update({k: light_tapes[k] for k in FUSED_FREE_TAPES})
         moments = {
-            "prep": fwd_pool_sum + sum(prep_tapes.values()) + qk_sum + fwd_rstd,
+            "prep": fwd_pool_sum + sum(prep.values()) + qk_sum + fwd_rstd,
             "walk": fwd_pool_sum
             - c1_gone
             + sum(walk_tapes.values())
             + qk_sum
             + (0 if eager else fwd_rstd),
         }
-        return {**prep_tapes, **walk_tapes}, moments
+        return {**prep, **walk_tapes}, moments
 
-    fwd_tapes, fwd_moments = forward_moments(fused, eager)
-    _, split_moments = forward_moments(False, eager)
+    fwd_tapes, fwd_moments = forward_moments(fused, eager, prep_fwd_form)
+    _, split_moments = forward_moments(False, eager, prep_fwd_form)
     fwd = {
         **fwd_pools,
         **fwd_tapes,
