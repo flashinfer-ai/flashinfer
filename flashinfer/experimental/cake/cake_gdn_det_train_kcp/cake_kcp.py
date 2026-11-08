@@ -2808,6 +2808,43 @@ def _identity_tile(
     return t
 
 
+def _new_ticket_slots(device: torch.device) -> torch.Tensor:
+    """Zeroed u32 ticket slots of every persistent launch site (:data:`TICKET_SITES`), one 128-byte-aligned slot each."""
+    # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
+    # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
+    words = len(TICKET_SITES) * TICKET_SLOT_WORDS
+    base = torch.zeros((words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device)
+    skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
+    return base[skew : skew + words]
+
+
+# The ticket slots the per-call workspaces of eager calls share, one buffer per (device index, raw CUDA stream).  A
+# persistent program leaves its word at zero (the self-resetting ticket), and every launch that reads a slot runs on
+# the stream the slots are keyed by, after the zeroing and after every earlier launch on that stream: the calls of one
+# stream use the slots one launch at a time, as the calls of one caller-held workspace do.  The first eager call on a
+# stream zeroes them (the launch order of that call is unchanged); later calls skip the per-call zeroing.
+_STREAM_TICKETS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_ticket_slots(device: torch.device) -> torch.Tensor | None:
+    """The shared ticket slots of the current stream of CUDA ``device``; ``None`` while that stream is capturing a
+    graph (a captured call keeps its own slots, as before)."""
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    stream = (
+        int(raw(index))
+        if raw is not None
+        else int(torch.cuda.current_stream(index).cuda_stream)
+    )
+    key = (int(index), stream)
+    t = _STREAM_TICKETS.get(key)
+    if t is None:
+        t = _STREAM_TICKETS[key] = _new_ticket_slots(device)
+    return t
+
+
 def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
     """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
     A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
@@ -2873,6 +2910,9 @@ class CakeGDNDetKcpWorkspace:
         self._tickets: torch.Tensor | None = (
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
         )
+        # the per-call workspace of an eager call (_prepare): its ticket slots are its stream's shared ones
+        # (_stream_ticket_slots); a caller's workspace keeps its own
+        self._shared_tickets = False
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
         # an eager call's pool and ticket sizing, deferred by ensure(defer=True) until the call's first launch has been
         # issued (CakeGDNDetKcpCall.kernel) or a pool is first read (a ticket read sizes the ticket slots alone):
@@ -2964,14 +3004,10 @@ class CakeGDNDetKcpWorkspace:
         if (
             self._tickets is None
         ):  # once per workspace: the kernels keep every word at zero afterwards
-            # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
-            # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
-            words = len(TICKET_SITES) * TICKET_SLOT_WORDS
-            base = torch.zeros(
-                (words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device
-            )
-            skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
-            self._tickets = base[skew : skew + words]
+            if self._shared_tickets and device.type == "cuda":
+                self._tickets = _stream_ticket_slots(device)
+            if self._tickets is None:
+                self._tickets = _new_ticket_slots(device)
 
     def settle(self) -> None:
         """Size the pools and ticket slots an ``ensure(defer=True)`` left pending (no-op otherwise)."""
@@ -5430,6 +5466,9 @@ def _prepare(
         _check(dout, "dout", (T, HV, D), backend.dtypes["dout"], device)
     if workspace is None:
         workspace = CakeGDNDetKcpWorkspace(state_dtype=backend.dtypes["state"])
+        # an eager call's own workspace: its stream's shared ticket slots (_stream_ticket_slots), not a zeroed buffer
+        # per call; a captured call (graph="replay", or a stream capture) zeroes its own
+        workspace._shared_tickets = opts.graph == "off"
     elif not isinstance(workspace, CakeGDNDetKcpWorkspace):
         raise TypeError("workspace must be a CakeGDNDetKcpWorkspace")
     if workspace.state_dtype != backend.dtypes["state"]:
