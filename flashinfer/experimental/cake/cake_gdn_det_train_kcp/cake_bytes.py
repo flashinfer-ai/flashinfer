@@ -96,13 +96,15 @@ travel on b1), ``Hg = ceil(HV / W)`` the heads per owner.
 
 * ``use_qk_l2norm_in_kernel=True`` (the in-kernel Q / K L2 norm): the saved
   set gains ``qk_rstd`` (FP32 ``[2, T_r, H_qk]``: ``8 T_r H_qk`` bytes, 4 MiB
-  at ``T_r = 32768``, ``H_qk = 16``; ``boundary_mode="saved"`` only); the
-  workspace gains the transient normalized rows ``qn`` / ``kn`` (BF16
+  at ``T_r = 32768``, ``H_qk = 16``; ``boundary_mode="saved"`` only) and, with
+  ``save_mode="full"``, the normalized rows ``qn`` / ``kn`` (BF16
   ``[T_r, H_qk, 128]`` each, ``2 * 256 T_r H_qk`` bytes together, 256 MiB at
-  the same shape) in the forward's tape walk and in every backward phase of
-  the replay and ``save_mode="full"`` forms (and in the kept form's recompute
-  forward, which hands them to its backward with the tapes: there they are
-  hand-off tensors, ``bwd.kept_tapes``, not workspace), plus the arena
+  the same shape: the full backward binds them, so it rebuilds nothing); the
+  workspace gains those rows as transient arena tapes in the forward's tape walk
+  and in every backward phase of the replay form when no saved set keeps them
+  (and in the kept form's recompute forward, which hands them to its backward
+  with the tapes: there they are hand-off tensors, ``bwd.kept_tapes``, not
+  workspace), plus the arena
   ``qk_rstd`` in the backward forms that re-run #1
   (the light replay of a saved set and the replay of a call without one; the
   ``save_mode="full"`` and kept-tape backwards read the saved one) and at #1 of
@@ -375,7 +377,8 @@ def cake_gdn_det_train_kcp_saved_layout(
 ) -> dict[str, int]:
     """The saved set of one layer on this rank, term by term in bytes (design table 4.1; module docstring).
     ``P`` overrides the plan's segment count (the call's ``segments`` option; the range the call accepts) for the
-    ``M_seg`` term; ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``, saved boundary only).
+    ``M_seg`` term; ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``, saved boundary only) and the
+    ``qn`` / ``kn`` terms (``256 T_r H_qk`` each, ``save_mode="full"`` with the saved boundary only).
     ``with_conv`` (default ``True``) adds ``hist``, the layer convolution's saved history rows: the module's
     convolution keeps them, the entry points of this package do not, so ``with_conv=False`` is what a GDN call
     saves."""
@@ -422,9 +425,12 @@ def cake_gdn_det_train_kcp_saved_layout(
             "qscale": ctx.R * HV * ROW_F32 if full else 0,
         }
     )
-    # the in-kernel L2 norm's r of q and k (the backward recomputes qn / kn from the raw rows and it)
+    # the in-kernel L2 norm's r of q and k (the light backward recomputes qn / kn from the raw rows and it) and, in
+    # "full", the forward's normalized rows (the full backward binds them: cake_kcp._saves_qk)
     if l2n:  # (no term without the norm: the norm-off layout is unchanged)
         terms["qk_rstd"] = ctx.T_r * H_qk * QK_RSTD_BYTES if saved else 0
+        terms["qn"] = ctx.T_r * H_qk * QK_ROW_BF16 if full else 0
+        terms["kn"] = ctx.T_r * H_qk * QK_ROW_BF16 if full else 0
     return terms
 
 
@@ -567,10 +573,11 @@ def cake_gdn_det_train_kcp_workspace_layout(
       wait(c1)).  The shipped light / saved forward is fused (the output walk ``kcp_fwdh_out`` where the registry
       ships it: no ``h`` / ``v_new`` tape), so its peak is #1; ``forward_split`` is the split form's (the
       ``fused_o=0`` test knob).  The eager forward binds its c2 send plane as a fresh tensor (``fwd.c2_send`` 0).
-      ``save_mode="full"`` with a saved set writes its tapes into fresh saved tensors (no tape term); without one
-      they are arena tapes of the split form.  With the norm every other forward runs the forward form of #1_l2n
-      where the registry ships it: #1 writes six tapes (no ``akk`` / ``gcum`` term in either moment); the kept form's
-      recompute forward (``bwd.phase.recompute_forward``) runs the full #1.
+      ``save_mode="full"`` with a saved set writes its tapes -- with the norm also ``qn`` / ``kn`` -- into fresh
+      saved tensors (no tape or row term); without one they are arena tapes of the split form.  With the norm every
+      other forward runs the forward form of #1_l2n where the registry ships it: #1 writes six tapes (no ``akk`` /
+      ``gcum`` term in either moment); the kept form's recompute forward (``bwd.phase.recompute_forward``) runs the
+      full #1.
     * ``backward``: the largest of its phases -- the adjoint exchange (the backward pools, without the c1 send pool
       that a replayed forward has already released, plus the forward tapes of the form and the tapes #6 wrote), the
       adjoint tape walk (``carry``, ``b2_recv`` unless the fused walks at ``P > 1`` dropped it, and ``dh``) and the
@@ -588,8 +595,8 @@ def cake_gdn_det_train_kcp_workspace_layout(
       state is the arena a forward leaves plus the backward tapes; that form's recompute forward keeps every tape in
       the arena until the hand-off (``bwd.phase.recompute_forward``) and counts as a phase too.
       ``"auto"`` reports the replay form (the bound the workspace may reach when a later operation of the
-      checkpointed region saves a tensor; a workspace bound: the kept form's hand-off tensors are outside it).  ``save_mode="full"`` with a saved set binds the saved tapes, none
-      of which is workspace.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors added
+      checkpointed region saves a tensor; a workspace bound: the kept form's hand-off tensors are outside it).  ``save_mode="full"`` with a saved set binds the saved tapes (with
+      the norm also the saved ``qn`` / ``kn``), none of which is workspace.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors added
       (the memory a backward needs besides the saved set): the same figure in both forms, except that the kept form
       holds the handed-over ``M_seg^T`` plane to #8 (the replay form drops its staging planes before the adjoint
       tape walk) and, with the norm, needs no arena ``qk_rstd`` (``8 T_r H_qk`` less).
@@ -599,10 +606,11 @@ def cake_gdn_det_train_kcp_workspace_layout(
       ``backward`` (``bwd.phase.graph``) is every backward pool, the ten light tapes (none with ``save_mode="full"``
       and a saved set), every backward tape and, under the norm, ``qn`` / ``kn`` and the arena ``qk_rstd`` where
       the backward re-runs #1.
-    * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in both forward moments, in every backward phase of the replay
-      and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute forward, which
-      hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors (``bwd.kept_tapes``,
-      ``bwd.qn`` / ``bwd.kn`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a forward without a saved set;
+    * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in both forward moments and every backward phase of the replay
+      form (#1_l2n writes them there) and in the kept form's recompute forward, which hands them over with the ten
+      tapes: in the kept-tape backward they are hand-off tensors (``bwd.kept_tapes``, ``bwd.qn`` / ``bwd.kn`` 0);
+      ``save_mode="full"`` with a saved set keeps them in the saved set (``fwd.qn`` / ``fwd.kn`` / ``bwd.qn`` /
+      ``bwd.kn`` 0: :func:`cake_gdn_det_train_kcp_saved_layout`); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a forward without a saved set;
       ``bwd.qk_rstd`` where the backward re-runs #1 (the light replay of a saved set, a backward without one).
     """
     H_qk, HV = _check(H_qk, HV)
@@ -689,11 +697,11 @@ def cake_gdn_det_train_kcp_workspace_layout(
     }
     fwd_pool_sum = sum(fwd_pools.values())
     # the in-kernel L2 norm's normalized rows: live through the tape walk (kn goes before the output, qn after #5);
-    # the arena r: written by #1_l2n when the forward keeps no saved set (else the saved set's fresh r), dropped after
-    # #1 (cake_kcp._forward; kept under graph="replay")
-    qk_rows = (
-        {"qn": T_r * H_qk * QK_ROW_BF16, "kn": T_r * H_qk * QK_ROW_BF16} if l2n else {}
-    )
+    # "full" with a saved set writes them into fresh saved tensors (cake_kcp._saves_qk: no arena row); the arena r:
+    # written by #1_l2n when the forward keeps no saved set (else the saved set's fresh r), dropped after #1
+    # (cake_kcp._forward; kept under graph="replay")
+    qk_row = 0 if full else T_r * H_qk * QK_ROW_BF16
+    qk_rows = {"qn": qk_row, "kn": qk_row} if l2n else {}
     qk_sum = sum(qk_rows.values())
     fwd_rstd = T_r * H_qk * QK_RSTD_BYTES if (l2n and not keep) else 0
     # the c1 send pool (M_f^T tiles included) is released after wait(c1), before any tape walk of the wait_first
@@ -793,9 +801,9 @@ def cake_gdn_det_train_kcp_workspace_layout(
         if group_reduce == "host"
         else 0,  # #8, the host form of the grouped reduction
     }
-    # the norm in the backward: qn / kn from #1_l2n (light replay, replay mode) or qk_apply (full) until #8 -- the
-    # kept form binds the recompute forward's hand-off rows (outside the workspace, bwd.kept_tapes) -- and the arena r
-    # where #1 is re-run (the full / kept forms read the saved r)
+    # the norm in the backward: qn / kn from #1_l2n (light replay, replay mode) until #8 -- the kept form binds the
+    # recompute forward's hand-off rows (outside the workspace, bwd.kept_tapes), the full form the saved rows (in the
+    # saved set: qk_rows are 0 there) -- and the arena r where #1 is re-run (the full / kept forms read the saved r)
     replays_prep = not (full or kept)
     kept_qk = qk_sum if kept else 0
     bwd_l2n = (

@@ -2523,7 +2523,8 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # generator's rows times a per-token, per-head power of two drawn from the global token index, so every rank sees
 # the bits of the global pack).  Per row and rank:
 #
-# * mode equalities with the norm (bitwise): repeat, light == full (``qk_apply``) == boundary replay, autograd ==
+# * mode equalities with the norm (bitwise): repeat, light == full (saved ``qn`` / ``kn``) == full with test knob
+#   ``full_qk="apply"`` (``qk_apply``) == boundary replay, autograd ==
 #   saved, checkpoint (replay form, kept tapes, "auto") == direct, recompute handle == direct, ``save_transfer``,
 #   ring == a2a (where the partition allows it), CUDA-graph replay == eager, ``.backward()`` twice;
 # * the composed chain: out / dv / dbeta / dg == the norm-off route on the materialized ``(qn, kn)`` (the forward's
@@ -2537,6 +2538,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: bitwise the contiguous call, the split still aliases the packed dQKV row;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
 #   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+#   with ``save_mode="full"`` both grow by the saved ``qn`` / ``kn`` (``512 T_r H_qk``) as well;
 #   the peaks and a profiler count of copy ops on the packed views are recorded.
 #
 # The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
@@ -2766,7 +2768,17 @@ def _run_rank_l2n(
     flags["l2n_repeat"] = _eq(res, saved_pass(**L2N))
     full = saved_pass(save_mode="full", **L2N, test_knobs={"record_qk": True})
     flags["l2n_light_eq_full"] = _eq(res, full) and (
-        T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
+        T_r == 0
+        or (
+            full["bwd"]["qk_source"] == "saved"
+            and "qk_apply" not in full["bwd"]["sequence"]
+        )
+    )
+    full_apply = saved_pass(
+        save_mode="full", **L2N, test_knobs={"record_qk": True, "full_qk": "apply"}
+    )
+    flags["l2n_light_eq_full_apply"] = _eq(res, full_apply) and (
+        T_r == 0 or full_apply["bwd"]["qk_source"] == "qk_apply"
     )
     flags["l2n_saved_eq_replay"] = _eq(res, saved_pass(boundary_mode="replay", **L2N))
     flags["l2n_save_transfer_eq"] = _eq(res, saved_pass(save_transfer=False, **L2N))
@@ -3058,6 +3070,30 @@ def _run_rank_l2n(
     info["saved_query"] = {"on": q_on, "off": q_off}
     flags["l2n_saved_bytes_on_minus_off"] = (
         saved_on_b - saved_off_b == rstd_bytes == q_on - q_off
+    )
+    # save_mode="full" keeps the forward's qn / kn as well: retained and saved grow by r and the two rows
+    kept_full_off, saved_full_off_b, _p = retained(save_mode="full")
+    kept_full_on, saved_full_on_b, _p = retained(save_mode="full", **L2N)
+    qk_bytes = 2 * T_r * H_qk * 256
+    qf_on = int(
+        gb.cake_gdn_det_train_kcp_saved_bytes(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", use_qk_l2norm_in_kernel=True
+        )
+    )
+    qf_off = int(
+        gb.cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, save_mode="full")
+    )
+    info["memory"].update(
+        retained_full_off=kept_full_off,
+        retained_full_on=kept_full_on,
+        saved_full_off=saved_full_off_b,
+        saved_full_on=saved_full_on_b,
+    )
+    flags["l2n_full_post_forward_eq_off_plus_rstd_rows"] = (
+        kept_full_on - kept_full_off == rstd_bytes + qk_bytes
+    )
+    flags["l2n_full_saved_bytes_on_minus_off"] = (
+        saved_full_on_b - saved_full_off_b == rstd_bytes + qk_bytes == qf_on - qf_off
     )
 
     # gather the flags; the verdict is WORLD-wide

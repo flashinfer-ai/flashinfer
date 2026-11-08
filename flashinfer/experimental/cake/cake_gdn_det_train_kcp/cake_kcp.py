@@ -97,12 +97,14 @@ In-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel=True``, default ``False``): `
 (``qk_rstd`` ``[2, T_r, H_qk]``) before its own body; every other q / k reader (#2, #3, #5, #7, #8) is the unchanged
 program bound to ``qn`` / ``kn``; #8 runs as ``bwd_dqkg_l2n``, which applies the norm's pullback (from the raw rows
 and the saved ``r``) before the one BF16 rounding of ``dq`` / ``dk`` (``group_reduce="host"``: the unchanged #8 and the
-pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd`` only
-(``KCP_SAVED_VERSION`` 2); ``qn`` / ``kn`` never outlive a call: the forward drops ``kn`` before its output and
-``qn`` after #5 (a hand-off forward hands both over with its tapes instead); the backward gets them from #1_l2n
-again (light replay, replay mode), from the recompute forward's #1_l2n through the kept hand-off (the kept recompute
-tapes) or from ``qk_apply`` (``qn = bf16(q * r)`` from the saved ``r``: ``save_mode="full"`` only) and drops them
-after #8.
+pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd``
+(``KCP_SAVED_VERSION`` 2) and, with ``save_mode="full"``, the rows ``qn`` / ``kn`` (fresh tensors #1_l2n writes:
+the full backward binds them, so it launches no ``qk_apply``); otherwise ``qn`` / ``kn`` never outlive a call: the
+forward drops ``kn`` before its output and ``qn`` after #5 (a hand-off forward hands both over with its tapes
+instead); the backward gets them from #1_l2n again (light replay, replay mode), from the recompute forward's #1_l2n
+through the kept hand-off (the kept recompute tapes), from the full saved set, or -- a full saved set without them
+(test knob ``full_qk="apply"``) -- from ``qk_apply`` (``qn = bf16(q * r)`` from the saved ``r``, #1_l2n's row rule)
+and drops them after #8.
 The numeric orders are :mod:`.cake_l2n`'s (FTZ off), bitwise the device programs'.
 
 This module reads tensor contents nowhere (no ``.item()``, no ``.tolist()``
@@ -170,10 +172,11 @@ PROGRAMS = (
     "gate_epilogue",  # #9: dg from the partials (reverse cumsum + chunk term), dbeta pass-through
     "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
     "bwd_dqkg_l2n",  # #8 on qn / kn with the norm's pullback before the BF16 rounding of dq / dk (group_reduce = 1)
-    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full")
+    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (full backward without saved rows)
 )
 # The in-kernel Q / K L2 norm programs (``use_qk_l2norm_in_kernel``): #1 and #8 run as their ``_l2n`` siblings, and
-# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay and no kept hand-off (save_mode="full").
+# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay, no kept hand-off and no saved rows (a
+# save_mode="full" set of the test knob full_qk="apply").
 L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
 LOCAL_PROGRAMS = (
     "fwd_prep",
@@ -596,11 +599,13 @@ FWD_TAPES = (
 )
 BWD_TAPES = ("do_g", "dv_intra", "dh_tape", "dv_new", "dg_part", "gamma_dot")
 # In-kernel Q / K L2 norm: the normalized rows (BF16 ``[T_r, H_qk, 128]``, contiguous) and the FP32 ``r`` of q and k
-# (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them (never saved): the forward
+# (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them: the forward
 # drops ``kn`` before its output (the tape walks were its last readers) and ``qn`` after #5 -- a hand-off forward
 # (``reuse_recompute_tapes``) unbinds both instead and hands them to the backward with its tapes (``_KeptTapes.qk``);
 # the backward drops both with the arena ``qk_rstd`` after #8 (or the host reduction).  A forward that keeps a saved set writes a fresh
 # ``qk_rstd`` (the saved set's tensor, bound in ``CakeGDNDetKcpCall.bufs``); the light replay's #1_l2n writes the arena one.
+# A forward that keeps a ``save_mode="full"`` set writes the rows into fresh tensors too and saves them
+# (:func:`_saves_qk`; :attr:`CakeGDNDetKcpSaved.qk`): its backward binds them instead of launching ``qk_apply``.
 QK_TAPES: tuple[str, ...] = ("qn", "kn")
 QK_RSTD = "qk_rstd"
 # group_reduce="host" with the norm: the FP32 group sum and the pullback run per block of this many tokens (the same
@@ -717,6 +722,19 @@ LIGHT_TAPES: tuple[str, ...] = ()
 def saved_tapes(save_mode: str) -> tuple[str, ...]:
     """The tape names a saved set of ``save_mode`` carries (in :data:`FWD_TAPES` order)."""
     return FWD_TAPES if save_mode == "full" else LIGHT_TAPES
+
+
+def _saves_qk(opts: CakeGDNDetKcpOptions) -> bool:
+    """Whether a forward that keeps a saved set saves the normalized rows ``qn`` / ``kn`` (:data:`QK_TAPES`):
+    ``save_mode="full"`` with ``use_qk_l2norm_in_kernel`` (#1_l2n writes them into fresh tensors and the backward
+    binds them -- the full backward then launches nothing before #6); the test knob ``full_qk="apply"`` keeps the
+    form without them (the backward rebuilds them with ``qk_apply``, the same bits).  A rank without tokens saves
+    none, as it saves no tape."""
+    return (
+        bool(opts.use_qk_l2norm_in_kernel)
+        and opts.save_mode == "full"
+        and opts.knob("full_qk") == "saved"
+    )
 
 
 # Forward tapes an eager forward leaves bound in the workspace arena (#5 reads them; the others go at
@@ -3081,7 +3099,9 @@ class CakeGDNDetKcpSaved:
     tapes of the ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the
     scalars of the call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32
     ``r`` of q and k ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows
-    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries).  Every
+    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries), and in ``save_mode="full"`` (:func:`_saves_qk`)
+    ``qk``, the normalized rows ``(qn, kn)`` (BF16 ``[T_r, H_qk, 128]`` each; between the tapes and ``qk_rstd`` in
+    :meth:`tensors`; presence ``meta()["qk_saved"]``).  Every
     tensor is fresh per call and travels through ``save_for_backward`` only (#7039).  ``kept`` (never saved, never
     compared: not in ``tensors()`` / ``flags()`` / ``meta()``) is the recompute forward's tape hand-off of
     ``reuse_recompute_tapes`` on its way through the autograd Function's backward; ``None`` everywhere else."""
@@ -3107,6 +3127,9 @@ class CakeGDNDetKcpSaved:
     ctx: Any
     qk_rstd: torch.Tensor | None = None
     qk_l2norm: bool = False
+    # save_mode="full" with the norm (_saves_qk): the forward's qn / kn (QK_TAPES order); qk_saved = their presence
+    qk: tuple[torch.Tensor, ...] | None = None
+    qk_saved: bool = False
     kept: Any = dataclasses.field(default=None, compare=False, repr=False)
     # The backward may forget ``S_in`` / ``c1_recv`` / ``M_seg`` at their last reader (:meth:`forget`): set by the
     # autograd Function on the set it rebuilds from ``save_for_backward`` (nothing else references those tensors
@@ -3123,6 +3146,8 @@ class CakeGDNDetKcpSaved:
             out.append(self.M_seg)
         if self.tapes is not None:
             out.extend(self.tapes)
+        if self.qk_saved:
+            out.extend(self.qk)
         if self.qk_l2norm:
             out.append(self.qk_rstd)
         return tuple(out)
@@ -3151,6 +3176,7 @@ class CakeGDNDetKcpSaved:
             "precision_mode": self.precision_mode,
             "transfer_walk": self.transfer_walk,
             "qk_l2norm": self.qk_l2norm,
+            "qk_saved": self.qk_saved,
         }
 
     @classmethod
@@ -3171,6 +3197,7 @@ class CakeGDNDetKcpSaved:
             if has_tapes
             else None
         )
+        qk = tuple(next(it) for _ in QK_TAPES) if meta.get("qk_saved") else None
         qk_rstd = next(it) if meta.get("qk_l2norm") else None
         return cls(
             S_in=S_in,
@@ -3179,10 +3206,13 @@ class CakeGDNDetKcpSaved:
             tapes=tapes,
             ctx=ctx,
             qk_rstd=qk_rstd,
+            qk=qk,
             **meta,
         )
 
     def tape(self, name: str) -> torch.Tensor:
+        if name in QK_TAPES and self.qk is not None:
+            return self.qk[QK_TAPES.index(name)]
         names = saved_tapes(self.save_mode)
         if self.tapes is None or name not in names:
             raise KeyError(
@@ -4043,9 +4073,9 @@ def _record(kind: str, call: CakeGDNDetKcpCall) -> None:
             "recompute_handle"
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
         "qk_l2norm": call.l2n,  # use_qk_l2norm_in_kernel
-        # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "recompute" (the replay mode's forward),
+        # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "saved" (a full saved set's rows), "recompute" (the replay mode's forward),
         # "replay" (the light replay's #1_l2n), "kept" (the recompute forward's #1_l2n, handed over with the kept
-        # tapes) or "qk_apply" (save_mode="full"); None without the norm
+        # tapes) or "qk_apply" (a save_mode="full" set without rows: test knob full_qk="apply"); None without the norm
         "qk_source": call.scratch.get("qk_source"),
         # the r #1_l2n wrote (forward: "fresh" = the saved set's tensor, "arena") / the pullback read (backward:
         # "saved", "arena" in the replay mode); None without the norm
@@ -4717,6 +4747,9 @@ def _forward(
         keep
     ):  # the saved tapes are fresh per call (light: none; full: every forward tape)
         call.fresh_tapes(saved_tapes(opts.save_mode))
+        if _saves_qk(opts):
+            # full with the norm: #1_l2n writes qn / kn into fresh tensors, saved for the backward (no qk_apply)
+            call.fresh_tapes(QK_TAPES)
     if call.l2n:
         # the saved set's r: fresh, written by #1_l2n directly (the arena r of a forward without a saved set and of
         # the replay-mode forward is dropped after #1 / kept for the pullback)
@@ -5005,6 +5038,12 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
                 for name, t in zip(FWD_TAPES, saved.tapes, strict=True):
                     call.tapes[name] = t
             call.scratch["tapes_source"] = "saved"
+            if call.l2n and saved.qk is not None:
+                # the forward's qn / kn (its #1_l2n wrote them into the saved set): bound as they are, so the
+                # backward launches no qk_apply (no program re-reads the raw Q / K rows to normalize them)
+                for name, t in zip(QK_TAPES, saved.qk, strict=True):
+                    call.tapes[name] = t
+                call.scratch["qk_source"] = "saved"
         elif kept is not None:
             # the recompute forward's tapes of this graph task (reuse_recompute_tapes): the full-mode form on them;
             # the handed-over stage_m plane stands in for the saved M_seg^T when the saved set carries none
@@ -5025,9 +5064,13 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
             if call.l2n:
                 call.scratch["qk_source"] = "replay"
     call.local("bwd_prep")
-    if call.l2n and call.scratch.get("tapes_source") == "saved":
-        # save_mode="full": no #1 replay and no hand-off: qn / kn from the raw rows and the saved r (bitwise
-        # #1_l2n's), before the first q / k reader
+    if (
+        call.l2n
+        and call.scratch.get("tapes_source") == "saved"
+        and call.scratch.get("qk_source") != "saved"
+    ):
+        # save_mode="full" without saved rows (test knob full_qk="apply"): no #1 replay and no hand-off: qn / kn from
+        # the raw rows and the saved r (bitwise #1_l2n's), before the first q / k reader
         call.local("qk_apply")
         call.scratch["qk_source"] = "qk_apply"
     if call.l2n and call.opts.knob("record_qk"):
@@ -5673,6 +5716,8 @@ def _saved_count(call: CakeGDNDetKcpCall, save: bool) -> int:
     )
     if call.T_r > 0:
         n += len(saved_tapes(opts.save_mode))
+        if _saves_qk(opts):  # qn / kn (save_mode="full" with the norm)
+            n += len(QK_TAPES)
     if call.l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
         n += 1
     return _SAVED_OPERANDS + n
@@ -5767,8 +5812,11 @@ def _fwd_body(
                 FWD_DEAD_BEFORE_O, keep=saved_tapes(call.opts.save_mode) if save else ()
             )
         if call.l2n and not hand_off:
-            # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes)
-            call.release_tapes(("kn",))
+            # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes; a full saved
+            # set keeps its fresh kn)
+            call.release_tapes(
+                ("kn",), keep=QK_TAPES if save and _saves_qk(call.opts) else ()
+            )
         call.release_pools(FWD_DEAD_POOLS)
     call.output()  # a fused forward's output walks wrote it; else allocated here, after the releases, for #5
     saved = _saved_set(call) if save else None
@@ -5782,7 +5830,10 @@ def _fwd_body(
     if launch and not fuse_o:
         call.local("fwd_o")
     if call.l2n and call.opts.graph == "off" and not hand_off:
-        call.release_tapes(("qn",))  # #5 was qn's last reader (or #5 is left out)
+        # #5 was qn's last reader (or #5 is left out); a full saved set keeps its fresh qn
+        call.release_tapes(
+            ("qn",), keep=QK_TAPES if save and _saves_qk(call.opts) else ()
+        )
     kept = None
     if hand_off:
         # with the norm the rows #1_l2n wrote go along: the backward binds them instead of running qk_apply
@@ -5808,6 +5859,7 @@ def _saved_set(call: CakeGDNDetKcpCall) -> CakeGDNDetKcpSaved:
     of the ``save_mode`` (none in ``"light"``), the scalars of the call.  Built before #5 so the forward knows what
     the Function saves."""
     tb, opts = call.tb, call.opts
+    qk_saved = call.T_r > 0 and _saves_qk(opts)
     return CakeGDNDetKcpSaved(
         version=KCP_SAVED_VERSION,
         S_in=call.bufs["S_in"],
@@ -5834,6 +5886,8 @@ def _saved_set(call: CakeGDNDetKcpCall) -> CakeGDNDetKcpSaved:
         ctx=call.ctx,
         qk_rstd=call.bufs.get(QK_RSTD) if call.l2n else None,
         qk_l2norm=call.l2n,
+        qk=tuple(call.tapes[n] for n in QK_TAPES) if qk_saved else None,
+        qk_saved=qk_saved,
         kept=None,
     )
 
@@ -5922,6 +5976,27 @@ def _check_saved(saved: CakeGDNDetKcpSaved, call: CakeGDNDetKcpCall) -> None:
         R, NC_pad = int(call.ctx.R), int(call.ctx.NC_pad)
         for name, t in zip(names, saved.tapes, strict=True):
             shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=call.HV, T=call.T_r)
+            _check(t, f"saved.{name}", shape, dtype, call.device)
+    # the normalized rows ride in a full saved set of a call with the norm and tokens only (either full form is
+    # accepted: without them the backward rebuilds them with qk_apply)
+    if saved.qk_saved != (saved.qk is not None):
+        raise ValueError("saved: qk_saved disagrees with the saved qn / kn")
+    if saved.qk is not None:
+        if not (call.l2n and saved.save_mode == "full" and call.T_r > 0):
+            raise ValueError(
+                'saved: qn / kn are saved with save_mode="full", use_qk_l2norm_in_kernel and tokens only'
+            )
+        if len(saved.qk) != len(QK_TAPES):
+            raise ValueError(f"saved: the saved rows are {QK_TAPES}")
+        for name, t in zip(QK_TAPES, saved.qk, strict=True):
+            shape, dtype = tape_spec(
+                name,
+                R=int(call.ctx.R),
+                NC_pad=int(call.ctx.NC_pad),
+                HV=call.HV,
+                T=call.T_r,
+                H_qk=call.H_qk,
+            )
             _check(t, f"saved.{name}", shape, dtype, call.device)
     kept: _KeptTapes | None = saved.kept
     # the recompute forward's ten tapes of this geometry (+ the stage_m plane without a saved M_seg)
