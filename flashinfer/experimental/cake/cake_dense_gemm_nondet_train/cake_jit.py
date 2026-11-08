@@ -40,9 +40,9 @@ from . import cake_build
 # Only the programs of this package live here (program names ``cake_dense_projection_gemm_<hex>``): those of the
 # non-deterministic schedule (templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_atomic_*`` /
 # ``router_fp32_gemm_ts_*`` / ``router_fp32_gemm_simt_*`` / ``router_fp32_dgrad_simt_*`` /
-# ``router_fp32_fwd_simt_*`` / ``dense_proj_gemm_dsm_*``) and the sum of the
-# deterministic router program's split-K partials in a fixed order (template ``router_partials_sum``), which this
-# package's binding of that program launches after it.  Every program the deterministic package registers
+# ``router_fp32_fwd_simt_*`` / ``dense_proj_gemm_dsm_*`` / ``dense_proj_gemm_wave_*`` / ``dense_proj_gemm_dgrad_*`` /
+# ``dense_proj_gemm_sk_*``) and the sum of the deterministic router program's split-K partials in a fixed order
+# (template ``router_partials_sum``), which this package's binding of that program launches after it.  Every program the deterministic package registers
 # (``cake_dense_projection_det_gemm_<hex>``) is served by that package's registry and loader only: :func:`select_module`
 # and :func:`load_cake_dense_projection_gemm_module` know this package's programs, nothing else.
 
@@ -115,8 +115,12 @@ PROGRAM_PREFIX = "cake_dense_projection_gemm_"
 #: ``router_fp32_gemm_simt_`` its exact-FP32 programs on the CUDA cores (one FFMA per product, no BF16 parts),
 #: ``router_fp32_dgrad_simt_`` the router input gradient's, ``router_partials_sum`` the fixed-order sum of the
 #: deterministic router program's split-K partials, ``router_fp32_fwd_simt_`` the router forward's exact-FP32
-#: programs on the CUDA cores (K split over the CTAs of a cluster) and ``dense_proj_gemm_dsm_`` the K1 weight
-#: gradient's cluster programs (K split over the CTAs of a cluster, the partials summed in its shared memory).
+#: programs on the CUDA cores (K split over the CTAs of a cluster), ``dense_proj_gemm_dsm_`` the K1 weight
+#: gradient's cluster programs (K split over the CTAs of a cluster, the partials summed in its shared memory),
+#: ``dense_proj_gemm_wave_`` the K1 forward's one-wave programs (one CTA pair per work item over the whole K) and
+#: ``dense_proj_gemm_dgrad_`` the K1 input gradient's programs (a persistent CTA pair per SM pair, the whole reduction
+#: per tile) and ``dense_proj_gemm_sk_`` the K1 weight gradient's stream-K programs (one line of K blocks over the
+#: co-resident CTA pairs, a split tile summed by one fixed reducer in unit order).
 TEMPLATE_PREFIXES = (
     "dense_proj_gemm_atomic_",
     "router_fp32_gemm_atomic_",
@@ -126,6 +130,9 @@ TEMPLATE_PREFIXES = (
     "router_partials_sum",
     "router_fp32_fwd_simt_",
     "dense_proj_gemm_dsm_",
+    "dense_proj_gemm_wave_",
+    "dense_proj_gemm_dgrad_",
+    "dense_proj_gemm_sk_",
 )
 
 #: The deterministic package, which this package needs next to it: its sibling, resolved on first use and never
