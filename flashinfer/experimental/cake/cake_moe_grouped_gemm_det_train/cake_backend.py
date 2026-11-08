@@ -126,10 +126,11 @@ in place) on the device's architecture and, when the plan splits its tail
 (``TAIL_REDUCE_ACC``) on the route of that tail (the 256-wide k tile's for
 ``main_halves_k256t``), which sums the ordered partials in their fixed order and
 adds the sum into C once; every such build's library can load by the loader's
-static rule (its prebuilt file under ``aot/``, else a FlashInfer JIT toolkit at
-its ``build.json`` ``min_cuda``: :func:`acc_library_loadable`, nothing built or
-probed), and C is ``ACC_ALIGN``-byte aligned (its base, row pitch and expert
-pitch).  The programs write ``out`` in place; no scratch.  ``"composed"``
+static rule (its prebuilt file under ``aot/``, else a FlashInfer JIT toolkit with
+``nvcc``, JIT not disabled, at its ``build.json`` ``min_cuda``:
+:func:`acc_library_loadable`, nothing built or probed), and C is
+``ACC_ALIGN``-byte aligned (its base, row pitch and expert pitch).  The programs
+write ``out`` in place; no scratch.  ``"composed"``
 (``plan["accumulate_reason"]``, the first that fails in this order:
 ``"tile_k"`` the 256-wide k tile, ``"stage"`` a main stage without an
 accumulate build (every bf16 ``out``), ``"tail"`` a split tail whose route
@@ -155,9 +156,11 @@ from __future__ import annotations
 import functools
 import inspect
 import math
+import os
 import threading
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
@@ -309,10 +312,18 @@ def acc_stage_served(out_dtype: str, arch: str) -> bool:
 @functools.cache
 def _jit_cuda_version() -> Optional[tuple[int, int]]:
     """``(major, minor)`` of the toolkit FlashInfer's JIT builds with, the version ``cake_build.jit_spec``
-    holds an entry's ``min_cuda`` against; None without FlashInfer's JIT (the loader cannot build then).
-    Asked once per process."""
+    holds an entry's ``min_cuda`` against; None when the loader cannot build: FlashInfer's JIT is not
+    importable, ``FLASHINFER_DISABLE_JIT`` is set, or the CUDA path has no ``bin/nvcc`` (FlashInfer's
+    version query then reports PyTorch's CUDA version, which compiles nothing).  Asked once per process."""
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return None
     try:
-        _gen_jit_spec, get_cuda_version = _jit_toolchain("an accumulate build")
+        # Any manifest library: the name only labels the error when the JIT is not importable.
+        _gen_jit_spec, get_cuda_version = _jit_toolchain(next(iter(libraries_by_name())))
+        from flashinfer.jit.cpp_ext import get_cuda_path
+
+        if not Path(get_cuda_path(), "bin", "nvcc").is_file():
+            return None
         return _local_cuda_version(get_cuda_version)
     except RuntimeError:
         return None
@@ -321,7 +332,8 @@ def _jit_cuda_version() -> Optional[tuple[int, int]]:
 def acc_library_loadable(name: str, stage: str, arch: str) -> bool:
     """Whether the library of ``stage`` of route ``name`` on ``arch`` can load, by the loader's own static rule
     (``cake_build.load_library``): its prebuilt file under ``aot/`` exists, or FlashInfer's JIT toolkit
-    reaches the entry's ``build.json`` ``min_cuda`` (``cake_build.jit_spec`` refuses a lower one).  Nothing is
+    (``nvcc`` present, JIT not disabled: :func:`_jit_cuda_version`) reaches the entry's ``build.json``
+    ``min_cuda`` (``cake_build.jit_spec`` refuses a lower one).  Nothing is
     built, loaded or probed: an ahead-of-time build below an entry's floor ships no file for it, and a JIT
     toolkit below it would raise at the preparation, so such an accumulate build is not bound (the composed
     route, ``plan["accumulate_reason"] == "min_cuda"``)."""
@@ -1713,7 +1725,12 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
         )
     if out.device != device:
         raise ValueError("out must be on the device of the operands")
-    if num_groups * out.stride(0) > int(c["int32_elems"]):
+    # The kernels address C with 32-bit offsets over its whole span (an expert stride of 0 or a row
+    # pitch above K included), so bound the span, not E times the expert stride.
+    out_span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(out.shape, out.stride()) if size > 0
+    )
+    if out_span > int(c["int32_elems"]):
         raise ValueError(
             "the output span exceeds the 32-bit element addressing of the kernel"
         )
@@ -1778,7 +1795,8 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
                 "cake_moe_grouped_gemm_det_train_prepare_wgrad(accumulate=True): the accumulate build of the "
                 f"{main_stage} stage or of its tail reduce on {arch} is neither prebuilt nor buildable by "
                 "FlashInfer's JIT "
-                "toolkit (below its build.json min_cuda), so the weight gradient is written to a "
+                "toolkit (below its build.json min_cuda, no nvcc, or FLASHINFER_DISABLE_JIT set), so the "
+                "weight gradient is written to a "
                 "scratch and added with out.add_ (the composed route, same bits, "
                 'plan["accumulate"] == "composed"); this warning is issued once per process',
             )
