@@ -993,8 +993,8 @@ class KernelBackend(Backend):
     (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's forward layout (``fwd``; a forward-only arena's
     ``fwd_kcp``, :data:`LOCAL_LAYOUT_FWD_ONLY`), with the records the plan selects
     on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
-    (on a lean arena the lean layout :data:`LOCAL_LAYOUT_BWD_LEAN`: ``kcp_dav``'s ``dA_qk`` to its sink, the tail
-    stages once per chunk range, :func:`_tail_pass_values`)
+    (on a lean arena the lean layout :data:`LOCAL_LAYOUT_BWD_LEAN`: no ``kcp_dav``, the tail stages once per chunk
+    range, :func:`_tail_pass_values`)
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
     rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk``, only where the
@@ -1227,9 +1227,6 @@ class KernelBackend(Backend):
                 call.scratch["kcp_dav"] = "launched" if launch else "skipped"
                 if not launch:
                     return
-                if hasattr(views, "dAqk_sink"):
-                    # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
-                    extra["dAqk"] = views.dAqk_sink
             self.programs().run_record(
                 KCP_LOCAL_RECORDS[name],
                 {**values, **extra},
@@ -3773,7 +3770,7 @@ class CakeKDADetKcpWorkspace:
     local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
     backward workspace sizes every pool and the existing backend's layouts (``local_arena="replay"``, the default,
     :data:`cake_kcp_plan.LOCAL_ARENAS`) or, under ``local_arena="lean"`` (opt-in), the KCP forward layout and the
-    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3588 B per internal token-head; the tail stages per chunk
+    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3332 B per internal token-head; the tail stages per chunk
     range) with its tail-count table (:data:`TAIL_COUNTS_ATTR`), the existing backend's layouts on the rows the lean
     layout does not serve (H 9-15).  ``lean_passes`` sizes a lean arena for that many tail passes (``None``:
     :data:`cake_kcp_plan.LEAN_PASSES_DEFAULT`, two; fewer passes launch fewer tail kernels for more bytes;
