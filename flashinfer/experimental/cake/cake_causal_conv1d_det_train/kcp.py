@@ -32,7 +32,8 @@ record per arch: co-resident grid, 4 CTAs per SM, 128 threads x 8 channels),
 record selected by ``channels_at_least`` = the zero-history rule;
 ``workspace_rule`` ``partial_rows`` with 4 taps) and ``kcp_bwd_head`` (one record; its grid is
 ``max(1, n_frag x ceil(C / (threads x vec)))`` computed here and launched
-through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``);
+through the record's ``arg_plan`` / ``logical`` / ``ffi_entry`` and ``load``) and ``kcp_bwd_halo`` (one record: the
+overlapped backward's tail-row program, launched on the head program's grid);
 logical tensor names are ``cake_jit.LOGICAL_TENSORS`` plus ``hist``,
 ``hist_row_off``, ``dpre_tail``, ``tail_row_off``, ``dpre_head``,
 ``head_row_off`` (``x_map`` / ``dy_map`` map to ``x`` / ``dy``); the scalars are
@@ -136,7 +137,8 @@ Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d
 the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per direction
 instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied out into
 each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with the
-single call's arguments, so outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
+single call's arguments (in the overlapped backward the first tensor's main programs run before the wait and its
+tail-row program after it), so outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
 uses the trimmed host path's per-context cache (the ``host_trim`` test knob selects the single call's path only).
 """
@@ -1558,14 +1560,29 @@ def _bwd_main(
         _launch_trim(e["reduce"], values, e["device_index"])
 
 
+# The overlapped backward's all ``-1`` ``tail_row_off`` rows of the trimmed host path, per device index: grow-only
+# buffers, none ever freed.  A captured graph keeps the pointer of the rows it read, and the host cache may drop the
+# entry that named them (:func:`cake_causal_conv1d_det_train_kcp_host_cache_clear`, ``HOST_CACHE_MAX``); unlike the
+# context's tables, nothing else holds them.
+_NO_TAIL: dict[int, list[torch.Tensor]] = {}
+
+
 def _no_tail(e: dict[str, Any], device: torch.device) -> torch.Tensor:
-    """The overlapped backward's ``tail_row_off`` of the host-cache entry: int32 ``[n_frag, 3]``, every entry ``-1``
-    (made at the entry's first overlapped call, then reused)."""
+    """The overlapped backward's ``tail_row_off`` of the host-cache entry: int32 ``[n_frag, 3]``, every entry ``-1``:
+    the first ``n_frag`` rows of the device's largest ``_NO_TAIL`` buffer (a new one, at least twice the last, when
+    that is too small), named by the entry at its first overlapped call, then reused.  During a graph capture that
+    finds no buffer large enough (the eager first call of a graph key made one) the call's own table, as in the
+    untrimmed path."""
     table = e.get("no_tail")
     if table is None:
-        table = e["no_tail"] = torch.full(
-            (e["n_frag"], HALO), -1, dtype=torch.int32, device=device
-        )
+        n = e["n_frag"]
+        bufs = _NO_TAIL.setdefault(e["device_index"], [])
+        if not bufs or bufs[-1].shape[0] < n:
+            if torch.cuda.is_current_stream_capturing():
+                return torch.full((n, HALO), -1, dtype=torch.int32, device=device)
+            rows = max(n, 2 * bufs[-1].shape[0] if bufs else 64)
+            bufs.append(torch.full((rows, HALO), -1, dtype=torch.int32, device=device))
+        table = e["no_tail"] = bufs[-1][:n]
     return table
 
 

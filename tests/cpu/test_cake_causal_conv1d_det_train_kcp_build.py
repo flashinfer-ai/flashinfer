@@ -43,7 +43,7 @@ _W = "sm100_sm103_sm107"
 FWD = f"tart.causal_conv1d_kcp_fwd_bf16_silu.{_W}.causal_conv1d_kcp_fwd"
 BWD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd"
 HEAD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd_head"
-# the tail-row program's identity: its kernel's key (the twenty hex digits of the nondet tail-row program)
+# the tail-row program's identity: its kernel's key, with no build keyword
 HALO = "causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo"
 
 FWD_PLAN = [

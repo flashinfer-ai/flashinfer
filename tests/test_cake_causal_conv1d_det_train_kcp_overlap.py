@@ -183,10 +183,10 @@ def test_overlapped_backward_order_and_bits(
 
 
 @pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])
-@pytest.mark.parametrize("host_trim", [1, 0])
 def test_overlapped_multi_backward_order_and_bits(
-    monkeypatch, name, lens, cuts, Cs, host_trim
+    monkeypatch, name, lens, cuts, Cs
 ) -> None:
+    """The multi entry has one host path (the trimmed one; the ``host_trim`` knob selects the single call's path)."""
     device = torch.device("cuda")
     ctx, xs, ws, dys = _multi_problem(lens, cuts, Cs, device)
     _, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(xs, ws, ctx)
@@ -196,7 +196,6 @@ def test_overlapped_multi_backward_order_and_bits(
     torch.cuda.synchronize()
     two = _TwoRanks(ctx)
     try:
-        conv_kcp._set_test_knobs({"host_trim": host_trim})
         order = _recorder(monkeypatch)
         want = _want(ctx, overlap=True, cooperative=False, n=len(Cs))
         for repeat in range(REPEATS):
@@ -205,11 +204,65 @@ def test_overlapped_multi_backward_order_and_bits(
                 xs, ws, two, dys, hists
             )
             torch.cuda.synchronize()
-            label = f"{name} host_trim={host_trim} #{repeat}"
+            label = f"{name} #{repeat}"
             assert order == want, (label, order)
             for i in range(len(Cs)):
                 assert torch.equal(_bits(dxs[i]), _bits(ref_dx[i])), (label, i)
                 assert torch.equal(_bits(dws[i]), _bits(ref_dw[i])), (label, i)
+    finally:
+        monkeypatch.undo()
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+
+
+def test_overlapped_no_tail_rows_outlive_the_host_cache(monkeypatch) -> None:
+    """The trimmed host path's all ``-1`` ``tail_row_off`` rows of the overlapped backward live in ``_NO_TAIL``, not
+    only in the host-cache entry that names them: after ``cake_causal_conv1d_det_train_kcp_host_cache_clear`` they
+    stay allocated and ``-1`` (a graph captured on them keeps a valid pointer), and the next call names the same rows.
+    """
+    name, lens, cuts, C = ROWS[0]
+    device = torch.device("cuda")
+    p = _problem(lens, cuts, C, device)
+    _, hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    ref = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
+        p.x_local, p.w, p.ctx, p.dy_local, hist, cooperative=False
+    )
+    torch.cuda.synchronize()
+
+    def tables() -> list[torch.Tensor]:
+        return [
+            e["no_tail"]
+            for _, entries in conv_kcp._HOST_CACHE.values()
+            for e in entries.values()
+            if "no_tail" in e
+        ]
+
+    try:
+        conv_kcp._set_test_knobs({"host_trim": 1})
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+        _recorder(monkeypatch)
+        ptrs = []
+        for repeat in range(2):
+            dx, dw = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
+                p.x_local, p.w, p.ctx, p.dy_local, hist, cooperative=False
+            )
+            torch.cuda.synchronize()
+            label = f"{name} #{repeat}"
+            assert torch.equal(_bits(dx), _bits(ref[0])), label
+            assert torch.equal(_bits(dw), _bits(ref[1])), label
+            (table,) = tables()
+            ptrs.append(table.data_ptr())
+            assert conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear() >= 1
+            assert not tables(), label
+            bufs = conv_kcp._NO_TAIL[torch.cuda.current_device()]
+            assert any(
+                b.data_ptr() <= ptrs[-1] < b.data_ptr() + b.numel() * b.element_size()
+                for b in bufs
+            ), label
+            assert all(bool((b == -1).all()) for b in bufs), label
+        assert ptrs[0] == ptrs[1], ptrs
     finally:
         monkeypatch.undo()
         conv_kcp._set_test_knobs(None)

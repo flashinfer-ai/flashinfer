@@ -85,10 +85,10 @@ keywords; the backward with ``vec=8, copy="tma2d"`` on sm_100a and sm_103a,
 with ``vec=8, min_blocks=2`` on sm_107a, and the big-channel backward with
 ``vec=8, copy="tma2d", stage_tokens=8, min_blocks=2`` -- the builds of the
 zero-history backward, which the KCP kernels extend; the ``kcp_bwd_split``
-programs add ``split=True`` to those keywords.  The tail-row program's module
-is its kernel's key ``causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo``
-with no keyword, so its twenty hex digits are those of the non-deterministic
-package's tail-row program.
+programs add ``split=True, pair=True`` to those keywords, and sm_107a's
+big-channel one also ``fast_roll=True``.  The tail-row program's module is its
+kernel's key ``causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo``
+with no keyword.
 """
 
 from __future__ import annotations
@@ -486,7 +486,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Built with ``split=True, pair=True`` (the token arithmetic on packed
         # ``f32x2`` channel pairs, bitwise the scalar build's ``dx`` and partial
-        # rows), as are the two other ``split`` records.
+        # rows), as are the other ``split`` records.
         # The ``split`` build of the cooperative fallback above (route
         # ``kcp_bwd_split``, FlashInfer issue #8365): an ordinary launch with no
         # grid-wide barrier that ends at its partial row; the record's

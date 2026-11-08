@@ -158,7 +158,8 @@ One `all_to_all_single` per direction and call:
   fragment's first tokens (the halo adjoints; a token feeds at most three
   predecessor fragments) into the send layout; the exchange delivers them to
   the predecessors as `dpre_tail` (`[n_tail_rows, C]` FP32), and the main
-  program adds them to the last rows' `dx` before the one BF16 rounding.
+  program (in the overlapped backward, the tail-row program after the wait)
+  adds them to the last rows' `dx` before the one BF16 rounding.
 
 The multi entry exchanges the rows of its `n` tensors side by side in one
 collective per direction and copies each tensor's rows into its own pool after
