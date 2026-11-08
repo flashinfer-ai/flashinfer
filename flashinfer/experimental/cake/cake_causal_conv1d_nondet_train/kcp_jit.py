@@ -65,8 +65,9 @@ rows arrived (grid :func:`head_grid`), which writes the last ``min(3, len)``
 rows of every fragment with a tail row again with the tail rows folded in, so
 ``dx`` is the det program's bits on every row.  The main program's ``work``
 words are the tiles' warp words ``tile_tk`` (``DYN_TILE_WORDS`` per tile of
-:data:`DYN_TILE` channels) then the claim words ``claims`` (``L + 1``), all
-zero before and after every launch (:func:`dyn_workspace_layout`).
+:data:`DYN_TILE` channels), the claim words ``claims`` (``L``, one per lane)
+and the departure word ``departs`` (one), all zero before and after every
+launch (:func:`dyn_workspace_layout`).
 
 The host plan reuses :mod:`.cake_jit`'s functions over a record (:func:`plan`,
 :func:`launch_grid`, :func:`accumulator_layout`, :func:`channel_split`)
@@ -551,6 +552,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "dpre_tail"],
             ["buffer", "tail_row_off"],
             ["buffer", "claims"],
+            ["buffer", "departs"],
             ["parameter", "S"],
             ["parameter", "C"],
             ["parameter", "num_docs"],
@@ -594,6 +596,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "S": "S",
             "claims": "claims",
             "cu": "cu",
+            "departs": "departs",
             "dpre_tail": "dpre_tail",
             "dw": "dw",
             "dw_acc": "acc",
@@ -760,9 +763,10 @@ HALO = WIDTH - 1
 # ``[n_frag, 3]``; ``dpre_head``: FP32 ``[n_head_rows, C]`` head derivatives
 # with ``head_row_off`` int32 ``[n_frag, 3, 3]``; ``acc`` / ``work``: the
 # backward's FP32 ``[C, 4]`` accumulators and uint32 ``[n_ch_tiles]`` ticket
-# counters (zero before and after every launch); ``tile_tk`` / ``claims``: the
-# overlapped main program's uint32 tile words and claim words (its ``acc``
-# holds ``slots`` copies of the accumulators; :func:`dyn_workspace_layout`).
+# counters (zero before and after every launch); ``tile_tk`` / ``claims`` /
+# ``departs``: the overlapped main program's uint32 tile words, claim words
+# and departure word (its ``acc`` holds ``slots`` copies of the accumulators;
+# :func:`dyn_workspace_layout`).
 LOGICAL_TENSORS = (
     "x",
     "w",
@@ -781,6 +785,7 @@ LOGICAL_TENSORS = (
     "head_row_off",
     "tile_tk",
     "claims",
+    "departs",
 )
 # The scalars: the zero-history scalars (``cake_jit.LOGICAL_SCALARS``) and the
 # overlapped main program's work plan (:func:`dyn_plan`).
@@ -992,8 +997,8 @@ def dyn_workspace_layout(
     record: dict[str, Any], C: int, n_tiles: int, L: int
 ) -> dict[str, Any]:
     """:func:`accumulator_layout` of the overlapped main program: ``slots`` copies of the ``[C, 4]`` FP32
-    accumulators, then ``DYN_TILE_WORDS x n_tiles`` tile words and ``L + 1`` claim words (``tile_tk`` is
-    ``work[:DYN_TILE_WORDS * n_tiles]``, ``claims`` the rest)."""
+    accumulators, then ``DYN_TILE_WORDS x n_tiles`` tile words, ``L`` claim words and one departure word
+    (``tile_tk`` is ``work[:DYN_TILE_WORDS * n_tiles]``, then ``claims``, then ``departs``)."""
 
     return accumulator_layout(record, C, DYN_TILE_WORDS * int(n_tiles) + int(L) + 1)
 

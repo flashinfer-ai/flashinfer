@@ -856,6 +856,7 @@ def _launch_dyn(
         entry="cake_causal_conv1d_nondet_train_kcp_backward",
     )
     k = d["tile_words"]
+    lanes = d["scalars"]["L"]
     _launch_trim(
         d["main"],
         {
@@ -867,7 +868,8 @@ def _launch_dyn(
             "dw": dw_out,
             "acc": acc,
             "tile_tk": words[:k],
-            "claims": words[k:],
+            "claims": words[k : k + lanes],
+            "departs": words[k + lanes : k + lanes + 1],
             "hist": hist_t,
             "hist_row_off": hist_row_off,
             "dpre_tail": spare,
