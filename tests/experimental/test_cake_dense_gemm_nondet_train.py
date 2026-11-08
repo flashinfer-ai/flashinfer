@@ -10836,7 +10836,8 @@ def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
 def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
     """Unforced (no split count): every K1 weight-gradient row with a verdict for this
     architecture and every measured router row prepares the program its verdict names on this device (by kernel
-    name, at ``T = 16231``; a row with a range of :data:`K1_DSM_RANGES_BY_SM` there the range's cluster program), and
+    name, at ``T = 16231``; a row with a range of :data:`K1_DSM_RANGES_BY_SM` there the range's cluster program, else
+    one with a range of :data:`K1_ORDERED_RANGES_BY_SM` there that range's fixed-order program), and
     a row whose verdict is ``None`` -- or that this device's SM count leaves to the deterministic program -- prepares
     the deterministic launch."""
     device, arch = _atomic_device_or_skip()
@@ -10860,7 +10861,9 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
         )
         kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=sm_count)
         dsm = cake_backend.k1_dsm_plan(**kw)
-        want = dsm or cake_backend.k1_plan(**kw)
+        # a token count of a fixed-order range runs that range's program in place of the verdict
+        ordered = None if dsm else cake_backend.k1_ordered_plan(**kw)
+        want = dsm or (tuple(ordered[:2]) if ordered else cake_backend.k1_plan(**kw))
         if want is None:
             assert not isinstance(
                 prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch
@@ -10873,6 +10876,10 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
         )
         assert (prepared.plan.block_n, prepared.plan.splits) == want
         assert prepared.plan.dsm == (dsm is not None), (M, N, dt)
+        if ordered:
+            assert (prepared.plan.chains, prepared.plan.split_order) == tuple(
+                ordered[2:]
+            ), (M, N, dt)
         _assert_ran(prepared.launch, prepared.module_name)
         torch.cuda.synchronize()
         _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt}")
