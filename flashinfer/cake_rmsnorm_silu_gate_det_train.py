@@ -70,8 +70,8 @@ Mode and dispatch rules:
    alerts: every deterministic launch gives the same bits for the same
    inputs on the same device (a sum across CTAs is exact).  A call of
    :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` alerts only when it
-   is a backward that computes a BF16 weight gradient in a row-claims band
-   (SM100 and SM103; see that module): it raises PyTorch's alert immediately
+   is a backward that computes a BF16 weight gradient in the fused band
+   (every architecture; see that module): it raises PyTorch's alert immediately
    before that launch (``RuntimeError``; with ``warn_only=True`` a
    ``UserWarning``, then the call runs), and no other call of that module
    alerts.  The check runs on the host: a CUDA Graph checks it when it is

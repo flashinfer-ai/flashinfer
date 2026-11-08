@@ -18,10 +18,9 @@ Benchmark of the Cake SiLU-gated RMSNorm training kernels
 package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
 approximate FP32 intrinsics, and one backward kernel whose CTAs add the
 weight-gradient partials exactly as 64-bit integer windows, the last CTA
-rounding the sum once, or, for a BF16 weight gradient in its row-claims bands,
-add FP32 runs of rows to FP64 accumulators with atomics; in its fused band,
-a BF16 weight gradient on SM107, it runs its copy of the deterministic
-package's backward) against the
+rounding the sum once, or, for a BF16 weight gradient in its fused band, run
+the deterministic package's fused backward's schedule and row arithmetic and
+add FP32 runs of rows to FP64 accumulators with atomics) against the
 deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
 the exact fixed-point weight-gradient sum), each called through its own public
@@ -44,23 +43,16 @@ that its mid, long, extra-long or pipelined forward (its copy of the
 deterministic forward) by bands of rows per SM (``cake_jit.FORWARD_BANDS``).
 Its backward runs one cluster of 16 CTAs for few rows, else one kernel by bands
 of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient (the one
-timed here) runs, on SM100, the short backward (one cluster, a fixed-order sum)
-up to 256 rows, the exact tiny backward (one cluster, the bits of the
-deterministic pair at FlashInfer 2e989556) up to 512 rows, a row-claims
-backward (256-thread CTAs of 16-row blocks, 4 per SM) up to 800 rows per SM,
-the row-claims mid backward (5 CTAs per SM) up to 1329 rows per SM and past
-that the claimed backward (at most 8 CTAs per SM
-over chunks of rows); on SM103 the short backward up to 256 rows, a row-claims
-backward up to 700 rows per SM, the row-claims mid backward up to 1294 rows per
-SM and the claimed backward past that; on SM107 the short backward up to 256
-rows, the exact tiny backward up to 512 rows, the fused backward (its copy of
-the deterministic package's backward) up to 60 rows per SM, the static
-backward up to 64 and the claimed backward past that.
+timed here) runs, on SM100 and SM107, the short backward (one cluster, a
+fixed-order sum) up to 256 rows, the exact tiny backward (one cluster, the bits
+of the deterministic pair at FlashInfer 2e989556) up to 512 rows and past that
+the fused backward (256-thread CTAs of 16-row blocks, at most 4 per SM); on
+SM103 the short backward up to 256 rows and the fused backward past that.
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
-every forward kernel of packed rows and every BF16 backward kernel that a
-148-SM B200 routes (2048 tokens: the extra-long forward).
+every forward kernel of packed rows and every BF16 backward kernel that a band
+of a 148-SM B200 runs (2048 tokens: the extra-long forward).
 
 Timing uses CUPTI kernel activity with a cold L2
 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``); each stage reports
@@ -80,8 +72,8 @@ forward's approximate intrinsics need not give the deterministic ``y`` bits),
 ``dx``, ``dz`` and ``dw`` as the largest distance in BF16 units in the last
 place, and the number of distinct ``dw`` bit patterns over ``--repeats``
 backward calls (1 for the deterministic package; 1 for the non-deterministic
-package too, except in its row-claims bands, where the BF16 ``dw``'s last bits
-may vary from run to run, so the count may exceed 1).
+package too, except in its fused band, where the BF16 ``dw``'s last bits may
+vary from run to run, so the count may exceed 1).
 
 Example::
 
@@ -126,15 +118,10 @@ MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones.
 # The BF16 backward each reaches at 48 heads (``cake_jit.BACKWARD_BANDS``):
-# - 148-SM B200 (sm_100a): 1 and 5 tokens the short backward; 7 the exact tiny
-#   backward; 16, 129, 1031 and 2048 the row-claims backward; 4097 the
-#   row-claims mid backward; 30000 to 33000 the claimed backward.
-# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7, 16, 129, 1031
-#   and 2048 the row-claims backward; 4097 the row-claims mid backward; 30000
-#   to 33000 the claimed backward.
-# - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
-#   backward; 16 and 129 the fused backward; 1031 and more the claimed
-#   backward.
+# - 148-SM B200 (sm_100a) and 212-SM R200 (sm_107a): 1 and 5 tokens the short
+#   backward; 7 the exact tiny backward; 16 and more the fused backward.
+# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 and more the
+#   fused backward.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 
