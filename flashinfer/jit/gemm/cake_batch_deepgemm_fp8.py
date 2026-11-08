@@ -789,6 +789,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan5",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_c1541da977c9a379e49b": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
         "sources": [
@@ -1415,6 +1427,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_ba92e96364e30012640e_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_ba92e96364e30012640e",
+    },
+    "cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb",
     },
     "cake_batch_deepgemm_fp8_c1541da977c9a379e49b_sm_100a": {
         "arch": "sm_100a",
@@ -2100,6 +2116,12 @@ _SM107A_MMSETUP_TWINS: dict[str, tuple[str, int, int | None]] = {
         "cake_batch_deepgemm_fp8_b82c4e12c443e4ba3850",
         64,
         None,
+    ),
+    # BLOCK_N 240, K=64 MMA (the bn240_k128 cells), up to 128 groups.
+    "cake_batch_deepgemm_fp8_55bb778b259bbabdf1d9": (
+        "cake_batch_deepgemm_fp8_bd29055fba0b2e5805eb",
+        64,
+        128,
     ),
 }
 
