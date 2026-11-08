@@ -752,7 +752,9 @@ def cake_gqa_nondet_train_backward(
         # check and then the fold order.  Both checks are short chains of small kernels that run while bwd_pre does,
         # and the main kernels start after both.  The host queues the work in the order the current stream needs it
         # (its time before the first main kernel is on the critical path): the plan kernel, bwd_pre, the checks, the
-        # main kernels, and last the fold order.
+        # main kernels, and last the fold order.  Past PLAN_MAX_PAIRS there is no plan kernel: the PyTorch ops of
+        # _tile_plan and then the checks run on the current stream after bwd_pre, and the fold order alone on the
+        # first side stream.
         stream = torch.cuda.current_stream(device_index)
         tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
         fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
@@ -961,8 +963,8 @@ def _check_ranges(
 def _check_keys(cu_seqlens_k: torch.Tensor, plan: Mapping[str, Any]) -> None:
     """Queue a device-side assert, on the current stream, that every device segment's keys lie within a host-boundary
     plan's ``key_blocks``.  Past them the main kernels would leave key blocks out and the dQ GEMM would read tile
-    counts past the table; the assert fires first.  It reads ``cu_seqlens_k`` only, so it runs beside the plan kernel
-    and :func:`_check_ranges`."""
+    counts past the table; the assert fires first.  It reads ``cu_seqlens_k`` only, so with the plan kernel's tables
+    it runs on its own side stream, beside the plan kernel and :func:`_check_ranges`."""
     keys = torch.diff(cu_seqlens_k).max() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
     torch._assert_async(keys, _DISAGREE)
 
@@ -1036,11 +1038,11 @@ def _fold_index(
 @functools.cache
 def _side_stream(device_index: int, stream_id: int, slot: int) -> torch.cuda.Stream:
     """High-priority side stream ``slot`` of the caller stream ``stream_id`` of device ``device_index``: slot 0 runs
-    the backward's tile tables (the one-CTA ``bwd_plan``) and the host-boundary range check, slot 1 the host-boundary
-    key check; the row-map fold order runs on slot 1 with host boundaries, else on slot 0.  One cached stream per
-    caller stream and slot, from PyTorch's high-priority stream pool (a pool that cycles, so two caller streams may
-    share one stream past its size: their work then queues on it in order); high priority: their small kernels take
-    the first SMs bwd_pre and the main kernels free."""
+    the backward's tile tables (the one-CTA ``bwd_plan``) and, with host boundaries, the range check; slot 1 the
+    host-boundary key check.  The row-map fold order runs on slot 1 when it exists (host boundaries with the plan
+    kernel's tables), else on slot 0.  One cached stream per caller stream and slot, from PyTorch's high-priority
+    stream pool (a pool that cycles, so two caller streams may share one stream past its size: their work then queues
+    on it in order); high priority: their small kernels take the first SMs bwd_pre and the main kernels free."""
     return torch.cuda.Stream(device_index, priority=-1)
 
 

@@ -1136,6 +1136,23 @@ def test_host_boundaries_match_the_reference_and_repeat(layout, kind, device) ->
     the minimum: every form within the accuracy budget of the FP64 reference, bitwise reproducible, out, lse, dK and
     dV with the bits of the call without them (only the dQ rounding may move), and the workspace bytes of the exact
     plan."""
+    _check_host_boundaries(layout, kind, device)
+
+
+@pytest.mark.parametrize("kind", ("default", "minimum"))
+@pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
+def test_host_boundaries_without_the_plan_kernel_match_the_reference_and_repeat(
+    layout, kind, device, monkeypatch
+) -> None:
+    """The same past ``PLAN_MAX_PAIRS`` pair positions (0 here, so every call is past it): the PyTorch ops of
+    ``_tile_plan`` build the tile tables, both host-boundary checks run on the current stream and the row-map fold
+    order on the first side stream."""
+    monkeypatch.setattr(cake_jit, "PLAN_MAX_PAIRS", 0)
+    _check_host_boundaries(layout, kind, device)
+
+
+def _check_host_boundaries(layout, kind, device) -> None:
+    """The checks of :func:`test_host_boundaries_match_the_reference_and_repeat` on ``layout`` at budget ``kind``."""
     name, q_lens, k_lens, h_q, h_kv = layout
     x = _inputs(q_lens, k_lens, h_q, h_kv, device)
     budget = _host_budget(kind, x, h_q, h_kv)
@@ -1187,17 +1204,21 @@ def test_host_boundaries_match_the_reference_and_repeat(layout, kind, device) ->
         _assert_matches_reference(label, x, form, got, ref, dst_init, row_map)
 
 
-def _child_backward(cu_q, cu_k, host_q, host_k, budget) -> subprocess.CompletedProcess:
+def _child_backward(
+    cu_q, cu_k, host_q, host_k, budget, plan_kernel=True
+) -> subprocess.CompletedProcess:
     """A child process (a device-side assert ends its CUDA context) running the forward, then the backward with the
     host boundaries ``host_q`` / ``host_k`` on device boundaries ``cu_q`` / ``cu_k``; it prints ``forward`` and
-    ``backward`` after each synchronizes."""
+    ``backward`` after each synchronizes.  ``plan_kernel=False`` sets ``PLAN_MAX_PAIRS`` to 0 in the child, so the
+    PyTorch ops build the tile tables and the checks run on the current stream."""
     t_q, t_k = cu_q[-1], cu_k[-1]
     code = (
         "import importlib, sys\n"
         f"sys.path[:0] = {sys.path!r}\n"
         "import torch\n"
         f"b = importlib.import_module({cake_backend.__name__!r})\n"
-        "d = torch.device('cuda:0')\n"
+        + ("" if plan_kernel else "b.cake_jit.PLAN_MAX_PAIRS = 0\n")
+        + "d = torch.device('cuda:0')\n"
         "g = torch.Generator(device=d).manual_seed(0)\n"
         "r = lambda *s: torch.randn(*s, generator=g, device=d).to(torch.bfloat16)\n"
         f"q, k, v, do = r({t_q}, 24, 256), r({t_k}, 4, 256), r({t_k}, 4, 256), r({t_q}, 24, 256)\n"
@@ -1221,7 +1242,7 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
     """Host boundaries that disagree with the device ones: within the plan (the same tiles per key block) the call
     runs and gives out, lse, dK and dV of the device boundaries; a device key segment longer than the plan's key
     blocks, or device tiles that overfill a range, fire the device-side assert before the main kernel writes (each in
-    a child process)."""
+    a child process, with the tile tables of the plan kernel and of the PyTorch ops)."""
     h_q, h_kv = 24, 4
     device_lens = ((2990, 10), (2990, 10))
     swapped = ((10, 2990), (10, 2990))  # other boundaries, the same tiles per key block
@@ -1289,16 +1310,17 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
             None,
         ),
     }
-    for label, (cu_q, cu_k, host_q, host_k, budget) in cases.items():
-        result = _child_backward(cu_q, cu_k, host_q, host_k, budget)
+    for (label, args), plan_kernel in itertools.product(cases.items(), (True, False)):
+        result = _child_backward(*args, plan_kernel=plan_kernel)
+        where = (label, "plan kernel" if plan_kernel else "PyTorch tables")
         assert result.stdout.split() == ["forward"], (
-            label,
+            where,
             result.stdout,
             result.stderr[-2000:],
         )
-        assert result.returncode != 0, (label, result.stderr[-2000:])
+        assert result.returncode != 0, (where, result.stderr[-2000:])
         assert "device-side assert" in result.stderr or "disagree" in result.stderr, (
-            label,
+            where,
             result.stderr[-2000:],
         )
 
