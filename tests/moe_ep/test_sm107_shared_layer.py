@@ -300,7 +300,12 @@ def test_shared_candidates_match_routed(variant):
     routed = dataclasses.replace(cfg, shared_quant_kind=None)
     valid = [k for k in candidates if is_valid_sm107(k, cfg)]
     assert valid == [k for k in candidates if is_valid_sm107(k, routed)]
-    assert valid
+    assert {(k["mma_tiler_mnk"][1], k["schedule_policy"][0]) for k in valid} >= {
+        (128, "grouped"),
+        (128, "phase_interleave"),
+        (256, "grouped"),
+        (256, "phase_interleave"),
+    }
 
 
 def test_shared_trial_preserves_prepared_payload():
