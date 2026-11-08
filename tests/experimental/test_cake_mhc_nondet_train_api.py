@@ -54,8 +54,9 @@ unchanged.  This module checks:
   give with the mode off (with ``warn_only``, ``backward_finish`` gives no
   alert and the same bits); a deterministic backward workspace (smaller than
   this package's layout) is refused; a deterministic prepare handle is refused
-  by ``cake_mhc_nondet_train_finish``; a hidden size runs exactly where the
-  deterministic package runs it;
+  by ``cake_mhc_nondet_train_finish``; on sm_100a / sm_103a a hidden size runs
+  exactly where the deterministic package runs it; on sm_107a this package
+  runs hidden 4096 only;
 * training with this package composed with the model's deterministic head
   (``flashinfer.cake_mhc_head_det_train.cake_mhc_head_det``, the stream mean
   of the last layer): the gradients reach every leaf through the head and
