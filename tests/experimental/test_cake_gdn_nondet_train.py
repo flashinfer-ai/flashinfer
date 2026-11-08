@@ -1280,6 +1280,7 @@ def _small_device(monkeypatch, device, sm_count: int) -> None:
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     monkeypatch.setattr(cake_chain, "_DHU_AUTO", {})
     monkeypatch.setattr(cake_chain, "_SDT_AUTO", {})
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
 
 
 def _record_streams(monkeypatch) -> list[tuple[str, int]]:
@@ -4320,3 +4321,245 @@ def test_adjoint_split_packed_views_give_the_contiguous_bits(
     want = _run(inputs, seq_lens)
     got = _run_packed(inputs, seq_lens, heads)
     _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- the backward plan
+
+
+def _logged_launches(monkeypatch) -> list:
+    """Every launch from here on as (stage, grid, stream, the values: a tensor by its shape, strides and dtype, a
+    scalar itself)."""
+    log = []
+    launch = cake_backend.launch_stage
+
+    def logged(stage, grid, values, **kwargs):
+        stream = torch.cuda.current_stream(kwargs["device_index"]).cuda_stream
+        args = tuple(
+            (tuple(v.shape), v.stride(), v.dtype) if isinstance(v, torch.Tensor) else v
+            for v in values
+        )
+        log.append((stage, tuple(grid), stream, args))
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", logged)
+    return log
+
+
+def _counted_replays(monkeypatch) -> list:
+    """The plan of every backward that replays one (:func:`cake_chain._replay`), in order."""
+    replays = []
+    replay = cake_chain._replay
+
+    def counted(plan, *args):
+        replays.append(plan)
+        return replay(plan, *args)
+
+    monkeypatch.setattr(cake_chain, "_replay", counted)
+    return replays
+
+
+# case -> (sequence lengths, or None for an equal-length batch of two 640-token sequences; (H, HV); "packed" for the
+# head views of one packed row, else contiguous q / k / v; the call's keywords, "h0" for an initial state)
+BWD_PLAN_CASES = {
+    "packed-g3": ((300, 77, 640, 17), (2, 6), "packed", {}),
+    "packed-g2": ((300, 77, 640, 17), (2, 4), "packed", {}),
+    "g3-h1-h0": ((64, 1, 2049), (1, 3), "views", {"h0": True}),
+    "tail-one-stream": (TAIL_LAYOUT, (2, 6), "views", {"tail": "tail", "streams": 1}),
+    "tail_g2": (TAIL_LAYOUT, (2, 4), "views", {"tail": "tail_g2"}),
+    "unfused": (TAIL_LAYOUT, (2, 4), "views", {"tail": "unfused"}),
+    "equal-length": (None, (2, 6), "views", {}),
+}
+
+
+def _plan_case(case, device):
+    """The inputs and the forward + backward of a :data:`BWD_PLAN_CASES` case, and the names it returns."""
+    seq_lens, heads, form, pins = BWD_PLAN_CASES[case]
+    pins = dict(pins)
+    layout, batch = (seq_lens, 1) if seq_lens is not None else ((640,), 2)
+    inputs = _inputs(layout, heads, torch.bfloat16, device, seed=7101, batch=batch)
+    h0 = None
+    if pins.pop("h0", False):
+        gen = torch.Generator().manual_seed(7102)
+        h0 = (
+            0.1 * torch.randn(len(layout), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+        ).to(device)
+
+    def run():
+        if form == "packed":
+            return _run_packed(inputs, seq_lens, heads, **pins)
+        return _run(inputs, seq_lens, initial_state=h0, **pins)
+
+    return run, OUTPUT_NAMES + (("dh0",) if h0 is not None else ())
+
+
+@pytest.mark.parametrize("case", list(BWD_PLAN_CASES), ids=list(BWD_PLAN_CASES))
+def test_the_backward_plan_replays_the_general_path(case, device, monkeypatch) -> None:
+    # resolve before launch: the first backward of a key runs the general path and records it as a plan, the later
+    # ones replay the plan: the launches of the general path (BWD_PLAN off; stage, grid, stream, every value's shape,
+    # strides and dtype, every scalar) and its bits on every output
+    run, names = _plan_case(case, device)
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    log = _logged_launches(monkeypatch)
+    replays = _counted_replays(monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        general = run()
+    assert not cake_chain._BWD_PLANS
+    general_launches = list(log)
+    log.clear()
+    recorded = run()
+    assert log == general_launches and not replays
+    (plan,) = cake_chain._BWD_PLANS.values()
+    assert plan.ops is not None, "this call's backward has a plan"
+    log.clear()
+    runs = [run() for _ in range(2)]
+    assert log == general_launches * 2
+    assert len(replays) == 2 and all(p is plan for p in replays)
+    for got in (recorded, *runs):
+        _assert_same_bits(got, general, names)
+
+
+def test_the_backward_plan_holds_no_tensor_of_a_call(device, monkeypatch) -> None:
+    # a plan's tensors are views of the stream's pooled workspaces and of the layout's chunk tables: a replayed call
+    # leaves the device memory where it was once its outputs and gradients are dropped
+    seq_lens, heads = (300, 77, 640, 17), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7103)
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    replays = _counted_replays(monkeypatch)
+    for _ in range(2):  # the workspaces, the tables and the plan
+        _run_packed(inputs, seq_lens, heads)
+    (plan,) = cake_chain._BWD_PLANS.values()
+    constants: set = set()
+    for buffers in cake_chain._POOLED.tables[plan.stream].values():
+        cake_chain._storages(list(buffers.values()), constants)
+    cake_chain._storages(
+        list(cake_chain._POOLED.zeroed.get(plan.stream, {}).values()), constants
+    )
+    cake_chain._storages(plan.meta, constants)
+    held = [
+        v
+        for op in plan.ops
+        if op[0] == cake_chain._OP_LAUNCH
+        for v in op[4]
+        if isinstance(v, torch.Tensor)
+    ]
+    assert held and all(v.untyped_storage().data_ptr() in constants for v in held)
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated(device)
+    got = _run_packed(inputs, seq_lens, heads)
+    assert len(replays) == 2
+    del got
+    gc.collect()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == before
+
+
+def test_the_backward_plan_follows_the_module_globals_and_the_pool(
+    device, monkeypatch
+) -> None:
+    # a plan replays only with the module globals, cake_backend.device_arch and the stream's pool tables it was
+    # recorded with: another object in their place, or a cleared pool, sends the call to the general path, which
+    # records a new plan; the bits never change.  The package tail ("tail") takes zeroed buffers of the pool too
+    seq_lens, heads = (300, 77, 640, 17), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7104)
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    replays = _counted_replays(monkeypatch)
+
+    def run():
+        return _run(inputs, seq_lens, tail="tail")
+
+    want = run()
+    arch_of, segments = cake_backend.device_arch, cake_chain.tail_segments
+    changes = (
+        lambda: monkeypatch.setattr(
+            cake_backend, "device_arch", lambda index: arch_of(index)
+        ),
+        lambda: monkeypatch.setattr(
+            cake_chain, "tail_segments", lambda *a, **k: segments(*a, **k)
+        ),
+        lambda: cake_chain._POOLED.tables.clear(),
+        lambda: cake_chain._POOLED.zeroed.clear(),
+    )
+    _assert_same_bits(run(), want, OUTPUT_NAMES)
+    assert len(replays) == 1
+    for i, change in enumerate(changes):
+        change()
+        _assert_same_bits(run(), want, OUTPUT_NAMES)  # the general path records
+        assert len(replays) == 1 + i, i
+        _assert_same_bits(run(), want, OUTPUT_NAMES)
+        assert len(replays) == 2 + i, i
+
+
+@pytest.mark.parametrize(
+    "why", ["device-route", "no-host-cache", "no-save-state", "dht", "off"]
+)
+def test_calls_without_a_backward_plan_keep_the_general_path(
+    why, device, monkeypatch
+) -> None:
+    # no plan for the device route (a new table per call), without the host cache or the kept tape, with a
+    # final-state gradient, or with BWD_PLAN off: every backward runs the general path, run to run the same bits
+    seq_lens, heads = (300, 77, 640, 17), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7105)
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    replays = _counted_replays(monkeypatch)
+    kwargs: dict = {
+        "device-route": {"route": "device"},
+        "no-host-cache": {"host_cache": False},
+        "no-save-state": {"save_state": False},
+        "off": {},
+    }.get(why, {})
+    names = OUTPUT_NAMES
+    if why == "dht":
+        gen = torch.Generator().manual_seed(7106)
+        dht = torch.randn(
+            len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen
+        ).to(device)
+        kwargs = {"output_final_state": True, "dht": dht}
+        names = OUTPUT_NAMES + ("final_state",)
+    elif why == "off":
+        monkeypatch.setattr(cake_chain, "BWD_PLAN", False)
+    runs = [_run(inputs, seq_lens, **kwargs) for _ in range(3)]
+    assert not replays and not cake_chain._BWD_PLANS
+    for got in runs[1:]:
+        _assert_same_bits(got, runs[0], names)
+
+
+def test_the_backward_plan_under_activation_checkpointing(device, monkeypatch) -> None:
+    # torch.utils.checkpoint (no reentrant): the backward recomputes the forward for its saved list and replays the
+    # plan of the first forward's key; the bits of the general path
+    seq_lens, heads = (300, 77, 640, 17), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7107)
+    cu = _cu(seq_lens)
+    cu_dev, cu_cpu = (
+        torch.tensor(cu, dtype=torch.int64, device=device),
+        torch.tensor(cu, dtype=torch.int64),
+    )
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    replays = _counted_replays(monkeypatch)
+
+    def f(q, k, v, g, beta):
+        o, _ = cake_gdn_nondet(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_dev,
+                               cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
+        return o
+
+    def step():
+        leaves = [
+            inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        o = checkpoint(f, *leaves, use_reentrant=False)
+        (o.float() * inputs["do"].float()).sum().backward()
+        torch.cuda.synchronize()
+        return {
+            "o": o.detach(),
+            **{name: t.grad for name, t in zip(GRAD_NAMES, leaves, strict=True)},
+        }
+
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        want = step()
+    runs = [step() for _ in range(3)]
+    assert len(replays) == 2
+    for got in runs:
+        _assert_same_bits(got, want, OUTPUT_NAMES)

@@ -263,6 +263,19 @@ inside the capture when the capture creates it); replay one captured graph at
 a time, not concurrently with itself or with eager calls on its capture
 stream.  A value-head group of one uses no workspace.
 
+The autograd backward of a host-table or equal-length call with
+`host_cache=True` and the kept tape is planned before it launches.  Its first
+call for a layout, stream and set of arguments records its launches, the
+gradients it allocates and its stream switches.  Later calls replay that
+record: the saved tensors, `do` and the new gradients fill its slots, and
+every other argument is a pooled workspace of the stream, a chunk table of
+the layout or a scalar.  The record holds no tensor of a call.  A replay
+needs the same stream, a contiguous `do`, no final-state gradient, the
+stream's pool tables and the module tables the record was made with;
+otherwise the call runs the general path and records again.  A replay makes
+the same launches as the general path, so the bits are the same.
+`cake_chain.BWD_PLAN = False` keeps every call on the general path.
+
 On the host-table route the long sequences start first.  The tables list the
 sequences by chunk count, longest first (ties in the caller's order); every
 chunk keeps its token offset, the initial-state rows are gathered into that
@@ -341,7 +354,7 @@ tail rule show.
 | `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits as `"reg"` on `dhu_tc2`, within the budgets on `dhu_tc2_dvl32`) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward state of the architecture's tape level for the backward (`T_full`: `w`, `h`, `v_new`; `u`, read only to rebuild `h` / `v_new`, is freed when the forward returns); `False` recomputes them |
-| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
+| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections, the per-stream workspaces and the backward's launch record between calls |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order |
 | `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream |
 | `tail` | rule | backward tail (see Chain): `"tail"`, `"tail_g2_f32x"` or `"tail_g2"` (`HV == 2 * H` only), `"tail_g3_f32x"` or `"tail_g3"` (`HV == 3 * H` only) or `"unfused"` |
