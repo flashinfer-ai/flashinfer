@@ -1615,7 +1615,8 @@ def test_round15_store_hint_knob():
     assert b200.store_hint == "none" and "_so" not in _nopro(b200.template)
     # the sm_100a / sm_103a rules of the batched MLA rows (64 heads): the eight-warp programs with the head interleave,
     # over all 64 heads for the absorbed-query forward and over 8 heads with the evict_last stores for the
-    # value-projection input gradient (raster group 4 on sm_100a, 2 on sm_103a); served by registered programs
+    # value-projection input gradient (raster group 4 on sm_100a, 2 on sm_103a), and the ten-warp quad-store program with
+    # the interleave over 8 heads for the value-projection forward at the training T; served by registered programs
     for arch, sm_count in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)):
         for row, op, template, group, group_m in (
             ("qabs", "fwd", "dense_proj_det_gemm_kn_n256_tma1_bg64_w8rs", 64, 2),
@@ -1640,6 +1641,29 @@ def test_round15_store_hint_knob():
             where = (arch, sm_count, row, op)
             assert gb.template == template and gb.batch_group == group, where
             assert gb.group_m == group_m and gb.form == "w8rs", where
+            assert template in cake_jit.KERNELS[arch], where
+        # the value-projection forward: the quad-store register program with the interleave over 8 heads at the training
+        # T alone (T-exact keys), the program without it at another T (the ragged rule)
+        for T, template, group in (
+            (16172, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (16231, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (16384, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (1001, "dense_proj_det_gemm_kk_n256_q_pro7", 0),
+            (4095, "dense_proj_det_gemm_kk_n256_q_pro7", 0),
+        ):
+            v = _views("mla", "vproj", "fwd", "bf16", T)
+            gb, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=sm_count,
+                l2_bytes=L2_BYTES,
+                arch=arch,
+                _fallback=False,
+            )
+            where = (arch, sm_count, T)
+            assert gb.template == template and gb.batch_group == group, where
+            assert gb.epi == "reg" and gb.promo == "l2_256b" and not gb.form, where
             assert template in cake_jit.KERNELS[arch], where
 
 
@@ -3350,7 +3374,8 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # keys (test_sm107a_ragged_wgrad_rules_plan_their_programs); the MLA absorbed-query forward adds one sm_100a key
     # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 10 sm_107a keys and re-values 2
     # (test_sm107a_212_tranche_rules_plan_their_programs); the MLA value-projection input gradient's head-interleaved
-    # raster adds one sm_103a key (test_round15_store_hint_knob)
+    # raster adds one sm_103a key (test_round15_store_hint_knob); the MLA value-projection forward's raster adds three
+    # sm_100a T-exact keys (test_round15_store_hint_knob)
     assert (
         len(ROW_RULES)
         == 109
@@ -3376,10 +3401,11 @@ def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
         + 1
         + 10
         + 1
+        + 3
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
-        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 6
+        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 6 + 3
     )
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 10
     assert (
@@ -7556,6 +7582,26 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
                     if own_key in ROW_RULES:
                         src = own_key
                         break
+                else:
+                    # without an own rule the parent's T-exact key wins over the parent's ragged rule at its T (the MLA
+                    # value-projection forward at T 16231); the ragged rule still plans one token less
+                    parent_exact = ("sm_100a",) + key[:5] + dims
+                    if M is None and parent_exact in ROW_RULES:
+                        assert (
+                            cake_backend._measured_row_rule(
+                                "sm_103a",
+                                a_mn,
+                                b_mn,
+                                out_f32,
+                                out_t,
+                                batched,
+                                N,
+                                K,
+                                16230,
+                            )
+                            == ROW_RULES[src]
+                        ), key
+                        src = parent_exact
             assert (
                 cake_backend._measured_row_rule(
                     "sm_103a", a_mn, b_mn, out_f32, out_t, batched, *dims
@@ -9134,6 +9180,8 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
         and not key[1]
         and not key[3]
         and not key[4]
+        # the batched MLA T-exact keys are test_round15_store_hint_knob's
+        and not key[5]
         and key[8] is not None
     )
     assert exact == [key for key in GB_T_EXACT_KEYS if key[0] == arch]
