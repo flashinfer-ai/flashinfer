@@ -35,6 +35,7 @@ from .ptx_helpers import (
     ldg_b32_raw,
     ldg_f32_raw,
     read_clock64,
+    multimem_red_add_release_sys_s32_raw,
     red_add_relaxed_sys_u64_raw,
     red_add_release_sys_s32_raw,
     red_add_release_sys_u64_raw,
@@ -48,6 +49,12 @@ from .flag_batch import GpuReleaseFlagBatchTracker
 from .sf_swizzle import sf_atom_int32_offset
 from cutlass._mlir import ir
 from moe_nvfp4_swapab.moe_utils import _nanosleep, spin_wait
+
+# POC gate (developer-only, read at trace time like MEGA_USE_NCU): when set,
+# nvlink_barrier replaces its O(world_size) loop of unicast peer atomics with a
+# single NVSwitch multimem.red to the multicast VA of nvlink_barrier_signal
+# (carried as peer_rank_ptr_mapper.mc_base). Default OFF -> baseline unchanged.
+_MEGA_MULTIMEM_BARRIER = os.environ.get("MEGA_MULTIMEM_BARRIER", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -1525,13 +1532,26 @@ class TokenInPullTokenBackPush:
                     target = Int32(0)
 
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
-                if lane_idx < Int32(self.world_size):
-                    lane_peer_addr = peer_rank_ptr_mapper.map(
-                        nbs_local_base,
-                        lane_idx,
-                        Int64(signal_phase * Int32(4)),
-                    )
-                    red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
+                if cutlass.const_expr(_MEGA_MULTIMEM_BARRIER):
+                    # One NVSwitch multimem.red fans +signal_delta to every rank's
+                    # copy of signal[signal_phase]; identical target math (each of
+                    # world_size ranks contributes +delta to every copy) but 1
+                    # instruction instead of world_size unicast peer atomics.
+                    if lane_idx == Int32(0):
+                        mc_signal_addr = Int64(peer_rank_ptr_mapper.mc_base) + Int64(
+                            signal_phase * Int32(4)
+                        )
+                        multimem_red_add_release_sys_s32_raw(
+                            mc_signal_addr, signal_delta
+                        )
+                else:
+                    if lane_idx < Int32(self.world_size):
+                        lane_peer_addr = peer_rank_ptr_mapper.map(
+                            nbs_local_base,
+                            lane_idx,
+                            Int64(signal_phase * Int32(4)),
+                        )
+                        red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
                 cute.arch.sync_warp()
 
                 if lane_idx == 0:

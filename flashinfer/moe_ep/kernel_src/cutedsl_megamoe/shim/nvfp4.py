@@ -48,7 +48,8 @@ from typing import Callable, Literal, Optional, Tuple, Union
 
 import torch
 
-from .comm import (
+from .comm import (  # noqa: F401 (_multicast_base is POC-gated)
+    _multicast_base,
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
@@ -516,6 +517,7 @@ class MegaMoENvfp4Frontend:
             shared_workspace,
             c.world_size,
         )
+        mc_base = _multicast_base(shared_workspace)  # POC: 0 unless gate on
 
         mega = _CompiledMega(
             compiled=None,
@@ -524,6 +526,7 @@ class MegaMoENvfp4Frontend:
             shared_workspace=shared_workspace,
             symmetric_base=symmetric_base,
             peer_offsets_list=peer_offsets_list,
+            mc_base=mc_base,
         )
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
@@ -810,11 +813,19 @@ class MegaMoENvfp4Frontend:
             )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # POC (multimem barrier): absolute multicast VA of nvlink_barrier_signal
+        # = workspace multicast base + its shared-region offset (0 when gate off).
+        mc_signal_base = (
+            mega.mc_base + int(mega.kernel._shared_offsets["nvlink_barrier_signal"])
+            if mega.mc_base
+            else 0
+        )
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=mega.symmetric_base,
             offsets=tuple(mega.peer_offsets_list),
             rank_idx=c.rank,
             num_max_ranks=c.world_size,
+            mc_base=mc_signal_base,
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 

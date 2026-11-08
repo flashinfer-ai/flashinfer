@@ -739,6 +739,24 @@ def _compute_peer_offsets(
     return local_base, peer_offsets_list
 
 
+def _multicast_base(sym_tensor: torch.Tensor) -> int:
+    """POC (multimem barrier): absolute multicast (NVLS) VA base of a symmetric
+    tensor, or 0 when MEGA_MULTIMEM_BARRIER is off / NVLS unavailable. Only
+    created on demand (an NVLS multicast costs an NVSHMEM team)."""
+    if _NO_DIST or os.environ.get("MEGA_MULTIMEM_BARRIER", "0") != "1":
+        return 0
+    try:
+        import nvshmem.core
+
+        mc = nvshmem.core.get_multicast_tensor(
+            nvshmem.core.Teams.TEAM_WORLD, sym_tensor
+        )
+        return int(mc.data_ptr())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[mega_runner] multicast mapping failed ({exc}); barrier stays baseline.")
+        return 0
+
+
 # =============================================================================
 # Tester
 # =============================================================================
@@ -1213,6 +1231,7 @@ class MegaMoETester:
             self.shared_workspace,
             self.world_size,
         )
+        self.mc_base = _multicast_base(self.shared_workspace)  # POC: 0 unless gate on
 
     # ------------------------------------------------------------------
     # Step 4: kernel launch
@@ -1517,11 +1536,19 @@ class MegaMoETester:
         # Runtime payload for the peer pointer mapper.  The generated host
         # wrapper packs these scalar args into ``SymBuffer{world_size}``
         # before launching the device kernel.
+        # POC (multimem barrier): absolute multicast VA of nvlink_barrier_signal.
+        mc_signal_base = (
+            self.mc_base
+            + int(self._kernel._shared_offsets["nvlink_barrier_signal"])
+            if getattr(self, "mc_base", 0)
+            else 0
+        )
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=self.symmetric_base,
             offsets=tuple(self.peer_offsets_list),
             rank_idx=self.rank,
             num_max_ranks=self.world_size,
+            mc_base=mc_signal_base,
         )
 
         runtime_kwargs = dict(

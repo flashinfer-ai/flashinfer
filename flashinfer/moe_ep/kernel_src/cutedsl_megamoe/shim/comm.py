@@ -126,6 +126,35 @@ def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
         raise
 
 
+def _multimem_barrier_enabled() -> bool:
+    # POC gate: must match token_comm._MEGA_MULTIMEM_BARRIER. Only when ON do we
+    # create the NVLS multicast mapping (it costs an NVSHMEM team; creating it
+    # unconditionally can exhaust the team pool in multi-node runs).
+    return os.environ.get("MEGA_MULTIMEM_BARRIER", "0") == "1"
+
+
+def _multicast_base(sym_tensor: torch.Tensor) -> int:
+    """Absolute multicast (NVLS) VA base of a symmetric tensor, or 0 if the gate
+    is off / NVLS is unavailable. The caller adds the signal-region offset."""
+    if not _multimem_barrier_enabled() or _no_dist():
+        return 0
+    try:
+        import nvshmem.core
+
+        mc = nvshmem.core.get_multicast_tensor(
+            nvshmem.core.Teams.TEAM_WORLD, sym_tensor
+        )
+        return int(mc.data_ptr())
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"MEGA_MULTIMEM_BARRIER=1 but multicast mapping failed ({exc}); "
+            "falling back to the loop-of-peer-atomics barrier.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 0
+
+
 def _compute_peer_offsets(
     sym_tensor: torch.Tensor,
     world_size: int,
@@ -172,6 +201,9 @@ class _CompiledMega:
     shared_workspace: torch.Tensor
     symmetric_base: int
     peer_offsets_list: Tuple[int, ...]
+    # POC (multimem barrier): multicast VA base of the shared workspace, or 0
+    # when MEGA_MULTIMEM_BARRIER is off / NVLS unavailable.
+    mc_base: int = 0
     # Launch-kwargs cache: rebuilding the cute tensor views (12x from_dlpack +
     # SymBufferHost) and re-validating inputs costs real host time per launch,
     # and the launch inputs are stable session buffers in steady state.  Keyed
