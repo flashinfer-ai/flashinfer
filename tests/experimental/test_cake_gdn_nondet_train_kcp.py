@@ -1699,6 +1699,7 @@ def test_byte_queries(W) -> None:
                             ctx,
                             H_qk=H_qk,
                             HV=HV,
+                            save_mode="light",
                             boundary_mode=boundary_mode,
                             save_transfer=save_transfer,
                             C=C_CONV,
@@ -1869,6 +1870,7 @@ def test_byte_queries(W) -> None:
                             ctx,
                             H_qk=H_qk,
                             HV=HV,
+                            save_mode="light",
                             boundary_mode=boundary_mode,
                             save_transfer=save_transfer,
                             C=C_CONV,
@@ -5155,6 +5157,8 @@ def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
 
     kcp, ctx, ops = _ckpt_setup()
     H_qk, HV = CKPT_HEADS
+    # a checkpointed call saves as "light" (the default with the norm, "light_akk",
+    # too), so the queries size it with save_mode="light"
     q = dict(
         H_qk=H_qk,
         HV=HV,
@@ -5162,6 +5166,7 @@ def test_kept_form_at_two_segments_follows_the_arena_and_the_hand_off(
         save_transfer=save_transfer,
         with_conv=False,
         use_qk_l2norm_in_kernel=l2n,
+        save_mode="light",
     )
     layout = gb.cake_gdn_nondet_train_kcp_workspace_layout(
         ctx, reuse_recompute_tapes=True, **q
@@ -7119,8 +7124,9 @@ def test_two_rank_light_akk_is_bitwise_light(monkeypatch, save_transfer) -> None
 
         return _run_threaded(kcp, 2, rank_fn, monkeypatch)
 
-    light = run()
+    light = run(save_mode="light")
     akk = run(save_mode="light_akk")
+    default = run()  # the norm's default save mode: "light_akk"
     kcp.graph_cache_clear()
     names = ("out",) + CKPT_GRADS
     for r, c in enumerate(ctxs):
@@ -7148,9 +7154,24 @@ def test_two_rank_light_akk_is_bitwise_light(monkeypatch, save_transfer) -> None
         assert ae["saved_bytes"] - le["saved_bytes"] == tape, r
         assert (
             gb.cake_gdn_nondet_train_kcp_saved_bytes(c, save_mode="light_akk", **q)
-            - gb.cake_gdn_nondet_train_kcp_saved_bytes(c, **q)
+            - gb.cake_gdn_nondet_train_kcp_saved_bytes(c, save_mode="light", **q)
             == tape
         ), r
+        assert gb.cake_gdn_nondet_train_kcp_saved_bytes(
+            c, **q
+        ) == gb.cake_gdn_nondet_train_kcp_saved_bytes(c, save_mode="light_akk", **q)
+        de, dsteps = default[r]
+        for n in names:
+            assert torch.equal(de[n], ae[n]), (r, "default explicit", n)
+        assert de["saved_bytes"] == ae["saved_bytes"], r
+        assert de["bwd"]["akk_source"] == "saved", r
+        assert de["bwd"]["sequence"] == ab["sequence"], r
+        for i, ((dres, _df, dbw), (ares, _af, abw)) in enumerate(
+            zip(dsteps, asteps, strict=True)
+        ):
+            for n in names:
+                assert torch.equal(dres[n], ares[n]), (r, "default step", i, n)
+            assert dbw["sequence"] == abw["sequence"], (r, i)
         for i, ((lres, _lf, lbw), (ares, _af, abw)) in enumerate(
             zip(lsteps, asteps, strict=True)
         ):
@@ -7418,6 +7439,8 @@ def test_workspace_layout_follows_the_arena_of_the_graph_replay_kept_form(
         return got
 
     def layout(reuse) -> dict:
+        # a checkpointed call saves as "light" (the default with the norm, "light_akk",
+        # too), so the query sizes it with save_mode="light"
         return gb.cake_gdn_nondet_train_kcp_workspace_layout(
             ctx,
             H_qk=H_qk,
@@ -7428,6 +7451,7 @@ def test_workspace_layout_follows_the_arena_of_the_graph_replay_kept_form(
             graph="replay",
             reuse_recompute_tapes=reuse,
             use_qk_l2norm_in_kernel=l2n,
+            save_mode="light",
         )
 
     lay = {reuse: layout(reuse) for reuse in (True, False, "auto")}
@@ -7479,7 +7503,9 @@ def test_workspace_layout_option_checks() -> None:
     with pytest.raises(ValueError, match="graph"):
         gb.cake_gdn_nondet_train_kcp_workspace_layout(ctx, graph="on", **q)
     for l2n in (False, True):
-        g = dict(graph="replay", use_qk_l2norm_in_kernel=l2n, **q)
+        # the forms of a checkpointed call, which saves as "light" (the default with
+        # the norm, "light_akk", too)
+        g = dict(graph="replay", use_qk_l2norm_in_kernel=l2n, save_mode="light", **q)
         replay = gb.cake_gdn_nondet_train_kcp_workspace_layout(
             ctx, reuse_recompute_tapes=False, **g
         )
@@ -7641,7 +7667,9 @@ def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch, l2n) -> Non
     places of #1 / #8, and every other launch -- this package's plan (``P_RULE_DEFAULT`` on every rank), its walks,
     merges and exchanges -- is the norm-off launch log's: the option replaces those two programs and nothing else of
     this route."""
-    knobs = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    # the light route: the default with the norm, "light_akk", replays #1 with
+    # fwd_prep_replay_l2n (test_cake_gdn_nondet_train_kcp_light_akk.py)
+    knobs = {"use_qk_l2norm_in_kernel": True, "save_mode": "light"} if l2n else {}
     kcp, part, ops = _mr_setup()
     _res, ctxs, calls, launched = _mr_run(kcp, part, ops, monkeypatch, knobs=knobs)
     for r in range(MR_W):

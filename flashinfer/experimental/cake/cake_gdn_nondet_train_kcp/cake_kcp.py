@@ -73,14 +73,16 @@ Saved set (``boundary_mode="saved"``): ``S_in`` (fresh), the owner's c1
 receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``, with
 ``save_transfer`` or ``save_mode="full"``) and, with
 ``save_mode="full"``, the forward tapes (``h``, ``v_new``, ``w``, ``u``,
-``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (default) keeps the
-boundary tensors only and the backward re-runs #1 and the #2 tape walk from
-the saved ``S_in`` -- no exchange, no transfer walk, no merge, no #5.
+``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (the default without
+the in-kernel norm) keeps the boundary tensors only and the backward re-runs
+#1 and the #2 tape walk from the saved ``S_in`` -- no exchange, no transfer
+walk, no merge, no #5.
 ``boundary_mode="replay"`` keeps nothing and the backward re-runs the whole
 forward exchange.  Every saved tensor travels through
 ``ctx.save_for_backward`` only, so ``torch.utils.checkpoint(use_reentrant=False)``
-retains nothing after a checkpointed forward (#7039).  The opt-in
-``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel`` only) is ``"light"``
+retains nothing after a checkpointed forward (#7039).
+``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel`` only; the default
+there: a call that leaves ``save_mode`` unset runs it) is ``"light"``
 plus #1's BF16 ``Akk`` tape: its light replay runs ``fwd_prep_replay_l2n``,
 #1_l2n reading that tape instead of forming it (no ``K K^T`` Gram, no block
 inverse), every other output bit for bit #1_l2n's.  Under
@@ -6324,6 +6326,12 @@ def _check_saved(saved: CakeGDNNondetKcpSaved, call: CakeGDNNondetKcpCall) -> No
         raise ValueError(
             f"saved: scale {saved.scale} differs from the call's {call.scale}"
         )
+    # the norm flag first: a call that leaves save_mode unset takes its default from it ("light_akk" with the norm,
+    # "light" without), so a flag that differs from the forward's also changes that default
+    if bool(saved.qk_l2norm) != call.l2n:
+        raise ValueError(
+            f"saved: use_qk_l2norm_in_kernel={call.l2n} differs from the forward's ({bool(saved.qk_l2norm)})"
+        )
     if (
         saved.save_transfer != opts.save_transfer
         or saved.exchange != call.exchange
@@ -6337,10 +6345,6 @@ def _check_saved(saved: CakeGDNNondetKcpSaved, call: CakeGDNNondetKcpCall) -> No
             "the forward's"
         )
     _check(saved.S_in, "saved.S_in", (tb.sizes["S_in"],), call.state_dtype, call.device)
-    if bool(saved.qk_l2norm) != call.l2n:
-        raise ValueError(
-            f"saved: use_qk_l2norm_in_kernel={call.l2n} differs from the forward's ({bool(saved.qk_l2norm)})"
-        )
     if call.l2n:
         if saved.qk_rstd is None:
             raise ValueError(
@@ -7097,7 +7101,7 @@ def cake_gdn_nondet_kcp(
     ctx: Any,
     *,
     scale: float | None = None,
-    save_mode: str = _opt.SAVE_MODE_DEFAULT,
+    save_mode: str | None = None,
     boundary_mode: str = _opt.BOUNDARY_MODE_DEFAULT,
     workspace: CakeGDNNondetKcpWorkspace | None = None,
     graph: str = _opt.GRAPH_DEFAULT,
@@ -7109,7 +7113,10 @@ def cake_gdn_nondet_kcp(
     """The differentiable KCP forward: ``out`` like ``v``; gradients for ``q, k, v, g, beta``
     in the backward's order ``(dq, dk, dv, dbeta, dg)``.  With an ``options`` instance, the four literal keywords
     (``save_mode``, ``boundary_mode``, ``graph``, ``use_qk_l2norm_in_kernel``) override it only when they differ from
-    their documented defaults.  ``use_qk_l2norm_in_kernel=True``: the in-kernel per-head L2 norm of q / k (the
+    their documented defaults.  ``save_mode`` left unset (``None``) runs ``"light_akk"`` with
+    ``use_qk_l2norm_in_kernel=True`` and ``"light"`` without it (:class:`CakeGDNNondetKcpOptions`; under
+    ``torch.utils.checkpoint(use_reentrant=False)`` ``"light_akk"`` saves as ``"light"``).
+    ``use_qk_l2norm_in_kernel=True``: the in-kernel per-head L2 norm of q / k (the
     gradient is the exact derivative of ``bf16(q * r)``'s FP32 form at the stored point; module docstring).  ``recompute_handle``
     (:class:`CakeGDNNondetKcpRecomputeHandle`): the checkpoint recompute of this forward exchanges nothing -- it reads the
     incoming states the original forward stored in the handle; needs ``boundary_mode="saved"`` and ``graph="off"``,
@@ -7124,7 +7131,7 @@ def cake_gdn_nondet_kcp(
     (7-8 %) on R200, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
     over = _literal_overrides(
         options,
-        ("save_mode", save_mode, _opt.SAVE_MODE_DEFAULT),
+        ("save_mode", save_mode, None),
         ("boundary_mode", boundary_mode, _opt.BOUNDARY_MODE_DEFAULT),
         ("graph", graph, _opt.GRAPH_DEFAULT),
         (

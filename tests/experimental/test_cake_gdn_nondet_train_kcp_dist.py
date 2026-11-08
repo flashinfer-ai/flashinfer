@@ -2114,7 +2114,7 @@ def _run_rank(
     info["retained_bytes"] = retained
     info["retained_block_bytes"] = retained_block
     # INT3 save_mode decision inputs (G8, M1): this rank's saved-set bytes per save_mode -- the public byte query and
-    # the measured bytes of the saved objects (recorded, not gated: the default stays "light")
+    # the measured bytes of the saved objects (recorded, not gated: the default without the norm stays "light")
     try:
         sb: dict[str, int] = {"T_r": int(q.shape[0])}
         for mode in ("light", "full"):
@@ -2687,7 +2687,9 @@ def _p2_full_arms(saved_pass, arm, info, flags, *, ring: bool, **extra) -> None:
     for full_name, light_name, opts in pairs:
         o = {"segments": 2, "save_transfer": False, **opts, **extra}
         res_full = _nan_allocations_pass(lambda o=o: saved_pass(save_mode="full", **o))
-        res_light = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+        res_light = _nan_allocations_pass(
+            lambda o=o: saved_pass(save_mode="light", **o)
+        )
         arm(light_name, res_light)
         arm(full_name, res_full, res_light, light_name)
         info[full_name] = {
@@ -3818,8 +3820,9 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``cake_gdn_nondet_train_kcp_packed_qkv_views`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
-#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
-# * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
+#   with the norm (``save_mode="light"``) == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the
+#   query's ``qk_rstd`` term; the default with the norm (``"light_akk"``) recorded with its ``Akk`` tape (not gated);
+# * ``save_mode="light_akk"`` (the default with the norm: the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
 #   #1_l2n reading that tape): within the FP64 budgets and against the light form in every form (a2a / ring,
 #   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2``, autograd, checkpoint, CUDA-graph replay
 #   steps on the light steps' workspace); exact: the launch census (the backward's ``fwd_prep_l2n`` becomes the
@@ -4143,8 +4146,9 @@ def _run_rank_l2n(
     )
     del res_off
 
-    # (a) the norm on: the worst of N_REPEAT runs against FP64; every form against FP64 and its partner
-    res = saved_pass(**L2N, test_knobs={"record_qk": True})
+    # (a) the norm on: the worst of N_REPEAT runs against FP64; every form against FP64 and its partner.  The light
+    # arms name save_mode="light" (the default with the norm is "light_akk"; the arms without a save mode run it)
+    res = saved_pass(save_mode="light", **L2N, test_knobs={"record_qk": True})
     rec_fwd_qk, rec_bwd_qk = res["fwd"].get("qk"), res["bwd"].get("qk")
     info["fwd_record"] = {
         k_: v_
@@ -4169,14 +4173,14 @@ def _run_rank_l2n(
     )
     arm("run0", res)
     for i in range(1, N_REPEAT):
-        arm(f"run{i}", saved_pass(**L2N), res, "run0")
+        arm(f"run{i}", saved_pass(save_mode="light", **L2N), res, "run0")
     full = saved_pass(save_mode="full", **L2N, test_knobs={"record_qk": True})
     arm("full", full, res, "run0")
     flags["l2n_full_rebuilds_with_qk_apply"] = (
         T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
     )
     arm("replay", saved_pass(boundary_mode="replay", **L2N), res, "run0")
-    res_nt = saved_pass(save_transfer=False, **L2N)
+    res_nt = saved_pass(save_mode="light", save_transfer=False, **L2N)
     arm("no_save_transfer", res_nt, res, "run0")
     # save_mode="full" without save_transfer under NaN-filled allocations (the M_seg^T plane at P > 1, see _run_rank)
     res_full_nt = _nan_allocations_pass(
@@ -4189,7 +4193,7 @@ def _run_rank_l2n(
     }
     flags["full_no_save_transfer_saves_m_seg"] = info["full_no_save_transfer"]["ok"]
     del res_full_nt, res_nt
-    res_auto = autograd_pass(False, **L2N)
+    res_auto = autograd_pass(False, save_mode="light", **L2N)
     arm("autograd", res_auto, res, "run0")
     for name, opts in (
         ("ckpt_replay_form", {"reuse_recompute_tapes": False}),
@@ -4212,7 +4216,9 @@ def _run_rank_l2n(
     judge.fp64("backward_twice_half", twice, refs, GRADS, half=True)
     del twice
     if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
-        res_ring = saved_pass(exchange="ring", save_transfer=False, **L2N)
+        res_ring = saved_pass(
+            exchange="ring", save_mode="light", save_transfer=False, **L2N
+        )
         arm("ring", res_ring, res, "run0")
         res_ring_full = _nan_allocations_pass(
             lambda: saved_pass(
@@ -4269,7 +4275,7 @@ def _run_rank_l2n(
         tape = int(ctx.R) * HV * 128
         q_light = int(
             gb.cake_gdn_nondet_train_kcp_saved_bytes(
-                ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N
+                ctx, H_qk=H_qk, HV=HV, save_mode="light", with_conv=False, **L2N
             )
         )
         q_akk = int(
@@ -4308,8 +4314,12 @@ def _run_rank_l2n(
                 forms.append(("ring_akk", {"exchange": "ring", "save_transfer": False}))
             for name, opts in forms:
                 o = {**opts, **L2N}
-                lt = _nan_allocations_pass(lambda o=o: saved_pass(**o))
-                lt2 = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                lt = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light", **o)
+                )
+                lt2 = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light", **o)
+                )
                 ak = _nan_allocations_pass(
                     lambda o=o: saved_pass(save_mode="light_akk", **o)
                 )
@@ -4536,6 +4546,7 @@ def _run_rank_l2n(
                 ctx,
                 workspace=ws,
                 graph="replay",
+                save_mode="light",
                 **base,
                 **L2N,
             )
@@ -4550,6 +4561,7 @@ def _run_rank_l2n(
                 saved=saved_g,
                 workspace=ws,
                 graph="replay",
+                save_mode="light",
                 **base,
                 **L2N,
             )
@@ -4710,7 +4722,9 @@ def _run_rank_l2n(
         return kept, nbytes, peak
 
     kept_off, saved_off_b, peak_off = retained()
-    kept_on, saved_on_b, peak_on = retained(**L2N)
+    kept_on, saved_on_b, peak_on = retained(save_mode="light", **L2N)
+    # the default with the norm ("light_akk"): recorded, not gated (+ the Akk tape, 128 R HV bytes, against "light")
+    kept_def, saved_def_b, peak_def = retained(**L2N)
     rstd_bytes = 8 * T_r * H_qk
     info["memory"] = {
         "retained_off": kept_off,
@@ -4720,11 +4734,15 @@ def _run_rank_l2n(
         "fwd_peak_off": peak_off,
         "fwd_peak_on": peak_on,
         "qn_kn_bytes": 2 * T_r * H_qk * 256,
+        "retained_on_default": kept_def,
+        "saved_on_default": saved_def_b,
+        "fwd_peak_on_default": peak_def,
+        "akk_tape_bytes": int(ctx.R) * HV * 128,
     }
     flags["l2n_post_forward_eq_off_plus_rstd"] = kept_on - kept_off == rstd_bytes
     q_on = int(
         gb.cake_gdn_nondet_train_kcp_saved_bytes(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True
+            ctx, H_qk=H_qk, HV=HV, save_mode="light", use_qk_l2norm_in_kernel=True
         )
     )
     q_off = int(gb.cake_gdn_nondet_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV))
