@@ -3075,6 +3075,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ],
             )
+            # The partner thread must finish reading this slot before the
+            # next key tile overwrites it (write-after-read on smem_exchange).
+            self.softmax_exchange_sync_bar.arrive_and_wait()
 
         # find correction factor
         correction_factor = cute.math.exp2(
