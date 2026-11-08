@@ -6415,11 +6415,11 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
 # default_workspace_cache_clear() it does).  The row count of a set changes from pack to pack (each document's rows are padded to
 # whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor is
 # allocated with its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16
-# more) and the call binds the leading [:n] view, so packs of nearby sizes take the same blocks.  A caller-held
-# workspace's arena stays allocated between calls, so nothing is freed and reallocated around its kept set: its calls
-# keep the default pool, whose blocks the set then shares with the step's other allocations.  A saving forward
-# outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd call) keeps its rows in the default pool: they
-# live until each layer's backward, and their blocks then serve the next step's other allocations.
+# more) and resized in place to its rows (the storage keeps the rounded size), so packs of nearby sizes take the same
+# blocks.  A caller-held workspace's arena stays allocated between calls, so nothing is freed and reallocated around
+# its kept set: its calls keep the default pool, whose blocks the set then shares with the step's other allocations.
+# A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd call) keeps its rows in the
+# default pool: they live until each layer's backward, and their blocks then serve the next step's other allocations.
 _MEM_POOL = getattr(torch.cuda, "MemPool", None)
 _USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
 _KEPT_POOLS: dict[int, Any] = {}
@@ -6471,13 +6471,15 @@ def _tape_alloc(
     call.scratch["kept_pool"] = pool is not None
     if pool is None:
         tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
-    else:  # the leading extent rounded up (_kept_extent); the call binds the [:n] view, contiguous at offset 0
+    else:  # the leading extent rounded up (_kept_extent), then resized in place to the call's rows: resize_ keeps
+        # the rounded storage and leaves a contiguous base tensor, not a [:n] view of a temporary base (that view
+        # costs about 4 us of host time per tensor, measured on GB200, before the intra launch of a rows set)
         tape = {}
         with _USE_MEM_POOL(pool, call.device):
             for n in names:
                 rows, *rest = shapes[n]
                 full = _alloc((_kept_extent(rows), *rest), torch.bfloat16, call.device)
-                tape[n] = full[:rows]
+                tape[n] = full.resize_(shapes[n])
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
