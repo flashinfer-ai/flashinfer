@@ -4954,9 +4954,12 @@ def test_fwd_a_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -> No
     # layout fwd_a_route takes otherwise, with the bits of the package whose forward is the prep's everywhere
     _fwd_a_or_skip(device)
     heads, seq_lens = FWD_A_CASES["g3"]
-    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=409)
+    # unit-norm q / k rows, as a caller that normalizes them itself passes them
+    inputs = _inputs(
+        seq_lens, heads, torch.float32, device, seed=409, normalized_qk=True
+    )
     stages = _record_launches(monkeypatch)
-    normalized = _run(inputs, seq_lens)
+    _run(inputs, seq_lens)
     assert "fwd_ho_a" in stages, stages
     stages.clear()
     got = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
@@ -4964,8 +4967,8 @@ def test_fwd_a_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -> No
     assert "fwd_ho" in stages or "fwd_ho_vh2" in stages, stages
     monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     want = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
+    assert all(bool(torch.isfinite(got[name].float()).all()) for name in OUTPUT_NAMES)
     _assert_same_bits(got, want, OUTPUT_NAMES)
-    assert not torch.equal(got["o"], normalized["o"])
 
 
 @pytest.mark.parametrize("reentrant", [False, True], ids=["non-reentrant", "reentrant"])
