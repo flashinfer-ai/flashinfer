@@ -38,6 +38,14 @@ backward without query rows launches nothing and does not alert.  The
 deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
 reserved name (planned) and does not exist yet.
 
+Run to run, with identical inputs on the same GPU:
+
+| Output | Run to run |
+|---|---|
+| `out`, `lse` and the `o_lo` residual (forward) | repeats bit for bit |
+| `dq_latent`, `dq_rope` | repeats bit for bit |
+| `dkv_latent`, `dk_rope`, and the rows accumulated into `dkv_acc` | may vary (unordered FP32 atomic adds) |
+
 | Before | Now |
 |---|---|
 | `flashinfer.dsa_sparse_attention` | `flashinfer.cake_dsa_sparse_attention_nondet_train` |
@@ -553,10 +561,11 @@ it replaced),
 `nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
 accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
 destination map; a persistent token loop, so the host launches them through
-`nope_bwd_launch_grid(num_queries, num_kv, sm_count)`: one CTA per SM --
+`nope_bwd_launch_grid(num_queries, num_kv, sm_count, arch)`: one CTA per SM --
 `min(num_queries, SMs)`, CTA `b` taking tokens `b, b + grid, ...` of the
 launch's `num_queries` tokens (the whole row or the chunk) -- while the launch's
-FP32 `dkv` window `num_kv x 2048 B` is within 64 MiB, else one CTA per token;
+FP32 `dkv` window `num_kv x 2048 B` is within 128 MiB on SM100 / SM103 and
+64 MiB on SM107, else one CTA per token;
 the SM count is read once per device), `nope_bwd_compact` (the rope compaction kernel),
 `nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
 and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
