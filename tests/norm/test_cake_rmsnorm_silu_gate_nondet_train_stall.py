@@ -103,11 +103,9 @@ and SM103; 59 on SM107, also at 10 and 30) keeps
 its speed beside the one-thread kernel, starts beside the all-SM kernel with
 the max-shared carveout, and beside a side kernel that holds ``k`` SMs (the
 item 1 side kernels and 16 CTAs of 1024 threads with the max-shared carveout)
-ends no later than this package's plain forward at the same rows (the role's
-module, one 64-thread CTA per block of 8 rows: a reference grid that
-``FORWARD_BANDS`` does not route; past the short band the mid forward runs)
-beside the same side kernel: the busy median
-is at most the plain forward's busy median times ``1 +
+ends no later than the deterministic forward (the deterministic package's
+plain forward module, whatever the rows) beside the same side kernel: the busy
+median is at most the deterministic forward's busy median times ``1 +
 PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of the
 event timer (about 1 microsecond on SM103) and a half, the calls taking a few
 microseconds.  The two forwards' alone / busy pairs alternate round by round
@@ -150,6 +148,8 @@ from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
+det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
+det_loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
 forward = pkg.cake_rmsnorm_silu_gate_nondet_train_forward
 backward = pkg.cake_rmsnorm_silu_gate_nondet_train_backward
 workspace_for = pkg.cake_rmsnorm_silu_gate_nondet_train_backward_workspace
@@ -930,6 +930,10 @@ SHORT_MAX_ALONE_SPREAD = 1.7
 SHORT_EXTRA_ATTEMPTS = 2
 
 
+def _det_plain(arch, role, rows, sm_count):
+    return det_loader.route_module(arch, role)
+
+
 def _short_forward_tokens(rows_per_sm: int) -> int:
     """The most tokens ``T`` (at least one) whose ``T * H`` rows stay within
     ``rows_per_sm`` rows per SM, one of the architecture's
@@ -1021,57 +1025,59 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
     tokens = _short_forward_tokens(rows_per_sm)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
-    y_plain = torch.empty_like(x)
-    plain = loader.route_module(loader.device_arch(x.device.index), "fwd")
+    y_det = torch.empty_like(x)
 
     def call():
         return (forward(x, z, w, EPS, out=y),)
 
-    def call_plain():
-        # the reference: this package's plain forward (the role's module, a
-        # grid FORWARD_BANDS does not route; past the short band the mid
-        # forward runs)
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(pkg, "module_for_rows", lambda *_args: plain)
-            return (forward(x, z, w, EPS, out=y_plain),)
+    def call_det():
+        # the deterministic package's plain forward module whatever the rows
+        routed = det_loader.module_for_rows
+        det_loader.module_for_rows = _det_plain
+        try:
+            return (
+                det_pkg.cake_rmsnorm_silu_gate_det_train_forward(
+                    x, z, w, EPS, out=y_det
+                ),
+            )
+        finally:
+            det_loader.module_for_rows = routed
 
     spin = _spin(carveout, ctas=ctas, threads=threads)
     side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
     attempts = 1 + SHORT_EXTRA_ATTEMPTS
     for attempt in range(1, attempts + 1):
-        short_medians, plain_medians = _interleaved_paired_medians(
-            (call, call_plain), spin, PROPORTIONAL_RUNS
+        short_medians, det_medians = _interleaved_paired_medians(
+            (call, call_det), spin, PROPORTIONAL_RUNS
         )
         alone_ms, busy_ms, alone, busy = short_medians
-        plain_alone_ms, plain_busy_ms, plain_alone, plain_busy = plain_medians
+        det_alone_ms, det_busy_ms, det_alone, det_busy = det_medians
         alone_min_ms = min(t for t, _ in alone)
-        plain_alone_min_ms = min(t for t, _ in plain_alone)
-        spread = max(alone_ms / alone_min_ms, plain_alone_ms / plain_alone_min_ms)
+        det_alone_min_ms = min(t for t, _ in det_alone)
+        spread = max(alone_ms / alone_min_ms, det_alone_ms / det_alone_min_ms)
         counts = spread <= SHORT_MAX_ALONE_SPREAD
         print(
             f"HELD stage=short_forward tokens={tokens} heads={H} side={side} "
             f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
-            f"plain_alone_ms={plain_alone_ms:.4f} "
-            f"plain_busy_ms={plain_busy_ms:.4f} "
-            f"busy_vs_plain={busy_ms / plain_busy_ms:.3f} "
-            f"alone_min_ms={alone_min_ms:.4f} "
-            f"plain_alone_min_ms={plain_alone_min_ms:.4f} "
+            f"det_alone_ms={det_alone_ms:.4f} det_busy_ms={det_busy_ms:.4f} "
+            f"busy_vs_det={busy_ms / det_busy_ms:.3f} "
+            f"alone_min_ms={alone_min_ms:.4f} det_alone_min_ms={det_alone_min_ms:.4f} "
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
         # each module's y repeats its own bits (two programs may associate a
         # row's sum of squares differently)
         _check_outputs("forward", tokens, alone, busy)
-        _check_outputs("forward", tokens, plain_alone, plain_busy)
+        _check_outputs("forward", tokens, det_alone, det_busy)
         if counts:
             break
     assert (
-        busy_ms <= plain_busy_ms * (1 + PROPORTIONAL_SLACK)
-        or busy_ms - plain_busy_ms <= SHORT_EXTRA_MS
+        busy_ms <= det_busy_ms * (1 + PROPORTIONAL_SLACK)
+        or busy_ms - det_busy_ms <= SHORT_EXTRA_MS
     ), (
         f"tokens={tokens}: beside {ctas} x {threads} side CTAs ({side}) the short "
-        f"forward took {busy_ms:.4f} ms, this package's plain forward "
-        f"{plain_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
+        f"forward took {busy_ms:.4f} ms, the deterministic forward "
+        f"{det_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
         f"{SHORT_EXTRA_MS} ms more; measurement {attempt} of at most {attempts}, "
         f"alone spread {spread:.3f}, "
         + ("counted)" if counts else f"none counted: above {SHORT_MAX_ALONE_SPREAD})")
