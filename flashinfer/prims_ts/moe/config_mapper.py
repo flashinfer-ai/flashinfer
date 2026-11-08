@@ -183,6 +183,38 @@ def _next_power_of_two(value: float) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _is_expert_parallel(num_local_experts: int | None, num_experts: int | None) -> bool:
+    """True when this rank holds only a slice of the routed experts."""
+    if num_local_experts is None or num_experts is None:
+        return False
+    return int(num_experts) > int(num_local_experts)
+
+
+def _avg_tokens_per_expert(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    num_experts: int | None,
+) -> float:
+    if num_local_experts <= 0:
+        raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
+    # Tokens pick their top-k out of every expert, so a local expert receives
+    # num_tokens * top_k / num_experts rows on average, whatever the EP split.
+    selection_experts = num_local_experts if num_experts is None else int(num_experts)
+    if selection_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {selection_experts}")
+    return float(num_tokens * top_k) / float(selection_experts)
+
+
+def _center_tile_n(avg_tokens_per_expert: float, supported_tiles: Sequence[int]) -> int:
+    """Smallest supported tile that covers the average expert-token count."""
+    return min(
+        max(_next_power_of_two(avg_tokens_per_expert), supported_tiles[0]),
+        supported_tiles[-1],
+    )
+
+
 def _selected_tile_ns(
     *,
     num_tokens: int | None,
@@ -193,16 +225,13 @@ def _selected_tile_ns(
 ) -> tuple[int, ...]:
     if num_tokens is None or top_k is None or num_local_experts is None:
         return (supported_tiles[-1],)
-    if num_local_experts <= 0:
-        raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
-    selection_experts = num_local_experts if num_experts is None else int(num_experts)
-    if selection_experts <= 0:
-        raise ValueError(f"num_experts must be positive, got {selection_experts}")
-    avg_tokens_per_expert = float(num_tokens * top_k) / float(selection_experts)
-    center_tile = min(
-        max(_next_power_of_two(avg_tokens_per_expert), supported_tiles[0]),
-        supported_tiles[-1],
+    avg_tokens_per_expert = _avg_tokens_per_expert(
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        num_experts=num_experts,
     )
+    center_tile = _center_tile_n(avg_tokens_per_expert, supported_tiles)
     center_idx = supported_tiles.index(center_tile)
     selected_tiles = {center_tile}
     for offset in (1, 2):
@@ -240,13 +269,33 @@ def _default_tile_n(
     num_experts: int | None = None,
     supported_tiles: Sequence[int] = SUPPORTED_BF16_TILE_N,
 ) -> int:
-    return _selected_tile_ns(
+    selected = _selected_tile_ns(
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
         num_experts=num_experts,
         supported_tiles=supported_tiles,
-    )[0]
+    )
+    if (
+        num_tokens is not None
+        and top_k is not None
+        and _is_expert_parallel(num_local_experts, num_experts)
+    ):
+        # Under expert parallelism a local expert sees few rows but its
+        # weights are streamed once per token tile, so the untuned default is
+        # the smallest tile that covers the average rather than the narrower
+        # neighbour, which would read every expert's weights twice.
+        avg_tokens_per_expert = _avg_tokens_per_expert(
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            num_experts=num_experts,
+        )
+        for tile in selected:
+            if tile >= avg_tokens_per_expert:
+                return tile
+        return selected[-1]
+    return selected[0]
 
 
 def _parse_tactic(
@@ -777,9 +826,8 @@ def _same_batch_mode(fc1_index: int, fc2_index: int, *, sm_arch: int) -> bool:
     )
 
 
-def _resolve_moe_json_config_pair(
+def _sorted_moe_json_config_pairs(
     tile_n: int,
-    moe_config_index: int,
     *,
     sm_arch: int,
     activation_type: int,
@@ -795,9 +843,7 @@ def _resolve_moe_json_config_pair(
     fc2_use_per_token_sf_b: bool | None = None,
     per_token_sf_dtype: int | None = None,
     weight_layout: int = int(WeightLayout.MajorK),
-) -> tuple[_JsonBatchedGemmConfig, _JsonBatchedGemmConfig] | None:
-    if moe_config_index < 0:
-        return None
+) -> list[tuple[int, int]]:
     fc1_indices = _moe_json_passing_indices(
         sm_arch=sm_arch,
         tile_n=tile_n,
@@ -892,6 +938,22 @@ def _resolve_moe_json_config_pair(
                 ),
             )
         )
+    return config_pairs
+
+
+def _resolve_moe_json_config_pair(
+    tile_n: int,
+    moe_config_index: int,
+    *,
+    sm_arch: int,
+    dtype_label: str,
+    **kwargs,
+) -> tuple[_JsonBatchedGemmConfig, _JsonBatchedGemmConfig] | None:
+    if moe_config_index < 0:
+        return None
+    config_pairs = _sorted_moe_json_config_pairs(
+        tile_n, sm_arch=sm_arch, dtype_label=dtype_label, **kwargs
+    )
     total = len(config_pairs)
     if moe_config_index >= total:
         raise ValueError(
@@ -902,6 +964,37 @@ def _resolve_moe_json_config_pair(
     return _json_config_by_global_index(
         fc1_index, sm_arch=sm_arch
     ), _json_config_by_global_index(fc2_index, sm_arch=sm_arch)
+
+
+def _json_config_is_persistent(cfg: _JsonBatchedGemmConfig) -> bool:
+    return str(cfg.options.get("tile_scheduler", "static")).lower() == "persistent"
+
+
+def _default_moe_config_index(
+    tile_n: int,
+    *,
+    sm_arch: int,
+    prefer_persistent_scheduler: bool,
+    **kwargs,
+) -> int:
+    """Config pair index the untuned ``[-1, -1]`` tactic resolves to.
+
+    Index 0 unless a persistent-scheduler pair is preferred: the static
+    scheduler launches the worst-case token-tile grid, which under expert
+    parallelism is num_experts / num_local_experts times the real work.
+    """
+    if not prefer_persistent_scheduler:
+        return 0
+    for index, (fc1_index, fc2_index) in enumerate(
+        _sorted_moe_json_config_pairs(tile_n, sm_arch=sm_arch, **kwargs)
+    ):
+        if _json_config_is_persistent(
+            _json_config_by_global_index(fc1_index, sm_arch=sm_arch)
+        ) and _json_config_is_persistent(
+            _json_config_by_global_index(fc2_index, sm_arch=sm_arch)
+        ):
+            return index
+    return 0
 
 
 def _ensure_json_config_supported_by_ts(cfg: _JsonBatchedGemmConfig) -> None:
@@ -1411,6 +1504,7 @@ def _make_default_json_moe_config_pair(
     num_tokens: int | None = None,
     top_k: int | None = None,
     num_experts: int | None = None,
+    prefer_persistent_scheduler: bool = False,
 ) -> PrimsTsGemmPair | None:
     fc1_indices = _moe_json_passing_indices(
         sm_arch=sm_arch,
@@ -1442,10 +1536,28 @@ def _make_default_json_moe_config_pair(
     )
     if not fc1_indices or not fc2_indices:
         return None
+    moe_config_index = _default_moe_config_index(
+        tile_n,
+        sm_arch=sm_arch,
+        prefer_persistent_scheduler=prefer_persistent_scheduler,
+        activation_type=activation_type,
+        dtype_a=dtype_a,
+        dtype_b=dtype_b,
+        fc1_dtype_c=fc1_dtype_c,
+        fc2_dtype_c=fc2_dtype_c,
+        dtype_label=dtype_label,
+        use_deepseek_fp8=use_deepseek_fp8,
+        fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+        fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+        fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+        fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+        per_token_sf_dtype=per_token_sf_dtype,
+        weight_layout=weight_layout,
+    )
     return _make_json_moe_config_pair(
         sm_arch=sm_arch,
         tile_n=tile_n,
-        moe_config_index=0,
+        moe_config_index=moe_config_index,
         activation_type=activation_type,
         dtype_a=dtype_a,
         dtype_b=dtype_b,
@@ -1478,14 +1590,27 @@ def _required_json_moe_config_pair(
     num_tokens: int | None = None,
     top_k: int | None = None,
     num_experts: int | None = None,
+    num_global_experts: int | None = None,
     **kwargs,
 ) -> PrimsTsGemmPair:
     sm_arch = _resolve_moe_sm_arch(sm_arch)
     pair = None
     if moe_config_index == -1:
-        for candidate_tile_n in fallback_tile_ns or _fallback_tile_ns_for_label(
-            dtype_label, tile_n
-        ):
+        # ``num_experts`` is the local expert count here (see the callers);
+        # ``num_global_experts`` is the routed total.
+        prefer_persistent = _is_expert_parallel(num_experts, num_global_experts)
+        if fallback_tile_ns is None:
+            fallback_tile_ns = _fallback_tile_ns_for_label(dtype_label, tile_n)
+            if prefer_persistent:
+                # The default tile was chosen to cover the expected rows per
+                # expert; if the menu has no entry for it, try the nearest
+                # narrower tiles before the widest or the narrowest ones.
+                fallback_tile_ns = (
+                    tile_n,
+                    *sorted((t for t in fallback_tile_ns if t < tile_n), reverse=True),
+                    *sorted(t for t in fallback_tile_ns if t > tile_n),
+                )
+        for candidate_tile_n in fallback_tile_ns:
             pair = _make_default_json_moe_config_pair(
                 sm_arch=sm_arch,
                 tile_n=candidate_tile_n,
@@ -1493,6 +1618,7 @@ def _required_json_moe_config_pair(
                 num_tokens=num_tokens,
                 top_k=top_k,
                 num_experts=num_experts,
+                prefer_persistent_scheduler=prefer_persistent,
                 **kwargs,
             )
             if pair is not None:
@@ -1930,6 +2056,7 @@ def map_trtllm_bf16_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.BF16),
         dtype_b=int(_DType.BF16),
@@ -1987,6 +2114,7 @@ def map_trtllm_nvfp4_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.E2M1),
         dtype_b=int(_DType.E2M1),
@@ -2052,6 +2180,7 @@ def map_trtllm_fp8_per_tensor_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.E4M3),
         dtype_b=int(_DType.E4M3),
@@ -2112,6 +2241,7 @@ def map_trtllm_mxfp4_mxfp8_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.MXE2M1),
         dtype_b=int(_DType.MXE4M3),
@@ -2167,6 +2297,7 @@ def map_trtllm_mxfp4_bf16_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.MXE2M1),
         dtype_b=int(_DType.BF16),
@@ -2222,6 +2353,7 @@ def map_trtllm_mxfp8_mxfp8_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.MXE4M3),
         dtype_b=int(_DType.MXE4M3),
@@ -2271,6 +2403,7 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
+        num_global_experts=num_experts,
         activation_type=int(ActivationType.Swiglu),
         dtype_a=int(_DType.E4M3),
         dtype_b=int(_DType.E4M3),

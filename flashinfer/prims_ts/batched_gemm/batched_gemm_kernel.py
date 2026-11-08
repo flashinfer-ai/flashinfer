@@ -168,6 +168,44 @@ def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
             smem_allocator.add_resource(resource)
 
 
+def _registered_smem_bytes(smem_allocator) -> int | None:
+    """Data + barrier SMEM bytes registered so far, before ``compute_layout()``.
+
+    Mirrors the allocator's bump layout (standalone allocations plus the
+    largest phase of every alias group) without alignment padding, so the
+    result is a lower bound of the final total.  Returns ``None`` when the
+    allocator does not expose its registrations.
+    """
+    allocations = getattr(smem_allocator, "_allocations", None)
+    alias_groups = getattr(smem_allocator, "_alias_groups", None)
+    aliased_ids = getattr(smem_allocator, "_aliased_ids", None)
+    if allocations is None or alias_groups is None or aliased_ids is None:
+        return None
+    total = sum(a.size_bytes for a in allocations if id(a) not in aliased_ids)
+    for group in alias_groups:
+        total += max((sum(a.size_bytes for a in phase) for phase in group), default=0)
+    return total + int(getattr(smem_allocator, "barrier_smem_bytes", 0))
+
+
+def _add_single_cta_smem_floor(smem_allocator, cfg) -> int:
+    """Pad the dynamic SMEM up to :attr:`BatchedGemmConfig.smem_single_cta_floor_bytes`.
+
+    Must run after every data allocation has been registered and before
+    ``compute_layout()``.  Returns the padding added (0 when none is needed).
+    """
+    floor_bytes = cfg.smem_single_cta_floor_bytes
+    if floor_bytes <= 0:
+        return 0
+    used = _registered_smem_bytes(smem_allocator)
+    if used is None or used >= floor_bytes:
+        return 0
+    pad_bytes = floor_bytes - used
+    smem_allocator.add(
+        SmemAllocation("single_cta_smem_floor", size_bytes=pad_bytes, alignment=16)
+    )
+    return pad_bytes
+
+
 def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
     """Create the typed TMEM-pointer slot with explicit barrier alignment.
 
@@ -1415,6 +1453,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 alignment=16,
             )
         )
+    _add_single_cta_smem_floor(smem_allocator, cfg)
     smem_allocator.compute_layout()
 
     # TMEM allocator
@@ -2065,6 +2104,9 @@ def _batched_gemm_kernel_bf16_body(
                     alignment=8,
                 )
             )
+    # Keep the hardware block scheduler at one CTA per SM when TMEM already
+    # forbids a second one (see BatchedGemmConfig.smem_single_cta_floor_bytes).
+    _add_single_cta_smem_floor(smem_allocator, cfg)
     smem_allocator.compute_layout()
 
     clc_response_ptr = None

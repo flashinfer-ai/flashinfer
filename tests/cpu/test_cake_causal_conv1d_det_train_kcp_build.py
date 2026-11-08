@@ -16,9 +16,9 @@ limitations under the License.
 The KCP registry (``kcp_jit``) of the Cake causal convolution training package: the records against the frozen
 kernel ABIs and the identity rule, the routes and the selection by channel count, and the ``build.json`` entries of
 the KCP programs.  Each backward program ships twice: the cooperative build (route ``kcp_bwd``) and its ``split``
-build (route ``kcp_bwd_split``, FlashInfer issue #8365), an ordinary launch one SM short of co-resident
-(``reserve_sms``) whose ``dweight`` partial rows the zero-history package's fixed-order reduce program sums.  No device
-is needed; nothing is built or launched.
+build (route ``kcp_bwd_split``, FlashInfer issue #8365, built with ``pair=True``: the token arithmetic on packed
+``f32x2`` channel pairs), an ordinary launch one SM short of co-resident (``reserve_sms``) whose ``dweight`` partial
+rows the zero-history package's fixed-order reduce program sums.  No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -75,9 +75,9 @@ REDUCE = "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5"
 FALLBACK = "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
 R200_FALLBACK = "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp"
 BIG = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
-SPLIT_FALLBACK = "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp"
-SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp"
-SPLIT_BIG = "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp"
+SPLIT_FALLBACK = "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp"
+SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp"
+SPLIT_BIG = "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp"
 BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
 
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
@@ -116,7 +116,7 @@ PROGRAMS = {
     ),
     SPLIT_FALLBACK: (
         BWD,
-        {"vec": 8, "copy": "tma2d", "split": True},
+        {"vec": 8, "copy": "tma2d", "split": True, "pair": True},
         ("sm_100a", "sm_103a"),
         "kcp_bwd_split",
         BWD_TMA_PLAN,
@@ -124,7 +124,7 @@ PROGRAMS = {
     ),
     SPLIT_R200_FALLBACK: (
         BWD,
-        {"vec": 8, "min_blocks": 2, "split": True},
+        {"vec": 8, "min_blocks": 2, "split": True, "pair": True},
         ("sm_107a",),
         "kcp_bwd_split",
         BWD_PLAN,
@@ -132,7 +132,14 @@ PROGRAMS = {
     ),
     SPLIT_BIG: (
         BWD,
-        {"vec": 8, "copy": "tma2d", "stage_tokens": 8, "min_blocks": 2, "split": True},
+        {
+            "vec": 8,
+            "copy": "tma2d",
+            "stage_tokens": 8,
+            "min_blocks": 2,
+            "split": True,
+            "pair": True,
+        },
         ARCHES,
         "kcp_bwd_split",
         BWD_TMA_PLAN,
@@ -292,10 +299,10 @@ def test_build_manifest_lists_the_kcp_programs() -> None:
 def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
     """The host's ``cooperative`` argument (FlashInfer issue #8365): ``None`` is the package default, a bool picks the
     ``kcp_bwd`` (cooperative) or ``kcp_bwd_split`` route, anything else is refused; the split records launch
-    ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp.launch_grid`), the cooperative ones the co-resident count."""
+    ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp._launch_grid`), the cooperative ones the co-resident count."""
 
     kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
-    assert kcp.COOPERATIVE_DEFAULT is True
+    assert kcp.COOPERATIVE_DEFAULT is False
     assert kcp._cooperative(None) is kcp.COOPERATIVE_DEFAULT
     assert kcp._cooperative(True) is True and kcp._cooperative(False) is False
     for bad in (0, 1, "split", 1.0):
@@ -310,8 +317,59 @@ def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
         full = (ctas_per_sm * 148, 1, 1)  # the co-resident grid of a 148-SM device
         reserve = 1 if role == "kcp_bwd_split" else 0
         monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: full)
-        assert kcp.launch_grid(record, device_index=0) == (
+        assert kcp._launch_grid(record, device_index=0) == (
             ctas_per_sm * (148 - reserve),
             1,
             1,
         )
+
+
+@pytest.mark.cpu_only
+def test_forward_launches_one_sm_short(monkeypatch) -> None:
+    """The forward record carries no ``reserve_sms`` (the non-deterministic package runs the same record); the host
+    launches it ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs wide (:func:`kcp._launch_grid`), one SM short of the
+    co-resident count, while that grid holds every channel tile of ``C``, else the full co-resident grid
+    (:func:`kcp._forward_grid`), also on a device too small to give up an SM."""
+
+    kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    assert kcp.FWD_RESERVE_SMS == 1
+    seen = set()
+    for name, (_m, _k, _a, role, _p, ctas_per_sm) in PROGRAMS.items():
+        if role != kcp.KCP_FWD:
+            continue
+        record = kcp_jit.MODULES[name]
+        assert "reserve_sms" not in record["grid_rule"]
+        full = (ctas_per_sm * 148, 1, 1)  # the co-resident grid of a 148-SM device
+        monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: full)
+        assert kcp._launch_grid(record, device_index=0) == (
+            ctas_per_sm * (148 - kcp.FWD_RESERVE_SMS),
+            1,
+            1,
+        )
+        # kcp._forward_grid: the shorter grid while it holds every channel tile, the full one when a tile needs the
+        # reserved SM (C launched with the full grid before the reservation), a ValueError past the full grid
+        short = (ctas_per_sm * (148 - kcp.FWD_RESERVE_SMS), 1, 1)
+        for n_ch_tiles, grid in (
+            (1, short),
+            (short[0], short),
+            (short[0] + 1, full),
+            (full[0], full),
+        ):
+            assert (
+                kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=n_ch_tiles)
+                == grid
+            ), (name, n_ch_tiles)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=full[0] + 1)
+        # a one-SM device: no SM to give up, so every C the full grid holds launches it
+        one_sm = (ctas_per_sm, 1, 1)
+        monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: one_sm)
+        for n_ch_tiles in (1, one_sm[0]):
+            assert (
+                kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=n_ch_tiles)
+                == one_sm
+            ), (name, n_ch_tiles)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=one_sm[0] + 1)
+        seen.add(name)
+    assert seen, "no kcp_fwd program in the table"

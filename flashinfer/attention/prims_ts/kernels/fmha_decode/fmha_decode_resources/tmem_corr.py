@@ -142,6 +142,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     b_idx: Int32 = None
     q_group_idx: Int32 = None
     active_splits_kv: Int32 = None
+    # Runtime launch fanout used as the GMEM partial split stride; None keeps
+    # the configured capacity stride.
+    partial_split_stride: Int32 = None
     static_full_split_prefix: Constexpr[bool] = False
     smem_p0_ref: Constexpr[SmemPResource] = None
     smem_p1_ref: Constexpr[SmemPResource] = None
@@ -421,9 +424,12 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Int64:
         """Return a split/row workspace offset using 64-bit arithmetic."""
 
-        return (
-            Int64(logical_kv_idx) * Int64(self.cfg.max_splits_kv) + Int64(cta_idx_kv)
-        ) * Int64(self.h_r) + Int64(row_idx)
+        split_stride = Int64(self.cfg.max_splits_kv)
+        if cutlass.const_expr(self.partial_split_stride is not None):
+            split_stride = Int64(self.partial_split_stride)
+        return (Int64(logical_kv_idx) * split_stride + Int64(cta_idx_kv)) * Int64(
+            self.h_r
+        ) + Int64(row_idx)
 
     @cute.jit
     def _cluster_reduction_rows_per_cta(self, splits_kv: Int32) -> Int32:
@@ -1028,7 +1034,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Float32 | None:
         """Dequantize ``count`` output columns per V channel in place.
 
-        Column ``c`` becomes ``value * norm_scale * sfV[c] + v_mean[c]``, read
+        Column ``c`` becomes ``value * norm_scale * sfV[c] + output_scale * v_mean[c]``, read
         from the work tile's staged ``SageVScalesResource`` block, so the
         normalization is consumed here and the caller continues with the unit
         scale. A row without mass has no V contribution and keeps a zero
@@ -1043,6 +1049,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._sage_v_scales, first_col=first_col, count=count
         )
         if cutlass.const_expr(cfg.sage_v_mean):
+            for value_idx in cutlass.range_constexpr(count):
+                v_means[value_idx] *= self.output_scale
             if not row_has_mass:
                 for value_idx in cutlass.range_constexpr(count):
                     v_means[value_idx] = Float32(0.0)

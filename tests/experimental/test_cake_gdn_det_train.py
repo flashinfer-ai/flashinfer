@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend suite of the Cake deterministic GDN chunked-training package
-(``flashinfer.experimental.cake_gdn_det_train``).
+(``flashinfer.experimental.cake.cake_gdn_det_train``).
 
-Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
+Without a device: the package's names (the det names only, the former names removed) and its mode contract (no
+``deterministic`` keyword; the low-level backward refuses a tape without the det tag), the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
 entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule, the split pass-2 rule on the campaign rows and
@@ -26,7 +27,7 @@ packed layouts (host and device table routes, FP32 and BF16 ``beta``, every regi
 and segment-parallel scans, both adjoint scans, both preps, the fused tails of a value-head group of two and of three
 and the unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
 initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
-contracts: two runs, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
+contracts: two runs, PyTorch's deterministic mode against the default, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
 against ``dv_local`` and the register one, the fused tail of a value-head group of three against the unfused one with
 either finalize, the longest-first dispatch order against the caller's (and its
 tables without a device), two streams against one (the adjoint scan of serial plans beside the fused tail of a
@@ -74,13 +75,14 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_mode_names import assert_mode_names
+from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 cake_backend = cake_package("cake_gdn_det_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_det_train", "cake_chain")
 cake_jit = cake_package("cake_gdn_det_train", "cake_jit")
 cake_gdn_det_train = cake_package("cake_gdn_det_train")
-chunk_gated_delta_rule_det = cake_gdn_det_train.chunk_gated_delta_rule_det
+cake_gdn_det = cake_gdn_det_train.cake_gdn_det
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 ARCHES = tuple(cake_jit.ARCHES)
@@ -182,7 +184,7 @@ def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_sta
         kwargs["cu_seqlens_cpu"] = (
             torch.tensor(cu, dtype=torch.int64) if route == "host" else None
         )
-    o, final = chunk_gated_delta_rule_det(
+    o, final = cake_gdn_det(
         leaves["q"],
         leaves["k"],
         leaves["v"],
@@ -341,18 +343,107 @@ FUSED_TAIL_STAGES = {
 }
 
 
-def test_former_names_are_aliases_of_the_det_names() -> None:
-    pairs = (
-        ("chunk_gated_delta_rule", "chunk_gated_delta_rule_det"),
-        ("ChunkGatedDeltaRuleFunction", "ChunkGatedDeltaRuleDetFunction"),
-        ("gdn_chunk_forward", "gdn_chunk_det_forward"),
-        ("gdn_chunk_backward", "gdn_chunk_det_backward"),
+# The package exports the mode-word names of FlashInfer #8928 only; the former names (with and without det) are
+# removed (no alias), and the planner and table helpers stay public in ``cake_chain`` only.
+DET_NAMES = (
+    "CakeGDNDetFunction",
+    "cake_gdn_det",
+    "cake_gdn_det_train_backward",
+    "cake_gdn_det_train_forward",
+)
+REMOVED_NAMES = (
+    "ChunkGatedDeltaRuleDetFunction",
+    "ChunkGatedDeltaRuleFunction",
+    "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_det",
+    "gdn_chunk_backward",
+    "gdn_chunk_det_backward",
+    "gdn_chunk_det_forward",
+    "gdn_chunk_forward",
+)
+CHAIN_ONLY_NAMES = (
+    "CHUNK",
+    "FINALIZE_STAGES",
+    "FULL",
+    "HEAD_DIM",
+    "PRESCAN_CONFIGS",
+    "REG_SCAN_CONFIGS",
+    "ChainOptions",
+    "ChunkMeta",
+    "ScanPlan",
+    "SegmentTable",
+    "StageSet",
+    "StreamGroups",
+    "build_chunk_meta",
+    "build_chunk_meta_from_cu_seqlens",
+    "choose_scan_plan",
+    "dhu_tc_pricing",
+    "finalize_stage",
+    "lpt_sequence_order",
+    "lpt_walk",
+    "make_options",
+    "scan_plans",
+    "sdt_pricing",
+    "sequence_groups",
+    "stage_set",
+    "two_stream_split",
+    "use_prep_tma",
+)
+
+
+def test_former_names_are_removed() -> None:
+    for module in (cake_gdn_det_train, cake_chain):
+        for name in REMOVED_NAMES:
+            assert not hasattr(module, name), (module.__name__, name)
+            assert name not in module.__all__, (module.__name__, name)
+        for name in DET_NAMES:
+            assert name in module.__all__, (module.__name__, name)
+            assert getattr(module, name) is getattr(cake_chain, name)
+    for name in DET_NAMES:
+        assert getattr(cake_chain, name).__name__ == name
+
+
+def test_the_package_exports_the_det_names_only() -> None:
+    assert sorted(cake_gdn_det_train.__all__) == sorted(DET_NAMES)
+    # the mode word as a token (the shared check; no order check, so a vendored import path passes too)
+    assert_mode_names(cake_gdn_det_train, "det", stem=False)
+    for name in CHAIN_ONLY_NAMES:
+        assert name in cake_chain.__all__ and hasattr(cake_chain, name), name
+        assert not hasattr(cake_gdn_det_train, name), name
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_the_det_entries_take_no_deterministic_keyword(value) -> None:
+    # the det entries have no mode: the keyword, of any value, fails the call's argument binding (no launch)
+    calls = (
+        (cake_gdn_det, (None,) * 5, {}),
+        (
+            cake_chain.cake_gdn_det_train_forward,
+            (None,) * 5,
+            {"meta": None, "arch": None},
+        ),
+        (cake_chain.cake_gdn_det_train_backward, (None,) * 2, {}),
     )
-    for former, det in pairs:
-        for module in (cake_gdn_det_train, cake_chain):
-            assert getattr(module, former) is getattr(module, det)
-            assert former in module.__all__ and det in module.__all__
-        assert getattr(cake_chain, det).__name__ == det
+    for entry, args, kwargs in calls:
+        with pytest.raises(TypeError, match="deterministic"):
+            entry(*args, **kwargs, deterministic=value)
+    with pytest.raises(TypeError):
+        cake_chain.CakeGDNDetFunction.apply(*(None,) * 12, deterministic=value)
+
+
+@pytest.mark.parametrize(
+    "tape",
+    [{"mode": "nondet"}, {}, {"mode": None}, {"deterministic": True}],
+    ids=["nondet-tape", "untagged", "none", "former-key"],
+)
+def test_det_backward_refuses_a_tape_without_the_det_tag(tape) -> None:
+    # the det tape carries "mode": "det" (the low-level forward's tape and the autograd chain's own tape); the
+    # non-deterministic package's tape carries "mode": "nondet"; the check runs before the tape is read
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, **tape}, None)
+    # a tape with the det tag passes the check and is read
+    with pytest.raises(KeyError, match="meta"):
+        cake_chain.cake_gdn_det_train_backward({"arch": None, "mode": "det"}, None)
 
 
 def test_registry_records_are_well_formed() -> None:
@@ -418,10 +509,36 @@ def test_the_wy_stage_follows_the_architecture() -> None:
         "sm_103a": "wy_tc2",
         "sm_107a": "wy_tc2",
     }
-    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
-    assert (
-        cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
+    # wy_tc2 reads v in place: wy_tc's arguments and v's token pitch in heads
+    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == (
+        *cake_chain.LAUNCH_ARGS["wy_tc"],
+        "v_row_heads",
     )
+    plan, plan2 = (cake_jit.MODULES[name]["arg_plan"] for name in ("wy_tc", "wy_tc2"))
+    assert [arg for arg in plan2 if arg != ["parameter", "v_row_heads"]] == plan
+
+
+def test_v_rows_reads_whole_head_rows_in_place() -> None:
+    # the stages that read v take its token pitch in 128-element heads: the value heads of a packed
+    # [T, (2 H + HV) * 128] row, contiguous rows, and leading axes that fold into the token axis; other layouts
+    # are copied (None)
+    tokens, heads, v_heads = 8, 2, 6
+    width = (2 * heads + v_heads) * HEAD_DIM
+    row = torch.empty(2, tokens, width, dtype=torch.bfloat16)
+    packed = row[..., 2 * heads * HEAD_DIM :].unflatten(-1, (v_heads, HEAD_DIM))
+    assert cake_chain._v_rows(packed) == 2 * heads + v_heads
+    assert cake_chain._v_rows(packed[:1, :5]) == 2 * heads + v_heads
+    dense = torch.empty(2, tokens, v_heads, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(dense) == v_heads
+    head_major = torch.empty(1, v_heads, tokens, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(head_major.transpose(1, 2)) is None
+    half_head = torch.empty(1, tokens, v_heads * HEAD_DIM + 64, dtype=torch.bfloat16)
+    half_head = half_head[..., : v_heads * HEAD_DIM].unflatten(-1, (v_heads, HEAD_DIM))
+    assert cake_chain._v_rows(half_head) is None
+    batch_minor = torch.empty(tokens, 2, v_heads, HEAD_DIM, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(batch_minor.transpose(0, 1)) is None
+    flat = torch.empty(tokens * v_heads * HEAD_DIM + 1, dtype=torch.bfloat16)
+    assert cake_chain._v_rows(flat[1:].view(1, tokens, v_heads, HEAD_DIM)) is None
 
 
 def test_the_value_half_split_rule() -> None:
@@ -442,6 +559,12 @@ def test_the_value_half_split_rule() -> None:
         "fwd_ho_vh2",
         "fwd_ho_vh2",
         "fwd_ho_vh2_sm_107a",
+    ]
+    # the doubled grid only where the record is the split; elsewhere fwd_ho's grid (the program's own)
+    assert [cake_chain.fwd_ho_vh2_splits(arch) for arch in ARCHES] == [
+        False,
+        False,
+        True,
     ]
     engaged = cake_chain.fwd_ho_vh2_engaged
     # twice the CTAs in one round of one CTA per SM
@@ -857,6 +980,8 @@ def _serial_scan_tables(monkeypatch) -> list:
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
         seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
+    # the serial-scan rule's tables alone (no tables priced for the tcgen05 chains)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     priced: list = []
     pricing = cake_chain.serial_scan_pricing
     monkeypatch.setattr(
@@ -918,6 +1043,357 @@ def test_dhu_scan_pin_keys_the_chunk_tables(
     for options in calls:
         assert cake_chain._chunk_meta(cu, cu, 1, sum(seq_lens), 0, num_v_heads, options,
                                       num_heads=num_heads) is metas[options.dhu_scan]  # fmt: skip
+
+
+# --------------------------------------------------------------------------- tables priced for the tcgen05 chains
+
+_PAIR_LAYOUT = (11000, 12000, 9768)
+# (row, seq_lens, H, HV): the campaign rows, the #7074 packs, head pairs and context-parallel packs, and the
+# value-head groups of two
+PRICED_ROWS = (
+    ("r01", (4096,) * 4, 8, 16),
+    ("r02", _REAL_3, 8, 16),
+    ("r03", (4096,) * 8, 8, 16),
+    ("r04", _REAL_7, 8, 16),
+    ("r07", (16384,), 8, 16),
+    ("r08", (4096,) * 4, 16, 32),
+    ("r10", (16384,), 16, 32),
+    ("issue", (131071, 87531, 43385), 2, 6),
+    ("P3", (128147, 131027), 2, 6),
+    ("P1", (126565, 32714, 33696, 15081, 22979, 10782), 2, 6),
+    ("64x4096", (4096,) * 64, 2, 6),
+    ("A16", _PAIR_LAYOUT, 16, 48),
+    ("h8_hv24", _PAIR_LAYOUT, 8, 24),
+    ("h4_hv12", _PAIR_LAYOUT, 4, 12),
+    ("h2_hv6", _PAIR_LAYOUT, 2, 6),
+    ("h1_hv3", _PAIR_LAYOUT, 1, 3),
+    ("cp2_h8", (30001, 20000, 15535), 8, 24),
+    ("cp4_h4", (70001, 40000, 21071), 4, 12),
+    ("cp16_h1", (262143, 131071, 99999, 31075), 1, 3),
+    ("h4_hv8", _PAIR_LAYOUT, 4, 8),
+    ("h2_hv4", _PAIR_LAYOUT, 2, 4),
+)
+PRICED_DEVICES = (
+    ("sm_100a", 148),
+    ("sm_103a", 148),
+    ("sm_103a", 152),
+    ("sm_107a", 212),
+    ("sm_107a", 216),
+)
+
+
+def _priced_device(monkeypatch, arch: str, sm_count: int) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+
+
+def _segments(chunks, plan) -> int:
+    if plan.segment_len <= 0 or max(chunks) <= plan.segment_len:
+        return len(chunks)
+    return sum(-(-n // plan.segment_len) for n in chunks)
+
+
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_tc_plan_rule(arch, sm_count, monkeypatch) -> None:
+    # the tc-priced adjoint table replaces the planner's (after the serial-scan rule) only where it saves at least the
+    # floor and a fraction of the planner's price, within the pre-scan capacity at SDT_CONFIG; a table whose scan runs
+    # as two groups beside the fused tail keeps its form
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    cap = cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG)
+    gain, min_saving = cake_chain.tc_plan_thresholds(arch)
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        plans = cake_chain._serial_adjoint_plan(
+            seq_lens, plans, num_heads, num_v_heads, 0, options
+        )
+        got, bwd_tc = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert got[0] == plans[0], row
+        kept = cake_chain._two_stream_kept(
+            chunks, plans[1], num_heads, num_v_heads, 0, options
+        )
+        rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, plans[1])
+        if kept or not rec["select"]:
+            assert (got, bwd_tc) == (plans, False), (row, rec)
+            continue
+        assert bwd_tc and got[1] == cake_chain.ScanPlan(
+            cake_chain.SDT_CONFIG, rec["segment_len"]
+        ), (row, rec)
+        assert tuple(plans[1].config) == cake_chain.SDT_CONFIG, (row, rec)
+        assert 0 <= rec["segment_len"] <= cap, (row, rec)
+        assert (
+            rec["saving"] >= min_saving and rec["best"]["T"] <= gain * rec["plan_T"]
+        ), (row, rec)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count", [("sm_100a", 148), ("sm_103a", 148), ("sm_103a", 152)]
+)
+def test_tc_plan_prices_the_whole_segment_prescan(arch, sm_count, monkeypatch) -> None:
+    # on an architecture of TC_PLAN_PRESCAN a split candidate's pre-scan is priced for a value head that scans its whole
+    # segment: the head pairs keep the planner's serial adjoint table over 24 value heads (the 6-segment table measured
+    # +8 % backward on B200) and take a 12-segment table over 12 (-24 %); the warm-up price took the 6-segment table
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    options = cake_chain.make_options()
+    chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
+    for num_heads, segments in ((8, len(chunks)), (4, 12)):
+        num_v_heads = 3 * num_heads
+        (_fwd, bwd), _bwd_tc = cake_chain.host_plans(
+            _PAIR_LAYOUT, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert _segments(chunks, bwd) == segments, (num_heads, bwd)
+    planner = cake_chain.scan_plans(
+        sum(_PAIR_LAYOUT), len(_PAIR_LAYOUT), 24, 0, _PAIR_LAYOUT
+    )
+    planner = cake_chain._serial_adjoint_plan(_PAIR_LAYOUT, planner, 8, 24, 0, options)
+    assert _segments(chunks, planner[1]) == len(chunks)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "TC_PLAN_PRESCAN", {})
+        warm = cake_chain.tc_plan_pricing(chunks, 24, 0, planner[1])
+        assert warm["select"] and warm["segment_len"] > 0, warm
+    # the pre-scan term covers the longest pre-scanned segment
+    fixed, step, _co = cake_chain.TC_PLAN_PRESCAN[arch]
+    const = dict(cake_chain._dhu_tc_constants(arch))
+    const["t_lat"], const["t_full"] = cake_chain.TC_PLAN_STEP[arch]
+    res = cake_chain._scan_residency("dhu", *cake_chain.SDT_CONFIG, 0)
+    for seg_len in (16, 32, 48, 94):
+        rec = cake_chain._tc_table_price(
+            chunks, 24, seg_len, sm_count, const, res, cake_chain.TC_PLAN_PRESCAN[arch]
+        )
+        longest = max(-(-c // -(-c // seg_len)) for c in chunks)
+        assert rec["T_extra"] >= fixed + longest * step, (seg_len, rec)
+    # a selected split table runs its dhu_tc2 CTAs in one round
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        plans = cake_chain._serial_adjoint_plan(
+            seq_lens, plans, num_heads, num_v_heads, 0, options
+        )
+        rows = tuple(-(-n // 64) for n in seq_lens)
+        rec = cake_chain.tc_plan_pricing(rows, num_v_heads, 0, plans[1])
+        if rec["select"] and rec["segment_len"] > 0:
+            assert rec["best"]["ctas"] <= sm_count, (row, rec)
+
+
+def test_tc_plan_prescan_leaves_r200_unchanged(monkeypatch) -> None:
+    # an architecture outside TC_PLAN_PRESCAN keeps the warm-up price (R200 prices its split tables with CHAIN_PLAN)
+    assert "sm_107a" not in cake_chain.TC_PLAN_PRESCAN
+    for sm_count in (212, 216):
+        _priced_device(monkeypatch, "sm_107a", sm_count)
+        options = cake_chain.make_options()
+        for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+            got = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "TC_PLAN_PRESCAN", {"sm_100a": (0.0, 99.0, 9.0)})
+                assert (
+                    cake_chain.host_plans(
+                        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+                    )
+                    == got
+                ), row
+
+
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_two_stream_forms_keep_their_tables(arch, sm_count, monkeypatch) -> None:
+    # a serial adjoint table that the two-stream rule groups, and a split one of a value-head group of three whose
+    # pass 2 runs on dhu_tc2 as two groups of segments beside tail_g3, keep the planner's table: the same tables with
+    # one or two streams, and with a finalize pin (the unfused tail) a group of three's split table is priced
+    _priced_device(monkeypatch, arch, sm_count)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        tables = {
+            streams: cake_chain.host_plans(
+                seq_lens,
+                num_v_heads,
+                0,
+                cake_chain.make_options(streams=streams),
+                num_heads=num_heads,
+            )
+            for streams in (1, 2)
+        }
+        assert tables[1] == tables[2], row
+        bwd = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )[1]
+        serial = _segments(chunks, bwd) == len(chunks)
+        grouped = cake_chain.two_stream_split(
+            len(chunks) if serial else _segments(chunks, bwd), num_v_heads, sm_count
+        )
+        r_form = (
+            not serial
+            and num_v_heads == 3 * num_heads
+            and tuple(bwd.config) == cake_chain.SDT_CONFIG
+            and cake_chain.sdt_pricing(chunks, bwd.segment_len, num_v_heads, 0)[
+                "select"
+            ]
+        )
+        kept = cake_chain._two_stream_kept(
+            chunks, bwd, num_heads, num_v_heads, 0, cake_chain.make_options()
+        )
+        if grouped is not None and (serial or r_form):
+            assert kept, row
+        if kept and not (arch == "sm_107a" and num_v_heads == 2 * num_heads):
+            assert tables[2][0][1] == bwd and tables[2][1] is False, row
+        if r_form and grouped is not None:
+            pinned = cake_chain.make_options(finalize="finalize")
+            assert not cake_chain._two_stream_kept(
+                chunks, bwd, num_heads, num_v_heads, 0, pinned
+            ), row
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [
+        {"segment_chunks": 0},
+        {"scan_config": (64, 1)},
+        {"dhu_scan": "tc"},
+        {"dhu_scan": "reg"},
+    ],
+    ids=["serial", "config", "tc", "reg"],
+)
+@pytest.mark.parametrize("arch, sm_count", PRICED_DEVICES)
+def test_plan_pins_keep_the_planner_tables(arch, sm_count, pins, monkeypatch) -> None:
+    _priced_device(monkeypatch, arch, sm_count)
+    options = cake_chain.make_options(**pins)
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        plans = cake_chain.scan_plans(sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens,
+                                      scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
+        got = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        assert got == (plans, False), (row, pins)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count", [d for d in PRICED_DEVICES if d[0] != "sm_107a"]
+)
+def test_chain_plan_keeps_the_b200_gb300_tables(arch, sm_count, monkeypatch) -> None:
+    # CHAIN_PLAN lists sm_107a only: on B200 and GB300 every row keeps the tables it plans without CHAIN_PLAN, also
+    # with a saving floor of 0
+    _priced_device(monkeypatch, arch, sm_count)
+    assert arch not in cake_chain.CHAIN_PLAN
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+        floor0 = {
+            name: {**const, "min_saving": 0.0}
+            for name, const in cake_chain.CHAIN_PLAN.items()
+        }
+        for table in (cake_chain.CHAIN_PLAN, floor0):
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "CHAIN_PLAN", table)
+                assert (
+                    cake_chain.host_plans(
+                        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+                    )
+                    == want
+                ), row
+                for kind, plan in zip(("fwd", "bwd"), want[0], strict=True):
+                    rec = cake_chain.chain_plan_pricing(
+                        kind, chunks, num_v_heads, 0, plan
+                    )
+                    assert rec["select"] is False, (row, kind, rec)
+
+
+@pytest.mark.parametrize("sm_count", [212, 216])
+def test_chain_plan_rule_on_r200(sm_count, monkeypatch) -> None:
+    # a deeper table replaces the chosen one exactly where its pricing selects it and the table's scan does not run as
+    # two groups: a deeper SDT_CONFIG split table within the pre-scan capacity, priced cheaper by the floor and gain
+    _priced_device(monkeypatch, "sm_107a", sm_count)
+    const = cake_chain.CHAIN_PLAN["sm_107a"]
+    cap = {
+        "fwd": cake_chain._prescan_capacity("fwd_h", cake_chain.SDT_CONFIG),
+        "bwd": cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG),
+    }
+    options = cake_chain.make_options()
+    for row, seq_lens, num_heads, num_v_heads in PRICED_ROWS:
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        got, bwd_tc = cake_chain.host_plans(
+            seq_lens, num_v_heads, 0, options, num_heads=num_heads
+        )
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want, want_tc = cake_chain.host_plans(
+                seq_lens, num_v_heads, 0, options, num_heads=num_heads
+            )
+        planner = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        planner = cake_chain._serial_adjoint_plan(
+            seq_lens, planner, num_heads, num_v_heads, 0, options
+        )
+        kept = cake_chain._two_stream_kept(
+            chunks, planner[1], num_heads, num_v_heads, 0, options
+        )
+        split = cake_chain.two_stream_split(len(chunks), num_v_heads, sm_count)
+        for kind, new, old in zip(("fwd", "bwd"), got, want, strict=True):
+            grouped = (_segments(chunks, old) == len(chunks) and split is not None) or (
+                kind == "bwd" and kept
+            )
+            rec = cake_chain.chain_plan_pricing(kind, chunks, num_v_heads, 0, old)
+            assert (new != old) is (rec["select"] and not grouped), (row, kind, rec)
+            if new != old:
+                assert tuple(new.config) == cake_chain.SDT_CONFIG, (row, kind, new)
+                assert 0 < new.segment_len <= cap[kind], (row, kind, new)
+                assert _segments(chunks, new) > _segments(chunks, old), (
+                    row,
+                    kind,
+                    new,
+                    old,
+                )
+                assert rec["saving"] >= const["min_saving"], (row, kind, rec)
+                assert rec["best"]["T"] <= const["gain"] * rec["plan_T"], (
+                    row,
+                    kind,
+                    rec,
+                )
+        assert bwd_tc is (want_tc or got[1] != want[1]), row
+
+
+def test_priced_tables_are_keyed_with_the_chunk_tables(monkeypatch) -> None:
+    # TC_PLAN and CHAIN_PLAN enter the table cache's key: a table planned with them is not served without them
+    _priced_device(monkeypatch, "sm_107a", 212)
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, "_host_chunk_meta", lambda seq_lens, plans, _index, lpt: cake_chain.build_chunk_meta(
+        seq_lens, "cpu", scan_plans=plans, lpt=lpt))  # fmt: skip
+    seq_lens, num_heads, num_v_heads = (16384,), 8, 16
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+    options = cake_chain.make_options()
+    priced = cake_chain._chunk_meta(
+        cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads
+    )
+    want, bwd_tc = cake_chain.host_plans(
+        seq_lens, num_v_heads, 0, options, num_heads=num_heads
+    )
+    assert priced.bwd_tc is bwd_tc
+    assert priced.bwd_segments.segment_len == want[1].segment_len
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    planner = cake_chain._chunk_meta(
+        cu, cu, 1, sum(seq_lens), 0, num_v_heads, options, num_heads=num_heads
+    )
+    assert planner is not priced and planner.bwd_tc is False
+    plans = cake_chain.scan_plans(
+        sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+    )
+    assert planner.bwd_segments.segment_len == plans[1].segment_len
 
 
 def test_two_stream_split_rule() -> None:
@@ -1372,6 +1848,73 @@ def test_run_to_run_bitwise(route, device) -> None:
     _assert_bitwise(first, uncached, OUTPUT_NAMES)
 
 
+@pytest.mark.parametrize("route", ["host", "device"])
+def test_torch_deterministic_algorithms_change_nothing(route, device) -> None:
+    # every launch is fixed-order: PyTorch's deterministic mode (strict, so an alert would raise) gives the same bits
+    seq_lens = (2048, 100, 513)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=5)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        strict = _run(inputs, seq_lens, route=route)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+    _assert_bitwise(strict, _run(inputs, seq_lens, route=route), OUTPUT_NAMES)
+
+
+def test_low_level_entries_record_and_check_the_mode(device) -> None:
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=263)
+    index = cake_chain._device_index(device)
+    plans = cake_chain.scan_plans(sum(seq_lens), len(seq_lens), 6, index, seq_lens)
+    meta = cake_chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
+    q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
+    tape = cake_chain.cake_gdn_det_train_forward(
+        q, k, v, g, beta, meta=meta, arch=cake_backend.device_arch(index)
+    )
+    assert tape["mode"] == "det" and "deterministic" not in tape
+    grads = cake_chain.cake_gdn_det_train_backward(tape, do)
+    assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
+    untagged = {key: value for key, value in tape.items() if key != "mode"}
+    for other in ({**tape, "mode": "nondet"}, untagged):
+        with pytest.raises(ValueError, match="this tape does not carry that tag"):
+            cake_chain.cake_gdn_det_train_backward(other, do)
+
+
+@pytest.mark.skipif(
+    "cake_gdn_nondet_train" not in PACKAGES,
+    reason="pending integration: the non-deterministic package is not in this tree's PACKAGES table",
+)
+def test_det_backward_refuses_a_real_nondet_tape(device) -> None:
+    # the tape of the non-deterministic package's low-level forward (the same keys as the det tape but its own tag):
+    # the det backward refuses it; a non-deterministic package that does not import fails here, it is not skipped
+    seq_lens, heads = (300, 77, 640), (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=263)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    nd_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
+    q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
+
+    def meta_of(chain):
+        plans = chain.scan_plans(
+            sum(seq_lens), len(seq_lens), heads[1], index, seq_lens
+        )
+        return chain.build_chunk_meta(seq_lens, device, scan_plans=plans)
+
+    nd_tape = nd_chain.cake_gdn_nondet_train_forward(
+        q, k, v, g, beta, meta=meta_of(nd_chain), arch=arch
+    )
+    assert nd_tape["mode"] == "nondet"
+    with pytest.raises(ValueError, match="this tape does not carry that tag"):
+        cake_chain.cake_gdn_det_train_backward(nd_tape, do)
+    tape = cake_chain.cake_gdn_det_train_forward(
+        q, k, v, g, beta, meta=meta_of(cake_chain), arch=arch
+    )
+    grads = cake_chain.cake_gdn_det_train_backward(tape, do)
+    assert all(bool(torch.isfinite(grads[n]).all()) for n in GRAD_NAMES)
+
+
 @pytest.mark.parametrize(
     "pins",
     [{}, {"save_state": False}, {"scan_config": (32, 2), "segment_chunks": 4}],
@@ -1645,6 +2188,48 @@ def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
     _assert_bitwise(runs["tc"], runs["reg"], names)
 
 
+@pytest.mark.parametrize("heads", [(8, 16), (8, 24)], ids=["g2", "g3"])
+def test_tc_priced_table_changes_only_the_adjoint_table(
+    heads, device, monkeypatch
+) -> None:
+    # one 16384-token sequence (gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor; no CHAIN_PLAN
+    # tables): the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats
+    # bitwise and stays within the accuracy gate of the planner's table; a plan pin keeps the planner's table
+    seq_lens = (16384,)
+    index = cake_chain._device_index(device)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    plans = cake_chain.scan_plans(16384, 1, heads[1], index, seq_lens)
+    rec = cake_chain.tc_plan_pricing((256,), heads[1], index, plans[1])
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=307)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    base = _run(inputs, seq_lens)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", True)
+    stages = _record_launches(monkeypatch)
+    runs = [_run(inputs, seq_lens) for _ in range(2)]
+    assert torch.equal(runs[0]["o"], base["o"])
+    _assert_bitwise(runs[1], runs[0], OUTPUT_NAMES)
+    _assert_close_to_reference(runs[0], base, OUTPUT_NAMES)
+    if rec["select"]:
+        want = ("dhu_pre_dvl_r64k1", "dhu_tc2") if rec["segment_len"] else ("dhu_tc2",)
+        assert all(x in stages for x in want) and "dv_local" not in stages, (
+            rec,
+            stages,
+        )
+    else:  # the pricing keeps the planner's table: the same bits
+        _assert_bitwise(runs[0], base, OUTPUT_NAMES)
+    pins = {
+        "scan_config": tuple(plans[1].config),
+        "segment_chunks": plans[1].segment_len,
+    }
+    on = _run(inputs, seq_lens, **pins)
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
+    _assert_bitwise(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
+
+
 @pytest.mark.parametrize(
     "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
 )
@@ -1740,7 +2325,7 @@ def test_two_streams_under_cuda_graph_capture(form, device, monkeypatch) -> None
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                       cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
                                       **pins)  # fmt: skip
@@ -1836,7 +2421,7 @@ def test_launches_run_on_the_callers_stream(streams, form, device, monkeypatch) 
         torch.cuda._sleep(200_000_000)
         with torch.no_grad():
             leaves["q"].copy_(new["q"])
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM),
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                       cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
@@ -1965,6 +2550,55 @@ def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
     assert _preps(stages) == {"prep"}
     aligned = _run(inputs, seq_lens, prep="plain")
     _assert_bitwise(shifted, aligned, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize(
+    "name, offset",
+    [("v", 1), ("v", 4), ("q", 1), ("k", 1), ("do", 1), ("do", 4)],
+    ids=["v-2B", "v-8B", "q-2B", "k-2B", "do-2B", "do-8B"],
+)
+def test_unaligned_operands_take_an_aligned_copy(name, offset, device) -> None:
+    # a contiguous view 2 or 8 bytes past a 16-byte boundary: .contiguous() keeps it where it is, and the 16-byte rows
+    # of v / do and the plain prep's 8-byte q / k loads would fault there (misaligned address); the package copies
+    # such an operand to an aligned buffer, so the run gives the bits of the aligned one
+    seq_lens = (300, 77)
+    inputs = _inputs(seq_lens, (2, 4), torch.float32, device, seed=29)
+    t = inputs[name]
+    buf = torch.empty(t.numel() + 16, dtype=t.dtype, device=device)
+    lead = (-buf.data_ptr() // t.element_size()) % (16 // t.element_size())
+    shifted = buf[lead + offset : lead + offset + t.numel()].view(t.shape).copy_(t)
+    assert (
+        shifted.is_contiguous() and shifted.data_ptr() % 16 == offset * t.element_size()
+    )
+    align = (
+        cake_chain.PREP_ALIGN_BYTES
+        if name in ("q", "k")
+        else cake_chain.ROW_ALIGN_BYTES
+    )
+    assert (
+        cake_chain._aligned(t, align) is t
+        and cake_chain._aligned(shifted, align) is not shifted
+    )
+
+    def run(ops):
+        leaves = {
+            n: ops[n].detach().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        cu = _cu(seq_lens)
+        o, _ = cake_gdn_det(
+            leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], scale=1.0 / math.sqrt(HEAD_DIM),
+            cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+            cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+        o.backward(ops["do"])
+        torch.cuda.synchronize()
+        return {
+            "o": o.detach(),
+            **{f"d{n}": leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+        }
+
+    _assert_bitwise(run({**inputs, name: shifted}), run(inputs), OUTPUT_NAMES)
 
 
 @pytest.mark.parametrize(
@@ -2262,6 +2896,8 @@ def test_serial_scan_rule_on_the_device(case, device, monkeypatch) -> None:
     sm_count, rows = SERIAL_SCAN_DEVICE_ROWS[arch]
     seq_lens, heads = rows[case]
     _small_device(monkeypatch, device, sm_count)
+    # the serial-scan rule's tables alone: the tc-priced table (TC_PLAN) also makes these layouts serial
+    monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=581)
     calls = _record_calls(monkeypatch)
     got = _run(inputs, seq_lens)
@@ -2342,7 +2978,7 @@ def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                           scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                           cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
                                           **pins)  # fmt: skip
@@ -2407,17 +3043,15 @@ def test_wavefront_strided_views_match_the_contiguous_call(device, monkeypatch) 
 def test_rejects_unsupported_inputs(device) -> None:
     inputs = _inputs((64,), (1, 2), torch.float32, device)
     with pytest.raises(NotImplementedError):
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             inputs["q"].half(), inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         )
     cu = torch.tensor([0, 64], dtype=torch.int64, device=device)
     two = {name: torch.cat([t, t], 0) for name, t in inputs.items()}
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_det(
-            two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu
-        )
+        cake_gdn_det(two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu)
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
@@ -2522,7 +3156,7 @@ _INVALID_MESSAGES = {
 
 def _call_rejected(call) -> ValueError:
     with pytest.raises(ValueError) as error:
-        chunk_gated_delta_rule_det(
+        cake_gdn_det(
             call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
             output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
             use_qk_l2norm_in_kernel=True,
@@ -2539,7 +3173,7 @@ def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> 
     assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
     assert stages == [], stages
     # the unmodified call is accepted
-    o, final = chunk_gated_delta_rule_det(
+    o, final = cake_gdn_det(
         base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
         output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
         use_qk_l2norm_in_kernel=True,
@@ -2574,7 +3208,7 @@ def test_device_route_does_not_synchronize(device) -> None:
             n: inputs[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         }
-        o, final = chunk_gated_delta_rule_det(
+        o, final = cake_gdn_det(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
             output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
         )  # fmt: skip
@@ -2675,7 +3309,7 @@ def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> 
 def _call(leaves, seq_lens, device, *, route="host", initial_state=None, output_final_state=False, **pins):  # fmt: skip
     """One call of the package on caller-made leaves (or views of them)."""
     cu = _cu(seq_lens)
-    return chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+    return cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), initial_state=initial_state,
                                       output_final_state=output_final_state,
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
@@ -2865,7 +3499,7 @@ def test_checkpoint_matches_and_retains_no_bytes(
     cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
 
     def layer(q, k, v, g, beta):
-        o, _ = chunk_gated_delta_rule_det(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+        o, _ = cake_gdn_det(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                           cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
         return o
 

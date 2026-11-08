@@ -469,3 +469,39 @@ def test_fixed_tile_large_heads(head_dim_qk, head_dim_vo, tile):
     scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) / head_dim_qk**0.5
     expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
     torch.testing.assert_close(result.float(), expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("kind", ["decode", "paged", "ragged"])
+def test_batch_invariant_wrappers_refuse_fixed_tile(kind):
+    """batch_invariant=True plans its own query tiles: a fixed tile must raise the
+    class's typed error instead of being silently ignored."""
+    from flashinfer import batch_invariant as bi
+    from flashinfer.attention.batch_invariant.wrappers import ATTENTION_ARCHS
+
+    if not bi.is_supported_device(torch.device("cuda"), ATTENTION_ARCHS):
+        pytest.skip("batch-invariant attention is not supported on this GPU")
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    indptr = torch.tensor([0, 1], dtype=torch.int32)
+    indices = torch.zeros(1, device="cuda", dtype=torch.int32)
+    last_page_len = torch.tensor([16], dtype=torch.int32)
+    if kind == "decode":
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace, "NHD", batch_invariant=True
+        )
+        args = (indptr, indices, last_page_len, 8, 2, 128, 16)
+    elif kind == "paged":
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", batch_invariant=True
+        )
+        args = (indptr, indptr, indices, last_page_len, 8, 2, 128, 16)
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, "NHD", batch_invariant=True
+        )
+        args = (indptr, torch.tensor([0, 16], dtype=torch.int32), 8, 2, 128)
+    methods = [wrapper.plan]
+    if kind != "ragged":
+        methods.append(wrapper.workspace_size)
+    for method in methods:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="fixed_cta_tile_q"):
+            method(*args, fixed_cta_tile_q=64)

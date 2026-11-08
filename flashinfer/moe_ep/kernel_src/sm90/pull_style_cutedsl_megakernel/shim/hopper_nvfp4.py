@@ -163,8 +163,14 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperMxfp4Config):
             raise ValueError("active_dispatch_warps must be 1, 2, or 4.")
 
     def _validate_weight_schedule(self) -> None:
-        if self.nvfp4_sf_stages and (self.mma_tiler_mnk[2] != 256 or self.pingpong):
-            raise ValueError("nvfp4_sf_stages requires MMA tile K=256 without pingpong")
+        # The scale ring needs AB stages that N72/N80 tiles leave no room for;
+        # the tuner admits it only on this tile as well.
+        if self.nvfp4_sf_stages and (
+            tuple(self.mma_tiler_mnk[1:]) != (64, 256) or self.pingpong
+        ):
+            raise ValueError(
+                "nvfp4_sf_stages requires MMA tile N=64, K=256 without pingpong"
+            )
         validate_nvfp4_fc1_overlap_override(
             self.nvfp4_fc1_k256_overlap,
             mma_tiler_mnk=self.mma_tiler_mnk,
@@ -374,6 +380,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
             ("nvfp4_conversion", dataclasses.astuple(c.nvfp4_conversion)),
             ("compact_pull_buffer", c.compact_pull_buffer),
+            ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),
             *MegaMoEHopperFp8Frontend._mega_compile_key(self),
         )
 
