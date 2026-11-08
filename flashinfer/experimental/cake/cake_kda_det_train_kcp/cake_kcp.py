@@ -5861,7 +5861,7 @@ def _intra_rows_keep(call: CakeKDADetKcpCall) -> bool:
         return False
     if _capturing() or getattr(call.ws, "local_arena", None) == "lean":
         return False
-    if call.local.plan.R > 2 * call.T_r:
+    if 2 * call.T_r < call.local.plan.R:
         return False  # the rows fit neither the dq / dk pair nor the outputs allocated after their copy
     if call.l2n_mode == "fused" and (
         call.local.arch not in INTRA_ROWS_L2N_ARCHS
@@ -5947,7 +5947,7 @@ def _ckpt_rows_take(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved) -> None:
         )
         or tuple(rows.shape) != (2, int(call.ctx.R), call.H, BT)
         or rows.dtype != torch.bfloat16
-        or call.local.plan.R > 2 * call.T_r
+        or 2 * call.T_r < call.local.plan.R
     ):
         call.scratch["intra_rows"] = "ignored"
         return
@@ -6693,9 +6693,14 @@ def _default_workspace(
     workspace = _call_workspace(None, backend, save_mode, gate, l2n, device)
     if key is None:
         return workspace, None, None
+    dead = key[0]
+
+    def _on_collect(_: Any) -> None:
+        _default_dead.append(dead)
+
     # a context without weak references: a workspace of this call alone
     try:
-        ref = weakref.ref(ctx, lambda _, dead=key[0]: _default_dead.append(dead))
+        ref = weakref.ref(ctx, _on_collect)
     except TypeError:
         return workspace, None, None
     return workspace, (key, ref), None

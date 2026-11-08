@@ -6786,7 +6786,12 @@ def test_gpu_fused_forward_output_is_bitwise_and_one_launch_fewer(
 
 # the kcp_dav knob rows: one rank, H 4 / 16 / 64 (the fused gradient stores every dAqk row: "auto" skips kcp_dav) and
 # H 12 (the plan dispatches its dav stage: both values launch it)
-KCP_DAV_ROWS = [((300, 724, 476), 4), ((300, 724, 476), 12), ((3000,), 16), ((300, 724, 476), 64)]
+KCP_DAV_ROWS = [
+    ((300, 724, 476), 4),
+    ((300, 724, 476), 12),
+    ((3000,), 16),
+    ((300, 724, 476), 64),
+]
 KCP_DAV_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in KCP_DAV_ROWS]
 
 
@@ -6812,7 +6817,10 @@ def test_gpu_kcp_dav_always_is_bitwise_auto(device, monkeypatch, lengths, H) -> 
 
     def walk(name, a, call, device_index):
         # the K2 adjoint walks (the fused forward walk reads aqk_int too, in the forwards)
-        if name.startswith("kcp_dhu") and "aqk_int" in cake_kcp_jit._WALK_OPERANDS[name]:
+        if (
+            name.startswith("kcp_dhu")
+            and "aqk_int" in cake_kcp_jit._WALK_OPERANDS[name]
+        ):
             k2.append((name, call.local_values["aqk_int"].data_ptr()))
         return real_walk(name, a, call, device_index)
 
@@ -6978,7 +6986,8 @@ def test_gpu_default_workspace_pool(device, lengths, H) -> None:
         torch.cuda.reset_peak_memory_stats(device)
         res = step(ctx, None)
         torch.cuda.synchronize(device)
-        peaks.append(torch.cuda.max_memory_allocated(device))  # absolute high-water mark of this step
+        # the absolute high-water mark of this step
+        peaks.append(torch.cuda.max_memory_allocated(device))
         assert all(
             torch.equal(_bits(a), _bits(b)) for a, b in zip(ref, res, strict=True)
         ), i
