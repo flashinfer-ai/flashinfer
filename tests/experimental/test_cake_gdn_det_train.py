@@ -353,13 +353,17 @@ FWD_A_CASES = {
     "g1": ((16, 16), (300, 77, 1, 130, 64, 65, 200, 17, 129, 5, 63, 250)),
 }
 # Layouts whose forward segment table splits a sequence on every device of the package: split sequences beside
-# sequences of one piece (one of them a single token), value-head groups of three and two.  Their pieces (30..42
-# chunks) are shorter than the split's shape class (cake_plan.FORWARD_SPLIT_MIN_PIECE): the tests of the split
-# forward's tables, bits and accuracy run them with the class lowered to FWD_SPLIT_TEST_MIN_PIECE (the same kernels and
-# tables on fewer tokens than a row of the class); test_fwd_split_shape_class pins the class itself.
+# sequences of one piece (one of them a single token), value-head groups of three and two, and ("g3-all") a layout
+# where every sequence splits (ForwardSplit.first_seq is None: the copy of wave 1's end states on wy_a's A indexes the
+# final states by first_index alone, as on the production rows; at 148 / 152 SMs pieces of 37 / 35 chunks, 17 + 9 /
+# 18 + 9 pieces).  Their pieces (30..42 chunks) are shorter than the split's shape class
+# (cake_plan.FORWARD_SPLIT_MIN_PIECE): the tests of the split forward's tables, bits and accuracy run them with the
+# class lowered to FWD_SPLIT_TEST_MIN_PIECE (the same kernels and tables on fewer tokens than a row of the class);
+# test_fwd_split_shape_class pins the class itself.
 FWD_SPLIT_CASES = {
     "g3": ((2, 6), (40000, 20000, 1000, 64, 1)),
     "g2": ((4, 8), (30000, 9000, 100)),
+    "g3-all": ((2, 6), (40000, 20000)),
 }
 FWD_SPLIT_TEST_MIN_PIECE = 16
 # the host launch order of the split forward: the middle pieces' summary (side stream) is issued before wave 1; on
@@ -375,9 +379,18 @@ PREP_FORWARD_OFF = (
     ("FWD_SPLIT_ARCHS", ()),
     ("FWD_A_SERIAL_KEEP", {}),
 )
-# the forwards on wy_a's A that the device tests force: "a" (wy_a and fwd_ho_a on a serial table) and "split" (the
-# one-wave split forward on wy_a's A or on the WY stage's w / u)
-FWD_ROUTES = ("a", "split")
+# the forwards on wy_a's A that the device tests force: "a" (wy_a and fwd_ho_a on a serial table), "split_a" (the
+# one-wave split forward on wy_a's A: fwd_summary_a and fwd_ho_a) and "split_w" (the split forward on the WY stage's
+# w / u: fwd_summary and fwd_fused).  Each split form is forced on every architecture of FWD_SPLIT_ARCHS
+# (_split_form), whichever form FWD_SPLIT_A_MIN_PIECE gives the test rows' pieces there (sm_103a: the w / u form
+# below 96 chunks), so both forms run on sm_100a and on sm_103a.
+FWD_SPLIT_ROUTES = ("split_a", "split_w")
+FWD_ROUTES = ("a",) + FWD_SPLIT_ROUTES
+# (route, layout) of the device tests that also run the split forms on the layout where every sequence splits
+FWD_ROUTE_CASES = (("a", "g3"),) + tuple(
+    (route, case) for route in FWD_SPLIT_ROUTES for case in ("g3", "g3-all")
+)
+FWD_ROUTE_CASE_IDS = [f"{route}-{case}" for route, case in FWD_ROUTE_CASES]
 
 
 def _current_arch() -> str:
@@ -410,9 +423,33 @@ def _fwd_split_test_class(monkeypatch) -> None:
 
 
 def _split_a() -> bool:
-    """Whether the split forward of the current device runs on wy_a's A on the test rows (FWD_SPLIT_A_ARCHS; their
-    pieces are shorter than every FWD_SPLIT_A_MIN_PIECE entry, test_fwd_split_tables_follow_the_plan)."""
+    """Whether the split forward of the current device runs on wy_a's A on the test rows: the form _split_form forces,
+    else the device's (FWD_SPLIT_A_ARCHS; the rows' pieces are shorter than every FWD_SPLIT_A_MIN_PIECE entry,
+    test_fwd_split_tables_follow_the_plan)."""
     return cake_chain._fwd_split_a(_current_arch(), FWD_SPLIT_TEST_MIN_PIECE)
+
+
+def _split_form(route: str, device, monkeypatch) -> str:
+    """Force the split forward of ``route`` (FWD_SPLIT_ROUTES) on the device, with the shape class lowered to
+    FWD_SPLIT_TEST_MIN_PIECE: "split_a" on wy_a's A (FWD_SPLIT_A_ARCHS the device's architecture, no
+    FWD_SPLIT_A_MIN_PIECE), "split_w" on the WY stage's w / u (FWD_SPLIT_A_ARCHS empty); skips where the split forward
+    or the form's stages are not delivered.  Returns the architecture."""
+    assert route in FWD_SPLIT_ROUTES, route
+    arch = _fwd_split_or_skip(device)
+    _fwd_split_test_class(monkeypatch)
+    a_form = route == "split_a"
+    stages = cake_chain.FWD_SPLIT_A_STAGES if a_form else cake_chain.FWD_SPLIT_W_STAGES
+    if not all(cake_chain._available(stage, arch) for stage in stages):
+        pytest.skip(
+            f"the {route} form of the split forward is not delivered for {arch}"
+        )
+    monkeypatch.setattr(cake_chain, "FWD_SPLIT_A_ARCHS", (arch,) if a_form else ())
+    if a_form:
+        monkeypatch.setattr(
+            cake_chain, "FWD_SPLIT_A_MIN_PIECE", types.MappingProxyType({})
+        )
+    assert _split_a() is a_form, (route, arch)
+    return arch
 
 
 def _split_stages() -> list[str]:
@@ -462,24 +499,25 @@ def _assert_fwd_route(stages, route: str, calls: int = 1) -> None:
         assert stages.count("wy_a") == stages.count("fwd_ho_a") == calls, stages
         assert not {"fwd_fused", "fwd_summary", "fwd_summary_a"} & set(stages), stages
     else:
+        if route in FWD_SPLIT_ROUTES:  # a forced form
+            assert _split_a() is (route == "split_a"), route
         summary = "fwd_summary_a" if _split_a() else "fwd_summary"
         assert stages.count("wy_a") == stages.count(summary) == calls, stages
         assert stages.count(_split_wave()) == 2 * calls, stages
 
 
 def _fwd_route(
-    route: str, device, monkeypatch
+    route: str, device, monkeypatch, case: str = "g3"
 ) -> tuple[tuple[int, int], tuple[int, ...]]:
-    """The layout ``((H, HV), sequence lengths)`` that runs ``route``'s forward with FP32 beta on the device (fresh
-    chunk tables; the split forward's shape class lowered to FWD_SPLIT_TEST_MIN_PIECE); skips where the device does not
-    route it."""
+    """The layout ``((H, HV), sequence lengths)`` of ``case`` (FWD_A_CASES for "a", else FWD_SPLIT_CASES) that runs
+    ``route``'s forward with FP32 beta on the device (fresh chunk tables; a split route's form forced by _split_form);
+    skips where the device does not route it."""
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     if route == "a":
         _fwd_a_or_skip(device)
-        return FWD_A_CASES["g3"]
-    _fwd_split_or_skip(device)
-    _fwd_split_test_class(monkeypatch)
-    return FWD_SPLIT_CASES["g3"]
+        return FWD_A_CASES[case]
+    _split_form(route, device, monkeypatch)
+    return FWD_SPLIT_CASES[case]
 
 
 def _prep_forward_off(monkeypatch) -> None:
@@ -2770,33 +2808,68 @@ def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
     _assert_bitwise(shifted, aligned, OUTPUT_NAMES)
 
 
+# The operands of the unaligned-operand test: row -> (operand, offset in elements past a 16-byte boundary).  FI main's
+# rows (v, q / k 2 bytes, do) run on every route, the prep forward included; q / k 8 bytes (which the plain prep reads
+# in place), g, beta and the initial state run on the forwards on wy_a's A.
+UNALIGNED_ROWS = {
+    "v-2B": ("v", 1),
+    "v-8B": ("v", 4),
+    "q-2B": ("q", 1),
+    "k-2B": ("k", 1),
+    "do-2B": ("do", 1),
+    "do-8B": ("do", 4),
+}
+UNALIGNED_A_ROWS = {
+    "q-8B": ("q", 4),
+    "k-8B": ("k", 4),
+    "g-4B": ("g", 1),
+    "g-8B": ("g", 2),
+    "beta-4B": ("beta", 1),
+    "beta-8B": ("beta", 2),
+    "h0-4B": ("h0", 1),
+    "h0-8B": ("h0", 2),
+}
+UNALIGNED_CASES = [
+    (route, row) for route in ("prep",) + FWD_ROUTES for row in UNALIGNED_ROWS
+] + [(route, row) for route in FWD_ROUTES for row in UNALIGNED_A_ROWS]
+
+
 @pytest.mark.parametrize(
-    "name, offset",
-    [("v", 1), ("v", 4), ("q", 1), ("k", 1), ("q", 4), ("k", 4), ("g", 1), ("g", 2), ("beta", 1), ("beta", 2),
-     ("do", 1), ("do", 4)],
-    ids=["v-2B", "v-8B", "q-2B", "k-2B", "q-8B", "k-8B", "g-4B", "g-8B", "beta-4B", "beta-8B", "do-2B", "do-8B"],
-)  # fmt: skip
+    "route, row", UNALIGNED_CASES, ids=[f"{r}-{w}" for r, w in UNALIGNED_CASES]
+)
 def test_unaligned_operands_take_an_aligned_copy(
-    name, offset, device, monkeypatch
+    route, row, device, monkeypatch
 ) -> None:
     # a contiguous view 2, 4 or 8 bytes past a 16-byte boundary: .contiguous() keeps it where it is, and the 16-byte
-    # rows of v / g / beta / do and the 16-byte tensor-map rows of wy_a's q / k would fault there (misaligned
-    # address); the package copies such an operand to an aligned buffer, so the run gives the bits of the aligned one.
-    # FP32 beta and normalized q / k on a serial table (5 + 2 chunks): both runs take the forward on wy_a's A on every
-    # architecture, whose route is decided before any copy (an address never moves a call off it: q / k 8 bytes past
-    # the boundary, which the plain prep would read in place, take an aligned copy and stay on the route)
-    seq_lens = (300, 77)
-    inputs = _inputs(seq_lens, (2, 4), torch.float32, device, seed=29)
-    t = inputs[name]
+    # rows of v / g / beta / do and of the initial state (the split forward's stitch), the 16-byte tensor-map rows of
+    # wy_a's q / k and the plain prep's 8-byte q / k loads would fault there (misaligned address); the package copies
+    # such an operand to an aligned buffer, so the run gives the bits of the aligned one (the final state and the
+    # initial state's gradient included).  "prep": the switches of PREP_FORWARD_OFF off (FI main's forward: the prep,
+    # the WY stage, fwd_ho) with FP32 beta, as FI main's test ran; the forwards on wy_a's A ("a" and both split forms)
+    # decide their route before any copy (an address never moves a call off it: q / k 8 bytes past the boundary, which
+    # the plain prep reads in place, take an aligned copy and stay on the route)
+    name, offset = {**UNALIGNED_ROWS, **UNALIGNED_A_ROWS}[row]
+    if route == "prep":
+        _prep_forward_off(monkeypatch)
+        heads, seq_lens = (2, 4), (300, 77)
+    else:
+        heads, seq_lens = _fwd_route(route, device, monkeypatch)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=29)
+    h0, dht = _state_pair(seq_lens, heads, device, 30)
+    ops = {**inputs, "h0": h0}
+    t = ops[name]
     buf = torch.empty(t.numel() + 16, dtype=t.dtype, device=device)
     lead = (-buf.data_ptr() // t.element_size()) % (16 // t.element_size())
     shifted = buf[lead + offset : lead + offset + t.numel()].view(t.shape).copy_(t)
     assert (
         shifted.is_contiguous() and shifted.data_ptr() % 16 == offset * t.element_size()
     )
-    align = (
-        cake_chain.TMA_ALIGN_BYTES if name in ("q", "k") else cake_chain.ROW_ALIGN_BYTES
-    )
+    if name not in ("q", "k"):
+        align = cake_chain.ROW_ALIGN_BYTES
+    elif route == "prep":
+        align = cake_chain.PREP_ALIGN_BYTES
+    else:
+        align = cake_chain.TMA_ALIGN_BYTES
     assert (
         cake_chain._aligned(t, align) is t
         and cake_chain._aligned(shifted, align) is not shifted
@@ -2806,27 +2879,36 @@ def test_unaligned_operands_take_an_aligned_copy(
     def run(ops):
         leaves = {
             n: ops[n].detach().requires_grad_(True)
-            for n in ("q", "k", "v", "g", "beta")
+            for n in ("q", "k", "v", "g", "beta", "h0")
         }
         cu = _cu(seq_lens)
-        o, _ = cake_gdn_det(
+        o, final = cake_gdn_det(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], scale=1.0 / math.sqrt(HEAD_DIM),
+            initial_state=leaves["h0"], output_final_state=True,
             cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
             cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
         )  # fmt: skip
-        o.backward(ops["do"])
+        torch.autograd.backward((o, final), (ops["do"], dht))
         torch.cuda.synchronize()
         return {
             "o": o.detach(),
+            "final_state": final.detach(),
             **{f"d{n}": leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+            "dh0": leaves["h0"].grad,
         }
 
-    got = run({**inputs, name: shifted})
-    _assert_fwd_route(stages, "a")
-    stages.clear()
-    want = run(inputs)
-    _assert_fwd_route(stages, "a")
-    _assert_bitwise(got, want, OUTPUT_NAMES)
+    def check_route() -> None:
+        if route == "prep":
+            assert _preps(stages) and "wy_a" not in stages, stages
+        else:
+            _assert_fwd_route(stages, route)
+        stages.clear()
+
+    got = run({**ops, name: shifted})
+    check_route()
+    want = run(ops)
+    check_route()
+    _assert_bitwise(got, want, OUTPUT_NAMES + ("final_state", "dh0"))
 
 
 @pytest.mark.parametrize(
@@ -3244,7 +3326,8 @@ def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
 # pair's tile order, "forward-split" the split forward's tables (_FORWARD_SPLITS: through _META_FRONT, or the cache
 # alone under host_cache=False); setup "wavefront" turns the pair's rule on, "forward-split" routes the layout through
 # the split forward (FP32 beta, the shape class lowered to FWD_SPLIT_TEST_MIN_PIECE; sm_100a / sm_103a, skipped
-# elsewhere), an int is the SMs the planner sees (two-stream groups)
+# elsewhere), "forward-split-a" through its form on wy_a's A on both (_split_form), an int is the SMs the planner sees
+# (two-stream groups)
 TABLE_CACHE_ROWS = {
     "chunk": ("chunk", (300, 77, 640), (2, 4), {}, None),
     "chunk-uncached-front": ("chunk", (300, 77, 640), (2, 4), {"host_cache": False}, None),
@@ -3257,10 +3340,14 @@ TABLE_CACHE_ROWS = {
 }  # fmt: skip
 # layout -> (sequence lengths, heads, setup) of the eviction and capture tests; their calls take lpt=False, so the
 # prep forward's fwd_ho reads the cached identity walk ("chunk-walk") and the split forward its cached split tables
+# (int64 indices of first pieces and their sequences; "forward-split-all": every sequence splits, first pieces only)
 TABLE_LAYOUTS = {
     "chunk-walk": ((300, 77, 640), (2, 4), None),
     "forward-split": (FWD_SPLIT_CASES["g2"][1], FWD_SPLIT_CASES["g2"][0], "forward-split"),
+    "forward-split-all": (FWD_SPLIT_CASES["g3-all"][1], FWD_SPLIT_CASES["g3-all"][0], "forward-split-a"),
 }  # fmt: skip
+# the setups that route a cached-table layout through the split forward
+FORWARD_SPLIT_SETUPS = ("forward-split", "forward-split-a")
 
 
 def _table_setup(monkeypatch, device, setup) -> None:
@@ -3270,22 +3357,25 @@ def _table_setup(monkeypatch, device, setup) -> None:
     elif setup == "forward-split":
         _fwd_split_or_skip(device)
         _fwd_split_test_class(monkeypatch)
+    elif setup == "forward-split-a":
+        _split_form("split_a", device, monkeypatch)
     elif setup is not None:
         _small_device(monkeypatch, device, setup)
 
 
 def _table_inputs(seq_lens, heads, setup, device, seed) -> dict:
-    """The operands of a cached-table call: FP32 beta under setup "forward-split" (a condition of the split forward),
-    else BF16 (the prep forward)."""
-    beta_dtype = torch.float32 if setup == "forward-split" else torch.bfloat16
+    """The operands of a cached-table call: FP32 beta under a setup of FORWARD_SPLIT_SETUPS (a condition of the split
+    forward), else BF16 (the prep forward)."""
+    beta_dtype = torch.float32 if setup in FORWARD_SPLIT_SETUPS else torch.bfloat16
     return _inputs(seq_lens, heads, beta_dtype, device, seed=seed)
 
 
 def _check_table_route(stages, setup) -> None:
-    """Under setup "forward-split", the call whose launches are ``stages`` ran the split forward; else the prep
-    forward."""
-    if setup == "forward-split":
+    """Under a setup of FORWARD_SPLIT_SETUPS, the call whose launches are ``stages`` ran the split forward (on wy_a's
+    A under "forward-split-a"); else the prep forward."""
+    if setup in FORWARD_SPLIT_SETUPS:
         assert _forward_stages(stages) == _split_stages(), stages
+        assert setup != "forward-split-a" or _split_a(), stages
     else:
         assert _preps(stages) and "wy_a" not in stages, stages
 
@@ -3480,7 +3570,7 @@ def test_an_evicted_table_waits_for_reads_on_another_stream(
     _check_table_route(stages, setup)
     tables = _cached_tables()
     # the chunk tables and the identity walk; the chunk tables and the split forward's int32 tables and int64 indices
-    assert len(tables) == (3 if setup == "forward-split" else 2), len(tables)
+    assert len(tables) == (3 if setup in FORWARD_SPLIT_SETUPS else 2), len(tables)
     addresses = _storage_addresses(tables)
     del tables
     cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
@@ -3560,11 +3650,11 @@ def test_a_capture_keeps_the_cached_tables_it_reads(
     own = _storage_addresses(
         _cached_tables(
             ("chunk", "forward-split")
-            if setup == "forward-split"
+            if setup in FORWARD_SPLIT_SETUPS
             else ("chunk", "walk")
         )
     )
-    assert len(own) == (3 if setup == "forward-split" else 2), own
+    assert len(own) == (3 if setup in FORWARD_SPLIT_SETUPS else 2), own
     sizes = [t.untyped_storage().nbytes() for t in tables]
     del tables
     graph = torch.cuda.CUDAGraph()
@@ -4208,8 +4298,9 @@ SIDE_STREAM_ITERS = 9
 SPLIT_2S_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
 # The "fwd-" rows take FP32 beta and run a forward on wy_a's A (route asserted on the reference call): "fwd-a" wy_a (one
 # persistent CTA per SM over 2048 (chunk, key head) items) and fwd_ho_a on a serial table (64 sequences x 6 value heads:
-# more CTAs than SMs on every device of the package), "fwd-split" the split forward (its summary on a side stream of its
-# own; the shape class lowered to FWD_SPLIT_TEST_MIN_PIECE; sm_100a / sm_103a, skipped elsewhere).
+# more CTAs than SMs on every device of the package), "fwd-split-a" / "fwd-split-w" the split forward on wy_a's A
+# (fwd_summary_a, fwd_ho_a) / on the WY stage's w / u (fwd_summary, fwd_fused), each form forced (its summary on a side
+# stream of its own; the shape class lowered to FWD_SPLIT_TEST_MIN_PIECE; sm_100a / sm_103a, skipped elsewhere).
 SIDE_STREAM_ROWS = (
     ("g2", (4096,) * 4, (2, 4), {}),
     ("g3", (4096,) * 4, (2, 6), {}),
@@ -4217,19 +4308,19 @@ SIDE_STREAM_ROWS = (
     ("split-g2-2s", (16384,), (2, 4), SPLIT_2S_PINS),
     ("split-g3-2s", (16384,), (2, 6), SPLIT_2S_PINS),
     ("fwd-a", (1024,) * 64, (2, 6), {}),
-    ("fwd-split", FWD_SPLIT_CASES["g3"][1], FWD_SPLIT_CASES["g3"][0], {}),
+    ("fwd-split-a", FWD_SPLIT_CASES["g3"][1], FWD_SPLIT_CASES["g3"][0], {}),
+    ("fwd-split-w", FWD_SPLIT_CASES["g3"][1], FWD_SPLIT_CASES["g3"][0], {}),
 )  # fmt: skip
 
 
 @pytest.mark.parametrize("row", SIDE_STREAM_ROWS, ids=[r[0] for r in SIDE_STREAM_ROWS])
 def test_forward_backward_beside_a_resident_side_stream_kernel(row, device, monkeypatch) -> None:  # fmt: skip
     row_id, seq_lens, heads, pins = row
-    route = {"fwd-a": "a", "fwd-split": "split"}.get(row_id)
+    route = {"fwd-a": "a", "fwd-split-a": "split_a", "fwd-split-w": "split_w"}.get(row_id)  # fmt: skip
     if route == "a":
         _fwd_a_or_skip(device)
-    elif route == "split":
-        _fwd_split_or_skip(device)
-        _fwd_split_test_class(monkeypatch)
+    elif route is not None:
+        _split_form(route, device, monkeypatch)
     beta_dtype = torch.bfloat16 if route is None else torch.float32
     inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=287)
     leaves = {
@@ -4540,23 +4631,25 @@ def test_fwd_split_shape_class(row, sm_count, monkeypatch) -> None:
     assert table.first_wave <= sm_count, table
 
 
-# The forward table rule of FWD_A_SERIAL_KEEP on the priced rows at 212 SMs (R200, sm_107a): row -> whether its split
-# forward table gives way to the planner's cheapest serial table.  The 3 sequences of 11000 / 12000 / 9768 tokens with
-# HV 48 (144 serial CTAs, fill 0.68, the serial table 1.06 x the split table's price) take it; with HV 24 (72 CTAs,
-# 1.51 x) and fewer value heads, and the long rows, the split table stays (64 x 4096 is serial without the rule).
-FWD_A_SERIAL_ROWS = {
-    212: {
-        "A16": True,
-        "h8_hv24": False,
-        "h4_hv12": False,
-        "h2_hv6": False,
-        "h1_hv3": False,
-        "issue": False,
-        "P3": False,
-        "P1": False,
-        "64x4096": False,
-    }
+# The forward table rule of FWD_A_SERIAL_KEEP on the priced rows at 208, 212 and 216 SMs (R200, sm_107a): row ->
+# whether its split forward table gives way to the planner's cheapest serial table.  At 212 SMs the 3 sequences of
+# 11000 / 12000 / 9768 tokens with HV 48 (144 serial CTAs, fill 0.68, the serial table 1.06 x the split table's price)
+# take it; with HV 24 (72 CTAs, 1.51 x) and fewer value heads, and the long rows, the split table stays (64 x 4096 is
+# serial without the rule).  At 208 and 216 SMs (the R200 boards of other SM counts) the same rows are expected: every
+# row but A16 and 64 x 4096 has fewer serial CTAs than 0.65 of the SMs, A16 fills 0.69 / 0.67 of them and its ratio
+# moves little with the SM count (the FWD_A_SERIAL lines, pytest -s, report the ratios of every SM count).
+_FWD_A_SERIAL_KEPT = {
+    "A16": True,
+    "h8_hv24": False,
+    "h4_hv12": False,
+    "h2_hv6": False,
+    "h1_hv3": False,
+    "issue": False,
+    "P3": False,
+    "P1": False,
+    "64x4096": False,
 }
+FWD_A_SERIAL_ROWS = {sm_count: _FWD_A_SERIAL_KEPT for sm_count in (208, 212, 216)}
 
 
 @pytest.mark.parametrize(
@@ -4603,6 +4696,7 @@ def test_fwd_a_serial_keep_rule(arch, sm_count, monkeypatch) -> None:
         assert _segments(chunks, fwd0) > len(chunks), (row, fwd0)
         meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=(fwd, bwd))
         assert meta.fwd_segments.num_segments == len(seq_lens), row
+    print(f"FWD_A_SERIAL {arch} sms={sm_count} kept={sorted(kept)} ratios={ {r: x for r, x in ratios.items() if x} }")  # fmt: skip
     if arch not in cake_chain.FWD_A_SERIAL_KEEP:
         assert kept == set()
     for row, want in FWD_A_SERIAL_ROWS.get(sm_count, {}).items():
@@ -4699,30 +4793,154 @@ def test_fwd_a_matches_the_fp64_recurrence(case, device, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
-def test_fwd_split_matches_the_fp64_recurrence(case, device, monkeypatch) -> None:
-    # the split forward replaces the prep, the WY stage, the pre-scan and fwd_ho; o, the final state and every gradient
-    # (the initial state's too) within the accuracy gate of the FP64 recurrence (REL_RMS_MAX, MAX_ABS_REL)
-    _fwd_split_or_skip(device)
-    _fwd_split_test_class(monkeypatch)
-    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
-    heads, seq_lens = FWD_SPLIT_CASES[case]
+@pytest.mark.parametrize("route", FWD_SPLIT_ROUTES)
+def test_fwd_split_matches_the_fp64_recurrence(route, case, device, monkeypatch) -> None:  # fmt: skip
+    # the split forward (on wy_a's A and on the WY stage's w / u) replaces the prep, the WY stage, the pre-scan and
+    # fwd_ho; o, the final state and every gradient (the initial state's too) within the accuracy gate of the FP64
+    # recurrence (REL_RMS_MAX, MAX_ABS_REL)
+    heads, seq_lens = _fwd_route(route, device, monkeypatch, case)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=421)
     h0, dht = _state_pair(seq_lens, heads, device, 422)
     stages = _record_launches(monkeypatch)
     got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
     assert _forward_stages(stages) == _split_stages(), stages
-    _assert_fwd_route(stages, "split")
+    _assert_fwd_route(stages, route)
     ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
 
+# (route, layout) of the accuracy tests beside the prep forward: every layout of the route's cases
+FWD_ACCURACY_CASES = tuple(("a", case) for case in sorted(FWD_A_CASES)) + tuple(
+    (route, case) for route in FWD_SPLIT_ROUTES for case in sorted(FWD_SPLIT_CASES)
+)
+
+
+@pytest.mark.parametrize(
+    "route, case", FWD_ACCURACY_CASES, ids=[f"{r}-{c}" for r, c in FWD_ACCURACY_CASES]
+)
+def test_fwd_routes_within_the_budgets_of_the_prep_forward(
+    route, case, device, monkeypatch
+) -> None:
+    # the forwards on wy_a's A against the prep forward (the switches of PREP_FORWARD_OFF off: the prep, the WY stage,
+    # fwd_ho, with the pre-scan and the stitch on a split table) on the same inputs: o, the final state and every
+    # gradient (the initial state's too) within the accuracy budgets (REL_RMS_MAX, MAX_ABS_REL), the prep forward's
+    # results as the reference
+    heads, seq_lens = _fwd_route(route, device, monkeypatch, case)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=403)
+    h0, dht = _state_pair(seq_lens, heads, device, 404)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    stages = _record_launches(monkeypatch)
+    got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
+    _assert_fwd_route(stages, route)
+    _prep_forward_off(monkeypatch)
+    stages.clear()
+    want = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
+    assert "wy_a" not in stages and _preps(stages), stages
+    _assert_close_to_reference(got, want, names)
+
+
+def _explicit_norm_run(inputs, seq_lens, device) -> dict:
+    """The explicit normalization of #7817 on the same operands: the caller normalizes q / k in FP32 as the FP64
+    reference does (``x / sqrt(sum x^2 + L2NORM_EPS)``), rounds them to BF16 and calls with
+    ``use_qk_l2norm_in_kernel=False``; dq / dk flow back through the caller's normalization to the raw q / k."""
+    leaves = {
+        n: inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    }
+
+    def normalized(x):
+        x32 = x.float()
+        return (x32 / torch.sqrt((x32 * x32).sum(-1, keepdim=True) + L2NORM_EPS)).to(x.dtype)  # fmt: skip
+
+    cu = _cu(seq_lens)
+    o, _ = cake_gdn_det(normalized(leaves["q"]), normalized(leaves["k"]), leaves["v"], leaves["g"], leaves["beta"],
+                        scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                        cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64),
+                        use_qk_l2norm_in_kernel=False)  # fmt: skip
+    (o.float() * inputs["do"].float()).sum().backward()
+    torch.cuda.synchronize()
+    return {
+        "o": o.detach(),
+        **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+    }
+
+
 @pytest.mark.parametrize("route", FWD_ROUTES)
-def test_fwd_routes_run_to_run_bitwise(route, device, monkeypatch) -> None:
+def test_fwd_routes_in_kernel_norm_beside_the_explicit_norm(
+    route, device, monkeypatch
+) -> None:
+    # #7817 on the routes (in-kernel normalization no less accurate against FP64 than the explicit path), on the same
+    # FP32-beta inputs: the in-kernel normalization on the route's forward (route asserted) and the explicit one (the
+    # caller's FP32 normalization with use_qk_l2norm_in_kernel=False, which keeps the prep forward), each against the
+    # FP64 recurrence on the raw q / k with FP64 normalization.  Both arms hold the FP64 gate (REL_RMS_MAX,
+    # MAX_ABS_REL); the ACC7817 lines (pytest -s) report both arms per output for the #7817 comparison, whose statistic
+    # (seeds, RMS or worst element) the issue does not fix: this test sets no bar of its own between the arms
+    heads, seq_lens = _fwd_route(route, device, monkeypatch)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=481)
+    stages = _record_launches(monkeypatch)
+    in_kernel = _run(inputs, seq_lens)
+    _assert_fwd_route(stages, route)
+    stages.clear()
+    explicit = _explicit_norm_run(inputs, seq_lens, device)
+    assert "wy_a" not in stages and _preps(stages), stages
+    ref = _reference(inputs, seq_lens)
+    index = cake_chain._device_index(device)
+    tag = f"ACC7817 {_current_arch()} sms={cake_chain._device_props(index)[0]} route={route}"
+    for name in OUTPUT_NAMES:
+        arms = {"in_kernel": in_kernel, "explicit": explicit}
+        fields = []
+        for arm, res in arms.items():
+            m = _metrics(res[name], ref[name])
+            fields.append(f"{arm} rel_rms={m['rel_rms']:.4e} max_rel={m['max_abs'] / max(m['max_ref'], 1e-30):.4e}")  # fmt: skip
+        print(f"{tag} {name} " + " ".join(fields))
+    _assert_close_to_reference(in_kernel, ref, OUTPUT_NAMES)
+    _assert_close_to_reference(explicit, ref, OUTPUT_NAMES)
+
+
+def test_fwd_split_a_tape_matches_the_w_form(device, monkeypatch) -> None:
+    # the two forms of the split forward on the same inputs: on wy_a's A the waves write the T_full tape themselves
+    # (fwd_ho_a word 11), w the bits of the WY stage's w on the same A, h, v_new and o within a relative L2 of 1e-2 of
+    # the waves on the WY stage's w / u (fwd_fused), u a placeholder in both
+    heads, seq_lens = _fwd_route("split_a", device, monkeypatch)
+    arch = _current_arch()
+    assert set(cake_plan.tape_state(arch, True)) == {"w", "h", "v_new"}, arch
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=437)
+
+    def saved_state() -> dict:
+        leaves = {
+            n: inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        o, _ = _call(leaves, seq_lens, device)
+        saved = _saved_list(o)
+        return {
+            "o": o.detach(),
+            **dict(zip(cake_plan.STATE_NAMES, saved[9:], strict=True)),
+        }
+
+    stages = _record_launches(monkeypatch)
+    got = saved_state()
+    assert _forward_stages(stages) == FWD_SPLIT_A_STAGES, stages
+    _split_form("split_w", device, monkeypatch)
+    stages.clear()
+    want = saved_state()
+    assert _forward_stages(stages) == FWD_SPLIT_STAGES, stages
+    assert cake_plan.is_placeholder(got["u"]) and cake_plan.is_placeholder(want["u"])
+    assert torch.equal(got["w"], want["w"])
+    for name in ("o", "h", "v_new"):
+        a, b = got[name].float(), want[name].float()
+        assert bool(torch.isfinite(a).all()), name
+        rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
+        assert rel <= 1e-2, (name, rel)
+
+
+@pytest.mark.parametrize("route, case", FWD_ROUTE_CASES, ids=FWD_ROUTE_CASE_IDS)
+def test_fwd_routes_run_to_run_bitwise(route, case, device, monkeypatch) -> None:
     # every launch of the forwards on wy_a's A has one writer per output element and a fixed order (wy_a's persistent
     # CTAs take their items in a fixed order; the split forward's wave 1 and summary write disjoint segments): run to
     # run, with tables built for the call, and on one stream as on two (the split forward's summary then on the
     # caller's stream), the same bits on every output, the final state and the initial state's gradient
-    heads, seq_lens = _fwd_route(route, device, monkeypatch)
+    heads, seq_lens = _fwd_route(route, device, monkeypatch, case)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=425)
     h0, dht = _state_pair(seq_lens, heads, device, 426)
     names = OUTPUT_NAMES + ("final_state", "dh0")
@@ -4943,14 +5161,14 @@ def test_fwd_routes_saved_list_keeps_its_arity(
 
 
 @pytest.mark.parametrize("reentrant", [False, True], ids=["non-reentrant", "reentrant"])
-@pytest.mark.parametrize("route", FWD_ROUTES)
+@pytest.mark.parametrize("route, case", FWD_ROUTE_CASES, ids=FWD_ROUTE_CASE_IDS)
 def test_fwd_routes_checkpoint_writes_the_tape_once(
-    route, reentrant, device, monkeypatch
+    route, case, reentrant, device, monkeypatch
 ) -> None:
     # under torch.utils.checkpoint (non-reentrant and reentrant) the first pass keeps no tape (tape word 0: its saved
     # tensors are dropped either way) and retains nothing beyond its outputs (#7039), and the recompute writes the
     # tape: o, the final state and every gradient (the initial state's too) are the bits of the plain call
-    heads, seq_lens = _fwd_route(route, device, monkeypatch)
+    heads, seq_lens = _fwd_route(route, device, monkeypatch, case)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=413)
     h0, dht = _state_pair(seq_lens, heads, device, 414)
     names = OUTPUT_NAMES + ("final_state", "dh0")
@@ -5028,7 +5246,7 @@ def test_low_level_fwd_routes_round_trip(
     cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
     meta = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1], options, num_heads=heads[0],
                                   a_inputs=True)  # fmt: skip
-    assert (meta.fwd_split is not None) is (route == "split")
+    assert (meta.fwd_split is not None) is (route != "a")
     q, k, v, g, beta, do = (inputs[n] for n in ("q", "k", "v", "g", "beta", "do"))
     stages = _record_launches(monkeypatch)
     fwd = cake_chain.cake_gdn_det_train_forward(
@@ -5073,7 +5291,7 @@ def test_fwd_routes_accumulate_into_a_nonzero_grad(
     stages = [stage for stage, _stream in launches]
     # the fresh call and the two accumulating ones
     _assert_fwd_route(stages, route, calls=3)
-    if route == "split":
+    if route != "a":
         summary = "fwd_summary_a" if _split_a() else "fwd_summary"
         side = [stage for stage, stream in launches if stream != main]
         assert side.count(summary) == (2 if streams == 2 else 0), launches
@@ -5160,13 +5378,18 @@ def test_fwd_split_tables_follow_the_plan(device, monkeypatch) -> None:
     assert got is not None and got.length == plan.pieces.length
     assert got.length >= cake_plan.FORWARD_SPLIT_MIN_PIECE[arch]
     assert got.ready is not None  # cached with its write
-    # the test rows cut pieces shorter than every FWD_SPLIT_A_MIN_PIECE entry (_split_a)
-    for case_heads, case_lens in FWD_SPLIT_CASES.values():
-        length = meta(case_heads, case_lens).fwd_split.length
+    # the test rows cut pieces shorter than every FWD_SPLIT_A_MIN_PIECE entry (_split_a); every sequence of "g3-all"
+    # splits (no first_seq index: wave 1's end states are the final states in table order), the other rows keep a
+    # sequence of one piece
+    for case, (case_heads, case_lens) in FWD_SPLIT_CASES.items():
+        split = meta(case_heads, case_lens).fwd_split
+        length = split.length
         assert length < min(
             cake_chain.FWD_SPLIT_A_MIN_PIECE.values(), default=length + 1
         )
         assert cake_chain._fwd_split_a(arch, length) is _split_a(), (arch, length)
+        every = split.num_first == len(case_lens)
+        assert every is (case == "g3-all") and (split.first_seq is None) is every, (case, split.num_first)  # fmt: skip
     assert got.num_segments == sum(plan.pieces.counts)
     assert got.num_first + got.num_middle + len(seq_lens) == got.num_segments
     assert got.num_middle >= 1
