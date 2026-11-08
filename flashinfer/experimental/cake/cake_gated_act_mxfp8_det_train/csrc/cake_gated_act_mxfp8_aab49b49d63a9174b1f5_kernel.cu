@@ -118,7 +118,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
+kernel_cake_gated_act_mxfp8_aab49b49d63a9174b1f5(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -361,124 +361,130 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&mul_5) : "l"(*(const unsigned long long*)&_f32x2_mul_a_35), "l"(*(const unsigned long long*)&cvt_f32_1_5));
         packed[3] = __as_u32(__float22bfloat162_rn(make_float2(mul_5.x, mul_5.y)));
         if (band != 0) {
+            unsigned int popc = (unsigned int)__popc(band);
             #pragma unroll 1
-            for (int i = 0; i < 4; i++) {
-                if ((band >> i & 1) != 0) {
-                    unsigned int vec_load[1];
-                    {
-                        vec_load[0] = *reinterpret_cast<const unsigned int*>(gated_input + (gate_index + 2 * i) + 0);
-                    }
-                    unsigned int vec_load_1[1];
-                    {
-                        vec_load_1[0] = *reinterpret_cast<const unsigned int*>(gated_input + (gate_index + K + 2 * i) + 0);
-                    }
-                    float2 cvt_f32_7 = cake_bf16x2_to_f32x2(__as_bf16x2(vec_load[0]));
-                    float2 cvt_f32_1_6 = cake_bf16x2_to_f32x2(__as_bf16x2(vec_load_1[0]));
-                    float e0_6 = approx_exp2(-cvt_f32_7.x * 1.442695f);
-                    float e1_6 = approx_exp2(-cvt_f32_7.y * 1.442695f);
-                    float d0_6 = 1.0f + e0_6;
-                    float d1_6 = 1.0f + e1_6;
-                    float r0_6 = approx_rcp(d0_6);
-                    float r1_6 = approx_rcp(d1_6);
-                    float _fma_36;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_36) : "f"(-d0_6), "f"(r0_6), "f"(1.0f));
-                    float fma_4;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_4) : "f"(r0_6), "f"(_fma_36), "f"(r0_6));
-                    float _fma_37;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_37) : "f"(-d1_6), "f"(r1_6), "f"(1.0f));
-                    float fma_1_3;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_1_3) : "f"(r1_6), "f"(_fma_37), "f"(r1_6));
-                    float t0_3 = fma_4;
-                    float t1_3 = fma_1_3;
-                    float d4_8a;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(d4_8a) : "f"(d0_6), "f"(0.25f));
-                    float r4_8a = approx_rcp(d4_8a);
-                    float _fma_39;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_39) : "f"(-d4_8a), "f"(r4_8a), "f"(1.0f));
-                    float _fma_38;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_38) : "f"(r4_8a), "f"(_fma_39), "f"(r4_8a));
-                    float big_8a;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(big_8a) : "f"(mul_f32_rn_noftz(_fma_38, 1.2676506e+30f)), "f"(1.4073749e+14f));
-                    float _add_40;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_40) : "f"(big_8a), "f"(8.388608e+06f));
-                    float whole_8a;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(whole_8a) : "f"(_add_40), "f"(8.388608e+06f));
-                    float above_8a;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(above_8a) : "f"(-d4_8a), "f"(mul_f32_rn_noftz(mul_f32_rn_noftz(big_8a, 7.888609e-31f), 7.1054274e-15f)), "f"(1.0f));
-                    float _sub_42;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_42) : "f"(big_8a), "f"(whole_8a));
-                    float _abs_41;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_41) : "f"(_sub_42));
-                    float _add_43;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_43) : "f"(big_8a), "f"(0.5f));
-                    float _sub_44;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_44) : "f"(big_8a), "f"(0.5f));
-                    float rounded_8a = ((_abs_41 == 0.5f) ? ((above_8a > 0.0f) ? _add_43 : _sub_44) : whole_8a);
-                    float u0 = ((d0_6 >= 8.507059e+37f) ? mul_f32_rn_noftz(mul_f32_rn_noftz(rounded_8a, 7.888609e-31f), 1.7763568e-15f) : t0_3);
-                    float d4_8a_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(d4_8a_0) : "f"(d1_6), "f"(0.25f));
-                    float r4_8a_0 = approx_rcp(d4_8a_0);
-                    float _fma_46;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_46) : "f"(-d4_8a_0), "f"(r4_8a_0), "f"(1.0f));
-                    float _fma_45;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_45) : "f"(r4_8a_0), "f"(_fma_46), "f"(r4_8a_0));
-                    float big_8a_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(big_8a_0) : "f"(mul_f32_rn_noftz(_fma_45, 1.2676506e+30f)), "f"(1.4073749e+14f));
-                    float _add_47;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47) : "f"(big_8a_0), "f"(8.388608e+06f));
-                    float whole_8a_0;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(whole_8a_0) : "f"(_add_47), "f"(8.388608e+06f));
-                    float above_8a_0;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(above_8a_0) : "f"(-d4_8a_0), "f"(mul_f32_rn_noftz(mul_f32_rn_noftz(big_8a_0, 7.888609e-31f), 7.1054274e-15f)), "f"(1.0f));
-                    float _sub_49;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_49) : "f"(big_8a_0), "f"(whole_8a_0));
-                    float _abs_48;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_48) : "f"(_sub_49));
-                    float _add_50;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_50) : "f"(big_8a_0), "f"(0.5f));
-                    float _sub_51;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_51) : "f"(big_8a_0), "f"(0.5f));
-                    float rounded_8a_0 = ((_abs_48 == 0.5f) ? ((above_8a_0 > 0.0f) ? _add_50 : _sub_51) : whole_8a_0);
-                    float u1 = ((d1_6 >= 8.507059e+37f) ? mul_f32_rn_noftz(mul_f32_rn_noftz(rounded_8a_0, 7.888609e-31f), 1.7763568e-15f) : t1_3);
-                    float2 _f32x2_mul_a_52 = mul_f32x2_noftz(cvt_f32_7, make_float2(max_noftz(u0, 0.0f), max_noftz(u1, 0.0f)));
-                    float2 mul_6;
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&mul_6) : "l"(*(const unsigned long long*)&_f32x2_mul_a_52), "l"(*(const unsigned long long*)&cvt_f32_1_6));
-                    unsigned int pair = __as_u32(__float22bfloat162_rn(make_float2(mul_6.x, mul_6.y)));
-                    packed[0] = ((i == 0) ? pair : packed[0]);
-                    packed[1] = ((i == 1) ? pair : packed[1]);
-                    packed[2] = ((i == 2) ? pair : packed[2]);
-                    packed[3] = ((i == 3) ? pair : packed[3]);
+            for (int _j = 0; _j < popc; _j++) {
+                int _find_first_set_36 = __ffs(band);
+                int j = _find_first_set_36 - 1;
+                band = band & band - 1;
+                unsigned int vec_load[1];
+                {
+                    vec_load[0] = *reinterpret_cast<const unsigned int*>(gated_input + (gate_index + 2 * j) + 0);
                 }
+                unsigned int vec_load_1[1];
+                {
+                    vec_load_1[0] = *reinterpret_cast<const unsigned int*>(gated_input + (gate_index + K + 2 * j) + 0);
+                }
+                float2 cvt_f32_7 = cake_bf16x2_to_f32x2(__as_bf16x2(vec_load[0]));
+                float2 cvt_f32_1_6 = cake_bf16x2_to_f32x2(__as_bf16x2(vec_load_1[0]));
+                float e0_6 = approx_exp2(-cvt_f32_7.x * 1.442695f);
+                float e1_6 = approx_exp2(-cvt_f32_7.y * 1.442695f);
+                float d0_6 = 1.0f + e0_6;
+                float d1_6 = 1.0f + e1_6;
+                float r0_6 = approx_rcp(d0_6);
+                float r1_6 = approx_rcp(d1_6);
+                float _fma_37;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_37) : "f"(-d0_6), "f"(r0_6), "f"(1.0f));
+                float fma_4;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_4) : "f"(r0_6), "f"(_fma_37), "f"(r0_6));
+                float _fma_38;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_38) : "f"(-d1_6), "f"(r1_6), "f"(1.0f));
+                float fma_1_3;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_1_3) : "f"(r1_6), "f"(_fma_38), "f"(r1_6));
+                float t0_3 = fma_4;
+                float t1_3 = fma_1_3;
+                float d4_8a;
+                asm("mul.rn.f32 %0, %1, %2;" : "=f"(d4_8a) : "f"(d0_6), "f"(0.25f));
+                float r4_8a = approx_rcp(d4_8a);
+                float _fma_40;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_40) : "f"(-d4_8a), "f"(r4_8a), "f"(1.0f));
+                float _fma_39;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_39) : "f"(r4_8a), "f"(_fma_40), "f"(r4_8a));
+                float big_8a;
+                asm("mul.rn.f32 %0, %1, %2;" : "=f"(big_8a) : "f"(mul_f32_rn_noftz(_fma_39, 1.2676506e+30f)), "f"(1.4073749e+14f));
+                float _add_41;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_41) : "f"(big_8a), "f"(8.388608e+06f));
+                float whole_8a;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(whole_8a) : "f"(_add_41), "f"(8.388608e+06f));
+                float above_8a;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(above_8a) : "f"(-d4_8a), "f"(mul_f32_rn_noftz(mul_f32_rn_noftz(big_8a, 7.888609e-31f), 7.1054274e-15f)), "f"(1.0f));
+                float _sub_43;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_43) : "f"(big_8a), "f"(whole_8a));
+                float _abs_42;
+                asm("abs.f32 %0, %1;" : "=f"(_abs_42) : "f"(_sub_43));
+                float _add_44;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_44) : "f"(big_8a), "f"(0.5f));
+                float _sub_45;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_45) : "f"(big_8a), "f"(0.5f));
+                float rounded_8a = ((_abs_42 == 0.5f) ? ((above_8a > 0.0f) ? _add_44 : _sub_45) : whole_8a);
+                float u0 = ((d0_6 >= 8.507059e+37f) ? mul_f32_rn_noftz(mul_f32_rn_noftz(rounded_8a, 7.888609e-31f), 1.7763568e-15f) : t0_3);
+                float d4_8a_0;
+                asm("mul.rn.f32 %0, %1, %2;" : "=f"(d4_8a_0) : "f"(d1_6), "f"(0.25f));
+                float r4_8a_0 = approx_rcp(d4_8a_0);
+                float _fma_47;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_47) : "f"(-d4_8a_0), "f"(r4_8a_0), "f"(1.0f));
+                float _fma_46;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_46) : "f"(r4_8a_0), "f"(_fma_47), "f"(r4_8a_0));
+                float big_8a_0;
+                asm("mul.rn.f32 %0, %1, %2;" : "=f"(big_8a_0) : "f"(mul_f32_rn_noftz(_fma_46, 1.2676506e+30f)), "f"(1.4073749e+14f));
+                float _add_48;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_48) : "f"(big_8a_0), "f"(8.388608e+06f));
+                float whole_8a_0;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(whole_8a_0) : "f"(_add_48), "f"(8.388608e+06f));
+                float above_8a_0;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(above_8a_0) : "f"(-d4_8a_0), "f"(mul_f32_rn_noftz(mul_f32_rn_noftz(big_8a_0, 7.888609e-31f), 7.1054274e-15f)), "f"(1.0f));
+                float _sub_50;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_50) : "f"(big_8a_0), "f"(whole_8a_0));
+                float _abs_49;
+                asm("abs.f32 %0, %1;" : "=f"(_abs_49) : "f"(_sub_50));
+                float _add_51;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_51) : "f"(big_8a_0), "f"(0.5f));
+                float _sub_52;
+                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_52) : "f"(big_8a_0), "f"(0.5f));
+                float rounded_8a_0 = ((_abs_49 == 0.5f) ? ((above_8a_0 > 0.0f) ? _add_51 : _sub_52) : whole_8a_0);
+                float u1 = ((d1_6 >= 8.507059e+37f) ? mul_f32_rn_noftz(mul_f32_rn_noftz(rounded_8a_0, 7.888609e-31f), 1.7763568e-15f) : t1_3);
+                float2 _f32x2_mul_a_53 = mul_f32x2_noftz(cvt_f32_7, make_float2(max_noftz(u0, 0.0f), max_noftz(u1, 0.0f)));
+                float2 mul_6;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&mul_6) : "l"(*(const unsigned long long*)&_f32x2_mul_a_53), "l"(*(const unsigned long long*)&cvt_f32_1_6));
+                unsigned int pair = __as_u32(__float22bfloat162_rn(make_float2(mul_6.x, mul_6.y)));
+                packed[0] = ((j == 0) ? pair : packed[0]);
+                packed[1] = ((j == 1) ? pair : packed[1]);
+                packed[2] = ((j == 2) ? pair : packed[2]);
+                packed[3] = ((j == 3) ? pair : packed[3]);
+                packed[4] = ((j == 4) ? pair : packed[4]);
+                packed[5] = ((j == 5) ? pair : packed[5]);
+                packed[6] = ((j == 6) ? pair : packed[6]);
+                packed[7] = ((j == 7) ? pair : packed[7]);
             }
         }
     }
     unsigned int nswizzle = (unsigned int)(row >> 3 & 3);
     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(tile_addr + (unsigned int)(row * 64) + (((unsigned int)quarter ^ nswizzle) << 4)), "r"(packed[0]), "r"(packed[1]), "r"(packed[2]), "r"(packed[3]) : "memory");
     __nv_bfloat162 amax = __as_bf16x2(0);
-    __nv_bfloat162 _hxa_54 = amax;
-    __nv_bfloat162 _hxb_54 = __as_bf16x2(packed[0]);
-    unsigned int _hxr_54;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_54) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_54)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_54)));
-    __nv_bfloat162 _max_53 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_54);
-    amax = _max_53;
-    __nv_bfloat162 _hxa_56 = amax;
-    __nv_bfloat162 _hxb_56 = __as_bf16x2(packed[1]);
-    unsigned int _hxr_56;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_56) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_56)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_56)));
-    __nv_bfloat162 _max_55 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_56);
-    amax = _max_55;
-    __nv_bfloat162 _hxa_58 = amax;
-    __nv_bfloat162 _hxb_58 = __as_bf16x2(packed[2]);
-    unsigned int _hxr_58;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_58) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_58)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_58)));
-    __nv_bfloat162 _max_57 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_58);
-    amax = _max_57;
-    __nv_bfloat162 _hxa_60 = amax;
-    __nv_bfloat162 _hxb_60 = __as_bf16x2(packed[3]);
-    unsigned int _hxr_60;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_60) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_60)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_60)));
-    __nv_bfloat162 _max_59 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_60);
-    amax = _max_59;
+    __nv_bfloat162 _hxa_55 = amax;
+    __nv_bfloat162 _hxb_55 = __as_bf16x2(packed[0]);
+    unsigned int _hxr_55;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_55) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_55)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_55)));
+    __nv_bfloat162 _max_54 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_55);
+    amax = _max_54;
+    __nv_bfloat162 _hxa_57 = amax;
+    __nv_bfloat162 _hxb_57 = __as_bf16x2(packed[1]);
+    unsigned int _hxr_57;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_57) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_57)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_57)));
+    __nv_bfloat162 _max_56 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_57);
+    amax = _max_56;
+    __nv_bfloat162 _hxa_59 = amax;
+    __nv_bfloat162 _hxb_59 = __as_bf16x2(packed[2]);
+    unsigned int _hxr_59;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_59) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_59)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_59)));
+    __nv_bfloat162 _max_58 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_59);
+    amax = _max_58;
+    __nv_bfloat162 _hxa_61 = amax;
+    __nv_bfloat162 _hxb_61 = __as_bf16x2(packed[3]);
+    unsigned int _hxr_61;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_61) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_61)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_61)));
+    __nv_bfloat162 _max_60 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_61);
+    amax = _max_60;
     unsigned int mag = __as_u32(amax) & 2147450879;
     unsigned int peer1 = __shfl_xor_sync(0xFFFFFFFF, mag, 1);
     __nv_bfloat162 pair_max = __hmax2_nan(__as_bf16x2(mag), __as_bf16x2(peer1));
@@ -519,20 +525,20 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
     #endif
     uint32_t bf16x2_mul_1;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_1) : "r"(packed[1]), "r"(inv2));
-    uint16_t _cvt_satfinite_e4m3x2_bf16x2_62;
+    uint16_t _cvt_satfinite_e4m3x2_bf16x2_63;
     #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_62) : "r"(bf16x2_mul_1));
+    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_63) : "r"(bf16x2_mul_1));
     #else
     {
     const uint32_t _bf16x2 = (uint32_t)(bf16x2_mul_1);
     const float _lo = __uint_as_float(_bf16x2 << 16);
     const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_62) : "f"(_hi), "f"(_lo));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_63) : "f"(_hi), "f"(_lo));
     }
     #endif
-    uint32_t _mov_b32_pack_u16x2_61;
-    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_61) : "h"(e4m3x2_bf16x2), "h"(_cvt_satfinite_e4m3x2_bf16x2_62));
-    row_words[0] = _mov_b32_pack_u16x2_61;
+    uint32_t _mov_b32_pack_u16x2_62;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_62) : "h"(e4m3x2_bf16x2), "h"(_cvt_satfinite_e4m3x2_bf16x2_63));
+    row_words[0] = _mov_b32_pack_u16x2_62;
     uint32_t bf16x2_mul_0;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_0) : "r"(packed[2]), "r"(inv2));
     uint16_t e4m3x2_bf16x2_0;
@@ -548,20 +554,20 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
     #endif
     uint32_t bf16x2_mul_1_0;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_1_0) : "r"(packed[3]), "r"(inv2));
-    uint16_t _cvt_satfinite_e4m3x2_bf16x2_64;
+    uint16_t _cvt_satfinite_e4m3x2_bf16x2_65;
     #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_64) : "r"(bf16x2_mul_1_0));
+    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_65) : "r"(bf16x2_mul_1_0));
     #else
     {
     const uint32_t _bf16x2 = (uint32_t)(bf16x2_mul_1_0);
     const float _lo = __uint_as_float(_bf16x2 << 16);
     const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_64) : "f"(_hi), "f"(_lo));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_65) : "f"(_hi), "f"(_lo));
     }
     #endif
-    uint32_t _mov_b32_pack_u16x2_63;
-    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_63) : "h"(e4m3x2_bf16x2_0), "h"(_cvt_satfinite_e4m3x2_bf16x2_64));
-    row_words[1] = _mov_b32_pack_u16x2_63;
+    uint32_t _mov_b32_pack_u16x2_64;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_64) : "h"(e4m3x2_bf16x2_0), "h"(_cvt_satfinite_e4m3x2_bf16x2_65));
+    row_words[1] = _mov_b32_pack_u16x2_64;
     reinterpret_cast<int2*>(row_output + (grow * K + col))[0] = reinterpret_cast<int2*>(row_words + 0)[0];
     __syncthreads();
     int lane_1 = tid & 31;
@@ -576,30 +582,30 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
         : "r"(src)
         : "memory");
     __nv_bfloat162 amax_c = __as_bf16x2(0);
-    __nv_bfloat162 _hxa_66 = amax_c;
-    __nv_bfloat162 _hxb_66 = __as_bf16x2(cols[0]);
-    unsigned int _hxr_66;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_66) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_66)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_66)));
-    __nv_bfloat162 _max_65 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_66);
-    amax_c = _max_65;
-    __nv_bfloat162 _hxa_68 = amax_c;
-    __nv_bfloat162 _hxb_68 = __as_bf16x2(cols[1]);
-    unsigned int _hxr_68;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_68) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_68)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_68)));
-    __nv_bfloat162 _max_67 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_68);
-    amax_c = _max_67;
-    __nv_bfloat162 _hxa_70 = amax_c;
-    __nv_bfloat162 _hxb_70 = __as_bf16x2(cols[2]);
-    unsigned int _hxr_70;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_70) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_70)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_70)));
-    __nv_bfloat162 _max_69 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_70);
-    amax_c = _max_69;
-    __nv_bfloat162 _hxa_72 = amax_c;
-    __nv_bfloat162 _hxb_72 = __as_bf16x2(cols[3]);
-    unsigned int _hxr_72;
-    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_72) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_72)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_72)));
-    __nv_bfloat162 _max_71 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_72);
-    amax_c = _max_71;
+    __nv_bfloat162 _hxa_67 = amax_c;
+    __nv_bfloat162 _hxb_67 = __as_bf16x2(cols[0]);
+    unsigned int _hxr_67;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_67) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_67)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_67)));
+    __nv_bfloat162 _max_66 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_67);
+    amax_c = _max_66;
+    __nv_bfloat162 _hxa_69 = amax_c;
+    __nv_bfloat162 _hxb_69 = __as_bf16x2(cols[1]);
+    unsigned int _hxr_69;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_69) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_69)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_69)));
+    __nv_bfloat162 _max_68 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_69);
+    amax_c = _max_68;
+    __nv_bfloat162 _hxa_71 = amax_c;
+    __nv_bfloat162 _hxb_71 = __as_bf16x2(cols[2]);
+    unsigned int _hxr_71;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_71) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_71)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_71)));
+    __nv_bfloat162 _max_70 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_71);
+    amax_c = _max_70;
+    __nv_bfloat162 _hxa_73 = amax_c;
+    __nv_bfloat162 _hxb_73 = __as_bf16x2(cols[3]);
+    unsigned int _hxr_73;
+    asm("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_hxr_73) : "r"(*reinterpret_cast<const unsigned int*>(&_hxa_73)), "r"(*reinterpret_cast<const unsigned int*>(&_hxb_73)));
+    __nv_bfloat162 _max_72 = *reinterpret_cast<const __nv_bfloat162*>(&_hxr_73);
+    amax_c = _max_72;
     unsigned int mag_c = __as_u32(amax_c) & 2147450879;
     __nv_bfloat162 col_max = __hmax2_nan(__as_bf16x2(mag_c), __as_bf16x2(mag_c >> 16));
     unsigned int cpeer1 = __shfl_xor_sync(0xFFFFFFFF, __as_u32(col_max), 1);
@@ -638,20 +644,20 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
     #endif
     uint32_t bf16x2_mul_1_1;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_1_1) : "r"(cols[1]), "r"(inv2_0));
-    uint16_t _cvt_satfinite_e4m3x2_bf16x2_74;
+    uint16_t _cvt_satfinite_e4m3x2_bf16x2_75;
     #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_74) : "r"(bf16x2_mul_1_1));
+    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_75) : "r"(bf16x2_mul_1_1));
     #else
     {
     const uint32_t _bf16x2 = (uint32_t)(bf16x2_mul_1_1);
     const float _lo = __uint_as_float(_bf16x2 << 16);
     const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_74) : "f"(_hi), "f"(_lo));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_75) : "f"(_hi), "f"(_lo));
     }
     #endif
-    uint32_t _mov_b32_pack_u16x2_73;
-    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_73) : "h"(e4m3x2_bf16x2_1), "h"(_cvt_satfinite_e4m3x2_bf16x2_74));
-    col_words[0] = _mov_b32_pack_u16x2_73;
+    uint32_t _mov_b32_pack_u16x2_74;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_74) : "h"(e4m3x2_bf16x2_1), "h"(_cvt_satfinite_e4m3x2_bf16x2_75));
+    col_words[0] = _mov_b32_pack_u16x2_74;
     uint32_t bf16x2_mul_3;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_3) : "r"(cols[2]), "r"(inv2_0));
     uint16_t e4m3x2_bf16x2_2;
@@ -667,20 +673,20 @@ kernel_cake_gated_act_mxfp8_34e92b6e8ad60c86843d(__nv_bfloat16* __restrict__ gat
     #endif
     uint32_t bf16x2_mul_1_2;
     asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(bf16x2_mul_1_2) : "r"(cols[3]), "r"(inv2_0));
-    uint16_t _cvt_satfinite_e4m3x2_bf16x2_76;
+    uint16_t _cvt_satfinite_e4m3x2_bf16x2_77;
     #if !defined(CAKE_CVT_SATFINITE_E4M3X2_BF16X2_FALLBACK) && defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_76) : "r"(bf16x2_mul_1_2));
+    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_77) : "r"(bf16x2_mul_1_2));
     #else
     {
     const uint32_t _bf16x2 = (uint32_t)(bf16x2_mul_1_2);
     const float _lo = __uint_as_float(_bf16x2 << 16);
     const float _hi = __uint_as_float(_bf16x2 & 0xFFFF0000u);
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_76) : "f"(_hi), "f"(_lo));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_bf16x2_77) : "f"(_hi), "f"(_lo));
     }
     #endif
-    uint32_t _mov_b32_pack_u16x2_75;
-    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_75) : "h"(e4m3x2_bf16x2_2), "h"(_cvt_satfinite_e4m3x2_bf16x2_76));
-    col_words[1] = _mov_b32_pack_u16x2_75;
+    uint32_t _mov_b32_pack_u16x2_76;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_76) : "h"(e4m3x2_bf16x2_2), "h"(_cvt_satfinite_e4m3x2_bf16x2_77));
+    col_words[1] = _mov_b32_pack_u16x2_76;
     reinterpret_cast<int2*>(col_output + (gcol * M + out_row))[0] = reinterpret_cast<int2*>(col_words + 0)[0];
     if ((lane_1 & 3) == 0) {
         int col_scale_index = ((gcol >> 7) * (M >> 7) + (by >> 2)) * 512 + (gcol & 31) * 16 + (gcol >> 5 & 3) * 4 + (by & 3);
