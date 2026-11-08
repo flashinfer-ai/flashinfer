@@ -124,6 +124,7 @@ POLICY_FIELDS = (
     "sample_dispatch_tiny_tiles_max",  # mean unit tiles up to which the tiny-unit cap applies
     "sample_shift_permille",  # conservative shift of the sampled rank
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
+    "sample_long_rule",  # [physical scan kinds, shift permille] of the long-unit calls of those kinds (more than sample_dispatch_mean_tiles_max mean unit tiles), or None; an explicit shift knob overrides it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
     "lsf_single_rule",  # [min mean unit tiles] from which a one-segment FP8 call of the wide unit runs the :lsf copy of its program, or None (never); read only by select_fp8_program
@@ -264,24 +265,45 @@ def sample_class_for(
     shift_knob: bool,
 ) -> tuple[int, int]:
     """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
-    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift on
-    packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny dispatch class (packed calls of short query
-    segments and few mean unit tiles) also its tile count.  A knob
-    the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rule or with sampling off nothing changes."""
-    class_rule = policy.sample_class_rule
+    record's ``sample_class_rule`` and ``sample_long_rule``, from the call's ``tiles`` / ``shift``: the wide-unit
+    programs take the class rule's shift on packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny
+    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count -- where that
+    count exceeds ``sample_tiles_tiny_units``, only on calls of more mean unit tiles than it; a long-unit call
+    (more than ``sample_dispatch_mean_tiles_max`` mean unit tiles) of a kind the long rule names takes its shift.  A
+    knob the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rules or with sampling off nothing
+    changes."""
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
     T, S = int(num_queries), int(num_segments)
-    if class_rule is None or tiles <= 0:
+    if tiles <= 0:
+        return tiles, shift
+    # the long-unit calls of the long rule's kinds shift further (#7549 on sm_107a)
+    if (
+        long_rule is not None
+        and physical in long_rule[0]
+        and policy.mean_unit_tiles(T, num_keys, S, ratio)
+        > policy.sample_dispatch_mean_tiles_max
+    ):
+        if not shift_knob:
+            shift = int(long_rule[1])
+        return tiles, shift
+    if class_rule is None:
         return tiles, shift
     # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
+    mean = policy.mean_unit_tiles(T, num_keys, S, ratio)
     if "wide" in physical:
         if not shift_knob and S >= CLASS_RULE_MIN_SEGMENTS:
             shift = int(class_rule[1])
     elif (
         not tiles_knob
-        and policy.mean_unit_tiles(T, num_keys, S, ratio)
-        <= policy.sample_dispatch_tiny_tiles_max
+        and mean <= policy.sample_dispatch_tiny_tiles_max
         and S >= CLASS_RULE_MIN_SEGMENTS
         and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
+        # a rule that samples more tiles than the tiny default applies only where the mean unit holds more than that
+        # many tiles: on shorter units the larger sample covers whole units (the ratio-4 pooled packed calls)
+        and not (
+            int(class_rule[0]) > policy.sample_tiles_tiny_units
+            and mean <= int(class_rule[0])
+        )
     ):
         tiles = int(class_rule[0])
         if not shift_knob:
@@ -343,6 +365,7 @@ _OPTIONAL_RULE = (
     "tile_unroll_rule",
     "sample_shift_rule",
     "sample_class_rule",
+    "sample_long_rule",
     "rank_rule",
     "rank_staged_rule",
     "rank_two_level_rule",
@@ -416,6 +439,7 @@ class DispatchPolicy:
     sample_shift_permille: int
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
+    sample_long_rule: Optional[list]
     lsf_programs: bool
     lsf_single_rule: Optional[list]
     static_scan_kinds: list
@@ -658,6 +682,20 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['sample_class_rule'] must be [tiny-unit sample tiles >= 1, shift permille in [{shift_lo}, {shift_hi}]] or None, got {class_rule!r}"
+            )
+        long_rule = raw["sample_long_rule"]
+        if long_rule is not None and (
+            len(long_rule) != 2
+            or not isinstance(long_rule[0], (list, tuple))
+            or not long_rule[0]
+            or list(long_rule[0]) != sorted(set(long_rule[0]))
+            or not set(long_rule[0]) <= set(PHYSICAL_KINDS)
+            or not _is_int(long_rule[1])
+            or not shift_lo <= long_rule[1] <= shift_hi
+        ):
+            raise ValueError(
+                f"policy['sample_long_rule'] must be [ascending physical scan kinds {PHYSICAL_KINDS}, shift permille in "
+                f"[{shift_lo}, {shift_hi}]] or None, got {long_rule!r}"
             )
         floor_rule = raw["cand_cap_floor_rule"]
         if floor_rule is not None and (

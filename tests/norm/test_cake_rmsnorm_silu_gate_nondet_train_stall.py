@@ -942,7 +942,10 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
             f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
             f"counts={int(counts)}"
         )
-        _check_outputs("forward", tokens, alone + det_alone, busy + det_busy)
+        # each package's y repeats; the deterministic forward's approximate gate
+        # and rstd need not give this package's bits
+        _check_outputs("forward", tokens, alone, busy)
+        _check_outputs("forward", tokens, det_alone, det_busy)
         if counts:
             break
     assert (
