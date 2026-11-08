@@ -23,7 +23,7 @@ rows' ``dx`` before the one BF16 rounding.
 ``cake_causal_conv1d_nondet_kcp(x_local, weight, ctx)`` is the autograd entry;
 its stable entry points are the non-deterministic package's KCP facade
 :mod:`flashinfer.cake_causal_conv1d_nondet_train_kcp`.  This module imports
-only ``os``, torch, torch.distributed, tvm_ffi and its own package.
+only ``hashlib``, ``weakref``, torch, torch.distributed, tvm_ffi and its own package.
 
 The host flow mirrors the deterministic package's
 (``flashinfer.cake_causal_conv1d_det_train_kcp``): the same context
