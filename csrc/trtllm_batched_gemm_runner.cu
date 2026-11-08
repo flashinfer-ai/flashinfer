@@ -740,8 +740,10 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     }
   }
 
-  FLASHINFER_CHECK(!validConfigIndices.empty(),
-                   "No valid config found for the given problem shape");
+  if (validConfigIndices.empty()) {
+    throw NoValidConfigError(__FUNCTION__, __FILE__, __LINE__,
+                             "No valid config found for the given problem shape");
+  }
 
   return validConfigIndices;
 }

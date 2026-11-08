@@ -39,6 +39,14 @@ class NoLoadableKernelError : public flashinfer::Error {
   using flashinfer::Error::Error;
 };
 
+// Thrown by TrtllmGenBatchedGemmRunner::getValidConfigIndices when no config of the tile is valid
+// for the problem shape. The MoE launcher's tile fallback skips such a tile the same way it skips
+// a tile whose cubins do not load; code that catches flashinfer::Error still receives it.
+class NoValidConfigError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
+
 // Keep this in sync with the ActType in
 // cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
 enum class ActType {

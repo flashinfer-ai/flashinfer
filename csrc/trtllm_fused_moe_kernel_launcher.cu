@@ -6522,6 +6522,13 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
       }
       reportTileFallbackOnce(hidden_states.device().device_id, resolved_tile_N,
                              tile_order[attempt + 1]);
+    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
+      // No config of this tile fits the problem shape: try the next tile, as for unloadable cubins.
+      if (attempt + 1 == tile_order.size()) {
+        throw;
+      }
+      reportTileFallbackOnce(hidden_states.device().device_id, resolved_tile_N,
+                             tile_order[attempt + 1]);
     }
   }
   // Unreachable: the loop returns or rethrows. Added to suppress compiler warning.
@@ -6812,6 +6819,9 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
       // No kernel of this tile loads on this driver (GitHub #5322): the tile has no anchor, so its
       // rows are left out and the factorized tactic space never sees the tile; the launch falls
       // back to another tile through tileFallbackOrder().
+      continue;
+    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
+      // No config of this tile fits the problem shape: the tile has no anchor either.
       continue;
     }
     result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
