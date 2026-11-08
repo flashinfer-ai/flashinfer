@@ -75,7 +75,7 @@ digits in the workspace and the sum rounded once by the CTA that arrives
 last.  Its ``dx``, ``dz`` and ``dw`` are the deterministic package's bits,
 the same for the rows and the SM count: ``dx`` and ``dz`` within the bound
 above, ``dw`` not the sum of the chunk partials of the deterministic backward
-at ``2e989556`` (within that package's budget, and the more accurate).
+at ``2e989556`` (within that package's budget).
 On sm_100a and sm_103a, where a
 row-claims backward saves at least 3 % of a checkpointed training step, a
 BF16 weight gradient runs it instead (256-thread CTAs of 16-row blocks, the

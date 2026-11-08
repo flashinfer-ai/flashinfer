@@ -111,8 +111,7 @@ may vary from run to run.  The kernels are those of the standalone package
   ``dz`` and weight gradient are the deterministic package's bits, the same
   for the rows and the SM count: ``dx`` and ``dz`` within the bound above,
   the weight gradient not the sum of the chunk partials of the deterministic
-  backward at FlashInfer 2e989556 (within that package's budget, and the
-  more accurate).
+  backward at FlashInfer 2e989556 (within that package's budget).
 - On SM100 and SM103 a BF16 weight gradient runs a row-claims backward where
   it saves at least 3 % of a checkpointed training step (2 x forward +
   backward): on SM100 from 513 rows up to 1329 rows per SM (the row-claims

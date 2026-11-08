@@ -30,7 +30,8 @@ the floor of the FP64 reference's largest magnitude, ``dw`` within
 ``|dw_eager| * 2^-7 + sum|terms| * 2^-20``.  ``y``, ``dx``, ``dz`` and an
 FP32 weight gradient (accumulated or not) must be the same bits on every
 launch and on every path: streams, CUDA Graph replays, autograd,
-``compute_grad_weight``, grids smaller than the work (the static, the claimed,
+``compute_grad_weight`` (``False`` the bits of the BF16 bands' module), grids
+smaller than the work (the static, the claimed,
 the row-claims and the fused backwards at 1, 3 and 7 CTAs; the fused backward's
 weight gradient the bits of its grid, whose chunks follow it), a workspace
 reused across shapes; so must a BF16 weight gradient in every band of
@@ -855,7 +856,8 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     (:func:`assert_dw_repeats`; a fused backward's, whose chunks follow the
     grid, the bits of a second launch at the same grid instead);
     ``compute_grad_weight=False`` (the BF16 bands' module) leaves
-    ``grad_weight`` as it is; the workspace is zero after every launch."""
+    ``grad_weight`` as it is, ``dx`` and ``dz`` that module's bits at the
+    host's grid; the workspace is zero after every launch."""
     shape = _band_shape(band)
     if shape is None:
         pytest.skip(f"this device routes no {band} band")
@@ -872,6 +874,12 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     dx_d, dz_d, _ = backward(dy, x, z, w, EPS, grad_weight=dw_d)
     main_d = torch.full((D,), 0.25, dtype=dtype, device="cuda")
     backward(dy, x, z, w, EPS, grad_weight=main_d, accumulate_grad_weight=True)
+    # compute_grad_weight=False runs the BF16 bands' module, whose dx and dz
+    # are another program's where that is the fused backward (an FP32 band's
+    # rows in the fused band on sm_107a): the bits of its call at the host's grid
+    dx_n, dz_n = dx_d, dz_d
+    if _backward_module(rows) != name:
+        dx_n, dz_n, _ = backward(dy, x, z, w, EPS, compute_grad_weight=False)
     ws = workspace_for(rows, x.device)
     monkeypatch.setattr(pkg, "backward_ctas", lambda name, rows, sm_count: ctas)
     launches.clear()
@@ -911,7 +919,7 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
         dy, x, z, w, EPS, grad_weight=main, compute_grad_weight=False, workspace=ws
     )
     assert dw is None
-    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
+    assert torch.equal(dx, dx_n) and torch.equal(dz, dz_n), what
     assert torch.equal(main, torch.full_like(main, 3.0)), what
     assert not bool(ws.any()), what
     # a call with compute_grad_weight=False runs the BF16 bands' module
