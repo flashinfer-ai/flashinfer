@@ -3318,8 +3318,9 @@ def test_shipped_unit_rules_by_architecture():
 def test_shipped_sample_shift_rule_by_architecture():
     """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
     ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
-    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
-    same scalar (host-only: ``arch`` and the SM count given)."""
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``, except where their class rules
+    shift a sampled two-segment call (sm_107a also by its long-unit rule).  The backend's plan carries the same scalar
+    (host-only: ``arch`` and the SM count given)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     p103, p100, p107 = (
@@ -3336,7 +3337,8 @@ def test_shipped_sample_shift_rule_by_architecture():
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
                 # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
-                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                # program shifts 500 permille, ahead of sample_shift_rule; on sm_107a the two-segment call shifts 500
+                # permille too (sample_long_rule on a long-unit l6 program, sample_class_rule [32, 500] on a wide one)
                 cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
@@ -3344,9 +3346,7 @@ def test_shipped_sample_shift_rule_by_architecture():
                     assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == (
-                            cls if cls and p is p100 else 250
-                        ), where
+                        assert c.sample_shift_permille == (cls or 250), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
