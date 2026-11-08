@@ -568,8 +568,8 @@ L2PF_ROWS = [
     pytest.param(4, 56, 512, 64, id="c4w512-q4-t56"),
 ]
 # Rows the host sends to the four-stage program outside the rule: one request
-# above each ceiling, a ragged call of 2-token requests (its last request one
-# token), 3-token requests and the c128 layer (compressed pages of 2 rows).
+# above each ceiling, 3-token requests and the c128 layer (compressed pages of
+# 2 rows).
 L2PF_EDGE_ROWS = [
     pytest.param(1, 58, 640, 64, id="c4w640-q1-t58"),
     pytest.param(4, 68, 640, 64, id="c4w640-q4-t68"),

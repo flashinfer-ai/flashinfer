@@ -2291,15 +2291,13 @@ _KV4_BCL_DECODE_SM_COUNTS = frozenset({212, 216})
 # compressed pages of 64 rows (the c4 layer) whose ``(sparse_topk,
 # max_q_len)`` names a row ceiling in ``_KV4_L2PF_MAX_TOKENS``, of at most
 # that many rows and at most one row per SM, on a device of an SM count in
-# ``_KV4_L2PF_SM_COUNTS``; a launch of 2- or 4-token requests also has to be
+# ``_KV4_L2PF_SM_COUNTS``; a launch of 4-token requests also has to be
 # uniform (``num_query_tokens == batch_size * max_q_len``).  Every other
 # launch keeps the four-stage program (:func:`_kv4_l2pf_variant`).  R200
 # (216 SMs) and VR200 (212 SMs), two processes each, eight calls per CUDA
 # graph over distinct inputs behind an L2 flush, four-stage program -> L2
 # prefetch program, per row and call: items 640 wide, one-token requests,
-# 32-47 rows 0.160-0.330 us faster; two-token requests, 32-46 and 58-64 rows
-# -0.008-0.347 us (22 of 24 board rows faster beyond the spread of two runs
-# of the same program, none slower); four-token requests, 32-44 and 60-64
+# 32-47 rows 0.160-0.330 us faster; four-token requests, 32-44 and 60-64
 # rows 0.060-0.328 us; items 512 wide, one-token requests at 40-41 rows
 # 0.090-0.176 us, four-token requests at 40-56 rows 0.028-0.250 us.  The
 # ceilings stop below the first measured row count that was not faster.
