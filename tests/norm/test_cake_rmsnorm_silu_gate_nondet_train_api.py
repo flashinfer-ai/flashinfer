@@ -72,7 +72,8 @@ package's public forward and backward only.  This module checks:
   value too), ``dx`` and ``dz`` are the deterministic package's bits, ``y``,
   ``dx``, ``dz`` and ``dw`` lie within the error budget, and ``dw`` within
   the weight-gradient budget of the deterministic ``dw``; so do they around
-  the ends of the forward's ``FORWARD_BANDS`` bands and
+  the ends of the forward's ``FORWARD_BANDS`` bands (packed rows) and
+  ``STRIDED_FORWARD_BANDS`` bands (other layouts) and
   at the first and last rows of each backward program, each call launching
   ``module_for_rows``' module: the small-row backwards (one cluster each, in
   the rows of their ``BACKWARD_BANDS`` bands), the static backward (at most 8
@@ -1309,19 +1310,21 @@ def _sm_count() -> int:
     ).multi_processor_count
 
 
-def _start_rows(arch: str, name: str, sms: int) -> int:
+def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
     """The fewest rows the routed module ``name`` runs for on ``arch`` with
     ``sms`` SMs: for a forward module the first row of its first
-    ``FORWARD_BANDS`` band (one more than the previous band's ``last * SMs``),
-    for the claimed backward the first row of more than
-    ``more_chunks_than_per_sm * SMs`` chunks of one block (its grid rule)."""
+    ``FORWARD_BANDS`` band (``STRIDED_FORWARD_BANDS`` where the rows are not
+    ``packed``; one more than the previous band's ``last * SMs``), for the
+    claimed backward the first row of more than ``more_chunks_than_per_sm *
+    SMs`` chunks of one block (its grid rule)."""
     rule = loader.MODULES[name]["grid_rule"]
     if "more_chunks_than_per_sm" in rule:
         chunks = int(rule["more_chunks_than_per_sm"]) * sms
         return chunks * int(rule["rows_per_block"]) + 1
     role = loader.MODULES[name]["role"]
     first = 1
-    for last, band in loader.FORWARD_BANDS[arch]:
+    table = loader.FORWARD_BANDS if packed else loader.STRIDED_FORWARD_BANDS
+    for last, band in table[arch]:
         if band == role:
             return first
         assert last is not None, (arch, role)
@@ -1353,10 +1356,12 @@ def _backward_tiers(
 
 
 # Forward inputs around and past the ends of the forward's bands: (tokens,
-# heads, layout); ``heads=None`` takes ``last * SMs + tokens`` rows as one flat
-# [rows, 128] tensor, ``last`` the rows per SM of the architecture's
-# ``FORWARD_BANDS`` band ``i`` of ``layout`` ``flat<i>`` (skipped where the
-# architecture has no such band with an end).
+# heads, layout); ``heads=None`` takes ``last * SMs + tokens`` rows of one
+# head, ``last`` the rows per SM of the architecture's ``FORWARD_BANDS`` band
+# ``i`` of ``layout`` ``flat<i>`` (packed rows: one flat [rows, 128] tensor) or
+# of its ``STRIDED_FORWARD_BANDS`` band ``i`` of ``layout`` ``strided<i>``
+# (the projection layout, whose ``z`` rows are not packed), skipped where the
+# architecture has no such band with an end.
 FORWARD_CASES = [
     pytest.param(1, 48, "contiguous", id="1x48"),
     pytest.param(13, 7, "contiguous", id="13x7"),
@@ -1366,6 +1371,10 @@ FORWARD_CASES = [
     pytest.param(1, None, "flat0", id="band0-end+1"),
     pytest.param(0, None, "flat1", id="band1-end"),
     pytest.param(1, None, "flat1", id="band1-end+1"),
+    pytest.param(0, None, "strided0", id="strided-band0-end"),
+    pytest.param(1, None, "strided0", id="strided-band0-end+1"),
+    pytest.param(0, None, "strided1", id="strided-band1-end"),
+    pytest.param(1, None, "strided1", id="strided-band1-end+1"),
     pytest.param(2048, 48, "contiguous", id="2048x48"),
     pytest.param(4097, 48, "contiguous", id="4097x48"),
     pytest.param(4097, 48, "projection", id="4097x48-projection"),
@@ -1398,27 +1407,33 @@ def test_forward_around_its_bands_within_the_deterministic_error(
 ) -> None:
     """On both sides of the ends of the forward's bands and past them, the
     forward launches ``module_for_rows``' module: the module of the first
-    ``FORWARD_BANDS`` band of the architecture with ``rows <= last * SMs``
-    (the short, mid, long and extra-long forwards and the forward, each where
+    ``FORWARD_BANDS`` band of the architecture (``STRIDED_FORWARD_BANDS``
+    band where the rows are not packed) with ``rows <= last * SMs`` (the
+    tiny, short, mid, long and extra-long forwards and the forward, each where
     the architecture's bands name it).  ``y`` repeats bit for bit and lies
     within the error budget of the deterministic package's ``y``."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
-    bands = loader.FORWARD_BANDS[arch]
     if heads is None:
-        i = int(layout[len("flat") :])
-        if i >= len(bands) or bands[i][0] is None:
-            pytest.skip(f"{arch} has no forward band {i} with an end")
-        end = int(bands[i][0]) * sms
-        x, z, w, dy = suite.make(end + tokens, 1, layout="flat", seed=21)
-    else:
-        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=21)
+        kind = "strided" if layout.startswith("strided") else "flat"
+        i = int(layout[len(kind) :])
+        layout = "projection" if kind == "strided" else "flat"
+        table = (
+            loader.STRIDED_FORWARD_BANDS if kind == "strided" else loader.FORWARD_BANDS
+        )
+        if i >= len(table[arch]) or table[arch][i][0] is None:
+            pytest.skip(f"{arch} has no {kind} forward band {i} with an end")
+        tokens += int(table[arch][i][0]) * sms
+        heads = 1
+    x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=21)
     rows = x.numel() // D
+    packed = suite._packed(tokens, heads, layout)
+    bands = (loader.FORWARD_BANDS if packed else loader.STRIDED_FORWARD_BANDS)[arch]
     launched = _spy_launches(monkeypatch)
     y = nd_forward(x, z, w, EPS)
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
-    name = loader.module_for_rows(arch, "fwd", rows, sms)
+    name = loader.module_for_rows(arch, "fwd", rows, sms, packed=packed)
     assert launched == [name] * 2, launched
     want = next(
         routes[band] for last, band in bands if last is None or rows <= last * sms
@@ -1457,8 +1472,9 @@ GATE_EDGE_VALUES = [
     float("-inf"),
     float("nan"),
 ]
-# Forward inputs the short forward runs, and those at the end of its band on
-# sm_100a and sm_103a, 12 rows per SM, on 148 SMs (37x48, 253x7, 55x32) and on
+# Forward inputs (``x`` and ``z`` packed rows, or ``z`` the gate columns of a
+# wider projection) the tiny or the short forward runs, and those at the end
+# of the short forward's band on sm_100a and sm_103a, 12 rows per SM, on 148 SMs (37x48, 253x7, 55x32) and on
 # 152 SMs (38x48, 260x7, 57x32), and on sm_107a, 59 rows per SM, on 212 SMs
 # (260x48, 1786x7, 390x32), and one token past it (261x48, 1787x7, 391x32),
 # with forward inputs at and past 48 rows per SM on 148 and 152 SMs (148x48,
@@ -1521,9 +1537,10 @@ def _gate_edge_inputs(tokens: int, heads: int, columns: int = D):
 
 
 @requires_device
+@pytest.mark.parametrize("layout", ["contiguous", "projection"])
 @pytest.mark.parametrize("tokens,heads", GATE_EDGE_CASES)
 def test_forward_gate_edges_keep_the_fp64_classes(
-    tokens, heads, determinism_setting, monkeypatch: pytest.MonkeyPatch
+    tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With gate inputs at and past the packed gate's range in two of every
     three rows (a quarter of their elements, so the range check fails for some
@@ -1535,10 +1552,16 @@ def test_forward_gate_edges_keep_the_fp64_classes(
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     x, z, w, dy = _gate_edge_inputs(tokens, heads)
+    if layout == "projection":
+        wide = torch.zeros(tokens, 2 * heads * D + 16, dtype=z.dtype, device=z.device)
+        view = wide[:, heads * D : 2 * heads * D].view(tokens, heads, D)
+        view.copy_(z)
+        z = view
     launched = _spy_launches(monkeypatch)
     y = nd_forward(x, z, w, EPS)
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
-    name = loader.module_for_rows(arch, "fwd", tokens * heads, sms)
+    packed = suite._packed(tokens, heads, layout)
+    name = loader.module_for_rows(arch, "fwd", tokens * heads, sms, packed=packed)
     assert launched == [name] * 2, launched
     y64 = suite.fp64_reference(dy, x, z, w, EPS)[0]
     assert_same_classes("y", y, y64)

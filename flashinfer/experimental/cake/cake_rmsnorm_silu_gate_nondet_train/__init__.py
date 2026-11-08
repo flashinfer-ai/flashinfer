@@ -111,12 +111,16 @@ Host design (the input layout rules are the deterministic package's):
   order).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count, the forward's by the bands of rows per SM of
-  ``cake_jit.FORWARD_BANDS``): a call runs the short, the mid, the long or
-  the extra-long forward.  The plain forward (the call role ``fwd``: one
-  64-thread CTA per block of 8 rows) is routed by no band; it stays in
-  ``ROUTES`` because the support query needs every role routed, and the
-  stall tests time the short forward against it.  The short forward (up to
-  12 rows per SM on sm_100a and sm_103a, 59 on sm_107a) launches one
+  ``cake_jit.FORWARD_BANDS`` where ``x`` and ``z`` hold packed rows, row
+  ``n`` at element ``128 n``, else of ``cake_jit.STRIDED_FORWARD_BANDS``): a
+  call runs the tiny, the short, the mid, the long or the extra-long
+  forward.  The plain forward (the call role ``fwd``: one 64-thread CTA per
+  block of 8 rows) is routed by no band; it stays in ``ROUTES`` because the
+  support query needs every role routed.  The tiny forward (packed rows, up
+  to 140 rows per SM on sm_100a, 120 on sm_103a and 65 on sm_107a) launches
+  one 128-thread CTA per block of 8 rows, with the short forward's
+  arithmetic, so the same ``y`` bits; the short forward (other layouts, up
+  to 12 rows per SM on sm_100a and sm_103a, 59 on sm_107a) launches one
   256-thread CTA per block of 16 rows; the other forwards a grid whose CTA
   ``b`` walks the blocks ``b``, ``b + grid``, ..., loading each next block
   while it computes the current one, in the fewest whole waves that give no
@@ -128,12 +132,13 @@ Host design (the input layout rules are the deterministic package's):
   one another meets, see ``_kernel_view``), the long forward (3 CTAs per SM,
   at most 6 blocks of 32 rows each; sm_100a) and the extra-long forward (the
   long forward whose thread 0 also warms the CTA's next block in L2).  The
-  bands: on sm_100a the mid forward up to 140 rows per SM, the long forward
-  up to 400, the extra-long forward up to 1000 and the mid forward past it;
-  on sm_103a the mid forward up to 250, the extra-long forward up to 550 and
-  the mid forward past it; on sm_107a the mid forward up to 200, the
-  extra-long forward up to 520 and the mid forward past it.  The forward
-  programs associate a row's sum of squares differently (the short forward:
+  bands past the tiny or the short forward's: on sm_100a the long forward up
+  to 400 rows per SM (other layouts: the mid forward up to 140, then the long
+  forward), the extra-long forward up to 1000 and the mid forward past it; on
+  sm_103a the mid forward up to 250, the extra-long forward up to 550 and the
+  mid forward past it; on sm_107a the mid forward up to 200, the extra-long
+  forward up to 520 and the mid forward past it.  The forward programs
+  associate a row's sum of squares differently (the tiny and the short forward:
   8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
   others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits can
   differ between bands while each program repeats them.  The static and the claimed
@@ -398,7 +403,13 @@ def _forward(
         "eps": float(eps),
     }
     index = _device_index(device)
-    name = module_for_rows(arch, "fwd", rows, device_sm_count(index))
+    # packed rows: row n of x and z at element 128 n (the tiny forward reads
+    # no other layout)
+    packed = all(
+        head == HEAD_DIM and tok in (0, heads * HEAD_DIM)
+        for tok, head in ((x_tok, x_head), (z_tok, z_head))
+    )
+    name = module_for_rows(arch, "fwd", rows, device_sm_count(index), packed=packed)
     _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)

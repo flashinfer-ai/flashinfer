@@ -43,15 +43,17 @@ streams.  The kernels are those of the standalone package
 - The forward computes ``rstd`` with ``rsqrt.approx`` and the SiLU gate with
   ``ex2.approx`` of ``-|z| log2(e)`` and ``rcp.approx`` (no flush of a nonzero
   sigmoid of a normal ``z``); its bits are not the deterministic package's.
-  Up to 12 rows per SM on SM100 and SM103 (59 on SM107) a forward with 16
-  threads to a row runs, and past that forwards whose CTAs each walk several
+  Where ``x`` and ``z`` hold packed rows (row ``n`` at element ``128 n``) a
+  forward with 16 threads to a row runs up to 140 rows per SM on SM100, 120
+  on SM103 and 65 on SM107, other layouts up to 12 rows per SM on SM100 and
+  SM103 (59 on SM107), and past that forwards whose CTAs each walk several
   row blocks, in bands of rows per SM.  Each forward program's arithmetic is
   fixed, but the programs associate a row's sum of squares differently (the
-  16-thread forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1,
+  16-thread forwards: 8-term FMA chains of 16 lanes folded by XOR shuffles 1,
   2, 4, 8; the others: 16-term chains of 8 lanes folded by 1, 2, 4; the row
-  count and the SM count pick the program), so ``y``'s bits can differ
-  between bands while each program repeats them for the same inputs on the
-  same device.
+  count, the SM count and the layout pick the program), so ``y``'s bits can
+  differ between bands while each program repeats them for the same inputs
+  on the same device.
 - The backward is one kernel over the deterministic backward's chunks of rows
   (8-row blocks, ``max(1, ceil(blocks / 8192))`` blocks a chunk): ``dx`` and
   ``dz`` are the deterministic backward's arithmetic, each chunk's FP32
@@ -229,11 +231,13 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
     inputs on the same device (its bits are not the deterministic package's;
     that one is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`).
-    Up to 12 rows per SM on SM100 / SM103 (59 on SM107) a forward with 16
-    threads to a row runs, and past that forwards whose CTAs each walk several
-    row blocks, in bands of rows per SM; the programs associate a row's sum of
-    squares differently (the row count and the SM count pick the program), so
-    ``y``'s bits can differ between bands.  The forward does not alert under
+    A forward with 16 threads to a row runs up to 140 rows per SM on SM100,
+    120 on SM103 and 65 on SM107 where ``x`` and ``z`` hold packed rows (row
+    ``n`` at element ``128 n``), up to 12 on SM100 / SM103 (59 on SM107) for
+    other layouts, and past that forwards whose CTAs each walk several row
+    blocks, in bands of rows per SM; the programs associate a row's sum of
+    squares differently (the row count, the SM count and the layout pick the
+    program), so ``y``'s bits can differ between bands.  The forward does not alert under
     ``torch.use_deterministic_algorithms(True)``.
 
     Parameters

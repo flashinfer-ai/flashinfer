@@ -41,21 +41,27 @@ same bits at any grid and in any order of the CTAs).
 a module may be delivered for more architectures than route it (every
 forward module is delivered for every architecture, so a new forward cut is a
 host-plan change).  :func:`module_for_rows` picks a call's module from the
-rows and the device's SM count: the forward by ``FORWARD_BANDS``, bands of
-rows per SM (the short forward, the forward and the mid, long and extra-long
-forwards, each where the architecture's bands name it); the backward by its
+rows, the device's SM count and the layout of the inputs: the forward of
+packed rows (``x`` and ``z`` hold row ``n`` at element ``128 n``) by
+``FORWARD_BANDS``, of other layouts by ``STRIDED_FORWARD_BANDS``, bands of
+rows per SM (the tiny forward, which reads packed rows only, the short
+forward, the forward and the mid, long and extra-long forwards, each where
+the architecture's bands name it); the backward by its
 small-row roles (``BAND_ROLES``) in the rows of their ``BACKWARD_BANDS``
 bands, past them its mid role (the claimed backward) where the rows have
 more chunks than ``more_chunks_than_per_sm`` per SM, else the call role.
-The forward's programs: the short forward (16 threads to a row, one 16-row
-block per CTA, the gate before the sum of squares), the forward (64-thread
+The forward's programs: the tiny forward (16 threads to a row, one 8-row
+block per 128-thread CTA, the gate before the sum of squares, packed rows
+only; the short forward's arithmetic and bits), the short forward (16
+threads to a row, one 16-row block per CTA, the gate before the sum of
+squares), the forward (64-thread
 CTAs, 8 threads to a row), the mid forward (128-thread CTAs walking 16-row
 blocks, thread 0 warming the CTA's next block and the first block of the CTA
 a wave later in L2), the long forward (256-thread CTAs walking 32-row
 blocks) and the extra-long forward (the long forward whose thread 0 also
 warms the CTA's next block in L2).  Each program's arithmetic is fixed; the
-programs associate a row's sum of squares differently (the short forward:
-8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
+programs associate a row's sum of squares differently (the tiny and the short
+forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits can differ
 between the programs, and so between the bands of one architecture, while
 each program gives the same bits for the same inputs on the same device.
@@ -415,6 +421,52 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "fwd_short",
+    },
+    # The tiny forward: 128 threads, 16 lanes per row (8-row blocks), one
+    # block per CTA, packed rows only (row n at element 128 n), the short
+    # forward's bits (build {"threads": 128}); FORWARD_BANDS gives it its
+    # rows.
+    "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "row_blocks",
+            "rows_per_cta": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "logical": {
+            "eps": "eps",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "y": "y",
+            "z": "z",
+        },
+        "role": "fwd_tiny",
     },
     # The static backward into a BF16 weight gradient: 128 threads, 16 lanes
     # per row (8-row blocks), the deterministic backward's chunks, CTA b
@@ -1070,6 +1122,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_long": "cake_rmsnorm_silu_gate_train_c6151f64f22ae65a48eb",
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
+        "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
@@ -1084,6 +1137,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_xlong": "cake_rmsnorm_silu_gate_train_83fe9e25ce0d01cc3ab1",
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
+        "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
@@ -1098,6 +1152,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_xlong": "cake_rmsnorm_silu_gate_train_83fe9e25ce0d01cc3ab1",
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
+        "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
@@ -1109,18 +1164,46 @@ ROUTES: dict[str, dict[str, str]] = {
     },
 }
 
-# The forward module of each architecture by the rows per SM of a call:
-# ``(last, role)`` bands in increasing ``last`` (``None``: no end); a call of
-# ``rows`` rows on a device of ``sm_count`` SMs runs the module of the first
-# band's routed ``role`` with ``rows <= last * sm_count``.  The cuts are the
-# measured fastest program at each rows per SM (CUPTI, cold L2), except the
-# short forward's end: 12 rows per SM on sm_100a and sm_103a, where its grid
-# of one 16-row block a CTA has at most as many CTAs as the SMs less 16 (from
-# 64 SMs), and 59 on sm_107a, where it fits one wave of 4 CTAs per SM on all
-# SMs but 16 (from 205 SMs), so beside a kernel holding 16 SMs it ends no
-# later than the plain forward.  Host plan only: a new cut needs no new
-# program.
+# The forward module of each architecture by the rows per SM of a call of
+# packed rows: ``(last, role)`` bands in increasing ``last`` (``None``: no
+# end); a call of ``rows`` rows on a device of ``sm_count`` SMs runs the
+# module of the first band's routed ``role`` with ``rows <= last *
+# sm_count``.  The cuts are the measured fastest program at each rows per SM
+# (CUPTI, cold L2): the tiny forward up to 140 rows per SM on sm_100a, 120 on
+# sm_103a and 65 on sm_107a, where beside a kernel holding 16 SMs it ends no
+# later than the deterministic package's plain forward (one CTA per 8-row
+# block, so the free SMs take the CTAs the held ones cannot run).  Host plan
+# only: a new cut needs no new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
+    "sm_100a": (
+        (140, "fwd_tiny"),
+        (400, "fwd_long"),
+        (1000, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+    "sm_103a": (
+        (120, "fwd_tiny"),
+        (250, "fwd_mid"),
+        (550, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+    "sm_107a": (
+        (65, "fwd_tiny"),
+        (200, "fwd_mid"),
+        (520, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+}
+
+# The forward bands of a call whose ``x`` or ``z`` rows are not packed (the
+# tiny forward reads packed rows only), as ``FORWARD_BANDS``.  The cuts are
+# the measured fastest program at each rows per SM (CUPTI, cold L2), except
+# the short forward's end: 12 rows per SM on sm_100a and sm_103a, where its
+# grid of one 16-row block a CTA has at most as many CTAs as the SMs less 16
+# (from 64 SMs), and 59 on sm_107a, where it fits one wave of 4 CTAs per SM on
+# all SMs but 16 (from 205 SMs), so beside a kernel holding 16 SMs it ends no
+# later than the plain forward.
+STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "fwd_short"),
         (140, "fwd_mid"),
@@ -1254,18 +1337,23 @@ def _claims(name: str, rows: int, sm_count: int) -> bool:
     return chunks > int(rule["more_chunks_than_per_sm"]) * int(sm_count)
 
 
-def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
+def module_for_rows(
+    arch: str, role: str, rows: int, sm_count: int, *, packed: bool = True
+) -> str:
     """The module that runs ``role`` (one of ``ROLES``) for ``rows`` rows on
     ``arch`` with ``sm_count`` SMs: for the forward the module of the first of
-    its ``FORWARD_BANDS[arch]`` bands with ``rows <= last * sm_count`` (or no
-    ``last``); for a backward role the module of the first of its
+    its ``FORWARD_BANDS[arch]`` bands (``STRIDED_FORWARD_BANDS[arch]`` when
+    ``packed`` is false: ``x`` or ``z`` does not hold row ``n`` at element
+    ``128 n``) with ``rows <= last * sm_count`` (or no ``last``); for a
+    backward role the module of the first of its
     ``BACKWARD_BANDS[arch]`` bands with ``rows <= last``, else its mid module
     (the claimed backward) when ``arch`` routes one and the rows have more
     than ``more_chunks_than_per_sm * sm_count`` chunks; else
     :func:`route_module`."""
 
     if role == "fwd":
-        for last, band in FORWARD_BANDS.get(arch, ()):
+        table = FORWARD_BANDS if packed else STRIDED_FORWARD_BANDS
+        for last, band in table.get(arch, ()):
             if last is None or int(rows) <= int(last) * int(sm_count):
                 return route_module(arch, band)
         return route_module(arch, role)
@@ -1460,6 +1548,7 @@ __all__ = [
     "MODULES",
     "ROLES",
     "ROUTES",
+    "STRIDED_FORWARD_BANDS",
     "WORKSPACE_ALIGNMENT",
     "WORKSPACE_BUFFERS",
     "arch_for_capability",

@@ -172,22 +172,38 @@ def _routes() -> dict[str, str]:
     return loader.ROUTES[loader.device_arch(torch.cuda.current_device())]
 
 
-def _module(role: str, rows: int) -> str:
+def _module(role: str, rows: int, *, packed: bool = True) -> str:
     """The module ``module_for_rows`` runs for ``role`` and ``rows`` rows on
-    this device."""
+    this device (``packed``: the forward's inputs hold packed rows)."""
     device_index = torch.cuda.current_device()
     return loader.module_for_rows(
         loader.device_arch(device_index),
         role,
         rows,
         loader.device_sm_count(device_index),
+        packed=packed,
     )
 
 
-def _forward_module(rows: int) -> str:
+def _packed(T: int, H: int, layout: str = "contiguous") -> bool:
+    """Whether ``make(T, H, layout=layout)``'s ``x`` and ``z`` hold packed
+    rows (row ``n`` at element ``128 n``) as the forward reads them: the
+    stride of a single token or a single head is never read, and the host
+    copies a misaligned input to packed rows."""
+    if layout in ("contiguous", "flat", "misaligned"):
+        return True
+    if layout == "projection":
+        return T == 1
+    if layout == "head_major":
+        return T == 1 or H == 1
+    raise ValueError(layout)
+
+
+def _forward_module(rows: int, packed: bool = True) -> str:
     """The forward module ``module_for_rows`` runs for ``rows`` rows on this
-    device (the program of the architecture's ``FORWARD_BANDS`` band)."""
-    return _module("fwd", rows)
+    device (the program of the architecture's ``FORWARD_BANDS`` band, of its
+    ``STRIDED_FORWARD_BANDS`` band where the rows are not ``packed``)."""
+    return _module("fwd", rows, packed=packed)
 
 
 def _backward_module(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> str:
@@ -1194,7 +1210,7 @@ def test_registry_records_reference_the_build_manifest():
         clustered = record["grid_rule"]["kind"] == "cluster"
         assert (record["launch"]["cluster"] != (1, 1, 1)) == clustered, name
         plan = [key for _kind, key in record["arg_plan"]]
-        if record["role"] in ("fwd", "fwd_short"):
+        if record["role"] in ("fwd", "fwd_tiny", "fwd_short"):
             assert record["grid_rule"]["kind"] == "row_blocks"
             assert record.get("workspace") is None
         elif record["role"] in ("fwd_xlong", "fwd_long", "fwd_mid"):
@@ -1296,14 +1312,36 @@ def test_backward_cta_rule(rows, sm_count, per_chunk, chunks, ctas):
             assert got == loader.ROUTES[arch][want], (arch, role, rows)
 
 
-# The forward bands of each architecture: (last rows per SM, role) in
-# increasing rows per SM (``None``: no end), a call of ``rows`` rows on
+# The forward bands of each architecture for packed rows: (last rows per SM,
+# role) in increasing rows per SM (``None``: no end), a call of ``rows`` rows on
 # ``sm_count`` SMs running the first band's role with ``rows <= last *
 # sm_count`` (the measured fastest program at each rows per SM).  The
 # forward's band roles; the claimed
 # backward (``bwd_*_mid``) runs past the static backward's 8 CTAs per SM in
 # chunks, on every architecture.
 FORWARD_BANDS = {
+    "sm_100a": (
+        (140, "fwd_tiny"),
+        (400, "fwd_long"),
+        (1000, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+    "sm_103a": (
+        (120, "fwd_tiny"),
+        (250, "fwd_mid"),
+        (550, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+    "sm_107a": (
+        (65, "fwd_tiny"),
+        (200, "fwd_mid"),
+        (520, "fwd_xlong"),
+        (None, "fwd_mid"),
+    ),
+}
+# The forward bands of inputs whose rows are not packed (the tiny forward
+# reads packed rows only), as FORWARD_BANDS.
+STRIDED_FORWARD_BANDS = {
     "sm_100a": (
         (12, "fwd_short"),
         (140, "fwd_mid"),
@@ -1324,7 +1362,7 @@ FORWARD_BANDS = {
         (None, "fwd_mid"),
     ),
 }
-FORWARD_ROLES = ("fwd_short", "fwd_mid", "fwd_long", "fwd_xlong")
+FORWARD_ROLES = ("fwd_tiny", "fwd_short", "fwd_mid", "fwd_long", "fwd_xlong")
 CLAIMED_ROUTES = {"bwd_bf16_mid": 8, "bwd_f32_mid": 8}
 
 
@@ -1349,20 +1387,30 @@ BACKWARD_BANDS = {
 
 
 def _short_end(arch, sm_count):
-    """The most rows the short forward runs on ``arch`` by ``FORWARD_BANDS``."""
-    (last, role) = FORWARD_BANDS[arch][0]
+    """The most rows the short forward runs on ``arch`` by
+    ``STRIDED_FORWARD_BANDS``."""
+    (last, role) = STRIDED_FORWARD_BANDS[arch][0]
     assert role == "fwd_short"
     return last * sm_count
 
 
-def _tier_module(arch, role, rows, sm_count):
-    """The module of ``role`` for ``rows`` rows by ``FORWARD_BANDS``,
+def _tiny_end(arch, sm_count):
+    """The most rows the tiny forward runs on ``arch`` by ``FORWARD_BANDS``."""
+    (last, role) = FORWARD_BANDS[arch][0]
+    assert role == "fwd_tiny"
+    return last * sm_count
+
+
+def _tier_module(arch, role, rows, sm_count, packed=True):
+    """The module of ``role`` for ``rows`` rows by ``FORWARD_BANDS`` (by
+    ``STRIDED_FORWARD_BANDS`` where the rows are not ``packed``),
     ``BACKWARD_BANDS`` and ``CLAIMED_ROUTES``: the forward's module of the
     first forward band whose rows per SM hold ``rows``; the backward's of the
     first backward band holding ``rows``, else the claimed backward past its
     chunks per SM, else the role's module."""
     if role == "fwd":
-        for last, band in FORWARD_BANDS[arch]:
+        table = FORWARD_BANDS if packed else STRIDED_FORWARD_BANDS
+        for last, band in table[arch]:
             if last is None or rows <= last * sm_count:
                 return loader.ROUTES[arch][band]
     for last, band in BACKWARD_BANDS[arch].get(role, ()):
@@ -1380,14 +1428,16 @@ def _tier_module(arch, role, rows, sm_count):
 @pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
 def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     """``module_for_rows``: the forward's module of the first
-    ``FORWARD_BANDS`` band with ``rows <= last * sm_count`` (rows per SM; the
-    short, mid, long and extra-long forwards and the forward, each where the
+    ``FORWARD_BANDS`` band (``STRIDED_FORWARD_BANDS`` band where the rows are
+    not packed) with ``rows <= last * sm_count`` (rows per SM; the tiny, short,
+    mid, long and extra-long forwards and the forward, each where the
     architecture's bands name it), a backward role's small-row module in the
     rows of its ``BACKWARD_BANDS`` band (each band at most its module's
     ``max_rows``), past them the claimed backward where the rows have more chunks
     than ``more_chunks_than_per_sm * sm_count``, else the static backward.  No
     grid rule carries rows per SM: the bands are host plan only."""
     assert loader.FORWARD_BANDS == FORWARD_BANDS
+    assert loader.STRIDED_FORWARD_BANDS == STRIDED_FORWARD_BANDS
     assert loader.BAND_ROLES == (
         "bwd_bf16_t512",
         "bwd_bf16_t1024",
@@ -1396,17 +1446,23 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     )
     assert loader.BACKWARD_BANDS == BACKWARD_BANDS
     for arch in loader.ARCHES:
-        bands = FORWARD_BANDS[arch]
-        lasts = [last for last, _ in bands[:-1]]
-        assert lasts == sorted(set(lasts)) and bands[-1][0] is None, arch
-        assert bands[0][1] == "fwd_short", arch
-        forward = {role for role in loader.ROUTES[arch] if role.startswith("fwd")}
-        assert forward == {"fwd"} | {band for _, band in bands}, arch
-        for _, band in bands:
-            record = loader.MODULES[loader.ROUTES[arch][band]]
-            assert record["role"] == band
-            kind = "row_blocks" if band in ("fwd", "fwd_short") else None
-            assert record["grid_rule"]["kind"] == (kind or "persistent_row_blocks")
+        forward = {"fwd"}
+        for table, first in (
+            (FORWARD_BANDS, "fwd_tiny"),
+            (STRIDED_FORWARD_BANDS, "fwd_short"),
+        ):
+            bands = table[arch]
+            lasts = [last for last, _ in bands[:-1]]
+            assert lasts == sorted(set(lasts)) and bands[-1][0] is None, arch
+            assert bands[0][1] == first, arch
+            forward |= {band for _, band in bands}
+            for _, band in bands:
+                record = loader.MODULES[loader.ROUTES[arch][band]]
+                assert record["role"] == band
+                kind = "row_blocks" if band in ("fwd_tiny", "fwd_short") else None
+                assert record["grid_rule"]["kind"] == (kind or "persistent_row_blocks")
+        routed = {role for role in loader.ROUTES[arch] if role.startswith("fwd")}
+        assert routed == forward, arch
         for role, bands in BACKWARD_BANDS[arch].items():
             lasts = [last for last, _ in bands]
             assert lasts == sorted(set(lasts)), (arch, role)
@@ -1429,9 +1485,10 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         edges = {1, 48, 255, 256, 257, 8 * 8192, 8 * 8192 + 1, 2**31 - 1}
         for bands in BACKWARD_BANDS[arch].values():
             edges |= {last + d for last, _ in bands for d in (0, 1)}
-        for bands in FORWARD_BANDS.values():
-            for last, _ in bands[:-1]:
-                edges |= {last * sm_count + d for d in (-1, 0, 1)}
+        for table in (FORWARD_BANDS, STRIDED_FORWARD_BANDS):
+            for bands in table.values():
+                for last, _ in bands[:-1]:
+                    edges |= {last * sm_count + d for d in (-1, 0, 1)}
         for start in (10, 12, 59, 64):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
@@ -1439,40 +1496,51 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
                 want = _tier_module(arch, role, rows, sm_count)
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == want, (arch, role, rows)
-    # the forward on sm_100a: the short forward up to 12 rows per SM, the mid
-    # forward up to 140, the long forward up to 400, the extra-long forward up
-    # to 1000, the mid forward past it
+                want = _tier_module(arch, role, rows, sm_count, packed=False)
+                got = loader.module_for_rows(arch, role, rows, sm_count, packed=False)
+                assert got == want, (arch, role, rows, "strided")
+    # the forward on sm_100a: packed rows the tiny forward up to 140 rows per
+    # SM, the long forward up to 400, the extra-long forward up to 1000, the
+    # mid forward past it; other layouts the short forward up to 12 rows per
+    # SM, the mid forward up to 140, then the same bands
     routes = loader.ROUTES["sm_100a"]
-    for rows, role in (
-        (1, "fwd_short"),
-        (12 * sm_count, "fwd_short"),
-        (12 * sm_count + 1, "fwd_mid"),
-        (140 * sm_count, "fwd_mid"),
-        (140 * sm_count + 1, "fwd_long"),
-        (400 * sm_count, "fwd_long"),
-        (400 * sm_count + 1, "fwd_xlong"),
-        (1000 * sm_count, "fwd_xlong"),
-        (1000 * sm_count + 1, "fwd_mid"),
-        (2**31 - 1, "fwd_mid"),
+    for rows, packed, strided in (
+        (1, "fwd_tiny", "fwd_short"),
+        (12 * sm_count, "fwd_tiny", "fwd_short"),
+        (12 * sm_count + 1, "fwd_tiny", "fwd_mid"),
+        (140 * sm_count, "fwd_tiny", "fwd_mid"),
+        (140 * sm_count + 1, "fwd_long", "fwd_long"),
+        (400 * sm_count, "fwd_long", "fwd_long"),
+        (400 * sm_count + 1, "fwd_xlong", "fwd_xlong"),
+        (1000 * sm_count, "fwd_xlong", "fwd_xlong"),
+        (1000 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (2**31 - 1, "fwd_mid", "fwd_mid"),
     ):
         got = loader.module_for_rows("sm_100a", "fwd", rows, sm_count)
-        assert got == routes[role], (rows, role)
-    # the forward on sm_103a: the short forward up to 12 rows per SM, the mid
-    # forward up to 250, the extra-long forward up to 550, the mid forward
-    # past it (sm_103a routes no long forward)
+        assert got == routes[packed], (rows, packed)
+        got = loader.module_for_rows("sm_100a", "fwd", rows, sm_count, packed=False)
+        assert got == routes[strided], (rows, strided)
+    # the forward on sm_103a: packed rows the tiny forward up to 120 rows per
+    # SM, other layouts the short forward up to 12 and the mid forward up to
+    # 120; then the mid forward up to 250, the extra-long forward up to 550,
+    # the mid forward past it (sm_103a routes no long forward)
     routes = loader.ROUTES["sm_103a"]
-    for rows, role in (
-        (1, "fwd_short"),
-        (12 * sm_count, "fwd_short"),
-        (12 * sm_count + 1, "fwd_mid"),
-        (250 * sm_count, "fwd_mid"),
-        (250 * sm_count + 1, "fwd_xlong"),
-        (550 * sm_count, "fwd_xlong"),
-        (550 * sm_count + 1, "fwd_mid"),
-        (2**31 - 1, "fwd_mid"),
+    for rows, packed, strided in (
+        (1, "fwd_tiny", "fwd_short"),
+        (12 * sm_count, "fwd_tiny", "fwd_short"),
+        (12 * sm_count + 1, "fwd_tiny", "fwd_mid"),
+        (120 * sm_count, "fwd_tiny", "fwd_mid"),
+        (120 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (250 * sm_count, "fwd_mid", "fwd_mid"),
+        (250 * sm_count + 1, "fwd_xlong", "fwd_xlong"),
+        (550 * sm_count, "fwd_xlong", "fwd_xlong"),
+        (550 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (2**31 - 1, "fwd_mid", "fwd_mid"),
     ):
         got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count)
-        assert got == routes[role], (rows, role)
+        assert got == routes[packed], (rows, packed)
+        got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count, packed=False)
+        assert got == routes[strided], (rows, strided)
     assert "fwd_long" not in routes
     # the backward on every architecture: the small-row backwards in their
     # bands whatever the SMs (on sm_100a the 4-team exact tiny backward up to
@@ -1504,23 +1572,28 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
             ):
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == loader.ROUTES[arch][role + tier], (arch, role, rows)
-    # the forward on sm_107a: the short forward up to 59 rows per SM, the mid
-    # forward up to 200, the extra-long forward up to 520, the mid forward
-    # past it (sm_107a routes no long forward)
+    # the forward on sm_107a: packed rows the tiny forward up to 65 rows per
+    # SM, other layouts the short forward up to 59 and the mid forward up to
+    # 65; then the mid forward up to 200, the extra-long forward up to 520,
+    # the mid forward past it (sm_107a routes no long forward)
     routes = loader.ROUTES["sm_107a"]
-    for rows, role in (
-        (1, "fwd_short"),
-        (10 * sm_count + 1, "fwd_short"),
-        (59 * sm_count, "fwd_short"),
-        (59 * sm_count + 1, "fwd_mid"),
-        (200 * sm_count, "fwd_mid"),
-        (200 * sm_count + 1, "fwd_xlong"),
-        (520 * sm_count, "fwd_xlong"),
-        (520 * sm_count + 1, "fwd_mid"),
-        (2**31 - 1, "fwd_mid"),
+    for rows, packed, strided in (
+        (1, "fwd_tiny", "fwd_short"),
+        (10 * sm_count + 1, "fwd_tiny", "fwd_short"),
+        (59 * sm_count, "fwd_tiny", "fwd_short"),
+        (59 * sm_count + 1, "fwd_tiny", "fwd_mid"),
+        (65 * sm_count, "fwd_tiny", "fwd_mid"),
+        (65 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (200 * sm_count, "fwd_mid", "fwd_mid"),
+        (200 * sm_count + 1, "fwd_xlong", "fwd_xlong"),
+        (520 * sm_count, "fwd_xlong", "fwd_xlong"),
+        (520 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (2**31 - 1, "fwd_mid", "fwd_mid"),
     ):
         got = loader.module_for_rows("sm_107a", "fwd", rows, sm_count)
-        assert got == routes[role], (rows, role)
+        assert got == routes[packed], (rows, packed)
+        got = loader.module_for_rows("sm_107a", "fwd", rows, sm_count, packed=False)
+        assert got == routes[strided], (rows, strided)
     assert "fwd_long" not in routes
 
 
@@ -1728,11 +1801,12 @@ def test_short_forward_grid_is_one_cta_a_block_beside_16_held_sms(rows, sm_count
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         assert loader.ROUTES[arch]["fwd_short"] == name
         end = _short_end(arch, sm_count)
-        want = loader.ROUTES[arch][FORWARD_BANDS[arch][1][1]]
+        want = loader.ROUTES[arch][STRIDED_FORWARD_BANDS[arch][1][1]]
         if rows <= end:
             routed.append(arch)
             want = name
-        assert loader.module_for_rows(arch, "fwd", rows, sm_count) == want
+        got = loader.module_for_rows(arch, "fwd", rows, sm_count, packed=False)
+        assert got == want
     assert routed, (rows, sm_count)
     record = loader.MODULES[name]
     assert record["grid_rule"] == {"kind": "row_blocks", "rows_per_cta": 16}
@@ -1759,7 +1833,8 @@ def test_short_forward_grid_bound_holds_from_its_fewest_sms(arch):
     record = loader.MODULES[name]
     for sm_count in range(1, 1025):
         rows = _short_end(arch, sm_count)
-        assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+        got = loader.module_for_rows(arch, "fwd", rows, sm_count, packed=False)
+        assert got == name
         grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
         fits = grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count)
         assert fits == (sm_count >= SHORT_FORWARD_MIN_SMS[arch]), (
@@ -1785,11 +1860,76 @@ def test_short_forward_grid_at_its_bands_end_keeps_the_bound_on_this_device():
             f"{SHORT_FORWARD_MIN_SMS[arch]} SMs or more"
         )
     rows = _short_end(arch, sm_count)
-    assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
-    assert loader.module_for_rows(arch, "fwd", rows + 1, sm_count) != name
+    assert loader.module_for_rows(arch, "fwd", rows, sm_count, packed=False) == name
+    assert loader.module_for_rows(arch, "fwd", rows + 1, sm_count, packed=False) != name
     grid = loader.launch_grid(loader.MODULES[name], rows=rows, sm_count=sm_count)
     assert grid == (-(-rows // 16), 1, 1)
     assert grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count), (arch, sm_count, grid)
+
+
+@pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
+def test_tiny_forward_runs_packed_rows_one_cta_an_8_row_block(sm_count):
+    """The tiny forward, routed on every architecture for packed rows only: one
+    128-thread CTA per 8-row block whatever the SMs, reading no stride (its
+    arguments are ``x``, ``z``, ``w``, ``y``, the rows and ``eps``)."""
+    name = loader.ROUTES["sm_100a"]["fwd_tiny"]
+    record = loader.MODULES[name]
+    assert record["grid_rule"] == {"kind": "row_blocks", "rows_per_cta": 8}
+    assert record["launch"]["block"] == (128, 1, 1)
+    assert record["launch"]["dynamic_smem_bytes"] == 0
+    assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
+    assert [key for _kind, key in record["arg_plan"]] == [
+        "x",
+        "z",
+        "w",
+        "y",
+        "rows",
+        "eps",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ]
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        assert loader.ROUTES[arch]["fwd_tiny"] == name
+        end = _tiny_end(arch, sm_count)
+        for rows in (1, 7, 8, 9, end):
+            assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+            got = loader.module_for_rows(arch, "fwd", rows, sm_count, packed=False)
+            assert got != name, (arch, rows)
+            grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+            assert grid == (-(-rows // 8), 1, 1)
+            assert (
+                loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+            )
+        assert loader.module_for_rows(arch, "fwd", end + 1, sm_count) != name
+
+
+# (T, H) whose rows both the tiny forward (packed rows) and the short forward
+# (other layouts) run on 148 SMs or more.
+TINY_AND_SHORT_SHAPES = [(1, 1), (2, 48), (8, 1), (13, 7), (255, 2), (37, 48)]
+
+
+@pytest.mark.parametrize(("T", "H"), TINY_AND_SHORT_SHAPES)
+def test_tiny_forward_gives_the_short_forwards_bits(T, H, launches):
+    """The tiny forward has the short forward's arithmetic: on the same rows,
+    ``z`` once packed (the tiny forward) and once the gate columns of a wider
+    projection (the short forward), ``y`` is the same bits."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    rows, end = T * H, _short_end(arch, loader.device_sm_count(device_index))
+    if rows > end:
+        pytest.skip(f"{rows} rows are past the short forward's band on {arch}")
+    x, z, w, _ = make(max(T, 2), H, layout="projection", seed=90)
+    x, z = x[:T], z[:T]
+    y_short = forward(x, z, w, EPS)
+    y_tiny = forward(x, z.contiguous(), w, EPS)
+    routes = _routes()
+    if T == 1:
+        # a single token's stride is never read: both calls read packed rows
+        assert launches == [routes["fwd_tiny"]] * 2, launches
+    else:
+        assert launches == [routes["fwd_short"], routes["fwd_tiny"]], launches
+    assert torch.equal(y_short, y_tiny)
 
 
 # (rows, SMs) of the small-row backwards: one cluster of 16 CTAs whatever the
@@ -1900,7 +2040,8 @@ def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
     x, z, w, dy = make(T, H, layout=layout, seed=80)
     name, short = _short_backward(T * H, dw_dtype)
     check_all(x, z, w, dy, EPS, dw_dtype=dw_dtype, repeats=5)
-    assert launches == [_forward_module(T * H), name, name] * 5, launches
+    fwd = _forward_module(T * H, _packed(T, H, layout))
+    assert launches == [fwd, name, name] * 5, launches
     if short is None:
         return
     assert pkg._STREAM_WORKSPACES == {}
@@ -2078,18 +2219,25 @@ def test_no_entry_point_takes_a_mode_keyword(launches):
     assert not bool(ws.any())
 
 
-def _forward_rows() -> dict[str, int]:
+def _forward_rows() -> dict[str, tuple[int, bool]]:
     """One row count of each forward module this device routes, the first row
-    of the module's first ``FORWARD_BANDS`` band: ``{module: rows}``."""
+    of the module's first ``FORWARD_BANDS`` band, else (a module only other
+    layouts run) of its first ``STRIDED_FORWARD_BANDS`` band, at least 2 rows
+    so that a projection layout's rows are not packed: ``{module: (rows,
+    packed)}``."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     sm_count = loader.device_sm_count(device_index)
-    found: dict[str, int] = {}
-    start = 1
-    for last, _role in loader.FORWARD_BANDS[arch]:
-        found.setdefault(_forward_module(start), start)
-        if last is not None:
-            start = last * sm_count + 1
+    found: dict[str, tuple[int, bool]] = {}
+    for packed, table in (
+        (True, loader.FORWARD_BANDS),
+        (False, loader.STRIDED_FORWARD_BANDS),
+    ):
+        start = 1 if packed else 2
+        for last, _role in table[arch]:
+            found.setdefault(_forward_module(start, packed), (start, packed))
+            if last is not None:
+                start = last * sm_count + 1
     return found
 
 
@@ -2109,7 +2257,10 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
     assert len(forward_rows) >= 3, forward_rows
     cases = [make(T, 48, seed=69 + i) for i, T in enumerate((5, 129, 300))]
     empty = torch.empty(0, 48, D, dtype=torch.bfloat16, device="cuda")
-    inputs = {rows: make(rows, 1, seed=72) for rows in forward_rows.values()}
+    inputs = [
+        make(rows, 1, layout="contiguous" if packed else "projection", seed=72)
+        for rows, packed in forward_rows.values()
+    ]
     ws = workspace_for(1, empty.device)
 
     def leaves(x, z, w, weight_grad=True):
@@ -2120,7 +2271,7 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
         ]
 
     def run(nodes):
-        out = [forward(x, z, w, EPS) for x, z, w, _ in inputs.values()]
+        out = [forward(x, z, w, EPS) for x, z, w, _ in inputs]
         for x, z, w, dy in cases:
             out += backward(dy, x, z, w, EPS)
             out += backward(dy, x, z, w, EPS, grad_weight=torch.empty(D, device="cuda"))
@@ -2173,6 +2324,7 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
         assert torch.equal(a, b), i
     assert launches == want_launches, launches
     modules = set(launches)
+    assert set(forward_rows) <= modules, forward_rows
     for x, *_ in cases:
         rows = x.numel() // D
         assert {
