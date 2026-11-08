@@ -103,8 +103,9 @@ keyword.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
   bits either way.  `cake_lm_head_det_train_logprob` (with or without a
-  temperature; a default call also when its backward runs a budget form; not
-  its explicit `"budget"` or kept-logits forms) forms no gradient in its
+  temperature, without `num_valid_rows`; a default call also when its
+  backward runs a budget form; not its explicit `"budget"` or kept-logits
+  forms, nor calls with `num_valid_rows`) forms no gradient in its
   forward; under `"auto"` inside a non-reentrant `torch.utils.checkpoint` its
   checkpointed forward keeps the call's row results (`logp`, the FP32 `lse`,
   the valid-row index and the compact temperature: O(T) bytes until the
@@ -343,20 +344,25 @@ keyword.
   autograd functions of `cake_backend_opt_in.py`, which reuse the kernels,
   launch helpers and per-device state of `cake_backend.py` and keep their
   own binding cache (`cake_backend_opt_in.BINDING_CACHE`, same settings).  So
-  does a default call (`memory_mode=None`) that forms a weight gradient --
-  grad mode on, `W` requiring a gradient, with a BF16 `W` and `X` on CUDA on
-  the `cake` backend: its automatic memory form (below) can pick a budget
-  form.  The loss entry then runs through the opt-in autograd function (its
-  fast form bitwise `cake_backend.py`'s); the log-probability entries without
-  a count run `cake_backend.py`'s forward with a backward that picks its form
+  does a default call (`memory_mode=None`) whose step forms a weight
+  gradient -- `W` requiring a gradient, with a BF16 `W` and `X` on CUDA on
+  the `cake` backend.  With grad mode on its automatic memory form (below)
+  can pick a budget form: the loss entry then runs through the opt-in
+  autograd function (its fast form bitwise `cake_backend.py`'s); the
+  log-probability entries without a count run `cake_backend.py`'s forward
+  with a backward that picks its form
   (`cake_backend_opt_in.CakeLMHeadDetLogprobAutoFunction` and its temperature
-  twin: `cake_backend.py`'s backward where the fast form fits).  Every other
-  call without either keyword -- grad mode off, a frozen `W`, an FP32 `W`,
-  `X` off CUDA, another backend -- runs `cake_backend.py`'s entry unchanged,
-  with its buffer lifetimes; the public entries of
-  `flashinfer.cake_lm_head_det_train` run their argument checks first
-  (`check_num_valid_rows`, which needs a count: `ValueError` without one; then
-  `memory_mode` and `num_valid_rows` against `None`, then grad mode and
+  twin: `cake_backend.py`'s backward where the fast form fits).  With grad
+  mode off (a reentrant checkpoint's first pass, an evaluation call of a
+  trainable head) it runs the fast form's forward -- the loss entry's in
+  `cake_backend_opt_in.py`, the log-probability entries' in
+  `cake_backend.py` -- with its hidden valid-row count checked as below
+  (bitwise the same outputs).  Every other call without either keyword -- a
+  frozen `W`, an FP32 `W`, `X` off CUDA, another backend -- runs
+  `cake_backend.py`'s entry unchanged, with its buffer lifetimes; the public
+  entries of `flashinfer.cake_lm_head_det_train` run their argument checks
+  first (`check_num_valid_rows`, which needs a count: `ValueError` without
+  one; then `memory_mode` and `num_valid_rows` against `None`, then
   `W.requires_grad`).  An explicit `memory_mode="fast"` without a count first
   goes through the dispatch of `cake_backend_opt_in.py` (a few more Python
   calls per call) and then runs the same `cake_backend.py` entry.
@@ -442,33 +448,47 @@ keyword.
   uncompacted call without a count keeps the fast form (`B` is not enforced
   there: it never counts on the host).  The log-probability entries decide
   in the backward (the bound covers it), from the forward's row index.
-  `cake_backend_opt_in._AUTO_MIN_CHUNKS` (1) sets the smallest chunk count
-  of the rows the fast form chunks over that is planned at all; a shorter
-  call keeps the fast form.  A multi-chunk call fits the fast form roughly
+  `cake_backend_opt_in._AUTO_MIN_CHUNKS` sets the smallest chunk count of
+  the rows the fast form chunks over that is planned at all; a shorter call
+  keeps the fast form (its step peak is then not bounded by `B`).  The
+  shipped value 1 plans every call with a valid row.  A multi-chunk call fits
+  the fast form roughly
   while `T_v * (1.96 V - 4 H) >= 4.04 V H + 2 C V` (the fast form's last
   phase: the `dX` output, the FP32 `dX` and `[V, H]` accumulators, the
   deferred chunk's logits and the `dW` output against `0.98 B`): about 18 400
   valid rows at `H = 6144`, `V = 154880`, `C = 4096`, about 13 500 at
   `H = 4096`.  A one-chunk call always exceeds `B` in the fast form (its
   deferred chunk holds the logits of every valid row beside both gradient
-  outputs and the FP32 `dX` accumulator), so it runs a budget form.  Below
+  outputs and the FP32 `dX` accumulator), so with the value 1 it runs a
+  budget form; with a larger `_AUTO_MIN_CHUNKS` it keeps the fast form and
+  its step peak exceeds `B`.  Below
   the threshold the budget forms run slower: the measured steps of the issue's
   shapes (`T = 16384`, a third of the labels ignored, `C = 4096`) went from
   6.971 to 5.020 GiB at `H = 6144` and from 5.041 to 3.888 GiB at
   `H = 4096`, 1-3 % slower; a short call that recomputes most of the
   vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
-  of the issue's shapes.  A default call that keeps the hidden valid-row
-  count plans its budget form with that count's chunk-0 buffers
-  (`chunk_size` rows, the gather buffer included) and keeps the count when
-  that plan fits, else it drops the count's queued chunk-0 work and plans as
-  `"budget"` does; a call whose chunk-0 buffers alone could exceed the budget
-  of any valid-row count runs without the hidden count (bitwise the same
-  outputs).  A loss call with zero-weight policy rows checks the fast call
-  the memory rule picks (the split or the call without it, with the logp-only
-  pass where it runs) and, when it does not fit and a budget plan does, runs
-  as a `"budget"` call (without the hidden count).  The package reads no
-  environment variable; through the public facade the
+  of the issue's shapes.  The hidden valid-row count allocates a whole
+  chunk's buffers before the count is known, and a call that misses the
+  binding cache (a new valid-row count: usually every training batch)
+  allocates the chunk workspace for its binding beside them.  A default call
+  whose step forms a BF16 `dW` -- every pass of it, a checkpointed step's
+  gradient-free first pass included -- keeps the count only where those
+  chunk-0 buffers plus that workspace fit `B` less the margin for every
+  valid-row count (the worst case is `T_v = chunk_size`, with the most dX
+  K-slice slabs the program can take); otherwise it runs without the count,
+  on the host count's path.  Its outputs are the same bits: the loss entry's
+  zero-weight row split is still decided as for the call with the count.  A
+  call that keeps the count plans its budget form with the count's chunk-0
+  buffers (`chunk_size` rows, the gather buffer included) and that
+  cache-miss phase, and keeps the count when that plan fits; else, when the
+  plan with the valid rows' buffers (an explicit `"budget"` call's) fits, it
+  drops the count's queued chunk-0 work and runs that plan; else it runs the
+  fast form with the count.  A loss call with zero-weight policy rows checks
+  the fast call the memory rule picks (the split or the call without it,
+  with the logp-only pass where it runs) and, when it does not fit and a
+  budget plan does, runs as a `"budget"` call (without the hidden count).
+  The package reads no environment variable; through the public facade the
   `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables (`COMPACT_ROWS`,
   `FUSE_DW_CAST`, `DX_FINALIZE`, `HIDDEN_COUNT`, `GEMM_TUNING`) set switches
   that are inputs of this rule -- an uncompacted default call keeps the fast

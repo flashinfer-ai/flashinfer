@@ -54,7 +54,8 @@ from tests.test_helpers.cake_package import cake_package
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_det_train_api.py``.
 pkg = cake_package("cake.cake_lm_head_det_train")
 cake_backend = cake_package("cake.cake_lm_head_det_train", "cake_backend")
-# The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
+# The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s, except a
+# default call whose step forms a BF16 weight gradient on the cake backend on CUDA (the automatic form).
 opt_in = cake_package("cake.cake_lm_head_det_train", "cake_backend_opt_in")
 cake_build = cake_package("cake.cake_lm_head_det_train", "cake_build")
 cake_jit = cake_package("cake.cake_lm_head_det_train", "cake_jit")
@@ -6385,8 +6386,20 @@ def test_memory_mode_and_count_keywords_are_validated():
             dict(memory_mode="auto", num_valid_rows=n),
         ):
             _assert_same_bits(fast, _run(inp, 16, entry=entry, **kw), keys=keys)
+        for bad in (True, 3.0, -1, T + 1, torch.tensor([1, 2]), torch.tensor(2.0), "5"):
+            with pytest.raises(ValueError, match="num_valid_rows"):
+                _run(inp, 16, entry=entry, num_valid_rows=bad)
+        if torch.cuda.is_available():
+            with pytest.raises(ValueError, match="host integer"):
+                _run(
+                    inp,
+                    16,
+                    entry=entry,
+                    num_valid_rows=torch.tensor(n, device="cuda"),
+                )
     # the eager forward: ``memory_mode=None`` is the fast form; the automatic form with an FP32 weight gradient or on
-    # the reference backend runs the fast form too (no plan, no ValueError)
+    # the reference backend runs the fast form too (no plan, no ValueError).  The reference backend runs no budget
+    # form at all: ``test_device_eager_default_forward_is_the_fast_form`` checks the eager default on the cake backend
     for mode in (None, "auto"):
         for dtype in (torch.bfloat16, torch.float32):
             fr = opt_in.forward_loss(
@@ -6400,17 +6413,6 @@ def test_memory_mode_and_count_keywords_are_validated():
                 memory_mode=mode,
             )
             assert fr.memory_plan is None, (mode, dtype)
-        for bad in (True, 3.0, -1, T + 1, torch.tensor([1, 2]), torch.tensor(2.0), "5"):
-            with pytest.raises(ValueError, match="num_valid_rows"):
-                _run(inp, 16, entry=entry, num_valid_rows=bad)
-        if torch.cuda.is_available():
-            with pytest.raises(ValueError, match="host integer"):
-                _run(
-                    inp,
-                    16,
-                    entry=entry,
-                    num_valid_rows=torch.tensor(n, device="cuda"),
-                )
     with pytest.raises(ValueError, match="BF16"):
         opt_in._check_budget_call("cake", torch.float32)
     given = opt_in._given_count
@@ -10332,8 +10334,9 @@ def test_temperature_reaches_the_reference_engine():
 
 
 def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
-    """The opt-in log-probability entry without a count in the fast memory mode (``memory_mode=None`` or ``"fast"``)
-    hands the temperature to ``cake_backend``'s entry: the graph node is ``cake_backend``'s autograd function,
+    """The opt-in log-probability entry without a count in the fast memory mode (``"fast"``, or ``memory_mode=None``:
+    the automatic form, which on the reference backend is ``cake_backend``'s fast entry) hands the temperature to
+    ``cake_backend``'s entry: the graph node is ``cake_backend``'s autograd function,
     ``logp`` / ``dX`` / ``dW`` are the bits of ``cake_backend``'s call with the same temperature (tensor and scalar)
     and differ from the call without one, and ``temperature`` / ``check_temperature`` arrive unchanged (a tensor as
     the same object)."""
@@ -11068,7 +11071,9 @@ _TAU_SWITCH_MATRIX: tuple[tuple[str, dict], ...] = (
     ("defaults", {}),
     ("uncompacted", dict(compact_rows=False)),
     ("host_count", dict(hidden_count=False)),
+    # the caller's count: the default (the automatic form, a budget form at these shapes) and the fast form
     ("given_count", dict(num_valid_rows=True)),
+    ("given_count_fast", dict(num_valid_rows=True, memory_mode="fast")),
     ("budget", dict(memory_mode="budget")),
     ("unfused_dw_cast", dict(fuse_dw_cast=False)),
     ("no_dx_finalize", dict(dx_finalize=False)),
@@ -13061,24 +13066,28 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
 
 def _tau_region_entry(entry, inp, X, W):
     """The scalar a temperature checkpoint test differentiates: the temperature entry on ``X`` / ``W`` (a per-token
-    temperature; ``opt_in_count``: the opt-in entry with a count, ``opt_in_budget``: its budget form)."""
+    temperature; ``opt_in_count``: the opt-in entry with a count -- the default, the automatic form --,
+    ``opt_in_count_fast``: with a count in the fast form, ``opt_in_budget``: its budget form)."""
     if entry == "backend":
         logp = cake_backend.cake_lm_head_det_train_logprob_temperature(
             X, W, inp.labels, chunk_size=4096, temperature=inp.temperature
         )
     else:
-        kw = (
-            dict(num_valid_rows=int((inp.labels >= 0).sum()))
-            if entry == "opt_in_count"
-            else dict(memory_mode="budget")
-        )
+        count = dict(num_valid_rows=int((inp.labels >= 0).sum()))
+        kw = {
+            "opt_in_count": count,
+            "opt_in_count_fast": dict(count, memory_mode="fast"),
+            "opt_in_budget": dict(memory_mode="budget"),
+        }[entry]
         logp = opt_in.cake_lm_head_det_train_logprob_temperature(
             X, W, inp.labels, chunk_size=4096, temperature=inp.temperature, **kw
         )
     return (logp * inp.dlogp).sum()
 
 
-@pytest.mark.parametrize("entry", ["backend", "opt_in_count", "opt_in_budget"])
+@pytest.mark.parametrize(
+    "entry", ["backend", "opt_in_count", "opt_in_count_fast", "opt_in_budget"]
+)
 def test_device_checkpointed_temperature_step_is_bitwise(glm_weight, entry):
     """The temperature entry under a non-reentrant checkpoint, selective activation checkpointing and a dispatch mode
     (around the checkpointed forward; around the whole step) gives the uncheckpointed step's ``dX`` / ``dW`` bits."""
@@ -13115,7 +13124,9 @@ def test_device_checkpointed_temperature_step_is_bitwise(glm_weight, entry):
 
 
 @pytest.mark.parametrize("kind", ["hold", "user_mode", "nested"])
-@pytest.mark.parametrize("entry", ["backend", "opt_in_count", "opt_in_budget"])
+@pytest.mark.parametrize(
+    "entry", ["backend", "opt_in_count", "opt_in_count_fast", "opt_in_budget"]
+)
 def test_device_selective_checkpoint_region_input_temperature(glm_weight, entry, kind):
     """:func:`test_device_selective_checkpoint_region_input` for the temperature entry: its input formed inside the
     selective-checkpoint region (``X = Hin @ P``), memory held between the forward and the backward (a binding miss in
@@ -13222,36 +13233,50 @@ def _auto_args(T, R, g, **kw):
     )
 
 
+def _auto_planned(rows: int, chunk: int = 4096) -> bool:
+    """Whether the automatic form plans a call whose fast form chunks over ``rows`` rows at all: at least
+    ``_AUTO_MIN_CHUNKS`` chunks (the module's value, whatever it is set to)."""
+    return rows > 0 and -(-int(rows) // int(chunk)) >= opt_in._AUTO_MIN_CHUNKS
+
+
 def test_auto_memory_plan_decisions(monkeypatch):
     """The automatic form's decision (``auto_memory_plan``, host integer arithmetic) at the GLM head (H 6144, V 154880,
-    chunk 4096): two thirds of the rows valid (four chunks) switches both entries to the partial form, the budget
+    chunk 4096): two thirds of the rows valid (three chunks) switches both entries to the partial form, the budget
     call's own plan; many valid rows (T 32463, 5 % ignored) keep the fast form, which fits with its own lifetimes; one
     chunk (T 4096, 5 % ignored) switches to a recompute form; one row, where no form fits, and a program without the
-    recompute arm keep the fast form; ``_AUTO_MIN_CHUNKS`` sets the smallest chunk count that is planned at all."""
+    recompute arm keep the fast form; ``_AUTO_MIN_CHUNKS`` sets the smallest chunk count that is planned at all (a
+    call of fewer chunks keeps the fast form; the expectations follow the module's value)."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
-    assert opt_in._AUTO_MIN_CHUNKS == 1
     for entry in ("loss", "logprob"):
         issue = _auto_args(16384, 10980, g)
         mp = opt_in.auto_memory_plan(entry, **issue)
-        assert mp is not None and mp.form == "partial" and mp.fits, (entry, mp)
-        assert mp == opt_in.memory_plan(entry, **issue), entry
         assert not opt_in.fast_form_fits(entry, **issue), entry
+        if _auto_planned(10980):
+            assert mp is not None and mp.form == "partial" and mp.fits, (entry, mp)
+            assert mp == opt_in.memory_plan(entry, **issue), entry
+        else:
+            assert mp is None, (entry, mp)
         many = _auto_args(32463, 30840, g)
         assert opt_in.fast_form_fits(entry, **many), entry
         assert opt_in.auto_memory_plan(entry, **many) is None, entry
         one = _auto_args(4096, 3891, g)
         assert not opt_in.fast_form_fits(entry, **one), entry
         mp = opt_in.auto_memory_plan(entry, **one)
-        assert mp is not None and mp.recompute and mp.fits, (entry, mp)
+        if _auto_planned(3891):
+            assert mp is not None and mp.recompute and mp.fits, (entry, mp)
+        else:
+            assert mp is None, (entry, mp)
         tiny = _auto_args(1, 1, g)
         assert not opt_in.memory_plan(entry, **tiny).fits, entry
         assert opt_in.auto_memory_plan(entry, **tiny) is None, entry
         assert opt_in.auto_memory_plan(entry, recompute=False, **issue) is None, entry
-    # 2: the one-chunk call keeps the fast form; 3: the two-chunk call too; the three-chunk call is planned
-    for minimum, planned in ((2, (False, True, True)), (3, (False, False, True))):
+    # every smallest chunk count: a call of fewer chunks keeps the fast form, the others are planned
+    cases = ((4096, 3891), (16384, 8000), (16384, 10980))
+    for minimum in (1, 2, 3, 4):
         monkeypatch.setattr(opt_in, "_AUTO_MIN_CHUNKS", minimum)
-        cases = ((4096, 3891), (16384, 8000), (16384, 10980))
-        for (T, R), want in zip(cases, planned, strict=True):
+        for T, R in cases:
+            want = minimum <= -(-R // 4096)
+            assert _auto_planned(R) == want, (minimum, R)
             for entry in ("loss", "logprob"):
                 got = opt_in.auto_memory_plan(entry, **_auto_args(T, R, g))
                 assert (got is not None) == want, (minimum, T, R, entry, got)
@@ -13318,9 +13343,10 @@ def test_memory_plan_keeps_the_dx_accumulator_for_the_fast_form():
 
 def test_memory_plan_zero_weight_pass_placement():
     """``zero_pass`` / ``hidden_count`` (where the fast split's logp-only pass runs, :func:`fast_form_fits`): a bad
-    place raises; without zero-weight rows neither changes the plan; with them every place predicts at least the call
-    without the pass, and the pass ahead of the loop beside the hidden count's chunk-0 buffers at least the pass
-    without them (one candidate form: the comparison is of the same form)."""
+    place raises; without zero-weight rows neither changes the plan at this shape (the hidden count's cache-miss phase,
+    ``test_hidden_count_check_bounds_the_cache_miss_phase``, stays below the plan's peak); with them every place
+    predicts at least the call without the pass, and the pass ahead of the loop beside the hidden count's chunk-0
+    buffers at least the pass without them (one candidate form: the comparison is of the same form)."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     plain_kw = _auto_args(16384, 10977, g)
     with pytest.raises(ValueError, match="memory_plan's zero_pass"):
@@ -13432,8 +13458,8 @@ def test_auto_log_probability_functions_reuse_the_backend_forward():
             got = step(run_auto, kind)
             _assert_step_bits(got, want, ("logp", "dX", "dW"))
     X, W = inp.X, inp.W.detach().requires_grad_(True)
-    assert not opt_in._auto_applies("reference", X, W)
-    assert not opt_in._auto_applies("cake", X.cpu(), W.cpu())
+    assert not opt_in._auto_reaches("reference", X, W)
+    assert not opt_in._auto_reaches("cake", X.cpu(), W.cpu())
     assert (
         opt_in._auto_logprob_plan(
             X,
@@ -13514,7 +13540,8 @@ def test_device_default_step_peak_within_the_head_bytes(
     * H``; forward through a backward that frees the graph, outputs and gradients included) and gives the explicit
     fast form's bits (integer views); the call runs the opt-in loss function or the automatic log-probability
     function, whose plan is a budget form that fits; the four-chunk loss call at H 6144 keeps the hidden valid-row
-    count."""
+    count.  A call of fewer chunks than ``_AUTO_MIN_CHUNKS`` keeps the fast form (no plan, the same bits) and is not
+    bounded by the head's bytes."""
     _require_program(entry=entry)
     _require_recompute()
     V = DEFAULT_V
@@ -13535,6 +13562,12 @@ def test_device_default_step_peak_within_the_head_bytes(
         result, peak, mplan = _budget_step(case, 4096, entry)
         _assert_same_bits(fast[name], result, keys=keys)
         del result
+        if not _auto_planned(R):
+            # fewer chunks than the automatic form plans: the fast form, whose one-chunk peak exceeds the head's bytes
+            assert mplan is None, mplan
+            if entry == "logprob":
+                assert logprob_plans[-1:] == [None], logprob_plans
+            continue
         if entry == "loss":
             assert mplan is not None and mplan.fits and mplan.budget_bytes < head, mplan
         else:
@@ -13564,19 +13597,21 @@ def test_device_default_step_peak_within_the_head_bytes(
 @pytest.mark.parametrize(
     "case", ["ce", "policy_zero_weights", "logprob", "logprob_zero_dlogp"]
 )
-def test_device_default_budget_form_is_deterministic(glm_weight, case):
-    """A default call whose automatic form is a budget form (T 8192, a third of the labels ignored) gives the same
-    bits on every run (integer views, the allocator poisoned between the runs): the loss entry (cross-entropy; the
-    policy objective with zero-weight rows, whose split the budget rule decides) and the log-probability entry (also
-    with a zero upstream gradient on 30 % of the valid rows: the budget form runs without the zero-gradient row skip).
-    Against the explicit fast form: the same bits, except ``dX`` / ``dW`` of the zero-weight and zero-gradient cases,
-    which pass the accuracy gates against the FP64 oracle instead."""
+def test_device_default_budget_form_is_deterministic(glm_weight, monkeypatch, case):
+    """A default call whose automatic form is a budget form (T 16384, a third of the labels ignored: three chunks of
+    valid rows, and of gradient rows with the zero weights) gives the same bits on every run (integer views, the
+    allocator poisoned between the runs): the loss entry (cross-entropy; the policy objective with zero-weight rows,
+    whose split the budget rule decides) and the log-probability entry (also with a zero upstream gradient on 30 % of
+    the valid rows: the budget form runs without the zero-gradient row skip); each run's plan is a budget form that
+    fits.  Against the explicit fast form: the same bits, except ``dX`` / ``dW`` of the zero-weight and zero-gradient
+    cases, which pass the accuracy gates against the FP64 oracle instead.  With fewer chunks than
+    ``_AUTO_MIN_CHUNKS`` the call keeps the fast form: no plan, the fast form's bits."""
     entry = "logprob" if case.startswith("logprob") else "loss"
     _require_program(entry=entry)
     _require_recompute()
     objective = "policy" if case == "policy_zero_weights" else "ce"
     inp = make_inputs(
-        8192,
+        16384,
         objective=objective,
         seed=SEED + 7991,
         device=CUDA,
@@ -13598,16 +13633,28 @@ def test_device_default_budget_form_is_deterministic(glm_weight, case):
         dlogp[pick.to(CUDA)] = 0.0
         inp = replace(inp, dlogp=dlogp.contiguous())
     keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    # the fewest rows the fast form can chunk over: the gradient rows of a split, else the valid rows
+    rows = int(inp.valid.sum())
+    if case == "policy_zero_weights":
+        rows = int((inp.valid & (inp.loss_weights != 0)).sum())
+    planned = _auto_planned(rows)
+    logprob_plans = _record_auto_logprob_plans(monkeypatch)
     runs = []
     for _ in range(2):
         _poison_allocator()
+        logprob_plans.clear()
         result, _, mplan = _budget_step(inp, 4096, entry)
         runs.append(result)
-        if entry == "loss":
-            assert mplan is not None and mplan.fits, mplan
+        plan = mplan if entry == "loss" else logprob_plans[-1]
+        if entry == "logprob":
+            assert len(logprob_plans) == 1, logprob_plans
+        if planned:
+            assert plan is not None and plan.fits, plan
+        else:
+            assert plan is None, plan
     _assert_same_bits(runs[0], runs[1], keys=keys)
     fast, _, _ = _budget_step(inp, 4096, entry, memory_mode="fast")
-    if case in ("policy_zero_weights", "logprob_zero_dlogp"):
+    if planned and case in ("policy_zero_weights", "logprob_zero_dlogp"):
         _assert_same_bits(fast, runs[0], keys=keys[:-2])
         _check_against_references(runs[0], inp, entry=entry)
     else:
@@ -13696,7 +13743,8 @@ def test_device_default_budget_form_keeps_the_hidden_count(glm_weight, monkeypat
     sides at this count), the count runs, the step peaks within the head's bytes and gives the bits of the explicit
     budget and fast forms.  With fewer valid rows than a chunk (T 8192, chunk 2048, 1500 rows valid) and the plan of
     chunk-sized buffers forced not to fit, the call drops the count's queued chunk-0 work and runs the plan of the
-    valid rows' buffers: the same bits, within the head's bytes."""
+    valid rows' buffers: the same bits, within the head's bytes.  A call of fewer chunks than ``_AUTO_MIN_CHUNKS``
+    plans nothing: the fast form, the same bits."""
     _require_program(entry="loss")
     _require_recompute()
     _require_hidden_count()
@@ -13712,9 +13760,12 @@ def test_device_default_budget_form_keeps_the_hidden_count(glm_weight, monkeypat
     torch.cuda.empty_cache()
     auto, peak, auto_plan = _budget_step(inp, 4096, "loss")
     assert begun, begun
-    assert auto_plan == budget_plan and auto_plan.fits, (auto_plan, budget_plan)
     _assert_same_bits(fast, auto, keys=keys)
-    assert peak <= head, (peak, head)
+    if _auto_planned(R):
+        assert auto_plan == budget_plan and auto_plan.fits, (auto_plan, budget_plan)
+        assert peak <= head, (peak, head)
+    else:
+        assert auto_plan is None, auto_plan
     del fast, budget, auto
     # the drop branch: fewer valid rows than a chunk, the chunk-sized plan forced not to fit
     T, C, R = 8192, 2048, 1500
@@ -13742,11 +13793,15 @@ def test_device_default_budget_form_keeps_the_hidden_count(glm_weight, monkeypat
     begun.clear()
     torch.cuda.empty_cache()
     dropped, peak, mplan = _budget_step(small, C, "loss")
-    # the count ran (its chunk-0 buffers fit the budget of any count) before the drop
+    # the count ran (its chunk-0 buffers, with a cache miss's workspace beside them, fit the budget of any count)
     assert begun, begun
+    _assert_same_bits(fast, dropped, keys=keys)
+    if not _auto_planned(R, C):
+        # one chunk below ``_AUTO_MIN_CHUNKS``: the fast form, no plan asked for (the count kept)
+        assert calls == [] and mplan is None, (calls, mplan)
+        return
     assert [rows for rows, _ in calls] == [C, R], calls
     assert mplan == calls[-1][1] and mplan.fits, (mplan, calls)
-    _assert_same_bits(fast, dropped, keys=keys)
     assert peak <= head, (peak, head)
 
 
@@ -13828,3 +13883,362 @@ def test_device_default_temperature_step_peak_within_the_head_bytes(glm_weight):
     assert (
         logp.grad_fn._forward_cls is opt_in.CakeLMHeadDetLogprobTemperatureAutoFunction
     )
+
+
+def test_hidden_count_check_bounds_the_cache_miss_phase():
+    """The hidden valid-row count's check (``_hidden_count_shape_fits``, host arithmetic) bounds the phase in which a
+    call that misses the binding cache allocates its chunk workspace beside the count's chunk-0 buffers.  At H 4096, V
+    154880, chunk 4096, T 12289 the chunk-0 buffers alone fit the budget of a call without a valid row, but with the
+    workspace beside them they exceed the budget at one chunk of valid rows: the count is not kept.  At H 6144,
+    T 16384 it is (the K-slice slabs of the workspace grow the phase: enough of them fail it), and ``memory_plan`` of
+    a call that keeps the count (``hidden_count``) counts that phase, which stays within the budget at every
+    valid-row count; fewer chunks than the count serves always pass."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    live = opt_in._allocated_bytes
+    V, C = 154880, 4096
+    tile = int(g.stats_tile)
+
+    def budget(rows, T, H):
+        head = 2 * rows * V + 2 * V * H + 2 * T * H
+        return head - int(math.ceil(head * opt_in.MEMORY_BUDGET_MARGIN))
+
+    def chunk0(H):
+        return live(2 * C * V) + live(8 * C * -(-V // tile)) + live(2 * C * H)
+
+    T, H = 12289, 4096
+    shape = dict(num_rows=T, hidden=H, vocab=V, chunk=C, need_dx=True, geometry=g)
+    assert chunk0(H) + live(4 * T, 4) + live(4 * T, 8) <= budget(0, T, H)
+    assert not opt_in._hidden_count_shape_fits(**shape)
+    assert opt_in._hidden_count_shape_fits(**dict(shape, num_rows=8192))
+    T, H = 16384, 6144
+    shape = dict(num_rows=T, hidden=H, vocab=V, chunk=C, need_dx=True, geometry=g)
+    assert opt_in._hidden_count_shape_fits(**shape)
+    assert opt_in._hidden_count_shape_fits(**shape, dx_ws_slabs=3)
+    assert not opt_in._hidden_count_shape_fits(**shape, dx_ws_slabs=7)
+    for R in (1, 1000, 4000, 4096, 4097, 8000, 10977, T):
+        kw = dict(
+            num_rows=T,
+            rows=R,
+            hidden=H,
+            vocab=V,
+            chunk=C,
+            geometry=g,
+            buffer_rows=C,
+            compact=True,
+        )
+        workspace = workspace_layout(
+            min(C, R), V, C, stats_tile=tile, hidden=H, compact=True
+        )["total"]
+        miss = chunk0(H) + live(workspace) + live(4 * T, 4) + live(4 * R, 8)
+        assert miss <= budget(R, T, H), (R, miss)
+        kept = opt_in.memory_plan("loss", hidden_count=True, **kw)
+        assert kept.predicted_bytes >= miss, (R, kept, miss)
+        assert kept.predicted_bytes >= opt_in.memory_plan("loss", **kw).predicted_bytes
+        # the log-probability entry plans its backward only
+        assert opt_in.memory_plan(
+            "logprob", hidden_count=True, **kw
+        ) == opt_in.memory_plan("logprob", **kw)
+
+
+def _clear_binding_caches() -> None:
+    """Drop every remembered binding of both backend modules: the next call misses the cache."""
+    cake_backend.BINDING_CACHE.clear()
+    opt_in.BINDING_CACHE.clear()
+
+
+def _record_every_hidden_count(monkeypatch) -> list:
+    """Record each hidden valid-row count either backend module's forwards begin (the module's name per count)."""
+    begun: list = []
+    for name, module in (("cake_backend", cake_backend), ("opt_in", opt_in)):
+        real = module._hidden_count_begin
+
+        def begin(*args, _real=real, _name=name, **kwargs):
+            begun.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_hidden_count_begin", begin)
+    return begun
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_default_cache_miss_step_within_the_head_bytes(monkeypatch, entry):
+    """A default step that misses the binding cache (a new valid-row count: every step here, the caches cleared before
+    it) prepares its chunk workspace while the hidden valid-row count's chunk-0 buffers would be alive.  At H 4096,
+    V 154880, T 12289 (four chunks) the count's chunk-0 buffers alone fit the budget of a call without a valid row,
+    but with that workspace beside them they exceed the head's bytes near one chunk of valid rows, so the default call
+    runs without the count; each step -- about 4000 valid rows, another count each time -- runs no hidden count in
+    either module, gives the explicit fast form's bits and peaks within the head's bytes (a call of fewer chunks than
+    ``_AUTO_MIN_CHUNKS`` keeps the fast form and is not bounded)."""
+    _require_program(entry=entry)
+    _require_recompute()
+    H, V, T, C = 4096, DEFAULT_V, 12289, 4096
+    assert not opt_in._hidden_count_fits(
+        CUDA, num_rows=T, hidden=H, vocab=V, chunk=C, need_dx=True, entry=entry
+    )
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    logprob_plans = _record_auto_logprob_plans(monkeypatch)
+    begun = _record_every_hidden_count(monkeypatch)
+    W = None
+    for i, R in enumerate((4000, 3990, 4010)):
+        inp = make_inputs(
+            T,
+            seed=SEED + 7996 + i,
+            H=H,
+            V=V,
+            device=CUDA,
+            W=W,
+            ignore_frac=(T - R) / T,
+        )
+        W = inp.W
+        assert int(inp.valid.sum()) == R
+        head = 2 * R * V + 2 * V * H + 2 * T * H
+        fast, _, _ = _budget_step(inp, C, entry, memory_mode="fast")
+        _clear_binding_caches()
+        begun.clear()
+        logprob_plans.clear()
+        torch.cuda.empty_cache()
+        result, peak, mplan = _budget_step(inp, C, entry)
+        assert begun == [], begun
+        _assert_same_bits(fast, result, keys=keys)
+        del fast, result
+        plan = mplan if entry == "loss" else (logprob_plans or [None])[-1]
+        if _auto_planned(R, C):
+            assert plan is not None and plan.fits, (R, plan)
+            assert peak <= head, (R, peak, head, plan)
+        else:
+            assert plan is None, (R, plan)
+
+
+@pytest.mark.parametrize("kind", ["nonreentrant", "reentrant"])
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_default_checkpointed_step_checks_the_hidden_count(
+    monkeypatch, entry, kind
+):
+    """At H 3584, V 154880, T 16384 (four chunks) with 3000 valid rows the hidden valid-row count's chunk-0 work can
+    exceed the step's budget, so the plain default step runs without the count -- and so does every pass of a
+    checkpointed one: the gradient-free first pass (no dX / dW formed inside a non-reentrant checkpoint; grad mode
+    off in a reentrant one, which the opt-in entries take on and the public entries route to them) and the
+    recomputation.  Each step misses the binding caches (cleared before it), begins no hidden count in either module,
+    gives the plain default step's bits (integer views) and peaks within the head's bytes (a call of fewer chunks
+    than ``_AUTO_MIN_CHUNKS`` keeps the fast form and is not bounded)."""
+    _require_program(entry=entry)
+    _require_recompute()
+    H, V, T, C, R = 3584, DEFAULT_V, 16384, 4096, 3000
+    assert not opt_in._hidden_count_fits(
+        CUDA, num_rows=T, hidden=H, vocab=V, chunk=C, need_dx=True, entry=entry
+    )
+    inp = make_inputs(
+        T, seed=SEED + 7997, H=H, V=V, device=CUDA, ignore_frac=(T - R) / T
+    )
+    assert int(inp.valid.sum()) == R
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    begun = _record_every_hidden_count(monkeypatch)
+    _clear_binding_caches()
+    plain, plain_peak = _auto_checkpoint_step(inp, C, entry, "plain")
+    _clear_binding_caches()
+    run, peak = _auto_checkpoint_step(inp, C, entry, kind)
+    assert begun == [], begun
+    _assert_same_bits(plain, run, keys=keys)
+    if _auto_planned(R, C):
+        assert plain_peak <= head, (plain_peak, head)
+        assert peak <= head, (kind, peak, head)
+
+
+def test_device_default_zero_weight_split_follows_the_default_entry(monkeypatch):
+    """A policy call whose hidden valid-row count the step-budget check drops (H 1536, V 154880, T 16384, chunk 4096:
+    the count's chunk-0 buffers alone exceed the budget) and whose zero-weight split depends on that count (8000
+    gradient rows, 4096 zero-weight rows: the memory rule declines the split with the count and takes it without):
+    the default call stays fast, decides its split as ``cake_backend``'s default call does (with the count), and gives
+    the explicit fast form's bits (integer views), ``dX`` and ``dW`` included."""
+    _require_program(entry="loss")
+    _require_hidden_count()
+    H, V, T, C, G, Z = 1536, DEFAULT_V, 16384, 4096, 8000, 4096
+    inp = make_inputs(
+        T,
+        objective="policy",
+        seed=SEED + 7998,
+        H=H,
+        V=V,
+        device=CUDA,
+        ignore_frac=(T - G - Z) / T,
+    )
+    weights = inp.loss_weights.clone()
+    weights[inp.valid.nonzero().squeeze(1)[:Z]] = 0.0
+    inp = replace(inp, loss_weights=weights.contiguous())
+    assert int((inp.valid & (inp.loss_weights == 0)).sum()) == Z
+    assert not opt_in._hidden_count_fits(
+        CUDA, num_rows=T, hidden=H, vocab=V, chunk=C, need_dx=True
+    )
+    problem = validate_lm_head_det_inputs(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="policy",
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=C,
+        entry="loss",
+    )
+    split = {
+        count: cake_backend.zero_weight_plan(
+            problem,
+            CUDA,
+            grad_rows=G,
+            zero_rows=Z,
+            backend="cake",
+            need_dx=True,
+            need_dw=True,
+            fuse_dw_cast=True,
+            dx_finalize=True,
+            hidden_count=count,
+            return_logp=True,
+            exact_loss=cake_backend.zero_weight_loss_mode() == "exact",
+            tuning={},
+        )["split"]
+        for count in (False, True)
+    }
+    assert split == {False: True, True: False}, split
+    fast, _, _ = _budget_step(inp, C, "loss", memory_mode="fast")
+    begun = _record_hidden_counts(monkeypatch)
+    result, _, mplan = _budget_step(inp, C, "loss")
+    assert begun == [], begun
+    assert mplan is None, mplan
+    _assert_same_bits(fast, result)
+
+
+def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
+    """The runtime gates follow ``_AUTO_MIN_CHUNKS``: set to 2, a one-chunk default call (T 4096, a third of the
+    labels ignored) of both entries keeps the fast form -- no loss plan, a ``None`` from the log-probability
+    backward's rule -- and so does a policy call with zero-weight rows whose split's chunk loop spans one chunk; every
+    output is the explicit fast form's bits.  Set to 1, the same calls run a budget form that fits (the policy call
+    decides its split as ``"budget"`` does: ``loss`` / ``logp`` bits only)."""
+    _require_program(entry="loss")
+    _require_program(entry="logprob")
+    _require_recompute()
+    T, C = 4096, 4096
+    ce = make_inputs(T, seed=SEED + 7999, device=CUDA, W=glm_weight, ignore_frac=0.33)
+    policy = make_inputs(
+        T,
+        objective="policy",
+        seed=SEED + 8000,
+        device=CUDA,
+        W=glm_weight,
+        ignore_frac=0.33,
+    )
+    weights = policy.loss_weights.clone()
+    weights[::5] = 0.0
+    policy = replace(policy, loss_weights=weights.contiguous())
+    assert int((policy.valid & (policy.loss_weights == 0)).sum()) > 0
+    cases = (("loss", ce), ("logprob", ce), ("loss", policy))
+    fast = [_budget_step(inp, C, entry, memory_mode="fast")[0] for entry, inp in cases]
+    logprob_plans = _record_auto_logprob_plans(monkeypatch)
+    for minimum in (2, 1):
+        monkeypatch.setattr(opt_in, "_AUTO_MIN_CHUNKS", minimum)
+        for (entry, inp), want in zip(cases, fast, strict=True):
+            keys = (
+                ("loss", "logp", "dX", "dW")
+                if entry == "loss"
+                else ("logp", "dX", "dW")
+            )
+            logprob_plans.clear()
+            result, _, mplan = _budget_step(inp, C, entry)
+            if entry == "logprob":
+                assert len(logprob_plans) == 1, logprob_plans
+                mplan = logprob_plans[0]
+            case = (minimum, entry, inp.objective, mplan)
+            if minimum == 2:
+                assert mplan is None, case
+                _assert_same_bits(want, result, keys=keys)
+                continue
+            assert mplan is not None and mplan.fits, case
+            _assert_same_bits(
+                want, result, keys=keys if inp is ce else ("loss", "logp")
+            )
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_default_uncompacted_call_without_a_count_stays_fast(
+    glm_weight, monkeypatch, entry
+):
+    """An uncompacted default call without ``num_valid_rows`` (``compact_rows=False``; through the public entries
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS=0`` makes every call one) never counts its valid rows on the host: at a
+    shape where a compacted default call switches (T 16384, a third of the labels ignored) it keeps the fast form (no
+    loss plan, a ``None`` from the log-probability backward's rule), gives the explicit fast form's bits (integer
+    views), and a call from the remembered binding runs its forward and backward without a host synchronization."""
+    _require_program(entry=entry)
+    T, C = 16384, 4096
+    inp = make_inputs(T, seed=SEED + 8001, device=CUDA, W=glm_weight, ignore_frac=0.33)
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(inp, C, entry, memory_mode="fast", compact_rows=False)
+    logprob_plans = _record_auto_logprob_plans(monkeypatch)
+    _budget_step(inp, C, entry, compact_rows=False)  # binds
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    loss = mplan = None
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        if entry == "loss":
+            loss, logp = opt_in.cake_lm_head_det_train_loss(
+                X,
+                W,
+                inp.labels,
+                loss_div=inp.loss_div,
+                chunk_size=C,
+                return_logp=True,
+                backend="cake",
+                compact_rows=False,
+            )
+            assert loss.grad_fn._forward_cls is opt_in.CakeLMHeadDetLossFunction
+            mplan = loss.grad_fn.memory_plan
+            loss.backward()
+        else:
+            logp = opt_in.cake_lm_head_det_train_logprob(
+                X, W, inp.labels, chunk_size=C, backend="cake", compact_rows=False
+            )
+            assert logp.grad_fn._forward_cls is opt_in.CakeLMHeadDetLogprobAutoFunction
+            logp.backward(inp.dlogp)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    result = dict(
+        loss=None if loss is None else loss.detach(),
+        logp=logp.detach(),
+        dX=X.grad,
+        dW=W.grad,
+    )
+    _assert_same_bits(fast, result, keys=keys)
+    assert mplan is None, mplan
+    if entry == "logprob":
+        assert logprob_plans == [None, None], logprob_plans
+
+
+def test_device_eager_default_forward_is_the_fast_form(glm_weight):
+    """The eager ``forward_loss`` with ``memory_mode=None`` runs the fast form (no plan) on the cake backend with a
+    BF16 weight gradient at a shape where the automatic form switches (T 16384, a third of the labels ignored), while
+    ``memory_mode="auto"`` there returns a budget form that fits (``None`` with fewer chunks than
+    ``_AUTO_MIN_CHUNKS``)."""
+    _require_program(entry="loss")
+    _require_recompute()
+    inp = make_inputs(
+        16384, seed=SEED + 8002, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    R = int(inp.valid.sum())
+    for mode in (None, "auto"):
+        result = opt_in.forward_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            loss_div=inp.loss_div,
+            chunk_size=4096,
+            backend="cake",
+            memory_mode=mode,
+        )
+        mplan = result.memory_plan
+        del result
+        torch.cuda.synchronize()
+        if mode == "auto" and _auto_planned(R):
+            assert mplan is not None and mplan.fits, mplan
+        else:
+            assert mplan is None, (mode, mplan)

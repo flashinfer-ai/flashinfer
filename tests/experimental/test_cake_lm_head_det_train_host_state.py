@@ -88,14 +88,32 @@ def _binding_caches(memory_mode):
 def _assert_steps_hit_one_binding(inp, chunk, memory_mode, step):
     """Training steps of ``step`` (the previous step's outputs alive while the next runs) reuse their bindings: after
     the two steps that bind, no step misses in any cache it binds in, every step allocates the same number of blocks,
-    and the bits are the call's with every cache off."""
+    and the bits are the call's with every cache off.  The default call (``None``) of at least ``_AUTO_MIN_CHUNKS``
+    chunks of valid rows on a program with the recompute's ``dz`` arm runs its budget backward: its two binding steps
+    miss in the opt-in module's cache."""
     caches = _binding_caches(memory_mode)
     for cache in caches:
         cache.clear()
+    bound_from = [cache.misses for cache in caches]
     out = step(inp, chunk, memory_mode)  # binds (misses once per direction)
     out = step(inp, chunk, memory_mode)
     torch.cuda.synchronize()
     misses, allocations = [cache.misses for cache in caches], []
+    rows = int(inp.labels.ge(0).sum())
+    name, _ = cake_backend.record_for(CUDA)
+    recompute = (
+        cake_backend.LOGPROB_DZ_STAGE in cake_jit.registered_stages(name)
+        if inp.temperature is None
+        else cake_backend.LOGPROB_DZ_TAU_STAGE
+        in cake_jit.registered_stages_with_temperature(name)
+    )
+    if (
+        memory_mode is None
+        and recompute
+        and -(-rows // chunk) >= opt_in._AUTO_MIN_CHUNKS
+    ):
+        # the budget backward bound in the opt-in module's cache (the fast form would leave it untouched)
+        assert misses[1] > bound_from[1], (misses, bound_from)
     for _ in range(6):
         before = torch.cuda.memory_stats()["allocation.all.allocated"]
         out = step(inp, chunk, memory_mode)

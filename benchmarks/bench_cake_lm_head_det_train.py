@@ -63,7 +63,11 @@ plus the step peak of a training step whose backward frees the graph (forward
 through backward, outputs and gradients included; the entries release their
 saved state early there) and its ratio to the bytes of a head that
 materializes the BF16 logits of the valid rows, ``B = 2 * T_v * V + 2 * V * H +
-2 * T * H`` (``step_peak_over_b``).  ``--accuracy`` adds the error report of
+2 * T * H``, from the remembered bindings and with the binding caches cleared
+first (``step_peak_hit_over_b`` / ``step_peak_miss_over_b``: a new valid-row
+count misses the cache, usually every training batch; ``step_peak_over_b`` is
+the larger), and ``step_miss_ms``, the step time with the caches cleared before
+every step.  ``--accuracy`` adds the error report of
 every arm against the chunked FP64 oracle and its ratio to the unchunked
 PyTorch path (the 1.05x gate of the tests).  The JSON carries an ``env`` record
 (torch / flashinfer / liger-kernel / cut-cross-entropy versions, device name
@@ -683,11 +687,25 @@ def _step_peak(arm):
     return peak
 
 
+def _clear_binding_caches():
+    """Drop the remembered bindings of both deterministic backend modules (the opt-in module's once it is imported):
+    the next ``cake`` call misses the binding cache, as a training step with a new valid-row count does."""
+    cake_backend.BINDING_CACHE.clear()
+    opt_in = sys.modules.get(
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in"
+    )
+    if opt_in is not None:
+        opt_in.BINDING_CACHE.clear()
+
+
 def measure_perf(arm, steps):
-    """Median forward / backward / step milliseconds, the peak allocation above the live tensors during
-    the forward and during the backward (the timed backward, which retains the graph), the bytes the forward leaves
-    alive for the backward, and the step peak of a step whose backward frees the graph (:func:`_step_peak`) with its
-    ratio to ``B`` (:func:`_head_bytes`)."""
+    """Median forward / backward / step milliseconds (``step_ms`` from the remembered bindings, ``step_miss_ms`` with
+    the binding caches cleared before every step: the miss a new valid-row count takes, usually every training
+    batch), the peak allocation above the live tensors during the forward and during the backward (the timed
+    backward, which retains the graph), the bytes the forward leaves alive for the backward, and the step peak of a
+    step whose backward frees the graph (:func:`_step_peak`) from the remembered bindings (``step_peak_hit_*``) and
+    after the caches were cleared (``step_peak_miss_*``), each with its ratio to ``B`` (:func:`_head_bytes`);
+    ``step_peak_gib`` / ``step_peak_over_b``: the larger of the two."""
     saved = [
         arm.forward()
     ]  # the forward state the timed backward consumes; released before the memory probes
@@ -700,6 +718,12 @@ def measure_perf(arm, steps):
         arm.backward(s)
 
     step_ms = median_ms(full, steps)
+
+    def full_miss():
+        _clear_binding_caches()
+        full()
+
+    step_miss_ms = median_ms(full_miss, steps)
     saved.clear()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
@@ -715,18 +739,33 @@ def measure_perf(arm, steps):
     torch.cuda.synchronize()
     bwd_peak = torch.cuda.max_memory_allocated() - base_bwd
     del grads, st
-    step_peak = _step_peak(arm)
+    step_peak_hit = _step_peak(arm)
+    _clear_binding_caches()
+    step_peak_miss = _step_peak(arm)
+    step_peak = None if step_peak_hit is None else max(step_peak_hit, step_peak_miss)
     head = _head_bytes(arm.inp)
+
+    def over_b(nbytes):
+        return None if nbytes is None else nbytes / head
+
+    def as_gib(nbytes):
+        return None if nbytes is None else gib(nbytes)
+
     return dict(
         fwd_ms=fwd_ms,
         bwd_ms=bwd_ms,
         step_ms=step_ms,
+        step_miss_ms=step_miss_ms,
         fwd_peak_gib=gib(fwd_peak),
         bwd_peak_gib=gib(bwd_peak),
         saved_gib=gib(saved),
-        step_peak_gib=None if step_peak is None else gib(step_peak),
+        step_peak_gib=as_gib(step_peak),
+        step_peak_hit_gib=as_gib(step_peak_hit),
+        step_peak_miss_gib=as_gib(step_peak_miss),
         head_gib=gib(head),
-        step_peak_over_b=None if step_peak is None else step_peak / head,
+        step_peak_over_b=over_b(step_peak),
+        step_peak_hit_over_b=over_b(step_peak_hit),
+        step_peak_miss_over_b=over_b(step_peak_miss),
     )
 
 
@@ -837,10 +876,12 @@ def run_perf(args, results, W):
                 step_peak = (
                     "   n/a"
                     if perf["step_peak_gib"] is None
-                    else f"{perf['step_peak_gib']:6.3f} GiB ({perf['step_peak_over_b']:.4f} B)"
+                    else f"hit {perf['step_peak_hit_gib']:6.3f} GiB ({perf['step_peak_hit_over_b']:.4f} B) "
+                    f"miss {perf['step_peak_miss_gib']:6.3f} GiB ({perf['step_peak_miss_over_b']:.4f} B)"
                 )
                 print(
                     f"{row:22s} {name:16s} fwd {fmt(perf['fwd_ms'])} ms  bwd {fmt(perf['bwd_ms'])} ms  step {fmt(perf['step_ms'])} ms  "
+                    f"step miss {fmt(perf['step_miss_ms'])} ms  "
                     f"peak fwd {perf['fwd_peak_gib']:6.2f} GiB  bwd {perf['bwd_peak_gib']:6.2f} GiB  saved {perf['saved_gib']:6.2f} GiB  "
                     f"step peak {step_peak}",
                     flush=True,

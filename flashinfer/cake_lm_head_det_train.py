@@ -83,13 +83,15 @@ def _cake_backend_opt_in() -> ModuleType:
 
 def _opt_in_call(W, memory_mode, num_valid_rows) -> bool:
     # A call with ``memory_mode`` or ``num_valid_rows`` takes the opt-in
-    # forms; so does a default call that forms a weight gradient (grad mode
-    # on, ``W`` requiring one): its automatic form (``memory_mode=None``) can
-    # pick a budget form.  Every other call runs the default entry.
+    # forms; so does a default call whose ``W`` requires a gradient: with grad
+    # mode on its automatic form (``memory_mode=None``) can pick a budget
+    # form, and with grad mode off (e.g. a reentrant checkpoint's first pass)
+    # its hidden valid-row count is checked against the step's bound.  Every
+    # other call runs the default entry.
     return (
         memory_mode is not None
         or num_valid_rows is not None
-        or (torch.is_grad_enabled() and isinstance(W, torch.Tensor) and W.requires_grad)
+        or (isinstance(W, torch.Tensor) and W.requires_grad)
     )
 
 
@@ -309,17 +311,21 @@ def cake_lm_head_det_train_loss(
     forms the gradient accumulators instead of the checkpointed forward (one
     gradient pass per step); every output is bitwise the same.
 
-    A call with neither ``memory_mode`` nor ``num_valid_rows`` that forms no
-    weight gradient (grad mode off, or a frozen ``W``) runs the backend's
-    default entry (``cake_backend``) after this function's argument checks
-    (``check_num_valid_rows``, then ``memory_mode`` and ``num_valid_rows``
-    against ``None``, then grad mode and ``W.requires_grad``).  Every other
-    call goes through ``cake_backend_opt_in``: an explicit
-    ``memory_mode="fast"`` without a count, and a default call the automatic
-    form cannot switch, then run the same default entry; a default call that
-    can switch runs this entry's autograd function of ``cake_backend_opt_in``
-    (its fast form bitwise the default entry's); every other such call takes
-    its opt-in forms.  With ``memory_mode="budget"``, or a default call whose
+    A call with neither ``memory_mode`` nor ``num_valid_rows`` whose ``W``
+    requires no gradient runs the backend's default entry (``cake_backend``)
+    after this function's argument checks (``check_num_valid_rows``, then
+    ``memory_mode`` and ``num_valid_rows`` against ``None``, then
+    ``W.requires_grad``).  Every other call goes through
+    ``cake_backend_opt_in``: an explicit ``memory_mode="fast"`` without a
+    count, and a default call whose step forms no BF16 ``dW`` on the cake
+    backend on CUDA, then run the same default entry; a default call that
+    can switch (grad mode on) runs this entry's autograd function of
+    ``cake_backend_opt_in`` (its fast form bitwise the default entry's); a
+    default call under grad mode off whose ``W`` requires a gradient (e.g.
+    the first pass of a reentrant ``torch.utils.checkpoint``) runs the fast
+    form's forward with its hidden valid-row count checked against the
+    step's bound (the same bits); every other such call takes its opt-in
+    forms.  With ``memory_mode="budget"``, or a default call whose
     automatic form is a budget form, a backward that frees the graph releases
     the saved accumulators as soon as it has used them (a second backward
     then raises).

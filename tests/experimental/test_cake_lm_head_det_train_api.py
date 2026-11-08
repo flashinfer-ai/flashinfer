@@ -135,8 +135,9 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
     """Both public entries take ``memory_mode`` (default ``None``, no environment variable), ``num_valid_rows``
     (``None``) and ``check_num_valid_rows`` (``False``) as keyword-only arguments and document them; a call with
     ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, and so does a call
-    with neither that forms a weight gradient (grad mode on, ``W`` requiring one: its automatic memory form can pick a
-    budget form); any other call with neither calls the default backend entry without them;
+    with neither whose ``W`` requires a gradient (with grad mode on its automatic memory form can pick a budget form;
+    with it off its hidden valid-row count is checked against the step's bound); any other call with neither calls
+    the default backend entry without them;
     ``cake_lm_head_det_train_preload`` is experimental and needs a CUDA device."""
     _clear(monkeypatch)
     for fn in (cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob):
@@ -195,25 +196,20 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
             not {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
             & seen[name].keys()
         ), name
-    # neither, with a weight gradient to form: the opt-in module's automatic form (memory_mode None); without grad mode
-    # the default backend entry
+    # neither, with a ``W`` that requires a gradient: the opt-in module's automatic form (memory_mode None), also
+    # without grad mode (a reentrant checkpoint's first pass: its hidden valid-row count is checked there)
     trained = W.detach().requires_grad_(True)
-    seen.clear()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        cake_lm_head_det_train_loss(X, trained, labels, loss_div=1.0)
-        cake_lm_head_det_train_logprob(X, trained, labels)
-    assert set(seen) == {"opt_in_loss", "opt_in_logprob"}, seen
-    for name in ("opt_in_loss", "opt_in_logprob"):
-        assert seen[name]["memory_mode"] is None, name
-        assert seen[name]["num_valid_rows"] is None, name
-        assert seen[name]["check_num_valid_rows"] is False, name
-    seen.clear()
-    with warnings.catch_warnings(), torch.no_grad():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        cake_lm_head_det_train_loss(X, trained, labels, loss_div=1.0)
-        cake_lm_head_det_train_logprob(X, trained, labels)
-    assert set(seen) == {"default_loss", "default_logprob"}, seen
+    for grad_mode in (True, False):
+        seen.clear()
+        with warnings.catch_warnings(), torch.set_grad_enabled(grad_mode):
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            cake_lm_head_det_train_loss(X, trained, labels, loss_div=1.0)
+            cake_lm_head_det_train_logprob(X, trained, labels)
+        assert set(seen) == {"opt_in_loss", "opt_in_logprob"}, (grad_mode, seen)
+        for name in ("opt_in_loss", "opt_in_logprob"):
+            assert seen[name]["memory_mode"] is None, name
+            assert seen[name]["num_valid_rows"] is None, name
+            assert seen[name]["check_num_valid_rows"] is False, name
     # check_num_valid_rows=True without a count: ValueError before either backend entry runs
     seen.clear()
     with warnings.catch_warnings():

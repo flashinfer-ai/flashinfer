@@ -1019,9 +1019,10 @@ def memory_plan(
     backward (the forward holds the chunk buffers only).  ``buffer_rows`` defaults to ``min(chunk, rows)``: an
     explicit budget call runs without the hidden valid-row count, whose chunk-0 buffers take ``min(chunk, T)`` rows
     before the count is known; a default call that keeps the hidden count plans with ``buffer_rows=chunk`` (the count
-    runs on calls of three chunks or more) and ``compact=True`` (its gather buffer exists also when every row is
-    valid).  ``x_copy`` (``Problem.x_copy``: ``X``'s leading stride or base is not a TMA pitch): an uncompacted call's
-    chunk loop reads a contiguous BF16 ``[T, H]`` copy of ``X``, counted while it lives -- the loss entry's forward
+    runs on calls of three chunks or more), ``compact=True`` (its gather buffer exists also when every row is valid)
+    and ``hidden_count=True``.  ``x_copy`` (``Problem.x_copy``: ``X``'s leading stride or base is not a TMA pitch):
+    an uncompacted call's chunk loop reads a contiguous BF16 ``[T, H]`` copy of ``X``, counted while it lives -- the
+    loss entry's forward
     (and, in the fused form, until the backward's deferred chunk, whose ``X`` rows are a view of it) and the
     log-probability backward's chunk loop and casts.  ``dx_finalize`` (the call's resolved switch): a compacted call
     with the fused dX finalize writes ``dX`` from the FP32 accumulator; otherwise the dX is first cast to a BF16
@@ -1040,9 +1041,12 @@ def memory_plan(
 
     The fast form's own lifetimes (:func:`fast_form_fits`, the automatic form's check; the budget forms keep the
     defaults): ``keep_dx_acc`` (loss entry) -- the backward keeps the FP32 dX accumulator until it ends (the forms
-    above release it once ``dX`` is written), so the ``dW`` phases hold it too; ``hidden_count`` -- the call runs
-    with the hidden valid-row count, whose chunk-0 buffers (logits, statistics and gather buffer of ``buffer_rows``
-    rows) exist beside a zero-weight pass ahead of the loop; ``zero_pass`` -- where the zero-weight rows' pass runs
+    above release it once ``dX`` is written), so the ``dW`` phases hold it too; ``hidden_count`` (loss entry; also a
+    budget form of a default call that keeps the count) -- the call runs with the hidden valid-row count, whose
+    chunk-0 buffers (logits, statistics and gather buffer of ``buffer_rows`` rows) exist beside a zero-weight pass
+    ahead of the loop and beside the chunk workspace a call that misses the binding cache allocates to prepare its
+    binding (:func:`.cake_backend.workspace_layout` of ``min(chunk, rows)`` rows, one more phase); ``zero_pass`` --
+    where the zero-weight rows' pass runs
     (:func:`.cake_backend.zero_weight_memory`'s order): ``"first"`` ahead of the loop on its own chunk buffers,
     ``"arena"`` ahead of the loop on chunk buffers carved out of the loop's FP32 ``[V, H]`` accumulator (allocated
     ahead of it), ``"after"`` after the loop, beside the state the loop keeps for the backward."""
@@ -1091,21 +1095,38 @@ def memory_plan(
         + (live(2 * Cb * H) if compact else 0)
         + live(4 * int(dx_ws_slabs) * Cb * H)
     )
+    # the hidden valid-row count's chunk-0 buffers (logits, statistics, gather buffer of ``buffer_rows`` rows), alive
+    # from before the count is known until the chunk loop takes them over
+    chunk0 = (
+        logits + live(8 * Cb * -(-V // tile)) + live(2 * Cb * H) if hidden_count else 0
+    )
+    # a loss call that misses the binding cache prepares its binding -- one allocation of the chunk workspace of
+    # ``min(chunk, rows)`` rows (:func:`.cake_backend.workspace_layout`: logits, statistics, row terms, K-slice slabs,
+    # gather buffer) -- while the hidden count's chunk-0 buffers are alive: a phase of its own.  The accumulators and
+    # outputs the templated binding aliases into that allocation are no larger than the forward phase's, which holds
+    # them beside chunk buffers of the same ``buffer_rows``.
+    miss_phase = 0
+    if entry == "loss" and hidden_count:
+        workspace = workspace_layout(
+            Cr,
+            V,
+            C,
+            stats_tile=tile,
+            dx_ws_slabs=int(dx_ws_slabs),
+            hidden=H,
+            compact=compact,
+        )["total"]
+        miss_phase = chunk0 + live(workspace) + rowvec
     # the zero-weight rows' pass ahead of the chunk loop: a phase of its own
     zero_phase = 0
     zero_held = 0  # the pass after the chunk loop: beside the state the loop keeps for the backward
     if entry == "loss" and Z:
         # the zero-weight rows' logp-only pass: its chunk buffers (logits, statistics, gather buffer), its compact row
-        # vectors (index, labels, lse, logp) and the call's O(T) vectors
+        # vectors (index, labels, lse, logp) and the call's O(T) vectors; ahead of the loop beside the hidden count's
+        # chunk-0 buffers when it runs
         Cz = min(C, Z)
         zero_bufs = live(2 * Cz * V) + live(8 * Cz * -(-V // tile)) + live(2 * Cz * H)
         zero_rowvec = live(8 * Z, 2) + live(4 * Z, 2)
-        # ahead of the loop beside the hidden count's chunk-0 buffers (logits, statistics, gather buffer)
-        chunk0 = (
-            logits + live(8 * Cb * -(-V // tile)) + live(2 * Cb * H)
-            if hidden_count
-            else 0
-        )
         if zero_pass == "after":
             zero_held = zero_bufs + zero_rowvec
         elif zero_pass == "arena":
@@ -1230,7 +1251,7 @@ def memory_plan(
             candidates.append(("partial", v0, min(vb_max, V - v0)))
         candidates.append(("recompute", 0, vb_max))
     scored = [
-        (form, v0, vb, max(peak(form, v0, vb or 0), zero_phase))
+        (form, v0, vb, max(peak(form, v0, vb or 0), zero_phase, miss_phase))
         for form, v0, vb in candidates
     ]
     chosen = next(
@@ -4135,6 +4156,29 @@ def _empty_forward(
     )
 
 
+def _hidden_count_program(
+    problem: Problem,
+    X: torch.Tensor,
+    *,
+    backend: str,
+    compact: bool,
+    stats: bool,
+    hidden_count: bool,
+) -> Optional[tuple[str, dict[str, Any]]]:
+    """``(module_name, record)`` of a call that runs the hidden valid-row count (:func:`_hidden_count`'s rules: a
+    compacted ``cake`` call with the switch on that :func:`hidden_count_eligible` admits), else ``None``.  Host checks
+    only: nothing is allocated or queued."""
+    if not (compact and backend == "cake" and hidden_count):
+        return None
+    rows, chunk = int(problem.num_rows), int(problem.chunk)
+    if rows <= 0 or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS:
+        return None  # the chunk rule of :func:`hidden_count_eligible`, ahead of the record lookup
+    module_name, record = record_for(X.device)
+    if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
+        return None
+    return module_name, record
+
+
 def _hidden_count(
     problem: Problem,
     X: torch.Tensor,
@@ -4150,14 +4194,17 @@ def _hidden_count(
     """The hidden valid-row count prologue of a compacted ``cake`` call when the switch (``hidden_count``, resolved by
     the caller) is on and the call is eligible (:func:`hidden_count_eligible`); ``None`` = the shipped
     :func:`valid_rows` path.  ``loss_weights``: the zero-weight split (:func:`.cake_backend.gradient_index`)."""
-    if not (compact and backend == "cake" and hidden_count):
+    program = _hidden_count_program(
+        problem,
+        X,
+        backend=backend,
+        compact=compact,
+        stats=stats,
+        hidden_count=hidden_count,
+    )
+    if program is None:
         return None
-    rows, chunk = int(problem.num_rows), int(problem.chunk)
-    if rows <= 0 or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS:
-        return None  # the chunk rule of :func:`hidden_count_eligible`, ahead of the record lookup
-    module_name, record = record_for(X.device)
-    if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
-        return None
+    module_name, record = program
     return _hidden_count_begin(
         problem,
         X,
@@ -4280,9 +4327,11 @@ def forward_loss(
     where it fits that budget with its own buffer lifetimes, else the budget form that fits (:func:`auto_memory_plan`;
     none fits: the fast form, ``memory_plan`` ``None``), on the valid rows of the count formed here or the caller's --
     an uncompacted call without the caller's count keeps the fast form, it never counts on the host.  It keeps the
-    hidden valid-row count where the count's chunk-0 buffers fit the budget of any valid-row count
-    (:func:`_hidden_count_fits`), plans a budget form with those chunk-sized buffers and drops the count's queued
-    chunk-0 work only when that plan does not fit and the plan without the count does.
+    hidden valid-row count where the count's chunk-0 buffers, with the chunk workspace a binding cache miss allocates
+    beside them, fit the budget of any valid-row count (:func:`_hidden_count_fits`; checked on every pass of a step
+    whose ``W`` requires a gradient, a checkpointed step's gradient-free first pass included), plans a budget form
+    with those chunk-sized buffers and drops the count's queued chunk-0 work only when that plan does not fit and the
+    plan without the count does.
 
     ``num_valid_rows`` (a host integer, default ``None``): the number of labels ``>= 0``, given by the caller.  A
     compacted call then plans on it without reading a count back -- the valid-row index is formed on the device and the
@@ -4300,8 +4349,10 @@ def forward_loss(
     of the gradient path when the count is formed here (not with ``num_valid_rows``); a call of a budget form plans its
     chunk loop on the gradient rows and its budget on every valid row (:func:`memory_plan`'s ``zero_rows``).  The
     automatic form first checks the fast call the memory rule picked (the split or the call without it, with the
-    hidden count's chunk-0 buffers and the logp-only pass where they run); when it does not fit and a budget plan
-    does, the call runs as a ``"budget"`` call (without the hidden count), whose split decision can differ."""
+    hidden count's chunk-0 buffers and the logp-only pass where they run) -- the rule's decision with the hidden count
+    of :mod:`.cake_backend`'s default call, also when the check above dropped it, so a call that stays fast gives
+    that call's bits; when it does not fit and a budget plan does, the call runs as a ``"budget"`` call (without the
+    hidden count), whose split decision can differ."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_det_inputs(
@@ -4337,6 +4388,16 @@ def forward_loss(
             and grad_weight_dtype == torch.bfloat16
             and X.is_cuda
         )
+    # the hidden valid-row count of a default call whose step forms a BF16 weight gradient -- in this pass, or in a
+    # later one of a checkpointed step (its first pass forms none, its ``W`` still requires one) -- is checked against
+    # the step's budget (:func:`_auto_hidden_count`; the step's ``dX`` when ``X`` requires a gradient)
+    count_checked = bool(
+        mode == MEMORY_AUTO
+        and backend == "cake"
+        and grad_weight_dtype == torch.bfloat16
+        and X.is_cuda
+        and (need_dw or W.requires_grad)
+    )
     if T == 0:
         return _empty_forward(
             problem,
@@ -4352,6 +4413,8 @@ def forward_loss(
     )  # resolved once per call; the backward follows it through row_valid
     compact = _resolve_compact(compact_rows)
     zero_index = None
+    # the hidden valid-row count the step-budget check dropped (the default call of :mod:`.cake_backend` runs with it)
+    count_dropped = False
     if given is None:
         # tensors on another device: the plain path raises the placement error
         split = (
@@ -4359,6 +4422,23 @@ def forward_loss(
             and loss_weights is not None
             and loss_weights.device == labels.device == X.device
         )
+        # ``"budget"``: no hidden valid-row count -- its chunk-0 buffers take ``min(chunk, T)`` rows before the count
+        # is known, which can exceed the budget of a call with fewer valid rows than a chunk; the automatic form keeps
+        # it where those buffers, and the chunk workspace a cache miss allocates beside them, fit the budget of any
+        # valid-row count (:func:`_hidden_count_fits`)
+        count = False if budget else _resolve_hidden_count(hidden_count)
+        if count and count_checked:
+            count = bool(
+                _auto_hidden_count(
+                    count,
+                    X,
+                    W,
+                    chunk_size,
+                    need_dx=bool(need_dx or X.requires_grad),
+                    entry="loss",
+                )
+            )
+            count_dropped = not count
         hc = _hidden_count(
             problem,
             X,
@@ -4367,24 +4447,7 @@ def forward_loss(
             backend=backend,
             compact=compact,
             stats=True,
-            # ``"budget"``: no hidden valid-row count -- its chunk-0 buffers take ``min(chunk, T)`` rows before the
-            # count is known, which can exceed the budget of a call with fewer valid rows than a chunk; the automatic
-            # form keeps it where those buffers fit the budget of any valid-row count (:func:`_hidden_count_fits`)
-            hidden_count=(
-                False
-                if budget
-                else (
-                    _auto_hidden_count(
-                        _resolve_hidden_count(hidden_count),
-                        X,
-                        W,
-                        chunk_size,
-                        need_dx=need_dx,
-                    )
-                    if auto
-                    else _resolve_hidden_count(hidden_count)
-                )
-            ),
+            hidden_count=count,
             loss_weights=loss_weights if split else None,
         )
         if hc is not None:
@@ -4425,26 +4488,46 @@ def forward_loss(
         grad_rows = int(row_index.numel())
         valid_total = grad_rows + zero_rows
         exact_mode = zero_weight_loss_mode() == "exact"
-        zplan = zero_weight_plan(
-            problem,
-            X.device,
-            grad_rows=grad_rows,
-            zero_rows=zero_rows,
-            backend=backend,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            fuse_dw_cast=fuse,
-            dx_finalize=fused_dx,
-            hidden_count=hc is not None,
-            return_logp=bool(return_logp),
-            exact_loss=exact_mode,
-            tuning=tuning,
-        )
+
+        def zero_plan(with_count: bool) -> dict[str, Any]:
+            return zero_weight_plan(
+                problem,
+                X.device,
+                grad_rows=grad_rows,
+                zero_rows=zero_rows,
+                backend=backend,
+                need_dx=need_dx,
+                need_dw=need_dw,
+                fuse_dw_cast=fuse,
+                dx_finalize=fused_dx,
+                hidden_count=with_count,
+                return_logp=bool(return_logp),
+                exact_loss=exact_mode,
+                tuning=tuning,
+            )
+
+        zplan = zero_plan(hc is not None)
         dx_cap, zero_order, split_ok = (
             zplan["dx_slices_cap"],
             bool(zplan["zero_first"]),
             bool(zplan["split"]),
         )
+        if (
+            count_dropped
+            and _hidden_count_program(
+                problem,
+                X,
+                backend=backend,
+                compact=compact,
+                stats=True,
+                hidden_count=True,
+            )
+            is not None
+        ):
+            # the split decision -- and with it the dX / dW bits -- of the default call of :mod:`.cake_backend`, which
+            # runs with the hidden count dropped here: the rule's model with that count (the logp-only pass's order and
+            # arena stay this call's, without it; ``dx_slices_cap`` does not depend on the count)
+            split_ok = bool(zero_plan(True)["split"])
 
         def budget_of(rows: int, *, split_call: bool) -> MemoryPlan:
             return _budget_plan(
@@ -4958,12 +5041,14 @@ def _budget_plan(
     zero_total: int = 0,
     exact_loss: bool = False,
     dx_slices_cap: Optional[int] = None,
+    hidden_count: bool = False,
 ) -> MemoryPlan:
     """:func:`memory_plan` of one call of a budget form on ``device``'s registered program (:func:`_plan_inputs`: its
     geometry, the dX GEMM's K-slice slabs of this call and whether the program registers the recompute's ``dz`` arm).
     ``rows``: the rows the chunk loop runs over; ``budget_rows``: the valid rows ``T_v`` of the budget
-    (:func:`_budget_valid_rows`); ``zero_rows`` / ``zero_total`` / ``exact_loss``: as :func:`memory_plan`'s;
-    ``dx_slices_cap``: the plan's (:func:`make_plan`)."""
+    (:func:`_budget_valid_rows`); ``zero_rows`` / ``zero_total`` / ``exact_loss`` / ``hidden_count`` (a default call
+    that keeps the hidden valid-row count): as :func:`memory_plan`'s; ``dx_slices_cap``: the plan's
+    (:func:`make_plan`)."""
     geometry, slabs, recompute = _plan_inputs(
         device,
         rows=rows,
@@ -4994,6 +5079,7 @@ def _budget_plan(
         zero_total=zero_total,
         exact_loss=exact_loss,
         geometry=geometry,
+        hidden_count=hidden_count,
     )
 
 
@@ -5099,26 +5185,36 @@ def _auto_plan(
     return plan if plan.fits else None
 
 
-def _hidden_count_fits(
-    device: torch.device,
+def _hidden_count_shape_fits(
     *,
     num_rows: int,
     hidden: int,
     vocab: int,
     chunk: int,
     need_dx: bool,
+    geometry: Geometry = DEFAULT_GEOMETRY,
+    dx_ws_slabs: int = 0,
+    tma_workspace_bytes: int = 0,
+    scratch_bytes: int = 0,
 ) -> bool:
-    """Whether the hidden valid-row count's chunk-0 buffers fit a default call's budget whatever its valid rows: they
-    take ``chunk`` rows (logits, statistics, gather buffer) beside the call's ``O(T)`` vectors before the count is
-    known, against :func:`memory_plan`'s budget with no valid row (``T_v = 0``, the smallest).  Pure host arithmetic
-    on the shape (``True`` for a call the count does not serve, fewer than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks):
-    a default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows` path, bitwise
-    the same outputs), so the count's chunk-0 work never exceeds the budget of a call that a budget form fits."""
+    """Whether the hidden valid-row count's chunk-0 work stays within :func:`memory_plan`'s budget for a call of this
+    shape whatever its valid rows ``T_v`` (pure host arithmetic; ``True`` for a call the count does not serve, fewer
+    than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks).
+
+    Before the count is known its chunk-0 buffers take ``chunk`` rows (logits, statistics, gather buffer) beside the
+    call's ``O(T)`` vectors (``chunk0``).  A call that misses the binding cache -- a new valid-row count, every new
+    batch -- then allocates the chunk workspace of ``min(chunk, rows)`` rows while they are alive: the loss entry's
+    templated binding, the log-probability forward's runner (:func:`.cake_backend.workspace_layout`: logits,
+    statistics, row terms, gather buffer, ``dx_ws_slabs`` K-slice slabs -- at most the program's dX slice count less
+    one, the largest any chunk of any call can take -- and the record's TMA descriptor and scratch bytes).  Below one
+    chunk that phase grows faster with ``T_v`` than the budget (a workspace row takes more than ``2 V`` bytes, the
+    budget ``0.98 * 2 V``), above it the workspace stops growing, so the worst case is ``T_v = chunk``:
+    ``chunk0 + workspace(chunk) <= (1 - margin) * (2 * chunk * V + 2 * V * H + 2 * T * H)`` (the last term without
+    ``dX``) bounds every valid-row count, the call without a valid row (``chunk0`` alone, no chunk loop) included."""
     T, H, V, C = int(num_rows), int(hidden), int(vocab), int(chunk)
     if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
         return True
-    _, record = record_for(device)
-    tile = int(Geometry.from_record(record).stats_tile)
+    tile = int(geometry.stats_tile)
     live = _allocated_bytes
     chunk0 = (
         live(2 * C * V)
@@ -5127,21 +5223,69 @@ def _hidden_count_fits(
         + live(4 * T, 4)
         + live(4 * T, 8)
     )
-    head = 2 * V * H + (2 * T * H if need_dx else 0)
-    return chunk0 <= head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
+    workspace = workspace_layout(
+        C,
+        V,
+        C,
+        stats_tile=tile,
+        tma_workspace_bytes=int(tma_workspace_bytes),
+        scratch_bytes=int(scratch_bytes),
+        dx_ws_slabs=int(dx_ws_slabs),
+        hidden=H,
+        compact=True,
+    )["total"]
+    head = 2 * C * V + 2 * V * H + (2 * T * H if need_dx else 0)
+    budget = head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
+    return chunk0 + live(workspace) <= budget
 
 
-def _auto_applies(backend: str, X: Any, W: Any) -> bool:
-    """Whether a default call (:data:`MEMORY_AUTO`) can switch to a budget form: the ``cake`` backend, ``X`` on a
-    CUDA device, a BF16 ``W`` that needs its gradient (gradient mode on).  Every other default call runs the fast
-    form (:mod:`.cake_backend`'s entry)."""
+def _hidden_count_fits(
+    device: torch.device,
+    *,
+    num_rows: int,
+    hidden: int,
+    vocab: int,
+    chunk: int,
+    need_dx: bool,
+    entry: str = "loss",
+) -> bool:
+    """:func:`_hidden_count_shape_fits` of a default call of ``entry`` on ``device``'s registered program: its
+    geometry, its TMA descriptor and scratch bytes and, for the loss entry with ``dX`` (whose forward runs the dX GEMM),
+    the program's largest dX slice count less one as the K-slice slabs (the log-probability forward has none).  A
+    default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows` path, bitwise the
+    same outputs), so the count's chunk-0 work -- the call that misses the binding cache included -- never exceeds the
+    budget of a call that a budget form fits."""
+    T, C = int(num_rows), int(chunk)
+    if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
+        return True
+    module_name, record = record_for(device)
+    stages = registered_stages(module_name)
+    slabs = dx_max_slices(stages) - 1 if (entry == "loss" and need_dx) else 0
+    return _hidden_count_shape_fits(
+        num_rows=T,
+        hidden=hidden,
+        vocab=vocab,
+        chunk=C,
+        need_dx=need_dx,
+        geometry=Geometry.from_record(record),
+        dx_ws_slabs=slabs,
+        tma_workspace_bytes=_record_tma_bytes(record, stages),
+        scratch_bytes=_record_scratch_bytes(record, stages),
+    )
+
+
+def _auto_reaches(backend: str, X: Any, W: Any) -> bool:
+    """Whether a default call (:data:`MEMORY_AUTO`) belongs to a step that forms a BF16 weight gradient on the
+    ``cake`` backend: ``X`` on a CUDA device and a BF16 ``W`` that requires a gradient, whatever the gradient mode.
+    With gradient mode on the call can switch to a budget form; with it off (e.g. a reentrant checkpoint's first pass)
+    it runs the fast form, its hidden valid-row count -- part of the step's peak -- checked as with it on
+    (:func:`_auto_hidden_count`).  Every other default call runs :mod:`.cake_backend`'s entry unchanged."""
     return (
         backend == "cake"
         and isinstance(X, torch.Tensor)
         and X.is_cuda
         and isinstance(W, torch.Tensor)
         and W.dtype == torch.bfloat16
-        and torch.is_grad_enabled()
         and W.requires_grad
     )
 
@@ -5153,9 +5297,11 @@ def _auto_hidden_count(
     chunk_size: Any,
     *,
     need_dx: bool,
+    entry: str = "loss",
 ) -> Optional[bool]:
-    """``hidden_count`` of a default call that can switch to a budget form: ``False`` when the hidden valid-row count's
-    chunk-0 buffers can exceed the call's budget (:func:`_hidden_count_fits`), else the caller's value."""
+    """``hidden_count`` of a default call whose step forms a BF16 weight gradient (:func:`_auto_reaches`), every pass
+    of a checkpointed step included: ``False`` when the hidden valid-row count's chunk-0 work can exceed the step's
+    budget (:func:`_hidden_count_fits` of ``entry``), else the caller's value."""
     if X.ndim != 2 or W.ndim != 2 or isinstance(chunk_size, bool):
         return hidden_count  # the validation raises
     try:
@@ -5171,6 +5317,7 @@ def _auto_hidden_count(
         vocab=int(W.shape[0]),
         chunk=chunk,
         need_dx=need_dx,
+        entry=entry,
     )
     return hidden_count if fits else False
 
@@ -5191,7 +5338,8 @@ def _auto_loss_plan(
     """The automatic form of a default loss call without zero-weight rows: ``(plan, keep_hidden_count)``.  ``plan``:
     ``None`` = the fast form.  ``rows``: the rows of its chunk loop, ``valid``: its valid rows ``T_v``,
     ``hidden_count``: the hidden valid-row count is alive (its chunk-0 buffers take ``chunk`` rows, its gather buffer
-    exists also when every row is valid).  With the count, the plan of ``chunk``-row buffers keeps it when it fits;
+    exists also when every row is valid, and a call that misses the binding cache prepares its binding beside them:
+    :func:`memory_plan`'s ``hidden_count``).  With the count, the plan of ``chunk``-row buffers keeps it when it fits;
     else the plan of ``min(chunk, rows)``-row buffers -- an explicit budget call's -- drops it (only once that plan is
     known to fit: a fast fallback keeps the count's queued chunk-0 work)."""
     C = int(problem.chunk)
@@ -5212,13 +5360,19 @@ def _auto_loss_plan(
         return None, True
     shared = min(C, int(rows))
     if hidden_count:
-        if _fast_fits("loss", device, compact=True, buffer_rows=C, **common):
+        if _fast_fits(
+            "loss", device, compact=True, buffer_rows=C, hidden_count=True, **common
+        ):
             return None, True
-        kept = _budget_plan("loss", device, compact=True, buffer_rows=C, **common)
+        kept = _budget_plan(
+            "loss", device, compact=True, buffer_rows=C, hidden_count=True, **common
+        )
         if kept.fits:
             return kept, True
         if shared == C and compact:
-            return None, True  # the same plan without the count: none fits
+            # the same plan without the count's phases, whose cache-miss phase the count's check keeps within the
+            # budget (:func:`_hidden_count_fits`): none fits
+            return None, True
     elif _fast_fits("loss", device, compact=compact, buffer_rows=shared, **common):
         return None, True
     plan = _budget_plan("loss", device, compact=compact, buffer_rows=shared, **common)
@@ -7455,7 +7609,12 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
                 if budget
                 else (
                     _auto_hidden_count(
-                        hidden, X, W, chunk_size, need_dx=bool(ctx.needs_input_grad[0])
+                        hidden,
+                        X,
+                        W,
+                        chunk_size,
+                        need_dx=bool(ctx.needs_input_grad[0]),
+                        entry="logprob",
                     )
                     if auto and ctx.needs_input_grad[1]
                     else hidden
@@ -7646,7 +7805,12 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
                 if budget
                 else (
                     _auto_hidden_count(
-                        hidden, X, W, chunk_size, need_dx=bool(ctx.needs_input_grad[0])
+                        hidden,
+                        X,
+                        W,
+                        chunk_size,
+                        need_dx=bool(ctx.needs_input_grad[0]),
+                        entry="logprob",
                     )
                     if auto and ctx.needs_input_grad[1]
                     else hidden
@@ -8306,9 +8470,14 @@ def cake_lm_head_det_train_loss(
     ``ValueError``.
 
     Without ``num_valid_rows``, with ``memory_mode="fast"`` or a default call
-    the automatic form cannot switch (another backend, ``X`` off CUDA, an
-    FP32 ``W``, no gradient of ``W``), the call is :mod:`.cake_backend`'s
-    ``cake_lm_head_det_train_loss``.  Its gradient placement
+    whose step forms no BF16 weight gradient on the ``cake`` backend (another
+    backend, ``X`` off CUDA, an FP32 ``W``, a ``W`` that requires no
+    gradient), the call is :mod:`.cake_backend`'s
+    ``cake_lm_head_det_train_loss``.  A default call under gradient mode off
+    whose ``W`` requires a gradient (e.g. a reentrant checkpoint's first
+    pass) computes the loss here in the fast form, its hidden valid-row count
+    checked against the step's budget (:func:`_auto_hidden_count`; the same
+    bits).  Its gradient placement
     (:func:`.cake_backend.set_gradient_placement`) applies here too.  With
     ``memory_mode="budget"``, or a default call whose automatic form is a
     budget form, a backward that
@@ -8320,7 +8489,7 @@ def cake_lm_head_det_train_loss(
         raise ValueError(_CHECK_WITHOUT_COUNT)
     mode = _resolve_memory_mode(memory_mode)
     if num_valid_rows is None and (
-        mode == "fast" or (mode == MEMORY_AUTO and not _auto_applies(backend, X, W))
+        mode == "fast" or (mode == MEMORY_AUTO and not _auto_reaches(backend, X, W))
     ):
         return _main.cake_lm_head_det_train_loss(
             X,
@@ -8445,8 +8614,10 @@ def cake_lm_head_det_train_logprob(
     the automatic form: the fast backward where it fits, else a budget form -- without ``num_valid_rows``
     :class:`CakeLMHeadDetLogprobAutoFunction`, :mod:`.cake_backend`'s forward and, where it fits, backward),
     ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in :func:`cake_lm_head_det_train_loss`;
-    without ``num_valid_rows``, with ``"fast"`` or a default call the automatic form cannot switch, the call is
-    :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob``.  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
+    without ``num_valid_rows``, with ``"fast"`` or a default call whose step forms no BF16 weight gradient on the
+    ``cake`` backend, the call is :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob``, and so is a default call
+    under gradient mode off whose ``W`` requires a gradient, with its hidden valid-row count checked against the
+    step's budget (:func:`_auto_hidden_count`).  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
     without ``num_valid_rows``; ``cake`` backend): :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_keep`` --
     where a backward can follow, the forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the
     backward) and the backward forms ``dz`` from them instead of recomputing them (bitwise the same ``logp`` /
@@ -8462,7 +8633,7 @@ def cake_lm_head_det_train_logprob(
         if not (isinstance(memory_mode, str) and memory_mode == KEEP_LOGITS):
             raise
     if num_valid_rows is None and (
-        mode == "fast" or (mode == MEMORY_AUTO and not _auto_applies(backend, X, W))
+        mode == "fast" or (mode == MEMORY_AUTO and not _auto_reaches(backend, X, W))
     ):
         return _main.cake_lm_head_det_train_logprob(
             X,
@@ -8505,7 +8676,33 @@ def cake_lm_head_det_train_logprob(
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     if num_valid_rows is None and mode == MEMORY_AUTO:
-        # a default call the automatic form can switch: the default entry's forward, a backward that picks its form
+        # a default call whose step forms a BF16 weight gradient: its hidden valid-row count checked against the
+        # step's budget (:func:`_auto_hidden_count`); with gradient mode on the default entry's forward and a backward
+        # that picks its form, with it off (e.g. a reentrant checkpoint's first pass) the default entry
+        hidden = _auto_hidden_count(
+            hidden_count,
+            X,
+            W,
+            chunk_size,
+            need_dx=bool(X.requires_grad),
+            entry="logprob",
+        )
+        if not torch.is_grad_enabled():
+            return _main.cake_lm_head_det_train_logprob(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden,
+                gemm_tuning=gemm_tuning,
+                logprob_dz=logprob_dz,
+                logprob_lbl=logprob_lbl,
+            )
         return CakeLMHeadDetLogprobAutoFunction.apply(
             X,
             W,
@@ -8516,9 +8713,7 @@ def cake_lm_head_det_train_logprob(
             fuse_dw_cast,
             dx_finalize,
             dw_stream,
-            _auto_hidden_count(
-                hidden_count, X, W, chunk_size, need_dx=bool(X.requires_grad)
-            ),
+            hidden,
             gemm_tuning,
             logprob_dz,
             logprob_lbl,
@@ -8576,8 +8771,10 @@ def cake_lm_head_det_train_logprob_temperature(
     the automatic form: as in :func:`cake_lm_head_det_train_logprob`, with
     :class:`CakeLMHeadDetLogprobTemperatureAutoFunction` for a call with a temperature), ``num_valid_rows`` and
     ``check_num_valid_rows`` (the forward's count) as in :func:`cake_lm_head_det_train_loss`; without
-    ``num_valid_rows``, with ``"fast"`` or a default call the automatic form cannot switch, the call is
-    :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_temperature``.
+    ``num_valid_rows``, with ``"fast"`` or a default call whose step forms no BF16 weight gradient on the ``cake``
+    backend, the call is :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_temperature`` (under gradient mode
+    off with a ``W`` that requires a gradient too, its hidden valid-row count checked as in
+    :func:`cake_lm_head_det_train_logprob`).
 
     ``temperature`` (default ``None``, the same as ``1.0``: no temperature):
     a positive number or a float32 ``[T]`` tensor on ``X``'s device (one value per
@@ -8627,7 +8824,7 @@ def cake_lm_head_det_train_logprob_temperature(
         )
     mode = _resolve_memory_mode(memory_mode)
     if num_valid_rows is None and (
-        mode == "fast" or (mode == MEMORY_AUTO and not _auto_applies(backend, X, W))
+        mode == "fast" or (mode == MEMORY_AUTO and not _auto_reaches(backend, X, W))
     ):
         return _main.cake_lm_head_det_train_logprob_temperature(
             X,
@@ -8652,10 +8849,35 @@ def cake_lm_head_det_train_logprob_temperature(
         type(temperature) is float and temperature == 1.0
     )  # the default path: no temperature operation (a scalar 1.0 resolves to none)
     if num_valid_rows is None and mode == MEMORY_AUTO:
-        # a default call the automatic form can switch: the default entry's forward, a backward that picks its form
+        # a default call whose step forms a BF16 weight gradient (as in :func:`cake_lm_head_det_train_logprob`): with
+        # gradient mode on the default entry's forward and a backward that picks its form, with it off the default
+        # entry, its hidden valid-row count checked against the step's budget either way
         hidden = _auto_hidden_count(
-            hidden_count, X, W, chunk_size, need_dx=bool(X.requires_grad)
+            hidden_count,
+            X,
+            W,
+            chunk_size,
+            need_dx=bool(X.requires_grad),
+            entry="logprob",
         )
+        if not torch.is_grad_enabled():
+            return _main.cake_lm_head_det_train_logprob_temperature(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden,
+                gemm_tuning=gemm_tuning,
+                logprob_dz=logprob_dz,
+                logprob_lbl=logprob_lbl,
+                temperature=temperature,
+                check_temperature=check_temperature,
+            )
         if plain:
             return CakeLMHeadDetLogprobAutoFunction.apply(
                 X,
