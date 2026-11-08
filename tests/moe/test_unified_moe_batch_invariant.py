@@ -1180,6 +1180,94 @@ def test_route_plan_equals_route_and_plan(T, k, E, method, align):
 
 
 @needs_device
+def test_gather_grouped_gemm_equals_grouped_gemm_on_the_permutation():
+    """The grouped GEMM1 with the A rows gathered by the kernel (LDGSTS chunks or the TMA's gather4 mode over the unpermuted
+    rows; rows past a group's end repeat its last row) gives the bits of the grouped kernel on the materialised permutation
+    at every record class (1-CTA and 2-CTA, 64- and 128-row CTA tiles), both producers and both GEMM1 chains: unaligned
+    group starts, empty groups, several rows per token (``k_div``), every token on one expert."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import (
+        can_implement_grouped,
+    )
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    records = [
+        Knobs((128, 128), (1, 1), False, True, "m", 1),
+        Knobs((64, 256), (1, 1), False, True, "n", 1),
+        Knobs((128, 256), (2, 1), True, True, "n", 1),
+        Knobs((256, 256), (2, 1), True, True, "m", 1),
+        Knobs((128, 64), (1, 2), False, True, "n", 1),
+    ]
+    g = torch.Generator().manual_seed(11)
+    for T, k, E, K, N in [
+        (37, 2, 8, 256, 128),
+        (5, 10, 512, 2560, 640),
+        (300, 6, 64, 512, 256),
+        (200, 1, 8, 1024, 192),
+    ]:
+        ex = (
+            torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(T)])
+            .int()
+            .cuda()
+            if k > 1 or E > 8
+            else torch.zeros(T, 1, dtype=torch.int32, device="cuda")
+        )
+        counts, dest, src = api.permute_plan(ex, E)
+        Tk = T * k
+        x = (torch.randn(T, K, generator=g) * 2).to(torch.bfloat16).cuda()
+        w = (torch.randn(E, N, K, generator=g) * 0.1).to(torch.bfloat16).cuda()
+        x_perm = x[(src.reshape(-1) // k).long()].contiguous()
+        for cfg in records:
+            for chain in ("swiglu", "relu2"):
+                if not can_implement_grouped(cfg, N, K, E, chain, "bf16"):
+                    continue
+                ref = api.grouped_gemm(x_perm, w, counts, cfg, chain)
+                for prod in ("ldgsts", "gather4"):
+                    got = api.grouped_gemm_gather(
+                        x, src, k, w, counts, cfg, chain, Tk=Tk, a_producer=prod
+                    )
+                    assert torch.equal(bits(got), bits(ref)), (
+                        (T, k, E, K, N),
+                        cfg.describe(),
+                        chain,
+                        prod,
+                    )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "T,k,H,I,E",
+    [
+        (37, 2, 256, 128, 8),
+        (300, 6, 512, 256, 64),
+        (1000, 8, 2048, 768, 128),
+        (1, 1, 4096, 1024, 16),
+    ],
+)
+def test_op_gather_path_equals_materialised_path(T, k, H, I, E):
+    """The op with GEMM1 gathering the tokens' rows (a selectable placement, either producer) == the op on the materialised
+    permutation (the default: the gather launch), bit for bit; the intermediate ``a`` too; the layer takes the default."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=T + E, adversarial=True)
+    ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+    ref, im_ref = api.fused_moe(
+        x, ids, wts, (w1, w2), gather=False, return_intermediates=True
+    )
+    for prod in (True, "ldgsts", "gather4"):
+        got, im = api.fused_moe(
+            x, ids, wts, (w1, w2), gather=prod, return_intermediates=True
+        )
+        assert im["x_perm"] is None and im_ref["x_perm"] is not None
+        assert torch.equal(bits(im["a"]), bits(im_ref["a"])), prod
+        assert torch.equal(bits(got), bits(ref)), prod
+    assert torch.equal(bits(api.fused_moe(x, ids, wts, (w1, w2))), bits(ref))
+    layer, W = _layer(k, E, I), _weights(w1, w2)
+    assert torch.equal(bits(layer(_routed_pack(x, ids, wts), W)), bits(ref))
+
+
+@needs_device
 def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
     (the same ids and weights from ``route``) bit for bit."""
