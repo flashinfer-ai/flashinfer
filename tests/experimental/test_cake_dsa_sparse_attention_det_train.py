@@ -1485,7 +1485,7 @@ def test_backward_reads_no_stale_scratch(monkeypatch, program, form, passes, red
     prev = torch.randn(rows, width, device="cuda", generator=gen)
 
     def run(pattern):
-        acc = None if form == "fresh" else prev.clone()
+        acc = prev.clone() if form.startswith("acc") else None
         if nope:
             runner = cake_backend.prepare_dsa_nope_train(
                 inp.q_latent, inp.kv_latent, inp.idx_global, topk_length=inp.topk_length,
