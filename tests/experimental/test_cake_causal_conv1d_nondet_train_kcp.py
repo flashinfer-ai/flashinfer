@@ -422,7 +422,9 @@ def test_forward_grid_per_architecture(monkeypatch) -> None:
         record["grid_rule"]["ctas_per_sm"]
     )
     seen = _record_forward_grids(monkeypatch)
-    _check_forward_grid(seen, (full[0] - reserved, full[1], full[2]), (1024, 10240), arch)
+    _check_forward_grid(
+        seen, (full[0] - reserved, full[1], full[2]), (1024, 10240), arch
+    )
 
 
 def test_forward_grid_reserve_falls_back_to_the_full_grid(monkeypatch) -> None:
