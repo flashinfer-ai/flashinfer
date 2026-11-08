@@ -68,11 +68,13 @@ CTAs, 8 threads to a row), the mid forward (128-thread CTAs walking 16-row
 blocks, thread 0 warming the CTA's next block and the first block of the CTA
 a wave later in L2), the long forward (256-thread CTAs walking 32-row
 blocks) and the extra-long forward (the long forward whose thread 0 also
-warms the CTA's next block in L2); and the pipelined forwards, this
-package's copies of the deterministic package's forward programs (the same
-builds of its kernel file under this package's names, routed where they make
+warms the CTA's next block in L2); and the pipelined forwards, builds of the
+deterministic package's forward kernel file with this package's gate (its
+builds with ``split_gate`` 1: the forward's ``ex2.approx`` / ``rcp.approx``
+sigmoid, which does not flush where the deterministic gate gives 0, ``z``
+from about -87.34 down), under this package's names, routed where they make
 the training step, two forwards and the backward, faster than this package's
-own): 128-thread CTAs walking 16-row blocks, each thread loading its row of
+own: 128-thread CTAs walking 16-row blocks, each thread loading its row of
 the CTA's next block into registers while it computes the current one, with
 the mid forward's L2 prefetches and the L2 ``evict_first`` policy on the
 loads of ``x`` and ``z``, one CTA per block below 8192 rows per SM
@@ -512,17 +514,18 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd_tiny",
     },
-    # The pipelined forward: the deterministic package's forward program (the
-    # same build of the same kernel file, under this package's name): 128
+    # The pipelined forward: the deterministic package's forward program with
+    # this package's gate (split_gate 1, under this package's name): 128
     # threads, 8 lanes per row (16-row blocks), at most 6 CTAs per SM, each
     # thread loading its row of the CTA's next block into registers while it
     # computes the current one, thread 0 warming the CTA's next block and the
     # first block of the CTA one wave later in L2 (build {"min_blocks": 6,
     # "packed_rows": 0, "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz":
-    # 0, "store_width": 128, "sum_pairs": 0, "threads": 128, "w_late": 0});
+    # 0, "split_gate": 1, "store_width": 128, "sum_pairs": 0, "threads": 128,
+    # "w_late": 0});
     # one CTA per block below 8192 rows per SM, whole waves of at most 2
     # blocks per CTA from there; FORWARD_BANDS gives it its rows.
-    "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae": {
+    "cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -551,8 +554,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_from_rows_per_sm": 8192,
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "kernel": "cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -560,7 +563,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "library": "cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99",
         "logical": {
             "eps": "eps",
             "heads": "heads",
@@ -578,14 +581,14 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # The sm_107a pipelined forward of packed rows (x and z hold row n at
     # element 128 n, fewer than PACKED_ROWS rows): the deterministic package's
-    # sm_107a forward of packed rows, the schedule above with the sum of
+    # sm_107a forward of packed rows with this package's gate, the schedule above with the sum of
     # squares as four FMA chains, rsqrt.approx.ftz, w loaded behind the first
     # block's loads, each row's offset taken from its index alone and one
     # 32-byte store per lane (build {"min_blocks": 6, "packed_rows": 1,
-    # "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width":
-    # 256, "sum_pairs": 1, "threads": 128, "w_late": 1}); FORWARD_BANDS gives
-    # it its rows.
-    "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9": {
+    # "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz": 1, "split_gate":
+    # 1, "store_width": 256, "sum_pairs": 1, "threads": 128, "w_late": 1});
+    # FORWARD_BANDS gives it its rows.
+    "cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7": {
         "arches": [
             "sm_107a",
         ],
@@ -613,8 +616,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_from_rows_per_sm": 8192,
             "rows_per_block": 16,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "kernel": "cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -622,7 +625,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "library": "cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7",
         "logical": {
             "eps": "eps",
             "heads": "heads",
@@ -1648,7 +1651,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "fwd_pipe": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "fwd_pipe": "cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
         "bwd_bf16_rc_mid": "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7",
@@ -1664,7 +1667,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "fwd_pipe": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "fwd_pipe": "cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
         "bwd_bf16_rc_mid": "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7",
@@ -1679,7 +1682,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "fwd_pipe_packed": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "fwd_pipe_packed": "cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",

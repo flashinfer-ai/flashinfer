@@ -159,8 +159,8 @@ Host design (the input layout rules are the deterministic package's):
   ``[T, 128]`` input whose rows follow one another meets, see
   ``_kernel_view``), the long forward (3 CTAs per SM, at most 6 blocks of 32
   rows each; sm_100a), the extra-long forward (the long forward whose thread
-  0 also warms the CTA's next block in L2) and the pipelined forwards (this
-  package's copies of the deterministic package's forward programs: the mid
+  0 also warms the CTA's next block in L2) and the pipelined forwards (the
+  deterministic package's forward programs with this package's gate: the mid
   forward's schedule and L2 prefetches with the L2 ``evict_first`` policy on
   the loads of x and z, one CTA per block below 8192 rows per SM; on sm_107a
   its program of packed rows).  The bands past the tiny forward's (packed

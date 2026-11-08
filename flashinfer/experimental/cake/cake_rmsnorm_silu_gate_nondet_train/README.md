@@ -57,9 +57,10 @@ the step with the row-claims backward takes 18.7 % .. 24.5 % longer than
 with the exact tiny backward, so `sm_107a` runs the exact tiny backward
 from 257 to 512 rows.
 
-`y` is the deterministic package's bits in the bands of the pipelined
-forwards (this package's copies of the deterministic package's forward
-programs) and not elsewhere.  `dx` and `dz` are, in every band.  Outside the row-claims bands and the short backward's band (a BF16
+`y` is not the deterministic package's bits: the pipelined forwards are
+the deterministic package's forward programs with this package's gate,
+which does not flush to 0 where that package's gate does (`z` from about
+-87.34 down).  `dx` and `dz` are the deterministic package's bits, in every band.  Outside the row-claims bands and the short backward's band (a BF16
 `dw` up to 256 rows) `dw` is the bits of the deterministic package at
 FlashInfer commit 2e989556, except where the exact sum lies within that
 package's FP64 sum's error of a rounding boundary; the deterministic package
@@ -190,8 +191,8 @@ each program repeats `y` bit for bit for the same inputs on the same device.
 | `fwd_mid` | whole waves of 6 CTAs per SM (as many waves as the rows need), each CTA at most 2 blocks of 16 rows | its forward bands |
 | `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
 | `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
-| `fwd_pipe` (`sm_100a`, `sm_103a`) | pipelined forward: this package's copy of the deterministic package's forward program (the same build and grid, so its bits): 128 threads, 8 lanes a row, one CTA per 16-row block below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2 blocks, a thread loading its row of the CTA's next block while it computes the current one, `x` and `z` loaded with the L2 `evict_first` policy | its forward bands |
-| `fwd_pipe_packed` (`sm_107a`) | the pipelined forward of packed rows (the deterministic package's packed-rows program on `sm_107a`: the pipelined forward's schedule with four sum chains, `rsqrt.approx.ftz` and one 32-byte store a lane) | its band of `FORWARD_BANDS` (packed rows, fewer than `PACKED_ROWS`) |
+| `fwd_pipe` (`sm_100a`, `sm_103a`) | pipelined forward: the deterministic package's forward program (the same build and grid) with this package's gate (`split_gate`): 128 threads, 8 lanes a row, one CTA per 16-row block below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2 blocks, a thread loading its row of the CTA's next block while it computes the current one, `x` and `z` loaded with the L2 `evict_first` policy | its forward bands |
+| `fwd_pipe_packed` (`sm_107a`) | the pipelined forward of packed rows (the deterministic package's packed-rows program on `sm_107a` with this package's gate: the pipelined forward's schedule with four sum chains, `rsqrt.approx.ftz` and one 32-byte store a lane) | its band of `FORWARD_BANDS` (packed rows, fewer than `PACKED_ROWS`) |
 | `bwd_bf16_short` | short backward (a BF16 weight gradient; every architecture): one cluster of 16 CTAs of 256 threads, 16 lanes a row, CTA `r` running the 16-row blocks `r`, `r + 16`, ... with the row-claims backward's row arithmetic; CTA `r` adds every CTA's FP32 partials of the columns `8r` .. `8r + 7` in rank order in FP64 (a fixed order), no workspace | the rows of its band (at most 256) |
 | `bwd_bf16_t512` (`sm_100a`, `sm_107a`), `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its band (at most 512) |
 | `bwd_f32` (every architecture), `bwd_bf16` (`sm_107a`) | static backward: 128 threads, 8-row blocks, CTA `b` runs chunks `b`, `b + grid`, ... (the same bits at any grid); on `sm_100a` and `sm_103a` 4 copies of the weight-gradient windows and no prefetch, on `sm_107a` 4 copies plus occupancy words (the last CTA reads only the windows some CTA added into) | its backward band (the call role `bwd_bf16` has no program on `sm_100a` and `sm_103a`: no BF16 band routes a static backward there) |
@@ -210,8 +211,8 @@ the 20 hex digits shown):
 | `fwd_mid` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` |
 | `fwd_long` | `c6151f64f22ae65a48eb` | (not routed) | (not routed) |
 | `fwd_xlong` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` |
-| `fwd_pipe` | `8a905176e52247f528ae` | `8a905176e52247f528ae` | (none) |
-| `fwd_pipe_packed` | (none) | (none) | `8a371a49c065b60c88a9` |
+| `fwd_pipe` | `e6e0bf4c758851cabc99` | `e6e0bf4c758851cabc99` | (none) |
+| `fwd_pipe_packed` | (none) | (none) | `9cb071b2dfe75474aaa7` |
 | `bwd_bf16_short` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` |
 | `bwd_bf16_t512` | `f6a3420d9aaa20a99e8d` | (none) | `f6a3420d9aaa20a99e8d` |
 | `bwd_bf16` | (none) | (none) | `6d7cf79fb3d679d07410` |
@@ -233,9 +234,7 @@ pipelined forward loads `x` and `z` with the L2 `evict_first` policy, so
 where the rows fit in L2 it is faster alone but makes the step slower.  The
 other bands run the program whose forward alone is fastest, but the tiny and
 the short forward end where beside a kernel holding 16 SMs they still end no
-later than the deterministic package's forward.  The pipelined forward is the
-deterministic package's forward, so `y` in its bands is that package's
-bits:
+later than the deterministic package's forward.  The bands:
 
 | architecture | packed rows (rows per SM) | other layouts (rows per SM) |
 | --- | --- | --- |

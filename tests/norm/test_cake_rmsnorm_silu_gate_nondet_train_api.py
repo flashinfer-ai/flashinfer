@@ -1738,9 +1738,7 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     tiny, short, pipelined, mid, long and extra-long forwards, each where the
     architecture's bands name it).  ``y`` repeats bit for bit and lies
     within the error budget of the deterministic package's ``y`` and within
-    one BF16 ulp of FP64; where a pipelined forward (this package's copy of a
-    deterministic forward program) runs, ``y`` is the deterministic package's
-    bits."""
+    one BF16 ulp of FP64."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
@@ -1773,10 +1771,54 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     assert name == want, (arch, rows, sms)
     y64 = suite.fp64_reference(dy, x, z, w, EPS)[0]
     y_det = det_forward(x, z, w, EPS)
-    if loader.MODULES[name]["role"] in ("fwd_pipe", "fwd_pipe_packed"):
-        assert_same_bits("y of the pipelined forward", y, y_det)
     assert_error_within_det("y", y, y_det, y64)
     assert_y_within_fp64(y, x, z, w, EPS, what="y")
+
+
+# Gate inputs where the deterministic package's gate flushes to 0
+# (``rcp.approx.ftz`` of a value past 2^126, from about -87.34 down) and FP32
+# ``expf`` does not overflow (above about -88.72): the sigmoid is a nonzero
+# FP32 subnormal there, and ``y`` a nonzero BF16 value of ordinary rows.
+GATE_TAIL = (-87.5, -88.0, -88.5)
+
+
+@pytest.mark.parametrize("band", range(8))
+@pytest.mark.parametrize("kind", ["flat", "strided"])
+def test_forward_keeps_the_gate_tail_in_every_band(
+    kind, band, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At the first row count of every forward band (``FORWARD_BANDS``, or
+    ``STRIDED_FORWARD_BANDS`` where the rows are not packed), with every ``z``
+    in :data:`GATE_TAIL`, the forward launches the band's module and ``y`` is
+    within one BF16 ulp of the FP64 forward plus half the smallest BF16
+    subnormal, with no floor: no forward program flushes the gate to 0 where
+    FP32 keeps it."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    table = (
+        loader.STRIDED_FORWARD_BANDS if kind == "strided" else loader.FORWARD_BANDS
+    )[arch]
+    if band >= len(table):
+        pytest.skip(f"{arch} has {len(table)} {kind} forward bands")
+    rows = (int(table[band - 1][0]) * sms if band else 0) + 1
+    x, z, w, _ = suite.make(
+        rows, 1, layout="projection" if kind == "strided" else "flat", seed=23
+    )
+    tail = torch.tensor(GATE_TAIL, dtype=z.dtype, device=z.device)
+    index = torch.arange(z.numel(), device=z.device) % len(GATE_TAIL)
+    z.copy_(tail[index].view(z.shape))
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    assert launched == [loader.ROUTES[arch][table[band][1]]], (arch, rows, launched)
+    xd, zd, wd = (t.double().reshape(-1, D) for t in (x, z, w))
+    rstd = torch.rsqrt(xd.square().mean(dim=-1, keepdim=True) + EPS)
+    want = xd * rstd * wd * (zd * torch.sigmoid(zd))
+    err = (y.double().reshape(-1, D) - want).abs()
+    bad = err > want.abs() * suite.BF16_RTOL + 2.0**-134
+    assert not bad.any(), (
+        f"{arch} {kind} band {band} ({rows} rows): {int(bad.sum())} elements "
+        f"of {bad.numel()} off FP64, the largest error {float(err.max()):.3e}"
+    )
 
 
 # Gate inputs at and past the edges of the packed gate's range: below -41,

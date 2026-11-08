@@ -28,8 +28,8 @@ per block of 8 rows.  Other layouts up to 12 rows per SM on SM100 and SM103
 (with 64 SMs or more on SM100 and SM103, as with 148 or 152, fewer CTAs than
 the SMs less 16; on SM107 with 205 SMs or more, as with 212 or 216, at most 4
 CTAs per SM on all SMs but 16; fewer SMs do not keep these bounds at the end
-of the band).  The pipelined forwards (this package's copies of the
-deterministic package's forward programs) launch one 128-thread CTA per block
+of the band).  The pipelined forwards (the deterministic package's forward
+programs with this package's gate) launch one 128-thread CTA per block
 of 16 rows below 8192 rows per SM and from there whole waves of 6 CTAs per SM
 that each walk at most 2 blocks; the mid forward launches whole waves of 6
 CTAs per SM that each walk at most 2 blocks of 16 rows; the long and the
@@ -1275,7 +1275,8 @@ def test_mid_forward_slows_in_proportion_to_the_sms_held(
     _forward_slows_in_proportion("fwd_mid", edge, nth, ctas, threads, layout)
 
 
-# The pipelined forwards (the deterministic package's forward programs: CTA
+# The pipelined forwards (the deterministic package's forward programs with
+# this package's gate: CTA
 # slots of 6 per SM, row blocks of 16 rows, one CTA a block below
 # ``persistent_from_rows_per_sm`` rows per SM, then whole waves whose CTAs walk
 # at most 2 blocks) in their ``nth`` band of ``layout``: at the band's first
