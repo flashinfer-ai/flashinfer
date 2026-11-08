@@ -49,7 +49,9 @@ are this module's.  Beyond the two keywords they differ from
   forward's saved accumulators as soon as it has used them (a second backward
   through that graph raises; ``retain_graph=True`` keeps them);
 * a call that misses the binding cache binds on buffers that share one
-  allocation of the largest of them and never launches on them.
+  allocation of the largest of them -- with the hidden valid-row count, on
+  views of the count's chunk-0 buffers for the chunk buffers -- and never
+  launches on them.
 
 Every output is bitwise the same as :mod:`.cake_backend`'s, with two
 exceptions of a default call whose automatic form is a budget form (both within
@@ -119,8 +121,11 @@ from .cake_backend import (
     _RECOUNT,
     _TemperatureGeometry,
     _assert_on_device,
+    CHUNK_VIEW_REGIONS,
     _carve,
     _check_output,
+    _chunk_view,
+    _chunk_view_layout,
     _check_temperature_arms,
     _check_temperature_operands,
     _deferred_operands,
@@ -1045,8 +1050,9 @@ def memory_plan(
     above release it once ``dX`` is written), so the ``dW`` phases hold it too; ``hidden_count`` (loss entry; also a
     budget form of a default call that keeps the count) -- the call runs with the hidden valid-row count, whose
     chunk-0 buffers (logits, statistics and gather buffer of ``buffer_rows`` rows) exist beside a zero-weight pass
-    ahead of the loop and beside the chunk workspace a call that misses the binding cache allocates to prepare its
-    binding (:func:`.cake_backend.workspace_layout` of ``min(chunk, rows)`` rows, one more phase); ``zero_pass`` --
+    ahead of the loop and beside the rest of the chunk workspace a call that misses the binding cache allocates to
+    prepare its binding on views of them (:func:`.cake_backend.workspace_layout` of ``min(chunk, rows)`` rows without
+    its chunk buffers, :func:`.cake_backend._chunk_view_layout`; one more phase); ``zero_pass`` --
     where the zero-weight rows' pass runs
     (:func:`.cake_backend.zero_weight_memory`'s order): ``"first"`` ahead of the loop on its own chunk buffers,
     ``"arena"`` ahead of the loop on chunk buffers carved out of the loop's FP32 ``[V, H]`` accumulator (allocated
@@ -1101,21 +1107,24 @@ def memory_plan(
     chunk0 = (
         logits + live(8 * Cb * -(-V // tile)) + live(2 * Cb * H) if hidden_count else 0
     )
-    # a loss call that misses the binding cache prepares its binding -- one allocation of the chunk workspace of
-    # ``min(chunk, rows)`` rows (:func:`.cake_backend.workspace_layout`: logits, statistics, row terms, K-slice slabs,
-    # gather buffer) -- while the hidden count's chunk-0 buffers are alive: a phase of its own.  The accumulators and
-    # outputs the templated binding aliases into that allocation are no larger than the forward phase's, which holds
-    # them beside chunk buffers of the same ``buffer_rows``.
+    # a loss call that misses the binding cache prepares its binding while the hidden count's chunk-0 buffers are
+    # alive: its template's logits, statistics and gather regions are views of those buffers, the other regions of the
+    # chunk workspace of ``min(chunk, rows)`` rows (:func:`.cake_backend.workspace_layout`: row terms, K-slice slabs)
+    # one allocation (``_chunk_views`` of :func:`prepare_lm_head_det_loss`) -- a phase of its own.  The accumulators
+    # and outputs the template aliases into that allocation are no larger than the forward phase's, which holds them
+    # beside chunk buffers of the same ``buffer_rows``.
     miss_phase = 0
     if entry == "loss" and hidden_count:
-        workspace = workspace_layout(
-            Cr,
-            V,
-            C,
-            stats_tile=tile,
-            dx_ws_slabs=int(dx_ws_slabs),
-            hidden=H,
-            compact=compact,
+        workspace = _chunk_view_layout(
+            workspace_layout(
+                Cr,
+                V,
+                C,
+                stats_tile=tile,
+                dx_ws_slabs=int(dx_ws_slabs),
+                hidden=H,
+                compact=compact,
+            )
         )["total"]
         miss_phase = chunk0 + live(workspace) + rowvec
     # the zero-weight rows' pass ahead of the chunk loop: a phase of its own
@@ -2251,6 +2260,7 @@ def prepare_lm_head_det_loss(
     keep_row_grad: bool = False,
     _template_only: bool = False,
     dx_slices_cap: Optional[int] = None,
+    _chunk_views: Optional[_HiddenCount] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -2312,6 +2322,10 @@ def prepare_lm_head_det_loss(
     binding (:meth:`_Binding.from_runner`), which launches with per-call buffers of its own.  The workspace and the
     accumulators / casts allocated here then share one allocation of the largest of them (views of it that alias one
     another), so building a binding costs the largest buffer rather than their sum; such a runner never launches.
+    ``_chunk_views`` (internal; with ``_template_only``, the call's hidden valid-row count): the template's logits,
+    statistics and gather regions are views of the count's chunk-0 buffers (:data:`.cake_backend.CHUNK_VIEW_REGIONS`)
+    and the other regions share that one allocation (:func:`.cake_backend._chunk_view_layout`): a call that misses the
+    binding cache prepares its binding beside the count's chunk buffers without a second chunk buffer.
     """
     if _template_only and backend != "cake":
         raise ValueError("a template-only runner templates a cake-backend binding")
@@ -2446,6 +2460,14 @@ def prepare_lm_head_det_loss(
         hidden=H,
         compact=plan.compact,
     )
+    if _chunk_views is not None and (
+        not _template_only or backend != "cake" or workspace_buffer is not None
+    ):
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner (_template_only) on its own workspace"
+        )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     arena = None
     alias: dict[str, int] = {}
     if _template_only:
@@ -2466,7 +2488,7 @@ def prepare_lm_head_det_loss(
         }
         alias = {name: n for name, n in sizes.items() if n}
         arena = torch.empty(
-            max([layout["total"] if workspace_buffer is None else 0, *alias.values()]),
+            max([carved["total"] if workspace_buffer is None else 0, *alias.values()]),
             dtype=torch.uint8,
             device=device,
         )
@@ -2477,10 +2499,15 @@ def prepare_lm_head_det_loss(
             layout["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -2498,12 +2525,12 @@ def prepare_lm_head_det_loss(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -2511,13 +2538,13 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
+        t["dx_ws"] = carve(
+            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
         )
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -2571,13 +2598,11 @@ def prepare_lm_head_det_loss(
     if plan.keep_row_grad:
         t["d_rows"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
+        t["workspace"] = carve(
+            "workspace", torch.uint8, (layout["workspace"][1],)
         )
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -4328,9 +4353,10 @@ def forward_loss(
     where it fits that budget with its own buffer lifetimes, else the budget form that fits (:func:`auto_memory_plan`;
     none fits: the fast form, ``memory_plan`` ``None``), on the valid rows of the count formed here or the caller's --
     an uncompacted call without the caller's count keeps the fast form, it never counts on the host.  It keeps the
-    hidden valid-row count where the count's chunk-0 buffers, with the chunk workspace a binding cache miss allocates
-    beside them, fit the budget of any valid-row count (:func:`_hidden_count_fits`; checked on every pass of a step
-    whose ``W`` requires a gradient, a checkpointed step's gradient-free first pass included), plans a budget form
+    hidden valid-row count where the count's chunk-0 buffers fit the budget of any valid-row count
+    (:func:`_hidden_count_fits`; checked on every pass of a step whose ``W`` requires a gradient, a checkpointed
+    step's gradient-free first pass included) -- a call that misses the binding cache prepares its binding on views
+    of those buffers (``_chunk_views`` of :func:`prepare_lm_head_det_loss`) --, plans a budget form
     with those chunk-sized buffers and drops the count's queued chunk-0 work only when that plan does not fit and the
     plan without the count does.
 
@@ -4425,8 +4451,8 @@ def forward_loss(
         )
         # ``"budget"``: no hidden valid-row count -- its chunk-0 buffers take ``min(chunk, T)`` rows before the count
         # is known, which can exceed the budget of a call with fewer valid rows than a chunk; the automatic form keeps
-        # it where those buffers, and the chunk workspace a cache miss allocates beside them, fit the budget of any
-        # valid-row count (:func:`_hidden_count_fits`)
+        # it where those buffers fit the budget of any valid-row count (:func:`_hidden_count_fits`; a cache miss
+        # prepares its binding on views of them)
         count = False if budget else _resolve_hidden_count(hidden_count)
         if count and count_checked:
             count = bool(
@@ -4755,6 +4781,7 @@ def forward_loss(
             dw_stream=stream_mode,
             _template_only=backend == "cake",
             dx_slices_cap=dx_cap,
+            _chunk_views=hc if backend == "cake" else None,
             **common,
             **(options or {}),
         )
@@ -4823,6 +4850,7 @@ def forward_loss(
             dw_stream=stream_mode,
             _template_only=backend == "cake",
             dx_slices_cap=dx_cap,
+            _chunk_views=hc if backend == "cake" else None,
             **common,
             **(options or {}),
         )
@@ -5194,24 +5222,19 @@ def _hidden_count_shape_fits(
     chunk: int,
     need_dx: bool,
     geometry: Geometry = DEFAULT_GEOMETRY,
-    dx_ws_slabs: int = 0,
-    tma_workspace_bytes: int = 0,
-    scratch_bytes: int = 0,
 ) -> bool:
-    """Whether the hidden valid-row count's chunk-0 work stays within :func:`memory_plan`'s budget for a call of this
-    shape whatever its valid rows ``T_v`` (pure host arithmetic; ``True`` for a call the count does not serve, fewer
-    than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks).
+    """Whether the hidden valid-row count's work before the count is known stays within :func:`memory_plan`'s budget
+    for a call of this shape whatever its valid rows ``T_v`` (pure host arithmetic; ``True`` for a call the count does
+    not serve, fewer than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks).
 
     Before the count is known its chunk-0 buffers take ``chunk`` rows (logits, statistics, gather buffer) beside the
-    call's ``O(T)`` vectors (``chunk0``).  A call that misses the binding cache -- a new valid-row count, every new
-    batch -- then allocates the chunk workspace of ``min(chunk, rows)`` rows while they are alive: the loss entry's
-    templated binding, the log-probability forward's runner (:func:`.cake_backend.workspace_layout`: logits,
-    statistics, row terms, gather buffer, ``dx_ws_slabs`` K-slice slabs -- at most the program's dX slice count less
-    one, the largest any chunk of any call can take -- and the record's TMA descriptor and scratch bytes).  Below one
-    chunk that phase grows faster with ``T_v`` than the budget (a workspace row takes more than ``2 V`` bytes, the
-    budget ``0.98 * 2 V``), above it the workspace stops growing, so the worst case is ``T_v = chunk``:
-    ``chunk0 + workspace(chunk) <= (1 - margin) * (2 * chunk * V + 2 * V * H + 2 * T * H)`` (the last term without
-    ``dX``) bounds every valid-row count, the call without a valid row (``chunk0`` alone, no chunk loop) included."""
+    call's ``O(T)`` vectors (``chunk0``).  That phase does not depend on ``T_v`` and the budget grows with it, so the
+    budget of a call without a valid row bounds it for every count: ``chunk0 <= (1 - margin) * (2 * V * H + 2 * T *
+    H)`` (the last term without ``dX``).  After the count, a call that misses the binding cache -- a new valid-row
+    count, every new batch -- prepares its binding on views of those buffers (``_chunk_views`` of
+    :func:`prepare_lm_head_det_loss`, of :func:`.cake_backend.prepare_lm_head_det_loss` for the log-probability
+    forward), so no second chunk buffer exists beside them: that phase is :func:`memory_plan`'s ``miss`` phase, never
+    above its forward phase."""
     T, H, V, C = int(num_rows), int(hidden), int(vocab), int(chunk)
     if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
         return True
@@ -5224,20 +5247,9 @@ def _hidden_count_shape_fits(
         + live(4 * T, 4)
         + live(4 * T, 8)
     )
-    workspace = workspace_layout(
-        C,
-        V,
-        C,
-        stats_tile=tile,
-        tma_workspace_bytes=int(tma_workspace_bytes),
-        scratch_bytes=int(scratch_bytes),
-        dx_ws_slabs=int(dx_ws_slabs),
-        hidden=H,
-        compact=True,
-    )["total"]
-    head = 2 * C * V + 2 * V * H + (2 * T * H if need_dx else 0)
+    head = 2 * V * H + (2 * T * H if need_dx else 0)
     budget = head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
-    return chunk0 + live(workspace) <= budget
+    return chunk0 <= budget
 
 
 def _hidden_count_fits(
@@ -5250,18 +5262,16 @@ def _hidden_count_fits(
     need_dx: bool,
     entry: str = "loss",
 ) -> bool:
-    """:func:`_hidden_count_shape_fits` of a default call of ``entry`` on ``device``'s registered program: its
-    geometry, its TMA descriptor and scratch bytes and, for the loss entry with ``dX`` (whose forward runs the dX GEMM),
-    the program's largest dX slice count less one as the K-slice slabs (the log-probability forward has none).  A
-    default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows` path, bitwise the
-    same outputs), so the count's chunk-0 work -- the call that misses the binding cache included -- never exceeds the
-    budget of a call that a budget form fits."""
+    """:func:`_hidden_count_shape_fits` of a default call of ``entry`` on ``device``'s registered program (its
+    geometry).  A default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows`
+    path, bitwise the same outputs), so the count's chunk-0 work never exceeds the budget of a call that a budget form
+    fits.  ``entry``: the loss or log-probability entry (the same rule: the work before the count is the same)."""
+    if entry not in ENTRIES:
+        raise ValueError(f"entry must be one of {ENTRIES}")
     T, C = int(num_rows), int(chunk)
     if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
         return True
-    module_name, record = record_for(device)
-    stages = registered_stages(module_name)
-    slabs = dx_max_slices(stages) - 1 if (entry == "loss" and need_dx) else 0
+    _, record = record_for(device)
     return _hidden_count_shape_fits(
         num_rows=T,
         hidden=hidden,
@@ -5269,9 +5279,6 @@ def _hidden_count_fits(
         chunk=C,
         need_dx=need_dx,
         geometry=Geometry.from_record(record),
-        dx_ws_slabs=slabs,
-        tma_workspace_bytes=_record_tma_bytes(record, stages),
-        scratch_bytes=_record_scratch_bytes(record, stages),
     )
 
 
@@ -5371,8 +5378,8 @@ def _auto_loss_plan(
         if kept.fits:
             return kept, True
         if shared == C and compact:
-            # the same plan without the count's phases, whose cache-miss phase the count's check keeps within the
-            # budget (:func:`_hidden_count_fits`): none fits
+            # the same plan without the count's phases: its cache-miss phase (the template on views of the count's
+            # buffers) never exceeds its forward phase, so that plan does not fit either -- none fits
             return None, True
     elif _fast_fits("loss", device, compact=compact, buffer_rows=shared, **common):
         return None, True

@@ -477,16 +477,23 @@ keyword.
   vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
-  chunk's buffers before the count is known, and a call that misses the
-  binding cache (a new valid-row count: usually every training batch)
-  allocates the chunk workspace for its binding beside them.  A default call
-  whose step forms a BF16 `dW` -- every pass of it, a checkpointed step's
-  gradient-free first pass included -- keeps the count only where those
-  chunk-0 buffers plus that workspace fit `B` less the margin for every
-  valid-row count (the worst case is `T_v = chunk_size`, with the most dX
-  K-slice slabs the program can take); otherwise it runs without the count,
-  on the host count's path.  Its outputs are the same bits: the loss entry's
-  zero-weight row split is still decided as for the call with the count.  A
+  chunk's buffers before the count is known.  A call that misses the binding
+  cache (a new valid-row count: usually every training batch) prepares its
+  binding on views of those buffers (the template's logits, statistics and
+  gather regions; the rest of the chunk workspace and the aliased
+  accumulators in one allocation), so no second chunk buffer exists beside
+  them and that phase never exceeds the forward's.  A default call whose step
+  forms a BF16 `dW` -- every pass of it, a checkpointed step's gradient-free
+  first pass included -- keeps the count only where those chunk-0 buffers
+  and the call's `O(T)` vectors fit the budget of a call without a valid
+  row, `2 * V * H + 2 * T * H` less the margin, which bounds that phase for
+  every valid-row count (at `V = 154880`, `C = 4096`: from `T = 10264` at
+  `H = 4096`, from `T = 33418` at `H = 3584`); otherwise it runs without
+  the count, on the host count's path.  Its outputs are the same bits: the
+  loss entry's zero-weight row split is still decided as for the call with
+  the count.  A call of fewer valid rows than a chunk that keeps the count
+  holds the count's `chunk_size`-row buffers (a one-chunk call, whose step
+  peak is not bounded by `B`, above).  A
   call that keeps the count plans its budget form with the count's chunk-0
   buffers (`chunk_size` rows, the gather buffer included) and that
   cache-miss phase, and keeps the count when that plan fits; else, when the

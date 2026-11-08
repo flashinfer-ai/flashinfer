@@ -4865,6 +4865,36 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
     return flat[offset : offset + needed].view(dtype).view(shape)
 
 
+# the workspace regions (:func:`workspace_layout`) a template runner takes from a call's hidden valid-row count
+# (:class:`_HiddenCount`) instead of allocating them: region -> the count's chunk-0 buffer
+CHUNK_VIEW_REGIONS = {"logits": "logits", "stats": "stats_buf", "x_c": "x_c"}
+
+
+def _chunk_view_layout(layout: dict) -> dict:
+    """``layout`` (:func:`workspace_layout`) without the regions of :data:`CHUNK_VIEW_REGIONS`: every other region in
+    the same order and alignment from offset 0 of one smaller allocation, ``"total"`` its size."""
+    out: dict = {}
+    offset = 0
+    for name, region in layout.items():
+        if name == "total" or name in CHUNK_VIEW_REGIONS:
+            continue
+        out[name] = (offset, region[1])
+        offset += _align(region[1])
+    out["total"] = offset
+    return out
+
+
+def _chunk_view(hidden: "_HiddenCount", name: str, shape) -> torch.Tensor:
+    """Region ``name`` of :data:`CHUNK_VIEW_REGIONS` as the leading ``shape[0]`` rows of the hidden valid-row count's
+    chunk-0 buffer (``min(chunk, T)`` rows, at least a runner's ``min(chunk, rows)`` for ``rows <= T``)."""
+    view = getattr(hidden, CHUNK_VIEW_REGIONS[name])[: shape[0]]
+    if tuple(view.shape) != tuple(shape):
+        raise ValueError(
+            f"the hidden valid-row count's {name} buffer {tuple(view.shape)} cannot hold the region {tuple(shape)}"
+        )
+    return view
+
+
 # ---------------------------------------------------------------------------
 # Launch binding
 # ---------------------------------------------------------------------------
@@ -6248,6 +6278,9 @@ class LmHeadDetLossRunner:
     engine: Optional[ReferenceEngine] = field(default=None, repr=False)
     dw_stream: str = "auto"
     _tma_prepared: bool = False
+    # built only to template a remembered binding on a hidden valid-row count's chunk-0 buffers
+    # (``prepare_lm_head_det_loss(_chunk_views=...)``): those buffers hold the count's chunk 0, so it never launches
+    _template_only: bool = False
 
     @property
     def problem(self) -> Problem:
@@ -6314,6 +6347,11 @@ class LmHeadDetLossRunner:
         self._tma_prepared = True
 
     def _run(self, keys: tuple) -> None:
+        if self._template_only:
+            raise RuntimeError(
+                "this runner only templates a remembered binding (its chunk buffers are a hidden valid-row count's); "
+                "it never launches"
+            )
         if self.backend == "cake":
             self.prepare_tma()
 
@@ -6380,7 +6418,7 @@ class _TemperatureRunner(LmHeadDetLossRunner):
     side-stream placement of the temperature forms (:func:`_run_keys_temperature`)."""
 
     def _run(self, keys: tuple) -> None:
-        if self.backend != "cake":
+        if self.backend != "cake" or self._template_only:
             super()._run(keys)
             return
         self.prepare_tma()
@@ -6547,6 +6585,7 @@ def prepare_lm_head_det_loss(
     logprob_keep: bool = False,
     dcnt: Optional[torch.Tensor] = None,
     dx_slices_cap: Optional[int] = None,
+    _chunk_views: Optional["_HiddenCount"] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -6618,9 +6657,19 @@ def prepare_lm_head_det_loss(
     the plan's rule-picked dX slice count per chunk stays at or below it
     (:func:`make_plan`), so the K-slice workspace never exceeds the one of the
     call without the split.
+
+    ``_chunk_views`` (private; the call's hidden valid-row count, ``cake``
+    backend): a runner built only to template a remembered binding
+    (:meth:`_Binding.from_runner`) for a call that missed the binding cache --
+    its logits, statistics and gather regions are views of the count's chunk-0
+    buffers (:data:`CHUNK_VIEW_REGIONS`) and the other regions one smaller
+    allocation (:func:`_chunk_view_layout`), so preparing it beside those
+    buffers allocates no second chunk buffer; it never launches.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
+        raise ValueError("_chunk_views templates a cake-backend runner on its own workspace")
     if entry != "logprob" and (logprob_dz or logprob_lbl or logprob_keep):
         raise ValueError(
             "logprob_dz / logprob_lbl / logprob_keep select logits GEMM arms of the log-probability entry"
@@ -6760,15 +6809,22 @@ def prepare_lm_head_det_loss(
         hidden=H,
         compact=plan.compact,
     )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
-            layout["total"], dtype=torch.uint8, device=device
+            carved["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -6784,12 +6840,12 @@ def prepare_lm_head_det_loss(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -6797,13 +6853,13 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
+        t["dx_ws"] = carve(
+            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
         )
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -6850,13 +6906,11 @@ def prepare_lm_head_det_loss(
             else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
+        t["workspace"] = carve(
+            "workspace", torch.uint8, (layout["workspace"][1],)
         )
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -6918,6 +6972,7 @@ def prepare_lm_head_det_loss(
         memory=memory,
         engine=engine,
         dw_stream=stream_mode,
+        _template_only=_chunk_views is not None,
     )
 
 
@@ -6954,6 +7009,7 @@ def prepare_lm_head_det_loss_temperature(
     logprob_lbl: Optional[bool] = None,
     temperature: Optional[torch.Tensor] = None,
     dcnt: Optional[torch.Tensor] = None,
+    _chunk_views: Optional["_HiddenCount"] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -7019,9 +7075,14 @@ def prepare_lm_head_det_loss_temperature(
     :func:`make_plan_temperature` whose forms the record registers: the counted ``dz`` temperature form
     (:func:`zero_dlogp_temperature_dz_counted`), else the mixed plan (the uncounted ``dz`` temperature form), each
     with the counted dW forms, and the forms without the count otherwise.
+
+    ``_chunk_views`` (private): a template runner on the hidden valid-row count's chunk-0 buffers, as in
+    :func:`prepare_lm_head_det_loss`; it never launches.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
+        raise ValueError("_chunk_views templates a cake-backend runner on its own workspace")
     if entry != "logprob" and (logprob_dz or logprob_lbl):
         raise ValueError(
             "logprob_dz / logprob_lbl select logits GEMM arms of the log-probability entry"
@@ -7196,15 +7257,22 @@ def prepare_lm_head_det_loss_temperature(
         hidden=H,
         compact=plan.compact,
     )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
-            layout["total"], dtype=torch.uint8, device=device
+            carved["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -7220,12 +7288,12 @@ def prepare_lm_head_det_loss_temperature(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -7233,13 +7301,13 @@ def prepare_lm_head_det_loss_temperature(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
+        t["dx_ws"] = carve(
+            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
         )
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -7290,13 +7358,11 @@ def prepare_lm_head_det_loss_temperature(
             else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
+        t["workspace"] = carve(
+            "workspace", torch.uint8, (layout["workspace"][1],)
         )
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -7373,6 +7439,7 @@ def prepare_lm_head_det_loss_temperature(
         memory=memory,
         engine=engine,
         dw_stream=stream_mode,
+        _template_only=_chunk_views is not None,
     )
 
 
@@ -9828,10 +9895,13 @@ def _forward_logprob_rows(
         compact_rows=False if row_index is None else row_index,
         gemm_tuning=tuning,
         logprob_lbl=lbl,
+        _chunk_views=hc,
     )
     if hc is not None or (arena is not None and backend == "cake"):
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
-        # through the templated binding too (the runner's own workspace is never written); the same with an arena
+        # through the templated binding too -- a template whose chunk buffers are views of the prologue's
+        # (``_chunk_views``: no second chunk buffer beside them); the same with an arena (the runner's own workspace is
+        # never written)
         binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
@@ -10210,10 +10280,12 @@ def forward_logprob_temperature(
         gemm_tuning=tuning,
         logprob_lbl=lbl,
         temperature=tau_rows,
+        _chunk_views=hc,
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
-        # through the templated binding too (the runner's own workspace is never written)
+        # through the templated binding too -- a template whose chunk buffers are views of the prologue's
+        # (``_chunk_views``: no second chunk buffer beside them)
         binding = _TemperatureBinding.from_runner(runner, hc)
         del runner
         if key is not None:
