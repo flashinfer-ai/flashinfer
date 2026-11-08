@@ -4,8 +4,7 @@ Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  The public entry point is
 `cake_gdn_nondet` in `flashinfer.cake_gdn_nondet_train`.  Every launch is
-fixed-order today, so two runs of one call on one device give the same bits;
-the contract does not promise run-to-run bits.  The
+fixed-order, so every output repeats bit for bit (see Outputs).  The
 results match the deterministic package
 `flashinfer.experimental.cake.cake_gdn_det_train` within that package's accuracy
 budgets, not bitwise: where the backward runs the package tail or a cluster
@@ -31,6 +30,47 @@ libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
 otherwise.  The package reads no environment variable.
 
+## Outputs
+
+Every output repeats bit for bit: two identical calls on one device (the same
+inputs, arguments, layout and route, plain or under activation checkpointing)
+give the same bits, and a second backward into the same leaves adds exactly
+the first one's gradients.  No output of this version may vary.  The outputs
+are not bitwise equal to the deterministic package's (see above).  The table
+gives the error of each output against an FP64 reference next to the error of
+the deterministic package of FlashInfer commit `2e989556` on the same inputs.
+
+| output | run to run | FP64 error at the `(2, 6)` pack of 131,071 + 87,531 + 43,385 tokens, this package / the deterministic package: rel-L2; worst | largest ratio to the deterministic package over 53 cases: rel-L2; worst |
+|---|---|---|---|
+| `o` | repeats bit for bit | 5.095e-3 / 5.095e-3; 5.783e-3 / 5.783e-3 | 1.010; 1.037 |
+| final state | repeats bit for bit | 4.211e-3 / 4.211e-3; 4.591e-3 / 4.591e-3 | 1.016; 1.052 |
+| `dq` | repeats bit for bit | 4.823e-3 / 5.100e-3; 5.167e-3 / 5.800e-3 | 1.000; 1.000 |
+| `dk` | repeats bit for bit | 5.904e-3 / 6.201e-3; 6.351e-3 / 6.745e-3 | 0.999; 1.000 |
+| `dv` | repeats bit for bit | 4.731e-3 / 4.826e-3; 6.119e-3 / 6.272e-3 | 1.009; 1.043 |
+| `dg` | repeats bit for bit | 5.879e-3 / 5.888e-3; 6.006e-3 / 5.924e-3 | 1.029; 1.058 |
+| `dbeta` | repeats bit for bit | 5.095e-3 / 5.182e-3; 5.451e-3 / 5.375e-3 | 1.015; 1.046 |
+| initial-state gradient | repeats bit for bit | not measured: the measured calls start every sequence from a zero state | not measured |
+
+rel-L2 is `||out - ref|| / ||ref||` and worst is `max |out - ref| / max |ref|`;
+`ref` is an FP64 token-by-token recurrence (FP64 Q/K L2 norm, autograd for the
+gradients), not chunked.  Each figure is the median over 25 input seeds on
+B200 (packed q / k / v head views, in-kernel L2 norm, scale `1 / sqrt(128)`,
+zero initial state).  The pack column uses decays log-spaced per value head
+from `1e-4` to `1` per token (times `U[0.5, 1.5)`) and `beta = sigmoid(N(0,
+1))`.  The 53 cases are the three `(2, 6)` packs of the source issue, a
+64 x 4,096-token pack and the head pairs `(16, 48)`, `(8, 24)`, `(4, 12)`,
+`(2, 6)` and `(1, 3)` at 32,768 tokens in three sequences, each under three
+gate regimes (FLA's GatedDeltaNet initialization, the log-spaced decays, and
+`logsigmoid(N(0, 1))`); five small layouts with chunk tails and one-token
+sequences; and adversarial inputs: a 131,072-token sum without decay, slow
+decay, near-cancellation (repeated and teacher-forced keys and values with
+`beta` near 1), heavy-tailed and concentrated values, large-norm and zero keys,
+`beta` near 0, near 1 and near 2 with near-parallel keys, every chunk tail,
+one-token, empty and 1,500 short sequences, value bursts, mirrored heads whose
+`dq` / `dk` are a small difference, and the unnormalized path.  A ratio is the
+median of this package's error over the seeds divided by the median of the
+deterministic package's error over the same seeds; every ratio is at most 1.1.
+
 ## Mode rules
 
 The mode is in the name.  No entry takes a `deterministic` keyword: passing
@@ -46,8 +86,8 @@ one raises `TypeError`.
   wants the deterministic route calls `flashinfer.cake_gdn_det_train`.
 * PyTorch's deterministic algorithms do not change the route.  Every launch
   of this version is fixed-order, so no call raises PyTorch's alert or warns.
-  The contract does not promise run-to-run bits: a later version may add an
-  unordered launch, which then raises PyTorch's alert before it runs
+  A later version may add an unordered launch for an output that then may
+  vary (see Outputs); that launch raises PyTorch's alert before it runs
   (`RuntimeError`; a `UserWarning` and then the launch under `warn_only=True`).
 * The forward tape carries the tag `"mode": "nondet"`.
   `cake_gdn_nondet_train_backward` refuses (`ValueError`) a tape without it,
@@ -201,7 +241,7 @@ select the fastest one measured on B200, GB300 and R200 (the production rows, pa
 source head pairs and group shapes of `benchmarks/bench_cake_gdn_nondet_train.py`),
 and the `tail` keyword pins one:
 
-| tail | selected for | `dq` / `dk` rounding | run to run today (not a contract) |
+| tail | selected for | `dq` / `dk` rounding | run to run |
 |---|---|---|---|
 | `"tail"`: one tcgen05 kernel per (chunk, value head), a workspace slot per value head, the last CTA of a (chunk, key head) sums the slots | `G` other than 2 and 3 with at least the architecture's `TAIL_MIN_CTAS` chunks x `HV` | the value heads' FP32 partials summed in value-head order, one BF16 rounding after the FP32 L2-norm pullback | bitwise |
 | `"tail_g2_f32x"`: one two-CTA cluster kernel per (chunk, key head), the CTAs exchange their FP32 partials over distributed shared memory | `G = 2` | as `"tail"` (the same bits) | bitwise |
