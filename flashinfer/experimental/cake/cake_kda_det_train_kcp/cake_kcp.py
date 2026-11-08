@@ -1064,12 +1064,15 @@ class _TapeSide:
 def _tape_side(
     call: CakeKDADetKcpCall, launches: list
 ) -> tuple[_TapeSide | None, Any]:
-    """The side-stream form of the backward's tape replay ``launches`` (``[(walk list, h0)]``), or ``None`` for the
-    call's stream, and the table-set key to mark once the replay ran on the call's stream (``None``: nothing to mark).
-    The side stream runs only on the trimmed host path of the kernel backend on a CUDA device, under the a2a exchange
+    """The side-stream form of the backward's tape replay ``launches`` (``[(walk list, initial-state view thunk)]``;
+    the side form holds the views, built now), or ``None`` for the call's stream, and the table-set key to mark once
+    the replay ran on the call's stream (``None``: nothing to mark).  The side stream runs only for a
+    :class:`CakeKDADetKcpCall` on the trimmed host path of the kernel backend on a CUDA device, under the a2a exchange
     and the ``wait_first`` schedule, with the tape launches uncapped (no cache-config bracket: the shipped split form)
     and no ``kcp_dav`` launch (it reads ``v_new`` right after the replay); the first replay of a table set on a device
     runs on the call's stream (it uploads the launches' device tables)."""
+    if not isinstance(call, CakeKDADetKcpCall):  # a test's driver call: the launches in order
+        return None, None
     form = str(call.opts.bwd_tape_stream)
     if form == "one" or not any(len(w) for w, _ in launches):
         return None, None
@@ -1092,7 +1095,7 @@ def _tape_side(
     key = (tuple(id(w) for w, _ in launches), index)
     if key not in seen:
         return None, (seen, key)
-    return _TapeSide(call, launches, form, index), None
+    return _TapeSide(call, [(w, h0()) for w, h0 in launches], form, index), None
 
 
 class KcpPreconditionError(RuntimeError):
@@ -6263,15 +6266,16 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
             call.bufs["carry"] = (
                 plane  # the tape replay below reads the saved plane; the adjoint carries go to the workspace pool
             )
-        # the tape replay's launches (walk list, initial states), issued here on the call's stream or on the side
-        # stream (:class:`_TapeSide`, the knob bwd_tape_stream)
+        # the tape replay's launches (walk list, initial-state view thunk), issued here on the call's stream or on the
+        # side stream (:class:`_TapeSide`, the knob bwd_tape_stream; its views are built here, while the saved plane
+        # stands in for the carry pool)
         if (
             tb.fused_walks and tb.P > 1
         ):  # fused walks: the whole tape replay from the carry plane in one launch
             tapes = [
                 (
                     tb.walk_live,
-                    call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
+                    lambda: call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
                 )
             ]
         else:
@@ -6279,7 +6283,7 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
             # identity-keyed device-table cache on every call: one blocking host-to-device copy per backward)
             trim = bool(call.host_trim)
             p0 = tb.walk_all_p0 if trim else [s for s in tb.walk_all if s % tb.P == 0]
-            tapes = [(p0, call.indexed("S_in", tb.h0_index, tb.s_in_tiles))]
+            tapes = [(p0, lambda: call.indexed("S_in", tb.h0_index, tb.s_in_tiles))]
             if tb.P > 1:
                 rest = (
                     tb.walk_all_rest
@@ -6287,12 +6291,15 @@ def _backward(call: CakeKDADetKcpCall, saved: CakeKDADetKcpSaved | None) -> None
                     else [s for s in tb.walk_all if s % tb.P != 0]
                 )
                 tapes.append(
-                    (rest, call.indexed("carry", tb.carry_index, tb.carry_tiles))
+                    (
+                        rest,
+                        lambda: call.indexed("carry", tb.carry_index, tb.carry_tiles),
+                    )
                 )
         side, mark = _tape_side(call, tapes)
         if side is None:
             for walk, h0 in tapes:
-                call.walk("kcp_fwdh_tape", walk, h0=h0, out=None)
+                call.walk("kcp_fwdh_tape", walk, h0=h0(), out=None)
             if mark is not None:
                 mark[0].add(mark[1])  # the replay's device tables are resident
         # where the replay reads the workspace's carry pool (no saved plane), the dcarry merges (which write that
