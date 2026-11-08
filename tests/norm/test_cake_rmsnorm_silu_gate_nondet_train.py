@@ -53,8 +53,8 @@ package's FP32 workspace is refused naming both modes' workspaces.
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
 imports nothing else from flashinfer.  The comparisons against the
-deterministic package (``y``, ``dx`` and ``dz`` bitwise, ``dw`` within the
-budget of the deterministic ``dw``), the facade, the ``flashinfer`` top level
+deterministic package (``dw`` within the budget of the deterministic ``dw``;
+``y``, ``dx`` and ``dz`` there held to FP64), the facade, the ``flashinfer`` top level
 and the facade's interplay with ``torch.use_deterministic_algorithms`` are
 ``test_cake_rmsnorm_silu_gate_nondet_train_api.py``'s.
 """

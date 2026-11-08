@@ -29,11 +29,12 @@ deterministic package's forward kernel rendered here (it has no reduction, so
 its bits are the same), and up to 12 rows per SM on sm_100a / sm_103a (59 on
 sm_107a) a forward with 16 threads to a row (the same bits) and from 976 rows
 per SM on sm_100a / sm_103a (800 on sm_107a) a forward whose CTAs each walk
-several row
-blocks with the same arithmetic (the same bits); the backward is one kernel that writes ``dx`` and ``dz``
-exactly as the deterministic backward does, sums the weight gradient of the
-row blocks each CTA takes (its own block when the grid has a CTA for every
-block, else the chunks it claims) in FP32 runs of at most 16 rows folded into
+several row blocks with the same arithmetic (the same bits); the backward is
+one kernel that writes ``dx`` and ``dz`` within one BF16 ulp of FP64 plus 1/64
+ulp of the tensor's largest finite magnitude (the same bits on every call),
+sums the weight gradient of the row blocks each CTA takes (its own block when
+the grid has a CTA for every block, else the chunks it claims) in FP32 runs of
+at most 16 rows folded into
 FP64 (a CTA of a few blocks adds its runs across its warps in FP32 and
 converts once: at most 16 FP32 roundings a term either way), and adds each
 CTA's FP64 column sums into
@@ -55,7 +56,8 @@ its dtype is rounded to a multiple of the dtype's smallest subnormal
 (``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite ``grad_out`` makes
 its columns' weight gradient infinite or ``NaN``: ``NaN`` where the infinite
 term is in the last row and the last row block is partial (its padding rows
-reread that row and multiply it by zero), as in the deterministic backward.
+reread that row and multiply it by zero; the deterministic backward gives
+the infinity there).
 On sm_100a from 800 rows per SM and on sm_103a from 700, up to 12000 (from 12000
 the long backward, whose fold is the FP64 fold above), and on sm_107a from 1024
 up to 3200 (from 3200 the long backward), the mid backward runs instead: the
@@ -910,9 +912,11 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
 
     One kernel of at most ``ctas_per_sm`` CTAs per SM (one row block each when
     the grid has a CTA for every block; past one wave they claim the blocks in
-    chunks from the workspace's claim counter): ``dx`` and ``dz`` are
-    the deterministic backward's bits, and each CTA adds its FP64 column sums
-    into the FP64 accumulators of the workspace with atomics; the CTA that
+    chunks from the workspace's claim counter): ``dx`` and ``dz`` lie within
+    one BF16 ulp of FP64 plus 1/64 ulp of the tensor's largest finite
+    magnitude (the same bits on every call), and each CTA adds its FP64
+    column sums into the FP64 accumulators of the workspace with atomics; the
+    CTA that
     arrives last rounds the FP64 sum into ``dw`` (adding ``grad_weight``'s value
     first when accumulating; FP64 -> FP32, and FP32 -> BF16 for a BF16 ``dw``)
     and zeroes the workspace.  Every call with rows

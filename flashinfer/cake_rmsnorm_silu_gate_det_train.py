@@ -37,13 +37,17 @@ reciprocal square root, base-2 exponential and reciprocal, so ``y`` can differ
 from the correctly rounded FP32 formula by one BF16 unit in the last place
 where that value lies within a few FP32 units in the last place of a BF16
 rounding boundary; for finite ``z`` below about ``-87.3`` the gate is ``-0``.  The
-forward's CTAs each walk at most two blocks of 16 rows, and the backward's
-CTAs, past one wave, claim chunks of row blocks from a counter, so a CTA that
-becomes resident late takes only the blocks left.  No kernel waits for another
-CTA or grid.  Beside a kernel on another stream that holds ``k`` of the ``N``
-SMs, the forward takes at most ``N / (N - k)`` times its time alone, plus the
-share of one CTA's row blocks in the call, plus 0.02 (a CTA whose slot that
-kernel holds walks all of its blocks once it starts).
+backward computes them with the same approximate instructions but keeps the
+subnormal sigmoid down to about ``-88.72``, so ``dx`` and ``dz`` lie within one
+BF16 unit in the last place of the correctly rounded FP32 formulas plus 1/64 of
+a unit of the row's largest term.  The forward's CTAs each walk at most two
+blocks of 16 rows, and the backward's CTAs, past one wave, claim chunks of row
+blocks from a counter, so a CTA that becomes resident late takes only the
+blocks left.  No kernel waits for another CTA or grid.  Beside a kernel on
+another stream that holds ``k`` of the ``N`` SMs, the forward takes at most
+``N / (N - k)`` times its time alone, plus the share of one CTA's row blocks in
+the call, plus 0.02 (a CTA whose slot that kernel holds walks all of its blocks
+once it starts).
 
 Mode and dispatch rules (the same in
 :mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` and
@@ -294,10 +298,14 @@ def cake_rmsnorm_silu_gate_det_train_backward(
         dx = BF16(rstd * a * weight - x * rstd^3 * mean(a * weight * x))
         dw = sum over every token and head of a * n
 
-    in FP32, the statistics and the gate recomputed from ``x`` and ``z``.  ``dw``
-    is summed in FP32 runs of at most 16 rows, added exactly in fixed point
-    whatever the order of the CTAs, and rounded once to FP32 (then to BF16 for
-    a BF16 gradient): the same row count on a device with the same SM count
+    in FP32, the statistics and the gate recomputed from ``x`` and ``z`` with
+    the approximate reciprocal square root, base-2 exponential and reciprocal:
+    ``dx`` and ``dz`` lie within one BF16 unit in the last place of these
+    formulas in correctly rounded FP32 plus 1/64 of a unit of the row's
+    largest term, the same bits at every call.
+    ``dw`` is summed in FP32 runs of at most 16 rows, added exactly in fixed
+    point whatever the order of the CTAs, and rounded once to FP32 (then to BF16
+    for a BF16 gradient): the same row count on a device with the same SM count
     gives the same bits.
 
     Parameters

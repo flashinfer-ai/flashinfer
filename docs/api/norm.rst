@@ -227,9 +227,13 @@ count return the same bits), and an autograd wrapper that saves only its
 inputs.  The forward computes ``rstd`` and the gate with the approximate FP32
 reciprocal square root, base-2 exponential and reciprocal, so ``y`` can differ
 from the correctly rounded FP32 formula by one BF16 unit in the last place near
-a BF16 rounding boundary.  The forward's CTAs each walk at most two row blocks,
-and the backward's CTAs claim row blocks past one wave.  Beside a kernel on
-another stream that holds ``k`` of the ``N`` SMs, the forward takes at most
+a BF16 rounding boundary.  The backward computes them with the same approximate
+instructions but keeps the subnormal sigmoid down to about ``-88.72``: ``dx``
+and ``dz`` lie within one BF16 unit in the last place of the correctly rounded
+FP32 formulas plus 1/64 of a unit of the row's largest term, the same bits at
+every call.  The forward's CTAs each walk at most two row blocks, and the
+backward's CTAs claim row blocks past one wave.  Beside a kernel on another
+stream that holds ``k`` of the ``N`` SMs, the forward takes at most
 ``N / (N - k)`` times its time alone, plus one CTA's share of the row blocks,
 plus 0.02.  The backward's workspace (18952 bytes, zero-filled) is left zero
 by every call, so one workspace serves every later call on its stream.
@@ -349,9 +353,12 @@ kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``):
   per SM on SM100 and SM103 and up to 59 on SM107, a forward with 16 threads
   to a row, and from 976 rows per SM on SM100 and SM103 and from 800 on SM107,
   a forward whose CTAs each walk several row blocks: the same bits).
-* The backward is one kernel: ``dx`` and ``dz`` are the deterministic
-  backward's bits, and the CTAs take row blocks (each CTA its own block when
-  the grid has a CTA for every block; past one wave of CTAs they claim the
+* The backward is one kernel: ``dx`` and ``dz`` lie within one BF16 unit in
+  the last place of the FP64 value plus 1/64 of a unit of the tensor's largest
+  finite magnitude (the same bits on every call; not the deterministic
+  backward's bits, whose gate and ``rstd`` are approximate), and the CTAs take
+  row blocks (each CTA its own block when the grid has a CTA for every block;
+  past one wave of CTAs they claim the
   blocks in chunks from the workspace's claim counter) and add their FP64
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
