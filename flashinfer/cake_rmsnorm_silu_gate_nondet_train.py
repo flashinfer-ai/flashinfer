@@ -37,10 +37,10 @@ values.
 ``y``, ``dx``, ``dz`` and an FP32 weight gradient repeat bit for bit: the
 same inputs on the same device give the same bits on every call, whatever the
 order in which CTAs run and the work beside the call on other streams, and
-whatever the grid but in the fused band (below: a BF16 weight gradient on
-SM107; there the rows and the SM count fix the grid and the bits).  A BF16
-weight gradient repeats bit for bit
-too, except in the row-claims bands (below: SM100 513 rows to 1329 rows per
+whatever the grid.  A BF16 weight gradient repeats bit for bit too, whatever
+the grid but in the fused band (below: SM107; there the rows and the SM count
+fix the grid and the bits), except in the row-claims bands (below: SM100 513
+rows to 1329 rows per
 SM, SM103 257 rows to 1294 rows per SM; SM107 has none), where its last bits
 may vary from run to run.  The kernels are those of the standalone package
 ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``:

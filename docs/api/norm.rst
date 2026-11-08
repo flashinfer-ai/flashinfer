@@ -374,8 +374,8 @@ reference value) is at most 1.1 times the deterministic package's on the same
 inputs, and within the deterministic package's absolute bounds; for an FP32
 weight gradient the 1.1 times bound holds against the deterministic package at
 FlashInfer 2e989556, and against the deterministic package in this release
-(which sums FP32 runs of rows exactly, so its FP32 weight gradient is the more
-accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
+(whose FP32 weight gradient need not be these bits) the bound is
+``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
 
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one

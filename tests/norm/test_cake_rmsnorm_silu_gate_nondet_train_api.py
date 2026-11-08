@@ -57,9 +57,10 @@ relative to the reference's largest magnitude are each at most
 deterministic package's is 0; an FP32 weight gradient is held instead to the
 deterministic package's within the backend suite's weight-gradient budget
 (its 1.1x bound is against the deterministic package of FlashInfer
-``2e989556``, whose FP32 ``dw`` this package's repeats bit for bit; the
-in-tree deterministic package sums FP32 runs of rows exactly, so its FP32
-``dw`` is the more accurate).  The deterministic outputs come from that
+``2e989556``, whose FP32 ``dw`` this package's repeats bit for bit except
+where the exact sum lies within that package's FP64 sum's error of a rounding
+boundary; the in-tree deterministic package's FP32 ``dw`` need not be these
+bits).  The deterministic outputs come from that
 package's public forward and backward only.  This module checks:
 
 * the surface without a device: the exports (one autograd function, the
@@ -1334,7 +1335,8 @@ def test_accumulation_within_the_deterministic_error(band, determinism_setting) 
             assert_error_within_det(
                 f"{dtype} accumulator", main, main_reference, want, mag=mag
             )
-        if _fused(suite._backward_module(rows, dtype)):
+        module = suite._backward_module(rows, dtype)
+        if _fused(module) and _det_routes_same_program(module):
             assert_same_bits(
                 f"{dtype} accumulator of the fused backward vs the deterministic "
                 "package",
@@ -2272,7 +2274,7 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     for acc_dw in acc if varies else acc[:1]:
         assert_error_within_det("accumulated dw", acc_dw, acc_d, 0.25 + dw64, mag=mag)
         suite.assert_dw_within(acc_dw, 0.25 + dw64, mag, what="accumulated dw vs FP64")
-    if _fused(name):
+    if _fused(name) and _det_routes_same_program(name):
         assert_same_bits(
             "accumulated dw of the fused backward vs the deterministic package",
             acc[0],

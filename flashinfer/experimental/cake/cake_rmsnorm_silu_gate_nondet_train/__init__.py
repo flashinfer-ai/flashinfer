@@ -27,10 +27,10 @@ call of this package runs it.
 Numerical contract.  ``y``, ``dx``, ``dz`` and an FP32 weight gradient repeat
 bit for bit: the same inputs on the same device give the same bits on every
 call, whatever the order in which CTAs run and the work beside the call on
-other streams, and whatever the grid but in the fused band of a BF16 weight
-gradient on sm_107a (whose grid, and so whose bits, the rows and the SM count
-fix).  A BF16 weight gradient
-repeats bit for bit too, except in the row-claims bands of
+other streams, and whatever the grid.  A BF16 weight gradient repeats bit for
+bit too, whatever the grid but in the fused band on sm_107a (whose grid, and
+so whose bits, the rows and the SM count fix), except in the row-claims bands
+of
 ``cake_jit.BACKWARD_BANDS`` (the roles ``bwd_bf16_rc`` and
 ``bwd_bf16_rc_mid``, on sm_100a and sm_103a only), where its last bits may
 vary from run to run.  The forward computes ``rstd`` with ``rsqrt.approx``

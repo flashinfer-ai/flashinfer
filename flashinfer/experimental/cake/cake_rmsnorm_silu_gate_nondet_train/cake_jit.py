@@ -170,7 +170,7 @@ whose slot such a kernel holds runs all of its blocks once it starts.
 The workspace of the static and the claimed backwards is three buffers
 (:func:`workspace_layout`, :func:`workspace_bytes`): ``dw_win``, the 64-bit
 integer windows of the exact sum (``slots`` copies of 7 windows of 128
-columns, 3, 4 or 5 slots; with ``sparse`` the last copy holds the occupancy
+columns, 4 or 5 slots; with ``sparse`` the last copy holds the occupancy
 words), ``dw_spec``, 128 FP32 class words for infinite and NaN partials,
 and ``dw_done``, two 32-bit words (the arrival ticket and the claim counter);
 that of a row-claims backward is ``dw_sums``, its 4 x 128 FP64 accumulators,

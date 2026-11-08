@@ -19,9 +19,9 @@ Its libraries are JIT-built by FlashInfer from `build.json`.
 `y`, `dx`, `dz` and an FP32 `dw` repeat bit for bit everywhere: the same
 inputs on the same device give the same bits on every call, whatever the
 order in which CTAs run and the work beside the call on other streams, and
-whatever the grid but in the fused band (`bwd_bf16_fused`, `sm_107a`), whose
-grid, and so whose bits, the rows and the SM count fix.  A BF16 `dw`
-repeats bit for bit too, except in the row-claims bands (`bwd_bf16_rc`,
+whatever the grid.  A BF16 `dw` repeats bit for bit too, whatever the grid
+but in the fused band (`bwd_bf16_fused`, `sm_107a`), whose grid, and so whose
+bits, the rows and the SM count fix, except in the row-claims bands (`bwd_bf16_rc`,
 `bwd_bf16_rc_mid`; see "Programs and routes"), where its last bits may vary
 from run to run, within the family's error budget:
 
@@ -81,9 +81,7 @@ row-claims bands, the short backward's band (a BF16 `dw` up to 256 rows) and
 the fused band (a BF16 `dw` on `sm_107a`) `dw` is the bits of the
 deterministic package at FlashInfer commit 2e989556, except where the exact
 sum lies within that package's FP64 sum's error of a rounding boundary; the
-deterministic package in this tree sums FP32 runs of at most 16 rows exactly
-and rounds once, so its `dw` is the more accurate and need not be these
-bits.  In the
+`dw` of the deterministic package in this tree need not be these bits.  In the
 fused band `dw` (and `dx` and `dz`) is the deterministic package's in this
 tree, not the sum of the chunk partials of the deterministic package at
 FlashInfer 2e989556.  In the
@@ -106,8 +104,9 @@ absolute error relative to the largest reference value.  The tests in this
 tree compare with the deterministic package in this tree: every output but
 an FP32 `dw` against the 1.1 times bound, an FP32 `dw` against the budget
 above (its 1.1 times bound holds against the deterministic package at
-FlashInfer 2e989556, whose FP32 `dw` bits it repeats in every band; the
-measured tables below compare with that package).  The tests also check
+FlashInfer 2e989556, whose FP32 `dw` bits it repeats in every band except
+where the exact sum lies within that package's FP64 sum's error of a rounding
+boundary; the measured tables below compare with that package).  The tests also check
 every output against the explicit eager operation (FP32 arithmetic, one final
 cast to BF16, PyTorch autograd for the gradients) with the deterministic
 suite's bounds: `y`, `dx` and `dz` within one BF16 ulp of the eager output plus

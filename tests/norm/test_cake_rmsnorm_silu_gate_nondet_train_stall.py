@@ -785,9 +785,9 @@ def _check_replaced_rows(
     ``z``, ``w``, ``dy``) into a ``dw_dtype`` weight gradient while that
     package routes the same program (:func:`_det_routes_same_program`), and the
     small-row backward's ``dx`` and ``dz`` bitwise those of the role's own
-    static backward (``ROUTES[arch][role]``, the backward the small-row
-    backward replaced before the fused band) at the same rows, which leaves
-    its workspace zero."""
+    static backward (``ROUTES[arch][role]``, whose row arithmetic the
+    small-row backward shares) at the same rows, which leaves its workspace
+    zero."""
     first, rep = alone[0][1], replaced_alone[0][1]
     if not _fused(replaced):
         assert torch.equal(rep[0], first[0]), f"dx tokens={tokens} (replaced)"
