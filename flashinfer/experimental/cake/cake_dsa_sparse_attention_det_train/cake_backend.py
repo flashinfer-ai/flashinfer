@@ -3182,7 +3182,9 @@ def nope_bwd_redo_launch_grid(num_queries: int, sm_count: int) -> int:
 # The NoPE backward stages launched with a persistent grid instead of the generated rule, and their grid.
 NOPE_PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
     "nope_bwd_main": nope_bwd_launch_grid,
-    "nope_bwd_redo": lambda num_queries, num_kv, sm_count: nope_bwd_redo_launch_grid(num_queries, sm_count),
+    "nope_bwd_redo": lambda num_queries, num_kv, sm_count: nope_bwd_redo_launch_grid(
+        num_queries, sm_count
+    ),
 }
 
 
