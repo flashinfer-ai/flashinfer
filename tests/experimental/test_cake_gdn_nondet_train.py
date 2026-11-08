@@ -3137,9 +3137,9 @@ def test_chain_plan_rule_on_r200(sm_count, plan, monkeypatch) -> None:
 
 # The forward table rule of FWD_A_SERIAL_KEEP on the gating rows, per SM count of R200 (sm_107a): row -> whether its
 # split forward table gives way to the planner's cheapest serial table.  The 3 sequences of 11000 / 12000 / 9768 tokens
-# with HV 48 (144 serial CTAs, the serial table 1.06 x the split table's price) take it; with HV 24 (72 CTAs, 1.51 x)
-# and fewer value heads, and the long rows, the split table stays (64 x 4096 is serial without the rule).  B200 and
-# GB300 keep every table.
+# with HV 48 (144 serial CTAs, fill 0.68, the serial table 1.06 x the split table's price) take it; with HV 24 (72 CTAs,
+# 1.51 x) and fewer value heads, and the long rows, the split table stays (64 x 4096 is serial without the rule); so does
+# g3_4x4096_h8 (96 CTAs, fill 0.45, 1.08 x: below the fill).  B200 and GB300 keep every table.
 FWD_A_SERIAL_ROWS = {
     212: {
         "A16": True,
@@ -3151,6 +3151,7 @@ FWD_A_SERIAL_ROWS = {
         "P3": False,
         "P1": False,
         "64x4096": False,
+        "g3_4x4096_h8": False,
     }
 }
 
@@ -3187,6 +3188,7 @@ def test_fwd_a_serial_keep_rule(arch, sm_count, monkeypatch) -> None:
             continue
         kept.add(row)
         assert rec["select"] and rec["ratio"] <= rec["limit"], (row, rec)
+        assert rec["fill"] >= rec["min_fill"], (row, rec)
         assert fwd == rec["serial"] and fwd.segment_len == 0, (row, fwd)
         assert _segments(chunks, fwd0) > len(chunks), (row, fwd0)
         meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=(fwd, bwd))
@@ -3197,6 +3199,7 @@ def test_fwd_a_serial_keep_rule(arch, sm_count, monkeypatch) -> None:
         assert (row in kept) is want, (row, sorted(kept), ratios)
     if sm_count in FWD_A_SERIAL_ROWS:
         assert 1.0 < ratios["A16"] <= 1.10 < ratios["h8_hv24"], ratios
+        assert ratios["g3_4x4096_h8"] <= 1.10, ratios  # kept split by the fill
         chunks = tuple(-(-n // 64) for n in _PAIR_LAYOUT)
         assert _segments(chunks, tables["h8_hv24"]) > len(chunks), tables["h8_hv24"]
     pinned = cake_chain.make_options(scan_config=(64, 1), segment_chunks=64)
