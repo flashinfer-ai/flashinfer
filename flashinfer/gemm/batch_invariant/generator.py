@@ -25,7 +25,7 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
@@ -49,11 +49,32 @@ K_TILE_BYTES = (
 )
 
 
-def inner_radix(in_fmt: str = "bf16") -> int:
-    """Instruction K-steps per smem stage: what one 128-byte stage holds at the format's step (4 for the 32-byte steps
-    of both bf16 and fp8). The inner radix of ``MainloopBlock.lowering()``; Lean's ``kblockLoopG_eq_kfoldG`` holds for
-    every value of it."""
-    return K_TILE_BYTES * 8 // (MMA_K_OF[in_fmt] * ELEM_BITS_OF[in_fmt])
+# The k-block (K elements per smem stage) a format admits besides its 128-byte default: the mixed classes stage their 4-bit
+# weight at a 64-byte row under the default, so they also admit the 256-element k-block (a 128-byte weight row;
+# `Knobs.k_block`); the lowering's inner radix follows (`inner_radix`), the fold does not (Lean's `kblockLoopG_eq_kfoldG`
+# holds for every radix).
+K_BLOCK_VALUES = {"mxfp4w8a": (128, 256), "mxfp4w8a_k64": (128, 256)}
+DEFAULT_K_BLOCK: Dict[
+    str, int
+] = {}  # a format's default k-block when it is not the 128-byte rule
+# the k-block of a format's swapped decode records in the enumerated space: the SM107 mixed class streams its e2m1 weight as
+# the instruction's A operand, and the 256-element stage gives that operand a 128-byte TMA row (the dense records keep the
+# 128-byte rule of the e4m3 activation row)
+SWAP_K_BLOCK = {"mxfp4w8a_k64": 256}
+
+
+def default_k_block(in_fmt: str) -> int:
+    """K elements per smem stage under the format's default: 128 bytes of the A operand's row, or the class's declared choice."""
+    return DEFAULT_K_BLOCK.get(in_fmt) or K_TILE_BYTES * 8 // ELEM_BITS_OF[in_fmt]
+
+
+def inner_radix(in_fmt: str = "bf16", k_block: int = 0) -> int:
+    """Instruction K-steps per smem stage: what one stage holds at the format's step (the 128-byte default: 4 for the
+    32-byte steps of both bf16 and fp8), or at an explicit ``k_block`` (`Knobs.k_block`, the formats of ``K_BLOCK_VALUES``).
+    The inner radix of ``MainloopBlock.lowering()``; Lean's ``kblockLoopG_eq_kfoldG`` holds for every value of it."""
+    kb = k_block or default_k_block(in_fmt)
+    assert kb % MMA_K_OF[in_fmt] == 0, (in_fmt, kb)
+    return kb // MMA_K_OF[in_fmt]
 
 
 # ----------------------------------------------------------------------------- knobs
@@ -144,6 +165,7 @@ class Knobs:
     cta_chunks: bool = False  # the in-CTA chunk fold (split class): one CTA folds every chunk of its tile
     cluster_k: int = 1  # in-cluster split-K factor (block-scaled body): the record computes the class kchunk[cluster_k]
     swap_ab: bool = False  # the decode specialisation (block-scaled body): operands swapped, one token tile for all tokens
+    k_block: int = 0  # K elements per smem stage: 0 = the format's default, else a value of K_BLOCK_VALUES[in_fmt] (a lowering choice)
 
     # named views
     @property
@@ -196,6 +218,7 @@ class Knobs:
             and self.raster_along in RASTERS
             and self.swizzle_size in SWIZZLES
             and self.use_tma_store
+            and (self.k_block == 0 or self.k_block in K_BLOCK_VALUES.get(in_fmt, ()))
         )
         if in_fmt in BLOCK_SCALED:
             tm_ok = self.tile_m in TILES_M_BLOCKSCALED[two] or (
@@ -264,6 +287,7 @@ class Knobs:
             + (f"_ck{self.cluster_k}" if self.cluster_k > 1 else "")
             + ("_swap" if self.swap_ab else "")
             + ("_cc" if self.cta_chunks else "")
+            + (f"_kb{self.k_block}" if self.k_block else "")
         )
 
     def instruction(self, in_fmt: str = "bf16") -> str:
@@ -356,6 +380,7 @@ def knob_product(
                                             cc,
                                             ck,
                                             swap,
+                                            SWAP_K_BLOCK.get(in_fmt, 0) if swap else 0,
                                         )
                                         if k.well_formed(in_fmt) and (
                                             bs
@@ -400,6 +425,7 @@ class MainloopBlock:
     fixed by the format; its instruction variant by the knobs."""
 
     in_fmt: str = "bf16"
+    k_block_override: int = 0  # `Knobs.k_block`: 0 = the format's default stage
 
     @property
     def step(self) -> int:
@@ -408,7 +434,7 @@ class MainloopBlock:
     @property
     def inner(self) -> int:
         """Instruction K-steps per smem stage (the lowering's inner radix)."""
-        return inner_radix(self.in_fmt)
+        return inner_radix(self.in_fmt, self.k_block_override)
 
     @property
     def k_block(self) -> int:
@@ -450,7 +476,7 @@ class GemmKernelPlan:
 
     @property
     def block(self) -> MainloopBlock:
-        return MainloopBlock(self.in_fmt)
+        return MainloopBlock(self.in_fmt, self.knobs.k_block)
 
     @property
     def epilogue(self) -> EpilogueChain:

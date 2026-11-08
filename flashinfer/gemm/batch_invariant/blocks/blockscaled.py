@@ -189,7 +189,9 @@ class BlockScaledPlan:
         self.cta_chunks = (
             chunks if (knobs.cta_chunks and chunks > 1) else 1
         )  # chunks folded inside the CTA (1: none)
-        self.block = MainloopBlock(self.IN_FMT)
+        self.block = MainloopBlock(
+            self.IN_FMT, knobs.k_block
+        )  # the record's k-block (the lowering's inner radix)
         self.a_dtype, self.b_dtype = self.A_DT, self.B_DT
         # the smem containers (the hooks above): the operand's own dtype unless the instruction reads an unpacked one
         self.a_smem_dtype = self.A_SMEM_DT or self.A_DT

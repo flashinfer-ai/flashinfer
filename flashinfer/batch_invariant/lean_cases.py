@@ -538,6 +538,37 @@ def loop_cases(in_fmt: str = "bf16") -> Tuple[int, List[Tuple[int, str]]]:
     ]
 
 
+def swap_loop_cases(in_fmt: str) -> Tuple[int, int, List[Tuple[int, str]]]:
+    """The lowering's trace at the k-block of the format's swapped decode records (`generator.SWAP_K_BLOCK`): the inner radix,
+    its ratio to the class's default radix and ``(nblk, sexpr)``; the trace at ``nblk`` blocks is the default radix's trace at
+    ``ratio * nblk`` blocks (one fold, two blockings), which the emitted theorem states without a new literal."""
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    low = MainloopBlock(in_fmt).lowering()
+    lowsw = MainloopBlock(in_fmt, SWAP_K_BLOCK[in_fmt]).lowering()
+    ratio = lowsw.inner // low.inner
+    assert ratio * low.inner == lowsw.inner, (in_fmt, lowsw.inner, low.inner)
+    alg = term.TermAlgebra()
+    out = []
+    for nblk in BY_FMT[in_fmt].loop_cases:
+        sx = term.sexpr(
+            lowsw.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk,
+            )
+        )
+        assert sx == term.sexpr(
+            low.trace(
+                reduction(nblk * lowsw.inner * MMA_K_OF[in_fmt], 0, 0, in_fmt),
+                alg,
+                nblk * ratio,
+            )
+        ), (in_fmt, nblk)
+        out.append((nblk, sx))
+    return lowsw.inner, ratio, out
+
+
 def out_cases(in_fmt: str = "bf16") -> List[Tuple[int, str, str]]:
     return [
         (K, fmt, term.sexpr(GemmSpec(K, fmt, in_fmt=in_fmt).out(0, 0)))
@@ -709,6 +740,25 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
         + ", ".join(str(n) for n in F.loop_cases)
         + "]"
     )
+    from ..gemm.batch_invariant.generator import SWAP_K_BLOCK
+
+    if SWAP_K_BLOCK.get(in_fmt):
+        # the swapped decode records of this class stage a wider k-block: the loop at that radix is the class's loop at
+        # ratio x the blocks (the same fold, another blocking), stated for every block count against the loop model
+        # itself through its fold equation (no new literal); the conformance executable prints its trace
+        inner_sw, ratio, _ = swap_loop_cases(in_fmt)
+        L.append(f"def {inner_name}Swap : Nat := {inner_sw}")
+        L.append(
+            f"theorem {tag}swap_mainloop_eq_kfold : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {kfold} a b (nblk * {inner_name}Swap) := "
+            f"fun S nblk a b => {loop}_eq_{kfold} a b {inner_name}Swap S nblk"
+        )
+        L.append(
+            f"theorem {tag}swap_loop_eq_loop : ∀ (S nblk : Nat) (a : RowData) (b : ColData), "
+            f"{loop} a b {inner_name}Swap S .zero nblk = {loop} a b {inner_name} S .zero (nblk * {ratio}) := "
+            f"fun S nblk a b => by rw [{loop}_eq_{kfold}, {loop}_eq_{kfold}]; "
+            f"exact congrArg ({kfold} a b) (by simp only [{inner_name}Swap, {inner_name}]; omega)"
+        )
     L.append("")
     L.append(
         f"/-! The {in_fmt} epilogue chain (`spec.output_elem`"

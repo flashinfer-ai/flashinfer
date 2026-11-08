@@ -19,6 +19,7 @@ import subprocess
 import pytest
 
 from flashinfer.batch_invariant import lean_cases
+from flashinfer.gemm.batch_invariant.generator import SWAP_K_BLOCK
 from flashinfer.gemm.batch_invariant.spec import MMA_K, MMA_K_OF
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
@@ -114,6 +115,7 @@ def test_lean_model_matches_python_engine_and_spec():
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
+        kinds[F.tag + "swaploop"] = "loop"
         kinds[F.tag + "out"] = "out"
         if F.table is not None:
             kinds[F.chunk_tag] = "chunks"
@@ -152,6 +154,12 @@ def test_lean_model_matches_python_engine_and_spec():
         for nblk, sx in lean_cases.loop_cases(in_fmt)[1]:
             assert lean[(F.tag + "loop", nblk)] == sx, (in_fmt, nblk)
             checked += 1
+        if (
+            in_fmt in SWAP_K_BLOCK
+        ):  # the swapped records' k-block: the trace at the class's second radix
+            for nblk, sx in lean_cases.swap_loop_cases(in_fmt)[2]:
+                assert lean[(F.tag + "swaploop", nblk)] == sx, (in_fmt, nblk)
+                checked += 1
         for K, fmt, sx in lean_cases.out_cases(in_fmt):
             assert lean[(F.tag + "out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
             checked += 1

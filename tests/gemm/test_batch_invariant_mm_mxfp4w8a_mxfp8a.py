@@ -406,7 +406,18 @@ def test_block_scaled_spaces_and_acceptance():
         and len(knob_product(in_fmt="mxfp4w8a_k64")) == 520
     )
     for fmt, twin in (("mxfp4w8a", "mxfp8"), ("mxfp4w8a_k64", "mxfp8_k64")):
-        assert knob_product(in_fmt=fmt) == knob_product(in_fmt=twin)
+        prod = knob_product(in_fmt=fmt)
+        # the records are the MXFP8 twin's with the k-block erased: the SM107 class's swapped records stage 256 elements
+        # (`Knobs.k_block`, the weight's TMA row at 128 bytes), every other record the 128-byte rule
+        assert [dataclasses.replace(k, k_block=0) for k in prod] == knob_product(
+            in_fmt=twin
+        )
+        kb = 256 if fmt == "mxfp4w8a_k64" else 0
+        assert all(k.k_block == (kb if k.swap_ab else 0) for k in prod)
+        assert all(
+            k.describe().endswith("_swap_kb256") == (k.swap_ab and kb == 256)
+            for k in prod
+        )
         assert enumerate_space(*REFERENCE_SHAPE, b_major="n", in_fmt=fmt) == []
         ref = enumerate_space(*REFERENCE_SHAPE, b_major="k", in_fmt=fmt)
         assert ref == enumerate_space(*REFERENCE_SHAPE, b_major="k", in_fmt=twin)
@@ -414,6 +425,9 @@ def test_block_scaled_spaces_and_acceptance():
         assert set(ref) < set(dec) and all(k.swap_ab for k in set(dec) - set(ref))
         c4 = enumerate_space(16, 128, 8192, chunks=4, b_major="k", in_fmt=fmt)
         assert any(k.cluster_k == 4 for k in c4) and any(k.cta_chunks for k in c4)
+        assert [dataclasses.replace(k, k_block=0) for k in c4] == enumerate_space(
+            16, 128, 8192, chunks=4, b_major="k", in_fmt=twin
+        )
         dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
         for K in (128, 256, 3968, 4096, 65536):
             assert can_implement(dense, 64, 256, K, "k", 1, fmt), (fmt, K)

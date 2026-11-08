@@ -97,6 +97,8 @@ def main : IO Unit := do
     IO.println s!"gemmmxw48k64 {steps} {C} {(outputElemAlpha "bf16" t).sexpr}"
   for nblk in gemmmxw48k64LoopCases do
     IO.println s!"gemmmxw48k64loop {nblk} {(kblockLoopMXW48K64 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMxW48K64 3 .zero nblk).sexpr}"
+  for nblk in gemmmxw48k64LoopCases do
+    IO.println s!"gemmmxw48k64swaploop {nblk} {(kblockLoopMXW48K64 ⟨0⟩ ⟨0⟩ gemmMainloopInnerMxW48K64Swap 3 .zero nblk).sexpr}"
   for (steps, fmt) in gemmmxw48k64OutCases do
     IO.println s!"gemmmxw48k64out {steps} {fmt} {(outputKfoldMXW48K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do

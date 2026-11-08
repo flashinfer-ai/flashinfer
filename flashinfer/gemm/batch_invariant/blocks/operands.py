@@ -327,6 +327,8 @@ def can_implement(
             or (chunks > 1 and Kc % chunk_unit(in_fmt))
         ):
             return False
+        if chunks > 1 and knobs.k_block and Kc % knobs.k_block:
+            return False  # a chunk is whole k-tiles of the record's k-block
         if knobs.swap_ab:
             # the decode specialisation: the kernel's M is N (the weights), its N is M (the tokens), all tokens in one
             # tile (the scale-factor atom read from its start); the M-major output needs N aligned
@@ -334,7 +336,7 @@ def can_implement(
                 chunks == 1
                 and knobs.tile_n >= M
                 and N % ALIGN["bf16"] == 0
-                and K % al_in == 0
+                and Kc % al_in == 0
             )
         if knobs.cluster_k > 1:
             # the in-cluster split computes exactly the class kchunk[cluster_k]: its chunks are whole k-tiles (one smem
@@ -343,7 +345,7 @@ def can_implement(
             # the record is not a placement of the shape and the workspace split (the same class) takes over
             from ..generator import MainloopBlock
 
-            k_tile = MainloopBlock(in_fmt).k_block
+            k_tile = MainloopBlock(in_fmt, knobs.k_block).k_block
             tiles = -(-M // knobs.tile_m) * -(-N // knobs.tile_n)
             return (
                 chunks == knobs.cluster_k
