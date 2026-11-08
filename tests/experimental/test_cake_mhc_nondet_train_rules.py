@@ -19,10 +19,12 @@ issue #8068; no GPU needed, nothing is built or launched).
 
 The package is a standalone copy of the deterministic package
 (``flashinfer.experimental.cake.cake_mhc_det_train``) under the ``cake_mhc_train_``
-prefix at its hidden sizes (4096 on every architecture, 5120 and 7168 on
-sm_100a / sm_103a), except the ``bwd_finish`` routes.  This module checks the
-registry ``cake_jit.py`` against the deterministic registry's records, routes
-and record scalars of every hidden size on its boards of record
+prefix at its own hidden sizes (4096 on every architecture, 5120 and 7168 on
+sm_100a / sm_103a: ``ND_HIDDEN_SIZES``), except the ``bwd_finish`` routes.  The
+deterministic package also exports 5120 and 7168 on sm_107a, which this package
+does not copy.  This module checks the registry ``cake_jit.py`` against the
+deterministic registry's records, routes and record scalars of this package's
+(architecture, hidden size) pairs on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
@@ -149,11 +151,17 @@ det_build = cake_package("cake.cake_mhc_det_train", "cake_build")
 PACKAGE_DIR = Path(nd.__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[2]
 HIDDEN = 4096
-# The package's hidden sizes (the deterministic package's): 4096 on every architecture, 5120 and 7168 on the
-# architectures of NEW_HIDDEN_ARCHES.
+# The package's hidden sizes: 4096 on every architecture, 5120 and 7168 on the architectures of NEW_HIDDEN_ARCHES
+# (the deterministic package also exports 5120 and 7168 on sm_107a; this package does not).
 HIDDEN_SIZES = (4096, 5120, 7168)
 NEW_HIDDEN_SIZES = HIDDEN_SIZES[1:]
 NEW_HIDDEN_ARCHES = ("sm_100a", "sm_103a")
+# The hidden sizes this package exports per architecture: the (architecture, hidden size) pairs on which it is
+# compared with the deterministic records, routes and record scalars (test_exported_hidden_sizes_per_architecture).
+ND_HIDDEN_SIZES = {
+    arch: HIDDEN_SIZES if arch in NEW_HIDDEN_ARCHES else (HIDDEN,)
+    for arch in det.ARCHES
+}
 ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 OWN = {
@@ -394,12 +402,22 @@ GROUP_ROW_KEYS = ("groups", "group_rows", "param_dim0", "param_dim1")
 # Sinkhorn counts other than the count of record: the token-owner pass runs its run-time-count record.
 RUN_TIME_ITERS = (1, 7, 64)
 T_VALUES = tuple(T for T in det.RULES_T_VALUES if T > 0)
-# The deterministic records, routes and record scalars of this package's hidden sizes (every size the deterministic
-# package exports: this package copies each of them).
+# The deterministic records, routes and record scalars of this package's (architecture, hidden size) pairs
+# (ND_HIDDEN_SIZES): a record keeps the architectures that export its hidden size here; a record left with none (the
+# deterministic sm_107a records at 5120 and 7168) has no copy in this package.
 DET_MODULES = {
-    name: record
+    name: {
+        **record,
+        "arches": [
+            arch
+            for arch in record["arches"]
+            if record["hidden"] in ND_HIDDEN_SIZES.get(arch, ())
+        ],
+    }
     for name, record in det.MODULES.items()
-    if record["hidden"] in HIDDEN_SIZES
+    if any(
+        record["hidden"] in ND_HIDDEN_SIZES.get(arch, ()) for arch in record["arches"]
+    )
 }
 DET_ROUTES = {
     arch: {
@@ -407,7 +425,9 @@ DET_ROUTES = {
         for key, route in routes.items()
         if key
         in {
-            det.route_key(hidden, kind) for hidden in HIDDEN_SIZES for kind in det.KINDS
+            det.route_key(hidden, kind)
+            for hidden in ND_HIDDEN_SIZES.get(arch, ())
+            for kind in det.KINDS
         }
     }
     for arch, routes in det.ROUTES.items()
@@ -607,8 +627,8 @@ def _route_hidden(key: str) -> int:
 
 
 def _arch_sizes(arch: str) -> tuple[int, ...]:
-    """The hidden sizes of ``arch``: the deterministic package's (this package routes every size it does)."""
-    return tuple(det.supported_hidden_sizes(arch))
+    """The hidden sizes this package exports on ``arch`` (:data:`ND_HIDDEN_SIZES`; none on another architecture)."""
+    return ND_HIDDEN_SIZES.get(arch, ())
 
 
 def _det_role(name: str) -> str:
@@ -652,8 +672,9 @@ def _torch_deterministic(mode: bool, *, warn_only: bool = False):
 def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_split() -> (
     None
 ):
-    """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*``, the
-    backward fn splits and the checkpoint carry's records (``CARRY_ROLES``) under the ``cake_mhc_train_`` prefix
+    """``MODULES`` = every deterministic record of this package's (architecture, hidden size) pairs (``DET_MODULES``)
+    but ``bwd_slab__*`` / ``bwd_reduce__*``, the backward fn splits and the checkpoint carry's records
+    (``CARRY_ROLES``) under the ``cake_mhc_train_`` prefix
     (the record equal field for field after the rename: arches, hidden size, build knobs, launch, arguments, rules;
     the token owner's group-row forms ``DET_GROUP_ROWS`` included, and every token owner selects by the
     deterministic rule, so none by its ``R`` regimes alone) plus the programs of this package (``OWN``); the dropped
@@ -661,8 +682,14 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     records are the only other records without a copy (no record of this package has a carry role, and the carry's
     table and rules, ``CARRY_RULES``, have no copy)."""
     assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
+    assert {record["hidden"] for record in det.MODULES.values()} == set(HIDDEN_SIZES)
     assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
-    assert DET_MODULES == det.MODULES
+    # every deterministic record at the architectures that export its size in this package; a record with none of
+    # them (sm_107a at 5120 and 7168) has no copy
+    for name, record in det.MODULES.items():
+        arches = [a for a in record["arches"] if record["hidden"] in _arch_sizes(a)]
+        want = {**record, "arches": arches} if arches else None
+        assert DET_MODULES.get(name) == want, name
     dropped = {name for name in DET_MODULES if _dropped(name)}
     assert dropped and {_det_role(name) for name in dropped} == set(DROPPED_ROLES)
     assert not [
@@ -700,7 +727,7 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     for name in CARRY_RULES:
         assert hasattr(det, name) and not hasattr(nd, name), name
     for name, det_name in copied.items():
-        assert nd.MODULES[name] == _renamed(det.MODULES[det_name]), name
+        assert nd.MODULES[name] == _renamed(DET_MODULES[det_name]), name
     for name, record in nd.MODULES.items():
         assert record["kernel_symbol"] == f"kernel_{record['kernel']}", name
         assert record["library"] == record["kernel"], name
@@ -2090,7 +2117,7 @@ _TWO_SIZE_CASES = [
         arch, sm, hidden, calibration, id=f"{arch}-{sm}-H{hidden}-{calibration}"
     )
     for arch, sm in det.RULES_BOARDS
-    for hidden in det.supported_hidden_sizes(arch)
+    for hidden in _arch_sizes(arch)
     for calibration in (
         ("record", "screen") if arch in OWN.get(_lpt(hidden), ()) else ("record",)
     )
@@ -3144,10 +3171,26 @@ def test_route_plan_binds_the_gb300_cell(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
+def test_exported_hidden_sizes_per_architecture() -> None:
+    """The (architecture, hidden size) pairs this package exports, on which the tests of this module compare it with
+    the deterministic records and routes: 4096, 5120 and 7168 on sm_100a / sm_103a, 4096 alone on sm_107a.  The
+    deterministic package exports each of them (and 5120 and 7168 on sm_107a too, which have no copy here)."""
+    assert ND_HIDDEN_SIZES == {
+        "sm_100a": (4096, 5120, 7168),
+        "sm_103a": (4096, 5120, 7168),
+        "sm_107a": (4096,),
+    }
+    for arch in det.ARCHES:
+        assert tuple(nd.supported_hidden_sizes(arch)) == ND_HIDDEN_SIZES[arch], arch
+        assert set(ND_HIDDEN_SIZES[arch]) <= set(det.supported_hidden_sizes(arch)), arch
+
+
+@pytest.mark.cpu_only
 def test_route_glue_and_supported_hidden_sizes() -> None:
-    """The hidden sizes of each architecture are the deterministic package's: 4096, 5120 and 7168 on sm_100a /
-    sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the deterministic one
-    does; a size or architecture without a route is a ``ValueError`` of the selection, and a size the package does
+    """The hidden sizes of each architecture are this package's (``ND_HIDDEN_SIZES``): 4096, 5120 and 7168 on
+    sm_100a / sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the
+    deterministic one does at those sizes (the deterministic package also routes 5120 and 7168 on sm_107a); a size
+    or architecture without a route is a ``ValueError`` of the selection, and a size the package does
     not list one of the column slab's rules (``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
     ``slab_plan``; as in ``host_plan``)."""
     for arch in det.ARCHES:
@@ -3177,9 +3220,14 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
                 applies = nd.route_applies(
                     device_capability=capability, hidden=hidden, kind=kind
                 )
-                assert applies == det.route_applies(
+                det_applies = det.route_applies(
                     device_capability=capability, hidden=hidden, kind=kind
-                ), (capability, hidden, kind)
+                )
+                assert applies == (det_applies and hidden in _arch_sizes(arch)), (
+                    capability,
+                    hidden,
+                    kind,
+                )
                 assert applies == (hidden in _arch_sizes(arch)), (capability, hidden)
         for capability in ((9, 0), (12, 0), (10, 1)):
             for hidden in HIDDEN_SIZES:
