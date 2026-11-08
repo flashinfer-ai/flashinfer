@@ -356,8 +356,10 @@ PDL_STAGES = frozenset(
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 51 and len(set(cake_jit.STAGES)) == 51
-    assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
+    # one stage per call-site argument list (the count follows the chain's table)
+    stages = cake_jit.STAGES
+    assert len(stages) == len(set(stages)) == len(cake_chain.LAUNCH_ARGS)
+    assert set(cake_chain.LAUNCH_ARGS) == set(stages)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
             serving = [
