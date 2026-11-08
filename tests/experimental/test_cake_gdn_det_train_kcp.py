@@ -3055,6 +3055,7 @@ README_SAVED_ROWS = {
     "`rowscale`, `qscale`": ("rowscale", "qscale"),
     "`h` tape, `v_new`, `w`, `u`, `Aqk`": ("h_tape", "v_new", "w", "u", "aqk"),
     "`qk_rstd`": ("qk_rstd",),
+    "`qn`, `kn`": ("qn", "kn"),
 }
 # the ten forward tapes save_mode="full" keeps (the options table's save_mode row states their bytes per row)
 FULL_TAPE_TERMS = (
@@ -3159,6 +3160,15 @@ def test_readme_saved_set_table_matches_the_saved_layout() -> None:
     # the formula cells: qk_rstd = 8 T_r H_qk (saved boundary), M_seg = P n_frag s (P > 1), S_in = n_in s_pad, the
     # owner's pairs = 2 s_owner N_out
     assert rows["`qk_rstd`"][2] == "`8 * T_r * H_qk`"
+    # the full set's normalized rows: qn = kn = 256 T_r H_qk (BF16, K = 128), 8,192 B per token for both at H_qk = 16
+    assert (
+        rows["`qn`, `kn`"][2]
+        == "`2 * 256 * T_r * H_qk` (8,192 B per token at `H_qk = 16`)"
+    )
+    lay_qk = gb.cake_gdn_det_train_kcp_saved_layout(
+        ctx, H_qk=16, HV=48, save_mode="full", P=1, use_qk_l2norm_in_kernel=True
+    )
+    assert lay_qk["qn"] + lay_qk["kn"] == 2 * 256 * ctx.T_r * 16 == 8192 * ctx.T_r
     assert rows["`M_seg`"][2] == "`P * n_frag * s`"
     assert rows["`S_in`"][2] == "`n_in * s_pad`"
     assert rows["received summary pairs"][2] == "`2 * s_owner * N_out`"
