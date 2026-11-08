@@ -24,7 +24,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashinfer.experimental.cake.cake_gdn_nondet_train import cake_chain, cake_plan
+from tests.test_helpers.cake_package import cake_package
+
+cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
+cake_plan = cake_package("cake_gdn_nondet_train", "cake_plan")
 
 PAIRS = (11000, 12000, 9768)
 ROWS = {
