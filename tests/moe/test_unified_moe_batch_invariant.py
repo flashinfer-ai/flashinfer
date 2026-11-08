@@ -1149,6 +1149,63 @@ def test_route_plan_equals_route_and_plan(T, k, E, method):
 
 
 @needs_device
+@pytest.mark.parametrize("pad_align", [128, 32])
+@pytest.mark.parametrize(
+    "T,k,E,method",
+    [
+        (1, 8, 256, "softmax_renorm"),
+        (16, 8, 128, "softmax_renorm"),
+        (7, 4, 8, "softmax_renorm"),
+        (13, 8, 128, "sigmoid_bias_renorm_scaled"),
+        (0, 8, 128, "softmax_renorm"),
+    ],
+)
+def test_route_plan_padded_positions_equal_route_and_plan(T, k, E, method, pad_align):
+    """``api.route_plan(..., pad_align)`` (the padded packings' form) gives the dense plan's bits and integers plus the second
+    position table of the two-launch dual plan: ``dest_pad[i] = pad_off[e_i] + (dest[i] - off[e_i])`` with ``pad_off`` the
+    exclusive prefix of the counts rounded up to ``pad_align``, and ``pos_pad[p] = dest_pad[src[p]]``."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    meth = (
+        S.SOFTMAX_RENORM if method == "softmax_renorm" else S.SIGMOID_BIAS_RENORM_SCALED
+    )
+    g = torch.Generator().manual_seed(T * 11 + E + pad_align)
+    logits = (torch.randn(max(T, 1), E, generator=g) * 2).float()[:T].cuda()
+    bias = (torch.randn(E, generator=g) * 0.1).float().cuda() if meth.bias else None
+    scale = 2.5 if meth.scaled else None
+    ex, w = api.route(logits, k, meth, bias, scale)
+    counts, dest, src = api.permute_plan(ex, E)
+    ex2, w2, counts2, dest2, src2, dest_pad, pos_pad = api.route_plan(
+        logits, k, meth, bias, scale, pad_align=pad_align
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2))
+    assert (
+        torch.equal(counts, counts2)
+        and torch.equal(dest, dest2)
+        and torch.equal(src, src2)
+    )
+    c = counts.cpu().long()
+    off = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.long), c]), 0)[:-1]
+    pad_off = torch.cumsum(
+        torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long),
+                (c + pad_align - 1) // pad_align * pad_align,
+            ]
+        ),
+        0,
+    )[:-1]
+    e_i = ex.cpu().long().reshape(-1)
+    d = dest.cpu().long().reshape(-1)
+    dest_pad_ref = pad_off[e_i] + (d - off[e_i])
+    assert torch.equal(dest_pad.cpu().long().reshape(-1), dest_pad_ref)
+    assert torch.equal(pos_pad.cpu().long(), dest_pad_ref[src.cpu().long()])
+    assert dest_pad.shape == (T, k) and pos_pad.shape == (T * k,)
+
+
+@needs_device
 def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
     (the same ids and weights from ``route``) bit for bit."""

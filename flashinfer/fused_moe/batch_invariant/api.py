@@ -317,16 +317,22 @@ def route_plan(
     method: Union[S.RoutingMethod, str] = S.SOFTMAX_RENORM,
     bias: Optional[torch.Tensor] = None,
     scaling_factor: Optional[Union[float, torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    pad_align: int = 1,
+) -> Tuple[torch.Tensor, ...]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
-    route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``."""
+    route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``.
+    ``pad_align > 1`` (the padded packings of the block-scaled backends) appends the second position table: ``dest_pad [T, k]``
+    the position of every expanded row with the groups padded to ``pad_align`` rows and ``pos_pad [T k]`` the padded position
+    of every dense row (the integers of the two-launch dual plan)."""
     from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
 
     method = S.METHODS[method] if isinstance(method, str) else method
     if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
         raise TypeError("route_plan: logits must be a row-major f32 or bf16 [T, E]")
+    if pad_align < 1:
+        raise ValueError(f"route_plan: pad_align {pad_align} must be >= 1")
     T, E = logits.shape
     if E > MAX_E:
         raise ValueError(
@@ -366,12 +372,38 @@ def route_plan(
     counts = torch.empty(E, dtype=torch.int32, device=dev)
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.empty(n, dtype=torch.int32, device=dev)
+    padded = pad_align > 1
+    dest_pad = torch.empty(n if padded else 0, dtype=torch.int32, device=dev)
+    pos_pad = torch.empty(n if padded else 0, dtype=torch.int32, device=dev)
     if T:
-        get_compiled_route_plan(expert_bucket(E), top_k, method, _IN[logits.dtype])(
-            logits, b, s, experts, weights, counts, dest, src, T, E
+        get_compiled_route_plan(
+            expert_bucket(E), top_k, method, _IN[logits.dtype], pad_align
+        )(
+            logits,
+            b,
+            s,
+            experts,
+            weights,
+            counts,
+            dest,
+            src,
+            dest_pad if padded else dest,
+            pos_pad if padded else src,
+            T,
+            E,
         )
     else:
         counts.zero_()
+    if padded:
+        return (
+            experts,
+            weights,
+            counts,
+            dest.view(T, top_k),
+            src,
+            dest_pad.view(T, top_k),
+            pos_pad,
+        )
     return experts, weights, counts, dest.view(T, top_k), src
 
 
