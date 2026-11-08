@@ -1169,36 +1169,46 @@ def test_forced_redo_of_most_rows_repeats_bit_for_bit(monkeypatch, nope):
     print("FORCED_REDO rel-L2 vs the shipped grid", rel_l2(dkv, ref_dkv))
 
 
-def test_nope_redo_persistent_grid_gives_the_bits_of_a_cta_per_token(monkeypatch):
-    """The NoPE redo launches one persistent CTA per SM (``nope_bwd_redo_launch_grid``) whatever the key count; with
-    most rows recomputed by the redo (``GRID_SHIFT = 24``) it gives the bits of a redo launched with a CTA per token."""
-    _require_program(backward=True, program=cake_jit.NOPE_PROGRAM)
+@pytest.mark.parametrize("nope", [False, True], ids=["rope", "nope"])
+def test_redo_persistent_grid_gives_the_bits_of_a_cta_per_token(monkeypatch, nope):
+    """The redo launches one persistent CTA per SM (``redo_launch_grid``) whatever the key count; with most rows
+    recomputed by the redo (``GRID_SHIFT = 24``) it gives the bits of a redo launched with a CTA per token."""
+    _require_program(
+        backward=True, program=cake_jit.NOPE_PROGRAM if nope else cake_jit.PROGRAM
+    )
     inp = make_inputs([256], [1024], seed=SEED + 32, topk=256)
     T = inp.total_q
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    assert cake_backend.nope_bwd_redo_launch_grid(T, sm_count) == min(T, sm_count)
-    assert cake_backend.nope_bwd_redo_launch_grid(T, 1 << 20) == T
-    assert cake_backend.nope_bwd_redo_launch_grid(0, sm_count) == 1
+    assert cake_backend.redo_launch_grid(T, sm_count) == min(T, sm_count)
+    assert cake_backend.redo_launch_grid(T, 1 << 20) == T
+    assert cake_backend.redo_launch_grid(0, sm_count) == 1
     monkeypatch.setattr(cake_backend, "GRID_SHIFT", 24)
     monkeypatch.setattr(cake_backend, "MIN_BUMP", 25)
+    stage = "nope_bwd_redo" if nope else "bwd_redo"
+    table = "NOPE_PERSISTENT_GRIDS" if nope else "PERSISTENT_GRIDS"
 
     def run():
-        runner = cake_backend.prepare_dsa_nope_train(
-            inp.q_latent, inp.kv_latent, inp.idx_global,
-            topk_length=inp.topk_length, dout=inp.dout,
-        )  # fmt: skip
+        if nope:
+            runner = cake_backend.prepare_dsa_nope_train(
+                inp.q_latent, inp.kv_latent, inp.idx_global,
+                topk_length=inp.topk_length, dout=inp.dout,
+            )  # fmt: skip
+        else:
+            runner = cake_backend.prepare_dsa_train(
+                *_rope_args(inp), topk_length=inp.topk_length, dout=inp.dout,
+            )  # fmt: skip
         runner.forward()
-        out = [t.clone() for t in runner.backward()]
+        out = [t.clone() for t in runner.backward() if t is not None]
         return runner, out
 
     persistent, got = run()
-    assert tuple(persistent.launches["nope_bwd_redo"].grid) == (min(T, sm_count), 1, 1)
+    assert tuple(persistent.launches[stage].grid) == (min(T, sm_count), 1, 1)
     assert _globals(persistent)[cake_backend.REDO_WORD] > inp.total_k // 4
-    grids = dict(cake_backend.NOPE_PERSISTENT_GRIDS)
-    grids["nope_bwd_redo"] = lambda num_queries, num_kv, sms: num_queries
-    monkeypatch.setattr(cake_backend, "NOPE_PERSISTENT_GRIDS", grids)
+    grids = dict(getattr(cake_backend, table))
+    grids[stage] = lambda num_queries, num_kv, sms: num_queries
+    monkeypatch.setattr(cake_backend, table, grids)
     per_token, want = run()
-    assert tuple(per_token.launches["nope_bwd_redo"].grid) == (T, 1, 1)
+    assert tuple(per_token.launches[stage].grid) == (T, 1, 1)
     for a, b in zip(got, want, strict=True):
         assert _same_bits(a, b)
 

@@ -90,7 +90,8 @@ limitations under the License.
 #   range move to a coarser grid (at least ``L + 1`` bits, :data:`MIN_BUMP`),
 #   are zeroed and recomputed by the main kernel's redo build, which visits
 #   every token and adds only the pairs of the flagged rows (no dQ).  Both
-#   launch on every call; the redo returns at once when no row is flagged (no
+#   launch on every call; the redo runs one persistent CTA per SM
+#   (:func:`redo_launch_grid`) and returns at once when no row is flagged (no
 #   host synchronization).  A flagged row costs a full pass of the main
 #   kernel over the pairs (the redo does not compact them).
 # * ``bwd_fold``: ``v = float(n) * 2 ** e`` (one rounding) into the fresh BF16
@@ -1274,6 +1275,23 @@ class _Launch:
         self.launcher(self.run, self.values, self.grid)
 
 
+def redo_launch_grid(num_queries: int, sm_count: int) -> int:
+    """Grid (x) of the redo launch (``bwd_redo`` / ``nope_bwd_redo``) over ``num_queries`` tokens -- the kernels'
+    ``redo_launch_grid``, mirrored: one persistent CTA per SM (``min(num_queries, sm_count)``, at least one) whatever
+    the key count.  A CTA takes the tokens ``blockIdx.x + k * gridDim.x`` in turn, so every grid gives the same bits;
+    a redo with no flagged row costs one wave instead of a CTA per token."""
+    return max(1, min(int(num_queries), int(sm_count)))
+
+
+# The RoPE backward stages launched with a persistent grid instead of the generated rule (one CTA per token), and
+# their grid ``rule(num_queries, num_kv, sm_count)``.
+PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
+    "bwd_redo": lambda num_queries, num_kv, sm_count: redo_launch_grid(
+        num_queries, sm_count
+    ),
+}
+
+
 def _stage_entry(
     stage: str,
     arch: str,
@@ -1666,8 +1684,11 @@ def _plan(
     if backward:
         # every registered backward stage, in the record's order, on every call
         backward_order = cake_jit.BACKWARD_STAGES
+        sm_count = _sm_count(_device_index(device))
         for stage in backward_order:
-            entries[stage] = _stage_entry(stage, arch, scalars)
+            rule = PERSISTENT_GRIDS.get(stage)
+            grid = (rule(T, S, sm_count), 1, 1) if rule is not None else None
+            entries[stage] = _stage_entry(stage, arch, scalars, grid=grid)
     return _Plan(
         module_name=module_name,
         arch=arch,
@@ -3172,17 +3193,10 @@ def nope_bwd_launch_grid(num_queries: int, num_kv_in_pass: int, sm_count: int) -
     return int(num_queries)
 
 
-def nope_bwd_redo_launch_grid(num_queries: int, sm_count: int) -> int:
-    """Grid (x) of the NoPE redo launch over ``num_queries`` tokens -- the kernel's ``redo_launch_grid``, mirrored:
-    one persistent CTA per SM (``min(num_queries, sm_count)``, at least one) whatever the key count, so a redo with no
-    marked row costs one wave instead of a CTA per token."""
-    return max(1, min(int(num_queries), int(sm_count)))
-
-
 # The NoPE backward stages launched with a persistent grid instead of the generated rule, and their grid.
 NOPE_PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
     "nope_bwd_main": nope_bwd_launch_grid,
-    "nope_bwd_redo": lambda num_queries, num_kv, sm_count: nope_bwd_redo_launch_grid(
+    "nope_bwd_redo": lambda num_queries, num_kv, sm_count: redo_launch_grid(
         num_queries, sm_count
     ),
 }

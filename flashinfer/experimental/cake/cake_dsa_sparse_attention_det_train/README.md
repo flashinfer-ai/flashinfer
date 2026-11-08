@@ -91,6 +91,7 @@ program prefixes the names with `nope_`); no stage is chosen by a tensor value:
    (`cake_backend.MIN_BUMP`), is zeroed and is recomputed by the main
    kernel's redo build, which visits every token and adds only the pairs of the
    flagged rows (no dQ).  Both stages are launched on every backward; the redo
+   runs one persistent CTA per SM (`cake_backend.redo_launch_grid`) and
    returns at once when no row is flagged (no host synchronization).
 7. `bwd_fold`: `v = float(n) * 2 ** e` (one rounding) into the fresh outputs
    (every row; a row no pair touches is `+0.0`), or `dkv_acc[r] = prev + v`
