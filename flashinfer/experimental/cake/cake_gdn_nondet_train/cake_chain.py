@@ -4405,12 +4405,13 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
             ctx.plan_key = key
         elif plan.ops is not None:
             ctx.plan_key, ctx.plan = key, plan
-    if cu_seqlens is not None and cu_seqlens_cpu is None:
+    if cu_seqlens is not None and cu_seqlens_cpu is None and _saved_hooks_active():
         # the device route's tables are one int32 tensor of this call (the ``meta``
-        # kernel's output): saved after the tape (``_function_backward`` takes it
-        # off and builds the ChunkMeta over it again), so non-reentrant
-        # checkpointing drops it with the tape and its replayed forward builds it
-        # again; ``ctx`` keeps only the host layout (#7039)
+        # kernel's output).  Under saved-tensor hooks (non-reentrant checkpointing,
+        # offload) it is saved after the tape (``_function_backward`` takes it off
+        # and builds the ChunkMeta over it again), so checkpointing drops it with the
+        # tape and its replayed forward builds it again; ``ctx`` keeps only the host
+        # layout (#7039).  A plain call keeps ``ctx.meta`` (no work in the backward)
         ctx.meta_layout = (meta.num_chunks, meta.num_seqs,
                            tuple((s.num_segments, s.segment_len, s.scan_config)
                                  for s in (meta.fwd_segments, meta.bwd_segments)))  # fmt: skip
@@ -4420,6 +4421,19 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
     if output.dtype != q.dtype:
         output = output.to(q.dtype)
     return output, (fwd["final_state"] if output_final_state else None)
+
+
+def _saved_hooks_active() -> bool:
+    """Whether default saved-tensor hooks pack this call's saved tensors (non-reentrant
+    checkpointing, CPU offload): the hook stack ``torch.utils.checkpoint`` itself reads;
+    ``True`` when this PyTorch has no such query (the table is then always saved)."""
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if top is None:
+        return True
+    try:
+        return top(False) is not None
+    except TypeError:  # an older signature without ``ignore_is_tracing``
+        return top() is not None
 
 
 def _function_backward(ctx, do, dht, grad_qkv=None):

@@ -129,9 +129,10 @@ dtype.  For a packed batch, `cu_seqlens_cpu` selects the route that builds the
 chunk and segment tables on the host; without it the `meta` kernel builds
 them on the device.  The device route plans its scans for a bound layout, so
 the two routes can pick different plans and agree to rounding, not bitwise.
-The device route saves its tables with the forward's other tensors, so
-non-reentrant activation checkpointing drops them with the rest and its
-replayed forward builds them again.
+Under saved-tensor hooks (non-reentrant activation checkpointing, offload)
+the device route saves its tables with the forward's other tensors, so
+checkpointing drops them with the rest and its replayed forward builds them
+again; a plain call keeps them for its backward.
 
 The entry point checks its inputs before the first launch and raises
 `ValueError`: every tensor on the device of `q`, `k` of the shape of `q`,
