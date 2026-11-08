@@ -213,6 +213,8 @@ order. Capacity must be positive and satisfy
 ``capacity * 16 * 3584 < 2**31``. ``knobs=None`` uses the native
 heuristic; a dictionary pins native settings. Online tuning,
 workspace pooling, and live-token tuning profiles are not supported.
+MXFP4/MXFP8 uses asynchronous epilogue flags; both ``epi_flag_batches``
+values must be in ``[1, 4]``.
 
 Warm each input shape before capture on every rank. CUDA graphs keep the
 token shape fixed; update values in the captured input tensors before
