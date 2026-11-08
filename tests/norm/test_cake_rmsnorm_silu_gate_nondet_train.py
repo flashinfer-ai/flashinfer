@@ -31,21 +31,21 @@ the floor of the FP64 reference's largest magnitude, ``dw`` within
 FP32 weight gradient (accumulated or not) must be the same bits on every
 launch and on every path: streams, CUDA Graph replays, autograd,
 ``compute_grad_weight`` (``False`` the bits of the BF16 bands' module), grids
-smaller than the work (the static, the claimed,
-the row-claims and the fused backwards at 1, 3 and 7 CTAs; the fused backward's
-weight gradient the bits of its grid, whose chunks follow it), a workspace
-reused across shapes; so must a BF16 weight gradient in every band of
-``BACKWARD_BANDS``
-but the row-claims backwards' (``_rc`` and ``_rc_mid``, :func:`_dw_varies`),
-whose CTAs claim row blocks at run time and add FP32 runs of rows with FP64
-atomics, so that their BF16 weight gradient may vary in its last bits from run
-to run: there every launch's BF16 weight gradient, alone and accumulated, lies
-within the budgets above instead.  The matrix covers dynamic token and head
+smaller than the work (the static, the claimed, the row-claims and the fused
+backwards at 1, 3 and 7 CTAs), a workspace reused across shapes; so must a
+BF16 weight gradient of every backward but the fused backward
+(``bwd_bf16_fused``, which runs a BF16 weight gradient's rows past the
+small-row bands of ``BACKWARD_BANDS`` on every architecture) and the
+row-claims backwards (``_rc`` and ``_rc_mid``, :func:`_varies`), whose CTAs
+claim 16-row blocks at run time and add FP32 runs of rows with FP64 atomics,
+so that their BF16 weight gradient may vary in its last bits from run to run:
+there every launch's BF16 weight gradient, alone and accumulated, lies within
+the budgets above instead.  The matrix covers dynamic token and head
 counts (``H = 48`` and small or irregular row counts), ``[T, H, 128]`` strided
 and flattened layouts (also in the bands of the claimed, the row-claims and
 the fused backwards, whose sm_100a and sm_103a claimed and row-claims mid
-programs warm packed rows with a bulk prefetch and other layouts with a
-prefetch per thread),
+programs and fused program on every architecture warm packed rows with a bulk
+prefetch and other layouts with a prefetch per thread),
 near-zero variance, saturated gates, weight-gradient terms that cancel per
 column, FP32 and BF16 weight gradients,
 accumulation, ``compute_grad_weight=False``, the small-row backwards (one
@@ -67,7 +67,8 @@ rows of every band of ``BACKWARD_BANDS`` run the band's program), and the mode
 policy: the mode is in the name, so no entry point takes a ``deterministic``
 keyword (passing one, of any value, is a ``TypeError`` before any launch); under
 ``torch.use_deterministic_algorithms(True)`` a backward that computes the
-weight gradient on a row-claims backward raises PyTorch's alert immediately
+weight gradient on the fused or a row-claims backward (grid kind
+``row_claims``) raises PyTorch's alert immediately
 before its launch (a ``RuntimeError``; with ``warn_only=True`` a
 ``UserWarning``, after which it runs; a CUDA Graph warns when it is captured
 and not when it is replayed), and every other call (the other bands,
@@ -146,9 +147,6 @@ WORKSPACE_DTYPES = {
     "dw_sums": torch.float64,
     "dw_spec": torch.float32,
     "dw_done": torch.uint32,
-    "acc": torch.uint64,
-    "flags": torch.uint32,
-    "done": torch.uint32,
 }
 # The row-claims backwards of a BF16 weight gradient (the base and the mid
 # backward whose CTAs claim 16-row blocks at run time) and their grid rules:
@@ -161,20 +159,21 @@ ROW_CLAIMS_GRID_RULES = {
 }
 ROW_CLAIMS_LAYOUT = (("dw_sums", 0, 4 * D), ("dw_done", 4096, 2))
 ROW_CLAIMS_WORKSPACE_BYTES = 4104
-# The fused backward (the deterministic package's backward program under this
-# package's name: ``bwd_bf16_fused``, a BF16 weight gradient on sm_107a; an
-# FP32 weight gradient runs no fused backward) and its grid rule: at most 4
-# CTAs per SM claiming 16-row blocks; and its workspace: 2304 u64 fixed-point
-# digits (``acc``), a u32 flag word a column (``flags``) and the u32 arrival
-# ticket and claim counter (``done``), 18952 bytes.
+# The fused backward of a BF16 weight gradient on every architecture
+# (``bwd_bf16_fused``: the row arithmetic of the deterministic package's BF16
+# backward program, the claimed 16-row block schedule, the weight gradient
+# added with FP64 atomics; an FP32 weight gradient runs no fused backward) and
+# its grid rule: at most 4 CTAs per SM claiming 16-row blocks, the grid kind
+# and the rule of ``bwd_bf16_rc``; and its workspace: the row-claims layout,
+# 4104 bytes.
 FUSED_ROLES = {
-    "sm_100a": (),
-    "sm_103a": (),
+    "sm_100a": ("bwd_bf16_fused",),
+    "sm_103a": ("bwd_bf16_fused",),
     "sm_107a": ("bwd_bf16_fused",),
 }
-FUSED_GRID_RULE = {"ctas_per_sm": 4, "kind": "claimed_row_blocks", "rows_per_block": 16}
-FUSED_LAYOUT = (("acc", 0, 18 * D), ("flags", 18432, D), ("done", 18944, 2))
-FUSED_WORKSPACE_BYTES = 18952
+FUSED_GRID_RULE = {"ctas_per_sm": 4, "kind": "row_claims", "rows_per_cta": 16}
+FUSED_LAYOUT = ROW_CLAIMS_LAYOUT
+FUSED_WORKSPACE_BYTES = ROW_CLAIMS_WORKSPACE_BYTES
 # The bytes of the backward workspace of each architecture, the largest of its
 # backward modules' (one zero-filled workspace serves them all, each module
 # laying its buffers over the first bytes): 29192 on sm_100a and sm_103a, 36360
@@ -375,21 +374,13 @@ def _band_shape(band: str) -> tuple[int, int] | None:
 
 def _varies(name: str) -> bool:
     """Whether the BF16 weight gradient of backward module ``name`` may vary
-    in its last bits from run to run: a row-claims backward's (``_rc`` and
-    ``_rc_mid``), whose CTAs claim 16-row blocks at run time and add the FP32
-    runs of their rows with FP64 atomics.  Every other backward repeats its
-    bits: the small-row backwards sum on chip in a fixed order, the static and
-    the claimed backwards add their partials exactly, as integers, and so
-    does the fused backward its chunks' terms, as fixed-point digits."""
+    in its last bits from run to run: the fused backward's and a row-claims
+    backward's (``_fused``, ``_rc`` and ``_rc_mid``, grid kind
+    ``row_claims``), whose CTAs claim 16-row blocks at run time and add the
+    FP32 runs of their rows with FP64 atomics.  Every other backward repeats
+    its bits: the small-row backwards sum on chip in a fixed order, the static
+    and the claimed backwards add their partials exactly, as integers."""
     return loader.MODULES[name]["grid_rule"]["kind"] == "row_claims"
-
-
-def _fused(name: str) -> bool:
-    """Whether backward module ``name`` is a fused backward (the
-    deterministic package's backward program, ``_fused``): its weight
-    gradient's bits are those of the rows and the grid (its chunks' rows
-    follow the grid), so a forced grid may give other bits than the host's."""
-    return loader.MODULES[name]["grid_rule"]["kind"] == "claimed_row_blocks"
 
 
 def _dw_varies(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> bool:
@@ -647,8 +638,10 @@ def test_layouts(layout):
 # (``z`` and ``dy`` the gate columns of wider projections, ``x`` and ``z``
 # head-major) fall back to a prefetch per thread.
 # One token of many heads (its token stride passed as 0) and contiguous tokens
-# are packed rows.  The row-claims backward (``bwd_bf16_rc``) and the fused
-# backward (``bwd_bf16_fused``) warm no rows and run the same checks.
+# are packed rows.  The row-claims backward (``bwd_bf16_rc``) warms no rows;
+# the fused backward (``bwd_bf16_fused``) warms the next block of a claim on
+# every architecture (one bulk prefetch per tensor for packed rows, else a
+# prefetch per thread); both run the same checks.
 BULK_BANDS = (
     "bwd_bf16_rc",
     "bwd_bf16_rc_mid",
@@ -853,8 +846,7 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     chunks or row blocks: ``dx`` and ``dz`` the bits of the host's grid; the
     weight gradient of the band's dtype, alone and accumulated, within the
     FP64 budget, and the bits of the host's grid where the band repeats them
-    (:func:`assert_dw_repeats`; a fused backward's, whose chunks follow the
-    grid, the bits of a second launch at the same grid instead);
+    (:func:`assert_dw_repeats`; within the budget only where it may vary);
     ``compute_grad_weight=False`` (the BF16 bands' module) leaves
     ``grad_weight`` as it is, ``dx`` and ``dz`` that module's bits at the
     host's grid; the workspace is zero after every launch."""
@@ -875,8 +867,8 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     main_d = torch.full((D,), 0.25, dtype=dtype, device="cuda")
     backward(dy, x, z, w, EPS, grad_weight=main_d, accumulate_grad_weight=True)
     # compute_grad_weight=False runs the BF16 bands' module, whose dx and dz
-    # are another program's where that is the fused backward (an FP32 band's
-    # rows in the fused band on sm_107a): the bits of its call at the host's grid
+    # are another program's where that is not the band's module (an FP32
+    # band's rows in the fused band): the bits of its call at the host's grid
     dx_n, dz_n = dx_d, dz_d
     if _backward_module(rows) != name:
         dx_n, dz_n, _ = backward(dy, x, z, w, EPS, compute_grad_weight=False)
@@ -887,21 +879,6 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     dw = torch.empty(D, dtype=dtype, device="cuda")
     dx, dz, _ = backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
     assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
-    if _fused(name):
-        # the bits of the forced grid: a second launch at it
-        dw_d = torch.empty(D, dtype=dtype, device="cuda")
-        backward(dy, x, z, w, EPS, grad_weight=dw_d, workspace=ws)
-        main_d = torch.full((D,), 0.25, dtype=dtype, device="cuda")
-        backward(
-            dy,
-            x,
-            z,
-            w,
-            EPS,
-            grad_weight=main_d,
-            accumulate_grad_weight=True,
-            workspace=ws,
-        )
     assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"dw {what}")
     assert_dw_within(dw, dw64, mag, what=f"dw {what}")
     assert not bool(ws.any()), what
@@ -924,8 +901,7 @@ def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeyp
     assert not bool(ws.any()), what
     # a call with compute_grad_weight=False runs the BF16 bands' module
     # whatever the dtype of grad_weight (it writes no weight gradient)
-    repeats = 4 if _fused(name) else 2
-    assert launches == [name] * repeats + [_backward_module(rows)], launches
+    assert launches == [name] * 2 + [_backward_module(rows)], launches
 
 
 @pytest.mark.parametrize("shape", [(0, 48, D), (5, 0, D), (0, D)])
@@ -1628,8 +1604,13 @@ def test_empty_and_errors():
 # source file names them.  The second static backwards of sm_100a and sm_103a
 # (9e8bf507c9563bb24193, 348592b55aa04975cc33) and of sm_107a (3 slots:
 # f5a44b8ba8bccb590488 of a BF16, de4ac875a4e07bb547fd of an FP32 weight
-# gradient), and the static backward of a BF16 weight gradient on sm_100a and
-# sm_103a (7e9f1c0cadbc18c390d2).
+# gradient), the static backward of a BF16 weight gradient on sm_100a and
+# sm_103a (7e9f1c0cadbc18c390d2), the deterministic package's backward program
+# under this package's name (8a6cb16beff15b6ffbfe, whose weight gradient the
+# fused backward now adds with FP64 atomics), and the forwards without the
+# split gate (c7919260b39b69e4e646, 83fe9e25ce0d01cc3ab1,
+# c6151f64f22ae65a48eb, cf7a87977aaad1a9822f, 3cb6aa31e140d9b13052,
+# 04bb67629537ef270bd4).
 REMOVED_PROGRAMS = tuple(
     f"cake_rmsnorm_silu_gate_train_{digest}"
     for digest in (
@@ -1638,15 +1619,24 @@ REMOVED_PROGRAMS = tuple(
         "7e9f1c0cadbc18c390d2",
         "f5a44b8ba8bccb590488",
         "de4ac875a4e07bb547fd",
+        "8a6cb16beff15b6ffbfe",
+        "c7919260b39b69e4e646",
+        "83fe9e25ce0d01cc3ab1",
+        "c6151f64f22ae65a48eb",
+        "cf7a87977aaad1a9822f",
+        "3cb6aa31e140d9b13052",
+        "04bb67629537ef270bd4",
     )
 )
 
 
 def test_registry_records_reference_the_build_manifest():
     """Every architecture routes the forward, the roles of its forward bands
-    and the roles of its ``BACKWARD_BANDS`` bands, and nothing else, one module
-    a role (the call role ``bwd_bf16`` on sm_107a only: no band of a BF16
-    weight gradient runs a static backward on sm_100a and sm_103a); every
+    and the roles of its ``BACKWARD_BANDS`` bands, one module a role, and
+    besides them only backward roles of a BF16 weight gradient that no band
+    runs (programs kept routed for measurement; the call role ``bwd_bf16`` on
+    sm_107a only: no static backward of a BF16 weight gradient ships on
+    sm_100a and sm_103a); every
     module record names its ``build.json`` library (schema ``cake-build/1``),
     whose entries carry the package's kernel and binding sources and the
     precise-arithmetic flags; no record, library or source file names a
@@ -1656,14 +1646,12 @@ def test_registry_records_reference_the_build_manifest():
     weight gradient of their architecture, ship on the architectures that
     route them and carry the workspace buffers of their slots
     (``BACKWARD_SLOTS``); the row-claims backward records claim 16-row blocks
-    by their grid rule (``ROW_CLAIMS_GRID_RULES``), launch 256-thread CTAs,
-    take the FP64 column sums and the two words (``ROW_CLAIMS_LAYOUT``) and no
-    chunks, and ship on the architectures that route them; the fused backward
-    records claim 16-row blocks by their grid rule (``FUSED_GRID_RULE``),
-    launch 256-thread CTAs, take the fixed-point digits, the flag words and
-    the two words (``FUSED_LAYOUT``) and no chunks, and ship on the
-    architectures that route them (``FUSED_ROLES``); the small-row backward
-    records launch one cluster and take no workspace."""
+    by their grid rule (``ROW_CLAIMS_GRID_RULES``; the fused backward's
+    ``FUSED_GRID_RULE``), launch 256-thread CTAs, take the FP64 column sums
+    and the two words (``ROW_CLAIMS_LAYOUT``) and no chunks, and ship on the
+    architectures that route them (the fused backward on every architecture,
+    ``FUSED_ROLES``); the small-row backward records launch one cluster and
+    take no workspace."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert (
@@ -1684,7 +1672,11 @@ def test_registry_records_reference_the_build_manifest():
         backward_bands = {
             band for bands in loader.BACKWARD_BANDS[arch].values() for _, band in bands
         }
-        assert routed == {"fwd"} | forward_bands | backward_bands, arch
+        banded = {"fwd"} | forward_bands | backward_bands
+        assert banded <= routed, (arch, banded - routed)
+        unbanded = routed - banded
+        assert all(role.startswith("bwd_bf16") for role in unbanded), (arch, unbanded)
+        assert not unbanded & set(loader.BAND_ROLES), (arch, unbanded)
         assert "bwd_f32" in routed, arch
         assert ("bwd_bf16" in routed) == (arch == "sm_107a"), arch
         for role, name in loader.ROUTES[arch].items():
@@ -1729,36 +1721,19 @@ def test_registry_records_reference_the_build_manifest():
             assert loader.workspace_bytes(name) == 0
         elif record["grid_rule"]["kind"] == "row_claims":
             role = record["role"]
-            assert role in ROW_CLAIMS_GRID_RULES, name
-            assert record["grid_rule"] == ROW_CLAIMS_GRID_RULES[role], name
+            fused = role in FUSED_ROLES[record["arches"][0]]
+            rule = FUSED_GRID_RULE if fused else ROW_CLAIMS_GRID_RULES.get(role)
+            assert record["grid_rule"] == rule, name
             assert record["launch"]["block"] == (256, 1, 1)
             assert {"dw_sums", "dw_done", "dw", "weight_grad"} <= set(plan), name
             assert not {"dw_win", "dw_spec", "blocks_per_chunk"} & set(plan), name
             routed_on = [a for a in loader.ARCHES if loader.ROUTES[a].get(role) == name]
             assert record["arches"] == routed_on, (name, record["arches"])
+            if fused:
+                assert routed_on == [a for a in loader.ARCHES if role in FUSED_ROLES[a]]
             assert record["workspace"] == {"dw_done": 2, "dw_sums": 4 * D}, name
             assert loader.workspace_layout(name) == ROW_CLAIMS_LAYOUT, name
             assert loader.workspace_bytes(name) == ROW_CLAIMS_WORKSPACE_BYTES, name
-            for arch in record["arches"]:
-                assert loader.workspace_bytes(name) <= WORKSPACE_BYTES[arch], name
-        elif record["grid_rule"]["kind"] == "claimed_row_blocks":
-            role = record["role"]
-            assert record["grid_rule"] == FUSED_GRID_RULE, name
-            assert record["launch"]["block"] == (256, 1, 1)
-            assert {"acc", "flags", "done", "dw", "weight_grad"} <= set(plan), name
-            assert not {
-                "dw_win",
-                "dw_sums",
-                "dw_spec",
-                "dw_done",
-                "blocks_per_chunk",
-            } & set(plan), name
-            routed_on = [a for a in loader.ARCHES if loader.ROUTES[a].get(role) == name]
-            assert record["arches"] == routed_on, (name, record["arches"])
-            assert routed_on == [a for a in loader.ARCHES if role in FUSED_ROLES[a]]
-            assert record["workspace"] == {"acc": 18 * D, "done": 2, "flags": D}, name
-            assert loader.workspace_layout(name) == FUSED_LAYOUT, name
-            assert loader.workspace_bytes(name) == FUSED_WORKSPACE_BYTES, name
             for arch in record["arches"]:
                 assert loader.workspace_bytes(name) <= WORKSPACE_BYTES[arch], name
         else:
@@ -1880,7 +1855,8 @@ ROW_CLAIMS_GRIDS = [
 )
 def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
     """The row-claims backwards (every routed module whose grid rule is
-    ``row_claims``): ``min(ceil(rows / 16), ctas_per_sm * SMs)`` CTAs, at most
+    ``row_claims`` but the fused backward's, :func:`test_fused_backward_cta_rule`):
+    ``min(ceil(rows / 16), ctas_per_sm * SMs)`` CTAs, at most
     one CTA a 16-row block (past one wave the CTAs claim the blocks from the
     claim counter at run time), a grid of that many CTAs, and no chunks."""
     assert -(-rows // 16) == blocks, rows
@@ -1889,7 +1865,7 @@ def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             rule = record["grid_rule"]
-            if rule["kind"] != "row_claims":
+            if rule["kind"] != "row_claims" or role in FUSED_ROLES[arch]:
                 continue
             found.add(role)
             assert rule == ROW_CLAIMS_GRID_RULES[role], (arch, role)
@@ -1910,17 +1886,16 @@ def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
     ("rows", "sm_count", "blocks", "ctas4", "_ctas5"), ROW_CLAIMS_GRIDS
 )
 def test_fused_backward_cta_rule(rows, sm_count, blocks, ctas4, _ctas5):
-    """The fused backward (every routed module whose grid rule is
-    ``claimed_row_blocks``, ``FUSED_ROLES``: ``bwd_bf16_fused`` on sm_107a):
-    ``min(ceil(rows / 16), 4 * SMs)`` CTAs (``ROW_CLAIMS_GRIDS`` at 4 CTAs per
-    SM; past one wave the CTAs
+    """The fused backward (``FUSED_ROLES``: ``bwd_bf16_fused`` on every
+    architecture, grid kind ``row_claims``): ``min(ceil(rows / 16), 4 * SMs)``
+    CTAs (``ROW_CLAIMS_GRIDS`` at 4 CTAs per SM; past one wave the CTAs
     claim the blocks at run time), a grid of that many CTAs, and no chunks."""
     assert -(-rows // 16) == blocks, rows
     found = set()
     for arch in loader.ARCHES:
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
-            if record["grid_rule"]["kind"] != "claimed_row_blocks":
+            if role not in FUSED_ROLES[arch]:
                 continue
             found.add((arch, role))
             assert record["grid_rule"] == FUSED_GRID_RULE, (arch, role)
@@ -2068,8 +2043,9 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     and the bands of rows per SM, each running a static, a row-claims (a BF16
     weight gradient on sm_100a and sm_103a only), a fused (``FUSED_ROLES``) or
     a claimed backward by its grid rule, the ends of
-    each kind in increasing order; last the claimed backward (``<role>_mid``)
-    with no end.  No grid rule carries a band's rows per SM or a
+    each kind in increasing order; last, with no end, the fused backward of a
+    BF16 weight gradient and the claimed backward (``<role>_mid``) of an FP32
+    one.  No grid rule carries a band's rows per SM or a
     chunks-per-SM cut (the pipelined forwards' ``persistent_from_rows_per_sm``
     shapes their grid only): the bands are host plan only.  Packed rows of
     ``PACKED_ROWS`` or more run by ``STRIDED_FORWARD_BANDS``."""
@@ -2108,9 +2084,11 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         assert set(loader.BACKWARD_BANDS[arch]) == {"bwd_bf16", "bwd_f32"}, arch
         for role, bands in loader.BACKWARD_BANDS[arch].items():
             # the small-row bands (counts of rows) and the bands of rows per SM,
-            # each kind's ends increasing; the last the claimed backward with no
-            # end
-            assert bands[-1] == (None, f"{role}_mid"), (arch, role, bands[-1])
+            # each kind's ends increasing; the last with no end the fused
+            # backward of a BF16 weight gradient and the claimed backward of an
+            # FP32 one
+            final = {"bwd_bf16": "bwd_bf16_fused", "bwd_f32": "bwd_f32_mid"}[role]
+            assert bands[-1] == (None, final), (arch, role, bands[-1])
             counts, per_sm = [], []
             for last, band in bands:
                 assert band == role or band.startswith(role + "_"), (arch, band)
@@ -3187,14 +3165,15 @@ def _forward_rows() -> dict[str, tuple[int, bool]]:
 
 @pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn_only"])
 def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launches):
-    """Every launch but a row-claims backward's weight gradient repeats bit for
-    bit, so under ``torch.use_deterministic_algorithms(True)`` (strict and
+    """Every launch but the weight gradient of the fused or a row-claims
+    backward repeats bit for bit, so under
+    ``torch.use_deterministic_algorithms(True)`` (strict and
     ``warn_only``) with every warning an error, those calls run without an
     alert and return the bits they return with the setting off, launching the
     same modules: the forward on every forward module this device routes; at
     the fewest rows of every ``BACKWARD_BANDS`` band of this device
     (:func:`_band_shape`) an FP32 weight gradient (accumulation included),
-    ``compute_grad_weight=False`` (the BF16 bands' module, a row-claims
+    ``compute_grad_weight=False`` (the BF16 bands' module, the fused
     backward included) and the autograd backward of a weight that needs no
     gradient, and where the band repeats a BF16 weight gradient
     (:func:`_dw_varies`) the BF16 weight gradient (caller workspace and none)
@@ -3299,11 +3278,11 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
     """Under ``torch.use_deterministic_algorithms(True)`` (strict and
     ``warn_only``) with every warning an error, a CUDA Graph captures the
     forward and the backward (caller workspace and none, BF16 and FP32 weight
-    gradients) without an alert at the fewest rows of the claimed backward's
+    gradients) without an alert at the fewest rows of the short backward's
     band (:func:`_band_shape`), whose BF16 weight gradient repeats its bits;
     its replays return the bits of eager calls, which lie within the FP64
     reference's budgets, the workspace zero after each."""
-    shape = _band_shape("bwd_bf16_mid")
+    shape = _band_shape("bwd_bf16_short")
     assert shape is not None
     T, H = shape
     assert not _dw_varies(T * H), (T, H)
@@ -3350,21 +3329,26 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
 
 
 # The bands whose backward of a weight gradient alerts under PyTorch's
-# deterministic algorithms (the row-claims backwards), and the rows of each
-# band a test runs: its first and its last.
+# deterministic algorithms (the fused and the row-claims backwards; the
+# row-claims backwards where a band runs them), and the rows of each band a
+# test runs: its first, its last (a band with an end) and the first rows past
+# one wave of claims (more 16-row blocks than 4 CTAs per SM, a band without
+# an end).
 ALERT_BAND_CASES = [
     pytest.param(band, edge, id=f"{band}-{edge}")
-    for band in ("bwd_bf16_rc", "bwd_bf16_rc_mid")
-    for edge in ("first", "last")
+    for band in ("bwd_bf16_fused", "bwd_bf16_rc", "bwd_bf16_rc_mid")
+    for edge in ("first", "last", "claims")
 ]
 
 
 @pytest.mark.parametrize("band,edge", ALERT_BAND_CASES)
 def test_backward_alerts_under_deterministic_algorithms(band, edge, launches):
     """Under ``torch.use_deterministic_algorithms(True)`` the paths that launch
-    a row-claims backward's order-varying weight-gradient sum (the first and
-    the last rows of the row-claims band ``band`` on this device, as tokens of
-    one head; skipped where this device routes no such band) -- the backward
+    the order-varying weight-gradient sum of the fused or a row-claims
+    backward (the first rows of the band ``band`` on this device and its last
+    or, in a band without an end, the first rows past one wave of claims, as
+    tokens of one head; skipped where this device routes no such band or the
+    band has no such rows) -- the backward
     with ``compute_grad_weight=True`` (also accumulating) and the autograd
     backward when ``weight`` needs a gradient, also for a node built before
     the mode was enabled -- raise PyTorch's alert immediately before the
@@ -3379,8 +3363,16 @@ def test_backward_alerts_under_deterministic_algorithms(band, edge, launches):
     if found is None:
         pytest.skip(f"this device routes no {band} band")
     first, last = found
-    assert last is not None, (band, found)
-    rows = first if edge == "first" else last
+    if edge == "first":
+        rows = first
+    elif edge == "last":
+        if last is None:
+            pytest.skip(f"the {band} band has no end")
+        rows = last
+    else:
+        rows = 64 * loader.device_sm_count(torch.cuda.current_device()) + 1
+        if rows < first or (last is not None and rows > last):
+            pytest.skip(f"the {band} band holds no rows past one wave of claims")
     name = _backward_module(rows)
     assert name == _routes()[band] and _varies(name), (rows, name)
     x, z, w, dy = make(rows, 1, seed=65)
@@ -3466,16 +3458,13 @@ def _alert(entry: str, deterministic_entry: str, *, warn_only: bool) -> str:
 
 
 def test_alert_texts_name_the_entry_point_and_the_deterministic_one(launches):
-    """At the fewest rows of the row-claims band (:func:`_band_shape`), the
+    """At the fewest rows of the fused band (:func:`_band_shape`), the
     alert of the functional backward names it and the deterministic
     backward; the autograd backward's names the autograd backward and the
     deterministic autograd function (strict: ``RuntimeError`` before the
     launch; ``warn_only``: one ``UserWarning`` a call, then the launch)."""
-    shape = _band_shape("bwd_bf16_rc")
-    if shape is None:
-        # sm_107a routes no row-claims band: no call there alerts
-        # (test_no_entry_point_alerts_under_deterministic_algorithms)
-        pytest.skip("this device routes no row-claims band")
+    shape = _band_shape("bwd_bf16_fused")
+    assert shape is not None
     T, H = shape
     assert _dw_varies(T * H), (T, H)
     x, z, w, dy = make(T, H, seed=66)
@@ -3520,23 +3509,20 @@ def test_alert_texts_name_the_entry_point_and_the_deterministic_one(launches):
         y.backward(dy)
     got = [str(r.message) for r in record if ALERT in str(r.message)]
     assert got == [_alert(*autograd, warn_only=True)], got
-    bwd = _routes()["bwd_bf16_rc"]
+    bwd = _routes()["bwd_bf16_fused"]
     assert launches == [bwd, _forward_module(T * H), bwd], launches
 
 
 def test_graph_capture_alerts_at_capture_and_replays_without_a_check():
     """Under ``torch.use_deterministic_algorithms(True, warn_only=True)``
     capturing a backward that computes the weight gradient at the fewest rows
-    of the row-claims band (:func:`_band_shape`) warns once (the check runs on
+    of the fused band (:func:`_band_shape`) warns once (the check runs on
     the host, at capture); the replays run the non-deterministic kernel
     without a warning, ``dx`` and ``dz`` the bits of the eager call and within
     the FP64 budget, ``dw`` within the budget, the workspace zero after
     each."""
-    shape = _band_shape("bwd_bf16_rc")
-    if shape is None:
-        # sm_107a routes no row-claims band: no call there alerts
-        # (test_no_entry_point_alerts_under_deterministic_algorithms)
-        pytest.skip("this device routes no row-claims band")
+    shape = _band_shape("bwd_bf16_fused")
+    assert shape is not None
     T, H = shape
     assert _dw_varies(T * H), (T, H)
     x, z, w, dy = make(T, H, seed=72)

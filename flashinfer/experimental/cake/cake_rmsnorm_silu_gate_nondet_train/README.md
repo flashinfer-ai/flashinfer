@@ -290,7 +290,7 @@ chunk.  The row-claims backwards cut the rows into 16-row blocks and launch
 (20736 bytes of dynamic shared memory each); past one wave the CTAs claim
 blocks from the claim counter, so a CTA that starts late takes fewer blocks.
 The fused backward cuts the rows into 16-row blocks and launches
-`min(blocks, 4 * SMs)` CTAs of 256 threads (FUSED_SMEM_TBD bytes of dynamic shared
+`min(blocks, 4 * SMs)` CTAs of 256 threads (20736 bytes of dynamic shared
 memory each), which claim the blocks in chunks when there are more blocks
 than CTAs; the bits of `dx` and `dz` do not depend on which CTA runs a block.
 A small-row backward launches one cluster of 16 CTAs whatever the rows: 512
