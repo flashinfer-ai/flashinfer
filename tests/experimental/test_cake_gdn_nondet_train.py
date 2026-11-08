@@ -4849,7 +4849,8 @@ def test_fwd_a_route_rule(monkeypatch) -> None:
     opts = cake_chain.make_options()
     assert route(whole, "sm_100a", *tensors(16, 48), True, opts)
     assert route(whole, "sm_103a", *tensors(16, 48), True, opts)
-    assert not route(whole, "sm_107a", *tensors(16, 48), True, opts)
+    assert route(whole, "sm_107a", *tensors(16, 48), True, opts)
+    assert not route(whole, "sm_120a", *tensors(16, 48), True, opts)
     assert not route(whole, "sm_100a", *tensors(16, 48, torch.bfloat16), True, opts)
     assert not route(whole, "sm_100a", *tensors(16, 48), False, opts)
     assert not route(whole, "sm_100a", *tensors(12, 48), True, opts)  # a group of four

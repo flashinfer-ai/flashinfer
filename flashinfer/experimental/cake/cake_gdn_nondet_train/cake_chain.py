@@ -2977,9 +2977,10 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
 # the same layouts, so the backward reads it unchanged (u is never formed in memory: its entry is a placeholder, as
 # under ``T_full``).  The route serves FP32 beta, normalized q / k, value-head groups of at most :data:`WY_A_MAX_GROUP`
 # and calls without a ``prep`` pin; every other call, and every row whose forward segment table splits a sequence, runs
-# the prep, ``wy_tc2`` and ``fwd_ho`` (the split forward keeps its own route). sm_107a builds both programs but keeps
-# the prep route until its timing is measured.
-FWD_A_ARCHS = ("sm_100a", "sm_103a")
+# the prep, ``wy_tc2`` and ``fwd_ho`` (the split forward keeps its own route).  On sm_107a (R200, 212 SMs) the route
+# takes the long serial row of 64 sequences of 4096 tokens: fwd 0.77, fwd+bwd 0.92 and checkpoint 0.86 of the prep
+# route's time under both gate regimes, the same bits run to run; the split forward stays off there.
+FWD_A_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 WY_A_MAX_GROUP = 3
 # fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
 FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
