@@ -67,45 +67,69 @@ def _bits(t):
     return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
 
 
-def _logprob_step(inp, chunk):
+def _logprob_step(inp, chunk, memory_mode):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
-    logp = public.cake_lm_head_det_train_logprob(X, W, inp.labels, chunk_size=chunk)
+    logp = public.cake_lm_head_det_train_logprob(
+        X, W, inp.labels, chunk_size=chunk, memory_mode=memory_mode
+    )
     logp.backward(inp.dlogp)
     return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
 
 
-@pytest.mark.parametrize(
-    "T, chunk", [(4097, 4096), (1000, 256)]
-)  # the host count (two chunks), the hidden count (four chunks)
-def test_device_logprob_steps_hit_one_backward_binding(weight, T, chunk):
-    """Training steps of the log-probability entry (the previous step's outputs alive while the next runs) reuse one
-    forward and one backward binding: the backward's ``lse`` and ``dlogp`` are fresh tensors every step, so no step
-    after the first misses, every step allocates the same number of blocks, and the bits are the uncached call's."""
-    inp = make_inputs(T, seed=SEED + T, device=CUDA, W=weight)
-    cache = cake_backend.BINDING_CACHE
-    cache.clear()
-    out = _logprob_step(inp, chunk)  # binds (misses once per direction)
-    out = _logprob_step(inp, chunk)
+def _binding_caches(memory_mode):
+    """The binding caches a log-probability step of ``memory_mode`` binds in: the backend's (the fast form), and the
+    opt-in module's too for the default call (``None``: the automatic form, whose budget backward binds there)."""
+    if memory_mode is None:
+        return (cake_backend.BINDING_CACHE, opt_in.BINDING_CACHE)
+    return (cake_backend.BINDING_CACHE,)
+
+
+def _assert_steps_hit_one_binding(inp, chunk, memory_mode, step):
+    """Training steps of ``step`` (the previous step's outputs alive while the next runs) reuse their bindings: after
+    the two steps that bind, no step misses in any cache it binds in, every step allocates the same number of blocks,
+    and the bits are the call's with every cache off."""
+    caches = _binding_caches(memory_mode)
+    for cache in caches:
+        cache.clear()
+    out = step(inp, chunk, memory_mode)  # binds (misses once per direction)
+    out = step(inp, chunk, memory_mode)
     torch.cuda.synchronize()
-    misses, allocations = cache.misses, []
+    misses, allocations = [cache.misses for cache in caches], []
     for _ in range(6):
         before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        out = _logprob_step(inp, chunk)
+        out = step(inp, chunk, memory_mode)
         torch.cuda.synchronize()
         allocations.append(
             torch.cuda.memory_stats()["allocation.all.allocated"] - before
         )
-    assert cache.misses == misses, (cache.misses - misses, allocations)
+    now = [cache.misses for cache in caches]
+    assert now == misses, (now, misses, allocations)
     assert len(set(allocations)) == 1, allocations
-    was = cache.enabled
-    cache.enabled = False
+    was = [cache.enabled for cache in caches]
+    for cache in caches:
+        cache.enabled = False
     try:
-        fresh = _logprob_step(inp, chunk)
+        fresh = step(inp, chunk, memory_mode)
     finally:
-        cache.enabled = was
+        for cache, enabled in zip(caches, was, strict=True):
+            cache.enabled = enabled
     for key, value in fresh.items():
         assert torch.equal(_bits(out[key]), _bits(value)), key
+
+
+@pytest.mark.parametrize("memory_mode", ["fast", None])
+@pytest.mark.parametrize(
+    "T, chunk", [(4097, 4096), (1000, 256)]
+)  # the host count (two chunks), the hidden count (four chunks)
+def test_device_logprob_steps_hit_one_backward_binding(weight, T, chunk, memory_mode):
+    """Training steps of the log-probability entry (the previous step's outputs alive while the next runs) reuse one
+    forward and one backward binding: the backward's ``lse`` and ``dlogp`` are fresh tensors every step, so no step
+    after the first misses, every step allocates the same number of blocks, and the bits are the uncached call's.
+    ``"fast"``: the backend's form, one cache; ``None`` (the default call, whose automatic form at these shapes is a
+    budget form): the backend's forward and the opt-in module's backward, both caches."""
+    inp = make_inputs(T, seed=SEED + T, device=CUDA, W=weight)
+    _assert_steps_hit_one_binding(inp, chunk, memory_mode, _logprob_step)
 
 
 def _run_threads(first, second):
@@ -200,7 +224,7 @@ def test_hidden_count_arange_records_each_stream_once():
     assert got["grown"] == (True, 1) and got["values"]
 
 
-def _policy_step(inp, chunk):
+def _policy_step(inp, chunk, memory_mode):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     loss, logp = public.cake_lm_head_det_train_loss(
@@ -212,16 +236,19 @@ def _policy_step(inp, chunk):
         loss_weights=inp.loss_weights,
         chunk_size=chunk,
         return_logp=True,
+        memory_mode=memory_mode,
     )
     loss.backward()
     return dict(loss=loss.detach(), logp=logp.detach(), dX=X.grad, dW=W.grad)
 
 
-def test_device_zero_weight_rows_concurrent_threads(weight, monkeypatch):
+@pytest.mark.parametrize("memory_mode", ["fast", None])
+def test_device_zero_weight_rows_concurrent_threads(weight, monkeypatch, memory_mode):
     """Policy steps with zero-weight and ignored rows on two threads, each on its own stream (four chunks: the hidden
     count and the dW side stream run).  The host order is forced: the first thread's call waits between its count's
     copy and its read until the second thread's whole step returned.  Both give the single-thread bits (one shared
-    count cell would hand the first call the second's count)."""
+    count cell would hand the first call the second's count).  ``"fast"``: the backend's form; ``None``: the default
+    call, whose automatic form here is a budget form (its count read before the form is known, then dropped)."""
     C, T = 256, 1000
     inputs = {}
     for name, seed, ignore in (("first", SEED + 5, 0.05), ("second", SEED + 6, 0.40)):
@@ -233,7 +260,9 @@ def test_device_zero_weight_rows_concurrent_threads(weight, monkeypatch):
     counts = {name: int(i.labels.ge(0).sum()) for name, i in inputs.items()}
     assert counts["second"] < counts["first"]  # the other count never indexes past
     ref = {
-        name: {k: _bits(v).clone() for k, v in _policy_step(inp, C).items()}
+        name: {
+            k: _bits(v).clone() for k, v in _policy_step(inp, C, memory_mode).items()
+        }
         for name, inp in inputs.items()
     }
     torch.cuda.synchronize()
@@ -254,11 +283,11 @@ def test_device_zero_weight_rows_concurrent_threads(weight, monkeypatch):
     got = {}
 
     def first():
-        got["first"] = _policy_step(inputs["first"], C)
+        got["first"] = _policy_step(inputs["first"], C, memory_mode)
 
     def second():
         begun.wait(_TIMEOUT_S)
-        got["second"] = _policy_step(inputs["second"], C)
+        got["second"] = _policy_step(inputs["second"], C, memory_mode)
         torch.cuda.current_stream().synchronize()
         read.wait(_TIMEOUT_S)
 
@@ -576,55 +605,44 @@ def _require_temperature_forms():
         pytest.skip(f"the registered program has no temperature forms {missing}")
 
 
-def _logprob_temperature_step(inp, chunk):
+def _logprob_temperature_step(inp, chunk, memory_mode):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     logp = public.cake_lm_head_det_train_logprob(
-        X, W, inp.labels, chunk_size=chunk, temperature=inp.temperature
+        X,
+        W,
+        inp.labels,
+        chunk_size=chunk,
+        temperature=inp.temperature,
+        memory_mode=memory_mode,
     )
     logp.backward(inp.dlogp)
     return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
 
 
+@pytest.mark.parametrize("memory_mode", ["fast", None])
 @pytest.mark.parametrize(
     "T, chunk", [(4097, 4096), (1000, 256)]
 )  # the host count (two chunks), the hidden count (four chunks)
-def test_device_logprob_temperature_steps_hit_one_backward_binding(weight, T, chunk):
+def test_device_logprob_temperature_steps_hit_one_backward_binding(
+    weight, T, chunk, memory_mode
+):
     """Training steps of the log-probability entry with a per-token temperature reuse one forward and one backward
     binding (the temperature path keys ``lse`` and ``dlogp`` by layout, as the path without one): no step after the
-    first misses, every step allocates the same number of blocks, and the bits are the uncached call's."""
+    first misses, every step allocates the same number of blocks, and the bits are the uncached call's.  ``"fast"`` /
+    ``None``: as :func:`test_device_logprob_steps_hit_one_backward_binding`."""
     _require_temperature_forms()
     inp = make_inputs(T, seed=SEED + T, device=CUDA, W=weight, temperature="hetero")
-    cache = cake_backend.BINDING_CACHE
-    cache.clear()
-    out = _logprob_temperature_step(inp, chunk)  # binds (misses once per direction)
-    out = _logprob_temperature_step(inp, chunk)
-    torch.cuda.synchronize()
-    misses, allocations = cache.misses, []
-    for _ in range(6):
-        before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        out = _logprob_temperature_step(inp, chunk)
-        torch.cuda.synchronize()
-        allocations.append(
-            torch.cuda.memory_stats()["allocation.all.allocated"] - before
-        )
-    assert cache.misses == misses, (cache.misses - misses, allocations)
-    assert len(set(allocations)) == 1, allocations
-    was = cache.enabled
-    cache.enabled = False
-    try:
-        fresh = _logprob_temperature_step(inp, chunk)
-    finally:
-        cache.enabled = was
-    for key, value in fresh.items():
-        assert torch.equal(_bits(out[key]), _bits(value)), key
+    _assert_steps_hit_one_binding(inp, chunk, memory_mode, _logprob_temperature_step)
 
 
-def test_device_temperature_concurrent_threads(weight, monkeypatch):
+@pytest.mark.parametrize("memory_mode", ["fast", None])
+def test_device_temperature_concurrent_threads(weight, monkeypatch, memory_mode):
     """Log-probability steps with a per-token temperature and ignored rows on two threads, each on its own stream
     (four chunks: the hidden count with the temperature's device-count form and the dW side stream run).  The first
     thread's call waits between its count's copy and its read until the second thread's whole step returned.  Both
-    give the single-thread bits (one shared count cell would hand the first call the second's count)."""
+    give the single-thread bits (one shared count cell would hand the first call the second's count).  ``"fast"``:
+    the backend's form; ``None``: the default call (its automatic form's backward here a budget form)."""
     _require_temperature_forms()
     C, T = 256, 1000
     inputs = {
@@ -645,7 +663,8 @@ def test_device_temperature_concurrent_threads(weight, monkeypatch):
     assert counts["second"] < counts["first"]  # the other count never indexes past
     ref = {
         name: {
-            k: _bits(v).clone() for k, v in _logprob_temperature_step(inp, C).items()
+            k: _bits(v).clone()
+            for k, v in _logprob_temperature_step(inp, C, memory_mode).items()
         }
         for name, inp in inputs.items()
     }
@@ -667,11 +686,11 @@ def test_device_temperature_concurrent_threads(weight, monkeypatch):
     got = {}
 
     def first():
-        got["first"] = _logprob_temperature_step(inputs["first"], C)
+        got["first"] = _logprob_temperature_step(inputs["first"], C, memory_mode)
 
     def second():
         begun.wait(_TIMEOUT_S)
-        got["second"] = _logprob_temperature_step(inputs["second"], C)
+        got["second"] = _logprob_temperature_step(inputs["second"], C, memory_mode)
         torch.cuda.current_stream().synchronize()
         read.wait(_TIMEOUT_S)
 

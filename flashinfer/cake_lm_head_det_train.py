@@ -70,14 +70,27 @@ def _cake_backend() -> ModuleType:
 
 @functools.cache
 def _cake_backend_opt_in() -> ModuleType:
-    # The opt-in forms (``memory_mode`` / ``num_valid_rows``), imported on
-    # their first use; a call with neither never imports them.  Their own
+    # The opt-in forms (``memory_mode`` / ``num_valid_rows``) and the default
+    # call's automatic memory form, imported on their first use; a call that
+    # takes none of them (:func:`_opt_in_call`) never imports them.  Their own
     # binding cache takes the same settings.
     _cake_backend()
     from .experimental.cake.cake_lm_head_det_train import cake_backend_opt_in
 
     _knobs.configure_binding_cache(cake_backend_opt_in, _BINDING_CACHE_SETTINGS)
     return cake_backend_opt_in
+
+
+def _opt_in_call(W, memory_mode, num_valid_rows) -> bool:
+    # A call with ``memory_mode`` or ``num_valid_rows`` takes the opt-in
+    # forms; so does a default call that forms a weight gradient (grad mode
+    # on, ``W`` requiring one): its automatic form (``memory_mode=None``) can
+    # pick a budget form.  Every other call runs the default entry.
+    return (
+        memory_mode is not None
+        or num_valid_rows is not None
+        or (torch.is_grad_enabled() and isinstance(W, torch.Tensor) and W.requires_grad)
+    )
 
 
 @flashinfer_api
@@ -221,9 +234,18 @@ def cake_lm_head_det_train_loss(
         blank: no explicit knob, the backend's own default; invalid JSON is a
         ``ValueError``).
     memory_mode : str, optional
-        ``None`` (the default) or ``"fast"``: the fastest form; an explicit
-        ``"fast"`` first goes through the opt-in dispatch
-        (``cake_backend_opt_in``) and then runs the same entry as ``None``.
+        ``None`` (the default): the automatic form.  A call that forms a BF16
+        ``dW`` on CUDA (grad mode on, ``W`` requiring a gradient) runs the
+        fastest form while its predicted step peak, with that form's own
+        buffer lifetimes, stays within ``B`` less the 2 % margin below, else
+        the ``"budget"`` form the planner picks when one fits, else the
+        fastest form (``cake_backend_opt_in.auto_memory_plan``).  It plans on
+        the valid rows of the forward's count or of ``num_valid_rows``; an
+        uncompacted call without ``num_valid_rows`` keeps the fastest form,
+        as does every call without such a ``dW``.  ``"fast"``: always the
+        fastest form, whose FP32 ``[V, H]`` weight-gradient accumulator lives
+        next to the chunk buffers; it first goes through the opt-in dispatch
+        (``cake_backend_opt_in``) and then runs the backend's default entry.
         ``"budget"``: bound the step peak (forward through backward, outputs
         included) by the bytes ``B`` of a head that materializes the BF16
         logits of the valid rows (``B = 2 * T_v * V + 2 * V * H + 2 * T * H``);
@@ -233,11 +255,21 @@ def cake_lm_head_det_train_loss(
         rows and the backward recomputing the others in vocabulary blocks
         (``cake_backend_opt_in.memory_plan``).  Bitwise the same ``loss`` /
         ``logp`` / ``dX`` / ``dW`` as ``"fast"``; the recompute forms run more
-        GEMM work.  The bound assumes a backward that frees the graph
-        (``retain_graph=True`` keeps the forward's state); its margin is
-        measured on GB200, GB300 and B200 (see the package README).
-        ``"keep_logits"`` belongs to ``cake_lm_head_det_train_logprob`` (a
-        ``ValueError`` here).  No environment variable.
+        GEMM work.  A default call whose automatic form is a budget form gives
+        the same bits, except that a call with zero-weight policy rows decides
+        its row split as ``"budget"`` does (``dX`` / ``dW`` within the
+        accuracy budget; see the package README).  The bound assumes a
+        backward that frees the graph (``retain_graph=True`` keeps the
+        forward's state, also for a default call); its margin is measured on
+        GB200, GB300 and B200 (see the package README).  ``"keep_logits"``
+        belongs to ``cake_lm_head_det_train_logprob`` (a ``ValueError``
+        here).  No environment variable selects the mode; the switches above
+        (``compact_rows``, ``fuse_dw_cast``, ``dx_finalize``, ``hidden_count``,
+        ``gemm_tuning``, and their ``FLASHINFER_CAKE_LM_HEAD_LOSS_*``
+        variables) are inputs of the automatic form's rule.  The
+        non-deterministic module ``flashinfer.cake_lm_head_nondet_train``,
+        whose entries refer to this description, has no automatic form: its
+        default ``None`` is the fastest form.
     num_valid_rows : int, optional
         The number of labels ``>= 0`` (not ``-100``), as a host integer (a
         Python or NumPy integer or a CPU scalar tensor; a CUDA tensor is
@@ -277,16 +309,20 @@ def cake_lm_head_det_train_loss(
     forms the gradient accumulators instead of the checkpointed forward (one
     gradient pass per step); every output is bitwise the same.
 
-    A call with neither ``memory_mode`` nor ``num_valid_rows`` runs the
-    backend's default entry (``cake_backend``) after this function's argument
-    checks (``check_num_valid_rows``, then ``memory_mode`` and
-    ``num_valid_rows`` against ``None``).  A call with either goes through
-    ``cake_backend_opt_in`` (bitwise the same outputs): an explicit
-    ``memory_mode="fast"`` without a count then runs the same default entry,
-    every other such call takes its opt-in forms; with
-    ``memory_mode="budget"`` a backward that frees the graph releases the
-    saved accumulators as soon as it has used them (a second backward then
-    raises).
+    A call with neither ``memory_mode`` nor ``num_valid_rows`` that forms no
+    weight gradient (grad mode off, or a frozen ``W``) runs the backend's
+    default entry (``cake_backend``) after this function's argument checks
+    (``check_num_valid_rows``, then ``memory_mode`` and ``num_valid_rows``
+    against ``None``, then grad mode and ``W.requires_grad``).  Every other
+    call goes through ``cake_backend_opt_in``: an explicit
+    ``memory_mode="fast"`` without a count, and a default call the automatic
+    form cannot switch, then run the same default entry; a default call that
+    can switch runs this entry's autograd function of ``cake_backend_opt_in``
+    (its fast form bitwise the default entry's); every other such call takes
+    its opt-in forms.  With ``memory_mode="budget"``, or a default call whose
+    automatic form is a budget form, a backward that frees the graph releases
+    the saved accumulators as soon as it has used them (a second backward
+    then raises).
 
     ``cake_lm_head_det_train_preload`` loads the libraries and creates the
     per-device state ahead of a process's first call.
@@ -295,14 +331,18 @@ def cake_lm_head_det_train_loss(
     binding (``data_ptr``, shape, stride and dtype of every input plus the
     options); later calls with the same binding launch from the remembered
     argument plans
-    (``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.BINDING_CACHE``).
-    ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables that cache and
+    (``flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend.BINDING_CACHE``;
+    the calls through ``cake_backend_opt_in`` -- the default loss calls that
+    form a weight gradient among them, and a log-probability backward in a
+    budget form -- keep theirs in ``cake_backend_opt_in.BINDING_CACHE``).
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables both caches and
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY`` (a positive
-    integer; default 64) sets its capacity: both are read when this module is
-    imported and applied through ``BINDING_CACHE.configure`` on the first call
-    of either entry point.  Peak temporary memory is reported separately
-    from the weights, the outputs and the FP32 accumulators by
-    ``cake_backend.memory_report``.
+    integer; default 64) sets their capacity: both are read when this module
+    is imported and applied through ``BINDING_CACHE.configure`` on the first
+    call that reaches each backend module; a later
+    ``cake_backend.BINDING_CACHE.configure(...)`` sets that cache only.  Peak
+    temporary memory is reported separately from the weights, the outputs and
+    the FP32 accumulators by ``cake_backend.memory_report``.
 
     Returns
     -------
@@ -317,7 +357,7 @@ def cake_lm_head_det_train_loss(
         )
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_knobs.CHECK_WITHOUT_COUNT)
-    if memory_mode is not None or num_valid_rows is not None:
+    if _opt_in_call(W, memory_mode, num_valid_rows):
         return _cake_backend_opt_in().cake_lm_head_det_train_loss(
             X,
             W,
@@ -392,7 +432,7 @@ def _logprob_temperature(
         )
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_knobs.CHECK_WITHOUT_COUNT)
-    if memory_mode is not None or num_valid_rows is not None:
+    if _opt_in_call(W, memory_mode, num_valid_rows):
         return _cake_backend_opt_in().cake_lm_head_det_train_logprob_temperature(
             X,
             W,
@@ -469,9 +509,15 @@ def cake_lm_head_det_train_logprob(
     (``None`` reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable; every
     switch is resolved once in the forward and the backward recomputes under
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
-    (``"budget"``: the backward's weight-gradient form within the same bound),
-    ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in
-    :func:`cake_lm_head_det_train_loss`.  ``memory_mode="keep_logits"`` (this
+    (``"budget"``: the backward's weight-gradient form within the same bound;
+    the default ``None``: the automatic form, decided in the backward, which
+    keeps the default entry's forward), ``num_valid_rows`` and
+    ``check_num_valid_rows`` (the forward's count) as in
+    :func:`cake_lm_head_det_train_loss`.  A default call whose backward runs
+    a budget form runs it without the zero-gradient row skip: its ``dX`` /
+    ``dW`` bits can then differ from the fastest form's where valid rows have
+    a zero upstream gradient (within the accuracy budget, the same bits on
+    every run).  ``memory_mode="keep_logits"`` (this
     entry only, without ``num_valid_rows``; opt-in): where a backward can
     follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
     logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
@@ -533,7 +579,7 @@ def cake_lm_head_det_train_logprob(
         )
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_knobs.CHECK_WITHOUT_COUNT)
-    if memory_mode is not None or num_valid_rows is not None:
+    if _opt_in_call(W, memory_mode, num_valid_rows):
         return _cake_backend_opt_in().cake_lm_head_det_train_logprob(
             X,
             W,

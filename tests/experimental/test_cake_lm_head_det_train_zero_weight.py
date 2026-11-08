@@ -1597,12 +1597,16 @@ def test_device_cold_binding_cache_peak_within_the_plain_path(
 ):
     """A split call that misses the binding cache (every call here: the caches are cleared first) prepares its binding
     before the logp-only pass's FP32 accumulator arena exists, so its measured step peak (allocated and reserved)
-    stays within the same call's without the split that misses the cache too."""
+    stays within the same call's without the split that misses the cache too.  The opt-in module's arm pins
+    ``memory_mode="fast"``: its default call's automatic form can plan different forms for the split and the plain
+    call."""
     _require_program(entry="loss")
     module = cake_backend if module_name == "main" else opt_in
     base = _device_inputs(T, W=glm_weight)
     inp = _with_zero_weights(base, _zero_weight_set(base, ("random", 0.166)))
     switches = {} if hidden_count is None else dict(hidden_count=hidden_count)
+    if module_name == "opt_in":
+        switches["memory_mode"] = "fast"
     call = _step_call(inp, module, **switches)
     caches = (cake_backend, opt_in)
     with _zero_weight_floor(0):
