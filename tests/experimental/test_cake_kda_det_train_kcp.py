@@ -6942,9 +6942,10 @@ def test_gpu_default_workspace_pool(device, lengths, H) -> None:
     """``workspace=None`` keeps its default workspaces between calls (``cake_kcp._default_pool``; one rank): every
     later call runs on the workspace object its key's first call built, bitwise the results of a held workspace (the
     caching allocator's free blocks filled with NaN before each step: no result reads a byte the call did not write),
-    a forward without a saved set (the lazy pools) included; a pooled step peaks no higher than the first, and between
-    calls the pooled workspaces hold no device memory (``memory_allocated`` returns at most to its level before the
-    step).
+    a forward without a saved set (the lazy pools) included; a pooled step's high-water mark of allocated device memory
+    is no higher than the first pooled step's (compared as absolute marks: the first step may also free what the
+    reference step left, 2 KiB on GB300, which lowers its base but not its mark), and between calls the pooled
+    workspaces hold no device memory (``memory_allocated`` returns at most to its level before the step).
     Once the context is collected, its workspaces leave the pool at the next call."""
     ctx, ops = _ckpt_problem(device, lengths, H)
     args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
@@ -6977,7 +6978,7 @@ def test_gpu_default_workspace_pool(device, lengths, H) -> None:
         torch.cuda.reset_peak_memory_stats(device)
         res = step(ctx, None)
         torch.cuda.synchronize(device)
-        peaks.append(torch.cuda.max_memory_allocated(device) - base)
+        peaks.append(torch.cuda.max_memory_allocated(device))  # absolute high-water mark of this step
         assert all(
             torch.equal(_bits(a), _bits(b)) for a, b in zip(ref, res, strict=True)
         ), i
