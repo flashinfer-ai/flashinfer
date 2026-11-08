@@ -1669,8 +1669,10 @@ def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
 # head, ``last`` the rows per SM of the architecture's ``FORWARD_BANDS`` band
 # ``i`` of ``layout`` ``flat<i>`` (packed rows: one flat [rows, 128] tensor) or
 # of its ``STRIDED_FORWARD_BANDS`` band ``i`` of ``layout`` ``strided<i>``
-# (the projection layout, whose ``z`` rows are not packed), skipped where the
-# architecture has no such band with an end.
+# (the projection layout, whose ``z`` rows are not packed); ``token<i>`` takes
+# one token of that many heads past ``FORWARD_BANDS`` band ``i`` (packed rows
+# whose token stride is passed as 0); skipped where the architecture has no
+# such band with an end.
 FORWARD_CASES = [
     pytest.param(1, 48, "contiguous", id="1x48"),
     pytest.param(13, 7, "contiguous", id="13x7"),
@@ -1691,6 +1693,9 @@ FORWARD_CASES = [
     pytest.param(6000, 32, "contiguous", id="6000x32"),
     pytest.param(0, None, "flat2", id="band2-end"),
     pytest.param(1, None, "flat2", id="band2-end+1"),
+    pytest.param(1, None, "token0", id="one-token-band0-end+1"),
+    pytest.param(1, None, "token1", id="one-token-band1-end+1"),
+    pytest.param(1, None, "token2", id="one-token-band2-end+1"),
     pytest.param(0, None, "strided2", id="strided-band2-end"),
     pytest.param(1, None, "strided2", id="strided-band2-end+1"),
     pytest.param(0, None, "strided3", id="strided-band3-end"),
@@ -1731,16 +1736,19 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     arch = loader.device_arch(torch.cuda.current_device())
     routes = loader.ROUTES[arch]
     if heads is None:
-        kind = "strided" if layout.startswith("strided") else "flat"
+        kind = next(k for k in ("strided", "flat", "token") if layout.startswith(k))
         i = int(layout[len(kind) :])
-        layout = "projection" if kind == "strided" else "flat"
         table = (
             loader.STRIDED_FORWARD_BANDS if kind == "strided" else loader.FORWARD_BANDS
         )
         if i >= len(table[arch]) or table[arch][i][0] is None:
             pytest.skip(f"{arch} has no {kind} forward band {i} with an end")
-        tokens += int(table[arch][i][0]) * sms
-        heads = 1
+        rows = int(table[arch][i][0]) * sms + tokens
+        if kind == "token":
+            tokens, heads, layout = 1, rows, "contiguous"
+        else:
+            tokens, heads = rows, 1
+            layout = "projection" if kind == "strided" else "flat"
     x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=21)
     rows = x.numel() // D
     packed = suite._packed(tokens, heads, layout)
@@ -2563,12 +2571,14 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 
 
 # The modules that warm rows in L2, by role: the mid and the extra-long
-# forward (row blocks of packed rows), the row-claims mid backward (sm_100a
-# and sm_103a: thread 0 warms the next block of packed rows) and the claimed
-# backward (on sm_100a and sm_103a a CTA's next block, with a bulk prefetch
-# per tensor where the rows are packed; on sm_107a the rows of the block two
-# ahead).  The one-head inputs take one row past each one's start
-# (``_start_rows``).
+# forward (row blocks of packed rows; one row past the start of their
+# ``STRIDED_FORWARD_BANDS`` band, where the one-head layouts with packed rows
+# run the pipelined forward, which warms rows as the mid forward does), the
+# row-claims mid backward (sm_100a and sm_103a: thread 0 warms the next block
+# of packed rows) and the claimed backward (on sm_100a and sm_103a a CTA's
+# next block, with a bulk prefetch per tensor where the rows are packed; on
+# sm_107a the rows of the block two ahead).  The one-head inputs take one row
+# past each one's start (``_start_rows``).
 ONE_HEAD_ROUTES = [
     pytest.param("fwd", "fwd_mid", id="fwd_mid"),
     pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
@@ -2583,27 +2593,28 @@ ONE_HEAD_ROUTES = [
 def test_one_head_inputs_give_the_same_bits_for_every_layout(
     role, band, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One row past the start of the mid and the extra-long forward and of the
-    row-claims mid and the claimed backward: a one-head input of every layout
-    (``ONE_HEAD_LAYOUTS``) launches ``module_for_rows``' module with head
-    stride 128, passes the packed-rows test exactly when its rows follow one
-    another (or the host copied it), and returns the same ``y``, or ``dx``,
-    ``dz`` and ``dw``, bits
-    for every layout and repeat (but a BF16 ``dw`` of the row-claims mid
+    """One row past the start of the mid and the extra-long forward (their
+    strided bands) and of the row-claims mid and the claimed backward: a
+    one-head input of every layout (``ONE_HEAD_LAYOUTS``) launches
+    ``module_for_rows``' module (for the forward, the module of its layout's
+    packing) with head stride 128, passes the packed-rows test exactly when its
+    rows follow one another (or the host copied it), and returns the same
+    ``y``, or ``dx``, ``dz`` and ``dw``, bits for every layout launching the
+    same module and every repeat (but a BF16 ``dw`` of the row-claims mid
     backward, which lies within the budgets of
     :func:`assert_dw_repeats_within_det` on every launch instead), with the
-    workspace zero after every call,
-    ``dx`` and ``dz`` the deterministic package's bits on the flat rows; those
-    lie within the error budget of the deterministic package's on the flat
-    rows, ``dw`` also within the weight-gradient budget of the deterministic
-    ``dw``."""
+    workspace zero after every call, ``dx`` and ``dz`` the deterministic
+    package's bits on the flat rows; each module's outputs lie within the error
+    budget of the deterministic package's on the flat rows, ``dw`` also within
+    the weight-gradient budget of the deterministic ``dw``."""
     arch = loader.device_arch(torch.cuda.current_device())
     name = loader.ROUTES[arch].get(band)
     if name is None:
         pytest.skip(f"{arch} routes no {band} module")
     sms = _sm_count()
-    rows = _start_rows(arch, name, sms) + 1
-    assert loader.module_for_rows(arch, role, rows, sms) == name
+    strided = role == "fwd"
+    rows = _start_rows(arch, name, sms, packed=not strided) + 1
+    assert loader.module_for_rows(arch, role, rows, sms, packed=not strided) == name
     x0, z0, w, dy0 = suite.make(rows, 1, layout="flat", seed=25)
     dw_dtype = torch.float32 if role == "bwd_f32" else torch.bfloat16
     y64, dx64, dz64, dw64 = suite.fp64_reference(dy0, x0, z0, w, EPS)
@@ -2626,9 +2637,15 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
         mag = suite.magnitudes(dy0, x0, z0, EPS)
     varies = role != "fwd" and suite._varies(name)
     launched = _spy_strides(monkeypatch)
-    want = None
+    wants: dict[str, tuple] = {}
     for layout, (packed, _) in ONE_HEAD_LAYOUTS.items():
         x, z, dy = (_one_head(t, layout) for t in (x0, z0, dy0))
+        module = (
+            loader.module_for_rows(arch, role, rows, sms, packed=packed)
+            if strided
+            else name
+        )
+        want = wants.get(module)
         launched.clear()
         for _ in range(calls):
             if role == "fwd":
@@ -2642,7 +2659,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
                 assert_det_bits(f"{layout}: dz", got[1], dets[1])
                 assert not bool(ws.any()), (layout, "the workspace is not zero")
             if want is None:
-                want = got
+                want = wants[module] = got
             for what, g, w_ in zip(names, got, want, strict=True):
                 if what == "dw":
                     assert_dw_repeats_within_det(
@@ -2650,18 +2667,22 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
                     )
                 else:
                     assert_same_bits(f"{layout}: {what}", g, w_)
-        assert [n for n, _ in launched] == [name] * calls, (layout, launched)
+        assert [n for n, _ in launched] == [module] * calls, (layout, launched)
         for _, strides in launched:
             assert strides["heads"] == 1, (layout, strides)
             heads = [v for k, v in strides.items() if k.endswith("_head")]
             assert heads and all(v == D for v in heads), (layout, strides)
             assert _packed(strides) == packed, (layout, strides)
-    for what, got, det, ref in zip(names, want, dets, refs, strict=True):
-        assert_error_within_det(what, got, det, ref, mag=mag if role != "fwd" else None)
-    if role != "fwd":
-        suite.assert_dw_within(
-            want[2], dets[2], mag, what="dw vs the deterministic package"
-        )
+    assert name in wants, (name, sorted(wants))
+    for want in wants.values():
+        for what, got, det, ref in zip(names, want, dets, refs, strict=True):
+            assert_error_within_det(
+                what, got, det, ref, mag=mag if role != "fwd" else None
+            )
+        if role != "fwd":
+            suite.assert_dw_within(
+                want[2], dets[2], mag, what="dw vs the deterministic package"
+            )
 
 
 # Identical rows whose weight-gradient terms ``dy * silu(z) * x * rstd`` are
@@ -2706,9 +2727,9 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
     sums) does not hold for either package: the backward launches
     ``module_for_rows``' module, every output repeats bit for bit, ``dx`` and
     ``dz`` are the deterministic package's bits and a BF16 ``dw`` the
-    deterministic ``dw``'s bits, ``dx``, ``dz`` and ``dw`` lie within the error
-    budget of the deterministic package's, and every ``dw`` lies within that
-    budget widened by the
+    deterministic ``dw``'s bits, ``dx``, ``dz`` and a BF16 ``dw`` lie within
+    the error budget of the deterministic package's, and every ``dw`` lies
+    within that budget widened by the
     documented underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row
     plus half the dtype's smallest subnormal, with the workspace zero."""
     x, z, w, dy = _underflowing_rows(T, H)
@@ -2749,8 +2770,12 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
             f"dw beyond the floored budget by {excess.max().item():.3e}"
         )
         assert not bool(ws.any()), "the workspace is not zero"
+    # an FP32 dw is held to the floored budget above, as FlashInfer main's
+    # suite holds it: the weight-gradient budget against the deterministic dw
+    # does not hold below the normal range
+    outputs = ("dx", "dz", "dw") if dw_dtype == torch.bfloat16 else ("dx", "dz")
     for what, got, det, ref in zip(
-        ("dx", "dz", "dw"), first, dets, (dx64, dz64, dw64), strict=True
+        outputs, first, dets, (dx64, dz64, dw64), strict=False
     ):
         assert_error_within_det(what, got, det, ref)
     assert launched == [name] * suite.REPEATS, launched

@@ -493,6 +493,10 @@ def _forward(
         for tok, head in ((x_tok, x_head), (z_tok, z_head))
     )
     name = module_for_rows(arch, "fwd", rows, device_sm_count(index), packed=packed)
+    if name == ROUTES[arch].get("fwd_pipe_packed"):
+        # this program requires the token stride H * 128 of packed rows; a
+        # single token's stride (passed as 0) is never read
+        values["x_tok"] = values["z_tok"] = heads * HEAD_DIM
     _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)
