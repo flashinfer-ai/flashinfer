@@ -1448,6 +1448,9 @@ def test_group_of_three_r_form_keeps_its_bits(row, plan, device, monkeypatch) ->
     # package's bits
     # plan "planner": the planner's tables (ADJOINT_SPLIT_ARCHS empty); plan "stage1": the shipped plan, where a row the
     # one-wave split prices runs the split beside the group's cluster tail instead of the R form
+    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
+    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     index = cake_chain._device_index(device)
     arch = cake_backend.device_arch(index)
     seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
@@ -2632,6 +2635,9 @@ def test_the_tail_keeps_the_deterministic_bits_but_dq_dk(
     # same bits run to run (the planner's tables, as the deterministic package plans them).  Without the FP32
     # dv_local adjoint (DVL32_ARCHS empty) the package keeps the deterministic package's o, dv, dg and dbeta, and its
     # fixed-order tails all of the deterministic bits; dq / dk stay within the budgets of both
+    # the prep's forward (prep, wy_tc2, fwd_ho): its bits are the deterministic package's; fwd_a_route's forward forms
+    # its own A (test_fwd_a_within_the_budgets_of_the_prep_forward)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     seq_lens = TAIL_LAYOUT
     group = heads[1] // heads[0]
@@ -3578,7 +3584,9 @@ def test_packed_views_give_the_contiguous_bits(
 ) -> None:
     # q / k / v as head views of one packed row give the bits of contiguous copies, every output and gradient:
     # prep_tma reads q / k in place (also where the rule's band would run the plain prep on contiguous rows: the two
-    # preps give the same bits), v is copied byte for byte; a plain pin copies q / k as well
+    # preps give the same bits), v is copied byte for byte; a plain pin copies q / k as well.  The prep's forward:
+    # fwd_a_route's forward reads the packed row in place too (test_fwd_a_packed_views_give_the_contiguous_bits)
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     seq_lens = (300, 77, 640, 1)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=233)
     pins = {"prep": "plain"} if band == "plain-pin" else {}
@@ -4939,6 +4947,25 @@ def test_fwd_a_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
             {"o": taped[0].detach(), "final_state": taped[1].detach()},
             ("o", "final_state"),
         )
+
+
+def test_fwd_a_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -> None:
+    # wy_a always normalizes q / k: a call without the in-kernel normalization runs the prep, wy_tc2 and fwd_ho on a
+    # layout fwd_a_route takes otherwise, with the bits of the package whose forward is the prep's everywhere
+    _fwd_a_or_skip(device)
+    heads, seq_lens = FWD_A_CASES["g3"]
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=409)
+    stages = _record_launches(monkeypatch)
+    normalized = _run(inputs, seq_lens)
+    assert "fwd_ho_a" in stages, stages
+    stages.clear()
+    got = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
+    assert "fwd_ho_a" not in stages and "wy_a" not in stages, stages
+    assert "fwd_ho" in stages or "fwd_ho_vh2" in stages, stages
+    monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
+    want = _run(inputs, seq_lens, use_qk_l2norm_in_kernel=False)
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+    assert not torch.equal(got["o"], normalized["o"])
 
 
 @pytest.mark.parametrize("reentrant", [False, True], ids=["non-reentrant", "reentrant"])
