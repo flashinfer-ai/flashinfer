@@ -2434,10 +2434,13 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     real regions) keeps its token-layout ``qn`` / ``kn`` in the arena: ``kn`` on the bytes of ``dv2``, which rides
     on dq / dk (the two halves of one ``[2, T_r, H, 128]`` tensor), and ``qn`` on the bytes of ``v_new``, which
     rides on dg (raw gate mode: on ``dg_raw`` only where it covers the ``R`` rows, here not, so ``qn`` is per
-    call).  Every launch that binds ``v_new`` / ``dv2`` binds the moved views and comes before the first launch
-    that binds an output they ride on; the arena's cached views are not rebound; the backward allocates no byte
-    beyond the flag-off backward's but the replay's rstd (and the raw mode's per-call ``qn``).  A forward and a
-    rank whose internal rows exceed twice its tokens move nothing; the decision is kept per plan."""
+    call).  Every launch that binds ``v_new`` / ``dv2`` binds the moved views (checked on the values each launch
+    recorded, which the call's value dict keeps) and comes before the first launch that binds an output they ride
+    on; the arena's cached views are not rebound, and the moved-views copy the call ran on (kept on the arena for the
+    next call, :func:`cake_kcp._l2n_bwd_rows`) holds the arena's buffers again once the call returns
+    (:func:`cake_kcp._l2n_restore_views`); the backward allocates no byte beyond the flag-off backward's but the
+    replay's rstd (and the raw mode's per-call ``qn``).  A forward and a rank whose internal rows exceed twice its
+    tokens move nothing; the decision is kept per plan."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
         pytest.skip(
@@ -2552,17 +2555,21 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     assert in_arena(arena.v_new) and in_arena(arena.dv2)
     dq, dk = call.grads["dq"], call.grads["dk"]
     assert dk.data_ptr() == dq.data_ptr() + T * H * D * 2
-    assert moved.dv2.data_ptr() == dq.data_ptr() and moved.dv2.shape == arena.dv2.shape
-    assert call.local_values["dv2"] is moved.dv2
+    # the moved views the call bound (its value dict); its moved-views copy is restored at the call's end
+    bound = call.local_values
+    assert (
+        bound["dv2"].data_ptr() == dq.data_ptr()
+        and bound["dv2"].shape == arena.dv2.shape
+    )
+    assert moved.dv2 is arena.dv2 and moved.v_new is arena.v_new
     if "v_new" in expected:
-        assert moved.v_new.data_ptr() == call.grads[dg].data_ptr()
+        assert bound["v_new"].data_ptr() == call.grads[dg].data_ptr()
         assert (
-            moved.v_new.shape == arena.v_new.shape
-            and moved.v_new.dtype == arena.v_new.dtype
+            bound["v_new"].shape == arena.v_new.shape
+            and bound["v_new"].dtype == arena.v_new.dtype
         )
-        assert call.local_values["v_new"] is moved.v_new
     else:
-        assert moved.v_new is arena.v_new
+        assert bound["v_new"] is arena.v_new
     # the normalized rows: kn on dv2's arena bytes, qn on v_new's (raw gate mode: per call)
     outs = {"dq", "dk", dg}
     first_out = next(
@@ -2576,7 +2583,7 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
         for buf in ("v_new", "dv2"):
             if buf in names:
                 assert i < first_out, (record, buf)
-                assert values[buf] is getattr(moved, buf), (record, buf)
+                assert values[buf] is bound[buf], (record, buf)
                 seen.add(buf)
         if {"qn", "kn", "q", "k"} & names:
             assert values["kn"].data_ptr() == arena.dv2.data_ptr(), record
