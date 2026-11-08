@@ -75,7 +75,11 @@ before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
 partial group overlaps the fused tail of the other (:func:`adjoint_r_form`:
 beside a value-head group of two's tail, and beside a group of three's cluster
-tail on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  On an
+tail on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  Where the serial
+adjoint scan is one round that fills most of the device and its sequences end
+at different steps, a device of ``ONE_ROUND_TAIL_DEVICES`` forks before the
+walks: the shortest sequences walk on the side stream and run their cluster
+tail on the SMs that the longer walks leave (:func:`one_round_split`).  On an
 architecture of ``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan
 beside a group of three's cluster tail runs the same way over its segments
 (:func:`split_r_form`).  On an architecture of ``ADJOINT_SPLIT_ARCHS`` the
@@ -208,6 +212,8 @@ __all__ = [
     "tail_min_ctas",
     "tail_segments",
     "two_stream_split",
+    "ONE_ROUND_TAIL_DEVICES",
+    "one_round_split",
     "use_prep_tma",
     "wy_stage",
 ]
@@ -659,10 +665,14 @@ class ChunkMeta:
 @dataclass(frozen=True)
 class StreamGroups:
     """Two sequence groups of a serial scan: group A is the table's segments ``[0, split)`` (its chunks
-    ``[0, split_chunk)``), group B the rest; one is launched on a side stream (:func:`sequence_groups`)."""
+    ``[0, split_chunk)``), group B the rest; one is launched on a side stream (:func:`sequence_groups`).  ``early``
+    (adjoint scan of one round, :func:`one_round_split`): the backward forks before both walks, group A walks and
+    runs its tail on the caller's stream, group B (the sequences whose walks end first) walks and runs its tail on
+    the side stream."""
 
     split: int
     split_chunk: int
+    early: bool = False
 
 
 def segment_bounds(num_chunks: int, segment_len: int) -> list[int]:
@@ -2553,14 +2563,59 @@ def two_stream_split(num_segments: int, num_v_heads: int, sm_count: int) -> int 
     return best
 
 
+# A serial adjoint scan of one round (every (sequence, value head) CTA resident at once) waits for its longest sequence
+# before one tail launch over the whole table, while the SMs of the sequences that end first stay idle.  On a device of
+# ``ONE_ROUND_TAIL_DEVICES`` such a scan that fills more than half of the SMs runs as two groups forked before both
+# walks: the longer sequences (group A, the table's first segments in its longest-first order) walk on the caller's
+# stream and then run their tail there; the shortest ones (group B) walk on the side stream and run their tail there,
+# on the SMs that the walks leave idle.  Every launch covers whole sequences: the same CTAs and bits as one walk and
+# one tail.  Group B is the sequences of the fewest chunks: a longer group would start its tail later, and the SMs of
+# every other sequence are free to it from the end of that sequence's walk.  The value is the device's floor on the
+# idle SM time from group B's end to the longest walk's end (the spare SMs and those of every sequence that has
+# ended), per SM, in walk steps: 12 on B200 (about 29 us at 2.41 us per step), which the (16, 48) head pair over
+# three sequences of 12000 / 11000 / 9768 tokens passes with 17.5.
+ONE_ROUND_TAIL_DEVICES: dict[tuple[str, int], float] = {("sm_100a", 148): 12.0}
+
+
+@lru_cache(maxsize=1024)
+def one_round_split(
+    chunks: tuple[int, ...], num_v_heads: int, sm_count: int, min_steps: float
+) -> int | None:
+    """Group A's sequences ``split`` of a serial adjoint scan of one round over sequences of ``chunks`` chunks (in table
+    order, longest first): group B, the last ``n - split`` sequences, is every sequence of the fewest chunks.
+    ``None`` (one walk, one tail) for fewer than two sequences, a scan of more than one round or of at most half the
+    SMs, a table that is not longest first, sequences of one length, and an idle SM time from group B's end to the
+    longest walk's end below ``min_steps`` walk steps per SM."""
+    n, hv, sms = len(chunks), int(num_v_heads), int(sm_count)
+    if n < 2 or n * hv > sms or 2 * n * hv <= sms:
+        return None
+    if any(chunks[i] < chunks[i + 1] for i in range(n - 1)):
+        return None
+    longest, end = chunks[0], chunks[-1]
+    if end >= longest:
+        return None
+    split = min(i for i in range(n) if chunks[i] == end)
+    idle = (sms - n * hv) * (longest - end) + hv * sum(
+        longest - max(c, end) for c in chunks
+    )
+    return split if idle >= min_steps * sms else None
+
+
 def sequence_groups(
-    meta: ChunkMeta, num_v_heads: int, sm_count: int, *, split_adjoint: bool = False
+    meta: ChunkMeta,
+    num_v_heads: int,
+    sm_count: int,
+    *,
+    split_adjoint: bool = False,
+    one_round: float | None = None,
 ) -> tuple[StreamGroups | None, StreamGroups | None]:
     """The two-stream groups of a host-built table's forward and adjoint scans (``None``: one stream).  A scan is
     grouped on a serial plan (one segment per sequence, the table's walk) when :func:`two_stream_split` splits it: the
     adjoint scan's group A is its full-round group, the forward scan's group A the rest.  With ``split_adjoint`` (the
     R form of :func:`split_r_form`) the adjoint table of a split plan is grouped over its segments by the same rule:
-    group A its first ``k`` segments, the chunks before segment ``k``."""
+    group A its first ``k`` segments, the chunks before segment ``k``.  With ``one_round`` (the device's floor of
+    ``ONE_ROUND_TAIL_DEVICES``) a serial adjoint scan of one round is grouped by :func:`one_round_split`, forked
+    before both walks (``early``)."""
     if meta.seq_lens is None:
         return None, None
     order = meta.order if meta.order is not None else range(meta.num_seqs)
@@ -2570,6 +2625,17 @@ def sequence_groups(
         k = None
         if segs.num_segments == meta.num_seqs and segs.walk is None:
             k = two_stream_split(meta.num_seqs, int(num_v_heads), int(sm_count))
+            if k is None and adjoint and one_round is not None:
+                early = one_round_split(
+                    tuple(chunks), int(num_v_heads), int(sm_count), float(one_round)
+                )
+                split_chunk = 0 if early is None else sum(chunks[:early])
+                groups.append(
+                    StreamGroups(early, split_chunk, True)
+                    if early is not None and 0 < split_chunk < meta.num_chunks
+                    else None
+                )
+                continue
         elif (
             adjoint
             and split_adjoint
@@ -3811,7 +3877,11 @@ def _backward_chain(
     two_groups = adjoint_r_form(
         arch, num_v_heads // num_heads, form, serial_tc=use_tc, split_tc=split_tc
     )
-    groups = meta.bwd_groups if two_groups and split1 is None else None
+    groups = meta.bwd_groups if split1 is None else None
+    if groups is not None and not (
+        (use_tc and form in GROUP_TAILS) if groups.early else two_groups
+    ):
+        groups = None  # early groups: the serial dhu_tc2 scan beside a cluster tail; the R form: adjoint_r_form
     if not (use_tc or split_tc or split1 is not None):
         dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
         ex.launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,
@@ -3896,16 +3966,18 @@ def _backward_chain(
         # the caller's views (``grad_qkv``) when given
         if groups is not None:
             # R form: group A's dhu_tc2 (the caller's stream) first, so the host work that makes the tail's outputs
-            # below runs while it does
+            # below runs while it does; the early groups bind both walks and fork before them (below)
             na, ca = groups.split, groups.split_chunk
 
             def dhu_tc2(s0, s1):
-                ex.launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
-                          dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
-                          segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
-                          1 if has_initial_state else 0, scale)  # fmt: skip
+                return ex.bind(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs,
+                               dht32[s0:s1] if use_dht else dht32, dh, dv2, dh0, dh0, meta.chunk_start,
+                               meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1], segs.seg_seq[s0:s1],
+                               meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0,
+                               scale)  # fmt: skip
 
-            dhu_tc2(0, na)
+            if not groups.early:
+                dhu_tc2(0, na)()
         qkv_stride = None
         if grad_qkv is not None and form in F32X_TAILS:
             qkv = ex.qkv(grad_qkv)
@@ -3985,6 +4057,20 @@ def _backward_chain(
 
         if groups is None:
             tail(0, meta.num_chunks)
+        elif groups.early:
+            # one round (one_round_split): both walks bound, then forked together; the caller's stream walks group A
+            # (the longer sequences) and runs its tail, the side stream walks group B (the sequences that end first)
+            # and runs its tail on the SMs the walks leave
+            walk_a, walk_b = dhu_tc2(0, na), dhu_tc2(na, segs.num_segments)
+            main, side = ex.fork(index)
+            try:
+                walk_a()
+                with ex.on(side):
+                    walk_b()
+                    tail(ca, meta.num_chunks)
+                tail(0, ca)
+            finally:
+                ex.join(main, side)  # the join
         else:
             # R form: the caller's stream runs dhu_tc2 of group A (the full rounds; sequences, or the segments of a
             # split plan's pass 2), then the tail of A while the side stream runs dhu_tc2 of group B (the partial
@@ -3992,7 +4078,7 @@ def _backward_chain(
             main, side = ex.fork(index)
             try:
                 with ex.on(side):
-                    dhu_tc2(na, segs.num_segments)
+                    dhu_tc2(na, segs.num_segments)()
                 tail(0, ca)
             finally:
                 ex.join(main, side)  # the join
@@ -4298,6 +4384,7 @@ def _chunk_meta(
         SPLIT_R_FORM,
         tuple(sorted(ADJOINT_SPLIT_ARCHS)),
         id(cake_plan.ADJOINT_FORMS),
+        tuple(sorted(ONE_ROUND_TAIL_DEVICES.items())),
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -4339,11 +4426,15 @@ def _chunk_meta(
         split_adjoint = _split_r_groups(
             cake_backend.device_arch(int(index)), group, options
         )
+        sm_count = _device_props(int(index))[0]
         fwd_groups, bwd_groups = sequence_groups(
             meta,
             int(num_v_heads),
-            _device_props(int(index))[0],
+            sm_count,
             split_adjoint=split_adjoint,
+            one_round=ONE_ROUND_TAIL_DEVICES.get(
+                (cake_backend.device_arch(int(index)), int(sm_count))
+            ),
         )
         if meta.bwd_split is not None:
             bwd_groups = None  # the split's two waves fill the device; the tail runs as one launch after them

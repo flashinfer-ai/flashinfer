@@ -932,6 +932,72 @@ def test_sequence_groups_partition_a_serial_table() -> None:
     assert cake_chain.sequence_groups(device_meta, num_v_heads, 5) == (None, None)
 
 
+def test_one_round_split_rule() -> None:
+    # one_round_split: a serial adjoint scan of one round that fills more than half of the SMs, its sequences longest
+    # first: group B is every sequence of the fewest chunks, kept when the SMs idle from its end to the longest walk's
+    # end (the spare ones and those of the sequences that have ended) reach the floor, in walk steps per SM
+    rule = cake_chain.one_round_split
+    a16 = tuple(-(-n // 64) for n in sorted(_PAIR_LAYOUT, reverse=True))
+    assert a16 == (188, 172, 153)
+    # B200: 4 x 35 + 48 x (35 + 16) = 2588 idle steps on 148 SMs, 17.5 per SM
+    assert rule(a16, 48, 148, 12.0) == 2
+    assert rule(a16, 48, 148, 17.4) == 2
+    assert rule(a16, 48, 148, 17.6) is None
+    assert rule(a16, 48, 152, 0.0) == 2
+    assert (
+        rule((188, 153, 153), 48, 148, 0.0) == 1
+    )  # every sequence of the fewest chunks
+    for chunks, hv, sms in (
+        (a16, 48, 143),  # more than one round
+        (a16, 24, 148),  # at most half the SMs
+        ((172, 172, 172), 48, 148),  # one length
+        ((188,), 100, 148),  # one sequence
+        ((153, 172, 188), 48, 148),  # not longest first
+    ):
+        assert rule(chunks, hv, sms, 0.0) is None, (chunks, hv, sms)
+
+
+# The adjoint groups of the bench layouts on a serial table per device: B200 (ONE_ROUND_TAIL_DEVICES) forks the
+# (16, 48) head pair over the pair layout before both walks, group B its shortest sequence; the R form of 64 x 4096
+# stays; the other devices, the (8, 24) head pair and a table in the caller's order run one walk and one tail.
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152), ("sm_107a", 208)],
+    ids=["B200", "GB200", "GB300", "R200"],
+)
+def test_one_round_groups_on_the_bench_layouts(arch, sm_count, monkeypatch) -> None:
+    assert cake_chain.ONE_ROUND_TAIL_DEVICES == {("sm_100a", 148): 12.0}
+    floor = cake_chain.ONE_ROUND_TAIL_DEVICES.get((arch, sm_count))
+    serial = (cake_chain.ScanPlan((64, 1), 0), cake_chain.ScanPlan((64, 1), 0))
+    for seq_lens, num_v_heads, lpt, want in (
+        (_PAIR_LAYOUT, 48, True, (2, 188 + 172) if floor else None),
+        (_PAIR_LAYOUT, 48, False, None),
+        (_PAIR_LAYOUT, 24, True, None),
+    ):
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=serial, lpt=lpt)
+        fwd, bwd = cake_chain.sequence_groups(
+            meta, num_v_heads, sm_count, one_round=floor
+        )
+        assert fwd is None, (seq_lens, num_v_heads, fwd)
+        if want is None:
+            assert bwd is None, (seq_lens, num_v_heads, lpt, bwd)
+        else:
+            assert bwd == cake_chain.StreamGroups(*want, early=True), bwd
+            assert meta.seq_chunk_start.tolist()[bwd.split] == bwd.split_chunk
+    meta = cake_chain.build_chunk_meta((4096,) * 64, "cpu", scan_plans=serial, lpt=True)
+    k = cake_chain.two_stream_split(64, 6, sm_count)
+    _fwd, bwd = cake_chain.sequence_groups(meta, 6, sm_count, one_round=floor)
+    assert bwd is not None and (bwd.split, bwd.early) == (k, False), bwd
+    # B200 plans the (16, 48) head pair over the pair layout on serial tables, so the backward takes the groups
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    if (arch, sm_count) == ("sm_100a", 148):
+        plans = cake_chain.host_plans(_PAIR_LAYOUT, 48, 0, group=3)[0]
+        assert all(plan.segment_len <= 0 for plan in plans), plans
+
+
 # The prep dispatch window on each architecture's SM count (slots = ctas_per_sm x SMs, the record's select
 # constants): the plain prep inside (slots, window x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs)
 # lie inside on sm_100a and sm_103a.  sm_107a has window 1.0, no band: prep_tma for every grid.
@@ -1516,6 +1582,61 @@ def _check_group_of_three_split(seq_lens, heads, device, monkeypatch) -> None:
     _assert_same_bits(_run(inputs, seq_lens, streams=1), got, OUTPUT_NAMES)
     _assert_same_bits(_run(inputs, seq_lens, tail="tail", host_cache=False), _run(inputs, seq_lens, host_cache=False),
                       OUTPUT_NAMES)  # fmt: skip
+
+
+def test_one_round_groups_keep_the_bits_of_one_walk(device, monkeypatch) -> None:
+    # the one-round groups (one_round_split) of the (16, 48) head pair over the pair layout: both walks forked
+    # together, group A's walk and tail on the caller's stream, group B's (the shortest sequence) on the side stream;
+    # the bits of one walk and one tail (one stream), run to run, through the packed row and the head views, and the
+    # recorded backward plan replays the general path's launches and bits.  The device's floor is lifted to 0 so that
+    # every device whose SMs hold the 144 CTAs in one round more than half full runs the groups.
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    sm_count = cake_chain._device_props(index)[0]
+    seq_lens, heads = _PAIR_LAYOUT, (16, 48)
+    if not 3 * 48 <= sm_count < 2 * 3 * 48:
+        pytest.skip(
+            f"{sm_count} SMs do not hold the adjoint scan in one round more than half full"
+        )
+    plans = cake_chain.host_plans(seq_lens, heads[1], index, group=3)[0]
+    if any(plan.segment_len > 0 for plan in plans):
+        pytest.skip(f"{arch} plans the pair layout on split tables")
+    monkeypatch.setattr(cake_chain, "ONE_ROUND_TAIL_DEVICES", {(arch, sm_count): 0.0})
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=347)
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(cake_chain, "BWD_PLAN", False)
+        general = _run(inputs, seq_lens)
+    tc2 = cake_chain.dhu_tc2_stage(arch)
+    form = cake_chain.tail_form(*heads, arch=arch)
+    assert form in cake_chain.GROUP_TAILS, form
+    tails = (form, form + "_bf16")  # the BF16 form for a BF16 beta
+    stages = [stage for stage, _ in launches]
+    side = [stage for stage, stream in launches if stream != main]
+    side_tails = [i for i, stage in enumerate(side) if stage in tails]
+    assert stages.count(tc2) == 2 and side.count(tc2) == 1, launches
+    assert len([s for s in stages if s in tails]) == 2 and len(side_tails) == 1, (
+        launches
+    )
+    assert side.index(tc2) < side_tails[0], side
+    log = _logged_launches(monkeypatch)
+    replays = _counted_replays(monkeypatch)
+    recorded = _run(inputs, seq_lens)
+    first = list(log)
+    log.clear()
+    runs = [_run(inputs, seq_lens) for _ in range(4)]
+    assert log == first * 4 and len(replays) == 4
+    for got in (recorded, *runs, _run_packed(inputs, seq_lens, heads)):
+        _assert_same_bits(got, general, OUTPUT_NAMES)
+    _assert_same_bits(_run(inputs, seq_lens, streams=1), general, OUTPUT_NAMES)
+    monkeypatch.setattr(cake_chain, "ONE_ROUND_TAIL_DEVICES", {})
+    launches.clear()
+    one = _run(inputs, seq_lens, host_cache=False)
+    assert [stage for stage, _ in launches].count(tc2) == 1, launches
+    _assert_same_bits(one, general, OUTPUT_NAMES)
 
 
 def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
