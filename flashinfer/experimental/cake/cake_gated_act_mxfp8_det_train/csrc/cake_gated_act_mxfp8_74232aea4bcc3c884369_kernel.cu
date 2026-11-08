@@ -120,7 +120,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gated_act_mxfp8_07f12e4d85523cdf2557(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
+kernel_cake_gated_act_mxfp8_74232aea4bcc3c884369(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -163,8 +163,8 @@ kernel_cake_gated_act_mxfp8_07f12e4d85523cdf2557(__nv_bfloat16* __restrict__ gat
         uint32_t _iv_0_5;
         uint32_t _iv_0_6;
         uint32_t _iv_0_7;
-        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-            : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(gated_input + gate_index + (0))), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+            : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(gated_input + gate_index + (0))) : "memory");
         words[0 + 0] = (uint32_t)_iv_0_0;
         words[0 + 1] = (uint32_t)_iv_0_1;
         words[0 + 2] = (uint32_t)_iv_0_2;
@@ -184,8 +184,8 @@ kernel_cake_gated_act_mxfp8_07f12e4d85523cdf2557(__nv_bfloat16* __restrict__ gat
         uint32_t _iv_1_5;
         uint32_t _iv_1_6;
         uint32_t _iv_1_7;
-        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-            : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(gated_input + (gate_index + K) + (0))), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+            : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(gated_input + (gate_index + K) + (0))) : "memory");
         words_0[0 + 0] = (uint32_t)_iv_1_0;
         words_0[0 + 1] = (uint32_t)_iv_1_1;
         words_0[0 + 2] = (uint32_t)_iv_1_2;
@@ -207,8 +207,8 @@ kernel_cake_gated_act_mxfp8_07f12e4d85523cdf2557(__nv_bfloat16* __restrict__ gat
         uint32_t _iv_2_5;
         uint32_t _iv_2_6;
         uint32_t _iv_2_7;
-        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-            : "=r"(_iv_2_0), "=r"(_iv_2_1), "=r"(_iv_2_2), "=r"(_iv_2_3), "=r"(_iv_2_4), "=r"(_iv_2_5), "=r"(_iv_2_6), "=r"(_iv_2_7) : "l"((const void*)(gated_input + gate_index_hi + (0))), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+            : "=r"(_iv_2_0), "=r"(_iv_2_1), "=r"(_iv_2_2), "=r"(_iv_2_3), "=r"(_iv_2_4), "=r"(_iv_2_5), "=r"(_iv_2_6), "=r"(_iv_2_7) : "l"((const void*)(gated_input + gate_index_hi + (0))) : "memory");
         words_1[0 + 0] = (uint32_t)_iv_2_0;
         words_1[0 + 1] = (uint32_t)_iv_2_1;
         words_1[0 + 2] = (uint32_t)_iv_2_2;
@@ -228,8 +228,8 @@ kernel_cake_gated_act_mxfp8_07f12e4d85523cdf2557(__nv_bfloat16* __restrict__ gat
         uint32_t _iv_3_5;
         uint32_t _iv_3_6;
         uint32_t _iv_3_7;
-        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
-            : "=r"(_iv_3_0), "=r"(_iv_3_1), "=r"(_iv_3_2), "=r"(_iv_3_3), "=r"(_iv_3_4), "=r"(_iv_3_5), "=r"(_iv_3_6), "=r"(_iv_3_7) : "l"((const void*)(gated_input + (gate_index_hi + K) + (0))), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+            : "=r"(_iv_3_0), "=r"(_iv_3_1), "=r"(_iv_3_2), "=r"(_iv_3_3), "=r"(_iv_3_4), "=r"(_iv_3_5), "=r"(_iv_3_6), "=r"(_iv_3_7) : "l"((const void*)(gated_input + (gate_index_hi + K) + (0))) : "memory");
         words_2[0 + 0] = (uint32_t)_iv_3_0;
         words_2[0 + 1] = (uint32_t)_iv_3_1;
         words_2[0 + 2] = (uint32_t)_iv_3_2;
