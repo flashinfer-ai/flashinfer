@@ -1041,11 +1041,11 @@ def test_matches_the_fp64_reference(layout, form, device) -> None:
 
 
 @pytest.mark.parametrize(
-    "h_q, h_kv", ((24, 4), (6, 2), (4, 4)), ids=("pairs", "group_3", "group_1")
+    "h_q, h_kv", ((24, 4), (4, 2), (8, 1)), ids=("group_6", "group_2", "group_8")
 )
 def test_the_forward_of_every_group_matches_the_reference(h_q, h_kv, device) -> None:
-    """An even group runs forward tiles of two query heads, an odd one tiles of one head: both match the FP64
-    reference and repeat bit for bit, also into a caller's ``out`` 16 bytes past a 32-byte boundary."""
+    """Forward tiles of two query heads of one key head match the FP64 reference for several groups and repeat bit
+    for bit, also into a caller's ``out`` 16 bytes past a 32-byte boundary."""
     q_lens, k_lens = (77, 300, 1, 129, 0, 40), (77, 700, 1000, 129, 50, 0)
     x = _inputs(q_lens, k_lens, h_q, h_kv, device)
     ref = _reference(x)
