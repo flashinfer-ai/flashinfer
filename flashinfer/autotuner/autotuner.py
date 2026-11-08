@@ -1250,9 +1250,8 @@ def set_autotune_process_group(
     skip decisions, profile count, measurement policy and ordered candidates.
     Rank-local shapes and cache roots may differ. A mismatch raises on every
     participating rank before tactic measurement. Cached selections must agree;
-    any miss or disagreement makes every rank re-profile. In multi-runner
-    tuning, disagreement on the final selection makes every rank use the
-    fallback.
+    any miss or disagreement makes every rank re-profile. At the final
+    selection in ``choose_one``, the group uses the fallback if ranks disagree.
 
     Input/candidate/runner preparation OOMs keep coordinated fallback. Other
     caught Python preparation errors raise across the group. Matching nested
@@ -3639,7 +3638,7 @@ class AutoTuner:
                 ):
                     has_selection = True
                     runner_id, tactic = incomplete_winner
-            if profiling_candidates is not None and _tune_process_group is not None:
+            if _tune_process_group is not None:
                 # Rank-local inputs can reject a winner after profile agreement.
                 selection = (runner_id, type(runners[runner_id]).__name__, tactic)
                 if not _all_ranks_hit_cache(

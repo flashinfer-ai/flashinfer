@@ -745,8 +745,9 @@ from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotun
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
-complete = case == "final_cached_disagreement"
-agreed = case == "final_incomplete_agreement"
+single_runner = case.startswith("final_single_runner_")
+complete = single_runner or case == "final_cached_disagreement"
+agreed = case in ("final_incomplete_agreement", "final_single_runner_agreement")
 root = Path(os.environ["CASE_ROOT"])
 
 class RunnerA(TunableRunner):
@@ -780,15 +781,19 @@ dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous")
 try:
     set_autotune_process_group(dist.group.WORLD)
     tuner = AutoTuner.get()
-    runners = [RunnerA(), RunnerB()]
+    winner = RunnerB()
+    runners = [winner] if single_runner else [RunnerA(), winner]
     inputs = [torch.zeros(8, 8)]
-    expected = (runners[1], 0) if agreed else (runners[0], -1)
+    expected = (winner, 0) if agreed else (runners[0], -1)
+    selections = []
     with autotune(True):
         for repeat in (False, True):
             profiled.clear()
-            chosen, tactic = tuner.choose_one("test::final_selection", runners, TuningConfig(), inputs)
-            assert (chosen, tactic) == expected, (rank, case, type(chosen).__name__, tactic)
+            selections.append(tuner.choose_one("test::final_selection", runners, TuningConfig(), inputs))
             assert profiled == ([] if repeat and complete else runners)
+    assert selections == [expected, expected], (
+        rank, case, [(type(runner).__name__, tactic) for runner, tactic in selections]
+    )
     print("cache agreement OK", rank, case, flush=True)
 finally:
     set_autotune_process_group(None)
@@ -815,6 +820,8 @@ finally:
         "final_incomplete_disagreement",
         "final_incomplete_agreement",
         "final_cached_disagreement",
+        "final_single_runner_disagreement",
+        "final_single_runner_agreement",
         "rejected_legacy",
         "rejected_shortlist_v1",
         "rejected_shortlist_managed",
