@@ -38,7 +38,7 @@ from flashinfer.gemm.batch_invariant.generator import (
     enumerate_space,
     knob_product,
 )
-from flashinfer.gemm.batch_invariant.heuristic import PARTS
+from flashinfer.gemm.batch_invariant.heuristic import PARTS, capacity_for
 from flashinfer.gemm.batch_invariant.schedule import (
     chunks_for,
     default_config,
@@ -286,6 +286,12 @@ def test_space_is_the_block_scale_tiles_on_a_k_major_weight():
 
 @pytest.mark.parametrize("family,sm_count", PARTS)
 def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
+    """R3 membership, and the structure the heuristic's block-scale terms give the pick at every nominal part: never the
+    2-CTA pair (its promotion runs in lockstep, `heuristic.estimate_cycles`); at a few tokens the narrowest tile whose
+    tiles fit the part in one wave (the per-block hand-off chain costs the same at every width) in the 4-wide N-cluster
+    when its clusters fit (the token box's zero-fill shared by the multicast); at many rows the 128 x 128 tile once its
+    tiles alone fill the part."""
+    cap4 = capacity_for(family, sm_count, nominal=True)[4]
     for N, K in DS_PAIRS:
         for M in DS_MS:
             space = set(enumerate_space(M, N, K, b_major="k", in_fmt=FMT))
@@ -293,9 +299,26 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 M, N, K, 1, "k", sm_count, 10, family, in_fmt=FMT, nominal=True
             )
             assert top and all(k in space for k in top), (family, sm_count, M, N, K)
-            assert top[0] == default_config(
-                M, N, K, 1, "k", sm_count, family, FMT, nominal=True
-            )
+            pick = default_config(M, N, K, 1, "k", sm_count, family, FMT, nominal=True)
+            assert top[0] == pick
+            where = (family, sm_count, M, N, K, pick.describe())
+            assert not pick.use_2cta_instrs, where
+            if M <= 32:
+                # the narrowest tile whose tiles fit one wave, in 4-wide N-clusters when those fit the part's cluster capacity
+                tiles = {tn: -(-N // tn) for tn in (16, 32, 64, 128)}
+                in_clusters = [tn for tn, t in tiles.items() if (t + 3) // 4 <= cap4]
+                if in_clusters:
+                    assert (pick.tile_n, pick.cluster_n) == (in_clusters[0], 4), where
+                else:
+                    assert (
+                        pick.tile_n
+                        == [tn for tn, t in tiles.items() if t <= sm_count][0]
+                    ), where
+            wide_tiles = -(-M // 128) * -(-N // 128)
+            if M >= 1024 and wide_tiles >= 2 * sm_count:
+                # the 128 x 128 tiles alone fill the part twice over: the widest tile (a narrower N, or a single partial wave, keeps
+                # the SMs busy with narrower tiles)
+                assert (pick.tile_m, pick.tile_n) == (128, 128), where
 
 
 def test_tactic_encoding_round_trips():
