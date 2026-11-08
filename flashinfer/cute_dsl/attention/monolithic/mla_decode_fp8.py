@@ -4026,6 +4026,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ]
             )
+            # The partner thread must finish reading this slot before the
+            # next work unit's epilogue overwrites it (write-after-read).
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
         # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
