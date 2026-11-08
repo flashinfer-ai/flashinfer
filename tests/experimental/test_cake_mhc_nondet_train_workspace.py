@@ -30,7 +30,7 @@ skip units or end away from zero), then the column slab's arrival counts
 the last CTA of a launch leaves both words zero).  The deterministic regions
 follow (the token owner's records and parameter rows: the per-CTA partials, or
 the group rows inside ``BWD_ROW_BANDS``), then the column slab's per-chunk
-``dfn`` slot pairs, so
+``dfn`` slots, so
 the workspace is larger than the deterministic package's.  A caller-owned buffer
 sized by ``cake_mhc_nondet_train_backward_workspace_bytes(T_max)`` serves
 every token count up to ``T_max`` (at its ``hidden``) and CUDA Graph replays
@@ -958,7 +958,7 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
     """At the hidden size ``H`` of the case, this package's backward workspace is the ticket region, the column slab's
     arrival counts (``SLAB_CNT_WORDS`` uint32 at offset 256: the zero prefix), the deterministic regions but the
     per-chunk ``dfn`` partials (their sizes and shapes, the parameter region the deterministic one: the group rows
-    inside ``BWD_ROW_BANDS``) and the per-chunk ``dfn`` slot pairs (``2 x min(32, ceil(T / 64)) x 24 x 4H`` FP32); its
+    inside ``BWD_ROW_BANDS``) and the per-chunk ``dfn`` slots (``min(32, ceil(T / 64)) x 24 x 4H`` FP32); its
     public size is the envelope over every token count up to ``T``, above the deterministic package's; the forward
     workspace is the deterministic one.  The size helper takes no ``deterministic`` keyword (``TypeError``).  A
     workspace of the deterministic sizing (``cake_mhc_det_train_backward_workspace``) is smaller than this package's
@@ -995,7 +995,7 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
         part, slots = dtl["regions"]["dfn_part"], ndl["regions"]["dfn_slot"]
         slot_parts = min(32, -(-T // 64))
         assert part["bytes"] == _parts(T, hidden) * MAPPING_ROWS * STREAMS * hidden * 4
-        assert slots["shape"] == (2, slot_parts, MAPPING_ROWS, STREAMS * hidden), T
+        assert slots["shape"] == (slot_parts, MAPPING_ROWS, STREAMS * hidden), T
         assert slots["dtype"] == "float32" and slot_parts >= _parts(T, hidden), T
         assert ndl["total_bytes"] == (
             dtl["total_bytes"]

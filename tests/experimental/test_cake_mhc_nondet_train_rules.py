@@ -70,7 +70,7 @@ and record scalars of every hidden size on its boards of record
   ``ZERO_PREFIX_BYTES`` at every token count and hidden size), then the
   deterministic regions without the trailing ``dfn_part`` (the parameter region
   the deterministic one: the group rows inside ``BWD_ROW_BANDS``), then the
-  column slab's per-chunk ``dfn`` slot pairs ``dfn_slot``; larger than the
+  column slab's per-chunk ``dfn`` slots ``dfn_slot``; larger than the
   deterministic workspace at every token count;
 * the host rules are copies (equal outputs, not the deterministic objects;
   the per-size tables the deterministic ones without the column-slab and
@@ -1683,7 +1683,7 @@ def test_workspace_holds_the_deterministic_regions_and_the_fold_regions(
         det_bwd[0],
         {"dtype": "uint32", "name": "slab_cnt", "shape": [SLAB_CNT_WORDS]},
         *det_bwd[1:-1],
-        {"dtype": "float32", "name": "dfn_slot", "shape": [2, "slot_parts", 24, "n"]},
+        {"dtype": "float32", "name": "dfn_slot", "shape": ["slot_parts", 24, "n"]},
     ]
     assert nd.WORKSPACE_OF_KIND == det.WORKSPACE_OF_KIND
     shift = ZERO_PREFIX_BYTES - 4 * det.TICKET_WORDS
@@ -1737,8 +1737,8 @@ def test_workspace_holds_the_deterministic_regions_and_the_fold_regions(
         assert slot_parts >= parts, what
         assert slots["offset"] == part["offset"] + shift, what
         assert slots["dtype"] == "float32", what
-        assert slots["shape"] == (2, slot_parts, 24, 4 * hidden), what
-        assert slots["bytes"] == 2 * slot_parts * 24 * 4 * hidden * 4, what
+        assert slots["shape"] == (slot_parts, 24, 4 * hidden), what
+        assert slots["bytes"] == slot_parts * 24 * 4 * hidden * 4, what
         assert layout["total_bytes"] == (
             reference["total_bytes"]
             - _round256(part["bytes"])

@@ -38,15 +38,15 @@ four programs of this package take their place:
   completes only after it;
 * ``cake_mhc_train_bwd_slab_fold__dynr`` (every architecture): the
   deterministic dynamic-schedule column-slab form ``dynr`` (``dX`` bit for
-  bit), which stores the ``dfn`` Kahan pair (running sum and compensation) of
-  every (column slab, token chunk) unit into its chunk's slots of the backward
-  workspace (``dfn_slot`` as ``[2, P, 24, 4H]``: the sums, then the
-  compensations; units without tokens store nothing).  It draws every unit
+  bit), which stores the compensated ``dfn`` sums of every (column slab, token
+  chunk) unit, the deterministic partials of that unit, into its chunk's slots
+  of the backward workspace (``dfn_slot`` as ``[P, 24, 4H]``; units without
+  tokens store nothing).  It draws every unit
   from the ticket, so only a running CTA holds a unit.  Each CTA adds its unit
   count to the first ``slab_cnt`` word once, after its last unit, and waits
   until the grid's count reaches every unit; the second word counts the CTAs
-  past that wait, and the last of them leaves both words zero.  The CTAs then
-  fold ``dfn`` element ranges in parallel: per element the pairs of the chunks
+  done with their fold, and the last of them leaves both words zero.  The CTAs
+  fold ``dfn`` element ranges in parallel: per element the slots of the chunks
   that hold tokens in ascending chunk order as a compensated FP32 sum
   (TwoSum), the entry value last under ``accumulate``, one rounding.  The
   order of every addition depends on the chunk geometry alone, never on the
@@ -99,22 +99,21 @@ So ``bwd_finish`` is the deterministic token-owner pass (with its group-row
 forms ``_trows_dyn`` inside ``BWD_ROW_BANDS``), the fn split and the column
 slab: no final reduction.  The ``bwd`` workspace holds the column slab's
 arrival counts (``slab_cnt``) right after the ticket region and its per-chunk
-``dfn`` slot pairs (``dfn_slot``, two FP32 planes of ``min(32, ceil(T / 64))``
-chunks) in place of the deterministic per-chunk partials (``dfn_part``).  Every
+``dfn`` slots (``dfn_slot``, FP32 ``[min(32, ceil(T / 64)), 24, 4H]``) in place
+of the deterministic per-chunk partials (``dfn_part``).  Every
 output repeats bit for bit from run to run on one device: each sum runs in an
 order fixed by the token count and the device.  ``dX`` and every other route's
 outputs are the deterministic package's bits, and so are ``dscale`` and
 ``dbase`` (the same parameter rows folded in the same order).  ``dfn`` is the
-compensated fold of at most ``P`` per-chunk slot pairs ``(acc, comp)`` (``P <=
-32``: the chunk count of :func:`k7_chunks`) and the entry value ``in`` under
-``accumulate``: within one FP32
-rounding of ``in + sum (acc - comp)`` plus ``O(P^2 u^2) (|in| + sum |acc|)``
-and ``O(P u) sum |comp|`` (``u = 2^-24``); no addition flushes a subnormal.
-The chunks are the deterministic column slab's: each pair ``(acc, comp)`` is
-the unit of the same tokens, and ``acc - comp`` rounded to FP32 is the
-deterministic partial of that unit.  The deterministic package folds those rounded partials in FP64
-instead, so ``dfn`` can differ from the deterministic ``dfn`` in the low-order
-bits (by the partials' roundings, which this fold does not make).
+compensated fold of at most ``P`` per-chunk slots ``x_p`` (``P <= 32``: the
+chunk count of :func:`k7_chunks`) and the entry value ``in`` under
+``accumulate``: within one FP32 rounding of ``in + sum x_p`` plus
+``O(P^2 u^2) (|in| + sum |x_p|)`` (``u = 2^-24``); no addition flushes a
+subnormal.  The chunks are the deterministic column slab's, and each slot is
+the deterministic partial of the same unit, bit for bit.  The deterministic
+package sums those partials in FP64 and rounds once, so ``dfn`` is the
+deterministic ``dfn`` except where the exact sum lies within that last term of
+an FP32 rounding boundary.
 The deterministic package's backward fn splits (``fn_split__tv128__t``,
 ``fn_split__tv128_t128__t``, ``fn_split__tv128__h<H>__t``) have no copy here:
 the atomic fn splits replace them.  The deterministic package's
@@ -7163,14 +7162,14 @@ PARAM_LAYOUT: dict[str, tuple[int, int]] = {
 # parameter region ``param_partial``: the per-CTA partials ``[G6, 32]``, or the
 # group rows ``[56, ceil(T / 8)]`` inside ``BWD_ROW_BANDS``), each 512 bytes
 # past its deterministic offset; the last region is the column slab's per-chunk
-# FP32 ``dfn`` slot pairs (``dfn_slot``, ``2 x slot_parts x 24 x n`` with
-# ``slot_parts = min(32, ceil(T / 64))``, at least the token-holding chunks of
-# either column-slab geometry; a launch of ``P`` chunks uses its first ``2 x P
-# x 24 x n`` values as ``[2, P, 24, n]``: the units' Kahan sums, then their
-# compensations), which the grid folds into ``dfn`` once every unit has stored
-# its pair.  The slot region depends on the token count alone, never on the
-# two-size screen, so the workspace envelope never runs that screen.  A
-# deterministic backward workspace does not serve this package.
+# FP32 ``dfn`` slots (``dfn_slot``, ``slot_parts x 24 x n`` with ``slot_parts =
+# min(32, ceil(T / 64))``, at least the token-holding chunks of either
+# column-slab geometry; a launch of ``P`` chunks uses its first ``P x 24 x n``
+# values as ``[P, 24, n]``: the units' compensated sums), which the grid folds
+# into ``dfn`` once every unit has stored its slots.  The slot region depends on
+# the token count alone, never on the two-size screen, so the workspace envelope
+# never runs that screen.  A deterministic backward workspace does not serve
+# this package.
 WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
     "fwd": [
         {"dtype": "uint32", "name": "ticket", "shape": [64]},
@@ -7189,7 +7188,7 @@ WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
             "name": "param_partial",
             "shape": ["param_dim0", "param_dim1"],
         },
-        {"dtype": "float32", "name": "dfn_slot", "shape": [2, "slot_parts", 24, "n"]},
+        {"dtype": "float32", "name": "dfn_slot", "shape": ["slot_parts", 24, "n"]},
     ],
 }
 # Scalar values a record fixes itself (the launch policy of a stage record):
@@ -7641,7 +7640,7 @@ FWD_FINISH_ROWS = {"production": 4, "r2": 2}
 # makespans) and would run the best on an "lpt" record (none ships) where its makespan is at most keep times the
 # one-size chunks'. Every entry of this table and of BWD_SLAB_LPT_HIDDEN is None
 # and BWD_SLAB_LPT_OVERRIDES has no cell, so every call runs the one-size chunks of k7_chunks, the deterministic column
-# slab's: each dfn slot pair is the deterministic unit's sum of the same tokens before its rounding. A two-size
+# slab's: each dfn slot is the deterministic unit's partial of the same tokens, bit for bit. A two-size
 # geometry sums other token ranges per chunk, so its dfn error against FP64 is another draw than the deterministic
 # package's: under the former calibrations below (and the 212-SM board's cell (1876, (0.5, 0.97)), (33600, (0.5,
 # 0.985)), (34368, (0.5, 0.98)), (None, (0.5, 0.97))) the worst-element dfn error of the four-times-accumulated case at
@@ -8510,7 +8509,7 @@ def host_plan(
         # the column slab's parameter fold: the layout of the rows the token owner wrote and their count
         "prow": int(group_rows),
         "param_rows": groups if group_rows else g6,
-        # the column slab's dfn slot pairs (two planes): one per chunk up to the 32 chunks of either geometry, and
+        # the column slab's dfn slots: one per chunk up to the 32 chunks of either geometry, and
         # never more than the 64-token tiles (a chunk without tokens writes no slot)
         "slot_parts": min(32, _ceil_div(rows, SLAB_TILE_T)),
     }

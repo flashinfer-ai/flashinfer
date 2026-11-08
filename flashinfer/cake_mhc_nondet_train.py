@@ -30,17 +30,17 @@ deterministic package ``flashinfer.cake_mhc_det_train``.
 Numerical contract: every output repeats bit for bit from run to run on one
 device (each sum runs in an order fixed by the token count and the device).
 ``backward_finish`` has no final reduction kernel: the column-slab pass
-stores the ``dfn`` Kahan pair (sum ``acc``, compensation ``comp``) of every
-(column slab, token chunk) unit in its chunk's slots of the backward
-workspace, and once every unit has stored its pair the grid folds the pairs
-(``P <= 32`` token chunks, the deterministic package's chunks per token count
-and device) into ``dfn`` in ascending chunk order as a compensated FP32 sum,
-the caller's ``dfn`` last under ``accumulate=True``, with one rounding: within
-one FP32 rounding of the exact sum plus ``O(P^2 u^2) (|start| + sum |acc|)``
-and ``O(P u) sum |comp|`` per element (``u = 2^-24``).  The deterministic
-package folds the same chunks' pairs in FP64, each rounded once to FP32
-first, so the low-order bits of ``dfn`` can differ from the deterministic
-``dfn``.  ``dX``, ``dscale`` and ``dbase`` are
+stores the compensated ``dfn`` sum of every (column slab, token chunk) unit,
+the deterministic package's FP32 partial of that unit bit for bit, in its
+chunk's slots of the backward workspace, and once every unit has stored its
+sums the grid folds the slots (``P <= 32`` token chunks, the deterministic
+package's chunks per token count and device) into ``dfn`` in ascending chunk
+order as a compensated FP32 sum, the caller's ``dfn`` last under
+``accumulate=True``, with one rounding: within one FP32 rounding of the exact
+sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` per element (``x_p`` the
+partials, ``u = 2^-24``).  The deterministic package sums the same partials
+in FP64 and rounds once, so ``dfn`` is the deterministic ``dfn`` except where
+the exact sum lies within that last term of an FP32 rounding boundary.  ``dX``, ``dscale`` and ``dbase`` are
 bitwise the deterministic values (the column-slab pass folds the parameter
 gradients in the deterministic reduction's order), and so are the forward,
 the statistics replay and ``backward_prepare`` (copies of the deterministic
@@ -51,8 +51,8 @@ Workspaces: the forward workspace has one layout in both packages.  The
 backward workspace has this package's own layout: a 256-byte ticket region
 and 512 bytes of column-slab arrival counts first (zero on first use), the
 deterministic package's regions without its per-chunk FP32 ``dfn`` partials,
-then the column slab's per-chunk FP32 ``dfn`` slot pairs
-(``2 x min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at hidden size ``H``).  A
+then the column slab's per-chunk FP32 ``dfn`` slots
+(``min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at hidden size ``H``).  A
 deterministic backward workspace does not serve this backward: a buffer the
 deterministic package's backward used must be zeroed
 (:func:`cake_mhc_nondet_train_reset_workspace`) before this package uses it.
@@ -208,8 +208,8 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
     column-slab arrival counts first (zero on first use; every completed
     launch leaves them zero), the deterministic package's regions without its
     per-chunk FP32 ``dfn`` partials, then the column slab's per-chunk FP32
-    ``dfn`` slot pairs (``2 x min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at
-    hidden size ``H``).  A deterministic backward workspace
+    ``dfn`` slots (``min(32, ceil(T / 64)) x 24 x 4H x 4`` bytes at hidden
+    size ``H``).  A deterministic backward workspace
     (:func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_workspace`)
     does not serve this backward.
 
@@ -499,14 +499,15 @@ def cake_mhc_nondet_train_backward_finish(
     the call runs the backend package's backward, with no final reduction
     kernel.  Every output repeats bit for bit from run to run on one device.
     ``dX``, ``dscale`` and ``dbase`` are bitwise the deterministic values.
-    Each element of ``dfn`` folds its ``P <= 32`` per-chunk Kahan pairs (sum
-    ``acc``, compensation ``comp``) in ascending chunk order as a compensated
-    FP32 sum, the caller's ``dfn`` last under ``accumulate=True``, with one
-    rounding: within one FP32 rounding of the exact sum plus
-    ``O(P^2 u^2) (|start| + sum |acc|)`` and ``O(P u) sum |comp|``
-    (``u = 2^-24``).  The deterministic package folds the same chunks' pairs
-    in FP64, each rounded once to FP32 first, so the low-order bits can differ
-    from the deterministic ``dfn`` (see the module docstring).
+    Each element of ``dfn`` folds its ``P <= 32`` per-chunk FP32 partials
+    ``x_p`` (bitwise the deterministic package's) in ascending chunk order as
+    a compensated FP32 sum, the caller's ``dfn`` last under
+    ``accumulate=True``, with one rounding: within one FP32 rounding of the
+    exact sum plus ``O(P^2 u^2) (|start| + sum |x_p|)`` (``u = 2^-24``).  The
+    deterministic package sums the same partials in FP64 and rounds once, so
+    ``dfn`` is the deterministic ``dfn`` except where the exact sum lies
+    within that last term of an FP32 rounding boundary (see the module
+    docstring).
 
     Parameters
     ----------

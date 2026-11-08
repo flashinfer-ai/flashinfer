@@ -23,21 +23,23 @@ backward prepare run its own copies of the deterministic programs, and
 deterministic token-owner pass (its group-row form inside ``BWD_ROW_BANDS``, as
 the deterministic package does), its atomic fn split (beside the token-owner
 pass as its programmatic dependent; it also clears ``dfn`` without
-``accumulate``) and its column-slab pass, which stores the ``dfn`` Kahan pair
-of every (column slab, token chunk) unit in its chunk's slots of the workspace,
-folds the pairs of each element in chunk order into ``dfn`` once every unit is
-done (a compensated FP32 sum, the carried value last under ``accumulate``, one
-rounding) and folds
+``accumulate``) and its column-slab pass, which stores the compensated ``dfn``
+sum of every (column slab, token chunk) unit (the deterministic partial of that
+unit) in its chunk's slots of the workspace, folds the slots of each element in
+chunk order into ``dfn`` once every unit is done (a compensated FP32 sum, the
+carried value last under ``accumulate``, one rounding) and folds
 ``dscale`` / ``dbase`` in the deterministic reduction's order; there is no
 reduction kernel.  Every output repeats bit for bit from launch to launch on
 one device.  ``dX``, ``dscale`` and ``dbase`` are the deterministic package's
-bits; each ``dfn`` element folds ``P`` per-chunk FP32 pairs (``P`` the
+bits; each ``dfn`` element folds ``P`` per-chunk FP32 partials (``P`` the
 column slab's chunk count: ``cake_jit.k7_chunks``, or the two-size geometry
-where ``cake_jit.lpt_chunks`` fires; at most 32), where the deterministic
-package folds its ``P`` partials in FP64, so its low-order bits may differ from
-the deterministic ``dfn``.  The mode is part of the names: no entry point takes
-a ``deterministic`` keyword (passing one is a ``TypeError``) and nothing falls
-back to the deterministic package (checked without a device by
+where ``cake_jit.lpt_chunks`` fires; at most 32; on the one-size chunks the
+deterministic package's partials) in a compensated FP32 sum, where the
+deterministic package sums its ``P`` partials in FP64, so its low-order bits
+may differ from the deterministic ``dfn`` near an FP32 rounding boundary.
+The mode is part of the names: no entry point takes a ``deterministic``
+keyword (passing one is a ``TypeError``) and nothing falls back to the
+deterministic package (checked without a device by
 ``test_cake_mhc_nondet_train_rules.py``).  The deterministic package
 (``flashinfer.experimental.cake.cake_mhc_det_train``) is the same-input reference
 throughout, never a source of tolerances.  This module checks:
@@ -1269,7 +1271,7 @@ def test_matches_the_deterministic_backward_in_each_unit_order(
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
 def test_run_to_run(hidden: int, T: int) -> None:
     """Repeated launches on the same inputs: every output, ``dfn`` included, the first launch's bits (the column slab
-    folds each ``dfn`` element's per-chunk slot pairs in chunk order, whatever the schedule of its units)."""
+    folds each ``dfn`` element's per-chunk slots in chunk order, whatever the schedule of its units)."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 2)
     prep = _forward(i)
