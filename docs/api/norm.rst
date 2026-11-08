@@ -351,39 +351,51 @@ kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``).
 to run everywhere.  A BF16 weight gradient repeats bit for bit too, except in
 the row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 257
 rows to 1294 rows per SM, SM107 above 24 to 68 rows per SM), where its last
-bits may vary from run to run.  ``y`` is not the deterministic package's bits;
-``dx`` and ``dz`` are in every band, and outside the row-claims bands and the
-short backward's band (a BF16 weight gradient up to 256 rows) ``dw`` is too,
-except where the exact sum lies within the deterministic FP64 sum's error of a
-rounding boundary.  In the short
+bits may vary from run to run.  ``y`` is the deterministic package's bits
+where a pipelined forward runs (below) and not elsewhere; ``dx`` and ``dz`` are
+in every band, and outside the row-claims bands and the
+short backward's band (a BF16 weight gradient up to 256 rows) ``dw`` is the
+bits of the deterministic package at FlashInfer commit 2e989556, except where
+the exact sum lies within that package's FP64 sum's error of a rounding
+boundary.  In the short
 backward's band ``dw`` is that kernel's own fixed-order sum, the same bits on
 every call, which need not be the deterministic package's.  The FP64 error of
 each output (relative L2 and the largest error relative to the largest
 reference value) is at most 1.1 times the deterministic package's on the same
-inputs, and within the deterministic package's absolute bounds.
+inputs, and within the deterministic package's absolute bounds; for an FP32
+weight gradient the 1.1 times bound holds against the deterministic package at
+FlashInfer 2e989556, and against the deterministic package in this release
+(which sums FP32 runs of rows exactly, so its FP32 weight gradient is the more
+accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
 
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
-  of several modules chosen by bands of rows per SM: where ``x`` and ``z``
-  hold packed rows (row ``n`` at element ``128 n``, as contiguous inputs do)
-  a tiny forward up to 140 rows per SM on SM100, 120 on SM103 and 65 on
-  SM107, one 128-thread CTA per 8-row block; for other layouts a short
-  forward up to 12 rows per SM on SM100 and SM103 (59 on SM107), one CTA per
-  16-row block; past that the mid forward (whole waves of 6 CTAs per SM, each CTA at most 2
+  of several modules chosen by bands of rows per SM, each band the module
+  measured fastest there: where ``x`` and ``z`` hold packed rows (row ``n``
+  at element ``128 n``, as contiguous inputs do; fewer than 2^24 rows) a tiny
+  forward up to 38 rows per SM on SM100, 85 on SM103 and 60 on SM107, one
+  128-thread CTA per 8-row block; for other layouts a short forward up to 12
+  rows per SM on SM100 and SM103 (59 on SM107), one CTA per 16-row block.
+  Past them the pipelined forward, this package's copy of the deterministic
+  package's forward (128 threads, one CTA per 16-row block below 8192 rows
+  per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2
+  blocks), runs packed rows (on SM103 but from 6001 to 8192 rows per SM) and
+  other layouts up to 100 rows per SM.  Past 100 rows per SM other layouts
+  run the mid forward (whole waves of 6 CTAs per SM, each CTA at most 2
   blocks of 16 rows), the long forward (whole waves of 3 CTAs per SM, each
   CTA at most 6 blocks of 32 rows) or the extra-long forward (the long
-  forward's grid, also prefetching its next block); the plain forward (one
-  64-thread CTA per 8-row block) is in no band.  The bands past the tiny or
-  the short forward: on SM100 long up to 400 rows per SM (other layouts: mid
-  up to 140, then long), extra-long up to 1000, mid past it; on SM103 mid up
-  to 250, extra-long up to 550, mid past it; on SM107 mid up to 200,
-  extra-long up to 520, mid past it.  Each module's arithmetic is fixed, but
-  the modules associate a row's sum of squares differently (the tiny and the
-  short forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4,
-  8; the others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits
-  can differ between bands, and ``y`` repeats bit for bit for the same inputs
-  on the same device.  Beside a kernel on another stream that holds ``k`` of
-  the ``N`` SMs, the mid, long and extra-long forwards take at most ``N / (N
+  forward's grid, also prefetching its next block): on SM100 mid up to 140,
+  long up to 400, extra-long up to 1000, mid past it; on SM103 mid up to 250,
+  extra-long up to 550, mid past it; on SM107 mid up to 200, extra-long up to
+  520, mid past it; the plain forward (one 64-thread CTA per 8-row block) is
+  in no band.  Each module's arithmetic is fixed, but the modules associate a
+  row's sum of squares differently (the tiny and the short forward: 8-term
+  FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
+  16-term chains of 8 lanes folded by 1, 2, 4, on SM107 the pipelined
+  forwards as four interleaved chains), so ``y``'s bits can differ between
+  bands, and ``y`` repeats bit for bit for the same inputs on the same
+  device.  Beside a kernel on another stream that holds ``k`` of the ``N``
+  SMs, the pipelined, mid, long and extra-long forwards take at most ``N / (N
   - k)`` times their time alone, plus one CTA's share of the row blocks, plus
   0.02, and the tiny and the short forward end no later than the
   deterministic package's forward (within 2 % or 1.5 microseconds).  On

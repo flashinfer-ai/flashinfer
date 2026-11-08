@@ -42,15 +42,17 @@ rows to FP64 accumulators with atomics, so only their weight gradient may
 vary in its last bits from run to run).
 ``ROUTES[arch][role]`` names the one module a role runs on an architecture;
 a module may be delivered for more architectures than route it (every
-forward module is delivered for every architecture, so a new forward cut is a
-host-plan change).  :func:`module_for_rows` picks a call's module from the
-rows, the device's SM count and the layout of the inputs: the forward of
-packed rows (``x`` and ``z`` hold row ``n`` at element ``128 n``) by
-``FORWARD_BANDS``, of other layouts by ``STRIDED_FORWARD_BANDS``, bands of
+forward module of this package's own kernels is delivered for every
+architecture, so a new cut between them is a host-plan change; the pipelined
+forwards are delivered where the deterministic package's are).
+:func:`module_for_rows` picks a call's module from the rows, the device's SM
+count and the layout of the inputs: the forward of packed rows (``x`` and
+``z`` hold row ``n`` at element ``128 n``, fewer than ``PACKED_ROWS`` rows)
+by ``FORWARD_BANDS``, of other layouts by ``STRIDED_FORWARD_BANDS``, bands of
 rows per SM (the tiny forward, which reads packed rows only, the short
-forward, the forward and the mid, long and extra-long forwards, each where
-the architecture's bands name it); the backward by ``BACKWARD_BANDS``,
-bands of rows or of rows per SM: its small-row roles (``BAND_ROLES``: the
+forward, the mid, long and extra-long forwards and the pipelined forwards,
+each where the architecture's bands name it); the backward by
+``BACKWARD_BANDS``, bands of rows or of rows per SM: its small-row roles (``BAND_ROLES``: the
 short backward ``bwd_bf16_short`` and the exact tiny backward ``_t512``, each
 up to a count of rows), its call role (the static backward, where an architecture
 routes one for the role), for a BF16 weight gradient its row-claims roles
@@ -64,11 +66,21 @@ CTAs, 8 threads to a row), the mid forward (128-thread CTAs walking 16-row
 blocks, thread 0 warming the CTA's next block and the first block of the CTA
 a wave later in L2), the long forward (256-thread CTAs walking 32-row
 blocks) and the extra-long forward (the long forward whose thread 0 also
-warms the CTA's next block in L2).  Each program's arithmetic is fixed; the
+warms the CTA's next block in L2); and the pipelined forwards, this
+package's copies of the deterministic package's forward programs (the same
+builds of its kernel file under this package's names, routed where they are
+measured faster than this package's own): 128-thread CTAs walking 16-row
+blocks, each thread loading its row of the CTA's next block into registers
+while it computes the current one, with the mid forward's L2 prefetches, one
+CTA per block below 8192 rows per SM (``fwd_pipe``; on sm_107a with four sum
+chains, ``rsqrt.approx.ftz`` and ``w`` loaded behind the first block's loads,
+and ``fwd_pipe_packed``, the same for packed rows with one 32-byte store per
+lane and the same bits).  Each program's arithmetic is fixed; the
 programs associate a row's sum of squares differently (the tiny and the short
-forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
-16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits can differ
-between the programs, and so between the bands of one architecture, while
+forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
+sm_107a pipelined forwards: four 4-term chains of 8 lanes added in pairs, then
+folded by 1, 2, 4; the others: 16-term chains of 8 lanes folded by 1, 2, 4),
+so ``y``'s bits can differ between the programs, and so between the bands of one architecture, while
 each program gives the same bits for the same inputs on the same device.
 
 The backward's call role is the static backward (CTA ``b``
@@ -104,7 +116,9 @@ Grids (:func:`launch_grid`): the forward and the short forward launch one
 CTA per block of ``rows_per_cta`` rows; the extra-long, long and mid forwards
 the fewest whole waves of ``ctas_per_sm * SMs`` CTAs whose CTAs walk at most
 ``max_blocks_per_cta`` blocks of ``rows_per_block`` rows each, never more
-CTAs than blocks (CTA ``b`` walks the blocks ``b``, ``b + grid``, ...); a
+CTAs than blocks (CTA ``b`` walks the blocks ``b``, ``b + grid``, ...), and
+so do the pipelined forwards from ``persistent_from_rows_per_sm`` rows per SM
+on, one CTA per block below it; a
 small-row backward one cluster of ``cluster`` CTAs (``launch.cluster``)
 whatever the rows, up to its rule's ``max_rows``.  The static and the
 claimed backward cut the rows into blocks of ``rows_per_block`` rows and the
@@ -494,6 +508,189 @@ MODULES: dict[str, dict[str, Any]] = {
             "z": "z",
         },
         "role": "fwd_tiny",
+    },
+    # The pipelined forward: the deterministic package's forward program (the
+    # same build of the same kernel file, under this package's name): 128
+    # threads, 8 lanes per row (16-row blocks), at most 6 CTAs per SM, each
+    # thread loading its row of the CTA's next block into registers while it
+    # computes the current one, thread 0 warming the CTA's next block and the
+    # first block of the CTA one wave later in L2 (build {"min_blocks": 6,
+    # "packed_rows": 0, "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz":
+    # 0, "store_width": 128, "sum_pairs": 0, "threads": 128, "w_late": 0});
+    # one CTA per block below 8192 rows per SM, whole waves of at most 2
+    # blocks per CTA from there; FORWARD_BANDS gives it its rows.
+    "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "persistent_from_rows_per_sm": 8192,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_pipe",
+    },
+    # The sm_107a pipelined forward: the deterministic package's sm_107a
+    # forward program, the schedule above with the sum of squares as four FMA
+    # chains, rsqrt.approx.ftz and w loaded behind the first block's loads
+    # (build {"min_blocks": 6, "packed_rows": 0, "prefetch_ahead": 1,
+    # "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width": 128, "sum_pairs": 1,
+    # "threads": 128, "w_late": 1}); FORWARD_BANDS gives it its rows.
+    "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "persistent_from_rows_per_sm": 8192,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_pipe",
+    },
+    # The sm_107a pipelined forward of packed rows (x and z hold row n at
+    # element 128 n, fewer than PACKED_ROWS rows): the deterministic package's
+    # sm_107a forward of packed rows, the program above with each row's offset
+    # taken from its index alone and one 32-byte store per lane, the same bits
+    # (build {"min_blocks": 6, "packed_rows": 1, "prefetch_ahead": 1,
+    # "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width": 256, "sum_pairs": 1,
+    # "threads": 128, "w_late": 1}); FORWARD_BANDS gives it its rows.
+    "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "persistent_from_rows_per_sm": 8192,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_pipe_packed",
     },
     # The static backward into a BF16 weight gradient on sm_107a: the static
     # schedule with the windows in 4 copies and an occupancy word per copy
@@ -1505,6 +1702,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "fwd_pipe": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
         "bwd_bf16_rc_mid": "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7",
@@ -1520,6 +1718,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "fwd_pipe": "cake_rmsnorm_silu_gate_train_8a905176e52247f528ae",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
         "bwd_bf16_rc_mid": "cake_rmsnorm_silu_gate_train_f14663d91454a0e833f7",
@@ -1534,6 +1733,8 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
+        "fwd_pipe": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
+        "fwd_pipe_packed": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
@@ -1550,43 +1751,46 @@ ROUTES: dict[str, dict[str, str]] = {
 # end); a call of ``rows`` rows on a device of ``sm_count`` SMs runs the
 # module of the first band's routed ``role`` with ``rows <= last *
 # sm_count``.  The cuts are the measured fastest program at each rows per SM
-# (CUPTI, cold L2): the tiny forward up to 140 rows per SM on sm_100a, 120 on
-# sm_103a and 65 on sm_107a, where beside a kernel holding 16 SMs it ends no
-# later than the deterministic package's plain forward (one CTA per 8-row
-# block, so the free SMs take the CTAs the held ones cannot run).  Host plan
-# only: a new cut needs no new program.
+# (CUPTI, cold L2), the pipelined forwards (the deterministic package's
+# forward programs) among them: the tiny forward up to 85 rows per SM on
+# sm_103a and 60 on sm_107a, then the pipelined forward (on sm_103a the mid
+# forward from 6001 to 8192 rows per SM, where the pipelined forward still
+# launches a CTA per block); on sm_100a the tiny forward up to 38 rows per
+# SM, where beside a kernel holding 16 SMs it still ends no later than the
+# deterministic package's forward (from 39 rows per SM, beside 16 CTAs of 1024
+# threads with the max-shared carveout, it ends up to 2 microseconds later),
+# then the pipelined forward, which is that forward.  Host plan only: a new
+# cut needs no new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
-        (140, "fwd_tiny"),
-        (400, "fwd_long"),
-        (1000, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (38, "fwd_tiny"),
+        (None, "fwd_pipe"),
     ),
     "sm_103a": (
-        (120, "fwd_tiny"),
-        (250, "fwd_mid"),
-        (550, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (85, "fwd_tiny"),
+        (6000, "fwd_pipe"),
+        (8192, "fwd_mid"),
+        (None, "fwd_pipe"),
     ),
     "sm_107a": (
-        (65, "fwd_tiny"),
-        (200, "fwd_mid"),
-        (520, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (60, "fwd_tiny"),
+        (None, "fwd_pipe_packed"),
     ),
 }
 
 # The forward bands of a call whose ``x`` or ``z`` rows are not packed (the
-# tiny forward reads packed rows only), as ``FORWARD_BANDS``.  The cuts are
-# the measured fastest program at each rows per SM (CUPTI, cold L2), except
-# the short forward's end: 12 rows per SM on sm_100a and sm_103a, where its
-# grid of one 16-row block a CTA has at most as many CTAs as the SMs less 16
-# (from 64 SMs), and 59 on sm_107a, where it fits one wave of 4 CTAs per SM on
-# all SMs but 16 (from 205 SMs), so beside a kernel holding 16 SMs it ends no
-# later than the plain forward.
+# tiny forward reads packed rows only), or of packed rows from
+# ``PACKED_ROWS`` on, as ``FORWARD_BANDS``.  The cuts are the measured fastest
+# program at each rows per SM (CUPTI, cold L2), the pipelined forward up to 100
+# rows per SM among them, except the short forward's end: 12 rows per SM on
+# sm_100a and sm_103a, where its grid of one 16-row block a CTA has at most as
+# many CTAs as the SMs less 16 (from 64 SMs), and 59 on sm_107a, where it fits
+# one wave of 4 CTAs per SM on all SMs but 16 (from 205 SMs), so beside a
+# kernel holding 16 SMs it ends no later than the plain forward.
 STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "fwd_short"),
+        (100, "fwd_pipe"),
         (140, "fwd_mid"),
         (400, "fwd_long"),
         (1000, "fwd_xlong"),
@@ -1594,12 +1798,14 @@ STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
     "sm_103a": (
         (12, "fwd_short"),
+        (100, "fwd_pipe"),
         (250, "fwd_mid"),
         (550, "fwd_xlong"),
         (None, "fwd_mid"),
     ),
     "sm_107a": (
         (59, "fwd_short"),
+        (100, "fwd_pipe"),
         (200, "fwd_mid"),
         (520, "fwd_xlong"),
         (None, "fwd_mid"),
@@ -1718,6 +1924,11 @@ HEAD_DIM = 128
 ALIGNMENT_ELEMENTS = 16
 # The kernels index rows with 32-bit integers.
 INT32_MAX = 2**31 - 1
+# A forward of packed rows (the tiny forward, the pipelined forward of packed
+# rows) takes the offset of an element of row ``n`` as ``n * 128 + column`` in
+# 32-bit arithmetic: ``FORWARD_BANDS`` serves fewer rows than this (2**31 //
+# HEAD_DIM), a call of more takes ``STRIDED_FORWARD_BANDS``.
+PACKED_ROWS = 16777216
 
 
 def arch_for_capability(device_capability: Sequence[int]) -> str | None:
@@ -1784,12 +1995,14 @@ def module_for_rows(
     ``arch`` with ``sm_count`` SMs: for the forward the module of the first of
     its ``FORWARD_BANDS[arch]`` bands (``STRIDED_FORWARD_BANDS[arch]`` when
     ``packed`` is false: ``x`` or ``z`` does not hold row ``n`` at element
-    ``128 n``) with ``rows <= last * sm_count`` (or no ``last``); for a
+    ``128 n``, or the call has ``PACKED_ROWS`` rows or more) with ``rows <=
+    last * sm_count`` (or no ``last``); for a
     backward role the module of the first of its ``BACKWARD_BANDS[arch]``
     bands whose ``last`` holds: ``(ROWS, n)`` with ``rows <= n``, a number
     with ``rows <= last * sm_count``, or ``None``; else :func:`route_module`."""
 
     if role == "fwd":
+        packed = packed and int(rows) < PACKED_ROWS
         table = FORWARD_BANDS if packed else STRIDED_FORWARD_BANDS
         for last, band in table.get(arch, ()):
             if last is None or int(rows) <= int(last) * int(sm_count):
@@ -1870,8 +2083,9 @@ def launch_grid(
     :func:`backward_ctas`).  The long and mid forwards take the fewest whole
     waves of ``ctas_per_sm * sm_count`` CTAs whose CTAs walk at most
     ``max_blocks_per_cta`` blocks of ``rows_per_block`` rows each, and at most
-    one CTA per block.  A small-row backward takes one cluster of
-    ``cluster`` CTAs."""
+    one CTA per block; a rule with ``persistent_from_rows_per_sm`` (the
+    pipelined forwards) takes one CTA per block below that many rows per SM.
+    A small-row backward takes one cluster of ``cluster`` CTAs."""
 
     rule = record["grid_rule"]
     kind = rule["kind"]
@@ -1879,6 +2093,9 @@ def launch_grid(
         return (-(-int(rows) // int(rule["rows_per_cta"])), 1, 1)
     if kind == "persistent_row_blocks":
         blocks = -(-int(rows) // int(rule["rows_per_block"]))
+        start = rule.get("persistent_from_rows_per_sm")
+        if start is not None and int(rows) < int(start) * int(sm_count):
+            return (blocks, 1, 1)
         wave = max(1, int(rule["ctas_per_sm"]) * int(sm_count))
         waves = max(1, -(-blocks // (wave * int(rule["max_blocks_per_cta"]))))
         return (min(blocks, waves * wave), 1, 1)
@@ -1994,6 +2211,7 @@ __all__ = [
     "HEAD_DIM",
     "INT32_MAX",
     "MODULES",
+    "PACKED_ROWS",
     "ROLES",
     "ROUTES",
     "STRIDED_FORWARD_BANDS",
