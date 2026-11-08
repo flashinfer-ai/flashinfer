@@ -25,7 +25,11 @@ otherwise through FlashInfer's JIT from the sources and flags of
 ``build.json``; the prebuilt route imports nothing from ``flashinfer``.
 
 Every launch is a plain stream-ordered launch on the current torch stream:
-nothing cooperative, no PDL, no co-residency requirement.  Nothing here reads
+nothing cooperative, no PDL, no co-residency requirement.  The backward
+builds its tile tables (``bwd_plan``) and the row-map fold order on a
+high-priority side stream of the device, forked from the current stream and
+joined back by CUDA events before their first read, so they overlap
+``bwd_pre`` and the main kernels.  Nothing here reads
 an environment variable, reads device memory or synchronizes; grids and
 scratch sizes come from tensor shapes, ``len(cu_seqlens) - 1`` and the SM
 count.  The segment boundaries ``cu_seqlens_q`` / ``cu_seqlens_k`` (int32 on
@@ -200,6 +204,24 @@ def parameters(name: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+@functools.cache
+def _entry(name: str, arch: str) -> Any:
+    """The FFI entry of record ``name`` in its ``arch`` library (looked up once per process)."""
+    return getattr(load(name, arch), record(name)["ffi_entry"])
+
+
+def _run(name: str, values: Mapping[str, Any], grid: tuple[int, int, int], arch: str) -> None:
+    """Launch record ``name`` on the current device and torch stream: the caller holds
+    ``torch.cuda.device(device_index)`` and ``tvm_ffi.use_torch_stream()`` (once per forward or backward call)."""
+    args = []
+    for key in parameters(name):
+        try:
+            args.append(values[key])
+        except KeyError:
+            raise ValueError(f"record {name} needs argument {key!r}") from None
+    _entry(name, arch)(*args, int(grid[0]), int(grid[1]), int(grid[2]))
+
+
 def run_record(
     name: str,
     values: Mapping[str, Any],
@@ -209,15 +231,9 @@ def run_record(
 ) -> None:
     """Launch record ``name`` with its kernel parameters named in ``values`` on ``grid``, on the current torch
     stream of device ``device_index`` (the operands' device, made current for the launch)."""
-    args = []
-    for key in parameters(name):
-        try:
-            args.append(values[key])
-        except KeyError:
-            raise ValueError(f"record {name} needs argument {key!r}") from None
-    entry = getattr(load(name, device_arch(device_index)), record(name)["ffi_entry"])
+    arch = device_arch(device_index)
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
-        entry(*args, int(grid[0]), int(grid[1]), int(grid[2]))
+        _run(name, values, grid, arch)
 
 
 def _launch(
@@ -227,13 +243,10 @@ def _launch(
     device_index: int,
     **chunk: int,
 ) -> None:
+    """Launch ``stage`` inside the caller's device and stream context (see :func:`_run`)."""
+    arch = device_arch(device_index)
     grid = cake_jit.grid(stage, sm_count=sm_count(device_index), **dims, **chunk)
-    run_record(
-        stage_record(stage, device_arch(device_index)),
-        values,
-        grid=grid,
-        device_index=device_index,
-    )
+    _run(stage_record(stage, arch), values, grid, arch)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -527,7 +540,8 @@ def cake_gqa_nondet_train_forward(
         "total_q": total_q,
         "softmax_scale_log2": scale * LOG2_E,
     }
-    _launch("fwd", values, dims, device_index)
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        _launch("fwd", values, dims, device_index)
     return out, lse
 
 
@@ -658,116 +672,144 @@ def cake_gqa_nondet_train_backward(
         "H_q": heads_q,
         "softmax_scale": scale,
     }
-    _launch(
-        "bwd_pre",
-        {
-            **common,
-            "O": out,
-            "dO": dout,
-            "LSE": lse,
-            "LSE_log2": lse_log2,
-            "dPsum": dpsum,
-            "dQ_accum": dq_accum,
-        },
-        dims,
-        device_index,
-    )
-    tile_base, pair_base, pair_order = _plan_tables(
-        cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q, dims, device_index
-    )
-    # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
-    # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
-    ds = _ds_tiles(plan["ws_tiles"], device)
-    if mode == "rowmap":
-        win_k = torch.empty(kv_shape, dtype=torch.float32, device=device)
-        win_v = torch.empty(kv_shape, dtype=torch.float32, device=device)
-    else:
-        win_k, win_v = dk_out, dv_out
-    values = {
-        **common,
-        "Q": q,
-        "dO": dout,
-        "K": k,
-        "V": v,
-        "lse_log2": lse_log2,
-        "dpsum": dpsum,
-        "ds_ws": ds.view(-1),
-        "dsw": ds,
-        "tile_base": tile_base,
-        "pair_base": pair_base,
-        "pair_order": pair_order,
-        "dq_accum": dq_accum,
-        "dk_out": win_k,
-        "dv_out": win_v,
-        "row_map": None,
-        "h_kv": heads_kv,
-        "group": group,
-        "softmax_scale_log2": scale * LOG2_E,
-        "tile_stride": plan["tile_stride"],
-        "zero_tile": plan["zero_tile"],
-    }
-    blocks, n_chunk, h_chunk = plan["key_blocks"], plan["n_chunk"], plan["h_chunk"]
-    for h0 in range(0, heads_kv, h_chunk):
-        hc = min(h_chunk, heads_kv - h0)
-        for index, n0 in enumerate(range(0, blocks, n_chunk)):
-            n1 = min(n0 + n_chunk, blocks)
-            chunk = {"chunk_blocks": n1 - n0, "chunk_heads": hc}
-            at = {
-                **values,
-                "n0": n0,
-                "n1": n1,
-                "h0": h0,
-                "hc": hc,
-                "accumulate": 1 if index else 0,
-            }
-            _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
-            _launch("bwd_dq", at, dims, device_index, **chunk)
-    if mode == "rowmap":
-        # Window rows sorted by destination row, ties in window order; each destination row adds its run in order.
-        dst_rows, perm = torch.sort(row_map, stable=True)
-        run_end = torch.searchsorted(dst_rows, dst_rows, right=True, out_int32=True)
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        # The tile tables and the fold order read cu_seqlens and row_map only.  Their buffers come from the current
+        # stream; a side stream fills them while the current stream runs bwd_pre (and, for the fold order, the main
+        # kernels), and the current stream waits for it before their first read: the same kernels write the same
+        # integers, off the critical path.
+        stream = torch.cuda.current_stream(device_index)
+        tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
+        fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
+        planned = side = None
+        if tables is not None or fold is not None:
+            side = _side_stream(device_index)
+            side.wait_stream(stream)
+            with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
+                if tables is not None:
+                    _launch_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q, tables, dims, device_index)
+                    planned = side.record_event()
+                if fold is not None:
+                    _fold_index(row_map, *fold)
         _launch(
-            "bwd_fold",
+            "bwd_pre",
             {
-                "dk_win": win_k,
-                "dv_win": win_v,
-                "perm": perm.to(torch.int32),
-                "dst_rows": dst_rows,
-                "run_end": run_end,
-                "dk_out": dk_out,
-                "dv_out": dv_out,
-                "T_k": total_k,
-                "h_kv": heads_kv,
+                **common,
+                "O": out,
+                "dO": dout,
+                "LSE": lse,
+                "LSE_log2": lse_log2,
+                "dPsum": dpsum,
+                "dQ_accum": dq_accum,
             },
             dims,
             device_index,
         )
-    _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
+        if tables is None:
+            tables = _tile_plan(cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q)
+        tile_base, pair_base, pair_order = tables
+        # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
+        # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
+        ds = _ds_tiles(plan["ws_tiles"], device)
+        if mode == "rowmap":
+            win_k = torch.empty(kv_shape, dtype=torch.float32, device=device)
+            win_v = torch.empty(kv_shape, dtype=torch.float32, device=device)
+        else:
+            win_k, win_v = dk_out, dv_out
+        values = {
+            **common,
+            "Q": q,
+            "dO": dout,
+            "K": k,
+            "V": v,
+            "lse_log2": lse_log2,
+            "dpsum": dpsum,
+            "ds_ws": ds.view(-1),
+            "dsw": ds,
+            "tile_base": tile_base,
+            "pair_base": pair_base,
+            "pair_order": pair_order,
+            "dq_accum": dq_accum,
+            "dk_out": win_k,
+            "dv_out": win_v,
+            "row_map": None,
+            "h_kv": heads_kv,
+            "group": group,
+            "softmax_scale_log2": scale * LOG2_E,
+            "tile_stride": plan["tile_stride"],
+            "zero_tile": plan["zero_tile"],
+        }
+        blocks, n_chunk, h_chunk = plan["key_blocks"], plan["n_chunk"], plan["h_chunk"]
+        if planned is not None:
+            stream.wait_event(planned)
+        for h0 in range(0, heads_kv, h_chunk):
+            hc = min(h_chunk, heads_kv - h0)
+            for index, n0 in enumerate(range(0, blocks, n_chunk)):
+                n1 = min(n0 + n_chunk, blocks)
+                chunk = {"chunk_blocks": n1 - n0, "chunk_heads": hc}
+                at = {
+                    **values,
+                    "n0": n0,
+                    "n1": n1,
+                    "h0": h0,
+                    "hc": hc,
+                    "accumulate": 1 if index else 0,
+                }
+                _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
+                _launch("bwd_dq", at, dims, device_index, **chunk)
+        if side is not None:
+            stream.wait_stream(side)
+        if fold is not None:
+            dst_rows, _order, perm, run_end = fold
+            _launch(
+                "bwd_fold",
+                {
+                    "dk_win": win_k,
+                    "dv_win": win_v,
+                    "perm": perm,
+                    "dst_rows": dst_rows,
+                    "run_end": run_end,
+                    "dk_out": dk_out,
+                    "dv_out": dv_out,
+                    "T_k": total_k,
+                    "h_kv": heads_kv,
+                },
+                dims,
+                device_index,
+            )
+        _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
     return dq, dk_out, dv_out
 
 
-def _plan_tables(
+def _plan_buffer(
+    key_blocks: int, total_q: int, segments: int, device: torch.device
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``(tile_base, pair_base, pair_order)`` views of one int32 buffer for :func:`_launch_plan`, from the caching
+    allocator on the current stream; ``None`` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions (the PyTorch ops
+    of :func:`_tile_plan` build those tables)."""
+    bound = cake_jit.pair_bound(total_q, segments)
+    if bound > cake_jit.PLAN_MAX_PAIRS:
+        return None
+    tiles = (key_blocks + 1) * segments
+    tables = torch.empty(tiles + segments + 1 + bound, dtype=torch.int32, device=device)
+    return (
+        tables[:tiles],
+        tables[tiles : tiles + segments + 1],
+        tables[tiles + segments + 1 :],
+    )
+
+
+def _launch_plan(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     key_blocks: int,
     total_q: int,
+    tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     dims: Mapping[str, int],
     device_index: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The tables of :func:`_tile_plan` from one ``bwd_plan`` launch (one CTA) into one int32 buffer, or from the
-    PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions.  Both write the same
-    integers."""
+) -> None:
+    """One ``bwd_plan`` launch (one CTA) writing the integers of :func:`_tile_plan` into ``tables``."""
     segments = dims["num_segments"]
-    bound = cake_jit.pair_bound(total_q, segments)
-    if bound > cake_jit.PLAN_MAX_PAIRS:
-        return _tile_plan(cu_seqlens_q, cu_seqlens_k, key_blocks, total_q)
-    tiles = (key_blocks + 1) * segments
-    tables = torch.empty(
-        tiles + segments + 1 + bound, dtype=torch.int32, device=cu_seqlens_q.device
-    )
-    tile_base = tables[:tiles]
-    pair_base = tables[tiles : tiles + segments + 1]
-    pair_order = tables[tiles + segments + 1 :]
+    tile_base, pair_base, pair_order = tables
     _launch(
         "bwd_plan",
         {
@@ -778,12 +820,67 @@ def _plan_tables(
             "pair_order": pair_order,
             "num_segments": segments,
             "key_blocks": key_blocks,
-            "pair_bound": bound,
+            "pair_bound": cake_jit.pair_bound(total_q, segments),
         },
         dims,
         device_index,
     )
-    return tile_base, pair_base, pair_order
+
+
+def _plan_tables(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    key_blocks: int,
+    total_q: int,
+    dims: Mapping[str, int],
+    device_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The tables of :func:`_tile_plan` on the current stream of device ``device_index``: from one ``bwd_plan``
+    launch, or from the PyTorch ops of :func:`_tile_plan` past :data:`.cake_jit.PLAN_MAX_PAIRS` pair positions.
+    Both write the same integers."""
+    tables = _plan_buffer(
+        key_blocks, total_q, dims["num_segments"], cu_seqlens_q.device
+    )
+    if tables is None:
+        return _tile_plan(cu_seqlens_q, cu_seqlens_k, key_blocks, total_q)
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
+        _launch_plan(
+            cu_seqlens_q, cu_seqlens_k, key_blocks, total_q, tables, dims, device_index
+        )
+    return tables
+
+
+def _fold_buffers(total_k: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """``(dst_rows, order, perm, run_end)`` for :func:`_fold_index`, from the caching allocator on the current
+    stream."""
+    return (
+        torch.empty(total_k, dtype=torch.int32, device=device),
+        torch.empty(total_k, dtype=torch.int64, device=device),
+        torch.empty(total_k, dtype=torch.int32, device=device),
+        torch.empty(total_k, dtype=torch.int32, device=device),
+    )
+
+
+def _fold_index(
+    row_map: torch.Tensor,
+    dst_rows: torch.Tensor,
+    order: torch.Tensor,
+    perm: torch.Tensor,
+    run_end: torch.Tensor,
+) -> None:
+    """The fold order: the window rows sorted by destination row with ties in window order (``dst_rows``, ``perm``
+    as int32), and ``run_end[j]`` = one past the last sorted position of ``dst_rows[j]``; each destination row adds
+    its run in order."""
+    torch.sort(row_map, stable=True, out=(dst_rows, order))
+    torch.searchsorted(dst_rows, dst_rows, right=True, out_int32=True, out=run_end)
+    perm.copy_(order)
+
+
+@functools.cache
+def _side_stream(device_index: int) -> torch.cuda.Stream:
+    """The high-priority side stream of device ``device_index`` that builds the backward's tile tables and fold
+    order (high priority: its one-CTA kernels take the first SMs the main kernels free)."""
+    return torch.cuda.Stream(device_index, priority=-1)
 
 
 def _tile_plan(

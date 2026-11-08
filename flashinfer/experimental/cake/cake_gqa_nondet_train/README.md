@@ -72,7 +72,12 @@ without.  The backend package exposes the same entry points (`cake_gqa_nondet`,
 
 Numerics: FP32 accumulation for the scores, `dP`, dK, dV, dQ and the row
 sums; P and dS are rounded to BF16 only as MMA operands.  Every launch is a
-plain stream-ordered launch: nothing cooperative, no PDL.
+plain stream-ordered launch: nothing cooperative, no PDL.  The backward builds
+the tile tables (`bwd_plan`) and the row-map fold order (a stable sort of the
+row map) on a high-priority side stream of the device, forked from the
+current stream and joined back by CUDA events before their first read, so
+they overlap `bwd_pre` and the main kernels; they hold the same integers as
+on the current stream.
 
 ## Workspace and chunking
 
