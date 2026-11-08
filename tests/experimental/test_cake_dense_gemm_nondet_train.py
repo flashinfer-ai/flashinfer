@@ -330,7 +330,9 @@ def test_k1_deterministic_programs_run_through_the_binding(monkeypatch, op, pdl)
         )
     assert call() is binding.result and not det.calls
     ((sources, flags, det_args, det_call, enable_pdl, *rest), kwargs) = binding.calls[0]
-    assert not kwargs and enable_pdl is pdl
+    # the input gradient names the nvjet program of K1_DGRAD_NVJET_RULES_BY_SM (none for this shape)
+    assert kwargs == ({"module": None} if op == "dgrad" else {})
+    assert enable_pdl is pdl
     pdl_kw = {} if pdl is None else {"enable_pdl": pdl}
     dA, dB, dout, transposed, knobs = det_args()
     assert dout is sources[-1] and transposed is False and knobs == ()
@@ -6045,14 +6047,41 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
         assert bound_plan(X, W, out) == det_plan(X, W, out, ()), sms
 
 
-#: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables).
+#: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables): the lean
+#: one-wave forward of eight epilogue warps on sm_100a, the plain one on sm_103a.
 K1_FORWARD_PROGRAM_ROWS = {
     part: {
-        (K, 512, T): "dense_proj_gemm_wave_kk_n224"
+        (K, 512, T): "dense_proj_gemm_wave_lean_kk_n224_ef_e8"
+        if part[0] == "sm_100a"
+        else "dense_proj_gemm_wave_kk_n224"
         for K in (4096, 5120)
         for T in (16172, 16231, 16384)
     }
     for part in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152))
+}
+#: The rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` (BF16 out, all on the lean nvjet program): ``4096 -> 32`` and
+#: ``4096 -> 64`` at the token counts of the thin scan, ``4096 -> 16, 48, 96, 128``, ``5120 -> 32, 48, 64, 128``,
+#: ``6144 -> 32, 128`` and ``8192 -> 128`` at 16231 tokens; sm_103a leaves ``4096 -> 32`` at 2048 tokens and sm_100a
+#: three rows to the other tables.
+_NVJET = "dense_proj_gemm_nvjet_early_kn_n256_lean"
+_NVJET_ROWS = {
+    *(
+        (4096, N, T)
+        for N in (32, 64)
+        for T in (512, 2048, 4864, 9472, 9728, 14592, 16172, 16231, 16384)
+    ),
+    *((4096, N, 16231) for N in (16, 48, 96, 128)),
+    *((5120, N, 16231) for N in (32, 48, 64, 128)),
+    (6144, 32, 16231),
+    (6144, 128, 16231),
+    (8192, 128, 16231),
+}
+_NVJET_SM103_KEPT = {(4096, 32, 2048)}
+_NVJET_SM100_KEPT = _NVJET_SM103_KEPT | {(4096, 32, 14592), (4096, 64, 4864)}
+K1_DGRAD_NVJET_ROWS = {
+    ("sm_100a", 148): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
+    ("sm_100a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
+    ("sm_103a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM103_KEPT},
 }
 _KD, _KD_TMA = (
     "dense_proj_gemm_dgrad_kn_n256_f32_ef",
@@ -6113,14 +6142,22 @@ K1_ORDERED_ROWS = {
 
 
 def test_k1_program_tables():
-    """The forward, input-gradient and stream-K weight-gradient program tables hold exactly the measured rows, each
-    naming a template this checkout registers for the table's architecture; the ranges of
+    """The forward, input-gradient (this package's programs, and the nvjet program on the deterministic plan of
+    :data:`K1_DGRAD_NVJET_DET_PROGRAM`) and stream-K weight-gradient program tables hold exactly the measured rows,
+    each naming a template this checkout registers for the table's architecture; the ranges of
     :data:`K1_ORDERED_RANGES_BY_SM` hold the measured rows and plan their program (:func:`k1_ordered_plan`) at their
     token counts only, on their part only, before :func:`k1_plan`'s routing."""
+    assert len(_NVJET_ROWS) == 29
+    assert {part: len(rows) for part, rows in K1_DGRAD_NVJET_ROWS.items()} == {
+        ("sm_100a", 148): 26,
+        ("sm_100a", 152): 26,
+        ("sm_103a", 152): 28,
+    }
     for table, want in (
         (cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM, K1_FORWARD_PROGRAM_ROWS),
         (cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM, K1_DGRAD_PROGRAM_ROWS),
         (cake_backend.K1_WGRAD_SK_RULES_BY_SM, K1_WGRAD_SK_ROWS),
+        (cake_backend.K1_DGRAD_NVJET_RULES_BY_SM, K1_DGRAD_NVJET_ROWS),
     ):
         assert table == want
         for (arch, _), rows in table.items():
@@ -8909,8 +8946,9 @@ def test_registered_templates_are_the_ones_the_planners_name():
         for bn in cake_backend.K1_BLOCK_N_CHOICES
         for chains in cake_backend.K1_CHAINS_CHOICES
     }
-    # the programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient / stream-K
-    # weight-gradient tables name, each registered for the architecture of its table
+    # the programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient (this package's and the
+    # nvjet program on the deterministic plan) / stream-K weight-gradient tables name, each registered for the
+    # architecture of its table
     named = {}
     for (arch, _), rows in cake_backend.K1_ORDERED_RANGES_BY_SM.items():
         for key, ranges in rows.items():
@@ -8920,6 +8958,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
     for table in (
         cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM,
         cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM,
+        cake_backend.K1_DGRAD_NVJET_RULES_BY_SM,
         cake_backend.K1_WGRAD_SK_RULES_BY_SM,
     ):
         for (arch, _), rows in table.items():
@@ -13394,11 +13433,13 @@ def test_k1_dgrad_rows_bind_their_plan(monkeypatch, arch):
     """``cake_dense_gemm_nondet_train_projection_dgrad()`` binds, for a row of :data:`K1_DGRAD_RULES_BY_SM` on its
     part (both operands with a unit stride on their last axis), the program of the row's knobs, and the deterministic
     plan for a token count, output dtype or SM count outside the table; an operand without a unit stride on its last
-    axis gets no knobs.  The rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`, which come first, are taken out
-    (``test_k1_program_rows_bind_their_program`` holds them)."""
+    axis gets no knobs.  The rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` and :data:`K1_DGRAD_NVJET_RULES_BY_SM`,
+    which come first, are taken out (``test_k1_program_rows_bind_their_program`` and
+    ``test_k1_dgrad_nvjet_rows_bind_the_nvjet_program`` hold them)."""
     _cpu_k1_launches(monkeypatch, arch)
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     monkeypatch.setattr(cake_backend, "K1_DGRAD_PROGRAM_RULES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_DGRAD_NVJET_RULES_BY_SM", {})
     bf16 = torch.bfloat16
     rows = cake_backend.K1_DGRAD_RULES_BY_SM[(arch, 152)]
     picked = sorted(rows.items())[:: max(1, len(rows) // 6)]
@@ -13442,6 +13483,77 @@ def test_k1_dgrad_rows_bind_their_plan(monkeypatch, arch):
         facts = dataclasses.replace(det_backend.device_facts(), sm_count=sms)
         monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
         assert cake_backend._k1_dgrad_knobs_of(G, W, out) == (), sms
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_k1_dgrad_nvjet_rows_bind_the_nvjet_program(monkeypatch, arch):
+    """``cake_dense_gemm_nondet_train_projection_dgrad()`` binds, for a row of :data:`K1_DGRAD_NVJET_RULES_BY_SM` on its
+    part, this package's nvjet program on the deterministic package's plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM`: the
+    cached entry holds that plan and names the program, and the bound arguments are the plan's arguments in the
+    program's argument order -- the argument plan and the cluster of the deterministic program.
+    Another token count, FP32 out, another SM count, an operand without a unit stride on its last axis and a measured
+    row the part leaves to the other tables (``4096 -> 32`` at 2048 tokens) keep the other tables (no program)."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    rows = cake_backend.K1_DGRAD_NVJET_RULES_BY_SM[(arch, 152)]
+    knobs = dict(cake_backend.k1_program_knobs(cake_backend.K1_DGRAD_NVJET_DET_PROGRAM))
+    picked = sorted(rows.items())[:: max(1, len(rows) // 6)]
+    for (K, N, T, dt), template in picked:
+        what = (K, N, T, dt)
+        module = cake_jit.KERNELS[arch][template]
+        G, W = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+        out = torch.empty(T, K, dtype=bf16)
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, out) == module, what
+        cake_backend._K1_DET_CACHE.clear()
+        entry_fn.calls.clear()
+        for _ in range(2):
+            got = cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out)
+            assert got is out, what
+        assert len(entry_fn.calls) == 2, what
+        ((key, entry),) = cake_backend._K1_DET_CACHE.items()
+        assert key[2][0] == ("dgrad",) and entry.k1 is not None, what
+        want = det_backend._k1_plan(G, W, out, transposed_out=False, knobs=knobs)
+        plan, *_, det_module = want
+        assert entry.plan == plan and entry.module_name == module, what
+        assert plan.template == (
+            det_backend._TEMPLATE_PREFIX + cake_backend.K1_DGRAD_NVJET_DET_PROGRAM
+        )
+        # the same argument plan and cluster as the deterministic program
+        record = cake_jit.MODULES[module]
+        det_record = det_backend.MODULES[det_module]
+        arg_plan = cake_jit.arg_plan_of(record)
+        assert arg_plan == det_backend.arg_plan_of(det_record), what
+        assert record["launch"]["cluster"] == det_record["launch"]["cluster"], what
+        (args, _) = entry_fn.calls[-1]
+        assert len(args) == len(arg_plan), what
+        for t in (T - 1, T + 1):
+            if (K, N, t, dt) in rows:
+                continue
+            Gt, outt = torch.empty(t, N, dtype=bf16), torch.empty(t, K, dtype=bf16)
+            assert cake_backend._k1_dgrad_nvjet_of(Gt, W, outt) is None, (what, t)
+        f32 = torch.empty(T, K, dtype=torch.float32)
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, f32) is None, what
+        Wmn = torch.empty(K, N, dtype=bf16).t()
+        assert cake_backend._k1_dgrad_nvjet_of(G, Wmn, out) is None, what
+    kept = _NVJET_SM100_KEPT if arch == "sm_100a" else _NVJET_SM103_KEPT
+    assert (4096, 32, 2048) in kept
+    for K, N, T in kept:
+        G, W = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+        out = torch.empty(T, K, dtype=bf16)
+        assert (K, N, T, "bf16") not in rows
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, out) is None, (K, N, T)
+    (K, N, T, dt), _ = picked[0]
+    G, W = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+    out = torch.empty(T, K, dtype=bf16)
+    for sms in (148, 150, 153, 160):
+        if (arch, sms) in cake_backend.K1_DGRAD_NVJET_RULES_BY_SM:
+            continue
+        facts = det_backend.DeviceFacts(
+            index=0, arch=arch, sm_count=sms, l2_bytes=126 << 20
+        )
+        monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, out) is None, sms
 
 
 #: The program the rows of :data:`K1_FORWARD_RULES_BY_SM` that name one run per part, and the deterministic plan of
@@ -13881,12 +13993,16 @@ def _meets_the_budget_into_nan(run, out, ref, what, reruns=RERUNS):
 
 def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
     """On a part of a table of :data:`K1_DGRAD_RULES_BY_SM`: the input gradient of every row (not a row of
-    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`, which runs this package's program) binds the table's program, gives the
+    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` or :data:`K1_DGRAD_NVJET_RULES_BY_SM`, which run this package's programs)
+    binds the table's program, gives the
     deterministic package's input gradient bit for bit (the deterministic plan's bits), meets the deterministic
     package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned outputs.  A part
     without such rows skips."""
     device, arch, sms = _part_or_skip()
-    own = cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
+    own = {
+        **cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {}),
+        **cake_backend.K1_DGRAD_NVJET_RULES_BY_SM.get((arch, sms), {}),
+    }
     rows = {
         key: value
         for key, value in cake_backend.K1_DGRAD_RULES_BY_SM.get((arch, sms), {}).items()
@@ -13922,6 +14038,44 @@ def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
         f"K1_DGRAD_ROWS {arch} sm_count={sms}: {ran} rows ran their program with the deterministic bits"
     )
     assert ran == len(rows)
+
+
+def test_gpu_k1_dgrad_nvjet_rows_keep_the_det_bits():
+    """On a part of a table of :data:`K1_DGRAD_NVJET_RULES_BY_SM`: the input gradient of every row binds this package's
+    nvjet program on the deterministic package's plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM`, gives the deterministic
+    package's input gradient bit for bit, meets the deterministic package's budget against FP64 and repeats bit for bit
+    over ``RERUNS`` calls into NaN-poisoned outputs; the first row runs the program by kernel name.  A part without
+    such rows skips."""
+    device, arch, sms = _part_or_skip()
+    rows = cake_backend.K1_DGRAD_NVJET_RULES_BY_SM.get((arch, sms), {})
+    if not rows:
+        pytest.skip(f"no K1 input-gradient nvjet row of {arch} on {sms} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 174)
+    det_program = cake_backend.K1_DGRAD_NVJET_DET_PROGRAM
+    det_template = det_backend._TEMPLATE_PREFIX + det_program
+    for i, ((K, N, T, dt), template) in enumerate(sorted(rows.items())):
+        what = f"dgrad {K} {N} {T} {dt} {template}"
+        module = cake_jit.KERNELS[arch][template]
+        G, W = _bf16((T, N), device, g), _bf16((N, K), device, g)
+        cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+        out = torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16)
+
+        def run(dst, G=G, W=W):
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, dst)
+
+        run(out)
+        torch.cuda.synchronize()
+        ((_, entry),) = cake_backend._K1_DET_CACHE.items()
+        assert entry.k1 is not None and entry.module_name == module, what
+        assert entry.plan.template == det_template, what
+        det_out = torch.full_like(out, float("nan"))
+        det_backend.cake_dense_gemm_det_train_projection_dgrad(G, W, det_out)
+        torch.cuda.synchronize()
+        assert torch.equal(out, det_out), what
+        _k1_check(out, G.double() @ W.double(), what)
+        _repeats_into_nan(run, out, what)
+        if i == 0:
+            _assert_ran(lambda G=G, W=W, out=out: run(out, G, W), module)
 
 
 def test_gpu_k1_forward_named_rows_keep_the_det_bits():

@@ -76,7 +76,9 @@ run another plan of those programs (the single-CTA program, every tile's whole K
 program), and the input-gradient rows of :data:`K1_DGRAD_RULES_BY_SM` another named program of that package (the
 deterministic plan's bits).  The K1 forward rows of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` run this package's one-wave
 forward program and the input-gradient rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` this package's input-gradient
-program: both add each output element's whole K in one ascending FP32 chain, with the deterministic plan's bits.
+program: both add each output element's whole K in one ascending FP32 chain, with the deterministic plan's bits.  The
+input-gradient rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` launch this package's nvjet program on the deterministic
+package's plan of one of its programs (the same kernel parameters and bits).
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
 of CTA pairs at three or more splits in the arrival order, a K2 stream-K partition that gives an element more than two
@@ -1648,6 +1650,7 @@ def dgrad_program_template(tma_store: bool) -> str:
 
 
 _WAVE_N224 = "dense_proj_gemm_wave_kk_n224"
+_WAVE_LEAN_N224_E8 = "dense_proj_gemm_wave_lean_kk_n224_ef_e8"
 _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 
@@ -1662,16 +1665,23 @@ _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 #: part, row, token count, layout and output dtype keeps that table and the deterministic plan.  Measured at exactly
 #: these rows and token counts on one part of each SM count against this package's program of the row in the same
 #: process: faster in eager launches and in CUDA graph replays in 5 of 5 paired groups, the output equal to the
-#: deterministic plan's bit for bit, and the same bits on 20 repeats.
+#: deterministic plan's bit for bit, and the same bits on 20 repeats.  On 148-SM and 152-SM ``sm_100a`` parts the rows
+#: run the lean form of the program (``wave_lean_kk_n224_ef_e8``: the same items, ring, MMAs and order of the sums, so
+#: the same bits; the start path of cuBLAS's nvjet kernels, each role waiting on the cluster barrier only before its
+#: first operation that needs it, the epilogue freeing the tensor memory, and eight epilogue warps): 0.95 to 0.98 times
+#: the time of the plain form in eager launches and in CUDA graph replays, 5 of 5 paired groups on every row of a B200
+#: and a GB200 part.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
-        (4096, 512, 16172): _WAVE_N224, (4096, 512, 16231): _WAVE_N224, (4096, 512, 16384): _WAVE_N224,
-        (5120, 512, 16172): _WAVE_N224, (5120, 512, 16231): _WAVE_N224, (5120, 512, 16384): _WAVE_N224,
+        (4096, 512, 16172): _WAVE_LEAN_N224_E8, (4096, 512, 16231): _WAVE_LEAN_N224_E8,
+        (4096, 512, 16384): _WAVE_LEAN_N224_E8, (5120, 512, 16172): _WAVE_LEAN_N224_E8,
+        (5120, 512, 16231): _WAVE_LEAN_N224_E8, (5120, 512, 16384): _WAVE_LEAN_N224_E8,
     },
     ("sm_100a", 152): {
-        (4096, 512, 16172): _WAVE_N224, (4096, 512, 16231): _WAVE_N224, (4096, 512, 16384): _WAVE_N224,
-        (5120, 512, 16172): _WAVE_N224, (5120, 512, 16231): _WAVE_N224, (5120, 512, 16384): _WAVE_N224,
+        (4096, 512, 16172): _WAVE_LEAN_N224_E8, (4096, 512, 16231): _WAVE_LEAN_N224_E8,
+        (4096, 512, 16384): _WAVE_LEAN_N224_E8, (5120, 512, 16172): _WAVE_LEAN_N224_E8,
+        (5120, 512, 16231): _WAVE_LEAN_N224_E8, (5120, 512, 16384): _WAVE_LEAN_N224_E8,
     },
     ("sm_103a", 152): {
         (4096, 512, 16172): _WAVE_N224, (4096, 512, 16231): _WAVE_N224, (4096, 512, 16384): _WAVE_N224,
@@ -1714,6 +1724,55 @@ K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, st
         (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA,
         (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
         (5120, 512, 16231, "f32"): _DGRAD_N_TMA, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
+    },
+}
+# fmt: on
+
+_NVJET_EARLY_LEAN = "dense_proj_gemm_nvjet_early_kn_n256_lean"
+#: The deterministic package's program on whose plan the rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` run this
+#: package's program (a template symbol without the ``dense_proj_det_gemm_`` prefix).
+K1_DGRAD_NVJET_DET_PROGRAM = "kn_n256_tma1_w8r"
+#: The ``(K, N, T)`` rows (BF16 out) measured for :data:`K1_DGRAD_NVJET_RULES_BY_SM`.
+# fmt: off
+_NVJET_DGRAD_ROWS: tuple[tuple[int, int, int], ...] = (
+    *((4096, n, t) for n in (32, 64) for t in (512, 2048, 4864, 9472, 9728, 14592, 16172, 16231, 16384)),
+    *((4096, n, 16231) for n in (16, 48, 96, 128)),
+    *((k, n, 16231) for k, n in ((5120, 32), (5120, 48), (5120, 64), (5120, 128), (6144, 32), (6144, 128), (8192, 128))),
+)
+#: The rows of :data:`_NVJET_DGRAD_ROWS` that 152-SM ``sm_103a`` parts, and 148-SM and 152-SM ``sm_100a`` parts,
+#: leave to the other tables.
+_NVJET_DGRAD_SM103_KEPT = frozenset({(4096, 32, 2048)})
+_NVJET_DGRAD_SM100_KEPT = _NVJET_DGRAD_SM103_KEPT | {(4096, 32, 14592), (4096, 64, 4864)}
+# fmt: on
+#: The K1 input-gradient rows that run this package's nvjet program on the deterministic package's plan of
+#: :data:`K1_DGRAD_NVJET_DET_PROGRAM`, ``(arch, sm_count) -> {(K, N, T, out_dtype): template}``: on a part of exactly
+#: ``sm_count`` SMs, :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]`` (both with a
+#: unit stride on their last axis) into an ``out[T, K]`` of ``out_dtype`` at exactly these extents and token count
+#: plans that program of the deterministic package (the knobs that name it, :func:`k1_program_knobs`) and launches this
+#: package's program ``template`` with the plan's arguments: the same kernel parameters, host plan, shared memory,
+#: cluster and grid, and the same bits as the deterministic plan.  The program (``nvjet_early_kn_n256_lean``) loads the
+#: first item's first K step and prefetches the boxes after it into the L2 in the prologue, and takes the start path of
+#: cuBLAS's nvjet kernels (a relaxed cluster arrive, each role's wait just before its first operation that needs the
+#: peer CTA, the pair's tensor-memory allocation at the constant base 0).  It comes after
+#: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` and before :data:`K1_DGRAD_RULES_BY_SM`; every other part, row, token count and
+#: output dtype keeps those tables and the deterministic plan.  Measured at exactly these rows and token counts against
+#: the deterministic program it replaces in the same process, on one B200, one GB200 and one GB300 part: faster in eager
+#: launches and in CUDA graph replays in 5 of 5 paired groups (that program's time 1.00 to 1.17 times this one's; on the
+#: GB300 part ``4096 -> 32`` at 14592 tokens in 9 of 10 eager groups), the same bits on every repeat, equal to the
+#: deterministic plan's.  ``4096 -> 32`` at 2048 tokens was slower in eager launches on all three parts (that
+#: program's time 0.96 to 0.99 times this one's) and keeps the other tables on every part; on ``sm_100a``
+#: ``4096 -> 32`` at 14592 tokens and ``4096 -> 64`` at 4864 tokens were not faster in every group on the GB200 part and
+#: keep the other tables too.
+# fmt: off
+K1_DGRAD_NVJET_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
+    },
+    ("sm_100a", 152): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
+    },
+    ("sm_103a", 152): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM103_KEPT
     },
 }
 # fmt: on
@@ -1804,6 +1863,33 @@ def _k1_dgrad_program_of(
     if _k1_index(G, W, out) < 0:
         return None
     return _k1_program_module(K1_DGRAD_PROGRAM_RULES_BY_SM, key, out)
+
+
+def _k1_dgrad_nvjet_of(
+    G: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
+    """The module of this package the input-gradient call ``(G, W, out)`` runs on the deterministic package's plan of
+    :data:`K1_DGRAD_NVJET_DET_PROGRAM` (:data:`K1_DGRAD_NVJET_RULES_BY_SM`), or ``None``: a shape and output dtype
+    without a row of the table, an operand without a unit stride on its last axis, tensors not on one CUDA device and a
+    part without the row keep the other tables.  The device is read only for a shape of the table."""
+    if (
+        G.dim() != 2
+        or W.dim() != 2
+        or out.dim() != 2
+        or out.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    key = (
+        int(W.shape[1]),
+        int(W.shape[0]),
+        int(G.shape[0]),
+        "f32" if out.dtype == torch.float32 else "bf16",
+    )
+    if not any(key in rows for rows in K1_DGRAD_NVJET_RULES_BY_SM.values()):
+        return None
+    if G.stride(1) != 1 or W.stride(1) != 1 or _k1_index(G, W, out) < 0:
+        return None
+    return _k1_program_module(K1_DGRAD_NVJET_RULES_BY_SM, key, out)
 
 
 def _launch_k1_program(
@@ -5001,6 +5087,8 @@ class _CachedDetK1:
     k1: Optional[_K1Binding] = field(default=None, repr=False)
     # a deterministic program is fixed-order: never alerts (read by :func:`_k1_cached_launch`)
     order_varying: bool = False
+    # this package's program bound on the plan in place of the plan's own (K1_DGRAD_NVJET_RULES_BY_SM), else None
+    module_name: Optional[str] = None
 
 
 def _plan_det_k1(
@@ -5014,15 +5102,18 @@ def _plan_det_k1(
     stream: int,
     pdl: int,
     weights_static: bool = False,
+    module: Optional[str] = None,
 ) -> _CachedDetK1:
     """Plan the deterministic K1 program for the deterministic package's convenience call ``(A, B, out,
     transposed_out, **knobs)`` (under ``_ATOMIC_PLAN_LOCK``): that package's planner (its errors), its program bound
     in its argument order with the PDL flag ``pdl`` (0 or 1; :func:`_k1_binding`; the per-call views rebuilt from the
     call's tensors ``sources``, which hold the data pointers of ``A`` / ``B`` / ``out``), the stream-K slabs and slice
-    counters in this package's arena.  A planner's view the call's tensors do not rebuild leaves the entry unbound
-    (the deterministic package's convenience path), as does a call without knobs that the deterministic package runs
-    on its swapped small-token forward (``_swap_ab_launch`` with the call's ``weights_static`` under PDL: its
-    program, not the planner's)."""
+    counters in this package's arena.  With ``module`` (this package's program of :data:`K1_DGRAD_NVJET_RULES_BY_SM`)
+    a plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` binds that program in place of the plan's own, in its own argument
+    order; a plan of another program binds its own.  A planner's view the call's tensors do not rebuild leaves the
+    entry unbound (the deterministic package's convenience path), as does a call without knobs that the
+    deterministic package runs on its swapped small-token forward (``_swap_ab_launch`` with the call's
+    ``weights_static`` under PDL: its program, not the planner's)."""
     det = deterministic_backend()
     if not knobs:
         # the deterministic call's swapped small-token forward: its program, not the planner's
@@ -5046,7 +5137,13 @@ def _plan_det_k1(
         out_l=out_l,
         enable_pdl=pdl,
     )
-    fn, template = det._bind(module_name, values, plan.grid, arch)
+    nvjet = module is not None and plan.template == (
+        det._TEMPLATE_PREFIX + K1_DGRAD_NVJET_DET_PROGRAM
+    )
+    if nvjet:
+        fn, template = _atomic_bind(module, values, plan.grid, arch)
+    else:
+        fn, template = det._bind(module_name, values, plan.grid, arch)
     views = dict(
         A=(a_desc, False),
         B=(b_desc, False),
@@ -5060,7 +5157,13 @@ def _plan_det_k1(
     arena = _atomic_arena_for(index, stream, out.device)
     arena.require("k1_det_ws", plan.ws_f32_elems)
     arena.require("k1_det_counters", plan.counters_alloc_u32)
-    return _CachedDetK1(plan=plan, entry=fn, arena=arena, k1=bound)
+    return _CachedDetK1(
+        plan=plan,
+        entry=fn,
+        arena=arena,
+        k1=bound,
+        module_name=module if nvjet else None,
+    )
 
 
 def _det_k1(
@@ -5070,9 +5173,11 @@ def _det_k1(
     det_call: Callable[[], Any],
     enable_pdl: Optional[bool],
     weights_static: bool = False,
+    module: Optional[str] = None,
 ) -> Any:
     """The deterministic package's K1 convenience call -- ``det_args()`` gives its ``(A, B, out, transposed_out,
-    knobs)``, ``det_call()`` makes it with ``enable_pdl`` / ``weights_static`` -- on this package's convenience path:
+    knobs)``, ``det_call()`` makes it with ``enable_pdl`` / ``weights_static`` -- on this package's convenience path
+    (``module``: this package's program bound on the plan, :func:`_plan_det_k1`):
     planned once per key of the entry point's tensors ``sources`` (the last is ``out``), ``flags`` and the PDL flag
     (``enable_pdl`` resolved for the device, bound into the argument list; :func:`_plan_det_k1`: the deterministic
     package's plan, program and so its bits), then the bound launch (:class:`_K1Binding`).  Tensors that are not on
@@ -5104,6 +5209,7 @@ def _det_k1(
                         stream,
                         pdl,
                         weights_static,
+                        module,
                     ),
                 )
     bound, fn = entry.k1, entry.entry
@@ -6292,8 +6398,10 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program (whole output tiles) through this package's
     binding of it (:func:`_det_k1`: the same plan, program and bits), except on a row of
     :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` for the device, which runs this package's input-gradient program (the same
-    bits), and on a row of :data:`K1_DGRAD_RULES_BY_SM` for the device, which runs the table's program of the
-    deterministic package (:func:`k1_dgrad_knobs`; the same bits as the deterministic plan, every run).  ``enable_pdl`` as for
+    bits), on a row of :data:`K1_DGRAD_NVJET_RULES_BY_SM`, which runs this package's nvjet program on the deterministic
+    package's plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` (the same bits), and on a row of
+    :data:`K1_DGRAD_RULES_BY_SM` for the device, which runs the table's program of the deterministic package
+    (:func:`k1_dgrad_knobs`; the same bits as the deterministic plan, every run).  ``enable_pdl`` as for
     :func:`cake_dense_gemm_nondet_train_projection`."""
     if out is None:
         out = torch.empty(
@@ -6310,14 +6418,24 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     module = _k1_dgrad_program_of(G, W, o)
     if module is not None:
         return _launch_dgrad_program(module, G, W, o, enable_pdl)
+    nvjet = _k1_dgrad_nvjet_of(G, W, o)
     return _det_k1(
         (G, W, o),
         ("dgrad",),
-        lambda: (G, W, o, False, _k1_dgrad_knobs_of(G, W, o)),
+        lambda: (
+            G,
+            W,
+            o,
+            False,
+            k1_program_knobs(K1_DGRAD_NVJET_DET_PROGRAM)
+            if nvjet
+            else _k1_dgrad_knobs_of(G, W, o),
+        ),
         lambda: deterministic_backend().cake_dense_gemm_det_train_projection_dgrad(
             G, W, o, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
         ),
         enable_pdl,
+        module=nvjet,
     )
 
 
