@@ -117,6 +117,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_gdn_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_gdn_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_gqa_nondet_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_gqa_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_lm_head_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart.
