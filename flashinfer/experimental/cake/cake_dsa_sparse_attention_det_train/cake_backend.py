@@ -227,7 +227,8 @@ def _check_key_passes(key_passes: Optional[int], num_kv: int) -> None:
 # The pass count is the non-deterministic package's policy (the record's ``key_pass_policy``, :class:`KeyPassPolicy`),
 # with one difference: every pass runs all T tokens in one launch (``token_base = 0``), so a row the policy would run
 # in several token chunks (T above :meth:`KeyPassPolicy.token_chunk`) takes one pass.  ``key_passes`` overrides it.
-DQ_PARTIAL_BYTES_PER_TOKEN = NUM_HEADS * D_QK * 4  # one FP32 dQ / dQ_rope partial row (147,456 B)
+# one FP32 dQ / dQ_rope partial row (147,456 B)
+DQ_PARTIAL_BYTES_PER_TOKEN = NUM_HEADS * D_QK * 4
 KEY_PASS_POLICY_FIELDS = (
     "l2_budget_bytes",
     "key_bytes",
@@ -250,11 +251,16 @@ _R1_RULE: dict[str, int] = dict.fromkeys(KEY_PASS_RULE_FIELDS, 0)
 class KeyPassPolicy:
     """The record's key-range-pass policy: the non-deterministic package's (see the comment above)."""
 
-    l2_budget_bytes: int  # FP32 accumulator bytes one pass may touch (100 MiB)
-    key_bytes: int  # FP32 accumulator bytes per key row (576 * 4 = 2304)
-    workspace_budget_bytes: int  # pass scratch one token chunk may need at most (640 MiB)
-    token_chunk_multiple: int  # the token chunk is a multiple of this and at least this (128)
-    max_passes: int  # the formula's count is taken only up to this many passes, else one pass (4)
+    # FP32 accumulator bytes one pass may touch (100 MiB)
+    l2_budget_bytes: int
+    # FP32 accumulator bytes per key row (576 * 4 = 2304)
+    key_bytes: int
+    # pass scratch one token chunk may need at most (640 MiB)
+    workspace_budget_bytes: int
+    # the token chunk is a multiple of this and at least this (128)
+    token_chunk_multiple: int
+    # the formula's count is taken only up to this many passes, else one pass (4)
+    max_passes: int
     # the per-target rules: ((arch, (tail_rows, fixed_passes, min_kv, tail_min_kv, tail_cap)), ...)
     rules: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
