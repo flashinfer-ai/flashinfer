@@ -522,7 +522,7 @@
     },
     {
       "arch": "sm_107a",
-      "closure_sha256": "42cc3e9d7b2ccd2b4c42ab5cdade6e61d120a34ac51d1509a78a6f19a33f2d60",
+      "closure_sha256": "7202302091a66f2fd9b2b75daaf307e196b3dd7aa8de74212c0933b54676e975",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
       "min_cuda": "13.4",
@@ -536,7 +536,7 @@
       "path": "aot/cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7_sm_107a.so",
       "sha256": {
         "csrc/cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7_binding.cu": "04620644a1450b3b7990eb686d1af13981a5772bb9303e10951d4814267f9dc8",
-        "csrc/cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7_kernel.cu": "c25a87f39ac5a3fa7d75e6804a5432f621963a1ebed4d4a5598b53cf00a451a4"
+        "csrc/cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7_kernel.cu": "7d0936bb0d611de61f9b41c56dbbd9aa46c52637f2d949618aab422a9dcd52ef"
       },
       "sources": [
         "csrc/cake_rmsnorm_silu_gate_train_9cb071b2dfe75474aaa7_kernel.cu",
@@ -844,7 +844,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "678c70d03441ffe0958f4decc3356ca919e052fc43888ca57d686d9444c7da32",
+      "closure_sha256": "90f9507e1078c52c25a3973e26dc98d084a054f6dc3ab274b2238fae4f824460",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.9",
@@ -858,7 +858,7 @@
       "path": "aot/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_sm_100a.so",
       "sha256": {
         "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_binding.cu": "67462f4615b1354512ef70a340c1fef38fbd2a62be62bcc49b688c26380425be",
-        "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu": "c90a2c0ce7015107b704fea2191912bb07b38a14170267ad687c450506d517eb"
+        "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu": "537959377a5b7d948b49ccedc5d2fb4a6ba0fa15de50bd8cb69f17aa74e002ec"
       },
       "sources": [
         "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu",
@@ -867,7 +867,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "0acc09f8da5bfbcc8af313dea4d14f6b2649d9fb7e14d2fe1f3441a617c202ea",
+      "closure_sha256": "91a94426413ae3e336dfec39186ef71814ea3d69d1af438f9f135b455df48293",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -881,7 +881,7 @@
       "path": "aot/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_sm_103a.so",
       "sha256": {
         "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_binding.cu": "67462f4615b1354512ef70a340c1fef38fbd2a62be62bcc49b688c26380425be",
-        "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu": "c90a2c0ce7015107b704fea2191912bb07b38a14170267ad687c450506d517eb"
+        "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu": "537959377a5b7d948b49ccedc5d2fb4a6ba0fa15de50bd8cb69f17aa74e002ec"
       },
       "sources": [
         "csrc/cake_rmsnorm_silu_gate_train_e6e0bf4c758851cabc99_kernel.cu",
