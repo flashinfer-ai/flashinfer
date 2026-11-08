@@ -210,8 +210,8 @@ A one-thread side kernel on GB200 (sm_100a, 152 SMs) barely changes the time:
 
 | Side kernel on another stream | shape A next-to / alone | shape B next-to / alone |
 | --- | --- | --- |
-| one thread, 2 ms | 0.997 | 1.013 |
-| one thread, 4 ms | 1.002 | 1.012 |
+| one thread, 2 ms | 1.000 | 1.002 |
+| one thread, 4 ms | 0.999 | 1.006 |
 
 The next table shows a resident kernel on another stream that holds `k` SMs. `N` is the SM count. The
 ratio columns give the time next to the resident kernel divided by the time alone. The `k = 0` rows give the
@@ -219,12 +219,12 @@ unloaded backward time. The previous non-deterministic backward ran as one progr
 
 | GPU | `k` | ideal `N / (N - k)` | shape A | shape B | previous backward, A / B |
 | --- | --- | --- | --- | --- | --- |
-| GB200 (sm_100a, 152 SMs) | 0 | 1 | 401.1 us | 538.8 us | |
-| GB200 | 16 | 1.118 | 1.086 | 1.214 | 1.43 / 1.63 |
-| GB200 | 32 | 1.267 | 1.235 | 1.311 | 1.73 / 1.61 |
-| B200 (sm_100a, 148 SMs) | 0 | 1 | 428.0 us | 569.3 us | |
-| B200 | 16 | 1.121 | 1.114 (476.6 us) | 1.244 (708.0 us) | 737.8 us / 974.7 us |
-| B200 | 32 | 1.276 | 1.263 (540.5 us) | 1.320 (751.2 us) | 741.9 us / 972.8 us |
+| GB200 (sm_100a, 152 SMs) | 0 | 1 | 365.0 us | 493.1 us | 395.0 us / 560.5 us |
+| GB200 | 16 | 1.118 | 1.087 (396.7 us) | 1.175 (579.5 us) | 667.5 us / 921.1 us |
+| GB200 | 32 | 1.267 | 1.208 (440.8 us) | 1.286 (634.2 us) | 687.8 us / 914.1 us |
+| B200 (sm_100a, 148 SMs) | 0 | 1 | 384.3 us | 519.2 us | 423.9 us / 583.7 us |
+| B200 | 16 | 1.121 | 1.114 (428.0 us) | 1.190 (618.0 us) | 738.0 us / 973.8 us |
+| B200 | 32 | 1.276 | 1.258 (483.3 us) | 1.295 (672.6 us) | 743.4 us / 975.9 us |
 
 For shape A, the slowdown closely follows the share of SMs the resident kernel holds and stays at or below the ideal ratio. For
 shape B it is above the ideal ratio.
