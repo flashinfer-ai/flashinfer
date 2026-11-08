@@ -187,6 +187,12 @@ KCP_BWD = "kcp_bwd"
 KCP_BWD_HEAD = "kcp_bwd_head"
 KCP_BWD_DYN = "kcp_bwd_dyn"
 KCP_BWD_HALO = "kcp_bwd_halo"
+# SMs of co-resident CTAs the forward (``kcp_fwd``, the deterministic KCP forward program) leaves free, per
+# architecture (:func:`_forward_grid`).  sm_107a launches the deterministic KCP forward's grid, one SM short: unloaded it
+# measured about 0.3% faster there than the full co-resident grid (R200, 212 SMs, world 4, 16384 tokens x 8192
+# channels x 3 tensors per rank; within noise at 32768 x 10240).  sm_100a and sm_103a keep the full grid, which
+# measured faster than the reserved one there.  ``y`` does not depend on the grid.
+FWD_RESERVE_SMS = {"sm_107a": 1}
 GRAPH_MODES = (
     "off",
     "replay",
@@ -1186,6 +1192,24 @@ def cake_causal_conv1d_nondet_train_kcp_forward(
     return (y if out is not None else y.detach()), hist
 
 
+def _forward_grid(
+    record: dict[str, Any], *, arch: str, device_index: int, C: int, n_ch_tiles: int
+) -> tuple[int, int, int]:
+    """The forward's launch grid: the record's co-resident grid (:func:`launch_grid`) less :data:`FWD_RESERVE_SMS`
+    SMs of CTAs for ``arch`` when that shorter grid still holds all ``n_ch_tiles`` channel tiles, else the full grid;
+    a ``ValueError`` when not even the full grid holds them.  ``y`` does not depend on the grid."""
+
+    full = launch_grid(record, device_index=device_index)
+    if n_ch_tiles > full[0]:
+        raise ValueError(
+            f"C={C} spans more channel tiles than the forward's grid on this device holds"
+        )
+    reserved = FWD_RESERVE_SMS.get(arch, 0) * int(record["grid_rule"]["ctas_per_sm"])
+    if reserved and full[0] - reserved >= max(n_ch_tiles, 1):
+        return (full[0] - reserved, full[1], full[2])
+    return full
+
+
 def _kcp_forward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
@@ -1241,10 +1265,13 @@ def _kcp_forward(
     device_index = _device_index(device)
     record = _loader.MODULES[name]
     scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    if scalars["n_ch_tiles"] > launch_grid(record, device_index=device_index)[0]:
-        raise ValueError(
-            f"C={C} spans more channel tiles than the forward's grid on this device holds"
-        )
+    grid = _forward_grid(
+        record,
+        arch=arch,
+        device_index=device_index,
+        C=C,
+        n_ch_tiles=scalars["n_ch_tiles"],
+    )
     values: dict[str, Any] = {
         "x": x_flat,
         "w": w,
@@ -1258,7 +1285,8 @@ def _kcp_forward(
     }
     if work is not None:
         work.wait()
-    run_module(name, values, device_index=device_index)
+    # the grid of :func:`_forward_grid`, as on the trimmed host path
+    run_module(name, values, device_index=device_index, grid=grid)
     return y, hist
 
 
@@ -1309,11 +1337,13 @@ def _fwd_host(
             scalars = plan(
                 S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
             )
-            grid = launch_grid(record, device_index=device_index)
-            if scalars["n_ch_tiles"] > grid[0]:
-                raise ValueError(
-                    f"C={C} spans more channel tiles than the forward's grid on this device holds"
-                )
+            grid = _forward_grid(
+                record,
+                arch=arch,
+                device_index=device_index,
+                C=C,
+                n_ch_tiles=scalars["n_ch_tiles"],
+            )
             e["scalars"] = _scalars(scalars)
             e["device_index"] = device_index
             e["launch"] = _launch_plan(name, grid, device_index)

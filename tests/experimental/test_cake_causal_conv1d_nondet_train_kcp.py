@@ -354,6 +354,56 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
+def test_forward_grid_per_architecture(monkeypatch) -> None:
+    """The forward launches the record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one
+    SM, the deterministic KCP forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and
+    ``hist`` are bitwise the deterministic KCP forward's either way."""
+
+    device = torch.device("cuda")
+    arch = conv_kcp._loader.device_arch(device.index)
+    (name,) = conv_kcp.route_modules(arch, conv_kcp.KCP_FWD)
+    record = conv_kcp._loader.MODULES[name]
+    full = conv_kcp.launch_grid(record, device_index=device.index)
+    reserved = conv_kcp.FWD_RESERVE_SMS.get(arch, 0) * int(
+        record["grid_rule"]["ctas_per_sm"]
+    )
+    expected = (full[0] - reserved, full[1], full[2])
+    seen = []
+    launch_plan, run_module = conv_kcp._launch_plan, conv_kcp.run_module
+
+    def recording_plan(name, grid, device_index):
+        if conv_kcp._loader.MODULES[name]["role"] == conv_kcp.KCP_FWD:
+            seen.append(tuple(grid))
+        return launch_plan(name, grid, device_index)
+
+    def recording_run(name, values, *, device_index, grid=None):
+        if conv_kcp._loader.MODULES[name]["role"] == conv_kcp.KCP_FWD:
+            seen.append(None if grid is None else tuple(grid))
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
+    monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    try:
+        for C in (1024, 10240):
+            p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+            y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+                p.x_local, p.w, p.ctx
+            )
+            for host_trim in (1, 0):
+                conv_kcp._set_test_knobs({"host_trim": host_trim})
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+                seen.clear()
+                y, hist = _fwd(p.x_local, p.w, p.ctx)
+                torch.cuda.synchronize()
+                label = f"{arch} C={C} host_trim={host_trim}"
+                assert seen == [expected], (label, seen)
+                assert torch.equal(_bits(y), _bits(y_det)), label
+                assert torch.equal(_bits(hist), _bits(hist_det)), label
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+
+
 @pytest.mark.parametrize("form", ["knob", "keyword"])
 def test_graph_replay_is_bitwise_for_y_and_dx(monkeypatch, form) -> None:
     """Graph replay of the KCP calls: the deterministic suite's event sequence; ``y`` / ``hist`` / ``dx`` bitwise the

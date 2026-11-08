@@ -32,6 +32,9 @@ The following parts are the deterministic KCP package's:
 - the multi-tensor calls
 
 Only the backward after the head program differs: it overlaps the halo exchange, and its `dweight` sum is unordered.
+The forward's launch grid follows the architecture (`kcp.FWD_RESERVE_SMS`). On sm_107a it is the deterministic
+route's grid, one SM short of the co-resident CTA count. On sm_100a and sm_103a it is the full co-resident grid,
+which measured faster there. `y` does not depend on the grid.
 
 - **Halo exchange:** one `all_to_all_single` per direction and call. The
   forward delivers the history rows into the history pool `hist`
