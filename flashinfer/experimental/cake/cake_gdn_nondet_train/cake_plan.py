@@ -41,7 +41,6 @@ from . import cake_backend, cake_jit
 
 __all__ = [
     "ADJOINT_FORMS",
-    "NOCUT_WARMUP_LOG2",
     "LEVEL_STATE",
     "STATE_NAMES",
     "TAPE_LEVELS",
@@ -73,16 +72,15 @@ TAPE_LEVELS: Mapping[str, str] = MappingProxyType(
 )
 
 # The backward form of a call where a measurement on the device fixes it instead of the split's pricing, by
-# (architecture, SM count, H, HV).  ``"nocut"``: the planner's tables (no one-wave split of the adjoint walk; a group of
-# three keeps its pre-scan R-form table) with every pre-scan of the call, forward and backward, run without the warm-up
-# cut (threshold :data:`NOCUT_WARMUP_LOG2`), so neither the plan nor its bits depend on the gates.  sm_100a on GB200
-# (152 SMs) at H 1 / HV 3: measured at the pair rows (three sequences of about 11k tokens), faster than the split in
-# fwd+bwd and the checkpointed step and as fast in the backward, within the accuracy budget of the split.
+# (architecture, SM count, H, HV).  ``"nosplit"``: the planner's tables (no one-wave split of the adjoint walk; a group
+# of three keeps its pre-scan R-form table) with the pre-scans' warm-up cut, which skips the steps whose decay has
+# fallen below the threshold: the split's price does not depend on the gates, the planner's time does.  sm_100a on
+# GB200 (152 SMs) at H 1 / HV 3 and H 2 / HV 6: faster at the pair rows (three sequences of about 11k tokens) with the
+# gates of the FI bench and of FLA's model init.  From H 4 / HV 12 on the split stays: its smallest margin to the best
+# FROST arm over the FI-bench and log-spaced gates is the larger one there.
 ADJOINT_FORMS: Mapping[tuple[str, int, int, int], str] = MappingProxyType(
-    {("sm_100a", 152, 1, 3): "nocut"}
+    {("sm_100a", 152, 1, 3): "nosplit", ("sm_100a", 152, 2, 6): "nosplit"}
 )
-# the warm-up threshold (log2) of the "nocut" form: no step of a pre-scan falls below it
-NOCUT_WARMUP_LOG2: float = -1.0e30
 
 
 def adjoint_form(

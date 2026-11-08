@@ -654,8 +654,6 @@ class ChunkMeta:
     bwd_tc: bool = False
     # the one-wave split of the adjoint walk over bwd_segments (:func:`adjoint_split_pricing`)
     bwd_split: AdjointSplit | None = None
-    # the pre-scans' warm-up threshold of the layout's plan entry (cake_plan.ADJOINT_FORMS; None: the call's options)
-    warmup_log2: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1013,14 +1011,10 @@ SCAN_STEP_FACTOR = {(32, 2): 1.0, (32, 1): 1.18, (64, 1): 1.27}
 WARMUP_THRESH_LOG2 = -10.0 / math.log(2.0)
 
 
-def warmup_thresh_log2(options: ChainOptions, meta: ChunkMeta | None = None) -> float:
-    """The pre-scans' warm-up threshold of a call: the caller's ``warmup_log2``, else that of the layout's plan entry
-    (``meta.warmup_log2``, :data:`cake_plan.ADJOINT_FORMS`), else ``WARMUP_THRESH_LOG2``."""
-    if options.warmup_log2 is not None:
-        return options.warmup_log2
-    if meta is not None and meta.warmup_log2 is not None:
-        return meta.warmup_log2
-    return WARMUP_THRESH_LOG2
+def warmup_thresh_log2(options: ChainOptions) -> float:
+    return (
+        options.warmup_log2 if options.warmup_log2 is not None else WARMUP_THRESH_LOG2
+    )
 
 
 @dataclass(frozen=True)
@@ -2033,7 +2027,7 @@ def split_r_form(
 # adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
 # cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
 # full cost.
-ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_107a"})
+ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
 ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
@@ -2048,8 +2042,9 @@ SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
 # join); the host's cost of wave 1's fork and join (``fork``): where the overlap that the side stream buys, the shorter
 # of wave 1's two launches, is at most ``fork``, wave 1 runs on the caller's stream, summaries first (the same kernels
 # and bits; the host's fork and join, not the GPU, then decides wave 1's time: measured on GB200's Grace host at the
-# group-of-three pair rows).  sm_100a measured on B200 (148 SMs), sm_107a on R200 (212 SMs; ``serial_full``
-# extrapolated from the 144-CTA rows, the fullest serial wave of the bench rows there).
+# group-of-three pair rows).  sm_100a measured on B200 (148 SMs), sm_103a on GB300 (152 SMs; its ``fork`` from the
+# pair rows there: one stream at the (1, 3) and (2, 6) pairs, two from (4, 12) on; B300 not measured), sm_107a on R200
+# (212 SMs; ``serial_full`` extrapolated from the 144-CTA rows, the fullest serial wave of the bench rows there).
 ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
     "sm_100a": {
         "walk": 2.69,
@@ -2060,6 +2055,16 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "stitch_piece": 3.0,
         "fixed": 15.0,
         "fork": 0.0,
+    },
+    "sm_103a": {
+        "walk": 2.24,
+        "summary": 2.64,
+        "serial_low": 2.13,
+        "serial_full": 2.19,
+        "stitch": 8.8,
+        "stitch_piece": 3.1,
+        "fixed": 15.0,
+        "fork": 65.0,
     },
     "sm_107a": {
         "walk": 2.0,
@@ -2749,7 +2754,7 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
         )
         _launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new, final_state,
                 seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
-                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options, meta))  # fmt: skip
+                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options))  # fmt: skip
         _launch(split_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                 final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_init, 1 if store_final_state else 0,
@@ -2877,7 +2882,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         run(_prepared(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new,
                       final_state, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_init, 0, seg_flag,
-                      warmup_thresh_log2(options, meta)))  # fmt: skip
+                      warmup_thresh_log2(options)))  # fmt: skip
         run(_prepared("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start,
                       segs.seq_seg_start, seg_flag, num_v_heads, use_init, 0))  # fmt: skip
         use_seg = 1
@@ -3861,12 +3866,12 @@ def _backward_chain(
             ex.launch(sdt_prescan(arch), segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, g_cs,
                       dht32, dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start,
                       segs.seg_seq, meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options, meta))  # fmt: skip
+                      warmup_thresh_log2(options))  # fmt: skip
         else:
             ex.launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32,
                       dh, dv2, dh0, seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                       meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 0, scale, seg_flag,
-                      warmup_thresh_log2(options, meta))  # fmt: skip
+                      warmup_thresh_log2(options))  # fmt: skip
         dh_end = workspaces.take(table, "b_dh_end", (segs.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM),
                                  torch.float32, device)  # fmt: skip
         ex.launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
@@ -4312,9 +4317,6 @@ def _chunk_meta(
     split_len = _adjoint_split_length(
         seq_lens, int(num_v_heads), int(index), options, group
     )
-    if _adjoint_form(int(index), int(num_v_heads), group, options) == "nocut":
-        # the plan entry's planner tables run every pre-scan without the warm-up cut (forward and backward)
-        meta = replace(meta, warmup_log2=cake_plan.NOCUT_WARMUP_LOG2)
     if split_len is not None and int(plans[1].segment_len) == split_len:
         # wave 1 on one stream where the pricing says so or where the caller keeps every launch on its stream
         one_stream = options.streams == 1 or bool(
