@@ -917,7 +917,7 @@ def test_nondet_entry_points_run_this_package(
     ], launched
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
     again = nd_backward(dy, x, z, w, EPS)
-    for what, got, want in zip(("dx", "dz"), again, (dx, dz), strict=True):
+    for what, got, want in zip(("dx", "dz"), again[:2], (dx, dz), strict=True):
         assert_same_bits(what, got, want)
     y64, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
     dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS)
@@ -1087,7 +1087,7 @@ def test_accuracy_matrix_within_the_deterministic_error(
         assert got[2].dtype == dw_dtype
         if first is None:
             first = got
-        for what, g, f in zip(("dx", "dz"), got, first, strict=True):
+        for what, g, f in zip(("dx", "dz"), got[:2], first[:2], strict=True):
             assert_same_bits(what, g, f)
         assert_dw_repeats_within_det(
             "dw", got[2], first[2], dets[2], dw64, mag, varies=varies
@@ -1305,7 +1305,7 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
         _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
         want = dw64 + start
         for what, got, det, ref in zip(
-            ("dx", "dz"), (dx, dz), dets, (dx64, dz64), strict=True
+            ("dx", "dz"), (dx, dz), dets[:2], (dx64, dz64), strict=True
         ):
             assert_error_within_det(f"{what} {case}", got, det, ref)
         for _, _, dw in runs if varies else runs[:1]:
@@ -1353,7 +1353,7 @@ def test_two_streams_repeat_the_current_stream_bits(determinism_setting) -> None
     for i in range(2):
         varies = suite._dw_varies(cases[i][0].numel() // D)
         for got in outputs[i]:
-            for what, g, want in zip(("dx", "dz"), got, refs[i], strict=True):
+            for what, g, want in zip(("dx", "dz"), got[:2], refs[i][:2], strict=True):
                 assert_same_bits(f"stream {i}: {what}", g, want)
             assert_dw_repeats_within_det(
                 f"stream {i}: dw",
@@ -1399,7 +1399,7 @@ def test_side_stream_repeats_the_current_stream_bits(determinism_setting) -> Non
     varies = suite._dw_varies(x.numel() // D)
     mag = suite.magnitudes(dy, x, z, EPS)
     for outputs in (got, fresh):
-        for what, g, w_ in zip(("dx", "dz"), outputs, want, strict=True):
+        for what, g, w_ in zip(("dx", "dz"), outputs[:2], want[:2], strict=True):
             assert_same_bits(what, g, w_)
         assert_dw_repeats_within_det(
             "dw", outputs[2], want[2], dets[2], dw64, mag, varies=varies
@@ -1449,7 +1449,7 @@ def test_cuda_graph_replay_repeats_the_eager_bits(determinism_setting) -> None:
         graph.replay()
         torch.cuda.synchronize()
         eager = (nd_forward(xn, zn, w, EPS), *nd_backward(dyn, xn, zn, w, EPS))
-        for what, got, want in zip(names[:3], (y, dx, dz), eager, strict=True):
+        for what, got, want in zip(names[:3], (y, dx, dz), eager[:3], strict=True):
             assert_same_bits(f"replay {k}: {what}", got, want)
         dets = (det_forward(xn, zn, w, EPS), *det_backward(dyn, xn, zn, w, EPS))
         assert_det_bits(f"replay {k}: dx", dx, dets[1])
@@ -1495,7 +1495,7 @@ def test_autograd_and_checkpoint_repeat_the_functional_bits(
 
     def check(y, xg, zg, wg, what):
         assert wg.dtype == torch.bfloat16, what
-        for name, got, w_ in zip(names[:3], (y, xg, zg), want, strict=True):
+        for name, got, w_ in zip(names[:3], (y, xg, zg), want[:3], strict=True):
             assert_same_bits(f"{what}: {name}", got, w_)
         assert_dw_repeats_within_det(
             f"{what}: dw", wg, want[3], dets[3], refs[3], mag, varies=varies
@@ -1931,7 +1931,7 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
         assert got[2].dtype == dw_dtype
         if first is None:
             first = got
-        for what, g, f in zip(("dx", "dz"), got, first, strict=True):
+        for what, g, f in zip(("dx", "dz"), got[:2], first[:2], strict=True):
             assert_same_bits(what, g, f)
         assert_dw_repeats_within_det(
             "dw", got[2], first[2], dets[2], dw64, mag, varies=varies
@@ -2217,7 +2217,7 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
         assert got[2].dtype == dw_dtype
         if first_run is None:
             first_run = got
-        for what, g, f in zip(("dx", "dz"), got, first_run, strict=True):
+        for what, g, f in zip(("dx", "dz"), got[:2], first_run[:2], strict=True):
             assert_same_bits(what, g, f)
         if not varies:
             assert_same_bits("dw", got[2], first_run[2])
@@ -2226,7 +2226,7 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
         assert_det_bits_beside_nans("dz", got[1], dets[1])
         assert not bool(ws.any()), "the workspace is not zero"
     for what, got, det, ref in zip(
-        ("dx", "dz"), first_run, dets, (dx64, dz64), strict=True
+        ("dx", "dz"), first_run[:2], dets[:2], (dx64, dz64), strict=True
     ):
         assert_same_classes(what, got, ref)
         assert_error_within_det(
@@ -2347,7 +2347,7 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
         assert got[2].dtype == dw_dtype
         if first_run is None:
             first_run = got
-        for what, g, f in zip(("dx", "dz"), got, first_run, strict=True):
+        for what, g, f in zip(("dx", "dz"), got[:2], first_run[:2], strict=True):
             assert_same_bits(what, g, f)
         if not varies:
             assert_same_bits("dw", got[2], first_run[2])
@@ -2356,7 +2356,7 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
         assert_det_bits_beside_nans("dz", got[1], dets[1])
         assert not bool(ws.any()), "the workspace is not zero"
     for what, got, det, ref in zip(
-        ("dx", "dz"), first_run, dets, (dx64, dz64), strict=True
+        ("dx", "dz"), first_run[:2], dets[:2], (dx64, dz64), strict=True
     ):
         assert_same_classes(f"{what} rows={rows}", got, ref)
         assert_error_within_det(

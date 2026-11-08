@@ -886,6 +886,9 @@ def _backward(
         if _loader.MODULES[name]["grid_rule"]["kind"] == "chunks":
             blocks_per_chunk = backward_chunks(name, rows)[0]
         if workspace is not None:
+            # A caller's workspace holds the documented bytes in every band,
+            # whatever part of them this module uses.
+            _check_workspace(workspace, device, _workspace_bytes(arch))
             buffers.update(_workspace_views(workspace, name, device))
     if dw is not None and _loader.MODULES[name]["grid_rule"]["kind"] == "row_claims":
         # The CTAs of a row-claims backward add their weight-gradient sums in an

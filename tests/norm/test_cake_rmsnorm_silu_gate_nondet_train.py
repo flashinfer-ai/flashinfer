@@ -670,7 +670,7 @@ def test_layouts_in_the_row_claims_and_claimed_backward_bands(band, layout, laun
         gw = torch.empty(D, dtype=dw_dtype, device=x.device)
     packed = [t.contiguous().view(rows, 1, D) for t in (dy, x, z)]
     again = backward(*packed, w, EPS, grad_weight=gw)
-    for what, a, b in zip(("dx", "dz"), again, (dx, dz), strict=True):
+    for what, a, b in zip(("dx", "dz"), again[:2], (dx, dz), strict=True):
         assert torch.equal(a.reshape(-1, D), b.reshape(-1, D)), (what, layout)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
     assert_dw_repeats(
@@ -1015,6 +1015,33 @@ def test_workspace_errors():
         with pytest.raises(ValueError, match="uint8"):
             backward(dy, x, z, w, EPS, workspace=bad)
         assert not bool(bad.any())
+
+
+@pytest.mark.parametrize("role", ["bwd_bf16", "bwd_f32"])
+def test_workspace_errors_in_every_band(role, launches):
+    """In every ``BACKWARD_BANDS`` band of ``role`` on this device (the
+    small-row, the static, the row-claims and the claimed backwards, whatever
+    part of the workspace the band's module uses), a caller workspace that is
+    not a contiguous ``torch.uint8`` buffer of at least ``workspace_bytes``
+    bytes (one byte short, strided, misaligned, of another dtype:
+    :func:`_unfit_workspaces`) raises ``ValueError`` naming ``uint8``,
+    launches nothing and is left as it is."""
+    dw_dtype = torch.float32 if role == "bwd_f32" else torch.bfloat16
+    nbytes = workspace_for(1, torch.device("cuda")).numel()
+    bands = _device_bands(role)
+    assert bands, role
+    for band, _first, _last in bands:
+        shape = _band_shape(band)
+        assert shape is not None, (role, band)
+        x, z, w, dy = make(*shape, seed=17)
+        assert _backward_module(shape[0] * shape[1], dw_dtype) == _routes()[band]
+        for bad in _unfit_workspaces(nbytes):
+            gw = torch.empty(D, dtype=dw_dtype, device="cuda")
+            with pytest.raises(ValueError, match="uint8"):
+                backward(dy, x, z, w, EPS, grad_weight=gw, workspace=bad)
+            torch.cuda.synchronize()
+            assert not bool(bad.any()), (band, bad.dtype, bad.numel())
+    assert launches == [], launches
 
 
 def test_reset_workspace_clears_nonzero_scratch():
@@ -2788,7 +2815,9 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
     buffers kept across steps are the workspace of the backward without a
     caller workspace, one per (device, stream, backward module) of
     ``workspace_bytes`` bytes, and the device's reserve of zero-filled
-    workspaces for CUDA Graph captures (one allocation)."""
+    workspaces for CUDA Graph captures (one allocation).  The first step's
+    kept bytes are requested bytes, because the sizes of the cached blocks
+    that serve a request depend on earlier tests."""
     monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
     monkeypatch.setattr(pkg, "_RESERVES", {})
     # 1056 rows: past every small-row backward band (a backward with a
@@ -2805,10 +2834,10 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
         )
 
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = torch.cuda.memory_stats()["requested_bytes.all.current"]
     checkpointed().backward(dy)  # loads the modules, allocates the workspace
     torch.cuda.synchronize()
-    kept = torch.cuda.memory_allocated() - before
+    kept = torch.cuda.memory_stats()["requested_bytes.all.current"] - before
     nbytes = workspace_bytes(1, x.device)
     key = (
         torch.cuda.current_device(),
