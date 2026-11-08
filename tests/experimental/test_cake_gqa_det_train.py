@@ -1636,9 +1636,7 @@ def test_host_boundaries_come_together_at_every_size(device) -> None:
         )
         args = (x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"])
         with pytest.raises(ValueError, match="together"):
-            cake_backend.cake_gqa_det_train_backward(
-                *args, cu_seqlens_q_host=x["cq"]
-            )
+            cake_backend.cake_gqa_det_train_backward(*args, cu_seqlens_q_host=x["cq"])
         with pytest.raises(ValueError, match="boundaries from 0"):
             cake_backend.cake_gqa_det_train_backward(
                 *args, cu_seqlens_q_host=[0, 1], cu_seqlens_k_host=x["ck"]
