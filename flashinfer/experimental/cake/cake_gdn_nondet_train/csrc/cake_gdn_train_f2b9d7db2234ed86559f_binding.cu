@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_gdn_train_f2b9d7db2234ed86559f(const __grid_constant__ CUtensorMap qn_tma, const __grid_constant__ CUtensorMap kn_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_tma, float* __restrict__ g_cs, float* __restrict__ dht, __nv_bfloat16* __restrict__ dh_out, __nv_bfloat16* __restrict__ dv2, float* __restrict__ dh0, float* __restrict__ seg_state, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int* __restrict__ seg_chunk_start, int* __restrict__ seg_seq, int* __restrict__ seq_chunk_start, int num_heads, int num_v_heads, int use_final_state_grad, int store_initial_state_grad, float scale, int* __restrict__ seg_index, int* __restrict__ seg_mode);
+extern "C" __global__ void kernel_cake_gdn_train_f2b9d7db2234ed86559f(const __grid_constant__ CUtensorMap qn_tma, const __grid_constant__ CUtensorMap kn_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_tma, float* __restrict__ g_cs, float* __restrict__ dht, __nv_bfloat16* __restrict__ dh_out, __nv_bfloat16* __restrict__ dv2, float* __restrict__ dh0, float* __restrict__ seg_state, int* __restrict__ chunk_start, int* __restrict__ chunk_len, int* __restrict__ seg_chunk_start, int* __restrict__ seg_seq, int* __restrict__ seq_chunk_start, int num_heads, int num_v_heads, int use_final_state_grad, int store_initial_state_grad, float scale, int* __restrict__ seg_index, int* __restrict__ seg_mode, float warmup_thresh_log2, int* __restrict__ seg_flag);
 
 namespace cake_binding_kernel_cake_gdn_train_f2b9d7db2234ed86559f {
 
@@ -214,7 +214,7 @@ CUtensorMap EncodeTma_do_tma(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_qn_tma, TensorView a_kn_tma, TensorView a_w_tma, TensorView a_do_tma, TensorView a_g_cs, TensorView a_dht, TensorView a_dh_out, TensorView a_dv2, TensorView a_dh0, TensorView a_seg_state, TensorView a_chunk_start, TensorView a_chunk_len, TensorView a_seg_chunk_start, TensorView a_seg_seq, TensorView a_seq_chunk_start, int64_t a_num_heads, int64_t a_num_v_heads, int64_t a_use_final_state_grad, int64_t a_store_initial_state_grad, double a_scale, TensorView a_seg_index, TensorView a_seg_mode, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_qn_tma, TensorView a_kn_tma, TensorView a_w_tma, TensorView a_do_tma, TensorView a_g_cs, TensorView a_dht, TensorView a_dh_out, TensorView a_dv2, TensorView a_dh0, TensorView a_seg_state, TensorView a_chunk_start, TensorView a_chunk_len, TensorView a_seg_chunk_start, TensorView a_seg_seq, TensorView a_seq_chunk_start, int64_t a_num_heads, int64_t a_num_v_heads, int64_t a_use_final_state_grad, int64_t a_store_initial_state_grad, double a_scale, TensorView a_seg_index, TensorView a_seg_mode, double a_warmup_thresh_log2, TensorView a_seg_flag, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_qn_tma.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_qn_tma, "qn_tma");
@@ -263,6 +263,8 @@ void Run(TensorView a_qn_tma, TensorView a_kn_tma, TensorView a_w_tma, TensorVie
   check_dtype(a_seg_index, DLDataType{kDLInt, 32, 1}, "seg_index");
   check_cuda_tensor(a_seg_mode, "seg_mode");
   check_dtype(a_seg_mode, DLDataType{kDLInt, 32, 1}, "seg_mode");
+  check_cuda_tensor(a_seg_flag, "seg_flag");
+  check_dtype(a_seg_flag, DLDataType{kDLInt, 32, 1}, "seg_flag");
   check_contiguous(a_qn_tma, "qn_tma");
   check_contiguous(a_kn_tma, "kn_tma");
   check_same_device(a_kn_tma, a_qn_tma, "kn_tma", "qn_tma");
@@ -296,6 +298,8 @@ void Run(TensorView a_qn_tma, TensorView a_kn_tma, TensorView a_w_tma, TensorVie
   check_same_device(a_seg_index, a_qn_tma, "seg_index", "qn_tma");
   check_contiguous(a_seg_mode, "seg_mode");
   check_same_device(a_seg_mode, a_qn_tma, "seg_mode", "qn_tma");
+  check_contiguous(a_seg_flag, "seg_flag");
+  check_same_device(a_seg_flag, a_qn_tma, "seg_flag", "qn_tma");
   TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
   TVM_FFI_CHECK((a_num_v_heads >= a_num_heads), ValueError)
@@ -339,7 +343,9 @@ void Run(TensorView a_qn_tma, TensorView a_kn_tma, TensorView a_w_tma, TensorVie
   float v_scale = static_cast<float>(a_scale);
   void* v_seg_index = DataPtr(a_seg_index);
   void* v_seg_mode = DataPtr(a_seg_mode);
-  void* kernel_args[] = {&v_qn_tma, &v_kn_tma, &v_w_tma, &v_do_tma, &v_g_cs, &v_dht, &v_dh_out, &v_dv2, &v_dh0, &v_seg_state, &v_chunk_start, &v_chunk_len, &v_seg_chunk_start, &v_seg_seq, &v_seq_chunk_start, &v_num_heads, &v_num_v_heads, &v_use_final_state_grad, &v_store_initial_state_grad, &v_scale, &v_seg_index, &v_seg_mode};
+  float v_warmup_thresh_log2 = static_cast<float>(a_warmup_thresh_log2);
+  void* v_seg_flag = DataPtr(a_seg_flag);
+  void* kernel_args[] = {&v_qn_tma, &v_kn_tma, &v_w_tma, &v_do_tma, &v_g_cs, &v_dht, &v_dh_out, &v_dv2, &v_dh0, &v_seg_state, &v_chunk_start, &v_chunk_len, &v_seg_chunk_start, &v_seg_seq, &v_seq_chunk_start, &v_num_heads, &v_num_v_heads, &v_use_final_state_grad, &v_store_initial_state_grad, &v_scale, &v_seg_index, &v_seg_mode, &v_warmup_thresh_log2, &v_seg_flag};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(320, 1, 1);
