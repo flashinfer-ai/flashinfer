@@ -119,7 +119,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
+kernel_cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, __nv_bfloat16* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1372,7 +1372,7 @@ kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restri
                 unsigned int bits = __as_u32(colsum);
                 unsigned int ex = bits >> 23 & 255;
                 unsigned int _max_212 = ((ex) > (1) ? (ex) : (1));
-                unsigned int idx = _max_212 - 1;
+                unsigned int idx = _max_212 - 1 + 38;
                 unsigned int _min_213 = ((ex) < (1) ? (ex) : (1));
                 unsigned long long m = (unsigned long long)(bits & 8388607 | _min_213 << 23);
                 unsigned int wk = idx / 48;
@@ -1500,8 +1500,8 @@ kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restri
             spec = _atomic_fetch_add_242;
             float old = 0.0f;
             if (accumulate != 0) {
-                float prev = atomicAdd(&dw[tid], -0.0f);
-                old = prev;
+                __nv_bfloat16 prev = atomicAdd(&dw[tid], -0.0f);
+                old = (float)prev;
             }
             long long digits[7];
             digits[0] = 0ll;
@@ -1632,7 +1632,7 @@ kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restri
                 unsigned int bits_1 = __as_u32(old);
                 unsigned int ex_1 = bits_1 >> 23 & 255;
                 unsigned int _max_243 = ((ex_1) > (1) ? (ex_1) : (1));
-                unsigned int idx_1 = _max_243 - 1;
+                unsigned int idx_1 = _max_243 - 1 + 38;
                 unsigned int _min_244 = ((ex_1) < (1) ? (ex_1) : (1));
                 unsigned long long m_1 = (unsigned long long)(bits_1 & 8388607 | _min_244 << 23);
                 unsigned int wk_1 = idx_1 / 48;
@@ -1673,6 +1673,21 @@ kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restri
             long long t_6 = digits[6] + carry;
             digits[6] = t_6 & 281474976710655ll;
             carry = t_6 >> 48ll;
+            long long up_0 = digits[1] << 10ll & 281474976710655ll;
+            digits[0] = digits[0] >> 38ll | up_0;
+            long long up_1 = digits[2] << 10ll & 281474976710655ll;
+            digits[1] = digits[1] >> 38ll | up_1;
+            long long up_2 = digits[3] << 10ll & 281474976710655ll;
+            digits[2] = digits[2] >> 38ll | up_2;
+            long long up_3 = digits[4] << 10ll & 281474976710655ll;
+            digits[3] = digits[3] >> 38ll | up_3;
+            long long up_4 = digits[5] << 10ll & 281474976710655ll;
+            digits[4] = digits[4] >> 38ll | up_4;
+            long long up_5 = digits[6] << 10ll & 281474976710655ll;
+            digits[5] = digits[5] >> 38ll | up_5;
+            long long top = carry << 10ll & 281474976710655ll;
+            digits[6] = digits[6] >> 38ll | top;
+            carry = carry >> 38ll;
             double exact = (double)carry;
             exact = exact * 281474976710656.0 + (double)digits[6];
             exact = exact * 281474976710656.0 + (double)digits[5];
@@ -1682,7 +1697,7 @@ kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe(__nv_bfloat16* __restri
             exact = exact * 281474976710656.0 + (double)digits[1];
             exact = exact * 281474976710656.0 + (double)digits[0];
             float rounded = ((spec != 0.0f) ? spec : (float)(exact * 1.401298464324817e-45));
-            dw[tid] = rounded;
+            dw[tid] = (__nv_bfloat16)rounded;
         }
     }
 }

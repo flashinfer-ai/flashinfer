@@ -119,7 +119,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
+kernel_cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, __nv_bfloat16* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -352,24 +352,6 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
         int run_lo = cell[half];
         int run_n = cell[half + 1];
         if (run_n > 0) {
-            int _min_5 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
-            if (run_lo * blocks_per_chunk + 1 < _min_5) {
-                if ((tid & 7) == 0) {
-                    int prow = (((run_lo * blocks_per_chunk + 1) * 8 + group) < (rows - 1) ? ((run_lo * blocks_per_chunk + 1) * 8 + group) : (rows - 1));
-                    if (shared_rows != 0) {
-                        long long pat = (long long)((unsigned long long)(unsigned int)prow * row_stride + (unsigned long long)col);
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + pat)));
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + pat)));
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + pat)));
-                    } else {
-                        uint32_t pq = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)prow), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)prow);
-                        uint32_t ph = (uint32_t)((unsigned int)prow) - pq * (uint32_t)(heads.divisor);
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)pq * dy_tok + (long long)ph * dy_head + (long long)col))));
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)pq * x_tok + (long long)ph * x_head + (long long)col))));
-                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)pq * z_tok + (long long)ph * z_head + (long long)col))));
-                    }
-                }
-            }
             acc[0] = 0.0f;
             acc[1] = 0.0f;
             acc[2] = 0.0f;
@@ -378,11 +360,11 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
             acc[5] = 0.0f;
             acc[6] = 0.0f;
             acc[7] = 0.0f;
+            int _min_5 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
+            int cend = ((run_lo * blocks_per_chunk + blocks_per_chunk) < (_min_5) ? (run_lo * blocks_per_chunk + blocks_per_chunk) : (_min_5));
             int _min_6 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
-            int cend = ((run_lo * blocks_per_chunk + blocks_per_chunk) < (_min_6) ? (run_lo * blocks_per_chunk + blocks_per_chunk) : (_min_6));
-            int _min_7 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
             #pragma unroll 1
-            for (int u = run_lo * blocks_per_chunk; u < _min_7; u++) {
+            for (int u = run_lo * blocks_per_chunk; u < _min_6; u++) {
                 float gs[8];
                 float xs[8];
                 float zs[8];
@@ -391,7 +373,21 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                 if (shared_rows != 0) {
                     long long at = (long long)((unsigned long long)(unsigned int)src * row_stride + (unsigned long long)col);
                     {
-                        const uint4* _vptr_8 = reinterpret_cast<const uint4*>(dy + at + 0);
+                        const uint4* _vptr_7 = reinterpret_cast<const uint4*>(dy + at + 0);
+                        uint4 _vld_7[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_7[_blk] = _vptr_7[_blk];
+                            uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&gs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
+                                (&gs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    {
+                        const uint4* _vptr_8 = reinterpret_cast<const uint4*>(x + at + 0);
                         uint4 _vld_8[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -399,13 +395,13 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                             uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&gs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) << 16);
-                                (&gs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) & 0xffff0000u);
+                                (&xs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) << 16);
+                                (&xs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) & 0xffff0000u);
                             }
                         }
                     }
                     {
-                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(x + at + 0);
+                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(z + at + 0);
                         uint4 _vld_9[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -413,22 +409,8 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                             uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&xs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) << 16);
-                                (&xs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) & 0xffff0000u);
-                            }
-                        }
-                    }
-                    {
-                        const uint4* _vptr_10 = reinterpret_cast<const uint4*>(z + at + 0);
-                        uint4 _vld_10[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_10[_blk] = _vptr_10[_blk];
-                            uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                (&zs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) << 16);
-                                (&zs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) & 0xffff0000u);
+                                (&zs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) << 16);
+                                (&zs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) & 0xffff0000u);
                             }
                         }
                     }
@@ -436,7 +418,21 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                     uint32_t tq = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)src), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)src);
                     uint32_t th = (uint32_t)((unsigned int)src) - tq * (uint32_t)(heads.divisor);
                     {
-                        const uint4* _vptr_11 = reinterpret_cast<const uint4*>(dy + ((long long)tq * dy_tok + (long long)th * dy_head + (long long)col) + 0);
+                        const uint4* _vptr_10 = reinterpret_cast<const uint4*>(dy + ((long long)tq * dy_tok + (long long)th * dy_head + (long long)col) + 0);
+                        uint4 _vld_10[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_10[_blk] = _vptr_10[_blk];
+                            uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&gs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) << 16);
+                                (&gs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    {
+                        const uint4* _vptr_11 = reinterpret_cast<const uint4*>(x + ((long long)tq * x_tok + (long long)th * x_head + (long long)col) + 0);
                         uint4 _vld_11[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -444,13 +440,13 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                             uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&gs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) << 16);
-                                (&gs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) & 0xffff0000u);
+                                (&xs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) << 16);
+                                (&xs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) & 0xffff0000u);
                             }
                         }
                     }
                     {
-                        const uint4* _vptr_12 = reinterpret_cast<const uint4*>(x + ((long long)tq * x_tok + (long long)th * x_head + (long long)col) + 0);
+                        const uint4* _vptr_12 = reinterpret_cast<const uint4*>(z + ((long long)tq * z_tok + (long long)th * z_head + (long long)col) + 0);
                         uint4 _vld_12[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -458,41 +454,36 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                             uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&xs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) << 16);
-                                (&xs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) & 0xffff0000u);
-                            }
-                        }
-                    }
-                    {
-                        const uint4* _vptr_13 = reinterpret_cast<const uint4*>(z + ((long long)tq * z_tok + (long long)th * z_head + (long long)col) + 0);
-                        uint4 _vld_13[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_13[_blk] = _vptr_13[_blk];
-                            uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                (&zs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) << 16);
-                                (&zs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) & 0xffff0000u);
+                                (&zs[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) << 16);
+                                (&zs[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) & 0xffff0000u);
                             }
                         }
                     }
                 }
-                int _min_14 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
-                if (u + 2 < _min_14) {
-                    if ((tid & 7) == 0) {
-                        int prow_1 = (((u + 2) * 8 + group) < (rows - 1) ? ((u + 2) * 8 + group) : (rows - 1));
+                int _min_13 = (((run_lo + run_n) * blocks_per_chunk) < (ndb) ? ((run_lo + run_n) * blocks_per_chunk) : (ndb));
+                if (u + 1 < _min_13) {
+                    if (shared_rows * ((dy_head == 128ll) ? 1 : 0) != 0) {
+                        if (tid == 0) {
+                            int first = (u + 1) * 8;
+                            int _min_14 = ((rows - first) < (8) ? (rows - first) : (8));
+                            int nbytes = _min_14 * 256;
+                            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(dy + (long long)first * 128ll), "r"((uint32_t)(nbytes)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (long long)first * 128ll), "r"((uint32_t)(nbytes)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(z + (long long)first * 128ll), "r"((uint32_t)(nbytes)) : "memory");
+                        }
+                    } else if ((tid & 7) == 0) {
+                        int prow = (((u + 1) * 8 + group) < (rows - 1) ? ((u + 1) * 8 + group) : (rows - 1));
                         if (shared_rows != 0) {
-                            long long pat_1 = (long long)((unsigned long long)(unsigned int)prow_1 * row_stride + (unsigned long long)col);
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + pat_1)));
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + pat_1)));
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + pat_1)));
+                            long long pat = (long long)((unsigned long long)(unsigned int)prow * row_stride + (unsigned long long)col);
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + pat)));
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + pat)));
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + pat)));
                         } else {
-                            uint32_t pq_1 = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)prow_1), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)prow_1);
-                            uint32_t ph_1 = (uint32_t)((unsigned int)prow_1) - pq_1 * (uint32_t)(heads.divisor);
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)pq_1 * dy_tok + (long long)ph_1 * dy_head + (long long)col))));
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)pq_1 * x_tok + (long long)ph_1 * x_head + (long long)col))));
-                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)pq_1 * z_tok + (long long)ph_1 * z_head + (long long)col))));
+                            uint32_t pq = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)prow), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)prow);
+                            uint32_t ph = (uint32_t)((unsigned int)prow) - pq * (uint32_t)(heads.divisor);
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)pq * dy_tok + (long long)ph * dy_head + (long long)col))));
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)pq * x_tok + (long long)ph * x_head + (long long)col))));
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)pq * z_tok + (long long)ph * z_head + (long long)col))));
                         }
                     }
                 }
@@ -1579,7 +1570,7 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                             unsigned int bits = __as_u32(colsum);
                             unsigned int ex = bits >> 23 & 255;
                             unsigned int _max_220 = ((ex) > (1) ? (ex) : (1));
-                            unsigned int idx = _max_220 - 1;
+                            unsigned int idx = _max_220 - 1 + 38;
                             unsigned int _min_221 = ((ex) < (1) ? (ex) : (1));
                             unsigned long long m = (unsigned long long)(bits & 8388607 | _min_221 << 23);
                             unsigned int wk = idx / 48;
@@ -1723,8 +1714,8 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
             spec = _atomic_fetch_add_252;
             float old = 0.0f;
             if (accumulate != 0) {
-                float prev = atomicAdd(&dw[tid], -0.0f);
-                old = prev;
+                __nv_bfloat16 prev = atomicAdd(&dw[tid], -0.0f);
+                old = (float)prev;
             }
             long long digits[7];
             digits[0] = 0ll;
@@ -1855,7 +1846,7 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
                 unsigned int bits_1 = __as_u32(old);
                 unsigned int ex_1 = bits_1 >> 23 & 255;
                 unsigned int _max_253 = ((ex_1) > (1) ? (ex_1) : (1));
-                unsigned int idx_1 = _max_253 - 1;
+                unsigned int idx_1 = _max_253 - 1 + 38;
                 unsigned int _min_254 = ((ex_1) < (1) ? (ex_1) : (1));
                 unsigned long long m_1 = (unsigned long long)(bits_1 & 8388607 | _min_254 << 23);
                 unsigned int wk_1 = idx_1 / 48;
@@ -1896,6 +1887,21 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
             long long t_6 = digits[6] + carry;
             digits[6] = t_6 & 281474976710655ll;
             carry = t_6 >> 48ll;
+            long long up_0 = digits[1] << 10ll & 281474976710655ll;
+            digits[0] = digits[0] >> 38ll | up_0;
+            long long up_1 = digits[2] << 10ll & 281474976710655ll;
+            digits[1] = digits[1] >> 38ll | up_1;
+            long long up_2 = digits[3] << 10ll & 281474976710655ll;
+            digits[2] = digits[2] >> 38ll | up_2;
+            long long up_3 = digits[4] << 10ll & 281474976710655ll;
+            digits[3] = digits[3] >> 38ll | up_3;
+            long long up_4 = digits[5] << 10ll & 281474976710655ll;
+            digits[4] = digits[4] >> 38ll | up_4;
+            long long up_5 = digits[6] << 10ll & 281474976710655ll;
+            digits[5] = digits[5] >> 38ll | up_5;
+            long long top = carry << 10ll & 281474976710655ll;
+            digits[6] = digits[6] >> 38ll | top;
+            carry = carry >> 38ll;
             double exact = (double)carry;
             exact = exact * 281474976710656.0 + (double)digits[6];
             exact = exact * 281474976710656.0 + (double)digits[5];
@@ -1905,7 +1911,7 @@ kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776(__nv_bfloat16* __restri
             exact = exact * 281474976710656.0 + (double)digits[1];
             exact = exact * 281474976710656.0 + (double)digits[0];
             float rounded = ((spec != 0.0f) ? spec : (float)(exact * 1.401298464324817e-45));
-            dw[tid] = rounded;
+            dw[tid] = (__nv_bfloat16)rounded;
         }
     }
 }
