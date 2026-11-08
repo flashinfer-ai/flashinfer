@@ -1693,9 +1693,18 @@ FORWARD_CASES = [
     pytest.param(6000, 32, "contiguous", id="6000x32"),
     pytest.param(0, None, "flat2", id="band2-end"),
     pytest.param(1, None, "flat2", id="band2-end+1"),
+    pytest.param(0, None, "flat3", id="band3-end"),
+    pytest.param(1, None, "flat3", id="band3-end+1"),
+    pytest.param(0, None, "flat4", id="band4-end"),
+    pytest.param(1, None, "flat4", id="band4-end+1"),
+    pytest.param(0, None, "flat5", id="band5-end"),
+    pytest.param(1, None, "flat5", id="band5-end+1"),
     pytest.param(1, None, "token0", id="one-token-band0-end+1"),
     pytest.param(1, None, "token1", id="one-token-band1-end+1"),
     pytest.param(1, None, "token2", id="one-token-band2-end+1"),
+    pytest.param(1, None, "token3", id="one-token-band3-end+1"),
+    pytest.param(1, None, "token4", id="one-token-band4-end+1"),
+    pytest.param(1, None, "token5", id="one-token-band5-end+1"),
     pytest.param(0, None, "strided2", id="strided-band2-end"),
     pytest.param(1, None, "strided2", id="strided-band2-end+1"),
     pytest.param(0, None, "strided3", id="strided-band3-end"),
@@ -2573,7 +2582,7 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 # The modules that warm rows in L2, by role: the mid and the extra-long
 # forward (row blocks of packed rows; one row past the start of their
 # ``STRIDED_FORWARD_BANDS`` band, where the one-head layouts with packed rows
-# run the pipelined forward, which warms rows as the mid forward does), the
+# run the forward of that row count's ``FORWARD_BANDS`` band), the
 # row-claims mid backward (sm_100a and sm_103a: thread 0 warms the next block
 # of packed rows) and the claimed backward (on sm_100a and sm_103a a CTA's
 # next block, with a bulk prefetch per tensor where the rows are packed; on

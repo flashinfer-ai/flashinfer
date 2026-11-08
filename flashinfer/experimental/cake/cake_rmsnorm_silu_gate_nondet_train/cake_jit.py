@@ -44,7 +44,9 @@ vary in its last bits from run to run).
 a module may be delivered for more architectures than route it (every
 forward module of this package's own kernels is delivered for every
 architecture, so a new cut between them is a host-plan change; the pipelined
-forwards are delivered where the deterministic package's are).
+forwards are delivered where they are routed: the deterministic package's
+forward program on sm_100a and sm_103a, its program of packed rows on
+sm_107a).
 :func:`module_for_rows` picks a call's module from the rows, the device's SM
 count and the layout of the inputs: the forward of packed rows (``x`` and
 ``z`` hold row ``n`` at element ``128 n``, fewer than ``PACKED_ROWS`` rows)
@@ -68,17 +70,18 @@ a wave later in L2), the long forward (256-thread CTAs walking 32-row
 blocks) and the extra-long forward (the long forward whose thread 0 also
 warms the CTA's next block in L2); and the pipelined forwards, this
 package's copies of the deterministic package's forward programs (the same
-builds of its kernel file under this package's names, routed where they are
-measured faster than this package's own): 128-thread CTAs walking 16-row
-blocks, each thread loading its row of the CTA's next block into registers
-while it computes the current one, with the mid forward's L2 prefetches, one
-CTA per block below 8192 rows per SM (``fwd_pipe``; on sm_107a with four sum
-chains, ``rsqrt.approx.ftz`` and ``w`` loaded behind the first block's loads,
-and ``fwd_pipe_packed``, the same for packed rows with one 32-byte store per
-lane and the same bits).  Each program's arithmetic is fixed; the
+builds of its kernel file under this package's names, routed where they make
+the training step, two forwards and the backward, faster than this package's
+own): 128-thread CTAs walking 16-row blocks, each thread loading its row of
+the CTA's next block into registers while it computes the current one, with
+the mid forward's L2 prefetches and the L2 ``evict_first`` policy on the
+loads of ``x`` and ``z``, one CTA per block below 8192 rows per SM
+(``fwd_pipe`` on sm_100a and sm_103a; on sm_107a ``fwd_pipe_packed``, for
+packed rows, with four sum chains, ``rsqrt.approx.ftz``, ``w`` loaded behind
+the first block's loads and one 32-byte store per lane).  Each program's arithmetic is fixed; the
 programs associate a row's sum of squares differently (the tiny and the short
 forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
-sm_107a pipelined forwards: four 4-term chains of 8 lanes added in pairs, then
+sm_107a pipelined forward: four 4-term chains of 8 lanes added in pairs, then
 folded by 1, 2, 4; the others: 16-term chains of 8 lanes folded by 1, 2, 4),
 so ``y``'s bits can differ between the programs, and so between the bands of one architecture, while
 each program gives the same bits for the same inputs on the same device.
@@ -573,72 +576,15 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd_pipe",
     },
-    # The sm_107a pipelined forward: the deterministic package's sm_107a
-    # forward program, the schedule above with the sum of squares as four FMA
-    # chains, rsqrt.approx.ftz and w loaded behind the first block's loads
-    # (build {"min_blocks": 6, "packed_rows": 0, "prefetch_ahead": 1,
-    # "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width": 128, "sum_pairs": 1,
-    # "threads": 128, "w_late": 1}); FORWARD_BANDS gives it its rows.
-    "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "z"],
-            ["buffer", "w"],
-            ["buffer", "y"],
-            ["parameter", "rows"],
-            ["parameter", "heads"],
-            ["parameter", "x_tok"],
-            ["parameter", "x_head"],
-            ["parameter", "z_tok"],
-            ["parameter", "z_head"],
-            ["parameter", "eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "ctas_per_sm": 6,
-            "kind": "persistent_row_blocks",
-            "max_blocks_per_cta": 2,
-            "persistent_from_rows_per_sm": 8192,
-            "rows_per_block": 16,
-        },
-        "kernel": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
-        "logical": {
-            "eps": "eps",
-            "heads": "heads",
-            "rows": "rows",
-            "w": "w",
-            "x": "x",
-            "x_head": "x_head",
-            "x_tok": "x_tok",
-            "y": "y",
-            "z": "z",
-            "z_head": "z_head",
-            "z_tok": "z_tok",
-        },
-        "role": "fwd_pipe",
-    },
     # The sm_107a pipelined forward of packed rows (x and z hold row n at
     # element 128 n, fewer than PACKED_ROWS rows): the deterministic package's
-    # sm_107a forward of packed rows, the program above with each row's offset
-    # taken from its index alone and one 32-byte store per lane, the same bits
-    # (build {"min_blocks": 6, "packed_rows": 1, "prefetch_ahead": 1,
-    # "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width": 256, "sum_pairs": 1,
-    # "threads": 128, "w_late": 1}); FORWARD_BANDS gives it its rows.
+    # sm_107a forward of packed rows, the schedule above with the sum of
+    # squares as four FMA chains, rsqrt.approx.ftz, w loaded behind the first
+    # block's loads, each row's offset taken from its index alone and one
+    # 32-byte store per lane (build {"min_blocks": 6, "packed_rows": 1,
+    # "prefetch_ahead": 1, "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width":
+    # 256, "sum_pairs": 1, "threads": 128, "w_late": 1}); FORWARD_BANDS gives
+    # it its rows.
     "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9": {
         "arches": [
             "sm_107a",
@@ -1733,7 +1679,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "fwd_pipe": "cake_rmsnorm_silu_gate_train_54ac9135902000a8eead",
         "fwd_pipe_packed": "cake_rmsnorm_silu_gate_train_8a371a49c065b60c88a9",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
         "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
@@ -1750,21 +1695,31 @@ ROUTES: dict[str, dict[str, str]] = {
 # packed rows: ``(last, role)`` bands in increasing ``last`` (``None``: no
 # end); a call of ``rows`` rows on a device of ``sm_count`` SMs runs the
 # module of the first band's routed ``role`` with ``rows <= last *
-# sm_count``.  The cuts are the measured fastest program at each rows per SM
-# (CUPTI, cold L2), the pipelined forwards (the deterministic package's
-# forward programs) among them: the tiny forward up to 85 rows per SM on
-# sm_103a and 60 on sm_107a, then the pipelined forward (on sm_103a the mid
-# forward from 6001 to 8192 rows per SM, where the pipelined forward still
-# launches a CTA per block); on sm_100a the tiny forward up to 38 rows per
-# SM, where beside a kernel holding 16 SMs it still ends no later than the
-# deterministic package's forward (from 39 rows per SM, beside 16 CTAs of 1024
-# threads with the max-shared carveout, it ends up to 2 microseconds later),
-# then the pipelined forward, which is that forward.  Host plan only: a new
-# cut needs no new program.
+# sm_count``.  On sm_100a and sm_107a the cuts are the program that makes the
+# checkpointed training step fastest at each rows per SM (two forwards and the
+# backward, of a BF16 and of an FP32 weight gradient; CUPTI, cold L2): the
+# pipelined forwards load ``x`` and ``z`` with the L2 ``evict_first``
+# policy, so where the rows fit in L2 the step's later kernels read them
+# from memory again and this package's own forwards make the step faster,
+# though the pipelined forward alone is faster.  On sm_103a the cuts are the
+# fastest forward alone (CUPTI, cold L2): the pipelined forward past the
+# tiny forward, but the mid forward from 6001 to 8192 rows per SM, where the
+# pipelined forward still launches a CTA per block.  The tiny forward ends
+# where beside a kernel holding 16 SMs it still ends no later than the
+# deterministic package's forward: 38 rows per SM on sm_100a (from 39,
+# beside 16 CTAs of 1024 threads with the max-shared carveout, it ends up to
+# 2 microseconds later; the pipelined forward, which is that forward, runs
+# from there up to 85), 85 on sm_103a and 65 on sm_107a.  Host plan only: a
+# new cut needs no new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (38, "fwd_tiny"),
-        (None, "fwd_pipe"),
+        (85, "fwd_pipe"),
+        (160, "fwd_mid"),
+        (400, "fwd_long"),
+        (520, "fwd_xlong"),
+        (6500, "fwd_pipe"),
+        (None, "fwd_mid"),
     ),
     "sm_103a": (
         (85, "fwd_tiny"),
@@ -1773,24 +1728,28 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
         (None, "fwd_pipe"),
     ),
     "sm_107a": (
-        (60, "fwd_tiny"),
-        (None, "fwd_pipe_packed"),
+        (65, "fwd_tiny"),
+        (175, "fwd_mid"),
+        (350, "fwd_xlong"),
+        (10000, "fwd_pipe_packed"),
+        (None, "fwd_mid"),
     ),
 }
 
 # The forward bands of a call whose ``x`` or ``z`` rows are not packed (the
 # tiny forward reads packed rows only), or of packed rows from
 # ``PACKED_ROWS`` on, as ``FORWARD_BANDS``.  The cuts are the measured fastest
-# program at each rows per SM (CUPTI, cold L2), the pipelined forward up to 100
-# rows per SM among them, except the short forward's end: 12 rows per SM on
-# sm_100a and sm_103a, where its grid of one 16-row block a CTA has at most as
-# many CTAs as the SMs less 16 (from 64 SMs), and 59 on sm_107a, where it fits
-# one wave of 4 CTAs per SM on all SMs but 16 (from 205 SMs), so beside a
-# kernel holding 16 SMs it ends no later than the plain forward.
+# program at each rows per SM (CUPTI, cold L2), except the short forward's
+# end: 12 rows per SM on sm_100a and sm_103a, where its grid of one 16-row
+# block a CTA has at most as many CTAs as the SMs less 16 (from 64 SMs), and
+# 59 on sm_107a, where it fits one wave of 4 CTAs per SM on all SMs but 16
+# (from 205 SMs), so beside a kernel holding 16 SMs it ends no later than the
+# plain forward.  On sm_100a and sm_107a no band runs the pipelined forward,
+# which makes the training step slower at every rows per SM measured; on
+# sm_103a it runs up to 100 rows per SM.
 STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "fwd_short"),
-        (100, "fwd_pipe"),
         (140, "fwd_mid"),
         (400, "fwd_long"),
         (1000, "fwd_xlong"),
@@ -1805,7 +1764,6 @@ STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
     "sm_107a": (
         (59, "fwd_short"),
-        (100, "fwd_pipe"),
         (200, "fwd_mid"),
         (520, "fwd_xlong"),
         (None, "fwd_mid"),

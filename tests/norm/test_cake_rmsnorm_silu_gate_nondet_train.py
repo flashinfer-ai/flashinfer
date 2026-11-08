@@ -1817,12 +1817,18 @@ def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
 # The forward bands of each architecture for packed rows: (last rows per SM,
 # role) in increasing rows per SM (``None``: no end), a call of ``rows`` rows on
 # ``sm_count`` SMs running the first band's role with ``rows <= last *
-# sm_count`` (the measured fastest program at each rows per SM).  The
+# sm_count`` (on sm_100a and sm_107a the program of the fastest checkpointed
+# training step at each rows per SM, on sm_103a the fastest forward).  The
 # forward's band roles; the backward's are ``BACKWARD_BANDS``.
 FORWARD_BANDS = {
     "sm_100a": (
         (38, "fwd_tiny"),
-        (None, "fwd_pipe"),
+        (85, "fwd_pipe"),
+        (160, "fwd_mid"),
+        (400, "fwd_long"),
+        (520, "fwd_xlong"),
+        (6500, "fwd_pipe"),
+        (None, "fwd_mid"),
     ),
     "sm_103a": (
         (85, "fwd_tiny"),
@@ -1831,8 +1837,11 @@ FORWARD_BANDS = {
         (None, "fwd_pipe"),
     ),
     "sm_107a": (
-        (60, "fwd_tiny"),
-        (None, "fwd_pipe_packed"),
+        (65, "fwd_tiny"),
+        (175, "fwd_mid"),
+        (350, "fwd_xlong"),
+        (10000, "fwd_pipe_packed"),
+        (None, "fwd_mid"),
     ),
 }
 # The forward bands of inputs whose rows are not packed (the tiny forward
@@ -1841,7 +1850,6 @@ FORWARD_BANDS = {
 STRIDED_FORWARD_BANDS = {
     "sm_100a": (
         (12, "fwd_short"),
-        (100, "fwd_pipe"),
         (140, "fwd_mid"),
         (400, "fwd_long"),
         (1000, "fwd_xlong"),
@@ -1856,7 +1864,6 @@ STRIDED_FORWARD_BANDS = {
     ),
     "sm_107a": (
         (59, "fwd_short"),
-        (100, "fwd_pipe"),
         (200, "fwd_mid"),
         (520, "fwd_xlong"),
         (None, "fwd_mid"),
@@ -2032,24 +2039,33 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
                 got = loader.module_for_rows(arch, role, rows, sm_count, packed=False)
                 assert got == want, (arch, role, rows, "strided")
     # the forward on sm_100a: packed rows the tiny forward up to 38 rows per
-    # SM, the pipelined forward past it; other layouts the short forward up to
-    # 12 rows per SM, the pipelined forward up to 100, the mid forward up to
-    # 140, the long forward up to 400, the extra-long forward up to 1000, the
-    # mid forward past it
+    # SM, the pipelined forward up to 85, the mid forward up to 160, the long
+    # forward up to 400, the extra-long forward up to 520, the pipelined
+    # forward up to 6500, the mid forward past it; other layouts the short
+    # forward up to 12 rows per SM, the mid forward up to 140, the long
+    # forward up to 400, the extra-long forward up to 1000, the mid forward
+    # past it
     routes = loader.ROUTES["sm_100a"]
     for rows, packed, strided in (
         (1, "fwd_tiny", "fwd_short"),
         (12 * sm_count, "fwd_tiny", "fwd_short"),
-        (12 * sm_count + 1, "fwd_tiny", "fwd_pipe"),
-        (38 * sm_count, "fwd_tiny", "fwd_pipe"),
-        (38 * sm_count + 1, "fwd_pipe", "fwd_pipe"),
-        (100 * sm_count, "fwd_pipe", "fwd_pipe"),
-        (100 * sm_count + 1, "fwd_pipe", "fwd_mid"),
-        (140 * sm_count + 1, "fwd_pipe", "fwd_long"),
-        (400 * sm_count + 1, "fwd_pipe", "fwd_xlong"),
+        (12 * sm_count + 1, "fwd_tiny", "fwd_mid"),
+        (38 * sm_count, "fwd_tiny", "fwd_mid"),
+        (38 * sm_count + 1, "fwd_pipe", "fwd_mid"),
+        (85 * sm_count, "fwd_pipe", "fwd_mid"),
+        (85 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (140 * sm_count + 1, "fwd_mid", "fwd_long"),
+        (160 * sm_count, "fwd_mid", "fwd_long"),
+        (160 * sm_count + 1, "fwd_long", "fwd_long"),
+        (400 * sm_count, "fwd_long", "fwd_long"),
+        (400 * sm_count + 1, "fwd_xlong", "fwd_xlong"),
+        (520 * sm_count, "fwd_xlong", "fwd_xlong"),
+        (520 * sm_count + 1, "fwd_pipe", "fwd_xlong"),
         (1000 * sm_count, "fwd_pipe", "fwd_xlong"),
         (1000 * sm_count + 1, "fwd_pipe", "fwd_mid"),
-        (PACKED_ROWS - 1, "fwd_pipe", "fwd_mid"),
+        (6500 * sm_count, "fwd_pipe", "fwd_mid"),
+        (6500 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (PACKED_ROWS - 1, "fwd_mid", "fwd_mid"),
         (PACKED_ROWS, "fwd_mid", "fwd_mid"),
         (2**31 - 1, "fwd_mid", "fwd_mid"),
     ):
@@ -2086,23 +2102,29 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
     assert "fwd_long" not in routes
-    # the forward on sm_107a: packed rows the tiny forward up to 60 rows per
-    # SM, the pipelined forward of packed rows past it; other layouts the
-    # short forward up to 59, the pipelined forward up to 100, the mid forward
-    # up to 200, the extra-long forward up to 520, the mid forward past it
-    # (sm_107a routes no long forward)
+    # the forward on sm_107a: packed rows the tiny forward up to 65 rows per
+    # SM, the mid forward up to 175, the extra-long forward up to 350, the
+    # pipelined forward of packed rows up to 10000, the mid forward past it;
+    # other layouts the short forward up to 59, the mid forward up to 200, the
+    # extra-long forward up to 520, the mid forward past it (sm_107a routes
+    # neither a long forward nor the pipelined forward of other layouts)
     routes = loader.ROUTES["sm_107a"]
     for rows, packed, strided in (
         (1, "fwd_tiny", "fwd_short"),
         (10 * sm_count + 1, "fwd_tiny", "fwd_short"),
         (59 * sm_count, "fwd_tiny", "fwd_short"),
-        (59 * sm_count + 1, "fwd_tiny", "fwd_pipe"),
-        (60 * sm_count, "fwd_tiny", "fwd_pipe"),
-        (60 * sm_count + 1, "fwd_pipe_packed", "fwd_pipe"),
-        (100 * sm_count + 1, "fwd_pipe_packed", "fwd_mid"),
-        (200 * sm_count + 1, "fwd_pipe_packed", "fwd_xlong"),
+        (59 * sm_count + 1, "fwd_tiny", "fwd_mid"),
+        (65 * sm_count, "fwd_tiny", "fwd_mid"),
+        (65 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (175 * sm_count, "fwd_mid", "fwd_mid"),
+        (175 * sm_count + 1, "fwd_xlong", "fwd_mid"),
+        (200 * sm_count + 1, "fwd_xlong", "fwd_xlong"),
+        (350 * sm_count, "fwd_xlong", "fwd_xlong"),
+        (350 * sm_count + 1, "fwd_pipe_packed", "fwd_xlong"),
         (520 * sm_count + 1, "fwd_pipe_packed", "fwd_mid"),
-        (PACKED_ROWS - 1, "fwd_pipe_packed", "fwd_mid"),
+        (10000 * sm_count, "fwd_pipe_packed", "fwd_mid"),
+        (10000 * sm_count + 1, "fwd_mid", "fwd_mid"),
+        (PACKED_ROWS - 1, "fwd_mid", "fwd_mid"),
         (PACKED_ROWS, "fwd_mid", "fwd_mid"),
         (2**31 - 1, "fwd_mid", "fwd_mid"),
     ):
@@ -2110,7 +2132,7 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         assert got == routes[packed], (rows, packed)
         got = loader.module_for_rows("sm_107a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
-    assert "fwd_long" not in routes
+    assert "fwd_long" not in routes and "fwd_pipe" not in routes
 
 
 def _check_backward_bands(arch: str, sm_count: int) -> None:
@@ -2243,7 +2265,8 @@ LONG_FORWARD_GRIDS = [
     (32 * 444, 148, 444),  # a block per CTA of one wave
     (32 * 444 * 6, 148, 444),  # one wave, 6 blocks a CTA
     (32 * 444 * 6 + 1, 148, 888),  # a block more: two waves
-    (140 * 148 + 1, 148, 444),  # B200 long band's first row: 648 blocks, 1 wave
+    (140 * 148 + 1, 148, 444),  # B200 strided long band's first row: 648 blocks
+    (160 * 148 + 1, 148, 444),  # B200 packed long band's first row: 741 blocks
     (400 * 148, 148, 444),  # its last row: 1850 blocks, 1 wave
     (2400 * 148, 148, 2220),  # 11100 blocks, 5 waves
     (32737 * 48, 148, 8436),  # 49106 blocks, 19 waves
@@ -2333,17 +2356,20 @@ MID_FORWARD_GRIDS = [
     (16 * 888, 148, 888),  # a block per CTA of one wave
     (16 * 888 * 2, 148, 888),  # one wave, 2 blocks a CTA
     (16 * 888 * 2 + 1, 148, 1776),  # a block more: two waves
-    (12 * 148 + 1, 148, 112),  # 112 blocks, fewer than a wave
-    (100 * 148 + 1, 148, 888),  # B200 first mid band's first row: 926 blocks
-    (140 * 148, 148, 888),  # its last row: 1295 blocks, 1 wave
+    (12 * 148 + 1, 148, 112),  # B200 strided mid band's first row: 112 blocks
+    (85 * 148 + 1, 148, 787),  # B200 packed mid band's first row: 787 blocks
+    (100 * 148 + 1, 148, 888),  # 926 blocks, one wave
+    (140 * 148, 148, 888),  # B200 strided mid band's last row: 1295 blocks
+    (160 * 148, 148, 888),  # B200 packed mid band's last row: 1480 blocks
     (976 * 148, 148, 5328),  # 9028 blocks, 6 waves
     (
         1000 * 148 + 1,
         148,
         5328,
-    ),  # B200 second mid band's first row: 9251 blocks, 6 waves
+    ),  # B200 last strided mid band's first row: 9251 blocks, 6 waves
     (2400 * 148 - 1, 148, 11544),  # 22200 blocks, 13 waves
     (4097 * 48, 148, 6216),  # 12291 blocks, 7 waves of 888
+    (6500 * 148 + 1, 148, 30192),  # B200 last packed mid band: 34 waves
     (250 * 152, 152, 1824),  # GB300 first mid band's last row: 2375 blocks, 2 waves
     (
         550 * 152 + 1,
@@ -2352,16 +2378,19 @@ MID_FORWARD_GRIDS = [
     ),  # GB300 second mid band's first row: 5226 blocks, 3 waves
     (976 * 152, 152, 5472),  # 9272 blocks, 6 waves
     (4097 * 48, 152, 6384),  # 12291 blocks, 7 waves of 912
-    (59 * 212 + 1, 212, 782),  # 782 blocks, fewer than a wave
-    (100 * 212 + 1, 212, 1272),  # R200 first mid band's first row: 1326 blocks
-    (200 * 212, 212, 2544),  # its last row: 2650 blocks, 2 waves
+    (59 * 212 + 1, 212, 782),  # R200 strided mid band's first row: 782 blocks
+    (65 * 212 + 1, 212, 862),  # R200 packed mid band's first row: 862 blocks
+    (100 * 212 + 1, 212, 1272),  # 1326 blocks, one wave
+    (175 * 212, 212, 1272),  # R200 packed mid band's last row: 2319 blocks
+    (200 * 212, 212, 2544),  # R200 strided mid band's last row: 2 waves
     (
         520 * 212 + 1,
         212,
         3816,
-    ),  # R200 second mid band's first row: 6891 blocks, 3 waves
+    ),  # R200 last strided mid band's first row: 6891 blocks, 3 waves
     (800 * 212 + 1, 212, 6360),  # 10601 blocks, 5 waves
     (1740 * 212, 212, 12720),  # 23055 blocks, 10 waves
+    (10000 * 212 + 1, 212, 67416),  # R200 last packed mid band: 53 waves
     (2**31 - 1, 148, 67109712),  # 2**27 blocks, 75574 waves
 ]
 
@@ -2401,16 +2430,20 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
 # CTAs walk at most 2 blocks, never more CTAs than blocks.
 PIPE_FORWARD_GRIDS = [
     (1, 148, 1),
-    (38 * 148 + 1, 148, 352),  # B200 packed band's first row: 352 blocks
+    (38 * 148 + 1, 148, 352),  # B200 first pipelined band's first row
+    (85 * 148, 148, 787),  # its last row: 787 blocks
+    (520 * 148 + 1, 148, 4811),  # B200 second pipelined band's first row
+    (6500 * 148, 148, 60125),  # its last row: 60125 blocks
     (8192 * 148 - 1, 148, 75776),  # below 8192 rows per SM: a CTA a block
     (8192 * 148, 148, 38184),  # from 8192 rows per SM: 75776 blocks, 43 waves
     (32737 * 48, 148, 49728),  # 98211 blocks, 56 waves of 888
     (85 * 152 + 1, 152, 808),  # GB300 packed band's first row: 808 blocks
     (6000 * 152, 152, 57000),  # its last row: 57000 blocks
     (8192 * 152 + 1, 152, 39216),  # GB300 last band's first row: 43 waves
-    (60 * 212 + 1, 212, 796),  # R200 packed band's first row: 796 blocks
+    (350 * 212 + 1, 212, 4638),  # R200 pipelined band's first row: 4638 blocks
     (32737 * 48, 212, 98211),  # 98211 blocks, below 8192 rows per SM
     (8192 * 212, 212, 54696),  # 108544 blocks, 43 waves of 1272
+    (10000 * 212, 212, 67416),  # R200 pipelined band's last row: 53 waves
     (2**24 - 1, 212, 525336),  # the most packed rows: 413 waves
 ]
 
@@ -2435,7 +2468,7 @@ def test_pipelined_forward_grid_is_a_block_a_cta_then_whole_waves(rows, sm_count
             }
             assert record["launch"]["block"] == (128, 1, 1)
             records.append(record)
-    assert len(records) == 4
+    assert len(records) == 3
     grid = loader.launch_grid(records[0], rows=rows, sm_count=sm_count)
     for other in records[1:]:
         assert loader.launch_grid(other, rows=rows, sm_count=sm_count) == grid

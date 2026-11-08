@@ -22,7 +22,7 @@ of ``FORWARD_BANDS`` where ``x`` and ``z`` hold packed rows (row ``n`` at
 element ``128 n``, fewer than ``PACKED_ROWS`` rows), else of
 ``STRIDED_FORWARD_BANDS``.  The plain forward launches a grid of independent
 CTAs, one 64-thread CTA per block of 8 rows.  Packed rows up to 38 rows per SM
-on SM100, 85 on SM103 and 60 on SM107 run the tiny forward, one 128-thread CTA
+on SM100, 85 on SM103 and 65 on SM107 run the tiny forward, one 128-thread CTA
 per block of 8 rows.  Other layouts up to 12 rows per SM on SM100 and SM103
 (59 on SM107) run the short forward, one 256-thread CTA per block of 16 rows
 (with 64 SMs or more on SM100 and SM103, as with 148 or 152, fewer CTAs than
@@ -35,11 +35,15 @@ that each walk at most 2 blocks; the mid forward launches whole waves of 6
 CTAs per SM that each walk at most 2 blocks of 16 rows; the long and the
 extra-long forward launch whole waves of 3 CTAs per SM that each walk at most
 6 blocks of 32 rows.  Their bands past the tiny or the short forward's: packed
-rows run the pipelined forward (on SM107 its program of packed rows), but on
-SM103 from 6001 to 8192 rows per SM, where the mid forward runs; other layouts
-run the pipelined forward up to 100 rows per SM, then on SM100 the mid forward
-up to 140, the long forward up to 400, the extra-long forward up to 1000 and
-the mid forward past it; on SM103 the mid forward up to 250, the extra-long
+rows on SM100 run the pipelined forward up to 85 rows per SM, the mid forward
+up to 160, the long forward up to 400, the extra-long forward up to 520, the
+pipelined forward up to 6500 and the mid forward past it; on SM103 the
+pipelined forward, but from 6001 to 8192 rows per SM the mid forward; on SM107
+the mid forward up to 175, the extra-long forward up to 350, the pipelined
+forward of packed rows up to 10000 and the mid forward past it.  Other layouts
+on SM100 run the mid forward up to 140 rows per SM, the long forward up to
+400, the extra-long forward up to 1000 and the mid forward past it; on SM103
+the pipelined forward up to 100, the mid forward up to 250, the extra-long
 forward up to 550 and the mid forward past it; on SM107 the mid forward up to
 200, the extra-long forward up to 520 and the mid forward past it.
 
@@ -131,17 +135,21 @@ the gate columns of a wider projection), at the band's first and last rows
 per SM and at the token counts that give the module's CTA slots the fewest
 whole row blocks each past the previous band's end and the most up to its
 band's end, or four times the fewest in the last band, which has no end: the
-mid forward of the strided layout 11 and 44 blocks of 16 rows in its second
-band on SM100, 2 in its first band and 6 and 24 in its second on SM103 and
-SM107, of packed rows 63 and 85 on SM103; the long forward 2 and 4 blocks of
-32 rows on SM100; the extra-long forward 5 and 10 on SM100, 3 and 5 on SM103
-and SM107.  The pipelined forwards by the same bound, in each of their bands
+mid forward of the strided layout 1 block of 16 rows in its first band and 11
+and 44 in its second on SM100, 2 in its first band and 6 and 24 in its second
+on SM103, 1 and 2 in its first band and 6 and 24 in its second on SM107, of
+packed rows 1 in its first band and 68 and 272 in its second on SM100, 63 and
+85 on SM103, 1 in its first band and 105 and 420 in its second on SM107; the
+long forward 2 and 4 blocks of 32 rows on SM100; the extra-long forward of
+the strided layout 5 and 10 on SM100, 3 and 5 on SM103 and SM107, of packed
+rows 5 on SM100 and 2 and 3 on SM107.  The pipelined forwards by the same
+bound, in each of their bands
 at its first and last rows per SM and at the deterministic package's probes
 the band holds: 85 blocks of 16 rows per slot (the most below 8192 rows per
 SM, where a CTA runs one block), 86 (the fewest whole waves from there) and
 344.  The forwards of the first band, the tiny forward of packed rows (at 1,
 12, 31 and 38 rows per SM on SM100, 1, 12, 41, 81 and 85 on SM103, 1, 10, 30,
-43 and 60 on SM107) and
+43 and 65 on SM107) and
 the short forward of the strided layout (at 1 and 12 rows per SM on SM100 and
 SM103, at 1, 10, 30 and 59 on SM107), each up to the end of its band, keep
 their speed beside the one-thread kernel, start beside the all-SM kernel with
@@ -1085,13 +1093,15 @@ def test_row_claims_backward_band_edges_slow_in_proportion_to_the_sms_held(
 # "band_last"; the last band has no last), at the fewest whole blocks per slot
 # past the previous band's end ("first") and at the most up to the band's end,
 # or four times "first" in the last band, which has no end ("last"): the mid
-# forward of other layouts 11 and 44 blocks per slot in its second band on
-# SM100, 2 in its first band (its fewest and most) and 6 and 24 in its second
-# on SM103 and SM107, of packed rows 63 and 85 on SM103; the long forward 2 and
-# 4 on SM100; the extra-long forward 5 and 10 on SM100, 3 and 5 on SM103 and
-# SM107.  A probe outside the band skips (the mid forward's first band of
-# other layouts on SM100, 101 to 140 rows per SM, holds no whole blocks per
-# slot).
+# forward of other layouts 1 block per slot in its first band (its fewest
+# and most) and 11 and 44 in its second on SM100, 2 in its first band and 6
+# and 24 in its second on SM103, 1 and 2 in its first band and 6 and 24 in its
+# second on SM107, of packed rows 1 in its first band and 68 and 272 in its
+# second on SM100, 63 and 85 on SM103, 1 in its first band and 105 and 420 in
+# its second on SM107; the long forward 2 and 4 on SM100; the extra-long
+# forward of other layouts 5 and 10 on SM100, 3 and 5 on SM103 and SM107, of
+# packed rows 5 on SM100 and 2 and 3 on SM107.  A probe outside the band
+# skips, and so does a last probe that is the band's first.
 FORWARD_EDGES = ("band_first", "first", "last", "band_last")
 FORWARD_LAYOUTS = ("packed", "strided")
 
@@ -1345,7 +1355,7 @@ def test_pipelined_forward_slows_in_proportion_to_the_sms_held(
 # projection).  The rows per SM of their token counts on each architecture
 # (one row per SM, rows between, and the end of the band, the largest, up to
 # which the architecture runs the module: the tiny forward 38 on sm_100a, 85
-# on sm_103a and 60 on sm_107a; the short forward 12 on sm_100a and sm_103a
+# on sm_103a and 65 on sm_107a; the short forward 12 on sm_100a and sm_103a
 # and 59 on sm_107a), and the side kernels of the item 1 test beside
 # them, the issue's three with the default carveout and 16 CTAs of 1024
 # threads with the max-shared carveout.
@@ -1353,7 +1363,7 @@ FIRST_FORWARD_ROWS_PER_SM = {
     "fwd_tiny": {
         "sm_100a": (1, 12, 31, 38),
         "sm_103a": (1, 12, 41, 81, 85),
-        "sm_107a": (1, 10, 30, 43, 60),
+        "sm_107a": (1, 10, 30, 43, 65),
     },
     "fwd_short": {
         "sm_100a": (1, 12),

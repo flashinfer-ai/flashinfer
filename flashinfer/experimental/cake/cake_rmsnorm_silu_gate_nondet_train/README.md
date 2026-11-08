@@ -177,7 +177,7 @@ programs write `dx` and `dz` with the deterministic backward's row arithmetic.
 The forward programs associate a row's sum of squares differently: the tiny
 and the short forward add 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8,
 the other forward programs 16-term chains of 8 lanes folded by XOR shuffles
-1, 2, 4 (the pipelined forwards on `sm_107a` as four interleaved chains, as
+1, 2, 4 (the pipelined forward on `sm_107a` as four interleaved chains, as
 the deterministic package's forward does there).  So `y`'s bits can differ
 between the programs, and so between the forward bands of one architecture;
 each program repeats `y` bit for bit for the same inputs on the same device.
@@ -190,8 +190,8 @@ each program repeats `y` bit for bit for the same inputs on the same device.
 | `fwd_mid` | whole waves of 6 CTAs per SM (as many waves as the rows need), each CTA at most 2 blocks of 16 rows | its forward bands |
 | `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
 | `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
-| `fwd_pipe` | pipelined forward: this package's copy of the deterministic package's forward program of the architecture (the same build and grid, so its bits): 128 threads, 8 lanes a row, one CTA per 16-row block below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2 blocks, a thread loading its row of the CTA's next block while it computes the current one | its forward bands |
-| `fwd_pipe_packed` (`sm_107a`) | the pipelined forward of packed rows (the deterministic package's packed-rows program on `sm_107a`: the same operations in the same order, one 32-byte store a lane) | its band of `FORWARD_BANDS` (packed rows, fewer than `PACKED_ROWS`) |
+| `fwd_pipe` (`sm_100a`, `sm_103a`) | pipelined forward: this package's copy of the deterministic package's forward program (the same build and grid, so its bits): 128 threads, 8 lanes a row, one CTA per 16-row block below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2 blocks, a thread loading its row of the CTA's next block while it computes the current one, `x` and `z` loaded with the L2 `evict_first` policy | its forward bands |
+| `fwd_pipe_packed` (`sm_107a`) | the pipelined forward of packed rows (the deterministic package's packed-rows program on `sm_107a`: the pipelined forward's schedule with four sum chains, `rsqrt.approx.ftz` and one 32-byte store a lane) | its band of `FORWARD_BANDS` (packed rows, fewer than `PACKED_ROWS`) |
 | `bwd_bf16_short` | short backward (a BF16 weight gradient; every architecture): one cluster of 16 CTAs of 256 threads, 16 lanes a row, CTA `r` running the 16-row blocks `r`, `r + 16`, ... with the row-claims backward's row arithmetic; CTA `r` adds every CTA's FP32 partials of the columns `8r` .. `8r + 7` in rank order in FP64 (a fixed order), no workspace | the rows of its band (at most 256) |
 | `bwd_bf16_t512` (`sm_100a`, `sm_107a`), `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its band (at most 512) |
 | `bwd_f32` (every architecture), `bwd_bf16` (`sm_107a`) | static backward: 128 threads, 8-row blocks, CTA `b` runs chunks `b`, `b + grid`, ... (the same bits at any grid); on `sm_100a` and `sm_103a` 4 copies of the weight-gradient windows and no prefetch, on `sm_107a` 4 copies plus occupancy words (the last CTA reads only the windows some CTA added into) | its backward band (the call role `bwd_bf16` has no program on `sm_100a` and `sm_103a`: no BF16 band routes a static backward there) |
@@ -210,7 +210,7 @@ the 20 hex digits shown):
 | `fwd_mid` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` | `cf7a87977aaad1a9822f` |
 | `fwd_long` | `c6151f64f22ae65a48eb` | (not routed) | (not routed) |
 | `fwd_xlong` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` | `83fe9e25ce0d01cc3ab1` |
-| `fwd_pipe` | `8a905176e52247f528ae` | `8a905176e52247f528ae` | `54ac9135902000a8eead` |
+| `fwd_pipe` | `8a905176e52247f528ae` | `8a905176e52247f528ae` | (none) |
 | `fwd_pipe_packed` | (none) | (none) | `8a371a49c065b60c88a9` |
 | `bwd_bf16_short` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` | `cb597a0bebd6145e2024` |
 | `bwd_bf16_t512` | `f6a3420d9aaa20a99e8d` | (none) | `f6a3420d9aaa20a99e8d` |
@@ -226,16 +226,22 @@ The forward bands (rows per SM: a call of `rows` rows on a device of `SMs`
 SMs runs the first band with `rows <= last * SMs`): `FORWARD_BANDS` where `x`
 and `z` hold packed rows (row `n` at element `128 n`, as contiguous
 `[T, H, 128]` and `[T * H, 128]` inputs do) and there are fewer than
-`PACKED_ROWS` (2^24) rows, `STRIDED_FORWARD_BANDS` otherwise.  Each band runs
-the program measured fastest there; past the tiny forward's band the pipelined
-forward is the deterministic package's forward, so `y` there is that
-package's bits:
+`PACKED_ROWS` (2^24) rows, `STRIDED_FORWARD_BANDS` otherwise.  On `sm_100a`
+and `sm_107a` each band of packed rows runs the program that makes the
+checkpointed training step (two forwards and the backward) fastest there; the
+pipelined forward loads `x` and `z` with the L2 `evict_first` policy, so
+where the rows fit in L2 it is faster alone but makes the step slower.  The
+other bands run the program whose forward alone is fastest, but the tiny and
+the short forward end where beside a kernel holding 16 SMs they still end no
+later than the deterministic package's forward.  The pipelined forward is the
+deterministic package's forward, so `y` in its bands is that package's
+bits:
 
 | architecture | packed rows (rows per SM) | other layouts (rows per SM) |
 | --- | --- | --- |
-| `sm_100a` | 1-38 `tiny`, past 38 `pipe` | 1-12 `short`, 13-100 `pipe`, 101-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
+| `sm_100a` | 1-38 `tiny`, 39-85 `pipe`, 86-160 `mid`, 161-400 `long`, 401-520 `xlong`, 521-6500 `pipe`, past 6500 `mid` | 1-12 `short`, 13-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
 | `sm_103a` | 1-85 `tiny`, 86-6000 `pipe`, 6001-8192 `mid`, past 8192 `pipe` | 1-12 `short`, 13-100 `pipe`, 101-250 `mid`, 251-550 `xlong`, past 550 `mid` |
-| `sm_107a` | 1-60 `tiny`, past 60 `pipe_packed` | 1-59 `short`, 60-100 `pipe`, 101-200 `mid`, 201-520 `xlong`, past 520 `mid` |
+| `sm_107a` | 1-65 `tiny`, 66-175 `mid`, 176-350 `xlong`, 351-10000 `pipe_packed`, past 10000 `mid` | 1-59 `short`, 60-200 `mid`, 201-520 `xlong`, past 520 `mid` |
 
 The backward bands (`BACKWARD_BANDS`, in order: a call of `rows` rows on a
 device of `SMs` SMs runs the first band it fits, a small-row band while

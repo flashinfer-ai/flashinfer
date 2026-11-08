@@ -370,29 +370,36 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
 
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
-  of several modules chosen by bands of rows per SM, each band the module
-  measured fastest there: where ``x`` and ``z`` hold packed rows (row ``n``
-  at element ``128 n``, as contiguous inputs do; fewer than 2^24 rows) a tiny
-  forward up to 38 rows per SM on SM100, 85 on SM103 and 60 on SM107, one
-  128-thread CTA per 8-row block; for other layouts a short forward up to 12
-  rows per SM on SM100 and SM103 (59 on SM107), one CTA per 16-row block.
-  Past them the pipelined forward, this package's copy of the deterministic
-  package's forward (128 threads, one CTA per 16-row block below 8192 rows
-  per SM, from there whole waves of 6 CTAs per SM, each CTA at most 2
-  blocks), runs packed rows (on SM103 but from 6001 to 8192 rows per SM) and
-  other layouts up to 100 rows per SM.  Past 100 rows per SM other layouts
-  run the mid forward (whole waves of 6 CTAs per SM, each CTA at most 2
-  blocks of 16 rows), the long forward (whole waves of 3 CTAs per SM, each
-  CTA at most 6 blocks of 32 rows) or the extra-long forward (the long
-  forward's grid, also prefetching its next block): on SM100 mid up to 140,
-  long up to 400, extra-long up to 1000, mid past it; on SM103 mid up to 250,
-  extra-long up to 550, mid past it; on SM107 mid up to 200, extra-long up to
-  520, mid past it; the plain forward (one 64-thread CTA per 8-row block) is
+  of several modules chosen by bands of rows per SM: where ``x`` and ``z``
+  hold packed rows (row ``n`` at element ``128 n``, as contiguous inputs do;
+  fewer than 2^24 rows) a tiny forward up to 38 rows per SM on SM100, 85 on
+  SM103 and 65 on SM107, one 128-thread CTA per 8-row block; for other
+  layouts a short forward up to 12 rows per SM on SM100 and SM103 (59 on
+  SM107), one CTA per 16-row block.  Past them the bands run the mid forward
+  (whole waves of 6 CTAs per SM, each CTA at most 2 blocks of 16 rows), the
+  long forward (whole waves of 3 CTAs per SM, each CTA at most 6 blocks of
+  32 rows), the extra-long forward (the long forward's grid, also prefetching
+  its next block) or the pipelined forward, this package's copy of the
+  deterministic package's forward (128 threads, one CTA per 16-row block
+  below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA
+  at most 2 blocks; it loads ``x`` and ``z`` with the L2 ``evict_first``
+  policy).  Packed rows on SM100 and SM107 take the module that makes the
+  checkpointed training step (two forwards and the backward) fastest, since
+  where the rows fit in L2 the pipelined forward is faster alone but makes
+  the step slower: on SM100 pipelined up to 85, mid up to 160, long up to
+  400, extra-long up to 520, pipelined up to 6500, mid past it; on SM107 mid
+  up to 175, extra-long up to 350, pipelined up to 10000, mid past it.  The
+  other bands take the module whose forward alone is fastest: packed rows on
+  SM103 pipelined up to 6000, mid up to 8192, pipelined past it; other
+  layouts on SM100 mid up to 140, long up to 400, extra-long up to 1000, mid
+  past it; on SM103 pipelined up to 100, mid up to 250, extra-long up to
+  550, mid past it; on SM107 mid up to 200, extra-long up to 520, mid past
+  it; the plain forward (one 64-thread CTA per 8-row block) is
   in no band.  Each module's arithmetic is fixed, but the modules associate a
   row's sum of squares differently (the tiny and the short forward: 8-term
   FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
   16-term chains of 8 lanes folded by 1, 2, 4, on SM107 the pipelined
-  forwards as four interleaved chains), so ``y``'s bits can differ between
+  forward as four interleaved chains), so ``y``'s bits can differ between
   bands, and ``y`` repeats bit for bit for the same inputs on the same
   device.  Beside a kernel on another stream that holds ``k`` of the ``N``
   SMs, the pipelined, mid, long and extra-long forwards take at most ``N / (N

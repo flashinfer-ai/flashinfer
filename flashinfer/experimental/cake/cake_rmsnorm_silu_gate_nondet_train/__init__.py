@@ -140,35 +140,48 @@ Host design (the input layout rules are the deterministic package's):
   the device's SM count, the forward's by the bands of rows per SM of
   ``cake_jit.FORWARD_BANDS`` where ``x`` and ``z`` hold packed rows, row
   ``n`` at element ``128 n``, else of ``cake_jit.STRIDED_FORWARD_BANDS``): a
-  call runs the tiny, the short, the mid, the long or the extra-long
-  forward.  The plain forward (the call role ``fwd``: one 64-thread CTA per
-  block of 8 rows) is routed by no band; it stays in ``ROUTES`` because the
-  support query needs every role routed.  The tiny forward (packed rows, up
-  to 140 rows per SM on sm_100a, 120 on sm_103a and 65 on sm_107a) launches
-  one 128-thread CTA per block of 8 rows, with the short forward's
-  arithmetic, so the same ``y`` bits; the short forward (other layouts, up
-  to 12 rows per SM on sm_100a and sm_103a, 59 on sm_107a) launches one
-  256-thread CTA per block of 16 rows; the other forwards a grid whose CTA
-  ``b`` walks the blocks ``b``, ``b + grid``, ..., loading each next block
-  while it computes the current one, in the fewest whole waves that give no
-  CTA more than a few blocks (past one wave the CTAs are not persistent): the mid
-  forward (6 CTAs per SM, at most 2 blocks of 16 rows each, thread 0 warming
-  the CTA's next block and the first block of the CTA one wave later in L2
-  where x and z hold their rows packed: head stride 128 and token stride ``H
-  * 128``, which a ``[T, 1, 128]`` or ``[T, 128]`` input whose rows follow
-  one another meets, see ``_kernel_view``), the long forward (3 CTAs per SM,
-  at most 6 blocks of 32 rows each; sm_100a) and the extra-long forward (the
-  long forward whose thread 0 also warms the CTA's next block in L2).  The
-  bands past the tiny or the short forward's: on sm_100a the long forward up
-  to 400 rows per SM (other layouts: the mid forward up to 140, then the long
-  forward), the extra-long forward up to 1000 and the mid forward past it; on
-  sm_103a the mid forward up to 250, the extra-long forward up to 550 and the
-  mid forward past it; on sm_107a the mid forward up to 200, the extra-long
+  call runs the tiny, the short, the mid, the long, the extra-long or a
+  pipelined forward.  The plain forward (the call role ``fwd``: one
+  64-thread CTA per block of 8 rows) is routed by no band; it stays in
+  ``ROUTES`` because the support query needs every role routed.  The tiny
+  forward (packed rows, up to 38 rows per SM on sm_100a, 85 on sm_103a and
+  65 on sm_107a) launches one 128-thread CTA per block of 8 rows, with the
+  short forward's arithmetic, so the same ``y`` bits; the short forward
+  (other layouts, up to 12 rows per SM on sm_100a and sm_103a, 59 on
+  sm_107a) launches one 256-thread CTA per block of 16 rows; the other
+  forwards a grid whose CTA ``b`` walks the blocks ``b``, ``b + grid``, ...,
+  loading each next block while it computes the current one, in the fewest
+  whole waves that give no CTA more than a few blocks (past one wave the
+  CTAs are not persistent): the mid forward (6 CTAs per SM, at most 2 blocks
+  of 16 rows each, thread 0 warming the CTA's next block and the first block
+  of the CTA one wave later in L2 where x and z hold their rows packed: head
+  stride 128 and token stride ``H * 128``, which a ``[T, 1, 128]`` or
+  ``[T, 128]`` input whose rows follow one another meets, see
+  ``_kernel_view``), the long forward (3 CTAs per SM, at most 6 blocks of 32
+  rows each; sm_100a), the extra-long forward (the long forward whose thread
+  0 also warms the CTA's next block in L2) and the pipelined forwards (this
+  package's copies of the deterministic package's forward programs: the mid
+  forward's schedule and L2 prefetches with the L2 ``evict_first`` policy on
+  the loads of x and z, one CTA per block below 8192 rows per SM; on sm_107a
+  its program of packed rows).  The bands past the tiny forward's (packed
+  rows): on sm_100a the pipelined forward up to 85 rows per SM, the mid
+  forward up to 160, the long forward up to 400, the extra-long forward up to
+  520, the pipelined forward up to 6500 and the mid forward past it; on
+  sm_103a the pipelined forward up to 6000, the mid forward up to 8192 and
+  the pipelined forward past it; on sm_107a the mid forward up to 175, the
+  extra-long forward up to 350, the pipelined forward up to 10000 and the mid
+  forward past it.  Past the short forward's (other layouts): on sm_100a the
+  mid forward up to 140, the long forward up to 400, the extra-long forward up
+  to 1000 and the mid forward past it; on sm_103a the pipelined forward up to
+  100, the mid forward up to 250, the extra-long forward up to 550 and the mid
+  forward past it; on sm_107a the mid forward up to 200, the extra-long
   forward up to 520 and the mid forward past it.  The forward programs
-  associate a row's sum of squares differently (the tiny and the short forward:
-  8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the
-  others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits can
-  differ between bands while each program repeats them.  The static and the claimed
+  associate a row's sum of squares differently (the tiny and the short
+  forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8;
+  the sm_107a pipelined forward: four 4-term chains of 8 lanes added in pairs,
+  then folded by 1, 2, 4; the others: 16-term chains of 8 lanes folded by 1,
+  2, 4), so ``y``'s bits can differ between bands while each program repeats
+  them.  The static and the claimed
   backward run 128-thread CTAs of 8-row blocks in the deterministic
   backward's chunks (``cake_jit.backward_chunks``) and launch
   ``cake_jit.backward_ctas`` ``G = min(chunks, ctas_per_sm * SMs)`` CTAs (8
