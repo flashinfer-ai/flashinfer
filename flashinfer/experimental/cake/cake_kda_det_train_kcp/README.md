@@ -10,7 +10,7 @@ The entry points of `flashinfer.cake_kda_det_train_kcp` are a stable top-level
 API; the modules of this package are their backend.
 
 The path is deterministic: the same inputs, hardware, plan and process group
-give bitwise the same outputs and gradients.
+give bitwise the same outputs and gradients (see Determinism below).
 
 ## Usage
 
@@ -470,7 +470,9 @@ The files of this package:
   and head, each over one 64-column half of the state), the affine
   merge in one record per register-blocked build, and the two chunk stages of the
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
-  `kcp_dav` (`dA_qk` and the `dv1` K2 reads), and the fused forward walk
+  `kcp_dav` (`dA_qk`, launched only where the single-rank plan dispatches
+  its `dav` stage; the K2 adjoint walks form `dv1 = Aqk^T dO` themselves from
+  the internal `Aqk` rows), and the fused forward walk
   `kcp_fwdh_o` (the forward state walk with the chunk output inside it: the
   same bits as the tape walk followed by `kcp_fwd_o`, no tape written; in its
   full-width and two-CTA records), which the forward that keeps no tape
@@ -508,6 +510,27 @@ The files of this package:
   context-parallel-only programs and `csrc/cake_kda_det_train_<digest>_{kernel,binding}.cu`
   of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
   single-rank ones (digests in `build.json` and `build.test.json`).
+
+## Determinism
+
+Every output repeats bit for bit for identical inputs, device (the same SM
+count), configuration (`cake_kda_det_train_kcp_partition` layout, options,
+workspace or `workspace=None`) and process group:
+
+- the forward output `out`;
+- the input gradients `dq`, `dk`, `dv`, `dbeta`;
+- the gate gradient `dg` (gate mode `g`), or with `use_gate_in_kernel=True`
+  the per-rank partials of `dA_log` and `dt_bias`, which repeat bit for bit on
+  each rank and are equal on every rank after
+  `cake_kda_det_train_kcp_reduce_gate_param_grads` (a fixed rank-order sum, no
+  all-reduce);
+- the saved set of `cake_kda_det_train_kcp_forward`.
+
+A checkpoint recompute (plain `torch.utils.checkpoint` or the recompute
+handle) gives the same bits as the saved-set path, and the recompute with the
+handle issues no collective.  Cross-rank state merges run in a fixed rank
+order.  Bits are not promised across SM counts, batch compositions, CP layouts
+or package versions.
 
 ## Vendoring
 
