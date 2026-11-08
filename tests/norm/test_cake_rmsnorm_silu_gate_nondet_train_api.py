@@ -1500,11 +1500,12 @@ GATE_EDGE_CASES = [
 ]
 
 
-def _gate_edge_inputs(tokens: int, heads: int):
+def _gate_edge_inputs(tokens: int, heads: int, columns: int = D):
     """``(x, z, w, dy)`` of ``suite.make`` with gate inputs from
-    ``GATE_EDGE_VALUES`` in a quarter of the elements of two of every three
-    rows (so the packed gate's range check fails for some threads of a row and
-    holds for others) and ordinary ones in the rest."""
+    ``GATE_EDGE_VALUES`` in a quarter of the elements of the first
+    ``columns`` columns of two of every three rows (so the packed gate's
+    range check fails for some threads of a row and holds for others) and
+    ordinary ones in the rest."""
     x, z, w, dy = suite.make(tokens, heads, seed=23)
     g = torch.Generator(device=z.device).manual_seed(24)
     values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
@@ -1514,6 +1515,7 @@ def _gate_edge_inputs(tokens: int, heads: int):
     edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
     rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
     edge &= rows % 3 != 0
+    edge &= torch.arange(D, device=z.device) < columns
     z.copy_(torch.where(edge, values[pick], z))
     return x, z, w, dy
 
@@ -1545,10 +1547,13 @@ def test_forward_gate_edges_keep_the_fp64_classes(
     )
 
 
-# Backward inputs with the forward's gate edges (``_gate_edge_inputs``): 48,
+# Backward inputs with the forward's gate edges (``_gate_edge_inputs``) in the
+# first GATE_EDGE_BACKWARD_COLUMNS columns, so every output keeps finite
+# elements (``dw`` in the other columns): 48,
 # 240 and 1008 rows (the first small-row band, and the second one or, where
 # that band ends below 1008 rows, the static backward) and 6192 and 49488 rows
 # (the static or the claimed backward, by the SM count).
+GATE_EDGE_BACKWARD_COLUMNS = 96
 GATE_EDGE_BACKWARD_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(5, 48, id="5x48"),
@@ -1566,17 +1571,18 @@ GATE_EDGE_BACKWARD_CASES = [
 def test_backward_gate_edges_keep_the_fp64_classes(
     tokens, heads, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the forward's gate edges (``_gate_edge_inputs``) the backward
-    launches ``module_for_rows``' module, every output repeats bit for bit,
-    ``dx`` and ``dz`` have the deterministic package's ``NaN`` positions and
-    its bits elsewhere, ``dx``, ``dz`` and ``dw`` have the FP64 reference's
-    ``NaN``, ``+inf`` and ``-inf`` positions, their finite elements lie
-    within the error budget of the deterministic package's, and the
-    workspace is zero after every call."""
+    """With the forward's gate edges in the first
+    ``GATE_EDGE_BACKWARD_COLUMNS`` columns (``_gate_edge_inputs``) the
+    backward launches ``module_for_rows``' module, every output repeats bit
+    for bit, ``dx`` and ``dz`` have the deterministic package's ``NaN``
+    positions and its bits elsewhere, ``dx``, ``dz`` and ``dw`` have the FP64
+    reference's ``NaN``, ``+inf`` and ``-inf`` positions, their finite
+    elements (each has some) lie within the error budget of the
+    deterministic package's, and the workspace is zero after every call."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
-    x, z, w, dy = _gate_edge_inputs(tokens, heads)
+    x, z, w, dy = _gate_edge_inputs(tokens, heads, GATE_EDGE_BACKWARD_COLUMNS)
     rows = tokens * heads
     _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
 
@@ -1601,7 +1607,9 @@ def test_backward_gate_edges_keep_the_fp64_classes(
         ("dx", "dz", "dw"), got, dets, (dx64, dz64, dw64), strict=True
     ):
         assert_same_classes(what, g, ref)
-        assert_error_within_det(f"finite {what}", g, det, ref, mask=torch.isfinite(ref))
+        finite = torch.isfinite(ref)
+        assert bool(finite.any()), f"{what}: the FP64 reference has no finite element"
+        assert_error_within_det(f"finite {what}", g, det, ref, mask=finite)
 
 
 def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
