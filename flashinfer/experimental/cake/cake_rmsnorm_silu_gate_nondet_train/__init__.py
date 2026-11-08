@@ -216,6 +216,7 @@ _DETERMINISTIC_PACKAGE = "flashinfer.cake_rmsnorm_silu_gate_det_train"
 # The torch dtype of each workspace buffer (``cake_jit.WORKSPACE_BUFFERS``).
 _WORKSPACE_DTYPES = {
     "dw_win": torch.uint64,
+    "dw_sums": torch.float64,
     "dw_spec": torch.float32,
     "dw_done": torch.uint32,
 }
@@ -721,9 +722,10 @@ def _workspace_views(
     workspace: torch.Tensor, name: str, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """The buffers of backward module ``name`` on a workspace
-    (``cake_jit.workspace_layout``): ``dw_win`` (uint64), ``dw_spec`` (FP32)
-    and ``dw_done`` (uint32: ``[0]`` the arrival ticket, ``[1]`` the claim
-    counter), each a view of its bytes."""
+    (``cake_jit.workspace_layout``): ``dw_win`` (uint64) or ``dw_sums`` (FP64,
+    a row-claims backward), ``dw_spec`` (FP32) and ``dw_done`` (uint32:
+    ``[0]`` the arrival ticket, ``[1]`` the claim counter), each a view of its
+    bytes."""
 
     flat = _check_workspace(workspace, device, workspace_bytes(name))
     views = {}
@@ -798,6 +800,7 @@ def _backward(
     ctas = backward_ctas(name, rows, sm_count)
     buffers: dict[str, Optional[torch.Tensor]] = {
         "dw_win": None,
+        "dw_sums": None,
         "dw_spec": None,
         "dw_done": None,
     }
@@ -811,7 +814,8 @@ def _backward(
         # Every launch of the others, weight_grad=0 included, takes the arrival
         # ticket (and the claimed backward claims its chunks from the claim
         # counter), and leaves the whole workspace zero.
-        blocks_per_chunk = backward_chunks(name, rows)[0]
+        if _loader.MODULES[name]["grid_rule"]["kind"] == "chunks":
+            blocks_per_chunk = backward_chunks(name, rows)[0]
         if workspace is not None:
             buffers.update(_workspace_views(workspace, name, device))
         else:
