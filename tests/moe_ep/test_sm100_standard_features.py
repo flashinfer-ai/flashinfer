@@ -39,7 +39,17 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
     ],
 )
 def test_standard_features(
-    kind, activation, mode, early, wire, in_kernel, monkeypatch, *, autotune=False
+    kind,
+    activation,
+    mode,
+    early,
+    wire,
+    in_kernel,
+    monkeypatch,
+    *,
+    autotune=False,
+    capacity=129,
+    knobs=None,
 ):
     if not torch.cuda.is_available():
         pytest.skip("requires Blackwell")
@@ -52,7 +62,7 @@ def test_standard_features(
         pytest.skip("requires SM100/SM103")
     if world == 1:
         monkeypatch.setenv("MEGA_NO_DIST", "1")
-    capacity, hidden, intermediate, topk, experts = 129, 384, 192, 3, 8 * world
+    hidden, intermediate, topk, experts = 384, 192, 3, 8 * world
     if kind == "mxfp4_mxfp8":
         intermediate = 256
     rng = torch.Generator(device="cuda").manual_seed(731 + rank)
@@ -82,7 +92,7 @@ def test_standard_features(
         num_valid_tokens_tensor=count if mode == "PERSISTENT" else None,
         apply_routing_weights_before_fc2=early,
         enable_in_kernel_fc2_reduce=in_kernel,
-        knobs={"in_kernel_fc2_reduce": True} if in_kernel else None,
+        knobs={"in_kernel_fc2_reduce": True} if in_kernel else knobs,
     )
     if autotune:
         options["knobs"] = "auto"
@@ -217,6 +227,28 @@ def test_standard_features(
     finally:
         graph = None
         layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_4
+@pytest.mark.parametrize("capacity", [1024, 2048, 8192])
+@pytest.mark.parametrize("native", [False, True])
+def test_standard_nvfp4_large_capacity(capacity, native, monkeypatch):
+    test_standard_features(
+        "nvfp4",
+        "minimax",
+        "PERSISTENT",
+        False,
+        "bf16",
+        False,
+        monkeypatch,
+        capacity=capacity,
+        knobs=(
+            {"mma_tiler_mnk": (256, 128, 128), "work_id_mode": "atomic_counter"}
+            if native
+            else None
+        ),
+    )
 
 
 @pytest.mark.arch_blackwell
