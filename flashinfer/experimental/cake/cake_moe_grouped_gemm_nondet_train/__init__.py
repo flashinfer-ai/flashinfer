@@ -27,13 +27,11 @@ limitations under the License.
 # The module is the mode: no entry point takes a ``deterministic`` argument, and
 # nothing here routes to the deterministic package.  The forward pass, the
 # activation gradient and the 256-wide k tile's weight gradient run copies of the
-# deterministic programs, but for the sm_100a activation gradient's L2
-# evict-first twin, this package's own build of the deterministic wide tile (all
-# of them the same bits); the 512-wide k tile's weight gradient finishes its
-# split tail in the same launch: each unit stores its fp32 partial to a slot and
-# the tile's last unit sums the slots in slot order (``cake_backend``, numerical
-# mode).  Every output repeats bit for bit for the same inputs, shapes, device
-# SM count and configuration, and no launch alerts under
+# deterministic programs (the same bits); the 512-wide k tile's weight gradient
+# finishes its split tail in the same launch: each unit stores its fp32 partial
+# to a slot and the tile's last unit sums the slots in slot order
+# (``cake_backend``, numerical mode).  Every output repeats bit for bit for the
+# same inputs, shapes, device SM count and configuration, and no launch alerts under
 # ``torch.use_deterministic_algorithms(True)``.  The alert stays for an
 # order-varying launch, which only an architecture listed in the host plan's
 # ``unordered_tail_archs`` (empty) plans: a ``RuntimeError``, or a
@@ -142,9 +140,7 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  The programs are copies of the deterministic
-    package's, but for the sm_100a evict-first twin, this package's own build of
-    the deterministic wide tile, and all give its bits (no alert under torch's
-    deterministic mode).  See
+    package's and give its bits (no alert under torch's deterministic mode).  See
     ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
     """
     from .cake_backend import cake_moe_grouped_gemm_nondet_train_prepare_dgrad

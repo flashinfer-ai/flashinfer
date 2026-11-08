@@ -56,11 +56,11 @@ from . import cake_build
 # the same stages: ``main``,
 # ``main_wide``, ``main_wide_ef`` and ``main_wide_ts33`` of ``fwd`` / ``dgrad``,
 # and ``main``, ``main_wave`` and the ordered fp32 ``tail_reduce`` of the
-# 256-wide k tile.  The data-gradient route's sm_100a ``main_wide_ef`` program
-# is this package's own build, not a copy: the deterministic package's sm_100a
-# wide domain-scheduled data-gradient kernel with the L2 evict-first G loads and
-# dX stores (the deterministic package has no sm_100a ``main_wide_ef`` stage),
-# which gives the bits of that package's sm_100a ``main_wide`` program.  The
+# 256-wide k tile.  The ``main_wide_ef`` programs are the deterministic
+# package's L2 evict-first twins of the wide tile: on sm_107a the A-collector
+# programs of ``fwd`` and ``dgrad``; on sm_100a and sm_103a the forward pass's
+# domain-scheduled program with the X loads and Y stores evict-first, and on
+# sm_100a the data gradient's with the G loads and dX stores evict-first.  The
 # 512-wide k tile's weight-gradient routes bind the
 # builds of the deterministic package's k512 forms -- ``main``, ``main_wave``,
 # ``main_halves`` (with the planned tile walk and the slack tail placement),
@@ -85,9 +85,9 @@ from . import cake_build
 #
 # The host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``,
 # with the deterministic package's rules and constants (``cake_backend``,
-# program choice), but for ``dgrad_evict_first_archs``, which also lists
-# sm_100a, where the data gradient's ``main_wide_ef`` stage is this package's
-# own build; ``ordered_tail_archs`` lists the architectures whose 512-wide k
+# program choice), but for ``k512_min_rows_per_group``, the rows per group from
+# which the weight gradient takes this package's own 512-wide k tile builds;
+# ``ordered_tail_archs`` lists the architectures whose 512-wide k
 # tile routes bind the ordered one-launch tail builds -- every architecture of
 # those routes; ``unordered_tail_archs`` is empty (the registry holds no build
 # that adds its split tail with unordered reductions); and
@@ -888,10 +888,12 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "wide_fwd_archs": ["sm_100a", "sm_103a", "sm_107a"],
     "wide_dgrad_archs": ["sm_100a", "sm_103a", "sm_107a"],
     "dgrad_evict_first_archs": ["sm_100a", "sm_107a"],
-    "dgrad_evict_first_min_rows": 16384,
+    "dgrad_evict_first_min_rows": {"sm_100a": 4096, "sm_103a": 16384, "sm_107a": 16384},
     "dgrad_evict_first_min_k": 4096,
     "fwd_lwh_ef_archs": ["sm_107a"],
     "fwd_lwh_ef_max_k": 2048,
+    "fwd_evict_first_archs": ["sm_100a", "sm_103a"],
+    "fwd_evict_first_min_k": 6144,
     "dgrad_wide_ts33_archs": ["sm_103a"],
     "dgrad_wide_ts33_min_rows": {"sm_103a": 8192},
     "dgrad_wide_ts33_min_k": 4096,

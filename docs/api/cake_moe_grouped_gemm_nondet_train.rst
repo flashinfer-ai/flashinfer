@@ -55,11 +55,10 @@ Numerical contract
 Every output (``Y``, ``dX``, ``dW`` in bf16 or fp32, and the accumulated ``out`` or
 ``w.main_grad``) repeats bit for bit for the same inputs, shapes, device SM count and
 configuration.  The forward ``Y`` and the data gradient ``dX`` are bitwise the
-deterministic module's (copies of the same programs; on sm_100a the data gradient's L2
-evict-first twin is the package's own build of the deterministic wide program, whose
-cache policy changes no arithmetic), and so is ``dW`` wherever the 256-wide k tile runs
-or the 512-wide k tile does not split its tail.  With the 512-wide k tile, the tiles of
-the last partial wave are split into ``tail_splits`` k-step units over the clusters.
+deterministic module's (copies of the same programs), and so is ``dW`` wherever the
+256-wide k tile runs or the 512-wide k tile does not split its tail.  With the 512-wide
+k tile, the tiles of the last partial wave are split into ``tail_splits`` k-step units
+over the clusters.
 Unit ``s`` of split tail tile ``j`` stores its fp32 partial to slot
 ``j * tail_splits + s`` of the fp32 slots (``tail_sums``), and the tile's last unit to
 arrive sums the tile's slots from 0.0 in slot order, rounds the sum once and stores it,
@@ -288,7 +287,7 @@ Features by architecture
 feature                                            sm_100a         sm_103a         sm_107a
 ================================================== =============== =============== ===============
 ``fwd`` / ``dgrad`` 256- and 512-column tiles      domain schedule domain schedule static schedule
-``fwd`` evict-first / 3-3 head-tail twin           -- / --         -- / yes        yes / --
+``fwd`` evict-first / 3-3 head-tail twin           yes / --        yes / yes       yes / --
 ``dgrad`` evict-first / 3-3 head-tail twin         yes / --        -- / yes        yes / --
 ``dgrad`` probed queue split                       yes             yes             --
 ``wgrad`` 256-wide k tile, two-launch tail reduce  yes             yes             yes
