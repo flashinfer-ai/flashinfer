@@ -23,31 +23,28 @@ deterministic package's determinism suite (seeded fixed inputs per case):
   deterministic package's bits for ``fwd`` and ``dgrad``;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
   package's bits, the data gradient's own sm_100a L2 evict-first build included
-  (it runs where the deterministic package launches its own evict-first twin,
-  from this package's larger ``dgrad_evict_first_min_rows``), and so does
-  this package's wide tile where the deterministic package launches an L2
-  evict-first twin that this package's host does not take;
+  (it runs where the deterministic package launches its wide tile);
 * the non-deterministic weight gradient, launched ``REPEATS`` times into an
   output filled with zero bytes and ``REPEATS`` times into one filled with
-  ``FILL_BYTE``, stays within the deterministic package's budget of the
-  deterministic weight gradient on every launch, and of its own first launch;
-  without a split unordered tail it repeats its bits, and gives the
-  deterministic bits where both packages take the same k tile (the
-  deterministic package takes the 512-wide k tile from fewer rows per group on
-  some architectures); the worst run-to-run variation is reported (``REPRO``
-  lines);
+  ``FILL_BYTE`` (the split-tail slots poisoned with ``FILL_BYTE`` before every
+  launch), gives the bits of its own first launch every time and stays within
+  the deterministic package's budget of the deterministic weight gradient; a
+  case without a split one-launch tail gives the deterministic bits (``REPRO``
+  lines report the comparison);
 * with the tail split switched off in both packages, the 512-wide k tile's
-  unordered-tail builds give the deterministic builds' bits (every whole tile is
-  reduced in the deterministic order);
-* the cases reach the unordered split tail on this device for both output dtypes;
+  ordered one-launch tail builds give the deterministic builds' bits (every
+  whole tile is reduced in the deterministic order);
+* the cases reach the ordered split tail on this device for both output dtypes;
+* on the one-group E1 rows (``E1_SUM_M``), where the deterministic package's own
+  fp32 weight gradient exceeds ``FP32_REL_L2``, the non-deterministic fp32 weight
+  gradient's rel-L2 and worst / max |ref| against the fp64 reference are each at
+  most ``DET_ERROR_RATIO`` times the deterministic package's at the same inputs;
 * row-padded ``g`` and ``x`` on the shape of the 256-wide k tile's ``main_wave``
   weight gradient give the deterministic package's bits.
 
-On the CPU, the registry mirrors the deterministic package's routes and stages
-(but for the deterministic package's forward evict-first twin, which this package
-does not build, and both packages' accumulate stages); the data gradient's own
-sm_100a ``main_wide_ef`` build is held to the launch shape and argument plan of the
-deterministic package's ``main_wide_ef``.
+On the CPU, the registry mirrors the deterministic package's routes and stages,
+and the host plan constants are the deterministic package's but for those of
+``OWN_CONSTANTS``.
 """
 
 import dataclasses
@@ -74,6 +71,13 @@ RACE_REPEATS = 50  # the flashinfer-ai/flashinfer#6570 shape
 FILL_BYTE = 0x5A
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient
+# The #5678 E1 customer rows reduce 112,576 / 136,064 rows in one group.  There the
+# deterministic package's own fp32 weight gradient has rel-L2 1.17e-4 / 1.41e-4
+# against the fp64 reference on GB300, above FP32_REL_L2, so these rows use the
+# deterministic package's error at the same inputs as the bar: per output, rel-L2 and
+# worst / max |ref| each at most DET_ERROR_RATIO times the deterministic package's.
+E1_SUM_M = (112576, 136064)
+DET_ERROR_RATIO = 1.1
 
 # The 58 MoE projection rows of benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py.
 BENCH_PROJ = {"gate_up": (4096, 6144), "down": (6144, 2048)}
@@ -124,22 +128,14 @@ ROW_PAD = 256
 OPS = ("fwd", "dgrad", "wgrad")
 INT_VIEW = {torch.bfloat16: torch.int16, torch.float32: torch.int32}
 
-# This package's own builds beside the copies: (route, stage) -> the deterministic
-# package's stage of the same kernel and launch.  The data gradient's L2 evict-first
-# twin of the wide tile on the architectures this package's
-# ``dgrad_evict_first_archs`` adds (none while the deterministic package serves its
-# own sm_100a twin): the deterministic wide domain-scheduled kernel with
-# evict-first G loads and dX stores.
-OWN_STAGES = {("cake_moe_grouped_gemm_dgrad", "main_wide_ef"): "main_wide"}
-# The architectures where the deterministic package's forward pass takes its L2
-# evict-first twin of the wide tile (``main_wide_ef`` where its ``fwd_evict_first``
-# holds: the gate/up projection) and this package builds no such twin: the forward
-# pass keeps its wide tile there.  The cache policy changes no arithmetic.
-DET_ONLY_FWD_EF_ARCHS = frozenset(
-    det_jit.HOST_PLAN_CONSTANTS.get("fwd_evict_first_archs", ())
-) - frozenset(HOST_PLAN_CONSTANTS.get("fwd_evict_first_archs", ()))
-# Data-gradient cases of the evict-first rule (at least ``dgrad_evict_first_min_rows``
-# rows per group on average, ``K >= dgrad_evict_first_min_k``): (label, sizes, N, K),
+# The host plan constants of this package alone: the keys of the one-launch split
+# tail.  Every other constant is the deterministic package's.
+OWN_CONSTANTS = frozenset(
+    {"unordered_tail_archs", "ordered_tail_archs", "atomic_tail_plan"}
+)
+# Data-gradient cases of the evict-first rule (at least every architecture's
+# ``dgrad_evict_first_min_rows`` rows per group on average,
+# ``K >= dgrad_evict_first_min_k``): (label, sizes, N, K),
 # over group sizes off every tile multiple, with a one-row group (the second and
 # third) and an empty group (the third).
 EF_CASES = (
@@ -342,6 +338,14 @@ def _bits(out):
     return out.view(INT_VIEW[out.dtype])
 
 
+def _poison_tail_sums(device):
+    """Fill the split-tail slots kept for the current stream with ``FILL_BYTE`` bytes (they
+    have no rest state: the ordered builds overwrite every slot they read)."""
+    buffer = cb.stream_workspace("tail_sums", device)
+    if buffer is not None:
+        buffer.view(torch.uint8).fill_(FILL_BYTE)
+
+
 def _budget(out, ref, out_dtype):
     """Error of ``out`` against ``ref`` in the budget's unit: the worst
     ``|out - ref| / (atol + rtol |ref|)`` for bf16 (<= 1 passes), the rel-L2 over
@@ -364,6 +368,7 @@ def _plan_record(launch):
         "num_tail",
         "tail_splits",
         "unordered_tail",
+        "ordered_tail",
         "raster_rows",
         "wave_mode",
         "launches",
@@ -371,64 +376,14 @@ def _plan_record(launch):
     return {key: launch.plan[key] for key in keys if key in launch.plan}
 
 
-def _own_stage(case, name, arch):
-    """The stage of ``OWN_STAGES`` this package's host takes for a fwd / dgrad
-    ``case`` on ``arch`` where the deterministic package takes its twin, else None:
-    the data gradient's ``main_wide_ef`` where this package's ``dgrad_evict_first``
-    holds on an architecture the deterministic package's constants do not list."""
-    sum_m, groups = sum(case.sizes), len(case.sizes)
-    if (
-        case.op == "dgrad"
-        and cb.dgrad_evict_first(case.k, arch, sum_m, groups, HOST_PLAN_CONSTANTS)
-        and arch not in det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]
-        and cake_jit.stage_served(name, "main_wide_ef", arch)
-        and cb.fwd_dgrad_tile_n("dgrad", case.n, case.k, arch, HOST_PLAN_CONSTANTS)
-        == int(HOST_PLAN_CONSTANTS["wide_block_n"])
-    ):
-        return "main_wide_ef"
-    return None
-
-
-def _det_ef_plain(case, name, arch, det_stages):
-    """This package's wide-tile stage for a fwd / dgrad ``case`` on ``arch`` where the
-    deterministic package takes its L2 evict-first twin (``main_wide_ef``) and this
-    package's host does not, else None: the forward twin on ``DET_ONLY_FWD_EF_ARCHS``,
-    and the data gradient's twin where the deterministic package's
-    ``dgrad_evict_first`` holds and this package's does not (fewer rows per group
-    than this package's ``dgrad_evict_first_min_rows``)."""
-    if "main_wide_ef" not in det_stages:
-        return None
-    sum_m, groups = sum(case.sizes), len(case.sizes)
-    stage, _ = cb.select_row_stage(
-        name,
-        case.op,
-        case.n,
-        case.k,
-        arch,
-        HOST_PLAN_CONSTANTS,
-        sum_m=sum_m,
-        num_groups=groups,
-    )
-    if stage == "main_wide_ef":
-        return None
-    if case.op == "fwd":
-        assert arch in DET_ONLY_FWD_EF_ARCHS, (name, arch)
-    else:
-        assert not cb.dgrad_evict_first(
-            case.k, arch, sum_m, groups, HOST_PLAN_CONSTANTS
-        ), (name, arch)
-    assert stage in ("main_wide", "main_wide_ts33"), (name, arch, stage)
-    return stage
-
-
 # ---------------------------------------------------------------------------
 # Registry against the deterministic package (CPU)
 # ---------------------------------------------------------------------------
 
 
-def _unordered_plan(arg_plan):
+def _one_launch_plan(arg_plan):
     """The deterministic argument plan of a k512 program with its fp32 partials replaced
-    by the split tail's sums and tickets."""
+    by the one-launch split tail's slots and tickets."""
     out = []
     for item in arg_plan:
         if tuple(item) == ("buffer", "partials"):
@@ -443,25 +398,17 @@ def test_routes_mirror_the_deterministic_package():
     over the same architectures and, per architecture, the same stages bound to
     programs with the same launch shape.  The fwd, dgrad and 256-wide k tile programs
     take the deterministic argument plans; on the architectures of
-    ``unordered_tail_archs`` the 512-wide k tile's take the split tail's ``tail_sums``
-    and ``tail_tickets`` in place of the partials, and those routes serve no
-    ``tail_reduce`` stage there.  A program may also take the row bases of ``A`` / ``B``
-    (``cake_backend.ROW_BASES``: the same tensors again); they are left out of both
-    argument plans.  A wave-synchronised stage may be missing on an
+    ``ordered_tail_archs`` (every architecture of the k512 routes) the 512-wide k
+    tile's take the one-launch split tail's ``tail_sums`` slots and ``tail_tickets`` in
+    place of the partials, and those routes serve no ``tail_reduce`` stage there.  A program may also take the row bases of ``A`` / ``B``
+    (``cake_backend.ROW_BASES``: the same tensors again), which a deterministic build
+    of an older kernel does not.  A wave-synchronised stage may be missing on an
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
-    route's k tile), and the forward ``main_wide_ef`` on ``DET_ONLY_FWD_EF_ARCHS``
-    (the deterministic package's evict-first twin, not built here).  The accumulate
-    stages (``<stage>_acc``: this package's on the 512-wide k tile, the deterministic
-    package's on both k tiles) are left out of the mirror on both sides; their
-    twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks this
-    package's against their twins.  So is a stage of ``OWN_STAGES`` on an architecture where the
-    deterministic route does not serve it (the data gradient's ``main_wide_ef``,
-    this package's own evict-first build; none while the deterministic package
-    serves its own sm_100a twin): it is held to the
-    deterministic stage of the same kernel (``main_wide``), with that stage's launch
-    shape, FFI entry and argument plan, under a program name of its own, and only on
-    the architectures this package's ``dgrad_evict_first_archs`` adds.  (A CPU check;
-    it lives here because the backend suite imports no package but its own.)"""
+    route's k tile).  The accumulate stages (``<stage>_acc``) are left out of the
+    mirror on both sides; their twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks them against
+    their twins.  The L2 evict-first twins of the wide tile (``main_wide_ef``) are
+    copies like every other fwd / dgrad stage.  (A CPU check; it lives here because
+    the backend suite imports no package but its own.)"""
     det_routes, det_programs = det_jit.ROUTES, det_jit.PROGRAMS
     routes, programs = cake_jit.ROUTES, cake_jit.PROGRAMS
     assert set(routes) == {
@@ -474,9 +421,12 @@ def test_routes_mirror_the_deterministic_package():
         assert route["op"] == det_route["op"]
         assert route["arches"] == det_route["arches"]
         for arch in route["arches"]:
-            unordered = cb.wgrad_unordered_tail(
-                512 if name.endswith("_k512") else 256, arch, HOST_PLAN_CONSTANTS
-            )
+            tile_k = 512 if name.endswith("_k512") else 256
+            one_launch = cb.wgrad_ordered_tail(
+                tile_k, arch, HOST_PLAN_CONSTANTS
+            ) or cb.wgrad_unordered_tail(tile_k, arch, HOST_PLAN_CONSTANTS)
+            if route["op"] == "wgrad":
+                assert one_launch == (tile_k == 512), (name, arch)
             det_stages = {
                 s["name"]
                 for s in det_route["stages"]
@@ -489,53 +439,12 @@ def test_routes_mirror_the_deterministic_package():
                 if arch in programs[s["program"]]["arches"]
                 and not s["name"].endswith(cb.ACC_SUFFIX)
             }
-            own = {
-                stage
-                for stage in stages
-                if (name, stage) in OWN_STAGES and stage not in det_stages
-            }
-            stages -= own
-            for stage in own:
-                twin = OWN_STAGES[(name, stage)]
-                assert stage == "main_wide_ef" and route["op"] == "dgrad", (name, stage)
-                assert arch in HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"], arch
-                det_ef_archs = det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]
-                assert arch not in det_ef_archs, arch
-                det_binding = det_jit.stage_binding(det_name, twin, arch)
-                binding = cake_jit.stage_binding(name, stage, arch)
-                assert binding["specializations"] == det_binding["specializations"]
-                det_program = det_programs[det_binding["program"]]
-                program = programs[binding["program"]]
-                assert program["launch"] == det_program["launch"], (name, stage, arch)
-                assert program["ffi_entry"] == det_program["ffi_entry"]
-                row_bases = {("buffer", rows) for rows in cb.ROW_BASES}
-                plan = [
-                    tuple(i) for i in program["arg_plan"] if tuple(i) not in row_bases
-                ]
-                det_plan = [
-                    tuple(i)
-                    for i in det_program["arg_plan"]
-                    if tuple(i) not in row_bases
-                ]
-                assert plan == det_plan, (name, stage)
-                # Not a copy: a program of its own, beside the copy of the twin.
-                copy = cake_jit.stage_binding(name, twin, arch)["program"]
-                assert binding["program"] != copy
-                assert binding["program"].startswith("cake_moe_grouped_gemm_")
-                assert (
-                    binding["program"].replace(
-                        "cake_moe_grouped_gemm", "cake_moe_grouped_det_gemm"
-                    )
-                    not in det_programs
-                )
-            expected_stages = det_stages - {"tail_reduce"} if unordered else det_stages
+            expected_stages = det_stages - {"tail_reduce"} if one_launch else det_stages
             unselected = set()
             if route["op"] == "wgrad":
                 tile_k = 512 if name.endswith("_k512") else 256
                 if arch not in HOST_PLAN_CONSTANTS["wave_sync_archs"][tile_k]:
                     unselected = {"main_wave", "main_wave_halves"}
-            if route["op"] == "fwd" and arch in DET_ONLY_FWD_EF_ARCHS:
-                unselected = {"main_wide_ef"}
             assert stages <= expected_stages, (name, arch, stages - expected_stages)
             assert expected_stages - stages <= unselected, (
                 name,
@@ -550,13 +459,16 @@ def test_routes_mirror_the_deterministic_package():
                 program = programs[binding["program"]]
                 assert program["launch"] == det_program["launch"], (name, stage, arch)
                 assert program["ffi_entry"] == det_program["ffi_entry"]
-                expected = (
-                    _unordered_plan(det_program["arg_plan"])
-                    if unordered
-                    else [tuple(i) for i in det_program["arg_plan"]]
-                )
                 row_bases = {("buffer", rows) for rows in cb.ROW_BASES}
-                expected = [i for i in expected if i not in row_bases]
+                expected = [
+                    i
+                    for i in (
+                        _one_launch_plan(det_program["arg_plan"])
+                        if one_launch
+                        else [tuple(i) for i in det_program["arg_plan"]]
+                    )
+                    if i not in row_bases
+                ]
                 plan = [tuple(i) for i in program["arg_plan"]]
                 assert [i for i in plan if i not in row_bases] == expected, (
                     name,
@@ -565,6 +477,16 @@ def test_routes_mirror_the_deterministic_package():
                 )
                 assert program["library"].startswith("cake_moe_grouped_gemm_")
                 assert binding["program"].startswith("cake_moe_grouped_gemm_")
+
+
+def test_host_plan_constants_mirror_the_deterministic_package():
+    """Every host plan constant but those of ``OWN_CONSTANTS`` is the deterministic
+    package's, so this package's host takes the deterministic stage rules at the
+    deterministic thresholds (the evict-first twins' included).  (A CPU check.)"""
+    det_c, c = det_jit.HOST_PLAN_CONSTANTS, HOST_PLAN_CONSTANTS
+    assert set(det_c) - OWN_CONSTANTS == set(c) - OWN_CONSTANTS
+    for key in sorted(set(det_c) - OWN_CONSTANTS):
+        assert c[key] == det_c[key], key
 
 
 # ---------------------------------------------------------------------------
@@ -608,24 +530,8 @@ def test_against_the_deterministic_package(label, record_property):
         out_dtype=str(case.out_dtype).replace("torch.", ""),
     )
     if case.op != "wgrad":
-        # fwd / dgrad: the deterministic programs' bits.  The stages are the
-        # deterministic package's, but where this package's host takes its own
-        # evict-first build of the data gradient's wide tile (``OWN_STAGES``), and
-        # where it keeps its wide tile in place of the deterministic package's
-        # evict-first twin (``_det_ef_plain``).
-        own = _own_stage(case, launch.record_name, cb.arch_for(device))
-        twin = OWN_STAGES.get((launch.record_name, own))
-        plain = _det_ef_plain(case, launch.record_name, cb.arch_for(device), det.stages)
-        expected = [
-            own
-            if stage == twin
-            else plain
-            if stage == "main_wide_ef" and plain
-            else stage
-            for stage in det.stages
-        ]
-        assert list(launch.stages) == expected, (launch.stages, det.stages)
-        record.update(own_stage=own, det_ef_plain=plain)
+        # fwd / dgrad: the deterministic package's stages and programs' bits.
+        assert list(launch.stages) == list(det.stages), (launch.stages, det.stages)
         for fill in (0, FILL_BYTE):
             out.view(torch.uint8).fill_(fill)
             launch.launch()
@@ -641,6 +547,7 @@ def test_against_the_deterministic_package(label, record_property):
     worst_elems = 0
     for fill in (0, FILL_BYTE):
         for _ in range(case.repeats):
+            _poison_tail_sums(device)
             out.view(torch.uint8).fill_(fill)
             launch.launch()
             launches += 1
@@ -662,7 +569,19 @@ def test_against_the_deterministic_package(label, record_property):
     for e, (s, t) in enumerate(zip([0] + ends[:-1], ends, strict=True)):
         if t == s:
             assert int(_bits(out[e]).count_nonzero()) == 0, f"empty group {e}"
+    # Where the two packages' ``k512_min_rows_per_group`` differ, the deterministic
+    # package may take the 512-wide k tile where this package takes the 256-wide one.
+    tile, det_tile = int(launch.plan["tile_k"]), int(det.plan["tile_k"])
+    same_tile = tile == det_tile
+    if not same_tile:
+        arch = cb.arch_for(device)
+        avg = sum(case.sizes) // max(len(case.sizes), 1)
+        det_min = int(det_jit.HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch])
+        own_min = int(HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch])
+        assert (det_tile, tile) == (512, 256), (det_tile, tile)
+        assert det_min <= avg < own_min, (det_min, avg, own_min)
     record.update(
+        same_tile_as_det=same_tile,
         launches=launches,
         run_to_run_mismatches=mismatches,
         worst_diff_elems=worst_elems,
@@ -670,39 +589,31 @@ def test_against_the_deterministic_package(label, record_property):
         launches_differing_from_det=differ_from_det,
         worst_vs_det_budget=worst_vs_det,
         exercised=bool(
-            launch.plan["unordered_tail"] and launch.plan["tail_splits"] > 1
+            (launch.plan["ordered_tail"] or launch.plan["unordered_tail"])
+            and launch.plan["tail_splits"] > 1
         ),
-        det_tile_k=det.plan["tile_k"],
+        order_varying=launch.order_varying,
     )
     print("REPRO " + json.dumps(record, sort_keys=True))
     record_property("repro", json.dumps(record, sort_keys=True))
-    if not record["exercised"]:
-        # No split unordered tail: the same bits every launch, and with the
-        # deterministic package's k tile its programs' order and bits.
-        assert mismatches == 0, record
-        if record["det_tile_k"] == launch.plan["tile_k"]:
-            assert differ_from_det == 0, record
-        else:
-            # Only the deterministic package's lower k512_min_rows_per_group
-            # separates the k tiles.
-            arch = record["arch"]
-            rows = sum(case.sizes) / max(len(case.sizes), 1)
-            det_min = det_jit.HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch]
-            own_min = HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch]
-            assert (record["det_tile_k"], launch.plan["tile_k"]) == (512, 256), record
-            assert det_min <= rows < own_min, record
+    assert not launch.order_varying, record
+    # Every launch gives the bits of the first, whatever the output and the slots held.
+    assert mismatches == 0 and worst_vs_first == 0.0, record
+    if not record["exercised"] and same_tile:
+        # No split one-launch tail: the deterministic programs' order, the same bits.
+        assert differ_from_det == 0, record
+    # A split tail's bits may differ from the deterministic package's (another tail
+    # plan and group order), within its budget.
     assert worst_vs_det <= 1.0, record
-    assert worst_vs_first <= 1.0, record
 
 
 @pytest.mark.parametrize("label,sizes,n,k", EF_CASES, ids=[c[0] for c in EF_CASES])
 def test_dgrad_evict_first_gives_the_deterministic_bits(
     label, sizes, n, k, monkeypatch
 ):
-    """Where this package's ``dgrad_evict_first`` holds, the data gradient launches the
-    L2 evict-first twin of its wide tile (``main_wide_ef``; on sm_100a this package's
-    own build).  The cache policy changes no arithmetic: over a one-row group, an
-    empty group and group sizes
+    """Where ``dgrad_evict_first`` holds, the data gradient launches the L2 evict-first
+    twin of its wide tile (``main_wide_ef``), as the deterministic package does.  The
+    cache policy changes no arithmetic: over a one-row group, an empty group and group sizes
     off every tile multiple, dX has the bits of the deterministic package's data
     gradient, of this package's wide tile (``main_wide``) and of its 256-column tile
     (``main``), whatever bytes the output held."""
@@ -713,7 +624,9 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
     arch = cb.arch_for(device)
     sum_m, groups = sum(sizes), len(sizes)
     # Every case is over the rule's thresholds: the rule holds on its architectures.
-    assert sum_m // groups >= int(c["dgrad_evict_first_min_rows"]), label
+    assert sum_m // groups >= max(
+        int(v) for v in c["dgrad_evict_first_min_rows"].values()
+    ), label
     assert k >= int(c["dgrad_evict_first_min_k"]), label
     assert k % int(c["wide_block_n"]) == 0, label
     assert any(size % 128 for size in sizes), label
@@ -749,8 +662,7 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
         if wide
         else "main"
     )
-    if ef and arch not in det_jit.HOST_PLAN_CONSTANTS["dgrad_evict_first_archs"]:
-        assert det.stages[0] == "main_wide", det.stages
+    assert list(det.stages) == list(launch.stages), (det.stages, launch.stages)
     for fill in (0, FILL_BYTE):
         out.view(torch.uint8).fill_(fill)
         launch.launch()
@@ -762,7 +674,11 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
             assert int(_bits(out[s:t]).count_nonzero()) > 0, label
     if not ef:
         pytest.skip(f"no evict-first data-gradient tile on {arch}")
-    monkeypatch.setitem(c, "dgrad_evict_first_min_rows", 1 << 30)
+    monkeypatch.setitem(
+        c,
+        "dgrad_evict_first_min_rows",
+        dict.fromkeys(c["dgrad_evict_first_min_rows"], 1 << 30),
+    )
     plain_out = _out(case, device)
     plain = _prepare(cb, case, a, b, offs, plain_out)
     assert plain.stages[0] == "main_wide", plain.stages
@@ -785,8 +701,9 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
 @pytest.mark.parametrize("label", K512_LABELS)
 def test_unsplit_k512_builds_give_the_deterministic_bits(label, monkeypatch):
     """With the tail split switched off in both packages (``max_splits`` 1), a weight
-    gradient on the 512-wide k tile runs every tile whole in both, and the unordered-tail
-    build gives the deterministic build's bits for every form the case selects."""
+    gradient on the 512-wide k tile runs every tile whole in both, and the ordered
+    one-launch tail build gives the deterministic build's bits for every form the case
+    selects."""
     case = CASE_BY_LABEL[label]
     device = _device()
     _require_programs(case, device)
@@ -847,10 +764,80 @@ def test_row_padded_wgrad_gives_the_deterministic_bits(out_dtype):
     assert torch.equal(_bits(out), _bits(det_out))
 
 
-def test_cases_exercise_the_unordered_tail(record_property):
-    """The cases reach, on this device, the 512-wide k tile's unordered split tail
-    (``unordered_tail`` and ``tail_splits > 1``) for both output dtypes, and the
-    256-wide k tile with its ordered tail reduce."""
+@pytest.mark.parametrize("sum_m", E1_SUM_M)
+@pytest.mark.parametrize("proj", list(BENCH_PROJ))
+def test_e1_fp32_wgrad_error_within_det(proj, sum_m, record_property):
+    """The fp32 weight gradient of an E1 customer row (one group of ``sum_m`` rows):
+    against the fp64 reference, its rel-L2 and worst / max |ref| are each at most
+    ``DET_ERROR_RATIO`` times the deterministic package's at the same inputs, and a
+    repeat (output refilled, split-tail slots poisoned) gives the first launch's bits.
+    On a supported GPU a missing program of either package fails instead of skipping,
+    and a deterministic output that is not finite fails the comparison."""
+    device = _device()
+    case = _case(
+        f"{proj}_e1_m{sum_m}_balanced",
+        "wgrad",
+        BENCH_PROJ[proj],
+        [sum_m],
+        out_dtype=torch.float32,
+    )
+    for backend in (cb, det_cb):
+        assert backend.generated_program_available(
+            device, op="wgrad", out_dtype=torch.float32
+        ), f"no fp32 wgrad program for {backend.arch_for(device)} in {backend.__name__}"
+    a, b, offs = _inputs(case, device)
+    # The per-group fp64 reference, rounded to fp32 (one group).
+    ref = (a.double().T @ b.double()).float().unsqueeze(0)
+    det_out = _out(case, device)
+    det = _prepare(det_cb, case, a, b, offs, det_out)
+    det_out.fill_(float("nan"))
+    det.launch()
+    out = _out(case, device)
+    launch = _prepare(cb, case, a, b, offs, out)
+    first = None
+    for fill in (0, FILL_BYTE):
+        _poison_tail_sums(device)
+        out.view(torch.uint8).fill_(fill)
+        launch.launch()
+        if first is None:
+            first = out.clone()
+        else:
+            assert torch.equal(_bits(out), _bits(first)), f"fill 0x{fill:02x}"
+    torch.cuda.synchronize(device)
+    ref64 = ref.double()
+    ref_max = float(ref64.abs().max())
+
+    def errors(t):
+        diff = t.double() - ref64
+        return float(diff.norm() / ref64.norm()), float(diff.abs().max()) / ref_max
+
+    rel_l2, worst = errors(first)
+    det_rel_l2, det_worst = errors(det_out)
+    record = dict(
+        case=case.label,
+        arch=cb.arch_for(device),
+        sm_count=cb.sm_count(device),
+        stages=list(launch.stages),
+        det_stages=list(det.stages),
+        plan=_plan_record(launch),
+        rel_l2=rel_l2,
+        det_rel_l2=det_rel_l2,
+        worst=worst,
+        det_worst=det_worst,
+        equal_to_det=bool(torch.equal(_bits(first), _bits(det_out))),
+    )
+    print("E1VSDET " + json.dumps(record, sort_keys=True))
+    record_property("e1_vs_det", json.dumps(record, sort_keys=True))
+    assert math.isfinite(det_rel_l2) and math.isfinite(det_worst), record
+    assert det_rel_l2 > 0.0 and det_worst > 0.0, record
+    assert rel_l2 <= DET_ERROR_RATIO * det_rel_l2, record
+    assert worst <= DET_ERROR_RATIO * det_worst, record
+
+
+def test_cases_exercise_the_ordered_tail(record_property):
+    """The cases reach, on this device, the 512-wide k tile's ordered one-launch split
+    tail (``ordered_tail`` and ``tail_splits > 1``) for both output dtypes, and the
+    256-wide k tile with its two-launch tail reduce."""
     device = _device()
     arch = cb.arch_for(device)
     seen = {}
@@ -868,17 +855,19 @@ def test_cases_exercise_the_unordered_tail(record_property):
             str(case.out_dtype).replace("torch.", ""),
             plan["tile_k"],
             "+".join(launch.stages),
-            bool(plan["unordered_tail"] and plan["tail_splits"] > 1),
+            bool(plan["ordered_tail"] and plan["tail_splits"] > 1),
         )
+        assert not plan["unordered_tail"], (case.label, plan)
         seen.setdefault(key, []).append(case.label)
         del a, b, offs, launch
     rows = sorted([*key, len(labels)] for key, labels in seen.items())
     record_property("coverage", json.dumps(dict(arch=arch, rows=rows)))
     print("COVERAGE " + json.dumps(dict(arch=arch, rows=rows)))
+    assert cb.wgrad_ordered_tail(512, arch), arch
     for dtype in ("bfloat16", "float32"):
-        assert not cb.wgrad_unordered_tail(512, arch) or any(
-            key[0] == dtype and key[1] == 512 and key[3] for key in seen
-        ), f"no case splits the unordered {dtype} tail on {arch}"
+        assert any(key[0] == dtype and key[1] == 512 and key[3] for key in seen), (
+            f"no case splits the ordered {dtype} tail on {arch}"
+        )
         assert any(
             key[0] == dtype and key[1] == 256 and key[2].endswith("+tail_reduce")
             for key in seen

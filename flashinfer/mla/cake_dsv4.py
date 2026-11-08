@@ -972,6 +972,10 @@ _SCALAR_VALUE_NAMES = frozenset(
         "batch_size",
         "max_q_len",
         "ragged_query",
+        # Rows of the flat compressed-KV pool: SM107's last-tile L2 prefetch
+        # sibling of the four-stage M64 program bounds the pool rows it
+        # prefetches by it (_kv4_l2pf_variant).
+        "compressed_KV_rows",
         # NVFP4 cache route.
         "num_main_tiles",
         "tiles_per_split",
@@ -2248,13 +2252,68 @@ _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 # 1.000-1.012x, no row slower beyond the spread of two runs of the same
 # program.  The window leaves out the launches on which the TMEM-batch program
 # trailed: one-token requests, 96-row launches over items 768 wide, items 1152
-# wide and 257- to 1024-token prefill.
+# wide and 257- to 1024-token prefill.  The decode windows
+# (``_KV4_BCL_DECODE_WINDOWS``) take back one-token launches of one layer,
+# width and row range where the TMEM-batch program measured faster.
 _KV4_BCL_HEADS = 64  # query heads
 _KV4_BCL_MIN_Q = 2  # query tokens of the call's longest request
 _KV4_BCL_MAX_Q = 4
 _KV4_BCL_MIN_TOKENS = 108  # query rows of the launch
 _KV4_BCL_MAX_TOKENS_PER_SM = 2  # query rows of the launch per SM of the device
 _KV4_BCL_MAX_TOPK = 768  # item width (sparse_topk), six tiles
+
+# The TMEM-batch sibling's decode windows: 64-head launches of calls whose
+# ``(max_q_len, sparse_topk, compressed_page_size)`` names a window, of its
+# rows and at most one row per SM, on a device of an SM count in
+# ``_KV4_BCL_DECODE_SM_COUNTS`` (:func:`_kv4_bcl_variant`).  One window: the
+# one-token decode of the c4 layer (compressed pages of 64 rows) over items
+# 1152 wide, 176-208 rows.  R200 (216 SMs) and VR200 (212 SMs), two
+# processes each, eight calls per CUDA graph over distinct inputs behind an
+# L2 flush, four-stage program -> TMEM-batch program at every row count from
+# 176 to 208: 0.007-0.133 us faster per call in every run, 19 of the 33 row
+# counts beyond the spread of two runs of the same program in all four
+# runs, no row slower.  The window leaves out the c128 layer (compressed
+# pages of 2 rows), 144- and 160-row and 256- to 416-row launches (slower
+# there) and devices of other SM counts (not measured; on 208 SMs a 208-row
+# launch fills the device).
+_KV4_BCL_DECODE_WINDOWS: dict[tuple[int, int, int], tuple[int, int]] = {
+    (1, 1152, 64): (176, 208),
+}
+_KV4_BCL_DECODE_SM_COUNTS = frozenset({212, 216})
+
+# The last-tile L2 prefetch sibling ``<route>_kv4_l2pf`` of the four-stage
+# sibling on SM107: the four-stage program whose index warp, in a launch of at
+# most one row per SM, prefetches into L2 the compressed-KV pool rows of each
+# item's last tile (items of at least four tiles) after the item's last index
+# pass, with the four-stage program's grid, launch and shared memory, the
+# compressed-KV pool and its row count as two more arguments, and the same
+# output bits.  It takes the four-stage launches of 64-head calls over
+# compressed pages of 64 rows (the c4 layer) whose ``(sparse_topk,
+# max_q_len)`` names a row ceiling in ``_KV4_L2PF_MAX_TOKENS``, of at most
+# that many rows and at most one row per SM, on a device of an SM count in
+# ``_KV4_L2PF_SM_COUNTS``; a launch of 4-token requests also has to be
+# uniform (``num_query_tokens == batch_size * max_q_len``).  Every other
+# launch keeps the four-stage program (:func:`_kv4_l2pf_variant`).  R200
+# (216 SMs) and VR200 (212 SMs), two processes each, eight calls per CUDA
+# graph over distinct inputs behind an L2 flush, four-stage program -> L2
+# prefetch program, per row and call: items 640 wide, one-token requests,
+# 32-47 rows 0.160-0.330 us faster; four-token requests, 32-44 and 60-64
+# rows 0.060-0.328 us; items 512 wide, one-token requests at 40-41 rows
+# 0.090-0.176 us, four-token requests at 40-56 rows 0.028-0.250 us.  The
+# ceilings stop below the first measured row count that was not faster.
+# The rows of these widths and request lengths that the host does not send
+# to the four-stage program (48-57 rows over items 640 wide, for example)
+# never reach it.
+_KV4_L2PF_HEADS = 64  # query heads
+_KV4_L2PF_PAGE = 64  # compressed page rows (the c4 layer)
+_KV4_L2PF_MAX_TOKENS: dict[tuple[int, int], int] = {
+    # (sparse_topk, max_q_len): most query rows of the launch
+    (640, 1): 47,
+    (640, 4): 64,
+    (512, 1): 41,
+    (512, 4): 56,
+}
+_KV4_L2PF_SM_COUNTS = frozenset({212, 216})
 
 # The routes with an early-PV sibling ``<route>_overlap`` on SM107: the route's
 # program whose P x V MMAs start once the softmax has written the low half of
@@ -2440,27 +2499,42 @@ def _kv4_bcl_variant(
     num_query_tokens: int,
     sparse_topk: int,
     device: torch.device,
+    compressed_page_size: Optional[int] = None,
 ) -> str:
     """The variant a launch over ``num_query_tokens`` rows of a call whose
     longest request has ``max_q_len`` tokens runs once :func:`_kv4_variant`
     chose ``variant``: its TMEM-batch sibling ``<variant>_bcl`` when
     ``variant`` is the four-stage sibling of a route in
-    ``_KV4_SIBLING_ROUTES``, the call has ``_KV4_BCL_HEADS`` heads,
-    ``max_q_len`` is from ``_KV4_BCL_MIN_Q`` to ``_KV4_BCL_MAX_Q``, the items
-    are at most ``_KV4_BCL_MAX_TOPK`` wide, the launch has at least
-    ``_KV4_BCL_MIN_TOKENS`` rows, ``arch`` routes the TMEM-batch sibling to a
-    program other than the four-stage one and the launch has at most
-    ``_KV4_BCL_MAX_TOKENS_PER_SM`` rows per SM of ``device``, else
-    ``variant``.  The four-stage launch check :func:`_kv4_variant` applied
-    covers the TMEM-batch sibling, which takes the same shared memory."""
+    ``_KV4_SIBLING_ROUTES``, the call has ``_KV4_BCL_HEADS`` heads, ``arch``
+    routes the TMEM-batch sibling to a program other than the four-stage one
+    and the launch is in one of the sibling's windows, else ``variant``.  The
+    MTP window: ``max_q_len`` is from ``_KV4_BCL_MIN_Q`` to
+    ``_KV4_BCL_MAX_Q``, the items are at most ``_KV4_BCL_MAX_TOPK`` wide and
+    the launch has from ``_KV4_BCL_MIN_TOKENS`` rows to
+    ``_KV4_BCL_MAX_TOKENS_PER_SM`` rows per SM of ``device``.  A decode
+    window: ``_KV4_BCL_DECODE_WINDOWS`` names the call's ``(max_q_len,
+    sparse_topk, compressed_page_size)``, the launch has the window's rows and
+    at most one row per SM of ``device``, and ``device`` has an SM count in
+    ``_KV4_BCL_DECODE_SM_COUNTS``; a launch of an unknown
+    ``compressed_page_size`` (``None``) takes no decode window.  The
+    four-stage launch check :func:`_kv4_variant` applied covers the
+    TMEM-batch sibling, which takes the same shared memory."""
     route = variant.removesuffix("_kv4")
     if route == variant or route not in _KV4_SIBLING_ROUTES:
         return variant
     if num_heads != _KV4_BCL_HEADS:
         return variant
-    if not _KV4_BCL_MIN_Q <= max_q_len <= _KV4_BCL_MAX_Q:
-        return variant
-    if sparse_topk > _KV4_BCL_MAX_TOPK or num_query_tokens < _KV4_BCL_MIN_TOKENS:
+    decode: Optional[tuple[int, int]] = None
+    if compressed_page_size is not None:
+        decode = _KV4_BCL_DECODE_WINDOWS.get(
+            (max_q_len, sparse_topk, compressed_page_size)
+        )
+    if decode is None:
+        if not _KV4_BCL_MIN_Q <= max_q_len <= _KV4_BCL_MAX_Q:
+            return variant
+        if sparse_topk > _KV4_BCL_MAX_TOPK or num_query_tokens < _KV4_BCL_MIN_TOKENS:
+            return variant
+    elif not decode[0] <= num_query_tokens <= decode[1]:
         return variant
     from ..jit.cake_dsv4 import VARIANTS
 
@@ -2468,7 +2542,66 @@ def _kv4_bcl_variant(
     sibling = f"{variant}_bcl"
     if programs.get(sibling, programs.get(variant)) == programs.get(variant):
         return variant
-    if num_query_tokens > _KV4_BCL_MAX_TOKENS_PER_SM * _device_sm_count(device):
+    sm_count = _device_sm_count(device)
+    if decode is None:
+        ceiling = _KV4_BCL_MAX_TOKENS_PER_SM * sm_count
+    elif sm_count in _KV4_BCL_DECODE_SM_COUNTS:
+        ceiling = sm_count
+    else:
+        return variant
+    if num_query_tokens > ceiling:
+        return variant
+    return sibling
+
+
+def _kv4_l2pf_variant(
+    variant: str,
+    *,
+    arch: str,
+    num_heads: int,
+    max_q_len: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    device: torch.device,
+    batch_size: Optional[int] = None,
+    compressed_page_size: Optional[int] = None,
+) -> str:
+    """The variant a launch over ``num_query_tokens`` rows of a call of
+    ``batch_size`` requests whose longest has ``max_q_len`` tokens runs once
+    :func:`_kv4_bcl_variant` chose ``variant``: its last-tile L2 prefetch
+    sibling ``<variant>_l2pf`` when ``variant`` is the four-stage sibling of a
+    route in ``_KV4_SIBLING_ROUTES`` (not its TMEM-batch sibling), the call
+    has ``_KV4_L2PF_HEADS`` heads and compressed pages of ``_KV4_L2PF_PAGE``
+    rows, ``_KV4_L2PF_MAX_TOKENS`` gives ``(sparse_topk, max_q_len)`` a row
+    ceiling the launch does not pass, a launch of requests of more than one
+    token is uniform (``num_query_tokens == batch_size * max_q_len``),
+    ``arch`` routes the sibling to a program other than the four-stage one,
+    and ``device`` has an SM count in ``_KV4_L2PF_SM_COUNTS`` and at least
+    one SM per row, else ``variant``.  A launch of an unknown
+    ``compressed_page_size`` or, past one-token requests, ``batch_size``
+    (``None``) keeps ``variant``.  The four-stage launch check
+    :func:`_kv4_variant` applied covers the sibling, which takes the same
+    shared memory."""
+    route = variant.removesuffix("_kv4")
+    if route == variant or route not in _KV4_SIBLING_ROUTES:
+        return variant
+    if num_heads != _KV4_L2PF_HEADS or compressed_page_size != _KV4_L2PF_PAGE:
+        return variant
+    ceiling = _KV4_L2PF_MAX_TOKENS.get((sparse_topk, max_q_len))
+    if ceiling is None or num_query_tokens > ceiling:
+        return variant
+    if max_q_len > 1 and (
+        batch_size is None or num_query_tokens != batch_size * max_q_len
+    ):
+        return variant
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{variant}_l2pf"
+    if programs.get(sibling, programs.get(variant)) == programs.get(variant):
+        return variant
+    sm_count = _device_sm_count(device)
+    if sm_count not in _KV4_L2PF_SM_COUNTS or num_query_tokens > sm_count:
         return variant
     return sibling
 
@@ -2945,9 +3078,17 @@ def run_cake_dsv4(
 
     On SM107 the four-stage multi-tile M64 program runs the 64-head launches of
     108 query rows up to two per SM over items at most 768 wide, of calls whose
-    longest request has 2-4 query tokens, on its TMEM-batch sibling and every
-    other launch on its own program (``_kv4_bcl_variant``); warm up launches on
-    both sides of that window eagerly before a capture as well.
+    longest request has 2-4 query tokens, on its TMEM-batch sibling, and so
+    the 64-head launches of 176-208 query rows of one-token requests over
+    items 1152 wide with compressed pages of 64 rows on a device of 212 or 216
+    SMs (``_KV4_BCL_DECODE_WINDOWS``), and every other launch on its own
+    program (``_kv4_bcl_variant``).  Its 64-head launches of few query rows
+    (at most 41 to 64 by item width and request length,
+    ``_KV4_L2PF_MAX_TOKENS``) over items 512 or 640 wide with compressed pages
+    of 64 rows, of one-token requests or of uniform 4-token requests, on
+    a device of 212 or 216 SMs run its L2 prefetch sibling
+    (``_kv4_l2pf_variant``).  Warm up launches on both sides of those windows
+    eagerly before a capture as well.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -3109,6 +3250,7 @@ def run_cake_dsv4(
         "Q": query_rows.view(torch.uint8) if is_fp8 else query_rows,
         "SWA_cache": swa.view(torch.uint8) if is_fp8 else swa,
         "compressed_KV_cache": compressed.view(torch.uint8) if is_fp8 else compressed,
+        "compressed_KV_rows": int(compressed.shape[0]),
         "O": out_rows,
         "seq_lens": seq_lens,
         "cum_seq_lens_q": cum_seq_lens_q_value,
@@ -3122,6 +3264,10 @@ def run_cake_dsv4(
         "batch_size": batch_size,
         "max_q_len": max_q_len,
         "ragged_query": int(ragged),
+        # Host-only: the TMEM-batch sibling's decode windows and the L2
+        # prefetch sibling key on it (_kv4_bcl_variant, _kv4_l2pf_variant);
+        # no argument plan names it.
+        "compressed_page_size": int(compressed_kv_cache.shape[-2]),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
         "enable_pdl": bool(enable_pdl),
@@ -3437,17 +3583,35 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # runs the multi-tile program's launches on its four-stage sibling
         # where this process can launch it (_kv4_variant); run_cake_dsv4
         # routed the FP8/H64 decode rows by the same check (_fp8_h64_kv4_edges).
-        # The four-stage launches of the TMEM-batch window (64-head MTP decode)
-        # run its TMEM-batch sibling (_kv4_bcl_variant).
+        # The four-stage launches of the TMEM-batch windows (64-head MTP decode
+        # and the decode windows of _KV4_BCL_DECODE_WINDOWS) run its TMEM-batch
+        # sibling (_kv4_bcl_variant); those of the L2 prefetch window (64-head
+        # decode of few rows over items 512 or 640 wide, _KV4_L2PF_MAX_TOKENS)
+        # run its L2 prefetch sibling (_kv4_l2pf_variant).  The windows do not
+        # overlap: the TMEM-batch windows start at 108 rows.
         parts = L.partials(1)
+        device = v["Q"].device
+        page = v.get("compressed_page_size")
         program = _kv4_bcl_variant(
-            _kv4_variant(route, arch=L.arch, device=v["Q"].device),
+            _kv4_variant(route, arch=L.arch, device=device),
             arch=L.arch,
             num_heads=H,
             max_q_len=v["max_q_len"],
             num_query_tokens=T,
             sparse_topk=topk,
-            device=v["Q"].device,
+            device=device,
+            compressed_page_size=page,
+        )
+        program = _kv4_l2pf_variant(
+            program,
+            arch=L.arch,
+            num_heads=H,
+            max_q_len=v["max_q_len"],
+            num_query_tokens=T,
+            sparse_topk=topk,
+            device=device,
+            batch_size=v.get("batch_size"),
+            compressed_page_size=page,
         )
         program = _pdl_variant(
             program,
