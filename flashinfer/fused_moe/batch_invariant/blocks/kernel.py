@@ -48,6 +48,7 @@ from .scheduler import (
     build_group_tables,
     warp_roles,
 )
+from .. import pdl
 
 CHAINS = ("plain", "swiglu", "relu2")
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_DENSE)
@@ -168,7 +169,7 @@ class GroupedBlockGemm:
         # programmatic dependent launch: wait for the predecessor grid before any dependent read (counts, the operands), and
         # let the successor start its prologue at once (this grid is one persistent wave)
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_early()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         use_2cta_instrs = atom_thr_size == 2
         bidx, _, _ = cute.arch.block_idx()
@@ -469,4 +470,5 @@ def grouped_tma_producer_loop(
                 peek_empty = ab_producer.try_acquire()
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
+    pdl.trigger_late()  # the CTA's loads are all issued: the dependents' prologues may start
     ab_producer.tail()

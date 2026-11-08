@@ -23,6 +23,7 @@ from ...batch_invariant import canon, jit
 from ...batch_invariant.fp_interface.cute import get_cutlass_dtype
 from ...batch_invariant.quantization.cute_ext import CuteF32
 from . import spec as S
+from . import pdl
 
 LANES = 32
 WARPS = 4
@@ -112,7 +113,7 @@ class RouteKernel:
             if (lane == Int32(r)) & valid:
                 mExp[t, r] = out_e[r]
                 mW[t, r] = out_w[r]
-        cute.arch.griddepcontrol_launch_dependents()
+        pdl.trigger_one_wave()
 
 
 @cute.jit
