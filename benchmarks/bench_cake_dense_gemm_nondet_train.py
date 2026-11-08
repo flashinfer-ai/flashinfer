@@ -454,6 +454,8 @@ def warm_on(stream, fn):
 
 def is_atomic(prepared):
     """Whether a prepared launch runs this package's program (else the deterministic package's)."""
+    if isinstance(prepared, cake_backend.CakeDenseGemmNondetProgramLaunch):
+        return prepared.own
     return isinstance(
         prepared,
         (
@@ -466,6 +468,14 @@ def is_atomic(prepared):
 def plan_record(prepared):
     """The plan facts of a prepared launch (and the rule-table key and value of this package's program, so a
     per-row verdict can be written into ``K1_SPLIT_RULES`` / ``ROUTER_RULES``)."""
+    if isinstance(prepared, cake_backend.CakeDenseGemmNondetProgramLaunch):
+        # a row of a program table: the table and the program it names (the entry point's launch geometry)
+        return dict(
+            template=prepared.template,
+            grid=None,
+            table=prepared.table,
+            reproducible=True,
+        )
     record = dict(template=prepared.template, grid=list(prepared.grid))
     if isinstance(prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch):
         p = prepared.plan
