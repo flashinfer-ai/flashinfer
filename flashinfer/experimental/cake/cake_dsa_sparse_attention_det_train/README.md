@@ -143,20 +143,21 @@ while it is used:
   `bwd_redo` reads them, and the fold writes the output last
   (`cake_backend.redo_lists_fit`).  Otherwise (`dkv_acc`, NoPE) they are part
   of the region.
-* After them, when they fit too, `delta` (`[T, 64]` FP32) and the global
-  words: `bwd_delta` writes them (it reads neither output), the redo is their
-  last reader (`cake_backend.output_scratch_layout`,
-  `cake_backend.delta_fits_output`: `2 * align(R * 4) + align(T * 256) + 256`
-  bytes within `dkv_latent`).
+* After them, when it fits too, `delta` (`[T, 64]` FP32): `bwd_delta` writes
+  it (it reads neither output), the redo is its last reader
+  (`cake_backend.output_scratch_layout`, `cake_backend.delta_fits_output`:
+  `2 * align(R * 4) + align(T * 256)` bytes within `dkv_latent`).  The global
+  words stay in the workspace (the flagged-row and non-finite counts are read
+  after the backward).
 * Otherwise those parts stay in the workspace or the region.  The eager and
-  autograd entries allocate per call only what stays there of `delta`, the
-  global words and the region (no `topk_length` vector).
+  autograd entries allocate per call only the global words and what stays
+  there of `delta` and the region (no `topk_length` vector).
 
 Peak memory against the non-deterministic package (same binding, allocated
 bytes).  A prepared rope runner with fresh outputs holds the int32
 accumulator where that package holds its FP32 accumulator (2304 B per row)
 plus the counters, grid words and pair counts (44 B per destination row), and
-no `delta`: it needs `align(R * 32) + align(R * 8) + align(R * 4) -
+no `delta`: it needs `align(R * 32) + align(R * 8) + align(R * 4) + 256 -
 align(T * 256)` bytes more, which is less whenever `R <= ~5.8 T`.  A prepared
 NoPE runner needs 48 B per destination row and the global words (one 256-byte
 part) more: its fresh `dkv` is the integer accumulator through the fold, the

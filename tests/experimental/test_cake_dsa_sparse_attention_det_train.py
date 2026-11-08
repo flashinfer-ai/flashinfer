@@ -224,10 +224,10 @@ def test_scratch_layouts_in_dead_output_storage():
         T, S, 96, dq_scratch=True, redo_in_output=True
     )
     assert "qstat" not in moved and moved["region"][1] == region["total"]
-    # delta and the global words follow the redo lists into a fresh dK/dV output when they fit it
+    # delta follows the redo lists into a fresh dK/dV output when it fits; the global words stay in the workspace
     front = cake_backend.output_scratch_layout(T, S)
     assert front["delta"] == (2 * _align(S * 4), T * NUM_HEADS * 4)
-    assert front["globals"] == (2 * _align(S * 4) + _align(T * NUM_HEADS * 4), 64)
+    assert "globals" not in front
     assert cake_backend.delta_fits_output(T, S, S)
     assert cake_backend.redo_lists_fit(64, 64)
     assert not cake_backend.delta_fits_output(T, 64, 64)
@@ -235,8 +235,8 @@ def test_scratch_layouts_in_dead_output_storage():
     no_delta = cake_backend.workspace_layout(
         T, S, 96, dq_scratch=True, redo_in_output=True, delta_in_output=True
     )
-    assert not {"delta", "globals", "qstat"} & set(no_delta)
-    assert no_delta["total"] == moved["total"] - _align(T * NUM_HEADS * 4) - _align(64)
+    assert not {"delta", "qstat"} & set(no_delta) and "globals" in no_delta
+    assert no_delta["total"] == moved["total"] - _align(T * NUM_HEADS * 4)
     per_call = cake_backend.workspace_layout(T, S, 96, per_call=True)
     assert "topk_length" not in per_call
     assert per_call["total"] == cake_backend.workspace_layout(T, S, 96)[
@@ -1235,8 +1235,8 @@ def _inside(x: torch.Tensor, y: torch.Tensor) -> bool:
 
 @pytest.mark.parametrize("mode", ["bf16", "fp32", "acc", "nope", "nope_acc"])
 def test_scratch_in_dead_output_storage_gives_the_same_bits(monkeypatch, mode):
-    """A runner's default plan keeps ``qstat`` and ``knorm`` in dQ and (fresh RoPE outputs) the redo lists,
-    ``delta`` and the global words in the dK/dV output; with most rows recomputed by the redo (``GRID_SHIFT = 24``)
+    """A runner's default plan keeps ``qstat`` and ``knorm`` in dQ and (fresh RoPE outputs) the redo lists and
+    ``delta`` in the dK/dV output; with most rows recomputed by the redo (``GRID_SHIFT = 24``)
     it gives the bits of the plan that keeps only the redo lists there and of the plan that keeps all of them in the
     workspace."""
     nope = mode.startswith("nope")
@@ -1273,15 +1273,15 @@ def test_scratch_in_dead_output_storage_gives_the_same_bits(monkeypatch, mode):
     out_key = "dkv_latent_fp32" if mode == "fp32" else "dkv_latent"
     if fresh:
         out = t[out_key]
-        for name in ("redo_mark", "redo_rows", "delta", "det_globals"):
+        for name in ("redo_mark", "redo_rows", "delta"):
             assert _inside(t[name], out), name
-        # the redo lists alone in the output, delta and the global words in the workspace
+        assert not _inside(t["det_globals"], out)
+        # the redo lists alone in the output, delta in the workspace
         monkeypatch.setattr(cake_backend, "delta_fits_output", lambda *a, **k: False)
         half, same = run()
         h = half.tensors
         assert _inside(h["redo_mark"], h[out_key])
         assert not _inside(h["delta"], h[out_key])
-        assert not _inside(h["det_globals"], h[out_key])
         for a, b in zip(got, same, strict=True):
             assert _same_bits(a, b)
     monkeypatch.setattr(cake_backend, "dq_scratch_layout", lambda *a: None)
