@@ -2866,7 +2866,6 @@ def cake_dense_gemm_det_train_projection_plan(
     mg: Optional[bool] = None,
     sw: Optional[int] = None,
     form: Optional[str] = None,
-    kser: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -2932,9 +2931,10 @@ def cake_dense_gemm_det_train_projection_plan(
     4096 -> 12288 input gradient at T 16172 carry ``kser`` 76) and dropped where the planned program cannot carry it
     (the single-CTA form, an exact, tail-first or synchronised split, the transposed staging, the whole-tile tile
     resolve, a batch raster, the eight-warp form) or where the device's CTA pairs are not P (74 pairs of a 148-SM part,
-    80 of a 160-SM part: the reversed blocks would not be the device's waves); a caller-forced ``kser`` is admitted or
-    refused by ``instance_key``.  It changes neither a launch argument nor the plan arithmetic; the output bits are
-    those of another FP32 summation order than the row's program without it, fixed run to run.
+    80 of a 160-SM part: the reversed blocks would not be the device's waves).  ``kser`` is a rule knob only, not a
+    planner keyword (the registry fallback never names a ``_ks<P>`` program).  It changes neither a launch argument
+    nor the plan arithmetic; the output bits are those of another FP32 summation order than the row's program without
+    it, fixed run to run.
     [Cake K1 kernel host L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -3013,7 +3013,6 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=mg,
         sw=sw,
         form=form,
-        kser=kser,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -3269,12 +3268,9 @@ def cake_dense_gemm_det_train_projection_plan(
         # the measured ``_sw<n>`` programs are pair programs: a caller-forced single-CTA form keeps the row's
         # single-CTA program without it (a caller-forced ``sw`` is admitted or refused by ``instance_key``)
         sw = 0
-    rule_kser = kser is None
-    if kser is None:
-        # the serpentine K walk of the row's rule (the ``_ks<P>`` programs); the wave guard before ``instance_key``
-        # drops it from a plan that cannot carry it or from a device with another pair count
-        kser = rule.get("kser", 0)
-    kser = int(kser)
+    # the serpentine K walk of the row's rule (the ``_ks<P>`` programs): a rule knob only, not a planner keyword; the
+    # wave guard before ``instance_key`` drops it from a plan that cannot carry it or from a device with another pair count
+    kser = int(rule.get("kser", 0))
     rule_form = form is None
     if form is None:
         # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` / ``_w8`` programs): the whole-tile
@@ -3601,22 +3597,17 @@ def cake_dense_gemm_det_train_projection_plan(
     # The wave guard of ``kser``: the ``_ks<P>`` programs reverse the K walk of the whole-K items in every odd block of
     # P items, measured with P = the 76 CTA pairs of the 152-SM parts.  A rule's ``kser`` yields where the planned
     # program cannot carry it (the single-CTA form, an exact / tail-first / synchronised split, the transposed staging,
-    # the whole-tile tile resolve, a batch raster, the eight-warp form) or where the device's pairs are not P; a
-    # caller-forced ``kser`` is admitted or refused by ``instance_key``.
-    if (
-        kser
-        and rule_kser
-        and (
-            cta1
-            or exact_plan is not None
-            or sk_first
-            or sync_plan is not None
-            or stt
-            or mg
-            or batch_group
-            or form
-            or units != kser
-        )
+    # the whole-tile tile resolve, a batch raster, the eight-warp form) or where the device's pairs are not P.
+    if kser and (
+        cta1
+        or exact_plan is not None
+        or sk_first
+        or sync_plan is not None
+        or stt
+        or mg
+        or batch_group
+        or form
+        or units != kser
     ):
         kser = 0
     key = instance_key(
@@ -3880,7 +3871,6 @@ _CTA1_CLEARED = (
     "pro",
     "sk_first",
     "lw",
-    "kser",
 )
 # The caller knobs the eight-warp CTA form yields to (``cake_dense_gemm_det_train_projection_plan``): a value a caller forces for any
 # of them shapes the pipeline, tile, epilogue, tail or raster the form cannot carry, so the row's ten-warp program runs
@@ -3914,7 +3904,6 @@ _W8_FIXED = (
     "lw",
     "mg",
     "sw",
-    "kser",
     "sk_max_units",
     "sk_parts",
 )
@@ -3984,7 +3973,7 @@ def _template_knobs(
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
     row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
     ``_lw`` = the load-warp prelude form, ``_mg`` = the whole-tile tile resolve, ``_sw<n>`` = the paced output stores,
-    ``_ks<P>`` = the serpentine K walk,
+    ``_ks<P>`` = the serpentine K walk - an ``instance_key`` field the planner reads from the rule only,
     ``_w8r`` / ``_w8rs`` / ``_w8`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
@@ -4131,8 +4120,8 @@ def _registry_variants(
         if bool(_template_form(tokens)) != bool(_template_form(wanted)):
             continue  # the eight-warp CTA form is a class of its own (its programs fall back onto each other only)
         knobs = _template_knobs(candidate, sk_exact_parts=sk_exact_parts)
-        if knobs is None or (knobs["batch_group"] and not batched):
-            continue
+        if knobs is None or (knobs["batch_group"] and not batched) or knobs.pop("kser"):
+            continue  # a ``_ks<P>`` program is planned from its rule only (``kser`` is not a planner keyword)
         ranked.append((_template_distance(wanted, tokens), candidate, knobs))
     ranked.sort(key=lambda item: item[:2])
     return tuple(knobs for _, _, knobs in ranked)
