@@ -440,7 +440,9 @@ dq    = cvt.rn.bf16(mul.rn(r, sub.rn(dq_hat, mul.rn(y, dot))))           dq_hat 
 FTZ off everywhere; `cake_l2n.py` is the pure-torch reference of these
 orders (bitwise the device programs; the `fma.rn` of `ss` is emulated
 exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
-`kn` and `r`, then runs #1's body on them), `bwd_dqkg_l2n` (#8 on `qn` /
+`kn` and `r`, then runs #1's body on them; its forward form, record
+`fwd_prep_l2n_fwd`, stores no `akk` / `g_cum` and runs for every forward
+whose `akk` / `g_cum` reach no backward), `bwd_dqkg_l2n` (#8 on `qn` /
 `kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
 runs the unchanged #8 and the reference pullback on the host, per block of
 2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
@@ -515,7 +517,7 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 |---|---|---|
 | 1 | `fwd_prep` | per chunk: cumulative gate, `gamma`, the WY representation (`w`, `u`), `Aqk`, `Akk` |
 | 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` or when its two-CTA grid finishes within the longest walked segment (LPT over two CTAs per SM) and writes bitwise-identical results |
-| 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
+| 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); a CTA whose first 32 chunk decays multiply to at most 2^-64 stops once its carried transition is exactly zero (every later step keeps it zero; bitwise the full walk); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |
 | 5 | `fwd_o` | the output from the `h` tape, `v_new` and `Aqk`; persistent, the tiles beyond the grid drawn in units from a ticket word |
 | 2+5 | `kcp_fwdh_out` (value width `vh` 128 or 64) | the output walk: #2's tape walk from `S_in` that writes each chunk's output from its `h` snapshot, its `v_new` operand, `q`, `Aqk` and `qscale` instead of the `h` / `v_new` tapes; the forward of a light, saved-boundary call that launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (two CTAs per segment and head, the `_vh64` record) runs under #2's rule (`n_walk × HV ≤ SM count`, or its two-CTA grid finishes within the longest walked segment); bitwise the split form's output |
