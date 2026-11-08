@@ -1586,23 +1586,23 @@ _FP8_CAUSAL_FORMS = ("LSE", "SINK")
 
 
 # Per target, the packs whose form programs have a one-stage build.
-_FORM_ONE_STAGE_PACKS = {"sm103a": (1, 2, 4, 8)}
+_FORM_ONE_STAGE_PACKS = {"sm100a": (1, 2, 4, 8), "sm103a": (1, 2, 4, 8)}
 
 
 def _form_program(target, pack, form, max_kv, max_q):
     """The program of an FP8 call of ``form`` at ``pack`` over at most
-    ``max_kv`` keys and ``max_q`` query tokens: sm103a runs the swapped build
-    (``_RUNTIME_SUFFIX``) but over at most 128 keys, where it keeps P in its
-    own S columns, and its one-stage build where every tile holds at most one
-    stage of query tokens (``max_q <= 128 / pack``) at packs 1, 2, 4 and 8."""
+    ``max_kv`` keys and ``max_q`` query tokens: sm103a over at most 128 keys
+    keeps P in its own S columns; else, where every tile holds at most one
+    stage of query tokens (``max_q <= 128 / pack``) at packs 1, 2, 4 and 8,
+    the swapped one-stage build (both targets), and otherwise the target's
+    two-stage build (sm103a: the swapped one, ``_RUNTIME_SUFFIX``)."""
 
     program = f"RUNTIME_PACK{pack}_{form}"
-    if max_kv <= 128:
+    if max_kv <= 128 and target == "sm103a":
         return program
-    program += _RUNTIME_SUFFIX[target]
     if pack in _FORM_ONE_STAGE_PACKS.get(target, ()) and max_q <= 128 // pack:
-        program += "_Q1"
-    return program
+        return program + "_PX_Q1"
+    return program + _RUNTIME_SUFFIX[target]
 
 
 def _form_m_blocks(program, pack, max_q):
@@ -1676,7 +1676,7 @@ def test_cake_fmha_context_fp8_form_programs_are_pinned() -> None:
     assert set(one_stage) == set(_FORM_ONE_STAGE_PACKS)
     for target, packs in _FORM_ONE_STAGE_PACKS.items():
         assert one_stage[target] == {
-            (form, pack, None): f"RUNTIME_PACK{pack}_{form}{_RUNTIME_SUFFIX[target]}_Q1"
+            (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX_Q1"
             for form in _FP8_FORMS
             for pack in packs
         }
@@ -1788,7 +1788,8 @@ def test_cake_fmha_context_fp8_form_short_kv_routes(monkeypatch, target, form) -
     """An sm103a call of another form over at most 128 keys takes the form
     program with each stage's P tile in its own S columns (the same pack,
     m-blocks and arguments), one key more the swapped one; sm100a runs the
-    program with P in its own S columns at every length."""
+    same program at every length (its one-stage calls the swapped one-stage
+    build)."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     monkeypatch.setattr(
@@ -1836,11 +1837,12 @@ def _row_shape(row, batch, max_q, max_kv):
 def test_cake_fmha_context_fp8_form_one_stage_routes(
     monkeypatch, target, form, pack
 ) -> None:
-    """An sm103a call of another form whose tiles hold at most one stage of
-    query tokens (``max_q <= 128 / pack``) over more than 128 keys takes the
-    one-stage build of its form program (one m-block of one stage, host and
-    device scales); one query token past 128 / pack, the two-stage one; over
-    at most 128 keys, the short-KV one; sm100a keeps the two-stage program."""
+    """A call of another form whose tiles hold at most one stage of query
+    tokens (``max_q <= 128 / pack``) over more than 128 keys takes the swapped
+    one-stage build of its form program on both targets (one m-block of one
+    stage, host and device scales); one query token past 128 / pack, the
+    two-stage one; over at most 128 keys, sm103a the program with P in its own
+    S columns and sm100a the one-stage build."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     monkeypatch.setattr(
@@ -1865,11 +1867,11 @@ def test_cake_fmha_context_fp8_form_one_stage_routes(
             assert route.num_m_blocks == _form_m_blocks(program, route.pack_g, q)
             if (q, kv) == (max_q, max_kv):
                 assert route.pack_g == pack, (shape, form, route)
-                one_stage = target == "sm103a"
-                assert program.endswith("_Q1") is one_stage, (shape, form, route)
+                assert program.endswith("_PX_Q1"), (shape, form, route)
                 assert route.num_m_blocks == 1
             elif route.pack_g == pack:
-                assert not program.endswith("_Q1"), (shape, form, route)
+                one_stage = target == "sm100a" and q <= 128 // pack
+                assert program.endswith("_Q1") is one_stage, (shape, form, route)
 
 
 # --- The FP8 split-KV route (host-only) --------------------------------------
@@ -5456,9 +5458,9 @@ def test_cake_context_fp8_form_programs_match_the_jit_route_on_rows_without_keys
 def test_cake_context_fp8_form_one_stage_programs_match_the_jit_route_bitwise(
     monkeypatch, served_programs, pack, form
 ) -> None:
-    """A call of another form whose tiles hold one stage of query tokens
-    (sm103a: the one-stage build) writes the JIT module's output and LSE bit
-    for bit, host and device scales."""
+    """A call of another form whose tiles hold one stage of query tokens (the
+    swapped one-stage build) writes the JIT module's output and LSE bit for
+    bit, host and device scales."""
 
     row, batch, max_q = _FP8_FORM_ONE_STAGE_ROWS[pack]
     case = _context_case(row, batch, max_q)

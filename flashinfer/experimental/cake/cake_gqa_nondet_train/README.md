@@ -72,7 +72,12 @@ without.  The backend package exposes the same entry points (`cake_gqa_nondet`,
 
 Numerics: FP32 accumulation for the scores, `dP`, dK, dV, dQ and the row
 sums; P and dS are rounded to BF16 only as MMA operands.  Every launch is a
-plain stream-ordered launch: nothing cooperative, no PDL.
+plain stream-ordered launch: nothing cooperative, no PDL.  The backward builds
+the tile tables (`bwd_plan`) and the row-map fold order (a stable sort of the
+row map) on a high-priority side stream of the device, forked from the
+current stream and joined back by CUDA events before their first read, so
+they overlap `bwd_pre` and the main kernels; they hold the same integers as
+on the current stream.
 
 ## Workspace and chunking
 
@@ -91,6 +96,27 @@ rewrites the FP32 dQ accumulator once.  The chunks come from host values only
 inside a chunk is computed on the device from `cu_seqlens` (`bwd_plan`).  The budget moves
 the rounding of dQ (its last bits, not its accuracy); `out`, `lse`, dK and dV
 do not depend on it.
+
+A caller that holds the boundaries on the host can pass them as
+`cu_seqlens_q_host` / `cu_seqlens_k_host` (lists or 1-D CPU tensors, both or
+neither; to `cake_gqa_nondet`, the backward and
+`cake_gqa_nondet_train_workspace_bytes`).  The plan then counts each key
+block's exact tiles (the numbering `bwd_plan` computes) instead of the bound
+above, takes the key blocks from the longest key segment, and cuts them into
+the widest even ranges that fit the budget; every range uses one stride, the
+tile count of the fullest range.  The long layouts run in fewer chunks
+(main-kernel and dQ launches with 24 query and 4 KV heads at the default
+budget: 12 to 8 on a CP8 zigzag rank of 300k tokens with 16 segments, 16 to 8
+on issue row 3, 8 to 2 on issue row 1) and with a dS^T workspace of the exact
+size.  The kernels still read the device boundaries.  Before the main kernel a
+device-side assert checks that every device segment's keys lie within the key
+blocks and that every range holds at most its stride of tiles in the device
+numbering.  Host boundaries within both bounds give the device boundaries'
+gradients (only the chunks, and with them the dQ rounding, may differ); past
+them the assert fires instead of leaving key blocks out or writing past a
+chunk.  PyTorch reports a device-side assert at the next synchronization, and
+the process's CUDA context is unusable after it.  The dQ bits depend on
+whether the host boundaries are given (and on their values).
 
 ## Repeatability per output
 
@@ -114,8 +140,9 @@ inputs: `sm_100a` on a GB200, `sm_103a` on a B300, `sm_107a` on an R200.  The
 form.
 
 On one architecture the bits depend only on the shapes (`T_q`, `T_k`, `H_q`,
-`H_kv`, the segment lengths), `max_seqlen_k` and the workspace budget: not on
-the stream, the workspace's earlier calls or kernels running beside it.
+`H_kv`, the segment lengths), `max_seqlen_k`, the workspace budget and, for dQ,
+the host boundaries (given or not): not on the stream, the workspace's earlier
+calls or kernels running beside it.
 
 ## Determinism
 
@@ -127,7 +154,8 @@ or with `warn_only=True`, nothing alerts or warns and the bits do not change.
 ## Checkpointing and memory
 
 Autograd saves `(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)` through
-`ctx.save_for_backward` only; `ctx` holds scalars, the `dkv_acc` callable and
+`ctx.save_for_backward` only; `ctx` holds scalars, the host boundaries as
+lists, the `dkv_acc` callable and
 a weak reference to the workspace.  Under
 `torch.utils.checkpoint(..., use_reentrant=False)` a forward retains nothing,
 and the replay gives the gradients of the run without checkpointing bit for

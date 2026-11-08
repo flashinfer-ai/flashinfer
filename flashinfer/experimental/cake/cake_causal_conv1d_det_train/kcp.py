@@ -98,6 +98,13 @@ changes no collective; every rank of a group passes the same ``cooperative``
 value (one launch form per layer of the group, so that the ranks' ``dweight``
 partials come from one reduction order).
 
+The forward launches ``ctas_per_sm x (SM count - FWD_RESERVE_SMS)`` CTAs when
+they hold every channel tile of ``C``, else the full co-resident grid
+(:func:`_forward_grid`).  Beside one small-carveout kernel of another stream
+that occupies a single SM, every CTA of the shorter grid can then start at
+once; kernels on more SMs still make some CTAs wait for a later wave.  ``y``
+does not depend on the grid.
+
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`CakeCausalConv1dDetKcpRecomputeHandle`, or any object
 with an ``entries`` dict) the original forward exchanges as always and stores
@@ -153,6 +160,13 @@ KCP_BWD_HEAD = "kcp_bwd_head"
 # its reduce program, which starts beside kernels resident on other streams; ``True`` = the cooperative ``kcp_bwd``
 # record, which waits for them (FlashInfer issue #8365).
 COOPERATIVE_DEFAULT = False
+# SMs of co-resident CTAs the forward (``kcp_fwd``) leaves free.  The forward record carries no ``reserve_sms`` (the
+# non-deterministic package's KCP forward runs the same record), so the rule is this host's (:func:`_launch_grid`): with
+# the shorter grid, no forward CTA waits for a second wave beside one small-carveout kernel of another stream resident
+# on an SM (a communication kernel).  A ``C`` whose channel tiles need the reserved SM launches the full grid
+# (:func:`_forward_grid`) and gives up that property.  ``y`` is formed per token in a fixed FMA order, so it does not
+# depend on the grid.
+FWD_RESERVE_SMS = 1
 GRAPH_MODES = (
     "off",
     "replay",
@@ -169,9 +183,10 @@ def _launch_grid(
     C: int | None = None,
     S: int | None = None,
 ) -> tuple[int, int, int]:
-    """The record's launch grid (:func:`cake_jit.launch_grid`) less its ``grid_rule.reserve_sms`` SMs of co-resident CTAs.
+    """The record's launch grid (:func:`cake_jit.launch_grid`) less its reserved SMs of co-resident CTAs: the record's
+    ``grid_rule.reserve_sms``, else :data:`FWD_RESERVE_SMS` for the forward record, else none.
 
-    A backward record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
+    A record with ``reserve_sms = 1`` launches ``ctas_per_sm x (SM count - 1)`` CTAs: one small-carveout kernel of
     another stream resident on an SM keeps the whole SM from hosting a CTA of this program (its shared memory needs the
     SM's large carveout), so a grid one SM short of the co-resident count still starts every CTA at once beside it
     (FlashInfer issue #8365).  The grid is a pure function of the device and the record, so the partial rows and the
@@ -181,7 +196,11 @@ def _launch_grid(
     """
 
     grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
-    reserve = int(record["grid_rule"].get("reserve_sms", 0))
+    reserve = int(
+        record["grid_rule"].get(
+            "reserve_sms", FWD_RESERVE_SMS if record.get("role") == KCP_FWD else 0
+        )
+    )
     if reserve:
         reserved = reserve * int(record["grid_rule"]["ctas_per_sm"])
         if grid[0] <= reserved:
@@ -190,6 +209,25 @@ def _launch_grid(
             )
         grid = (grid[0] - reserved, grid[1], grid[2])
     return grid
+
+
+def _forward_grid(
+    record: dict[str, Any], *, device_index: int, C: int, n_ch_tiles: int
+) -> tuple[int, int, int]:
+    """The forward's launch grid: :func:`_launch_grid` (one SM short, :data:`FWD_RESERVE_SMS`) when that grid holds
+    all ``n_ch_tiles`` channel tiles, else the record's full co-resident grid, which every ``C`` it holds launched with
+    before the reservation (also on a device too small to give up an SM); a ``ValueError`` when not even the full grid
+    holds them.  ``y`` does not depend on the grid."""
+
+    full = _record_launch_grid(record, device_index=device_index)
+    if n_ch_tiles > full[0]:
+        raise ValueError(
+            f"C={C} spans more channel tiles than the forward's grid on this device holds"
+        )
+    reserved = FWD_RESERVE_SMS * int(record["grid_rule"]["ctas_per_sm"])
+    if full[0] - reserved >= max(n_ch_tiles, 1):
+        return _launch_grid(record, device_index=device_index)
+    return full
 
 
 def _cooperative(cooperative: Optional[bool]) -> bool:
@@ -897,10 +935,9 @@ def _kcp_forward(
     device_index = _device_index(device)
     record = _loader.MODULES[name]
     scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    if scalars["n_ch_tiles"] > _launch_grid(record, device_index=device_index)[0]:
-        raise ValueError(
-            f"C={C} spans more channel tiles than the forward's grid on this device holds"
-        )
+    grid = _forward_grid(
+        record, device_index=device_index, C=C, n_ch_tiles=scalars["n_ch_tiles"]
+    )
     values: dict[str, Any] = {
         "x": x_flat,
         "w": w,
@@ -914,7 +951,8 @@ def _kcp_forward(
     }
     if work is not None:
         work.wait()
-    run_module(name, values, device_index=device_index)
+    # the grid of :func:`_forward_grid`, as on the trimmed host path
+    run_module(name, values, device_index=device_index, grid=grid)
     return y, hist
 
 
@@ -965,11 +1003,12 @@ def _fwd_host(
             scalars = plan(
                 S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
             )
-            grid = _launch_grid(record, device_index=device_index)
-            if scalars["n_ch_tiles"] > grid[0]:
-                raise ValueError(
-                    f"C={C} spans more channel tiles than the forward's grid on this device holds"
-                )
+            grid = _forward_grid(
+                record,
+                device_index=device_index,
+                C=C,
+                n_ch_tiles=scalars["n_ch_tiles"],
+            )
             e["scalars"] = _scalars(scalars)
             e["device_index"] = device_index
             e["launch"] = _launch_plan(name, grid, device_index)

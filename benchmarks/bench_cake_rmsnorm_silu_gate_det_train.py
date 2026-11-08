@@ -23,9 +23,9 @@ of the same formula.
 Every row times, on identical generated inputs:
 
 - ``fwd``: one forward call as training runs it (autograd recording);
-- ``bwd``: one backward call (the weight-gradient reduction and its final cast
-  included; for the autograd comparators the time of forward plus backward
-  less the forward);
+- ``bwd``: one backward call (for the Cake rows one kernel: ``dx``, ``dz`` and
+  the weight gradient, rounded once; for the autograd comparators the time of
+  forward plus backward less the forward);
 - ``2fwd+bwd``: the activation-checkpointed step, ``2 * fwd + bwd``;
 - ``ckpt``: the same step measured: ``torch.utils.checkpoint(...,
   use_reentrant=False)`` of the forward, then the backward (which replays it).
@@ -36,13 +36,15 @@ several kernels reports the sum of their GPU time, copies and initializations
 included.  Memory columns report the bytes autograd saves for the backward
 (``saved``) and the peak allocation of one forward plus backward beyond the
 inputs and gradients (``peak``); the Cake rows also report the backward's
-workspace (``workspace``), the FP32 weight-gradient partials it allocates per
-call unless the caller passes one.  Each comparator's outputs are checked
+workspace (``workspace``), a zero-filled FP32 buffer of one size for every row
+count that every call leaves zero (a call without a caller workspace uses its
+stream's, allocated once).  Each comparator's outputs are checked
 against the Cake outputs (largest absolute difference of ``y``, ``dx``, ``dz``,
 ``dw``).
 
 The Cake rows name the forward module the call runs (``module``: its role and
-program, from the row count and the device's SM count).
+program, chosen from the architecture and the layout whatever the row count:
+contiguous inputs run the packed-rows forward where one is routed).
 
 ``--side-stream`` adds, for the Cake kernels, the event-timed median of seven
 forward and seven backward calls beside a one-thread kernel resident on
@@ -122,11 +124,23 @@ def _beside_resident(call: Callable[[], object]) -> dict:
     return {"alone_ms": alone_ms, "busy_ms": busy_ms, "ratio": busy_ms / alone_ms}
 
 
-def _forward_module(rows: int, device: torch.device) -> str:
-    """``<role> <program>`` of the forward module ``rows`` rows run on ``device``."""
+def _forward_module(tokens: int, heads: int, device: torch.device) -> str:
+    """``<role> <program>`` of the forward module a contiguous ``[tokens, heads,
+    128]`` call runs on ``device``."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     arch = _loader.device_arch(index)
-    name = _loader.module_for_rows(arch, "fwd", rows, _loader.device_sm_count(index))
+    rows = tokens * heads
+    tok = heads * _loader.HEAD_DIM if tokens > 1 else 0
+    name = _loader.forward_module(
+        arch,
+        rows,
+        heads,
+        _loader.device_sm_count(index),
+        tok,
+        _loader.HEAD_DIM,
+        tok,
+        _loader.HEAD_DIM,
+    )
     return f"{_loader.MODULES[name]['role']} {name}"
 
 
@@ -248,7 +262,7 @@ def bench_row(
     cake["workspace_bytes"] = cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
         T * H, x.device
     )
-    cake["module"] = _forward_module(T * H, x.device)
+    cake["module"] = _forward_module(T, H, x.device)
     if side_stream:
         y = torch.empty_like(x)
         ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(T * H, x.device)

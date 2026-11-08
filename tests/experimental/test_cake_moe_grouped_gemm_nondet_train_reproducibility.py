@@ -23,12 +23,19 @@ deterministic package's determinism suite (seeded fixed inputs per case):
   deterministic package's bits for ``fwd`` and ``dgrad``;
 * ``fwd`` and ``dgrad`` of the non-deterministic package give the deterministic
   package's bits, the data gradient's own sm_100a L2 evict-first build included
-  (it runs where the deterministic package launches its wide tile);
+  (it runs where the deterministic package launches its own evict-first twin,
+  from this package's larger ``dgrad_evict_first_min_rows``), and so does
+  this package's wide tile where the deterministic package launches an L2
+  evict-first twin that this package's host does not take;
 * the non-deterministic weight gradient, launched ``REPEATS`` times into an
   output filled with zero bytes and ``REPEATS`` times into one filled with
   ``FILL_BYTE``, stays within the deterministic package's budget of the
   deterministic weight gradient on every launch, and of its own first launch;
-  the worst run-to-run variation is reported (``REPRO`` lines);
+  without a split unordered tail it repeats its bits, and gives the
+  deterministic bits where both packages take the same k tile (the
+  deterministic package takes the 512-wide k tile from fewer rows per group on
+  some architectures); the worst run-to-run variation is reported (``REPRO``
+  lines);
 * with the tail split switched off in both packages, the 512-wide k tile's
   unordered-tail builds give the deterministic builds' bits (every whole tile is
   reduced in the deterministic order);
@@ -37,8 +44,10 @@ deterministic package's determinism suite (seeded fixed inputs per case):
   weight gradient give the deterministic package's bits.
 
 On the CPU, the registry mirrors the deterministic package's routes and stages
-(but for the data gradient's own sm_100a ``main_wide_ef`` build, held to the
-deterministic wide tile's launch shape and argument plan).
+(but for the deterministic package's forward evict-first twin, which this package
+does not build, and both packages' accumulate stages); the data gradient's own
+sm_100a ``main_wide_ef`` build is held to the launch shape and argument plan of the
+deterministic package's ``main_wide_ef``.
 """
 
 import dataclasses
@@ -118,9 +127,17 @@ INT_VIEW = {torch.bfloat16: torch.int16, torch.float32: torch.int32}
 # This package's own builds beside the copies: (route, stage) -> the deterministic
 # package's stage of the same kernel and launch.  The data gradient's L2 evict-first
 # twin of the wide tile on the architectures this package's
-# ``dgrad_evict_first_archs`` adds (sm_100a): the deterministic wide
-# domain-scheduled kernel with evict-first G loads and dX stores.
+# ``dgrad_evict_first_archs`` adds (none while the deterministic package serves its
+# own sm_100a twin): the deterministic wide domain-scheduled kernel with
+# evict-first G loads and dX stores.
 OWN_STAGES = {("cake_moe_grouped_gemm_dgrad", "main_wide_ef"): "main_wide"}
+# The architectures where the deterministic package's forward pass takes its L2
+# evict-first twin of the wide tile (``main_wide_ef`` where its ``fwd_evict_first``
+# holds: the gate/up projection) and this package builds no such twin: the forward
+# pass keeps its wide tile there.  The cache policy changes no arithmetic.
+DET_ONLY_FWD_EF_ARCHS = frozenset(
+    det_jit.HOST_PLAN_CONSTANTS.get("fwd_evict_first_archs", ())
+) - frozenset(HOST_PLAN_CONSTANTS.get("fwd_evict_first_archs", ()))
 # Data-gradient cases of the evict-first rule (at least ``dgrad_evict_first_min_rows``
 # rows per group on average, ``K >= dgrad_evict_first_min_k``): (label, sizes, N, K),
 # over group sizes off every tile multiple, with a one-row group (the second and
@@ -372,6 +389,38 @@ def _own_stage(case, name, arch):
     return None
 
 
+def _det_ef_plain(case, name, arch, det_stages):
+    """This package's wide-tile stage for a fwd / dgrad ``case`` on ``arch`` where the
+    deterministic package takes its L2 evict-first twin (``main_wide_ef``) and this
+    package's host does not, else None: the forward twin on ``DET_ONLY_FWD_EF_ARCHS``,
+    and the data gradient's twin where the deterministic package's
+    ``dgrad_evict_first`` holds and this package's does not (fewer rows per group
+    than this package's ``dgrad_evict_first_min_rows``)."""
+    if "main_wide_ef" not in det_stages:
+        return None
+    sum_m, groups = sum(case.sizes), len(case.sizes)
+    stage, _ = cb.select_row_stage(
+        name,
+        case.op,
+        case.n,
+        case.k,
+        arch,
+        HOST_PLAN_CONSTANTS,
+        sum_m=sum_m,
+        num_groups=groups,
+    )
+    if stage == "main_wide_ef":
+        return None
+    if case.op == "fwd":
+        assert arch in DET_ONLY_FWD_EF_ARCHS, (name, arch)
+    else:
+        assert not cb.dgrad_evict_first(
+            case.k, arch, sum_m, groups, HOST_PLAN_CONSTANTS
+        ), (name, arch)
+    assert stage in ("main_wide", "main_wide_ts33"), (name, arch, stage)
+    return stage
+
+
 # ---------------------------------------------------------------------------
 # Registry against the deterministic package (CPU)
 # ---------------------------------------------------------------------------
@@ -397,15 +446,18 @@ def test_routes_mirror_the_deterministic_package():
     ``unordered_tail_archs`` the 512-wide k tile's take the split tail's ``tail_sums``
     and ``tail_tickets`` in place of the partials, and those routes serve no
     ``tail_reduce`` stage there.  A program may also take the row bases of ``A`` / ``B``
-    (``cake_backend.ROW_BASES``: the same tensors again), which a deterministic build
-    of an older kernel does not.  A wave-synchronised stage may be missing on an
+    (``cake_backend.ROW_BASES``: the same tensors again); they are left out of both
+    argument plans.  A wave-synchronised stage may be missing on an
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
-    route's k tile).  The accumulate stages of the 512-wide k tile (``<stage>_acc``,
-    which the deterministic package does not have) are left out of the mirror; their
-    twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks them against
-    their twins.  So is a stage of ``OWN_STAGES`` on an architecture where the
-    deterministic route does not serve it (the data gradient's sm_100a
-    ``main_wide_ef``, this package's own evict-first build): it is held to the
+    route's k tile), and the forward ``main_wide_ef`` on ``DET_ONLY_FWD_EF_ARCHS``
+    (the deterministic package's evict-first twin, not built here).  The accumulate
+    stages (``<stage>_acc``: this package's on the 512-wide k tile, the deterministic
+    package's on both k tiles) are left out of the mirror on both sides; their
+    twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks this
+    package's against their twins.  So is a stage of ``OWN_STAGES`` on an architecture where the
+    deterministic route does not serve it (the data gradient's ``main_wide_ef``,
+    this package's own evict-first build; none while the deterministic package
+    serves its own sm_100a twin): it is held to the
     deterministic stage of the same kernel (``main_wide``), with that stage's launch
     shape, FFI entry and argument plan, under a program name of its own, and only on
     the architectures this package's ``dgrad_evict_first_archs`` adds.  (A CPU check;
@@ -429,6 +481,7 @@ def test_routes_mirror_the_deterministic_package():
                 s["name"]
                 for s in det_route["stages"]
                 if arch in det_programs[s["program"]]["arches"]
+                and not s["name"].endswith(cb.ACC_SUFFIX)
             }
             stages = {
                 s["name"]
@@ -459,7 +512,11 @@ def test_routes_mirror_the_deterministic_package():
                 plan = [
                     tuple(i) for i in program["arg_plan"] if tuple(i) not in row_bases
                 ]
-                det_plan = [tuple(i) for i in det_program["arg_plan"]]
+                det_plan = [
+                    tuple(i)
+                    for i in det_program["arg_plan"]
+                    if tuple(i) not in row_bases
+                ]
                 assert plan == det_plan, (name, stage)
                 # Not a copy: a program of its own, beside the copy of the twin.
                 copy = cake_jit.stage_binding(name, twin, arch)["program"]
@@ -477,6 +534,8 @@ def test_routes_mirror_the_deterministic_package():
                 tile_k = 512 if name.endswith("_k512") else 256
                 if arch not in HOST_PLAN_CONSTANTS["wave_sync_archs"][tile_k]:
                     unselected = {"main_wave", "main_wave_halves"}
+            if route["op"] == "fwd" and arch in DET_ONLY_FWD_EF_ARCHS:
+                unselected = {"main_wide_ef"}
             assert stages <= expected_stages, (name, arch, stages - expected_stages)
             assert expected_stages - stages <= unselected, (
                 name,
@@ -497,6 +556,7 @@ def test_routes_mirror_the_deterministic_package():
                     else [tuple(i) for i in det_program["arg_plan"]]
                 )
                 row_bases = {("buffer", rows) for rows in cb.ROW_BASES}
+                expected = [i for i in expected if i not in row_bases]
                 plan = [tuple(i) for i in program["arg_plan"]]
                 assert [i for i in plan if i not in row_bases] == expected, (
                     name,
@@ -550,12 +610,22 @@ def test_against_the_deterministic_package(label, record_property):
     if case.op != "wgrad":
         # fwd / dgrad: the deterministic programs' bits.  The stages are the
         # deterministic package's, but where this package's host takes its own
-        # evict-first build of the data gradient's wide tile (``OWN_STAGES``).
+        # evict-first build of the data gradient's wide tile (``OWN_STAGES``), and
+        # where it keeps its wide tile in place of the deterministic package's
+        # evict-first twin (``_det_ef_plain``).
         own = _own_stage(case, launch.record_name, cb.arch_for(device))
         twin = OWN_STAGES.get((launch.record_name, own))
-        expected = [own if stage == twin else stage for stage in det.stages]
+        plain = _det_ef_plain(case, launch.record_name, cb.arch_for(device), det.stages)
+        expected = [
+            own
+            if stage == twin
+            else plain
+            if stage == "main_wide_ef" and plain
+            else stage
+            for stage in det.stages
+        ]
         assert list(launch.stages) == expected, (launch.stages, det.stages)
-        record.update(own_stage=own)
+        record.update(own_stage=own, det_ef_plain=plain)
         for fill in (0, FILL_BYTE):
             out.view(torch.uint8).fill_(fill)
             launch.launch()
@@ -602,12 +672,25 @@ def test_against_the_deterministic_package(label, record_property):
         exercised=bool(
             launch.plan["unordered_tail"] and launch.plan["tail_splits"] > 1
         ),
+        det_tile_k=det.plan["tile_k"],
     )
     print("REPRO " + json.dumps(record, sort_keys=True))
     record_property("repro", json.dumps(record, sort_keys=True))
     if not record["exercised"]:
-        # No split unordered tail: the deterministic programs' order, the same bits.
-        assert mismatches == 0 and differ_from_det == 0, record
+        # No split unordered tail: the same bits every launch, and with the
+        # deterministic package's k tile its programs' order and bits.
+        assert mismatches == 0, record
+        if record["det_tile_k"] == launch.plan["tile_k"]:
+            assert differ_from_det == 0, record
+        else:
+            # Only the deterministic package's lower k512_min_rows_per_group
+            # separates the k tiles.
+            arch = record["arch"]
+            rows = sum(case.sizes) / max(len(case.sizes), 1)
+            det_min = det_jit.HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch]
+            own_min = HOST_PLAN_CONSTANTS["k512_min_rows_per_group"][arch]
+            assert (record["det_tile_k"], launch.plan["tile_k"]) == (512, 256), record
+            assert det_min <= rows < own_min, record
     assert worst_vs_det <= 1.0, record
     assert worst_vs_first <= 1.0, record
 
@@ -618,8 +701,8 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
 ):
     """Where this package's ``dgrad_evict_first`` holds, the data gradient launches the
     L2 evict-first twin of its wide tile (``main_wide_ef``; on sm_100a this package's
-    own build, where the deterministic package launches ``main_wide``).  The cache
-    policy changes no arithmetic: over a one-row group, an empty group and group sizes
+    own build).  The cache policy changes no arithmetic: over a one-row group, an
+    empty group and group sizes
     off every tile multiple, dX has the bits of the deterministic package's data
     gradient, of this package's wide tile (``main_wide``) and of its 256-column tile
     (``main``), whatever bytes the output held."""
