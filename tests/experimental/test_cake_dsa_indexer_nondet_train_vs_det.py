@@ -24,11 +24,7 @@ limitations under the License.
 # * every host plan has the deterministic plan's fields (scan program, split, grid, unit, capacity, check period,
 #   sampling, segment order, pair, staging and workspace bytes, ticket decisions), the deterministic package's
 #   rank-fused merge being the plain merge here;
-# * one exception: the sm_107a l6 and CTA-pair l6 keys (``_TICKET_KINDS``), whose deterministic programs keep the
-#   static unit enumeration, run their ticket twins (``_TICKET_TWINS``): the same builds drawing every work unit from
-#   their ``TicketWord`` block, each a program of its own, so a call slows with the SMs another stream holds rather
-#   than by a whole second wave (flashinfer-ai/flashinfer#7548).  The record keeps no static scan kind there;
-# * and on sm_107a the sampled first threshold's launch scalars (tile count and rank shift) are this package's own
+# * on sm_107a the sampled first threshold's launch scalars (tile count and rank shift) are this package's own
 #   (``_OWN_SAMPLING``: its ``sample_class_rule`` and the ``sample_long_rule`` the deterministic record has no field
 #   for), so that no #7549 rank input runs slower with sampling on than off (flashinfer-ai/flashinfer#7549).  Whether a
 #   call samples, and every other decision, stays the deterministic one;
@@ -75,41 +71,22 @@ P1_CU_SEQLENS_K = (0, 1777, 58619, 60742, 128665, 130788, 198711, 200834, 268757
 P2_T, P2_TKV = 16172, 267520
 
 
-# the physical scan kinds whose deterministic programs keep the static enumeration and whose keys run ticket twins here
-_TICKET_KINDS = {"sm_107a": frozenset({"l6", "pair_l6"})}
 # the policy fields this package sets on its own: the deterministic record has no ``sample_long_rule``, and on sm_107a
 # the sampled tile count and rank shift follow this package's class and long-unit rules (#7549)
 _OWN_FIELDS = ("sample_long_rule",)
 _OWN_SAMPLING = {"sm_107a": ("sample_class_rule", "sample_long_rule")}
-# deterministic twenty-hex identity -> ticket twin's (sm_107a-only programs: l6 / pair_l6 x s0:f0, s0:f1, s1:f1)
-_TICKET_TWINS = {
-    "3c9bece1433e9cf03979": "d188e52d69dea931ebd1",
-    "110194b650e766125f9f": "7182498450255eae7083",
-    "384649a6eee3c6a35aa4": "4192ea34f6519197720b",
-    "7d1b556b2aedea7f5249": "802e619829994de2fab4",
-    "9f4b76cb713088f1285d": "070d919ecf1cb5a20275",
-    "88619e22363515835efe": "0633d0c5c9ad00d26f4d",
-}
 
 
 def _nondet_name(det_name: str) -> str:
-    """The non-deterministic program of a deterministic program: the same twenty-hex identity, the other prefix, or
-    the ticket twin's identity for a static sm_107a l6 / CTA-pair l6 program."""
+    """The non-deterministic program of a deterministic program: the same twenty-hex identity, the other prefix."""
     assert det_name.startswith(DET_PREFIX), det_name
-    ident = det_name[len(DET_PREFIX) :]
-    return NONDET_PREFIX + _TICKET_TWINS.get(ident, ident)
+    return NONDET_PREFIX + det_name[len(DET_PREFIX) :]
 
 
 def _det_name(name: str) -> str:
     """The deterministic program a program of this package comes from (the inverse of ``_nondet_name``)."""
     assert name.startswith(NONDET_PREFIX), name
-    ident = name[len(NONDET_PREFIX) :]
-    statics = {twin: static for static, twin in _TICKET_TWINS.items()}
-    return DET_PREFIX + statics.get(ident, ident)
-
-
-def _is_twin(name: str) -> bool:
-    return name[len(NONDET_PREFIX) :] in _TICKET_TWINS.values()
+    return DET_PREFIX + name[len(NONDET_PREFIX) :]
 
 
 def _bf16_keys(keys: dict) -> dict:
@@ -190,10 +167,9 @@ def test_registry_constants_and_argument_plans_are_the_deterministic_ones():
 
 def test_program_keys_are_the_deterministic_bf16_scan_keys_and_the_plain_merge():
     """Per architecture the keys are the deterministic registry's BF16 scan keys and ``merge``, each naming the
-    deterministic program of the same twenty-hex identity under this package's prefix, or its ticket twin on an
-    sm_107a l6 / CTA-pair l6 key; every program record has the deterministic record's role, architectures and
-    ticket-argument architectures, and reads its TicketWord exactly where the deterministic program does, but a twin
-    reads it on sm_107a, where its static deterministic program does not."""
+    deterministic program of the same twenty-hex identity under this package's prefix; every program record has the
+    deterministic record's role, architectures and ticket-argument architectures, and reads its TicketWord exactly
+    where the deterministic program does."""
     assert set(cake_jit.PROGRAM_KEYS) == set(det_jit.PROGRAM_KEYS)
     shipped = set()
     for arch, det_keys in det_jit.PROGRAM_KEYS.items():
@@ -205,44 +181,28 @@ def test_program_keys_are_the_deterministic_bf16_scan_keys_and_the_plain_merge()
         shipped |= set(expected.values())
         for key, det_name in _bf16_keys(det_keys).items():
             if key.startswith("scan:"):
-                name = _nondet_name(det_name)
-                twin = key.split(":")[1] in _TICKET_KINDS.get(arch, ())
-                assert _is_twin(name) == twin, (arch, key, name)
-                if twin:
-                    assert cake_backend.reads_ticket_word(name, arch), (arch, key)
-                    assert not det_backend.reads_ticket_word(det_name, arch), (
-                        arch,
-                        key,
-                    )
-                else:
-                    assert cake_backend.reads_ticket_word(
-                        name, arch
-                    ) == det_backend.reads_ticket_word(det_name, arch), (arch, key)
-        det_skips = det_backend.ticket_tail_skips(arch)
-        assert cake_backend.ticket_tail_skips(arch) == (
-            det_skips - _TICKET_KINDS.get(arch, frozenset())
-        ), arch
+                assert cake_backend.reads_ticket_word(
+                    _nondet_name(det_name), arch
+                ) == det_backend.reads_ticket_word(det_name, arch), (arch, key)
+        assert cake_backend.ticket_tail_skips(
+            arch
+        ) == det_backend.ticket_tail_skips(arch), arch
     assert set(cake_jit.PROGRAMS) == shipped
-    assert sum(_is_twin(name) for name in shipped) == len(_TICKET_TWINS)
     for name, record in cake_jit.PROGRAMS.items():
         det_record = det_jit.PROGRAMS[_det_name(name)]
         for field in ("role", "arches"):
             assert record.get(field) == det_record.get(field), (name, field)
-        if _is_twin(name):
-            assert det_record.get("ticket_arg_arches") is None, name
-            assert record.get("ticket_arg_arches") == ["sm_107a"], name
-        else:
-            assert record.get("ticket_arg_arches") == det_record.get(
-                "ticket_arg_arches"
-            ), name
+        assert record.get("ticket_arg_arches") == det_record.get(
+            "ticket_arg_arches"
+        ), name
         assert record["library"] == name
 
 
 def test_policy_records_are_the_deterministic_records_restricted():
     """Every architecture's dispatch record holds exactly the fields this package's policy reads, with the
     deterministic record's values: the same scan, capacity, check-period, split, pair, sampling and ticket rules,
-    but no static scan kind where the keys run ticket twins and the sm_107a sampling rules of this package
-    (``_OWN_SAMPLING``); ``sample_long_rule`` is set on sm_107a only."""
+    but the sm_107a sampling rules of this package (``_OWN_SAMPLING``); ``sample_long_rule`` is set on sm_107a
+    only."""
     assert set(cake_jit.POLICY) == set(det_jit.POLICY)
     for arch, record in cake_jit.POLICY.items():
         det_record = det_jit.POLICY[arch]
@@ -258,11 +218,6 @@ def test_policy_records_are_the_deterministic_records_restricted():
             for field in record
             if field not in own
         }
-        expected["static_scan_kinds"] = [
-            kind
-            for kind in det_record["static_scan_kinds"]
-            if kind not in _TICKET_KINDS.get(arch, ())
-        ]
         assert {f: v for f, v in record.items() if f not in own} == expected, arch
 
 
