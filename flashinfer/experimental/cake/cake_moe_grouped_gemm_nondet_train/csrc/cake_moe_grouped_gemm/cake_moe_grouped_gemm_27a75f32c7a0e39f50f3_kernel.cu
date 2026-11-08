@@ -145,13 +145,14 @@ __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
 
 
 
-__device__ __forceinline__ void tma_3d_gmem2smem_cta2(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
+
+__device__ __forceinline__ void tma_4d_gmem2smem_cta2(
+    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
     asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cluster.global"
+        "cp.async.bulk.tensor.4d.shared::cluster.global"
         ".mbarrier::complete_tx::bytes.cta_group::2"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
            "r"(mbar_addr) : "memory");
 }
 
@@ -159,7 +160,7 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int sum_m, int N, int K, int ldc, unsigned int* __restrict__ sched, int c0, int c1)
+kernel_cake_moe_grouped_gemm_27a75f32c7a0e39f50f3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int sum_m, int N, int K, int ldc, unsigned int* __restrict__ sched, int c0, int c1)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -269,8 +270,9 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
         { // load_main
             unsigned int load_stage = 0;
             unsigned int work_stage = 0;
-            int num_iters = N / BLOCK_K;
-            unsigned int grid_c_u = (unsigned int)(K / 512);
+            int num_iters = K / BLOCK_K;
+            int prank = cta_rank & 1;
+            unsigned int grid_n_u = (unsigned int)(N / 512);
             unsigned int rows = 0;
             int p_start = 0;
             #pragma unroll 1
@@ -280,10 +282,10 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                 p_start = p_end;
             }
             unsigned int cl = (unsigned int)(c0 + c1);
-            unsigned int w0 = grid_c_u * (unsigned int)c0;
-            unsigned int w1 = grid_c_u * (unsigned int)c1;
+            unsigned int w0 = grid_n_u * (unsigned int)c0;
+            unsigned int w1 = grid_n_u * (unsigned int)c1;
             unsigned int t0 = rows * w0 / cl;
-            unsigned int t1 = rows * grid_c_u - t0;
+            unsigned int t1 = rows * grid_n_u - t0;
             unsigned int g_cur = 0;
             unsigned int g_row0 = 0;
             int g_start = 0;
@@ -292,10 +294,10 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
             unsigned int near = 0;
             if (cta_rank == 0) {
                 unsigned long long base = (unsigned long long)sched;
-                unsigned int chunk_a = (unsigned int)((base + 8319 & 18446744073709543424) - base) >> 2;
+                unsigned int chunk_a = (unsigned int)((base + 8319ull & 18446744073709543424ull) - base) >> 2;
                 unsigned int word_a = chunk_a + (unsigned int)cluster_id % 32 * 32;
-                unsigned long long lat_a = 4294967295;
-                unsigned long long lat_b = 4294967295;
+                unsigned long long lat_a = 4294967295ll;
+                unsigned long long lat_b = 4294967295ll;
                 #pragma unroll
                 for (int _rnd = 0; _rnd < 2; _rnd++) {
                     unsigned long long t0_0;
@@ -333,8 +335,8 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                 if (cta_rank == 0) {
                     queue = near;
                     mbarrier_wait_cluster_hint(work_empty_addr + (work_stage) * 8, _phase_work_empty, 10000000);
-                    unsigned int _atomic_old_0 = atomicAdd(&sched[queue], 1);
-                    work_ring[work_stage * 4] = _atomic_old_0;
+                    unsigned int _atomic_old_1 = atomicAdd(&sched[queue], 1);
+                    work_ring[work_stage * 4] = _atomic_old_1;
                     asm volatile(
                         "{\n\t"
                         ".reg .b32 remAddr32;\n\t"
@@ -352,15 +354,17 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         : "=r"(_mbar_peer_1) : "r"(work_full_addr + (work_stage) * 8), "r"(1));
                     asm volatile(
                         "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                        :: "r"(_cluster_mapa_0), "r"(_atomic_old_0), "r"(_mbar_peer_1) : "memory");
+                        :: "r"(_cluster_mapa_0), "r"(_atomic_old_1), "r"(_mbar_peer_1) : "memory");
                     mbarrier_arrive(work_full_addr + (work_stage) * 8);
-                    unsigned int first = _atomic_old_0;
+                    unsigned int ticket_0 = _atomic_old_1;
+                    unsigned int first = ticket_0;
                     if ((first & 2147483647) >= ((queue == 1) ? t1 : t0)) {
                         claim_ends = claim_ends + 1;
                         queue = queue ^ 1;
                     }
                 }
                 unsigned int ends = 0;
+                unsigned int tiles_done = 0;
                 #pragma unroll 1
                 for (unsigned int _item = 0; _item < t0 + t1 + 2; _item++) {
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
@@ -377,8 +381,8 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     if (cta_rank == 0) {
                         if (claim_ends < 2) {
                             mbarrier_wait_cluster_hint(work_empty_addr + (work_stage) * 8, _phase_work_empty, 10000000);
-                            unsigned int _atomic_old_0_1 = atomicAdd(&sched[queue], 1);
-                            work_ring[work_stage * 4] = _atomic_old_0_1;
+                            unsigned int _atomic_old_1_1 = atomicAdd(&sched[queue], 1);
+                            work_ring[work_stage * 4] = _atomic_old_1_1;
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b32 remAddr32;\n\t"
@@ -396,9 +400,10 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                                 : "=r"(_mbar_peer_3) : "r"(work_full_addr + (work_stage) * 8), "r"(1));
                             asm volatile(
                                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_0_1), "r"(_mbar_peer_3) : "memory");
+                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_1_1), "r"(_mbar_peer_3) : "memory");
                             mbarrier_arrive(work_full_addr + (work_stage) * 8);
-                            unsigned int nxt = _atomic_old_0_1;
+                            unsigned int ticket_0_1 = _atomic_old_1_1;
+                            unsigned int nxt = ticket_0_1;
                             if ((nxt & 2147483647) >= ((queue == 1) ? t1 : t0)) {
                                 claim_ends = claim_ends + 1;
                                 queue = queue ^ 1;
@@ -413,9 +418,9 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     unsigned int r0 = ((k + 1) * cl - 1) / w0s;
                     unsigned int r1 = k * cl / w1s;
                     unsigned int n0 = k - r0 * w0s / cl;
-                    unsigned int n1 = grid_c_u - 1 - (k - (r1 * w1s + cl - 1) / cl);
+                    unsigned int n1 = grid_n_u - 1 - (k - (r1 * w1s + cl - 1) / cl);
                     unsigned int row = ((q == 1) ? r1 : r0);
-                    unsigned int col = ((q == 1) ? n1 : n0);
+                    unsigned int item = ((q == 1) ? n1 : n0);
                     if (valid == 0) {
                         ends = ends + 1;
                     }
@@ -437,26 +442,25 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             g_end = offs[g_cur];
                             g_rows = (unsigned int)((g_end - g_start + CLUSTER_M - 1) / CLUSTER_M);
                         }
-                        int off_m = g_start + (int)(row - g_row0) * CLUSTER_M + cta_rank * BLOCK_M;
-                        int off_k = (int)col * 512 + cta_rank * (BLOCK_N / CTA_GROUP);
+                        int off_m = g_start + (int)(row - g_row0) * CLUSTER_M + prank * BLOCK_M;
+                        int off_n = (int)item * 512 + prank * (BLOCK_N / CTA_GROUP);
                         #pragma unroll 1
-                        for (int iter_n = 0; iter_n < num_iters; iter_n++) {
+                        for (int iter_k = 0; iter_k < num_iters; iter_k++) {
                             mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(smem_a_addr + load_stage * 49152), "l"((&A)), "r"(0), "r"(off_m), "r"(iter_n),
+                                :: "r"(smem_a_addr + load_stage * 49152), "l"((&A)), "r"(0), "r"(off_m), "r"(iter_k),
                                    "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
-                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 49152, (&B), off_k, iter_n * BLOCK_K, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 49152 + 8192, (&B), off_k + 64, iter_n * BLOCK_K, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 49152 + 16384, (&B), off_k + 256, iter_n * BLOCK_K, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 49152 + 24576, (&B), off_k + 320, iter_n * BLOCK_K, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 49152, (&B), 0, off_n, iter_k, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 49152 + 16384, (&B), 0, off_n + 256, iter_k, (int)g_cur, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             asm volatile(
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                                 :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
                             load_stage += 1;
                             if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                         }
+                        tiles_done = tiles_done + 1;
                     }
                 }
                 if (cta_rank == 0) {
@@ -465,12 +469,12 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     if (retired == (unsigned int)num_clusters - 1) {
                         __threadfence();
                         sched[0] = 0;
-                        sched[1] = 2147483648;
+                        sched[1] = 2147483648ll;
                         sched[2] = 0;
                     }
                 }
                 #pragma unroll
-                for (int _ = 0; _ < 4; _++) {
+                for (int _ = 0; _ < NUM_STAGES; _++) {
                     mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                     load_stage += 1;
                     if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
@@ -483,8 +487,8 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
         { // mma_main
             unsigned int mma_tma_stage = 0;
             unsigned int work_stage_m = 0;
-            int num_iters_m = N / BLOCK_K;
-            unsigned int grid_c_m = (unsigned int)(K / 512);
+            int num_iters_m = K / BLOCK_K;
+            unsigned int grid_n_m = (unsigned int)(N / 512);
             unsigned int rows_1 = 0;
             int p_start_1 = 0;
             #pragma unroll 1
@@ -494,15 +498,16 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                 p_start_1 = p_end_1;
             }
             unsigned int cl_1 = (unsigned int)(c0 + c1);
-            unsigned int w0_1 = grid_c_m * (unsigned int)c0;
-            unsigned int w1_1 = grid_c_m * (unsigned int)c1;
+            unsigned int w0_1 = grid_n_m * (unsigned int)c0;
+            unsigned int w1_1 = grid_n_m * (unsigned int)c1;
             unsigned int t0_1 = rows_1 * w0_1 / cl_1;
-            unsigned int t1_2 = rows_1 * grid_c_m - t0_1;
+            unsigned int t1_2 = rows_1 * grid_n_m - t0_1;
             unsigned int _phase_work_full_1 = 0;
             unsigned int _phase_epi_free0 = 1;
             unsigned int _phase_tma_full = 0;
             if (cta_rank == 0) {
                 unsigned int ends_m = 0;
+                unsigned int tiles_done_m = 0;
                 #pragma unroll 1
                 for (unsigned int _item_m = 0; _item_m < t0_1 + t1_2 + 2; _item_m++) {
                     mbarrier_wait(work_full_addr + (work_stage_m) * 8, _phase_work_full_1);
@@ -525,9 +530,9 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     unsigned int r0_1 = ((k_1 + 1) * cl_1 - 1) / w0s_1;
                     unsigned int r1_1 = k_1 * cl_1 / w1s_1;
                     unsigned int n0_1 = k_1 - r0_1 * w0s_1 / cl_1;
-                    unsigned int n1_1 = grid_c_m - 1 - (k_1 - (r1_1 * w1s_1 + cl_1 - 1) / cl_1);
+                    unsigned int n1_1 = grid_n_m - 1 - (k_1 - (r1_1 * w1s_1 + cl_1 - 1) / cl_1);
                     unsigned int row_1 = ((q_1 == 1) ? r1_1 : r0_1);
-                    unsigned int col_1 = ((q_1 == 1) ? n1_1 : n0_1);
+                    unsigned int item_1 = ((q_1 == 1) ? n1_1 : n0_1);
                     if (valid_1 == 0) {
                         ends_m = ends_m + 1;
                     }
@@ -540,7 +545,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_1 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -552,24 +557,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -580,7 +585,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 8, ((mma_tma_stage + 1 < 4) ? _phase_tma_full : _phase_tma_full ^ 1));
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
-                            int _smem_desc_lo_3 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+                            int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -592,24 +597,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -620,7 +625,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 2 >= 4));
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_4 = (((smem_a_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
-                            int _smem_desc_lo_5 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+                            int _smem_desc_lo_5 = (((smem_b_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -632,24 +637,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -660,7 +665,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 3 >= 4));
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_6 = (((smem_a_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
-                            int _smem_desc_lo_7 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+                            int _smem_desc_lo_7 = (((smem_b_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -672,24 +677,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -700,7 +705,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (0 < num_iters_m) {
                             int _smem_desc_lo_8 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_9 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_9 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -712,24 +717,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -741,7 +746,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         if (1 < num_iters_m) {
                             int _smem_desc_lo_10 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_11 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_11 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -753,24 +758,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -782,7 +787,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         if (2 < num_iters_m) {
                             int _smem_desc_lo_12 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_13 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_13 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -794,24 +799,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -823,7 +828,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         if (3 < num_iters_m) {
                             int _smem_desc_lo_14 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_15 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_15 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -835,24 +840,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -867,7 +872,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _mma_b_lo_0 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -879,30 +884,30 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accum), "r"(1) : "memory");
-                            int _mma_b_lo_1 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _mma_b_lo_1 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -914,24 +919,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -945,7 +950,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_16 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_17 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_17 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -957,24 +962,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -985,7 +990,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 8, ((mma_tma_stage + 1 < 4) ? _phase_tma_full : _phase_tma_full ^ 1));
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_18 = (((smem_a_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
-                            int _smem_desc_lo_19 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+                            int _smem_desc_lo_19 = (((smem_b_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -997,24 +1002,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -1025,7 +1030,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 2 >= 4));
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _smem_desc_lo_20 = (((smem_a_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
-                            int _smem_desc_lo_21 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+                            int _smem_desc_lo_21 = (((smem_b_addr) >> 4) & 0x3FFF) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1037,24 +1042,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -1064,7 +1069,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         elect_commit_cg2_multicast(acc_full0_addr, (uint16_t)(3));
                         if (4 < num_iters_m) {
                             int _smem_desc_lo_22 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_23 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_23 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1076,24 +1081,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -1105,7 +1110,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         if (5 < num_iters_m) {
                             int _smem_desc_lo_24 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_25 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_25 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1117,24 +1122,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -1146,7 +1151,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         if (6 < num_iters_m) {
                             int _smem_desc_lo_26 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _smem_desc_lo_27 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _smem_desc_lo_27 = (((smem_b1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1158,24 +1163,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272696464;\n\t"
+                    "mov.b32 id, 272630928;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -1187,6 +1192,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         }
                         elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                         _phase_epi_free0 ^= 1;
+                        tiles_done_m = tiles_done_m + 1;
                     }
                 }
             }
@@ -1199,7 +1205,7 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
             const int epi_warp = warp % 4;
             const int epi_tid = epi_warp * 32 + lane;
             const int epi_half = (warp - 2) / 4;
-            unsigned int grid_c_e = (unsigned int)(K / 512);
+            unsigned int grid_n_e = (unsigned int)(N / 512);
             unsigned int rows_2 = 0;
             int p_start_2 = 0;
             #pragma unroll 1
@@ -1209,16 +1215,17 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                 p_start_2 = p_end_2;
             }
             unsigned int cl_2 = (unsigned int)(c0 + c1);
-            unsigned int w0_2 = grid_c_e * (unsigned int)c0;
-            unsigned int w1_2 = grid_c_e * (unsigned int)c1;
+            unsigned int w0_2 = grid_n_e * (unsigned int)c0;
+            unsigned int w1_2 = grid_n_e * (unsigned int)c1;
             unsigned int t0_2 = rows_2 * w0_2 / cl_2;
-            unsigned int t1_3 = rows_2 * grid_c_e - t0_2;
+            unsigned int t1_3 = rows_2 * grid_n_e - t0_2;
             unsigned int g_cur_e = 0;
             unsigned int g_row0_e = 0;
             int g_start_e = 0;
             int g_end_e = offs[0];
             unsigned int g_rows_e = (unsigned int)((g_end_e + CLUSTER_M - 1) / CLUSTER_M);
             unsigned int ends_e = 0;
+            unsigned int tiles_done_e = 0;
             unsigned int _phase_work_full_2 = 0;
             unsigned int _phase_acc_full0 = 0;
             #pragma unroll 1
@@ -1243,9 +1250,9 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                 unsigned int r0_2 = ((k_2 + 1) * cl_2 - 1) / w0s_2;
                 unsigned int r1_2 = k_2 * cl_2 / w1s_2;
                 unsigned int n0_2 = k_2 - r0_2 * w0s_2 / cl_2;
-                unsigned int n1_2 = grid_c_e - 1 - (k_2 - (r1_2 * w1s_2 + cl_2 - 1) / cl_2);
+                unsigned int n1_2 = grid_n_e - 1 - (k_2 - (r1_2 * w1s_2 + cl_2 - 1) / cl_2);
                 unsigned int row_2 = ((q_2 == 1) ? r1_2 : r0_2);
-                unsigned int col_2 = ((q_2 == 1) ? n1_2 : n0_2);
+                unsigned int item_2 = ((q_2 == 1) ? n1_2 : n0_2);
                 if (valid_2 == 0) {
                     ends_e = ends_e + 1;
                 }
@@ -1267,12 +1274,12 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                         g_end_e = offs[g_cur_e];
                         g_rows_e = (unsigned int)((g_end_e - g_start_e + CLUSTER_M - 1) / CLUSTER_M);
                     }
-                    int row_g = g_start_e + (int)(row_2 - g_row0_e) * CLUSTER_M + cta_rank * BLOCK_M + epi_tid;
+                    int row_g = g_start_e + (int)(row_2 - g_row0_e) * CLUSTER_M + (cta_rank & 1) * BLOCK_M + epi_tid;
                     mbarrier_wait(acc_full0_addr, _phase_acc_full0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int _packed_0[128];
                     float _tmem_load_0[32];
-                    int tmem_row = taddr + (unsigned int)(cta_rank * 128 + epi_warp * 32 << 16) + (unsigned int)(epi_half * 128);
+                    int tmem_row = taddr + (unsigned int)((cta_rank & 1) * 128 + epi_warp * 32 << 16) + (unsigned int)(epi_half * 128);
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -1977,23 +1984,24 @@ kernel_cake_moe_grouped_gemm_68f4f0125c2ec1f39ca1(const __grid_constant__ CUtens
                     }
                     _phase_acc_full0 ^= 1;
                     if (row_g < g_end_e) {
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128))), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "r"(_packed_0[(0) + 2]), "r"(_packed_0[(0) + 3]), "r"(_packed_0[(0) + 4]), "r"(_packed_0[(0) + 5]), "r"(_packed_0[(0) + 6]), "r"(_packed_0[(0) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128))), "r"(_packed_0[(64) + 0]), "r"(_packed_0[(64) + 1]), "r"(_packed_0[(64) + 2]), "r"(_packed_0[(64) + 3]), "r"(_packed_0[(64) + 4]), "r"(_packed_0[(64) + 5]), "r"(_packed_0[(64) + 6]), "r"(_packed_0[(64) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 16))), "r"(_packed_0[(8) + 0]), "r"(_packed_0[(8) + 1]), "r"(_packed_0[(8) + 2]), "r"(_packed_0[(8) + 3]), "r"(_packed_0[(8) + 4]), "r"(_packed_0[(8) + 5]), "r"(_packed_0[(8) + 6]), "r"(_packed_0[(8) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 16))), "r"(_packed_0[(72) + 0]), "r"(_packed_0[(72) + 1]), "r"(_packed_0[(72) + 2]), "r"(_packed_0[(72) + 3]), "r"(_packed_0[(72) + 4]), "r"(_packed_0[(72) + 5]), "r"(_packed_0[(72) + 6]), "r"(_packed_0[(72) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 32))), "r"(_packed_0[(16) + 0]), "r"(_packed_0[(16) + 1]), "r"(_packed_0[(16) + 2]), "r"(_packed_0[(16) + 3]), "r"(_packed_0[(16) + 4]), "r"(_packed_0[(16) + 5]), "r"(_packed_0[(16) + 6]), "r"(_packed_0[(16) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 32))), "r"(_packed_0[(80) + 0]), "r"(_packed_0[(80) + 1]), "r"(_packed_0[(80) + 2]), "r"(_packed_0[(80) + 3]), "r"(_packed_0[(80) + 4]), "r"(_packed_0[(80) + 5]), "r"(_packed_0[(80) + 6]), "r"(_packed_0[(80) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 48))), "r"(_packed_0[(24) + 0]), "r"(_packed_0[(24) + 1]), "r"(_packed_0[(24) + 2]), "r"(_packed_0[(24) + 3]), "r"(_packed_0[(24) + 4]), "r"(_packed_0[(24) + 5]), "r"(_packed_0[(24) + 6]), "r"(_packed_0[(24) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 48))), "r"(_packed_0[(88) + 0]), "r"(_packed_0[(88) + 1]), "r"(_packed_0[(88) + 2]), "r"(_packed_0[(88) + 3]), "r"(_packed_0[(88) + 4]), "r"(_packed_0[(88) + 5]), "r"(_packed_0[(88) + 6]), "r"(_packed_0[(88) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 64))), "r"(_packed_0[(32) + 0]), "r"(_packed_0[(32) + 1]), "r"(_packed_0[(32) + 2]), "r"(_packed_0[(32) + 3]), "r"(_packed_0[(32) + 4]), "r"(_packed_0[(32) + 5]), "r"(_packed_0[(32) + 6]), "r"(_packed_0[(32) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 64))), "r"(_packed_0[(96) + 0]), "r"(_packed_0[(96) + 1]), "r"(_packed_0[(96) + 2]), "r"(_packed_0[(96) + 3]), "r"(_packed_0[(96) + 4]), "r"(_packed_0[(96) + 5]), "r"(_packed_0[(96) + 6]), "r"(_packed_0[(96) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 80))), "r"(_packed_0[(40) + 0]), "r"(_packed_0[(40) + 1]), "r"(_packed_0[(40) + 2]), "r"(_packed_0[(40) + 3]), "r"(_packed_0[(40) + 4]), "r"(_packed_0[(40) + 5]), "r"(_packed_0[(40) + 6]), "r"(_packed_0[(40) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 80))), "r"(_packed_0[(104) + 0]), "r"(_packed_0[(104) + 1]), "r"(_packed_0[(104) + 2]), "r"(_packed_0[(104) + 3]), "r"(_packed_0[(104) + 4]), "r"(_packed_0[(104) + 5]), "r"(_packed_0[(104) + 6]), "r"(_packed_0[(104) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 96))), "r"(_packed_0[(48) + 0]), "r"(_packed_0[(48) + 1]), "r"(_packed_0[(48) + 2]), "r"(_packed_0[(48) + 3]), "r"(_packed_0[(48) + 4]), "r"(_packed_0[(48) + 5]), "r"(_packed_0[(48) + 6]), "r"(_packed_0[(48) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 96))), "r"(_packed_0[(112) + 0]), "r"(_packed_0[(112) + 1]), "r"(_packed_0[(112) + 2]), "r"(_packed_0[(112) + 3]), "r"(_packed_0[(112) + 4]), "r"(_packed_0[(112) + 5]), "r"(_packed_0[(112) + 6]), "r"(_packed_0[(112) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + epi_half * 128 + 112))), "r"(_packed_0[(56) + 0]), "r"(_packed_0[(56) + 1]), "r"(_packed_0[(56) + 2]), "r"(_packed_0[(56) + 3]), "r"(_packed_0[(56) + 4]), "r"(_packed_0[(56) + 5]), "r"(_packed_0[(56) + 6]), "r"(_packed_0[(56) + 7]) : "memory");
-                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)col_2 * 512 + 256 + epi_half * 128 + 112))), "r"(_packed_0[(120) + 0]), "r"(_packed_0[(120) + 1]), "r"(_packed_0[(120) + 2]), "r"(_packed_0[(120) + 3]), "r"(_packed_0[(120) + 4]), "r"(_packed_0[(120) + 5]), "r"(_packed_0[(120) + 6]), "r"(_packed_0[(120) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128))), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "r"(_packed_0[(0) + 2]), "r"(_packed_0[(0) + 3]), "r"(_packed_0[(0) + 4]), "r"(_packed_0[(0) + 5]), "r"(_packed_0[(0) + 6]), "r"(_packed_0[(0) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128))), "r"(_packed_0[(64) + 0]), "r"(_packed_0[(64) + 1]), "r"(_packed_0[(64) + 2]), "r"(_packed_0[(64) + 3]), "r"(_packed_0[(64) + 4]), "r"(_packed_0[(64) + 5]), "r"(_packed_0[(64) + 6]), "r"(_packed_0[(64) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 16))), "r"(_packed_0[(8) + 0]), "r"(_packed_0[(8) + 1]), "r"(_packed_0[(8) + 2]), "r"(_packed_0[(8) + 3]), "r"(_packed_0[(8) + 4]), "r"(_packed_0[(8) + 5]), "r"(_packed_0[(8) + 6]), "r"(_packed_0[(8) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 16))), "r"(_packed_0[(72) + 0]), "r"(_packed_0[(72) + 1]), "r"(_packed_0[(72) + 2]), "r"(_packed_0[(72) + 3]), "r"(_packed_0[(72) + 4]), "r"(_packed_0[(72) + 5]), "r"(_packed_0[(72) + 6]), "r"(_packed_0[(72) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 32))), "r"(_packed_0[(16) + 0]), "r"(_packed_0[(16) + 1]), "r"(_packed_0[(16) + 2]), "r"(_packed_0[(16) + 3]), "r"(_packed_0[(16) + 4]), "r"(_packed_0[(16) + 5]), "r"(_packed_0[(16) + 6]), "r"(_packed_0[(16) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 32))), "r"(_packed_0[(80) + 0]), "r"(_packed_0[(80) + 1]), "r"(_packed_0[(80) + 2]), "r"(_packed_0[(80) + 3]), "r"(_packed_0[(80) + 4]), "r"(_packed_0[(80) + 5]), "r"(_packed_0[(80) + 6]), "r"(_packed_0[(80) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 48))), "r"(_packed_0[(24) + 0]), "r"(_packed_0[(24) + 1]), "r"(_packed_0[(24) + 2]), "r"(_packed_0[(24) + 3]), "r"(_packed_0[(24) + 4]), "r"(_packed_0[(24) + 5]), "r"(_packed_0[(24) + 6]), "r"(_packed_0[(24) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 48))), "r"(_packed_0[(88) + 0]), "r"(_packed_0[(88) + 1]), "r"(_packed_0[(88) + 2]), "r"(_packed_0[(88) + 3]), "r"(_packed_0[(88) + 4]), "r"(_packed_0[(88) + 5]), "r"(_packed_0[(88) + 6]), "r"(_packed_0[(88) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 64))), "r"(_packed_0[(32) + 0]), "r"(_packed_0[(32) + 1]), "r"(_packed_0[(32) + 2]), "r"(_packed_0[(32) + 3]), "r"(_packed_0[(32) + 4]), "r"(_packed_0[(32) + 5]), "r"(_packed_0[(32) + 6]), "r"(_packed_0[(32) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 64))), "r"(_packed_0[(96) + 0]), "r"(_packed_0[(96) + 1]), "r"(_packed_0[(96) + 2]), "r"(_packed_0[(96) + 3]), "r"(_packed_0[(96) + 4]), "r"(_packed_0[(96) + 5]), "r"(_packed_0[(96) + 6]), "r"(_packed_0[(96) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 80))), "r"(_packed_0[(40) + 0]), "r"(_packed_0[(40) + 1]), "r"(_packed_0[(40) + 2]), "r"(_packed_0[(40) + 3]), "r"(_packed_0[(40) + 4]), "r"(_packed_0[(40) + 5]), "r"(_packed_0[(40) + 6]), "r"(_packed_0[(40) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 80))), "r"(_packed_0[(104) + 0]), "r"(_packed_0[(104) + 1]), "r"(_packed_0[(104) + 2]), "r"(_packed_0[(104) + 3]), "r"(_packed_0[(104) + 4]), "r"(_packed_0[(104) + 5]), "r"(_packed_0[(104) + 6]), "r"(_packed_0[(104) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 96))), "r"(_packed_0[(48) + 0]), "r"(_packed_0[(48) + 1]), "r"(_packed_0[(48) + 2]), "r"(_packed_0[(48) + 3]), "r"(_packed_0[(48) + 4]), "r"(_packed_0[(48) + 5]), "r"(_packed_0[(48) + 6]), "r"(_packed_0[(48) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 96))), "r"(_packed_0[(112) + 0]), "r"(_packed_0[(112) + 1]), "r"(_packed_0[(112) + 2]), "r"(_packed_0[(112) + 3]), "r"(_packed_0[(112) + 4]), "r"(_packed_0[(112) + 5]), "r"(_packed_0[(112) + 6]), "r"(_packed_0[(112) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + epi_half * 128 + 112))), "r"(_packed_0[(56) + 0]), "r"(_packed_0[(56) + 1]), "r"(_packed_0[(56) + 2]), "r"(_packed_0[(56) + 3]), "r"(_packed_0[(56) + 4]), "r"(_packed_0[(56) + 5]), "r"(_packed_0[(56) + 6]), "r"(_packed_0[(56) + 7]) : "memory");
+                        asm volatile("st.global.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(C + (row_g * ldc + ((int)item_2 * 512 + 256 + epi_half * 128 + 112))), "r"(_packed_0[(120) + 0]), "r"(_packed_0[(120) + 1]), "r"(_packed_0[(120) + 2]), "r"(_packed_0[(120) + 3]), "r"(_packed_0[(120) + 4]), "r"(_packed_0[(120) + 5]), "r"(_packed_0[(120) + 6]), "r"(_packed_0[(120) + 7]) : "memory");
                     }
+                    tiles_done_e = tiles_done_e + 1;
                 }
             }
         }
