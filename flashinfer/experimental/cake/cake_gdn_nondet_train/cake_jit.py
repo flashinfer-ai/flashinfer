@@ -46,7 +46,10 @@ cumsum, FP32 beta), ``prep_tma`` / ``prep_tma_bf16beta`` (the same prep with
 the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
 ``wy_tc`` (the WY representation, tcgen05), ``wy_tc2`` (the same chains and
 outputs in a five-CTA-per-SM form: a 64-column TMEM accumulator and packed
-lower-triangular operands), the forward
+lower-triangular operands), ``wy_a`` (the WY A
+producer of the rows whose forward scan is serial: ``A =
+bf16((I + L)^-1)`` by tcgen05 and TF32x3 merges with the prep's rstd_q /
+rstd_k / g_cs / qn / kn bits, one persistent CTA per SM), the forward
 register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
 segment-parallel route; the serial and split scans serve the backward's
 recompute), ``stitch``
@@ -54,7 +57,9 @@ recompute), ``stitch``
 output in one tcgen05 kernel), ``fwd_ho_vh2`` (the same scan and output split
 over the two value halves, two CTAs per segment and value head; the same
 bits; on ``sm_107a`` record ``fwd_ho_vh2_sm_107a``, on ``sm_100a`` and
-``sm_103a``, which never run it, the ``fwd_ho`` program), ``dv_local``, the adjoint register scans
+``sm_103a``, which never run it, the ``fwd_ho`` program), ``fwd_ho_a`` (the
+fused scan and output on ``wy_a``'s A, qn and kn: u and w formed in the CTA,
+the h / v_new / w tapes by its ``tape`` word), ``dv_local``, the adjoint register scans
 ``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
 pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA) and
 ``dhu_pre_dvl32_r64k1`` (the same pre-scan adding its FP32 ``dv_local`` tiles
@@ -98,6 +103,7 @@ STAGES = (
     "prep_tma_bf16beta",
     "wy_tc",
     "wy_tc2",
+    "wy_a",
     "fwd_h_r32k2",
     "fwd_h_r32k1",
     "fwd_h_r64k1",
@@ -108,6 +114,7 @@ STAGES = (
     "stitch",
     "fwd_ho",
     "fwd_ho_vh2",
+    "fwd_ho_a",
     "dv_local",
     "dhu_r32k2",
     "dhu_r32k1",
@@ -413,6 +420,41 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_0954d744f023a6df38b6",
         "stage": "wy_tc2",
+    },
+    "wy_a": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "k_tma64"],
+            ["buffer", "k_tma32"],
+            ["buffer", "q_tma"],
+            ["buffer", "glog"],
+            ["buffer", "beta"],
+            ["buffer", "a_out"],
+            ["buffer", "rk_out"],
+            ["buffer", "rq_out"],
+            ["buffer", "gcs_out"],
+            ["buffer", "qn_out"],
+            ["buffer", "kn_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_chunks"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_wy_a",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_wy_a",
+        "stage": "wy_a",
     },
     "fwd_h_r32k2": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -844,6 +886,55 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_987a195ad34c5460d24d",
         "stage": "fwd_ho_vh2",
+    },
+    "fwd_ho_a": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "a_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "beta"],
+            ["buffer", "h0"],
+            ["buffer", "seg_start"],
+            ["buffer", "h_tma"],
+            ["buffer", "h_out"],
+            ["buffer", "v_new_tma"],
+            ["buffer", "v_new"],
+            ["buffer", "o_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "final_state"],
+            ["buffer", "w_tma"],
+            ["buffer", "w_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "walk"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "use_seg_start"],
+            ["parameter", "scale"],
+            ["parameter", "tape"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_fwd_ho_a",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_fwd_ho_a",
+        "stage": "fwd_ho_a",
     },
     "dv_local": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
