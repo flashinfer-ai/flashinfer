@@ -73,8 +73,10 @@ void Run(TensorView a_x, TensorView a_y, int64_t a_T, int64_t a_hv, int64_t grid
       << KERNEL_NAME << ": requires (T <= 4194303)";
   TVM_FFI_CHECK((a_hv >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (hv >= 1)";
-  TVM_FFI_CHECK((a_hv <= 1024LL), ValueError)
-      << KERNEL_NAME << ": requires (hv <= 1024)";
+  TVM_FFI_CHECK((a_hv <= 2048LL), ValueError)
+      << KERNEL_NAME << ": requires (hv <= 2048)";
+  TVM_FFI_CHECK((a_hv == a_hv), ValueError)
+      << KERNEL_NAME << ": requires (hv == hv)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

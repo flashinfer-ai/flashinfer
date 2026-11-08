@@ -577,6 +577,15 @@ kernel_cake_dsa_indexer_nondet_topk_04db38446d526901fed3(const __grid_constant__
                     }
                     unit_base_q += (nb + 1) / 2;
                 }
+                if (rank_q == 0) {
+                    if (n_tot_q > g_units_q) {
+                        if (nunit_q >= 1) {
+                            mbarrier_arrive_expect_tx(tk_peer_addr, 4);
+                            mbarrier_wait_cluster_hint(tk_peer_addr, _phase_tk_peer, 10000000);
+                            _phase_tk_peer ^= 1;
+                        }
+                    }
+                }
             }
             __syncwarp();
         }

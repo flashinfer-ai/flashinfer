@@ -5645,6 +5645,92 @@ def test_walk_streams_knob_is_gated_and_validated(monkeypatch) -> None:
             cake_kcp._options({"_kcp_test_knobs": {"walk_streams": bad}})
 
 
+def test_bwd_tape_stream_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``bwd_tape_stream`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a
+    public keyword, validated against :data:`BWD_TAPE_STREAMS`; the shipped default is ``"post"`` (the tape replay on
+    the side stream, forked after the adjoint offset walk)."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert cake_kcp.BWD_TAPE_STREAMS == (
+        "one",
+        "pre",
+        "mid",
+        "post",
+        "pre_hi",
+        "mid_hi",
+        "post_hi",
+    )
+    assert cake_kcp.BWD_TAPE_STREAM_DEFAULT == "post"
+    assert cake_kcp.P2_KNOBS["bwd_tape_stream"] == cake_kcp.BWD_TAPE_STREAMS
+    assert cake_kcp._options({}).bwd_tape_stream == "post"
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"bwd_tape_stream": "one"}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"bwd_tape_stream": "one"})
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    for form in cake_kcp.BWD_TAPE_STREAMS:
+        o = cake_kcp._options({"_kcp_test_knobs": {"bwd_tape_stream": form}})
+        assert o.bwd_tape_stream == form
+    for bad in ("two", "side", "Pre", "hi"):
+        with pytest.raises(ValueError, match="bwd_tape_stream"):
+            cake_kcp._options({"_kcp_test_knobs": {"bwd_tape_stream": bad}})
+
+
+# the tape replay's operands and tapes (cake_kcp_jit._WALK_OPERANDS["kcp_fwdh_tape"]) and the launch steps of the
+# single-rank lifetime tables: 3 = the replay, 5 = the adjoint walks (the offset walk writes only the call's pools; the
+# tape walk writes dh / dv2 after the side stream's join)
+_TAPE_REPLAY_STEP, _ADJ_WALK_STEP = 3, 5
+
+
+def test_bwd_tape_side_stream_arena_lifetimes() -> None:
+    """The side-stream tape replay (knob ``bwd_tape_stream``) rests on the backward layouts: in the replay layout
+    (:data:`LOCAL_LAYOUT_BWD`) and the lean layout, over gates, L2 norm modes, head counts, geometries and tail
+    passes, every buffer that shares bytes with an operand of the replay (``w`` / ``kg`` / ``u`` / ``gk``) or one of
+    its tapes (``h`` / ``v_new``) is dead before the replay (last read before step 3) or first written at the adjoint
+    walks' step 5 or later (the adjoint tape walk's ``dh`` over ``u``, which the side stream's join precedes), and the
+    replay's operands are live at step 3.  No buffer of the dav step (4) shares bytes with them."""
+    assert set(cake_kcp_jit._WALK_OPERANDS["kcp_fwdh_tape"]) == {
+        "w",
+        "kg",
+        "u",
+        "gk",
+        "h",
+        "v_new",
+    }
+    operands = cake_kcp_jit._WALK_OPERANDS["kcp_fwdh_tape"]
+    kp.register_lean_layout()
+    checked = 0
+    for arch, sm in (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 216)):
+        for pack in ((16384,), (6144, 4096, 3584, 2560), (300, 724, 476), (64,) * 12):
+            for H in (16, 32, 64):
+                for gate, l2n in (("g", "off"), ("g", "fused"), ("raw", "fused")):
+                    p = cake_backend.plan(
+                        sum(pack), len(pack), H, sm, arch, gate=gate, l2n=l2n
+                    )
+                    layouts = [(cake_kcp.LOCAL_LAYOUT_BWD, 1)]
+                    if l2n == "off" and gate == "g":
+                        layouts += [(kp.LOCAL_LAYOUT_BWD_LEAN, b) for b in (1, 2, 4)]
+                    for mode, b in layouts:
+                        regions = p.layout(mode, b)
+                        by_name = {r.name: r for r in regions}
+                        for name in operands:
+                            o = by_name[name]
+                            assert (
+                                o.lifetime[0] <= _TAPE_REPLAY_STEP <= o.lifetime[1]
+                            ), (mode, name, o.lifetime)
+                            for x in regions:
+                                if x is o or not (
+                                    x.offset < o.offset + o.nbytes
+                                    and o.offset < x.offset + x.nbytes
+                                ):
+                                    continue
+                                assert (
+                                    x.lifetime[1] < _TAPE_REPLAY_STEP
+                                    or x.lifetime[0] >= _ADJ_WALK_STEP
+                                ), (arch, pack, H, gate, l2n, mode, b, name, x.name)
+                                checked += 1
+    assert checked > 0
+
+
 def test_default_options_are_fresh_validated_copies(monkeypatch) -> None:
     """``_default_options()`` (an entry point without keyword options) equals ``_options({})`` and the defaults
     validated through the full path field by field, returns a fresh object per call (a caller's change stays in its
@@ -6176,6 +6262,7 @@ LOCAL_RECORD_CASES = [
     (64, "sm_103a", 152),
     (64, "sm_107a", 216),
     (4, "sm_100a", 148),
+    (12, "sm_103a", 152),
 ]
 
 
@@ -6190,7 +6277,8 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     every logical name of every
     record it launches -- the plan's records on the forward path without a saved set and on the replay path, the
     direct WY record where the plan fuses the WY representation into a recurrence the KCP does not run, and the
-    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
+    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids (``kcp_dav`` only where the plan dispatches its dav stage,
+    H 12 here: :func:`cake_kcp_plan.kcp_dav_needed`); the two backward modes launch the same records on the same
     grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
     bytes count it) while every other program reads the context's tables."""
     part = _small_partition(2)
@@ -6330,7 +6418,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
         expect("bwd_prep", b),
         expect("fwd_intra", b),
         expect("wy", b),
-        "kcp_dav",
+        *(["kcp_dav"] if kp.kcp_dav_needed(plan) else []),
         expect("dqkg", b),
         expect("glm_intra", b),
         # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a: glm_intra;
@@ -6378,7 +6466,9 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
         fwd[1][3]["chunk_bos"] is ctx.tables["chunk_bos"]
     )  # the WY program reads the context's tables
     assert fwd[2][2] == (plan.NC_pad * H, 1, 1)
-    assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
+    assert kp.kcp_dav_needed(plan) == (H == 12)
+    if kp.kcp_dav_needed(plan):
+        assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
     for kind, record, grid, _values in fwd + bwd:
         if kind == "backend":
             stage = cake_jit.MODULES[record]["stage"]
@@ -6780,6 +6870,98 @@ def test_gpu_fused_forward_output_is_bitwise_and_one_launch_fewer(
         assert b0["n_launches"] == b1["n_launches"]
 
 
+# the kcp_dav knob rows: one rank, H 4 / 16 / 64 (the fused gradient stores every dAqk row: "auto" skips kcp_dav) and
+# H 12 (the plan dispatches its dav stage: both values launch it)
+KCP_DAV_ROWS = [
+    ((300, 724, 476), 4),
+    ((300, 724, 476), 12),
+    ((3000,), 16),
+    ((300, 724, 476), 64),
+]
+KCP_DAV_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in KCP_DAV_ROWS]
+
+
+@pytest.mark.parametrize("lengths,H", KCP_DAV_ROWS, ids=KCP_DAV_IDS)
+def test_gpu_kcp_dav_always_is_bitwise_auto(device, monkeypatch, lengths, H) -> None:
+    """The private test knob ``kcp_dav="always"`` (``kcp_dav`` on every backward of the replay layout) against the
+    shipped ``"auto"`` (only where ``cake_kcp_plan.kcp_dav_needed``, H 9-15), one rank: ``out``, the saved set and
+    every gradient of a saved-mode and a replay-mode backward and of a checkpointed autograd call are bitwise equal
+    (the adjoint walks form ``dv1`` themselves and the fused gradient stores every ``dAqk`` row where "auto" skips
+    it); ``LAST_CALL["bwd"]["kcp_dav"]`` records the launch, the stage is counted either way.  The checkpointed
+    call's backward binds the recompute's kept intra rows (``intra_rows="ckpt"``), and every K2 adjoint walk it
+    launches reads ``aqk_int`` from them (the carrier form) or from the arena rows they were copied into."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    needed = 9 <= H <= 15
+    # the K2 walks' aqk_int and the rows a backward binds (carrier) or copies into its arena (copy)
+    k2: list = []
+    rows_at: list = []
+    real_walk = cake_kcp_jit._walk
+    real_bind = cake_kcp._bind_intra_rows
+    real_copy = cake_kcp._copy_intra_rows
+
+    def walk(name, a, call, device_index):
+        # the K2 adjoint walks (the fused forward walk reads aqk_int too, in the forwards)
+        if (
+            name.startswith("kcp_dhu")
+            and "aqk_int" in cake_kcp_jit._WALK_OPERANDS[name]
+        ):
+            k2.append((name, call.local_values["aqk_int"].data_ptr()))
+        return real_walk(name, a, call, device_index)
+
+    def bind(call, rows):
+        rows_at.append(("carrier", rows[0].data_ptr()))
+        return real_bind(call, rows)
+
+    def copy(call, rows):
+        real_copy(call, rows)
+        rows_at.append(("copy", call.scratch["views"].aqk_int.data_ptr()))
+
+    monkeypatch.setattr(cake_kcp_jit, "_walk", walk)
+    monkeypatch.setattr(cake_kcp, "_bind_intra_rows", bind)
+    monkeypatch.setattr(cake_kcp, "_copy_intra_rows", copy)
+    res: dict = {}
+    for mode in ("auto", "always"):
+        knobs = {"_kcp_test_knobs": {"kcp_dav": mode}}
+        ws = cake_kcp.CakeKDADetKcpWorkspace()
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, **knobs
+        )
+        assert cake_kcp.LAST_CALL["fwd"]["kcp_dav"] is None
+        g_saved = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
+        )
+        rec_s = dict(cake_kcp.LAST_CALL["bwd"])
+        g_replay = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=None, workspace=ws, **knobs
+        )
+        rec_r = dict(cake_kcp.LAST_CALL["bwd"])
+        k2.clear()
+        rows_at.clear()
+        ck, (_rec_o, _rec_f, rec_b) = _ckpt_pass(ctx, ops, **knobs)
+        torch.cuda.synchronize(device)
+        want = "launched" if (needed or mode == "always") else "skipped"
+        for rec in (rec_s, rec_r, rec_b):
+            assert rec["kcp_dav"] == want, (mode, rec["kcp_dav"])
+            assert rec["sequence"].count("dav") == 1, mode
+        # the checkpointed backward bound the recompute's rows; every K2 adjoint walk reads aqk_int from them
+        assert rec_b["intra_rows"] == "bound", rec_b["intra_rows"]
+        form = rec_b["intra_rows_form"]
+        assert form in ("carrier", "copy") and rows_at and rows_at[-1][0] == form
+        assert k2, mode
+        assert all(p == rows_at[-1][1] for _n, p in k2), (form, k2, rows_at)
+        res[mode] = (
+            (out, *saved.tensors(), *g_saved, *g_replay, *[ck[n] for n in sorted(ck)]),
+            (rec_s, rec_r, rec_b),
+        )
+    for a, b in zip(res["auto"][0], res["always"][0], strict=True):
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert torch.equal(_bits(a), _bits(b))
+    for ra, rb in zip(res["auto"][1], res["always"][1], strict=True):
+        assert ra["sequence"] == rb["sequence"] and ra["n_launches"] == rb["n_launches"]
+
+
 def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:
     """Template-cache ownership (KDA module, one rank): a training loop that builds a NEW context and
     workspace per step must not grow device memory -- after each step's objects are dropped the workspace, its
@@ -6847,6 +7029,84 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
         )
         now = torch.cuda.memory_allocated(device)
         assert now == base, (i, now - base)
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_default_workspace_pool(device, lengths, H) -> None:
+    """``workspace=None`` keeps its default workspaces between calls (``cake_kcp._default_pool``; one rank): every
+    later call runs on the workspace object its key's first call built, bitwise the results of a held workspace (the
+    caching allocator's free blocks filled with NaN before each step: no result reads a byte the call did not write),
+    a forward without a saved set (the lazy pools) included; a pooled step's high-water mark of allocated device memory
+    is no higher than the first pooled step's (compared as absolute marks: the first step may also free what the
+    reference step left, 2 KiB on GB300, which lowers its base but not its mark), and between calls the pooled
+    workspaces hold no device memory (``memory_allocated`` returns at most to its level before the step).
+    Once the context is collected, its workspaces leave the pool at the next call."""
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+
+    def step(c, ws):
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(*args, c, workspace=ws)
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, c, ops["dout"], saved=saved, workspace=ws
+        )
+        light, none = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, c, workspace=ws, save_for_backward=False
+        )
+        assert none is None
+        res = (out, *written_tensors(saved), *grads, light)
+        return tuple(t.detach().clone() for t in res)
+
+    def pooled(c) -> dict:  # the context's pooled workspaces per key
+        return {
+            key: [e[0] for e in entries]
+            for key, entries in cake_kcp._default_pool.items()
+            if key[0] == id(c)
+        }
+
+    ref = step(ctx, cake_kcp.CakeKDADetKcpWorkspace())
+    peaks, shells = [], []
+    for i in range(3):
+        _poison(device)
+        gc.collect()
+        base = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        res = step(ctx, None)
+        torch.cuda.synchronize(device)
+        # the absolute high-water mark of this step
+        peaks.append(torch.cuda.max_memory_allocated(device))
+        assert all(
+            torch.equal(_bits(a), _bits(b)) for a, b in zip(ref, res, strict=True)
+        ), i
+        del res
+        gc.collect()
+        torch.cuda.synchronize(device)
+        # nothing stays behind a step (the first may also free what the reference step left: 2 KiB on GB300)
+        assert torch.cuda.memory_allocated(device) <= base, i
+        mine = pooled(ctx)
+        assert sorted(key[4] for key in mine) == [False, True], mine  # fwd, bwd
+        for key, workspaces in mine.items():
+            for ws in workspaces:
+                storages = [t.untyped_storage() for t in ws._pools.values()]
+                storages += [t.untyped_storage() for t, _ in ws._parked.values()]
+                storages.append(ws.local.arena.untyped_storage())
+                assert all(s.nbytes() == 0 for s in storages), i
+                # the lazy pools wait parked (the forward's); from the second step on the ensure record stays (the
+                # first allocation of a lazy pool drops it once), so the next call takes the trimmed ensure path
+                assert bool(ws._parked) == (not key[4]), (i, key, list(ws._parked))
+                assert ws._fast or i == 0, (i, key)
+        shells.append({key: [id(ws) for ws in w] for key, w in mine.items()})
+    assert shells[0] == shells[1] == shells[2], shells
+    assert max(peaks[1:]) <= peaks[0], peaks
+    gone = [weakref.ref(ws) for w in pooled(ctx).values() for ws in w]
+    ctx_ref = weakref.ref(ctx)
+    del ctx, mine, workspaces, ws, storages
+    gc.collect()
+    assert ctx_ref() is None
+    ctx2, _ = _ckpt_problem(device, lengths, H)
+    out2, _ = cake_kcp.cake_kda_det_train_kcp_forward(*args, ctx2)
+    assert torch.equal(_bits(out2), _bits(ref[0]))
+    gc.collect()
+    assert all(r() is None for r in gone)
 
 
 def test_gpu_workspace_upgrade_releases_superseded_storage_first(device) -> None:
@@ -7540,5 +7800,170 @@ def test_gpu_walk_streams_graph_replay_is_bitwise(device, monkeypatch) -> None:
         assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
         res, _ = run("two", "off")
         assert same(ref, res)
+    finally:
+        cake_kcp.graph_cache_clear()
+
+
+BWD_TAPE_ROWS = (
+    ((6144, 4096, 3584, 2560), 64, 512),
+    ((300, 724, 476), 2, None),
+    ((3000,), 64, None),
+)
+BWD_TAPE_IDS = ("w4r1walks-h64", "s300_724_476-h2", "s3000-h64")
+
+
+@pytest.mark.parametrize("lengths,H,plan_sm", BWD_TAPE_ROWS, ids=BWD_TAPE_IDS)
+def test_gpu_bwd_tape_stream_is_bitwise(
+    device, monkeypatch, lengths, H, plan_sm
+) -> None:
+    """The saved-set backward's tape replay on the call's stream (knob ``bwd_tape_stream="one"``) and on the side
+    stream under every other form of :data:`BWD_TAPE_STREAMS`, one rank: the forward's ``out`` and the gradients of
+    the saved-set backward (with a held workspace and with ``workspace=None``; at ``P > 1`` also under
+    ``saved_carry=0``, whose replay reads the workspace's carry pool) and of a checkpointed step with a recompute
+    handle are bitwise the same under every form, two rounds each, and the held-workspace backward's peak of
+    requested bytes is at most the ``"one"`` form's.  The records show each saved-set backward on its form (``"one"`` where
+    the call launches ``kcp_dav``), except the table set's first side-stream replay, which runs on the call's stream
+    (it uploads the launches' device tables), and the held-workspace backward's launch record (``sequence``) is the
+    ``"one"`` form's."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops, _chains = _walk_streams_problem(device, lengths, H, plan_sm)
+    P = ctx.heads(H).P
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    ws = cake_kcp.CakeKDADetKcpWorkspace()
+
+    def one_round(form: str, extra: dict):
+        knobs = {"_kcp_test_knobs": {"bwd_tape_stream": form, **extra}}
+        recs = []
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, **knobs
+        )
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        # requested (tensor) bytes: the allocated-bytes peak also counts the unsplit tails of the cached blocks the
+        # allocator hands out, which follow the cache's history (the workspace=None and checkpointed passes between
+        # the rounds), not the tensors the backward keeps alive
+        base = torch.cuda.memory_stats(device)["requested_bytes.all.current"]
+        g_held = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
+        )
+        torch.cuda.synchronize(device)
+        peak = torch.cuda.memory_stats(device)["requested_bytes.all.peak"] - base
+        rec = cake_kcp.LAST_CALL["bwd"]
+        recs.append((rec["bwd_tape_stream"], rec["kcp_dav"]))
+        seq = tuple(rec["sequence"])
+        out_n, saved_n = cake_kcp.cake_kda_det_train_kcp_forward(*args, ctx, **knobs)
+        g_none = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved_n, **knobs
+        )
+        rec = cake_kcp.LAST_CALL["bwd"]
+        recs.append((rec["bwd_tape_stream"], rec["kcp_dav"]))
+        ck, (_orig, _rec_r, rec_b) = _ckpt_pass(
+            ctx, ops, handle=cake_kcp.CakeKDADetKcpRecomputeHandle(), **knobs
+        )
+        recs.append((rec_b["bwd_tape_stream"], rec_b["kcp_dav"]))
+        torch.cuda.synchronize(device)
+        tensors = (
+            out,
+            out_n,
+            *g_held,
+            *g_none,
+            *(ck[n] for n in TENSOR_NAMES + ("dw",)),
+        )
+        return tuple(t.clone() for t in tensors), recs, peak, seq
+
+    configs = [{}] + ([{"saved_carry": 0}] if P > 1 else [])
+    records: dict = {}
+    first_side = True
+    for extra in configs:
+        ref = ref_peak = ref_seq = None
+        for form in cake_kcp.BWD_TAPE_STREAMS:
+            for r in range(2):
+                tensors, recs, peak, seq = one_round(form, extra)
+                records[f"{extra}:{form}:{r}"] = [list(x) for x in recs] + [peak]
+                for ran, dav in recs:
+                    if form == "one" or dav == "launched":
+                        assert ran == "one", (extra, form, r, recs)
+                    elif first_side:
+                        # the table set's first side-stream replay runs on the call's stream (device tables)
+                        assert ran == "one", (extra, form, r, recs)
+                        first_side = False
+                    else:
+                        assert ran == form, (extra, form, r, recs)
+                if ref is None:
+                    ref, ref_peak, ref_seq = tensors, peak, seq
+                    assert "kcp_fwdh_tape" in ref_seq
+                    assert all(torch.isfinite(t.float()).all().item() for t in ref)
+                    continue
+                assert seq == ref_seq, (extra, form, r)
+                assert peak <= ref_peak, (extra, form, r, peak, ref_peak)
+                for a, b in zip(ref, tensors, strict=True):
+                    assert (
+                        a.shape == b.shape
+                        and a.dtype == b.dtype
+                        and torch.equal(_bits(a), _bits(b))
+                    ), (extra, form, r)
+    _evidence(
+        "gpu_bwd_tape_stream",
+        {
+            "lengths": list(lengths),
+            "H": H,
+            "plan_sm": plan_sm,
+            "P": P,
+            "records": records,
+            "pass": True,
+        },
+    )
+
+
+def test_gpu_bwd_tape_stream_graph_replay_is_bitwise(device, monkeypatch) -> None:
+    """``graph="replay"`` of the saved-set backward with its tape replay on the side stream (``bwd_tape_stream``
+    ``"pre"`` and ``"pre_hi"``), one rank, ``P > 1``: the first call of a key runs eagerly, the second is captured (the
+    fork and join events become graph dependencies of the side and high-priority streams' launches) and the later
+    calls replay it; the forward's ``out`` and the backward's gradients are bitwise the eager one-stream results on
+    every call, and the captured and replayed backward calls record the side-stream form."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops, _chains = _walk_streams_problem(device, (6144, 4096, 3584, 2560), 64, 512)
+    assert ctx.heads(64).P > 1
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    ws = cake_kcp.CakeKDADetKcpWorkspace()
+
+    def run(form: str, graph: str):
+        knobs = {"_kcp_test_knobs": {"bwd_tape_stream": form}}
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, graph=graph, **knobs
+        )
+        fwd = (out.clone(),)
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, graph=graph, **knobs
+        )
+        rec_b = dict(cake_kcp.LAST_CALL["bwd"])
+        return fwd + tuple(t.clone() for t in grads), rec_b
+
+    def same(a, b) -> bool:
+        return all(
+            x.shape == y.shape
+            and x.dtype == y.dtype
+            and torch.equal(_bits(x), _bits(y))
+            for x, y in zip(a, b, strict=True)
+        )
+
+    cake_kcp.graph_cache_clear()
+    try:
+        ref, rec = run("one", "off")
+        assert rec["bwd_tape_stream"] == "one"
+        fallback0 = cake_kcp.GRAPH_STATS["fallback"]
+        for form in ("pre", "post", "post_hi"):
+            events = []
+            for i in range(5):
+                res, rec_b = run(form, "replay")
+                events.append(rec_b["graph_event"])
+                assert same(ref, res), (form, i, events)
+                if rec_b["graph_event"] != "eager":
+                    assert rec_b["bwd_tape_stream"] == form, rec_b
+            assert events.count("capture") == 1 and events[-1] == "replay", events
+            cake_kcp.graph_cache_clear()
+        assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
+        res, rec = run("post", "off")
+        assert same(ref, res) and rec["bwd_tape_stream"] == "post"
     finally:
         cake_kcp.graph_cache_clear()

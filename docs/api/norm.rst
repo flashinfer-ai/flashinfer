@@ -227,9 +227,13 @@ count return the same bits), and an autograd wrapper that saves only its
 inputs.  The forward computes ``rstd`` and the gate with the approximate FP32
 reciprocal square root, base-2 exponential and reciprocal, so ``y`` can differ
 from the correctly rounded FP32 formula by one BF16 unit in the last place near
-a BF16 rounding boundary.  The forward's CTAs each walk at most two row blocks,
-and the backward's CTAs claim row blocks past one wave.  Beside a kernel on
-another stream that holds ``k`` of the ``N`` SMs, the forward takes at most
+a BF16 rounding boundary.  The backward computes them with the same approximate
+instructions but keeps the subnormal sigmoid down to about ``-88.72``: ``dx``
+and ``dz`` lie within one BF16 unit in the last place of the correctly rounded
+FP32 formulas plus 1/64 of a unit of the row's largest term, the same bits at
+every call.  The forward's CTAs each walk at most two row blocks, and the
+backward's CTAs claim row blocks past one wave.  Beside a kernel on another
+stream that holds ``k`` of the ``N`` SMs, the forward takes at most
 ``N / (N - k)`` times its time alone, plus one CTA's share of the row blocks,
 plus 0.02.  The backward's workspace (18952 bytes, zero-filled) is left zero
 by every call, so one workspace serves every later call on its stream.

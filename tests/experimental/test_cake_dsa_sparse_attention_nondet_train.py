@@ -3680,31 +3680,44 @@ def test_nope_key_pass_policy_plans_with_2048_bytes_per_key():
 
 def test_nope_bwd_launch_grid_mirrors_the_kernel_rule():
     """The persistent grid of the NoPE main stages: ``min(num_queries, SMs)`` (at least one CTA) while the launch's
-    FP32 dkv window ``num_kv x 2048 B`` is within 64 MiB, a CTA per token beyond it; every value is <= num_queries
-    (legal for the kernel's token loop) except the never-launched zero-token non-resident case, which mirrors the rule."""
+    FP32 dkv window ``num_kv x 2048 B`` is within its architecture's window (128 MiB on sm_100a / sm_103a, 64 MiB
+    on sm_107a and without an architecture), a CTA per token beyond it; every value is <= num_queries (legal for the
+    kernel's token loop) except the never-launched zero-token non-resident case, which mirrors the rule."""
     grid = cake_backend.nope_bwd_launch_grid
     assert cake_backend.NOPE_PERSISTENT_DKV_BYTES == 64 << 20
+    assert cake_backend.NOPE_PERSISTENT_DKV_BYTES_BY_ARCH == {
+        "sm_100a": 128 << 20,
+        "sm_103a": 128 << 20,
+        "sm_107a": 64 << 20,
+    }
     assert cake_backend.NOPE_DKV_BYTES_PER_KEY == 2048
-    window = (
-        cake_backend.NOPE_PERSISTENT_DKV_BYTES // cake_backend.NOPE_DKV_BYTES_PER_KEY
-    )
-    assert window == 32768
-    for sms in (132, 148, 160):
-        assert grid(4096, window, sms) == sms  # the 64 MiB window itself is resident
-        assert grid(4096, window + 1, sms) == 4096  # one key more: a CTA per token
-        assert grid(100, window, sms) == 100  # fewer tokens than SMs
-        assert grid(sms, 128, sms) == sms
-        assert grid(1, 128, sms) == 1
-        assert grid(0, 128, sms) == 1  # resident: never below one CTA
-        # the kernel's rule past the window at zero tokens; the host never launches zero tokens
-        assert grid(0, window + 1, sms) == 0
-        assert grid(4736, 65536, sms) == 4736  # a 128 MiB window
-        assert grid(32768, 262144, sms) == 32768
+    for arch, window in (
+        ("sm_100a", 65536),
+        ("sm_103a", 65536),
+        ("sm_107a", 32768),
+        (None, 32768),
+    ):
+        for sms in (132, 148, 160):
+            # the window itself is resident
+            assert grid(4096, window, sms, arch) == sms
+            # one key more: a CTA per token
+            assert grid(4096, window + 1, sms, arch) == 4096
+            assert grid(100, window, sms, arch) == 100  # fewer tokens than SMs
+            assert grid(sms, 128, sms, arch) == sms
+            assert grid(1, 128, sms, arch) == 1
+            assert grid(0, 128, sms, arch) == 1  # resident: never below one CTA
+            # the kernel's rule past the window at zero tokens; the host never launches zero tokens
+            assert grid(0, window + 1, sms, arch) == 0
+            assert grid(4736, 131072, sms, arch) == 4736  # a 256 MiB window
+            assert grid(32768, 262144, sms, arch) == 32768
+    assert grid(4736, 65536, 148) == 4736  # 128 MiB: beyond the default window
+    assert grid(4736, 65536, 148, "sm_103a") == 148
     # chunk ranges of a multi-pass backward: each launch counts its own tokens against the same key window
     policy = KeyPassPolicy.from_record(cake_jit.record(NOPE_PROGRAM))
     chunk = policy.token_chunk(2176)
     chunks = policy.token_chunks(chunk + 128, 2176)
     assert [grid(n, 65536, 148) for _b, n in chunks] == [chunk, 128]
+    assert [grid(n, 65536, 148, "sm_100a") for _b, n in chunks] == [148, 128]
     assert [grid(n, 4096, 148) for _b, n in chunks] == [148, 128]
 
 
@@ -5069,7 +5082,10 @@ def test_nope_plan_main_stage_grids_follow_the_persistent_rule(monkeypatch):
     )
     monkeypatch.setattr(cake_backend, "_sm_count", lambda device_index: 4)
     window = (
-        cake_backend.NOPE_PERSISTENT_DKV_BYTES // cake_backend.NOPE_DKV_BYTES_PER_KEY
+        cake_backend.NOPE_PERSISTENT_DKV_BYTES_BY_ARCH.get(
+            cake_backend.arch_for(), cake_backend.NOPE_PERSISTENT_DKV_BYTES
+        )
+        // cake_backend.NOPE_DKV_BYTES_PER_KEY
     )
     T, K = 8, 5
     out, lse, o_lo = _saved_outputs(T)

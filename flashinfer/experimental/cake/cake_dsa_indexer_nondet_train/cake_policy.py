@@ -225,6 +225,7 @@ def sample_class_for(
     ):
         if not shift_knob:
             shift = int(long_rule[1])
+        # a long-unit call keeps its tile count and never takes the class rule, which is for few mean unit tiles
         return tiles, shift
     if class_rule is None:
         return tiles, shift
@@ -563,6 +564,7 @@ class DispatchPolicy:
             len(long_rule) != 2
             or not isinstance(long_rule[0], (list, tuple))
             or not long_rule[0]
+            or not all(isinstance(kind, str) for kind in long_rule[0])
             or list(long_rule[0]) != sorted(set(long_rule[0]))
             or not set(long_rule[0]) <= set(PHYSICAL_KINDS)
             or not _is_int(long_rule[1])

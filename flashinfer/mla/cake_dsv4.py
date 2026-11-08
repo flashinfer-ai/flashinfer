@@ -104,8 +104,8 @@ Host contract (flashinfer#4671 hardening)
   ``merge_by_splits`` names for ``s`` and their rows
   (:func:`_k64_split_merge`): on SM107, for 128 heads, a merge built for
   ``s`` pieces alone, one CTA per row and head (nine and five pieces) or one
-  warp per row and head and two heads per CTA (three pieces at 16 or 17
-  rows), else the merge of any ``s``, one CTA per row and head. It carves
+  warp per row and head and two heads per CTA (three pieces at 16-20 rows),
+  else the merge of any ``s``, one CTA per row and head. It carves
   ``cake_dsv4_workspace_layout(R, H, s)`` for its ``R = T - W`` split rows
   and stores the pieces in token-major order: piece ``j`` of row ``t`` is
   ``p = (t - W) * s + j``, its BF16 partial O the rows ``[p, :, :]`` of
@@ -2588,16 +2588,21 @@ class _K64SplitRule:
 # them, split launch vs the K=32 program: 1.50-1.51x at 1-2 rows and 1.43x
 # at 4 (nine pieces), 1.34x at 8 (five).  Nine pieces at 5 rows (45 pieces)
 # measured 0.97x of five, so nine and five stay at 40 pieces.  Three pieces
-# run every launch of 9-17 rows (at most 17 x 3 = 51 pieces, so no launch
+# run every launch of 9-20 rows (at most 20 x 3 = 60 pieces, so no launch
 # takes two).  With the merge of any count, three pieces measured 1.23x of
 # the K=32 program at 12 rows and 1.11-1.12x at 15, but 0.91-0.92x of two
-# pieces at 16 rows (48 pieces).  The launches of 16 and 17 rows merge with
+# pieces at 16 rows (48 pieces).  The launches of 16-20 rows merge with
 # the three-piece merge (``merge_by_splits``: one warp per row and head, two
 # heads per CTA, the per-element operations of the merge of any count): in a
 # test harness on a 216-SM R200, three pieces with a merge of the three-piece
 # merge's geometry ran a median 0.80-0.93 us per call faster than two pieces
 # with the merge of any count at 16 and 17 rows, and at least 0.3 us faster
-# in each of 8 rounds.  The launches of 9-15 rows do not take the three-piece
+# in each of 8 rounds.  At 18-20 rows, three pieces with the three-piece
+# merge ran 0.84-1.07 us per call faster than the K=32 program (1.09-1.11x)
+# in a test harness on a 216-SM R200 (CUDA graph of 8 calls, PDL, rows that
+# use all nine tiles), 1.08-1.13x on a 208-SM R200 and 1.05-1.11x on a
+# 212-SM VR200, faster beyond the A/A difference in every round on each.
+# The launches of 9-15 rows do not take the three-piece
 # merge: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
 # lengths ran slower with it in every round.  The launches of nine and five
 # pieces merge with the merge built for their count alone
@@ -2614,14 +2619,17 @@ class _K64SplitRule:
 # ceil(9 / s) tiles: short requests, piece 0 writes O itself) still runs the
 # merge kernel and measured 0.81-0.86x (0.97x of two pieces at 15 rows of at
 # most three tiles); the host does not read row lengths, so those launches
-# split as well.  Without PDL the 17-row launch measured 0.98x with two pieces:
+# split as well.  At 18-20 rows, with the three-piece merge, such a launch
+# measured 0.78-0.81x (1.57-1.83 us per call slower) and one whose every row
+# uses at most five tiles 0.86-0.89x (0.97-1.33 us slower) on those three
+# boards.  Without PDL the 17-row launch measured 0.98x with two pieces:
 # no launch without PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
-        max_tokens_pdl=17,
+        max_tokens_pdl=20,
         max_tokens_no_pdl=0,
-        splits=((9, 40), (5, 40), (3, 51)),
+        splits=((9, 40), (5, 40), (3, 60)),
         merge_by_splits=(
             (9, 1, f"{_K64_SPLIT_MERGE}_c9"),
             (5, 5, f"{_K64_SPLIT_MERGE}_c5"),
@@ -2923,7 +2931,7 @@ def run_cake_dsv4(
     query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
     rows run a split-KV producer and a merge when the workspace holds their
     carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; their
-    launches of nine and five pieces and of three pieces at 16 or 17 rows
+    launches of nine and five pieces and of three pieces at 16-20 rows
     merge with a merge built for their piece count where the registry has
     it, :func:`_k64_split_merge`) and FP8/H64 over items of four to nine
     tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;

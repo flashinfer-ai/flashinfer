@@ -96,7 +96,7 @@ kernel_cake_rmsnorm_det_train_fb3f2a96e954f0e241bc(float* __restrict__ partial, 
     #pragma unroll
     for (int d = 0; d < 16; d++) {
         int cc = rsub + d * 48;
-        long long src = (long long)cc * 6144 + (long long)col;
+        long long src = (long long)cc * 6144ll + (long long)col;
         #pragma unroll
         for (int q = 0; q < 1; q++) {
             asm volatile(
@@ -115,7 +115,7 @@ kernel_cake_rmsnorm_det_train_fb3f2a96e954f0e241bc(float* __restrict__ partial, 
         #pragma unroll
         for (int d_1 = 0; d_1 < 16; d_1++) {
             int cc_1 = rsub + (w * 16 + d_1) * 48;
-            long long src_1 = (long long)cc_1 * 6144 + (long long)col;
+            long long src_1 = (long long)cc_1 * 6144ll + (long long)col;
             #pragma unroll
             for (int q_1 = 0; q_1 < 1; q_1++) {
                 asm volatile(
