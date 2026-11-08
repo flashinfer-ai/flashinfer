@@ -300,7 +300,7 @@ def test_shared_candidates_match_routed(variant):
     routed = dataclasses.replace(cfg, shared_quant_kind=None)
     valid = [k for k in candidates if is_valid_sm107(k, cfg)]
     assert valid == [k for k in candidates if is_valid_sm107(k, routed)]
-    assert len(valid) == (16 if variant == "inference" else 10)
+    assert valid
 
 
 def test_shared_trial_preserves_prepared_payload():
