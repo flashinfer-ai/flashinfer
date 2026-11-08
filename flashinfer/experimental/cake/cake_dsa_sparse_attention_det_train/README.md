@@ -70,7 +70,12 @@ program prefixes the names with `nope_`); no stage is chosen by a tensor value:
    the row-bound words.
 3. `bwd_bound`: per destination row, a fixed-point upper bound `B_row` on the
    row's `sum |dK|`, `sum |dV|` over every valid (query, key) pair that maps to
-   it (latent and rope parts separately), and the row's pair count `N`.
+   it (latent and rope parts separately), and the row's pair count `N`.  While
+   `T * topk < 2 ** 26`, one reduction per pair adds the pair count and a
+   12-bit term to one word, and a pair whose 12-bit term is small adds its
+   full-resolution term to a second word, so `B_row` keeps the full resolution
+   (global word 10 records the packed launch for `bwd_grid`); a larger launch
+   uses one word per part and a count word.
 4. `bwd_grid`: the row's grid exponent `e = ceil(log2 B_row) - 30 - L` with
    `L = 12` (`cake_backend.GRID_SHIFT`) and the overflow counters' skip
    threshold `2 ** (30 - ceil(log2 N))`; it zeroes the accumulator row and
@@ -97,10 +102,22 @@ Repeated destination rows of `dkv_dst_map` add into the same integers, so they
 combine exactly before the one FP32 addition.
 
 Non-finite values: a pair whose contribution is NaN or infinite has no integer
-image, so the counters mark its destination row and the fold writes every
-element of that row as NaN (fresh outputs and `dkv_acc` alike); the other rows
-are unaffected.  `dq` follows the main kernel's arithmetic (a NaN input gives
-NaN in the rows it reaches).
+image, so the counters flag its destination row, the redo flags it again, and
+the fold writes every element of that row as NaN (fresh outputs and `dkv_acc`
+alike); the other rows are unaffected.  The rows written as NaN:
+
+| non-finite input | dK/dV rows written as NaN |
+|---|---|
+| `q_latent`, `q_rope`, `dout` or `out` of token `t` | every row token `t` selects |
+| `kv_latent[k]` or `k_rope[k]` | the destination row of key `k` only |
+| `lse[t]` = -inf or NaN | every row token `t` selects |
+| `lse[t]` = +inf | none (the probabilities are 0) |
+
+A finite input large enough (about `1e38`) to overflow an FP32 bound term
+counts as non-finite.  Where the non-deterministic package writes NaN or
+infinities element by element, this package writes NaN across the whole row.
+`dq` follows the main kernel's arithmetic (a NaN input gives NaN in the rows
+it reaches).
 
 Known limitation: the redo does not compact the pairs of the flagged rows.
 When any row is flagged, the redo costs about one more main-kernel pass over

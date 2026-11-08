@@ -73,7 +73,10 @@ limitations under the License.
 #   up, at a power-of-two scale set by the maxima) of ``a_q + b_q *
 #   ||kv_latent[k]||`` over every valid pair ``(q, k)`` whose key maps to
 #   ``r`` -- a bound on the row's ``sum |dK|``, ``sum |dV|`` (latent and rope
-#   parts separately) -- and the row's pair count ``N``.
+#   parts separately) -- and the row's pair count ``N``.  While ``T * topk <
+#   2 ** 26`` one reduction per pair packs the count with a 12-bit term (a pair
+#   with a small term adds its full-resolution term to the count word instead),
+#   and :data:`PACK_WORD` tells ``bwd_grid`` how to read the words.
 # * ``bwd_grid``: per destination row the grid exponents ``e = ceil(log2 B_row)
 #   - 30 - L`` (``L`` = :data:`GRID_SHIFT`), latent and rope, and the counter
 #   skip threshold ``2 ** t`` with ``t = 30 - ceil(log2 N)`` (packed into the
@@ -188,6 +191,8 @@ GLOBAL_WORDS = 16  # u32 words of the backward's global state (maxima, the flagg
 REDO_WORD = 8  # the global word that counts the rows the redo preparation flags (the redo's ``redo_count``)
 # the global word that counts the rows with a non-finite contribution
 NONFINITE_WORD = 9
+# the global word bwd_bound sets to 1 when its launch packs the pair count into the term word (bwd_grid reads it)
+PACK_WORD = 10
 O_LO_BYTES_PER_TOKEN = NUM_HEADS * D_LATENT * 2  # BF16 o_lo: 64 KiB per query token
 
 
@@ -664,7 +669,8 @@ def _layout_of(sizes: list[tuple[str, int]]) -> dict:
 
 
 # u64 words between the row-bound words of one accumulator row (latent, rope and the pair count; NoPE latent and the
-# pair count): words in different 128-byte lines spread the row-bound stage's reductions over more of L2.
+# pair count; a packed launch keeps the count in the latent word and the small terms in the count word): words in
+# different 128-byte lines spread the row-bound stage's reductions over more of L2.
 BOUND_PART_STRIDE = {cake_jit.PROGRAM: 96, cake_jit.NOPE_PROGRAM: 128}
 
 

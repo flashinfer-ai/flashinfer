@@ -87,7 +87,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_bound": {
-            "library": "cake_dsa_h64_det_train_da9947485b6dbd33c4ee",
+            "library": "cake_dsa_h64_det_train_e515ef20935db22e2103",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
@@ -98,7 +98,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_grid": {
-            "library": "cake_dsa_h64_det_train_d580918f8e0cbb39f3be",
+            "library": "cake_dsa_h64_det_train_3dd5b7143dd684e308ea",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
@@ -217,7 +217,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_bound": {
-            "library": "cake_dsa_h64_det_nope_train_aedc5c845a7175b21782",
+            "library": "cake_dsa_h64_det_nope_train_bbf314a9c088b14d6317",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
@@ -228,7 +228,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_grid": {
-            "library": "cake_dsa_h64_det_nope_train_4bb407c884a7703fd17e",
+            "library": "cake_dsa_h64_det_nope_train_983a1842d246e99cf5f0",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
