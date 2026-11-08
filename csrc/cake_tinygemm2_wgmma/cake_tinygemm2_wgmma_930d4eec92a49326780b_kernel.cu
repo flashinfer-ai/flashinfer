@@ -203,6 +203,7 @@ kernel_cake_tinygemm2_wgmma_930d4eec92a49326780b(const __grid_constant__ CUtenso
     float bv_0 = 0.0f;
     if (tid < 128) {
         int _min_0 = ((m0 + tid % 16) < (M - 1) ? (m0 + tid % 16) : (M - 1));
+        asm volatile("griddepcontrol.wait;" ::: "memory");
         bv_0 = bias[_min_0];
     }
 

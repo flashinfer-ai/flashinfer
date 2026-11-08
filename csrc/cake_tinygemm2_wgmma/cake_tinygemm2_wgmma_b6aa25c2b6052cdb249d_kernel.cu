@@ -232,6 +232,7 @@ kernel_cake_tinygemm2_wgmma_b6aa25c2b6052cdb249d(const __grid_constant__ CUtenso
             int g = lane / 4;
             int t = lane % 4;
             int _min_0 = ((m0 + g) < (M - 1) ? (m0 + g) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             float bvr_0 = bias[_min_0];
             int _min_1 = ((m0 + g + 8) < (M - 1) ? (m0 + g + 8) : (M - 1));
             float bvr_1 = bias[_min_1];
