@@ -2311,7 +2311,6 @@ _KV4_L2PF_PAGE = 64  # compressed page rows (the c4 layer)
 _KV4_L2PF_MAX_TOKENS: dict[tuple[int, int], int] = {
     # (sparse_topk, max_q_len): most query rows of the launch
     (640, 1): 47,
-    (640, 2): 64,
     (640, 4): 64,
     (512, 1): 41,
     (512, 4): 56,

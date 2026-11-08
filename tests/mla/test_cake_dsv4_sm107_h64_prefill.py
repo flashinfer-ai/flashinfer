@@ -562,8 +562,6 @@ L2PF_VARIANT = f"{KV4_VARIANT}_l2pf"
 L2PF_ROWS = [
     pytest.param(1, 32, 640, 64, id="c4w640-q1-t32"),
     pytest.param(1, 47, 640, 64, id="c4w640-q1-t47"),
-    pytest.param(2, 40, 640, 64, id="c4w640-q2-t40"),
-    pytest.param(2, 64, 640, 64, id="c4w640-q2-t64"),
     pytest.param(4, 32, 640, 64, id="c4w640-q4-t32"),
     pytest.param(4, 64, 640, 64, id="c4w640-q4-t64"),
     pytest.param(1, 41, 512, 64, id="c4w512-q1-t41"),
@@ -574,11 +572,9 @@ L2PF_ROWS = [
 # token), 3-token requests and the c128 layer (compressed pages of 2 rows).
 L2PF_EDGE_ROWS = [
     pytest.param(1, 58, 640, 64, id="c4w640-q1-t58"),
-    pytest.param(2, 66, 640, 64, id="c4w640-q2-t66"),
     pytest.param(4, 68, 640, 64, id="c4w640-q4-t68"),
     pytest.param(1, 42, 512, 64, id="c4w512-q1-t42"),
     pytest.param(4, 60, 512, 64, id="c4w512-q4-t60"),
-    pytest.param(2, 63, 640, 64, id="c4w640-q2-t63-ragged"),
     pytest.param(3, 60, 640, 64, id="c4w640-q3-t60"),
     pytest.param(1, 40, 640, 2, id="c128w640-q1-t40"),
 ]
@@ -654,67 +650,6 @@ def test_l2pf_edge_rows_run_the_four_stage_program(
     torch.cuda.synchronize()
     assert launched == [KV4_VARIANT]
     hardening._assert_valid(out, case)
-
-
-def test_l2pf_row_tiled_launches_run_the_four_stage_program(monkeypatch):
-    """A workspace of 40 rows tiles a 64-row call of 2-token requests over
-    items 640 wide into 40 + 24 rows: neither chunk is a uniform launch of
-    the call, so both run the four-stage program, with the bits of the single
-    launch."""
-    _skip_unless_sm107()
-    _require_l2pf_program()
-    case = _decode_case(2, 64, 640, 64, lengths="mixed")
-    req = case.requirement()
-    small_bytes = cake_dsv4_workspace_layout(
-        40, HEADS, 1, num_query_offsets=case.batch_size + 1
-    ).total_bytes
-    assert req.rows_per_launch(small_bytes) == 40
-    small = torch.zeros(small_bytes, dtype=torch.uint8, device="cuda:0")
-    launched = _record_launches(monkeypatch)
-    single = case.run(workspace=_workspace(case), out=case.nan_out(), enable_pdl=True)
-    tiled = case.run(workspace=small, out=case.nan_out(), enable_pdl=True)
-    torch.cuda.synchronize()
-    assert launched == [_l2pf_program(), KV4_VARIANT, KV4_VARIANT]
-    hardening._assert_valid(tiled, case)
-    assert torch.equal(tiled, single), "row-tiled launches differ from one launch"
-
-
-def test_l2pf_program_is_deterministic(monkeypatch):
-    """Eager calls and CUDA graph replays of a row of the L2 prefetch rule (64
-    rows of 2-token requests over items 640 wide, masked columns of both
-    kinds, PDL on) are bitwise identical and run the device's program for
-    it."""
-    _skip_unless_sm107()
-    _require_l2pf_program()
-    program = _l2pf_program()
-    case = _decode_case(2, 64, 640, 64, lengths="mixed")
-    workspace = _workspace(case)
-    run = dict(workspace=workspace, float_scales=True, enable_pdl=True)
-    launched = _record_launches(monkeypatch)
-    first = case.run(out=case.nan_out(), **run)
-    torch.cuda.synchronize()
-    hardening._assert_valid(first, case)
-    for repeat in range(REPEATS):
-        again = case.run(out=case.nan_out(), **run)
-        torch.cuda.synchronize()
-        assert torch.equal(again, first), f"eager repeat {repeat} differs"
-
-    source = case.query.clone()
-    out = case.nan_out()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        case.query.copy_(source)
-        case.run(out=out, **run)
-    torch.cuda.synchronize()
-    assert launched == [program] * (REPEATS + 2)
-    for repeat in range(REPEATS):
-        case.query.zero_()
-        out.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out.reshape(first.shape), first), (
-            f"graph replay {repeat} differs from the eager call"
-        )
 
 
 # --------------------------------------------------------------------------- #

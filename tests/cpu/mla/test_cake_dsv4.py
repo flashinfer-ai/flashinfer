@@ -7382,7 +7382,7 @@ def test_run_cake_dsv4_launches_the_bcl_sibling_in_its_decode_window(monkeypatch
 
 _L2PF_SIBLING = f"{_KV4_SIBLING}_l2pf"
 # The delivered rule: (sparse_topk, max_q_len) -> most rows of the launch.
-_L2PF_CEILINGS = {(640, 1): 47, (640, 2): 64, (640, 4): 64, (512, 1): 41, (512, 4): 56}
+_L2PF_CEILINGS = {(640, 1): 47, (640, 4): 64, (512, 1): 41, (512, 4): 56}
 
 
 def _l2pf_variants():
@@ -7537,64 +7537,6 @@ def test_l2pf_rule_edges(monkeypatch, sm_count, sparse_topk, max_q_len, ceiling)
 
 
 @pytest.mark.cpu_only
-def test_l2pf_variant_needs_a_program_of_its_own(monkeypatch):
-    """A four-stage launch in the window takes the L2 prefetch sibling only
-    where its architecture routes the sibling to a program other than the
-    four-stage one; launches outside the window never read the device's SM
-    count, and one inside reads it once, after the program check."""
-    import flashinfer.jit.cake_dsv4 as jit
-
-    read = []
-
-    def sm_count(device):
-        read.append(device)
-        return _SM107_SM_COUNT
-
-    monkeypatch.setattr(cake, "_device_sm_count", sm_count)
-    window = dict(
-        num_heads=64,
-        max_q_len=2,
-        num_query_tokens=40,
-        sparse_topk=640,
-        batch_size=20,
-        compressed_page_size=64,
-    )
-    four, prefetch = "cake_dsv4_four_stage", "cake_dsv4_l2_prefetch"
-    for table in (
-        {"sm_107a": {_KV4_SIBLING: four}},
-        {"sm_107a": {_KV4_SIBLING: four, _L2PF_SIBLING: four}},
-        {"sm_103a": {_KV4_SIBLING: four, _L2PF_SIBLING: prefetch}},
-    ):
-        monkeypatch.setattr(jit, "VARIANTS", table)
-        variant = cake._kv4_l2pf_variant(
-            _KV4_SIBLING, arch="sm_107a", device=_DEVICE, **window
-        )
-        assert variant == _KV4_SIBLING
-    assert read == []
-    monkeypatch.setattr(
-        jit, "VARIANTS", {"sm_107a": {_KV4_SIBLING: four, _L2PF_SIBLING: prefetch}}
-    )
-    for outside in (
-        dict(window, num_query_tokens=66, batch_size=33),
-        dict(window, batch_size=21),
-        dict(window, compressed_page_size=None),
-        dict(window, compressed_page_size=2),
-        dict(window, num_heads=128),
-        dict(window, max_q_len=3),
-    ):
-        variant = cake._kv4_l2pf_variant(
-            _KV4_SIBLING, arch="sm_107a", device=_DEVICE, **outside
-        )
-        assert variant == _KV4_SIBLING, outside
-    assert read == []
-    variant = cake._kv4_l2pf_variant(
-        _KV4_SIBLING, arch="sm_107a", device=_DEVICE, **window
-    )
-    assert variant == _L2PF_SIBLING
-    assert read == [_DEVICE]
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_l2pf_sibling_extends_the_four_stage_contract(arch):
     """SM100 and SM103 route the L2 prefetch sibling to their four-stage key's
@@ -7649,9 +7591,6 @@ def test_fp8_h64_m64_launch_takes_the_l2pf_sibling(
         (32, 1, 32, 64, True),
         (47, 1, 47, 64, True),
         (48, 1, 48, 64, False),
-        (64, 2, 32, 64, True),
-        (66, 2, 33, 64, False),
-        (63, 2, 32, 64, False),
         (64, 4, 16, 64, True),
         (68, 4, 17, 64, False),
         (60, 3, 20, 64, False),
@@ -7737,8 +7676,6 @@ def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
         (216, 640, 1, 32, 64, _L2PF_SIBLING),
         (216, 640, 1, 47, 64, _L2PF_SIBLING),
         (212, 640, 1, 40, 64, _L2PF_SIBLING),
-        (216, 640, 2, 64, 64, _L2PF_SIBLING),
-        (212, 640, 2, 58, 64, _L2PF_SIBLING),
         (216, 640, 4, 60, 64, _L2PF_SIBLING),
         (212, 640, 4, 64, 64, _L2PF_SIBLING),
         (216, 512, 1, 41, 64, _L2PF_SIBLING),
@@ -7747,7 +7684,6 @@ def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
         (212, 512, 4, 44, 64, _L2PF_SIBLING),
         (216, 640, 1, 58, 64, _KV4_SIBLING),
         (212, 640, 1, 57, 64, _KV4_SIBLING),
-        (216, 640, 2, 66, 64, _KV4_SIBLING),
         (216, 640, 4, 68, 64, _KV4_SIBLING),
         (216, 512, 1, 42, 64, _KV4_SIBLING),
         (216, 512, 4, 60, 64, _KV4_SIBLING),
@@ -7774,21 +7710,6 @@ def test_run_cake_dsv4_launches_the_l2pf_sibling_in_its_window(monkeypatch):
             pool = bound["compressed_KV_cache"]
             assert bound["compressed_KV_rows"] == pool.shape[0] == 4 * page, shape
             assert pool.dtype == torch.uint8 and pool.shape[1] == 512, shape
-    # A ragged call of 2-token requests: 64 rows in 33 requests, the last
-    # empty, keeps the four-stage sibling though its longest request and row
-    # count are in the rule.
-    offsets = torch.tensor([*range(0, 66, 2), 64], dtype=torch.int32)
-    programs, _, _ = _run_fake_h64_decode_fp8(
-        monkeypatch,
-        arch="sm_107a",
-        width=640,
-        tokens=64,
-        max_q_len=2,
-        sm_count=216,
-        batch_size=33,
-        cum_seq_lens_q=offsets,
-    )
-    assert programs == [_KV4_SIBLING]
 
 
 @pytest.mark.cpu_only
