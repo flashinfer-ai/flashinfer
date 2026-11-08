@@ -92,7 +92,7 @@ CLASS = {
 
 def _public_names(mode: str) -> set:
     module = f"{OP}_{mode}_train"
-    names = {
+    return {
         f"{OP}_{mode}",
         CLASS[mode],
         f"is_{module}_supported",
@@ -100,10 +100,8 @@ def _public_names(mode: str) -> set:
         f"{module}_backward",
         f"{module}_backward_workspace",
         f"{module}_backward_workspace_bytes",
+        f"{module}_reset_workspace",
     }
-    if mode == "nondet":
-        names.add(f"{module}_reset_workspace")
-    return names
 
 
 PUBLIC = {mode: _public_names(mode) for mode in MODES}
@@ -378,6 +376,17 @@ def test_the_two_modes_are_separate_modules() -> None:
         | set(loader.MID_ROLES)
         | set(loader.SHORT_ROLES)
     )
+    # the deterministic package routes its call roles and, on some
+    # architectures, a forward of packed rows
+    det_loader = det_backend.cake_jit
+    roles = {record["role"] for record in det_loader.MODULES.values()}
+    assert (
+        set(det_loader.ROLES)
+        <= roles
+        <= set(det_loader.ROLES) | set(det_loader.PACKED_ROLES)
+    )
+    for routes in det_loader.ROUTES.values():
+        assert set(det_loader.ROLES) <= set(routes) <= roles
 
 
 def test_facade_objects() -> None:

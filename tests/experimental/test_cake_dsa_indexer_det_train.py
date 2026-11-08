@@ -139,6 +139,7 @@ _COMMON = dict(
     sample_shift_permille=250,
     sample_shift_rule=None,
     sample_class_rule=None,
+    sample_long_rule=None,
     lsf_programs=False,
     lsf_single_rule=None,
     static_scan_kinds=[],
@@ -3317,8 +3318,9 @@ def test_shipped_unit_rules_by_architecture():
 def test_shipped_sample_shift_rule_by_architecture():
     """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
     ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
-    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
-    same scalar (host-only: ``arch`` and the SM count given)."""
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``, except where their class rules
+    shift a sampled two-segment call (sm_107a also by its long-unit rule).  The backend's plan carries the same scalar
+    (host-only: ``arch`` and the SM count given)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     p103, p100, p107 = (
@@ -3335,7 +3337,8 @@ def test_shipped_sample_shift_rule_by_architecture():
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
                 # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
-                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                # program shifts 500 permille, ahead of sample_shift_rule; on sm_107a the two-segment call shifts 500
+                # permille too (sample_long_rule on a long-unit l6 program, sample_class_rule [32, 500] on a wide one)
                 cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
@@ -3343,9 +3346,7 @@ def test_shipped_sample_shift_rule_by_architecture():
                     assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == (
-                            cls if cls and p is p100 else 250
-                        ), where
+                        assert c.sample_shift_permille == (cls or 250), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -4121,6 +4122,60 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
+    """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift -- not a call whose units average no more tiles than that
+    (the ratio-4 pooled packed rows keep the tiny defaults) -- and the long-unit l6 calls (the two-segment 262144-key
+    document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
+    of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
+    architectures set no long-unit rule, and the sm_107a FP8 record sets neither rule."""
+    assert policy_for("sm_100a").sample_long_rule is None
+    assert policy_for("sm_103a").sample_long_rule is None
+    assert policy_for("sm_107a", "fp8").sample_class_rule is None
+    assert policy_for("sm_107a", "fp8").sample_long_rule is None
+    arch, grid = "sm_107a", _FROZEN_GRIDS["sm_107a"][0]
+    policy = policy_for(arch)
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
+    assert class_rule is not None and long_rule is not None
+
+    def plan(T, Tkv, S, top_k=2048, **knobs):
+        return plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=top_k, arch=arch, num_sms=grid, **knobs
+        )
+
+    def sampling(choice):
+        return choice.sample_tiles_max, choice.sample_shift_permille
+
+    assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # the ratio-4 pooled packed call (top-512 pools, about 21 mean unit tiles) keeps the tiny defaults: the class
+    # rule's larger sample would cover its whole units; sm_100a / sm_103a sample the tiny default count under theirs
+    pooled = plan(10624, 43824, 16, top_k=512, ratio=4)
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(pooled) == (
+        policy.sample_tiles_tiny_units,
+        policy.sample_shift_for(512),
+    )
+    for other in ("sm_100a", "sm_103a"):
+        assert (
+            policy_for(other).sample_class_rule[0]
+            == policy_for(other).sample_tiles_tiny_units
+        )
+    for top_k in (256, 2048, 4096):
+        doc = plan(16384, 270336, 2, top_k=top_k)
+        assert doc.physical_kind in long_rule[0], top_k
+        assert sampling(doc) == (policy.sample_tiles_max, long_rule[1]), top_k
+    wide = plan(4096, 131072, 1)
+    assert wide.physical_kind not in long_rule[0]
+    assert sampling(wide) == (policy.sample_tiles_max, policy.sample_shift_for(2048))
+    assert sampling(plan(16384, 270336, 2, sample_tiles_max=16)) == (16, long_rule[1])
+    assert sampling(plan(16384, 270336, 2, sample_shift_permille=100)) == (
+        policy.sample_tiles_max,
+        100,
+    )
+    assert plan(16384, 270336, 2, sample_tiles_max=0).sample_tiles_max == 0
+    assert plan(17536, 289344, 22, sample_tiles_max=0).sample_tiles_max == 0
+
+
 def test_far_sample_knob_is_validated_on_the_host():
     """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
     if not cake_jit.PROGRAM_KEYS:
@@ -4439,7 +4494,9 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     # the scan binding zeroes nothing: the device's one empty region, no per-call view
@@ -4493,7 +4550,9 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runner._tail_shared
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
@@ -4636,7 +4695,9 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert not host_memsets and runner._ticket_restore is None
         return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
