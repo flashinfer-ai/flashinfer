@@ -914,8 +914,12 @@ except AttributeError:  # pragma: no cover - older torch
 STREAM_WORKSPACES = ("sched", "wave_sync")
 # Arguments a generated program may name beside the operands it addresses through TMA descriptors: the
 # operands' row-addressed bases, the same tensors as ``A`` / ``B`` (``_bind`` passes them where the
-# argument plan names them).
+# argument plan names them).  A build on an architecture outside ``ROW_BASE_READ_ARCHS`` never reads its
+# row bases, and the host binds a one-element view of the operand there: no copy, any row stride, safe
+# under CUDA graph capture.  (Today only the 256-wide k tile's ``main_wave`` program on sm_100a /
+# sm_103a takes row bases, and it does not read them.)
 OPERAND_ALIASES = {"A_rows": "A", "B_rows": "B"}
+ROW_BASE_READ_ARCHS = ("sm_107a",)
 # Stream workspaces (module docstring): one buffer per (kind, device index,
 # CUDA stream handle), created on the first launch on that stream.
 _stream_workspaces: dict[tuple[str, int, int], torch.Tensor] = {}
@@ -1315,6 +1319,21 @@ def _aligned_bytes(nbytes: int, device: torch.device, what: str) -> torch.Tensor
     return ws
 
 
+def _row_base(t: torch.Tensor, operand: str, program: str, arch: str) -> torch.Tensor:
+    """The row-base argument of ``operand`` (``t``, two or more dimensions) for a launch on ``arch``: ``t``
+    itself where the build reads rows through it (``ROW_BASE_READ_ARCHS``), refused unless its rows are
+    dense (row stride = row width; a single row has any stride); else a one-element view at ``t``'s first
+    element."""
+    if arch not in ROW_BASE_READ_ARCHS:
+        return t.as_strided((1,), (1,))
+    if t.size(-2) > 1 and t.stride(-2) != t.size(-1):
+        raise ValueError(
+            f"{operand} must have dense rows (row stride {t.size(-1)}, got {t.stride(-2)}): the {arch} "
+            f"build {program} also reads its rows through a plain pointer; pass a contiguous tensor"
+        )
+    return t
+
+
 def _bind(
     name: str, stage: str, kwargs: dict[str, Any], arch: str, *, split: bool = False
 ) -> _Launch:
@@ -1323,7 +1342,7 @@ def _bind(
     plan names after a stream workspace kind is left to ``CakeMoEGroupedGemmDetLaunch.launch``; with ``split`` so
     are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
     queue probe is built here.  An argument of ``OPERAND_ALIASES`` the plan names gets the operand it
-    aliases."""
+    aliases (``_row_base``)."""
     binding = stage_binding(name, stage, arch)
     program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
@@ -1338,7 +1357,14 @@ def _bind(
         elif arg in kwargs:
             arguments.append(kwargs[arg])
         elif OPERAND_ALIASES.get(arg) in kwargs:
-            arguments.append(kwargs[OPERAND_ALIASES[arg]])
+            arguments.append(
+                _row_base(
+                    kwargs[OPERAND_ALIASES[arg]],
+                    OPERAND_ALIASES[arg],
+                    binding["program"],
+                    arch,
+                )
+            )
         else:
             raise KeyError(
                 f"generated program {binding['program']!r} (route {name!r}, stage {stage!r}) "

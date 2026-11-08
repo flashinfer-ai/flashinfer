@@ -797,9 +797,12 @@ def test_argument_plans_name_only_bound_arguments():
 
 
 def test_bind_passes_each_operand_alias_its_operand(monkeypatch):
-    """A program whose argument plan names ``A_rows`` / ``B_rows`` gets the tensors the
-    host binds as ``A`` / ``B``, in the plan's order; an argument the host does not bind
-    is refused with a ``KeyError`` naming it."""
+    """A program whose argument plan names ``A_rows`` / ``B_rows`` gets the row bases of
+    the tensors the host binds as ``A`` / ``B``, in the plan's order: on an architecture
+    of ``ROW_BASE_READ_ARCHS`` the tensor itself, refused unless its rows are dense;
+    elsewhere a one-element view at its first element, whatever its row stride (the
+    build does not read it).  An argument the host does not bind is refused with a
+    ``KeyError`` naming it."""
     program = "cake_moe_grouped_det_gemm_alias_probe"
     arg_plan = [
         ["buffer", "A"],
@@ -814,7 +817,7 @@ def test_bind_passes_each_operand_alias_its_operand(monkeypatch):
     monkeypatch.setitem(
         PROGRAMS,
         program,
-        {"arg_plan": arg_plan, "ffi_entry": "run", "arches": ["sm_100a"]},
+        {"arg_plan": arg_plan, "ffi_entry": "run", "arches": ["sm_100a", "sm_107a"]},
     )
     monkeypatch.setattr(
         cb,
@@ -825,12 +828,27 @@ def test_bind_passes_each_operand_alias_its_operand(monkeypatch):
     monkeypatch.setattr(
         cb, "load_module", lambda *args: type("Module", (), {"run": entry})
     )
-    a, b = object(), object()
+    assert cb.ROW_BASE_READ_ARCHS == ("sm_107a",)
+    a, b = torch.zeros(4, 8), torch.zeros(2, 6)
+    padded = torch.zeros(4, 16)[:, :8]
     kwargs = dict(A=a, B=b, K=7, grid=(4, 2, 1))
-    launch = cb._bind("alias_probe", "main", kwargs, "sm_100a")
-    assert launch.entry is entry
-    assert launch.arguments == (a, a, b, b, 7, 4, 2, 1)
-    assert launch.workspace_slots == ()
+    for arch in ("sm_100a", "sm_107a"):
+        launch = cb._bind("alias_probe", "main", kwargs, arch)
+        assert launch.entry is entry
+        args = launch.arguments
+        assert args[0] is a and args[3] is b and args[4:] == (7, 4, 2, 1)
+        assert launch.workspace_slots == ()
+        for row_base, t in ((args[1], a), (args[2], b)):
+            if arch in cb.ROW_BASE_READ_ARCHS:
+                assert row_base is t
+            else:
+                assert row_base.shape == (1,) and row_base.data_ptr() == t.data_ptr()
+    launch = cb._bind("alias_probe", "main", dict(kwargs, A=padded), "sm_100a")
+    assert launch.arguments[0] is padded
+    assert launch.arguments[1].shape == (1,)
+    assert launch.arguments[1].data_ptr() == padded.data_ptr()
+    with pytest.raises(ValueError, match="dense rows"):
+        cb._bind("alias_probe", "main", dict(kwargs, A=padded), "sm_107a")
     arg_plan.insert(1, ["buffer", "C_rows"])
     with pytest.raises(KeyError, match="C_rows"):
         cb._bind("alias_probe", "main", kwargs, "sm_100a")
@@ -1081,6 +1099,47 @@ def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
     assert plain.plan["tile_k"] == launch.plan["tile_k"]
     torch.cuda.synchronize()
     assert torch.equal(plain.launch(), out)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_wave_sync_takes_row_padded_operands(out_dtype):
+    """The 256-wide k tile's weight gradient takes ``g`` and ``x`` with padded rows (the
+    leading columns of wider NaN-filled tensors) and gives the bits of contiguous
+    copies.  Its ``main_wave`` build on sm_100a / sm_103a names the operands' row bases
+    and never reads them; the host binds a one-element view there
+    (``cake_backend.ROW_BASE_READ_ARCHS``)."""
+    device = _require_program("wgrad", out_dtype)
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    sizes, n, k = [2048] * 8, 4096, 4096
+    x, _w, g, offs = _inputs(sizes, n, k, device, seed=11)
+
+    def padded(t):
+        wide = torch.full(
+            (t.size(0), t.size(1) + 256), float("nan"), dtype=t.dtype, device=t.device
+        )
+        wide[:, : t.size(1)] = t
+        return wide[:, : t.size(1)]
+
+    gp, xp = padded(g), padded(x)
+    assert not gp.is_contiguous() and not xp.is_contiguous()
+    dense = cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        g, x, offs, out_dtype=out_dtype
+    )
+    launch = cake_moe_grouped_gemm_det_train_prepare_wgrad(
+        gp, xp, offs, out_dtype=out_dtype
+    )
+    wave = arch in c["wave_sync_archs"][256] and cake_jit.stage_served(
+        launch.record_name, "main_wave", arch
+    )
+    assert launch.plan["tile_k"] == 256, launch.plan
+    assert launch.stages[0] == ("main_wave" if wave else "main"), launch.stages
+    assert launch.stages == dense.stages
+    ref = dense.launch().clone()
+    launch.out.fill_(float("nan"))
+    out = launch.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
 
 
 @pytest.mark.parametrize("op", ["fwd", "dgrad"])
