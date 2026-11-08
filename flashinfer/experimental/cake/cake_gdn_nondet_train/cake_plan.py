@@ -193,13 +193,21 @@ def tape_state(arch: str, save_state: bool) -> tuple[str, ...]:
     return LEVEL_STATE[TAPE_LEVELS[arch]] if save_state else ()
 
 
+# the one-element tensor every placeholder of a (device, dtype) expands, made at its first placeholder
+_PLACEHOLDER_BASES: dict[tuple[torch.device | str, torch.dtype], torch.Tensor] = {}
+
+
 def placeholder(
     shape: Sequence[int], dtype: torch.dtype, device: torch.device | str
 ) -> torch.Tensor:
     """A tensor of ``shape``, ``dtype`` and ``device`` without storage of its own (one element, every stride 0): it
     stands in a saved list for an entry the call does not save, so the list keeps its arity.  Consumers decide from
-    the plan, never by reading a placeholder."""
+    the plan, never by reading a placeholder.  Every placeholder of a (device, dtype) is a view of the same element,
+    made once, so a call allocates nothing for it (the host, not the GPU, sets the forward's time at short rows)."""
+    base = _PLACEHOLDER_BASES.get((device, dtype))
+    if base is None:
+        base = _PLACEHOLDER_BASES[(device, dtype)] = torch.empty(
+            1, dtype=dtype, device=device
+        )
     shape = tuple(int(s) for s in shape)
-    if not shape:
-        return torch.empty((), dtype=dtype, device=device)
-    return torch.empty(1, dtype=dtype, device=device).expand(shape)
+    return base.expand(shape) if shape else base.view(())

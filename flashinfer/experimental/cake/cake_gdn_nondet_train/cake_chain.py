@@ -2942,8 +2942,8 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     beta_bf16 = beta.dtype == torch.bfloat16
     # every tensor of the forward is made before its first launch, so the launches follow one another without host
     # work between them: the tape's tensors (and the state its tape level keeps under save_state,
-    # :func:`cake_plan.tape_state`) as views of one allocation (:func:`_carve`), the rest of the state as views of
-    # another, freed when the forward returns, the output as its own (the caller keeps it past the tape)
+    # :func:`cake_plan.tape_state`) as views of one allocation (:func:`_carve`), the rest of the state in allocations
+    # of its own, freed when the forward returns, the output as its own (the caller keeps it past the tape)
     f32 = torch.float32
     # v stays a view where the stages that read it by rows take its token pitch (``wy_tc2`` on every architecture
     # today; :func:`_v_rows`), else it is copied once into contiguous rows
@@ -2965,7 +2965,10 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
     off_state = [s for s, on in zip(state, on_tape, strict=True) if not on]
     views = _carve(device, pieces + kept_state)
     kept_views = iter(views[len(pieces) :])
-    off_views = iter(_carve(device, off_state) if off_state else ())
+    # the state off the tape (u under T_full): one torch.empty each (no carve's view), freed when the forward returns
+    off_views = iter(
+        [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in off_state]
+    )
     views = views[: len(pieces)]
     views += [next(kept_views) if on else next(off_views) for on in on_tape]
     qn, kn, rstd_q, rstd_k, g_cs, A = views[:6]

@@ -154,6 +154,11 @@ def test_placeholder() -> None:
     assert empty.shape == (0, 6, 128) and empty.dtype == torch.bfloat16
     scalar = cake_plan.placeholder((), torch.float32, "cpu")
     assert scalar.shape == ()
+    # every placeholder of a (device, dtype) views the same element: a call allocates nothing for it
+    again = cake_plan.placeholder((3, 2), torch.float32, "cpu")
+    assert again.untyped_storage().data_ptr() == p.untyped_storage().data_ptr()
+    assert scalar.untyped_storage().data_ptr() == p.untyped_storage().data_ptr()
+    assert empty.untyped_storage().data_ptr() != p.untyped_storage().data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
