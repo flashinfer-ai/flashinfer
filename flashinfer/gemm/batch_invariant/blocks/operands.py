@@ -11,7 +11,7 @@ the MLIR context; the results are plain attributes the kernel reads as constants
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -97,8 +97,11 @@ class StaticPlan:
         extra_smem_bytes: int = 2048,
         chunks: int = 1,
         in_fmt: str = "bf16",
+        k_blocks: Optional[int] = None,
     ):
-        """``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
+        """``k_blocks`` overrides the instruction K-steps per smem stage (default ``MMA_K_BLOCKS``: one 128-byte swizzle atom
+        of K per row; the grouped MoE kernels take two atoms for bf16) -- the lowering's inner radix, a placement of the same
+        fold (Lean's ``kblockLoopG_eq_kfoldG`` holds for every radix). ``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
         ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``chunks`` is the
         class's chunk count: with ``knobs.cta_chunks`` the CTA folds all of them (``cta_chunks`` below) and the
         TMEM holds the running sum next to the accumulator stages. ``in_fmt`` names the operand format whose knob
@@ -131,7 +134,7 @@ class StaticPlan:
         self.mma_tiler = (
             knobs.mma_tiler_mn[0],
             knobs.mma_tiler_mn[1],
-            inst_k * MMA_K_BLOCKS,
+            inst_k * (k_blocks or MMA_K_BLOCKS),
         )
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // self.atom_thr_size,

@@ -12,6 +12,8 @@ builds the histogram, the group tables and the positions from the shared copy wi
 form up to ``ROUTE_PLAN_MAX_TOKENS`` tokens (one CTA's warps route the tokens serially beyond a few per warp, where the two-launch
 form's parallel plan wins). ``align``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing:
 ``src`` then spans the padded bound and the launch writes ``-1`` into every padding slot, the two-launch form's host fill).
+``dual``: the dense positions and, next to them, the positions with the groups padded to ``pad_align`` rows (``dest_pad``,
+``pos_pad``: the block-scaled classes' dense packing, whose scale factors and row scales sit at the padded positions).
 """
 
 from __future__ import annotations
@@ -44,9 +46,21 @@ ROUTE_PLAN_MAX_TOKENS = (
 
 
 class RoutePlanKernel:
-    def __init__(self, Ep: int, k: int, method: S.RoutingMethod, align: int = 1):
+    def __init__(
+        self,
+        Ep: int,
+        k: int,
+        method: S.RoutingMethod,
+        align: int = 1,
+        dual: bool = False,
+        pad_align: int = 128,
+    ):
+        """``dual``: the dense positions and, next to them, the positions with the groups padded to ``pad_align`` rows
+        (``dest_pad [T k]``, ``pos_pad [T k]``: the padded position of every dense row) -- the block-scaled classes' dense
+        packing, whose scale factors sit at the padded positions (``PlanKernel(1, True, pad_align)``'s integers)."""
         assert Ep % LANES == 0 and Ep // LANES in (1, 2, 4, 8, 16, 32) and 1 <= k <= 16
         assert align >= 1 and align & (align - 1) == 0, align
+        assert not (dual and align > 1) and pad_align > 1, (align, dual, pad_align)
         self.Ep, self.P, self.k, self.method, self.align = (
             Ep,
             Ep // LANES,
@@ -54,6 +68,7 @@ class RoutePlanKernel:
             method,
             align,
         )
+        self.dual, self.pad_align = dual, pad_align
         red = S.softmax_reduction(Ep, lambda fp, e: None)
         self.plan = canon.plan(
             red, canon.Placement.make({"expert": [(self.P, "reg"), (LANES, "lane")]})
@@ -70,13 +85,15 @@ class RoutePlanKernel:
         mCounts: cute.Tensor,
         mDest: cute.Tensor,
         mSrc: cute.Tensor,
+        mDestPad: cute.Tensor,
+        mPosPad: cute.Tensor,
         T: Int32,
         E: Int32,
         stream,
     ):
-        self.kernel(mL, mBias, mScale, mExp, mW, mCounts, mDest, mSrc, T, E).launch(
-            grid=[1, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True
-        )
+        self.kernel(
+            mL, mBias, mScale, mExp, mW, mCounts, mDest, mSrc, mDestPad, mPosPad, T, E
+        ).launch(grid=[1, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True)
 
     @cute.kernel
     def kernel(
@@ -89,6 +106,8 @@ class RoutePlanKernel:
         mCounts: cute.Tensor,
         mDest: cute.Tensor,
         mSrc: cute.Tensor,
+        mDestPad: cute.Tensor,
+        mPosPad: cute.Tensor,
         T: Int32,
         E: Int32,
     ):
@@ -113,6 +132,15 @@ class RoutePlanKernel:
         wcnt = smem.allocate_tensor(
             Int16, cute.make_layout((RANK_WARPS * MAX_E,)), byte_alignment=16
         )
+        s_off_pad = s_off
+        s_pre_pad = s_pre
+        if cutlass.const_expr(self.dual):
+            s_off_pad = smem.allocate_tensor(
+                Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
+            )
+            s_pre_pad = smem.allocate_tensor(
+                Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
+            )
         for j in cutlass.range(tidx, RANK_WARPS * MAX_E, THREADS):
             wcnt[j] = Int16(0)
         # phase A: the tokens of this warp, the route kernel's per-token code
@@ -166,6 +194,8 @@ class RoutePlanKernel:
         cute.arch.barrier()
         if warp == 0:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
+            if cutlass.const_expr(self.dual):
+                build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
         cute.arch.barrier()
         # phase B3: the positions
         if warp < Int32(RANK_WARPS):
@@ -174,9 +204,14 @@ class RoutePlanKernel:
                 i = base_w + Int32(c * LANES) + lane
                 if i < n:
                     e = es[c]
-                    p = s_off[e] + wcnt[warp * MAX_E + e].to(Int32) + rs[c]
+                    rank = wcnt[warp * MAX_E + e].to(Int32) + rs[c]
+                    p = s_off[e] + rank
                     mDest[i] = p
                     mSrc[p] = i
+                    if cutlass.const_expr(self.dual):
+                        pp = s_off_pad[e] + rank
+                        mDestPad[i] = pp
+                        mPosPad[p] = pp
         if cutlass.const_expr(self.align > 1):
             # the padded packing's -1 slots: every group's rows past its count up to its rounded extent (one warp per expert),
             # and the rows past the padded total up to the buffer's end (the host's bound)
@@ -192,9 +227,15 @@ class RoutePlanKernel:
 
 
 def route_plan_kernel_name(
-    Ep: int, k: int, method_name: str, in_fmt: str, align: int = 1
+    Ep: int,
+    k: int,
+    method_name: str,
+    in_fmt: str,
+    align: int = 1,
+    dual: bool = False,
+    pad_align: int = 128,
 ) -> str:
-    mode = f"_a{align}" if align > 1 else ""
+    mode = (f"_a{align}" if align > 1 else "") + (f"_dual{pad_align}" if dual else "")
     return jit.sanitize_symbol_name(
         f"moe_route_plan_Ep{Ep}_k{k}_{method_name}_{in_fmt}{mode}"
     )
@@ -202,10 +243,17 @@ def route_plan_kernel_name(
 
 @functools.cache
 def get_compiled_route_plan(
-    Ep: int, k: int, method: S.RoutingMethod, in_fmt: str = "f32", align: int = 1
+    Ep: int,
+    k: int,
+    method: S.RoutingMethod,
+    in_fmt: str = "f32",
+    align: int = 1,
+    dual: bool = False,
+    pad_align: int = 128,
 ) -> Any:
     """``kernel(logits [T, E], bias [E] f32, scale [1] f32, experts [T, k] i32, weights [T, k] f32, counts [E] i32,
-    dest [T k] i32, src [T k] i32 (the padded bound's rows when ``align > 1``), T, E)``; ``Ep`` the expert bucket, ``T`` and
+    dest [T k] i32, src [T k] i32 (the padded bound's rows when ``align > 1``), dest_pad [T k] i32, pos_pad [T k] i32 (the dual
+    form's padded positions; any int32 tensors otherwise), T, E)``; ``Ep`` the expert bucket, ``T`` and
     ``E`` runtime."""
     in_dt = get_cutlass_dtype(in_fmt)
 
@@ -230,9 +278,11 @@ def get_compiled_route_plan(
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         src_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
+        dp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        pp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            RoutePlanKernel(Ep, k, method, align),
+            RoutePlanKernel(Ep, k, method, align, dual, pad_align),
             l_fake,
             b_fake,
             s_fake,
@@ -241,6 +291,8 @@ def get_compiled_route_plan(
             c_fake,
             d_fake,
             src_fake,
+            dp_fake,
+            pp_fake,
             Int32(1),
             Int32(1),
             stream_fake,
@@ -248,5 +300,7 @@ def get_compiled_route_plan(
         )
 
     return jit.build_and_load(
-        MODULE, route_plan_kernel_name(Ep, k, method.name, in_fmt, align), compile_fn
+        MODULE,
+        route_plan_kernel_name(Ep, k, method.name, in_fmt, align, dual, pad_align),
+        compile_fn,
     )
