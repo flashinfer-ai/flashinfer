@@ -10,6 +10,7 @@ from flashinfer.triton.activation import silu_and_mul
 @pytest.mark.parametrize("column_stride", [0, 1, 2])
 @pytest.mark.parametrize("scaled", [False, True])
 def test_silu_and_mul_strided_input(dtype, dim, column_stride, scaled):
+    """Strided columns match the reference with and without scaling."""
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         pytest.skip("bfloat16 is not supported on this GPU")
     torch.manual_seed(42)
@@ -31,3 +32,17 @@ def test_silu_and_mul_strided_input(dtype, dim, column_stride, scaled):
             min=torch.finfo(dtype).min, max=torch.finfo(dtype).max
         )
     torch.testing.assert_close(y, expected.to(dtype), rtol=2e-2, atol=2e-3)
+
+
+def test_silu_and_mul_strided_scaled_saturation():
+    """Scaled strided inputs clamp to the largest finite output value."""
+    dim = 31
+    base = torch.zeros(2, 4 * dim, dtype=torch.float16, device="cuda")
+    x = base[:, ::2]
+    x.fill_(1000)
+    x_scale = torch.tensor([0.25], device=x.device)
+    o_scale = torch.tensor([1.75], device=x.device)
+
+    y = silu_and_mul(x, x_scale=x_scale, o_scale=o_scale)
+    expected = torch.full((2, dim), 65504, dtype=x.dtype, device=x.device)
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
