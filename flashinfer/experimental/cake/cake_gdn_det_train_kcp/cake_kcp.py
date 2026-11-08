@@ -1567,6 +1567,68 @@ def resolve_launch(
     return str(record), values, grid, is_test
 
 
+def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int, jit: Any) -> tuple:
+    """Every input :func:`resolve_launch` reads besides the launch's tensors: the registry's identity (module, record
+    table and its size), the program, the static knobs, the grid rule's arguments (in the call site's order), the
+    walk-form inputs (``_sm_count``, ``_fwdh_vh``, ``_vh64_fits``, ``_dhu_vh``, ``_arch``, ``_dhu_long_chain``), the
+    merge's columns and the caller's grid x.
+
+    The launch cache is valid only because :func:`resolve_launch` derives the record, the grid, the test flag and the
+    merge's ``cols_per_cta`` from these values and the registry alone and reads nothing from the launch's tensors: an
+    input added to :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
+    grid_args = args.get("_grid_args")
+    modules = getattr(jit, "MODULES", None)
+    return (
+        name,
+        id(jit),
+        id(modules),
+        len(modules) if isinstance(modules, dict) else None,
+        args.get("_precision_mode"),
+        args.get("_transfer_walk"),
+        tuple(grid_args.items()) if grid_args else None,
+        args.get("_sm_count"),
+        args.get("_fwdh_vh"),
+        args.get("_vh64_fits"),
+        args.get("_dhu_vh"),
+        args.get("_arch"),
+        args.get("_dhu_long_chain"),
+        args.get("ncols"),
+        args.get("cols_per_cta"),
+        args.get("_grid"),
+        int(cols_per_cta),
+    )
+
+
+def _resolve_cached(
+    name: str, args: dict[str, Any], *, cols_per_cta: int = 8
+) -> tuple[str, dict[str, Any], tuple[int, int, int], bool]:
+    """:func:`resolve_launch` through the launch cache of the call's tables (``_Tables.launches``, one per context
+    plan): the record, the grid, the test flag and the merge's ``cols_per_cta`` of a launch key are resolved once;
+    every launch rebuilds its public values and appends ``(record, grid)`` to the call's records as
+    :func:`resolve_launch` does.  A key with an unhashable value resolves per launch."""
+    call = args.get("_call")
+    cache = getattr(getattr(call, "tb", None), "launches", None)
+    if cache is None:
+        return resolve_launch(name, args, cols_per_cta=cols_per_cta)
+    try:
+        key = _launch_key(name, args, cols_per_cta, _registry())
+        hit = cache.get(key)
+    except TypeError:  # an unhashable grid argument or knob
+        return resolve_launch(name, args, cols_per_cta=cols_per_cta)
+    if hit is None:
+        record, values, grid, is_test = resolve_launch(
+            name, args, cols_per_cta=cols_per_cta
+        )
+        cache[key] = (record, grid, is_test, values.get("cols_per_cta"))
+        return record, values, grid, is_test
+    record, grid, is_test, cols = hit
+    values = _public_args(args)
+    if cols is not None:
+        values["cols_per_cta"] = cols
+    call.records.append((record, grid))
+    return record, values, grid, is_test
+
+
 _L2N_NOT_SHIPPED = (
     "use_qk_l2norm_in_kernel=True needs the in-kernel Q / K L2 norm programs (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply), "
     "which this package's registry does not ship yet; use backend='fake' (the torch emulation) or the norm-off route"
@@ -1633,7 +1695,7 @@ class KernelBackend(Backend):
         elif name in DHU_PROGRAMS:
             # the #7 width rule reads the architecture (dhu_vh)
             args = {**args, "_arch": be.device_arch(device_index)}
-        record, values, grid, is_test = resolve_launch(
+        record, values, grid, is_test = _resolve_cached(
             name, args, cols_per_cta=self.cols_per_cta
         )
         module = None
@@ -1673,7 +1735,7 @@ class FakeBackend(Backend):
     def run(self, name: str, args: dict[str, Any]) -> None:
         mod = self.module()
         call: CakeGDNDetKcpCall = args["_call"]
-        record, values, grid, _is_test = resolve_launch(name, args)
+        record, values, grid, _is_test = _resolve_cached(name, args)
         run_module = getattr(mod, "run_module", None)
         if (
             run_module is not None
@@ -1861,6 +1923,37 @@ def _prefix(values) -> list[int]:
 MEMO_MAX = 4096  # entries of a plan's walk-form memo (_Tables.memo) before it is cleared and rebuilt on use
 
 
+class _IndexedSpec:
+    """The static part of the :class:`Indexed` views a plan builds from one pair of its tables: the normalised
+    ``index`` / ``tiles`` tuples (the views' fields), the kernels' addressing of the tiles (derived at the first
+    :meth:`CakeGDNDetKcpCall.block`, by :meth:`Indexed.addressing`) and the device index table per device.  ``src``
+    holds the keyed source tuples, so their ids cannot be reused while the entry lives."""
+
+    __slots__ = ("src", "index", "tiles", "addr", "dev")
+
+    def __init__(self, index: tuple, tiles: tuple) -> None:
+        self.src = (index, tiles)
+        self.index = tuple(int(i) for i in index)
+        self.tiles = tuple(tuple(int(t) for t in row) for row in tiles)
+        self.addr: tuple[int, int, int, int] | None = None
+        self.dev: dict[torch.device, torch.Tensor] = {}
+
+
+def _chain_device_tables(tb: Any, ch: Any, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """The device tables of the merge chains ``ch`` (``chain_start`` int32; ``elem_m``, ``elem_c``, ``elem_y``,
+    ``x0_index``, ``y_final`` int64), cached by content on the head plan (:meth:`_Tables.dev`)."""
+    tag = ("chain", ch.content())
+    i64 = torch.int64
+    return (
+        tb.dev(tag + ("start",), ch.chain_start, device),
+        tb.dev(tag + ("m",), ch.elem_m, device, i64),
+        tb.dev(tag + ("c",), ch.elem_c, device, i64),
+        tb.dev(tag + ("y",), ch.elem_y, device, i64),
+        tb.dev(tag + ("x0",), ch.x0_index, device, i64),
+        tb.dev(tag + ("yf",), ch.y_final, device, i64),
+    )
+
+
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, HV)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the merge chains, derived once from ``cake_kcp_plan.CakeGDNDetKcpContext``
@@ -1887,7 +1980,15 @@ class _Tables:
     ) -> None:
         self.ctx = ctx
         # host decisions of this plan derived at their first use (the walk lists' vh = 64 chain clause, walk_fits)
+        # and the launches' static pieces (host data, never a kernel argument value of its own): the normalised pool
+        # tables of CakeGDNDetKcpCall.indexed with their kernel addressing and device index tables
+        # (_IndexedSpec), the walk lists' and the merge chains' device tables, the zero block's index table and the
+        # collectives' split lists.  Every device table is the one ``dev`` returns (cached by content on the head
+        # plan), so a launch receives the very tensors it received before.
         self.memo: dict[tuple, Any] = {}
+        # launch key -> (record, grid, is_test, merge cols_per_cta): the launch cache of _resolve_cached (host data of
+        # this plan, filled at the first launch of each key)
+        self.launches: dict[tuple, tuple] = {}
         self.H = H = int(HV)  # every pool, split and chain is per VALUE head
         self.fused_walks = int(
             fused_walks
@@ -2462,6 +2563,60 @@ class _Tables:
         self.memo[key] = value
         return value
 
+    def indexed_spec(self, index: Any, tiles: Any) -> _IndexedSpec | None:
+        """The memo entry of an :class:`Indexed` view over the tables ``index`` / ``tiles`` -- keyed by the identity
+        of the two tuples (immutable; the entry holds them, so their ids stay theirs); ``None`` for any other type
+        (a list may change after its first use: such a view is derived per call as before)."""
+        if type(index) is not tuple or type(tiles) is not tuple:
+            return None
+        spec = self.memo.get(("ix", id(index), id(tiles)))
+        if spec is None:
+            spec = _IndexedSpec(index, tiles)
+            self._memo_put(("ix", id(index), id(tiles)), spec)
+            self._memo_put(("ixn", id(spec.index), id(spec.tiles)), spec)
+        return spec
+
+    def walk_table(self, walk: Sequence[int], device: torch.device) -> torch.Tensor:
+        """The int32 device table of the walk list ``walk`` (keyed by its content: the lists are short)."""
+        key = ("walk", tuple(walk), device)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, self.dev("walk", [int(s) for s in walk], device))
+        return hit
+
+    def neg_index(self, device: torch.device) -> torch.Tensor:
+        """The zero block's ``[NSEG]`` index table (every entry ``-1``) on the device."""
+        key = ("neg", device)
+        t = self.memo.get(key)
+        if t is None:
+            t = self._memo_put(key, self.dev("neg", [-1] * int(self.NSEG), device))
+        return t
+
+    def chain_tables(self, family: str, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """The six device tables of the plan's merge chain family ``family`` (``chain_start`` int32; ``elem_m``,
+        ``elem_c``, ``elem_y``, ``x0_index``, ``y_final`` int64), uploaded in this order at first use."""
+        key = ("chain", family, device)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, _chain_device_tables(self, self.chains[family], device))
+        return hit
+
+    def split_lists(self, coll: str) -> tuple[list[int], list[int]]:
+        """:meth:`split_elems` of ``coll``, derived once (the caller must not mutate the lists)."""
+        key = ("split", coll)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, self.split_elems(coll))
+        return hit
+
+    def pool_size_items(self, backward: bool) -> tuple[tuple[str, int], ...]:
+        """:meth:`pool_sizes` of ``backward`` as ``(name, elements)`` pairs, derived once."""
+        key = ("pool_sizes", bool(backward))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, tuple(self.pool_sizes(backward).items()))
+        return hit
+
     def walk_fits(self, walk: Sequence[int], sm_count: int) -> bool:
         """:func:`walk_vh64_fits` of the walk list ``walk`` (its segments' chunk counts; keyed by its content like
         :meth:`walk_table`)."""
@@ -2725,7 +2880,7 @@ class CakeGDNDetKcpWorkspace:
     def _size_pools(
         self, tb: _Tables, backward: bool, skip: Sequence[str], device: torch.device
     ) -> None:
-        for name, n in tb.pool_sizes(backward).items():
+        for name, n in tb.pool_size_items(backward):
             if name in skip:
                 continue
             cur = self._pools.get(name)
@@ -2785,7 +2940,8 @@ class CakeGDNDetKcpWorkspace:
                     f"CakeGDNDetKcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
-        return t if n is None else t[:n]
+        # a pool of exactly ``n`` elements is its own first-``n`` view (same storage, offset, shape and stride)
+        return t if n is None or t.numel() == n else t[:n]
 
     def has(self, name: str) -> bool:
         if self._pending is not None:
@@ -3123,6 +3279,9 @@ class CakeGDNDetKcpCall:
     def indexed(
         self, pool: str, index: Sequence[int], tiles: Sequence[Sequence[int]]
     ) -> Indexed:
+        spec = self.tb.indexed_spec(index, tiles)
+        if spec is not None:  # the plan's own tables: normalised once
+            return Indexed(self.buf(pool), spec.index, spec.tiles)
         return Indexed(
             self.buf(pool),
             tuple(int(i) for i in index),
@@ -3203,16 +3362,30 @@ class CakeGDNDetKcpCall:
     def block(self, ix: Indexed | None) -> _Block:
         """The kernel's view of an :class:`Indexed` pool; ``None`` (or no slot) = the zero state: every index ``-1``
         and a never-read base pointer."""
-        nseg = int(self.tb.NSEG)
+        tb = self.tb
+        nseg = int(tb.NSEG)
         if ix is None or ix.n_slots == 0:
-            return _Block(self.buf("eye"), self.dev("neg", [-1] * nseg), self.H, 1, 1)
-        base_tile, hg, n, stride = ix.addressing(self.H)
+            return _Block(self.buf("eye"), tb.neg_index(self.device), self.H, 1, 1)
+        # a view from indexed() over the plan's own tables: its addressing and index table are derived once
+        spec = tb.memo.get(("ixn", id(ix.index), id(ix.tiles)))
+        if spec is None:
+            base_tile, hg, n, stride = ix.addressing(self.H)
+        else:
+            if spec.addr is None:
+                spec.addr = ix.addressing(self.H)
+            base_tile, hg, n, stride = spec.addr
         if len(ix.index) != nseg:
             raise ValueError(
                 f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}"
             )
         ptr = ix.pool.view(-1)[base_tile * TILE :] if base_tile else ix.pool.view(-1)
-        return _Block(ptr, self.dev("index", ix.index), int(hg), int(n), int(stride))
+        if spec is None:
+            index_t = self.dev("index", ix.index)
+        else:
+            index_t = spec.dev.get(self.device)
+            if index_t is None:
+                index_t = spec.dev[self.device] = self.dev("index", ix.index)
+        return _Block(ptr, index_t, int(hg), int(n), int(stride))
 
     # -- launches
     def kernel(self, name: str, grid: int, **args: Any) -> None:
@@ -3238,7 +3411,7 @@ class CakeGDNDetKcpCall:
             "num_qk_heads": self.H_qk,
             "seg_chunk_start": tb.seg_table(self.device),
             "num_seqs": int(tb.NSEG),
-            "walk_seg": self.dev("walk", walk),
+            "walk_seg": tb.walk_table(walk, self.device),  # the plan's memo (content-keyed device table)
             "chunk_bos": self.ctx.tables["chunk_bos"],
             "chunk_len": self.ctx.tables["chunk_len"],
         }
@@ -3396,8 +3569,12 @@ class CakeGDNDetKcpCall:
         x0 = (
             self.buf(spec["x0"]) if spec["x0"] else y
         )  # never read when every x0_index is -1
-        tag = ("chain", ch.content())
-        i64 = torch.int64
+        # the plan's own family: its tables from the plan's memo; explicit chains (the ring's): derived per call
+        start, elem_m, elem_c, elem_y, x0_index, y_final = (
+            self.tb.chain_tables(family, self.device)
+            if chains is None
+            else _chain_device_tables(self.tb, ch, self.device)
+        )
         self.kernel(
             "kcp_affine_merge",
             ch.n_chains * (ch.ncols // cols_eff),
@@ -3407,12 +3584,12 @@ class CakeGDNDetKcpCall:
             c=c,
             x0=x0,
             y=y,
-            chain_start=self.dev(tag + ("start",), ch.chain_start),
-            elem_m=self.dev(tag + ("m",), ch.elem_m, i64),
-            elem_c=self.dev(tag + ("c",), ch.elem_c, i64),
-            elem_y=self.dev(tag + ("y",), ch.elem_y, i64),
-            x0_index=self.dev(tag + ("x0",), ch.x0_index, i64),
-            y_final=self.dev(tag + ("yf",), ch.y_final, i64),
+            chain_start=start,
+            elem_m=elem_m,
+            elem_c=elem_c,
+            elem_y=elem_y,
+            x0_index=x0_index,
+            y_final=y_final,
             ncols=int(ch.ncols),
             transpose_m=int(spec["tm"]),
             write_states=int(spec["ws"]),
@@ -3674,8 +3851,13 @@ class CakeGDNDetKcpCall:
             raise ValueError(
                 f"{tag}: split lists must have one entry per rank ({self.world})"
             )
-        send = self.buf(send_name)[: sum(send_splits)]
-        recv = self.buf(recv_name)[: sum(recv_splits)]
+        send, recv = self.buf(send_name), self.buf(recv_name)
+        n_send, n_recv = sum(send_splits), sum(recv_splits)
+        # a buffer of exactly the exchanged size is its own leading view (same storage, offset, shape, stride)
+        if send.numel() != n_send:
+            send = send[:n_send]
+        if recv.numel() != n_recv:
+            recv = recv[:n_recv]
         self.counters["collectives"] += 1
         self._sequence(tag)
         if self.world == 1 or not (dist.is_available() and dist.is_initialized()):
@@ -4497,7 +4679,7 @@ def _forward(
         started_early = not wait_first and not hand_off
         _ring_forward(call, walk_starts=started_early, program=walk_program)
     else:
-        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
+        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_lists("c1"))
         if not wait_first:
             if tb.P > 1:
                 call.merge(
@@ -4524,7 +4706,7 @@ def _forward(
             # plane exists from here to wait(c2) only, not across the whole forward
             call.fresh("c2_send")
         call.merge("fwd")  # the owner's chains: S_in slices into the c2 send layout
-        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_elems("c2"))
+        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_lists("c2"))
         call.wait(w2)
         w2 = None
         # sent: a fresh plane goes now (a workspace pool stays until FWD_DEAD_POOLS)
@@ -4785,7 +4967,7 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
         merged_end = ended_early and tb.P > 1
         _ring_backward(call, walk_ends=ended_early)
     else:
-        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
+        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_lists(f"b1_{form}"))
         call.wait(wb1)
         wb1 = None
         call.merge(
@@ -4795,7 +4977,7 @@ def _backward(call: CakeGDNDetKcpCall, saved: CakeGDNDetKcpSaved | None) -> None
             call.release_pools(BWD_DEAD_AFTER_ADJ_MERGE)
             # the saved c1 receive tensor: the adjoint merge was its last reader
             call.drop_bound("c1_recv", saved)
-        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_elems("b2"))
+        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_lists("b2"))
         if not wait_first:
             if tb.P > 1:
                 call.merge("dcarry_end")  # reads the staging planes only
@@ -5096,7 +5278,13 @@ def _prepare(
         ctx, "prepare", None
     )  # the plan's device tables per (HV, sm_count, P) key, uploaded at first use
     if callable(prepare):
-        prepare(H_qk, HV, P=P)
+        caches = getattr(ctx, "_caches", None)
+        # the bundle is built once per key: later calls skip the lookup
+        done = ("kcp_prepared", H_qk, HV, P)
+        if not isinstance(caches, dict) or done not in caches:
+            prepare(H_qk, HV, P=P)
+            if isinstance(caches, dict):
+                caches[done] = True
     # Dead pools are not allocated (R2-L1 1a): the ring pools under the a2a exchange and the pools the call binds
     # fresh / saved tensors for (``c1_recv`` under ``save_transfer``, ``stage_m`` when the saved set carries
     # ``M_seg``) never hold a byte of this call.
@@ -5960,11 +6148,13 @@ def _qkv_views(
     qkv: torch.Tensor, H_qk: int, HV: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     lead = tuple(qkv.shape[:-1])
-    a, b = H_qk * D, 2 * H_qk * D
+    a = H_qk * D
+    # narrow along the channel axis: the views of ``qkv[..., :a]`` / ``[a:2a]`` / ``[2a:]`` (same storage offset,
+    # shape and strides) without the indexing parser
     return (
-        qkv[..., :a].view(*lead, H_qk, D),
-        qkv[..., a:b].view(*lead, H_qk, D),
-        qkv[..., b:].view(*lead, HV, D),
+        qkv.narrow(-1, 0, a).view(*lead, H_qk, D),
+        qkv.narrow(-1, a, a).view(*lead, H_qk, D),
+        qkv.narrow(-1, 2 * a, HV * D).view(*lead, HV, D),
     )
 
 
@@ -6023,6 +6213,30 @@ def cake_gdn_det_train_kcp_packed_qkv_views(
     return CakeGDNDetKcpPackedQKVSplitFunction.apply(qkv, H_qk, HV)
 
 
+# cake_gdn_det_kcp's validated options per keyword set (no ``options`` object): a CakeGDNDetKcpOptions built and checked
+# once per distinct keyword values (with their types, so ``1`` never stands in for ``True``) and shared by the calls --
+# never handed to the caller, never mutated by the package (a recompute handle's form is a dataclasses.replace copy).
+_KEYWORD_OPTIONS: dict[tuple, CakeGDNDetKcpOptions] = {}
+KEYWORD_OPTIONS_MAX = 64
+
+
+def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> CakeGDNDetKcpOptions:
+    try:
+        key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
+            None,
+            *((k, type(v), v) for k, v in sorted(knobs.items())),
+        )
+        opts = _KEYWORD_OPTIONS.get(key)
+    except TypeError:  # an unhashable value (a test_knobs dict): validated per call
+        return make_options(None, **over, **knobs)
+    if opts is None:
+        opts = make_options(None, **over, **knobs)
+        if len(_KEYWORD_OPTIONS) >= KEYWORD_OPTIONS_MAX:
+            _KEYWORD_OPTIONS.clear()
+        _KEYWORD_OPTIONS[key] = opts
+    return opts
+
+
 @_option_keywords
 def cake_gdn_det_kcp(
     q: torch.Tensor,
@@ -6075,7 +6289,11 @@ def cake_gdn_det_kcp(
         raise ValueError(
             "recompute_handle keeps the incoming states only: it needs save_transfer=False"
         )
-    opts = make_options(options, **over, **knobs)
+    opts = (
+        make_options(options, **over, **knobs)
+        if options is not None
+        else _keyword_options(over, knobs)
+    )
     if recompute_handle is not None:
         if opts.boundary_mode != "saved" or opts.graph != "off":
             raise ValueError(

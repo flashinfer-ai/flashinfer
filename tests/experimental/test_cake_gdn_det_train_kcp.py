@@ -7128,3 +7128,175 @@ def test_settle_completes_a_pending_sizing_before_any_read() -> None:
     ws = kcp.CakeGDNDetKcpWorkspace()
     ws.ensure(ctx, 2, 6, defer=True)
     assert ws.release_pool("eye") and ws._pending is None and not ws.has("eye")
+
+
+# --------------------------------------------------------------------------- host launch-state memos (launch cache, plan memos)
+# The launch cache (_Tables.launches: record, grid, test flag, merge columns per launch key) and the plan's memos of the
+# launches' static pieces (normalised pool tables, kernel addressing, walk / merge-chain / zero-block device tables,
+# split lists, pool sizes) change no launch: every launch receives the very tensors and values it receives without them.
+
+
+def _arg_print(values: dict) -> tuple:
+    """A launch's logical arguments as comparable values: an int32 / int64 tensor (a plan device table, cached on the
+    shared context) by its identity (data pointer), shape, stride and dtype; any other tensor (operands, outputs,
+    tapes, pools, ticket slots: per call) by shape, stride, storage offset and dtype; scalars as they are."""
+    out = []
+    for k in sorted(values):
+        v = values[k]
+        if isinstance(v, torch.Tensor):
+            ptr = v.data_ptr() if v.dtype in (torch.int32, torch.int64) else None
+            v = ("T", ptr, tuple(v.shape), tuple(v.stride()), v.storage_offset(), str(v.dtype))
+        out.append((k, v))
+    return tuple(out)
+
+
+def _memos_off(kcp, monkeypatch) -> None:
+    """The launch path without the launch cache and the plan memos (each piece derived per launch as before)."""
+    T = kcp._Tables
+    monkeypatch.setattr(kcp, "_resolve_cached", lambda name, args, cols_per_cta=8: kcp.resolve_launch(name, args, cols_per_cta=cols_per_cta))
+    monkeypatch.setattr(T, "indexed_spec", lambda self, index, tiles: None)
+    monkeypatch.setattr(T, "walk_table", lambda self, walk, device: self.dev("walk", [int(s) for s in walk], device))
+    monkeypatch.setattr(T, "neg_index", lambda self, device: self.dev("neg", [-1] * int(self.NSEG), device))
+    monkeypatch.setattr(T, "chain_tables", lambda self, family, device: kcp._chain_device_tables(self, self.chains[family], device))
+    monkeypatch.setattr(T, "split_lists", lambda self, coll: self.split_elems(coll))
+    monkeypatch.setattr(T, "pool_size_items", lambda self, backward: tuple(self.pool_sizes(backward).items()))
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
+    ids=("light", "full", "l2n", "P2"),
+)
+@pytest.mark.parametrize("row", tuple(DEFER_ROWS))
+def test_launch_memos_hand_every_launch_the_same_arguments(monkeypatch, row, knobs) -> None:
+    """Every rank's forward and saved-set backward, twice on the same contexts (the second pass hits every memo), with
+    the launch cache and the plan memos and without them: each launch gets the same record, grid and logical
+    arguments (the same device tensors: data pointer, shape, stride, dtype); out and the five gradients are bitwise
+    equal; the cache holds one entry per distinct launch key and the second pass adds none."""
+    if row != "one_rank" and knobs.get("segments") == 2:
+        pytest.skip("P = 2 needs fragments of more than one chunk (the one-rank row)")
+    kcp, part, W, ops = _defer_setup(row)
+    ctxs = [
+        gp.cake_gdn_det_train_kcp_build_context(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(W)
+    ]
+    holder: dict = {}
+    seen: dict = {}
+    lock = threading.Lock()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            comm = holder.get("comm")
+            rank = getattr(comm.local, "rank", 0) if comm is not None else 0
+            n0 = len(args["_call"].records)
+            record, values, grid, _ = kcp._resolve_cached(name, dict(args))
+            del args["_call"].records[n0:]  # the backend's own resolution below appends the record
+            with lock:
+                seen.setdefault(holder["tag"], {}).setdefault(rank, []).append(
+                    (name, record, tuple(grid), _arg_print(values))
+                )
+            super().run(name, args)
+
+    def one_pass(tag: str):
+        holder["tag"] = tag
+
+        def rank_fn(r, comm):
+            holder["comm"] = comm
+            loc = fake.slice_local(ops, part, r)
+            args = [loc[n] for n in LEAVES]
+            out, saved = kcp.cake_gdn_det_train_kcp_forward(*args, ctxs[r], backend="fake", **knobs)
+            grads = kcp.cake_gdn_det_train_kcp_backward(
+                *args, ctxs[r], loc["dout"], saved=saved, backend="fake", **knobs
+            )
+            return out, grads
+
+        if W == 1:
+            per_rank = [rank_fn(0, None)]
+        else:
+            per_rank = _run_threaded(kcp, W, rank_fn, monkeypatch)
+        res = {"out": fake.gather_global(part, [o for o, _ in per_rank])}
+        for i, n in enumerate(EXPLICIT_GRADS):
+            res[n] = fake.gather_global(part, [g[i] for _, g in per_rank])
+        return res
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        on1 = one_pass("on1")
+        tables = [
+            tb for c in ctxs for k, tb in c._caches.items() if isinstance(k, tuple) and k[:1] == ("kcp_tables",)
+        ]
+        assert tables and all(isinstance(tb.launches, dict) for tb in tables)
+        sizes1 = [len(tb.launches) for tb in tables]
+        on2 = one_pass("on2")
+        assert [len(tb.launches) for tb in tables] == sizes1  # warm: no new key
+        assert sum(sizes1) > 0
+        _memos_off(kcp, monkeypatch)
+        off = one_pass("off")
+    finally:
+        kcp.set_backend("fake", previous)
+        monkeypatch.undo()
+    for n in ("out",) + EXPLICIT_GRADS:
+        assert torch.equal(on1[n], off[n]) and torch.equal(on2[n], off[n]), n
+    for r in range(W):
+        assert seen["on1"][r] == seen["off"][r], r
+        # the second pass reuses the device tables, so the very same launches repeat
+        assert seen["on2"][r] == seen["off"][r], r
+
+
+def test_keyword_options_are_validated_once_per_keyword_set(monkeypatch) -> None:
+    """``cake_gdn_det_kcp`` without ``options``: the same keywords (values and types) share one validated options
+    object, other values build another, an unhashable value (``test_knobs``) validates per call, and an ``options``
+    instance is validated per call as before; the results do not change."""
+    kcp, ctx, ops = _ckpt_setup()
+    built: dict[str, int] = {"keywords": 0, "instance": 0}
+    real = kcp.make_options
+
+    def counting(*a, **k):
+        built["keywords" if not a or a[0] is None else "instance"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(kcp, "make_options", counting)
+    kcp._KEYWORD_OPTIONS.clear()
+    a = kcp._keyword_options({"save_mode": "full"}, {"backend": "fake"})
+    b = kcp._keyword_options({"save_mode": "full"}, {"backend": "fake"})
+    assert a is b and built["keywords"] == 1
+    c = kcp._keyword_options({"save_mode": "light"}, {"backend": "fake"})
+    assert c is not a and built["keywords"] == 2
+    d1 = kcp._keyword_options({}, {"backend": "fake", "test_knobs": {"fused_o": 0}})
+    d2 = kcp._keyword_options({}, {"backend": "fake", "test_knobs": {"fused_o": 0}})
+    assert d1 is not d2 and built["keywords"] == 4
+    # the autograd entry: one validated object across forwards of the same keywords
+    built.update(keywords=0, instance=0)
+    r1 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_mode="full")
+    r2 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_mode="full")
+    assert built["keywords"] == 1
+    _assert_same(r1, r2, "memoised options")
+    r0 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_mode="full", test_knobs={"fused_o": 1})
+    _assert_same(r0, r1, "per-call options")
+    opts = real(None, backend="fake", save_mode="full")
+    built.update(keywords=0, instance=0)
+    _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=opts)
+    _ckpt_autograd(kcp, ctx, ops, ckpt=False, options=opts)
+    assert built["keywords"] == 0 and built["instance"] >= 2  # an options instance: validated per call
+
+
+def test_packed_qkv_views_are_the_sliced_views() -> None:
+    """The packed split's views (``narrow`` on the channel axis) are the ``[..., :a]`` / ``[a:2a]`` / ``[2a:]``
+    slices' views: the same storage offset, shape and strides, with and without a batch axis."""
+    kcp = _package("cake_kcp")
+    for lead in ((37,), (1, 37)):
+        qkv = torch.randn(*lead, (2 * 2 + 6) * 128).to(torch.bfloat16)
+        got = kcp._qkv_views(qkv, 2, 6)
+        a = 2 * 128
+        want = (
+            qkv[..., :a].view(*lead, 2, 128),
+            qkv[..., a : 2 * a].view(*lead, 2, 128),
+            qkv[..., 2 * a :].view(*lead, 6, 128),
+        )
+        for x, y in zip(got, want, strict=True):
+            assert (x.data_ptr(), x.shape, x.stride(), x.storage_offset()) == (
+                y.data_ptr(),
+                y.shape,
+                y.stride(),
+                y.storage_offset(),
+            )
