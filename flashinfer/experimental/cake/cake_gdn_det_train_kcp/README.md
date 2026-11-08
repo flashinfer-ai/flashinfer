@@ -215,7 +215,7 @@ context serves every call of the same batch layout and head pair.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
+| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`; with `use_qk_l2norm_in_kernel` also the normalized rows `qn` / `kn`, 8,192 B per token at `H_qk = 16`, so its backward launches no `qk_apply`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward; `"replay"` keeps no tape and no `qk_rstd` either: `save_mode="full"` there runs the same backward as `"light"` (the whole-forward replay) |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -256,6 +256,7 @@ bytes per padded token row, `R = 64 * NC_pad` rows per rank, at `HV = 48`):
 | `rowscale`, `qscale` (chunk-preparation FP32 row factors) | yes | **no** (the chunk preparation re-runs in the backward) | 384 B per token |
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
 | `qk_rstd` (`use_qk_l2norm_in_kernel=True`; `boundary_mode="saved"` only) FP32 | yes | yes | `8 * T_r * H_qk` |
+| `qn`, `kn` (`use_qk_l2norm_in_kernel=True`: the normalized rows `fwd_prep_l2n` wrote) BF16 | yes | **no** (the replay's `fwd_prep_l2n` writes them again) | `2 * 256 * T_r * H_qk` (8,192 B per token at `H_qk = 16`) |
 
 With `boundary_mode="replay"` the saved set keeps no boundary state, no
 `M_seg`, no tape and no `qk_rstd` in either `save_mode`: the backward replays
@@ -410,8 +411,9 @@ cake_gdn_det_train_kcp_workspace_bytes(ctx, *, H_qk, HV, save_mode="light", boun
     `backward_transient`, which that plane can put above the replay form's).  graph="replay": nothing is released,
     so the forward is every forward pool and tape it writes (no tape with save_mode="full" and a saved set) and the
     backward every backward pool, the ten light tapes (none with save_mode="full" and a saved set) and every
-    backward tape; with use_qk_l2norm_in_kernel both add qn / kn and the arena qk_rstd where #1 writes it (a
-    forward without a saved set, a backward that re-runs #1).
+    backward tape; with use_qk_l2norm_in_kernel both add qn / kn (none with save_mode="full" and a saved set, whose
+    rows are saved-set tensors) and the arena qk_rstd where #1 writes it (a forward without a saved set, a backward
+    that re-runs #1).
     At P > 1 the c1 send pool also holds the M_f^T tiles (`c1_send_mf` = s * n_out(r)) and, with the fused walks, the
     carry plane max(n_in(r), n_out(r)) more slots (`fused_walks=0` is the test knob's split form); the b1 pools
     take the larger split form (the d_f plane, or the d_f plane + the n_io(r) re-sent maps); a backward on a caller-held workspace also sizes the forward exchange pools
@@ -453,16 +455,19 @@ other reader (#2, #3, #5, #2+5, #7) is the unchanged program bound to `qn` / `kn
 | forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
 | light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
-| `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
+| `save_mode="full"` | the saved set (the forward's `fwd_prep_l2n` rows; no `qk_apply`) | saved | after #8 (unbound; the saved set holds them) |
+| `save_mode="full"`, test knob `full_qk="apply"` | `qk_apply` after #6 | saved | after #8 |
 | `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
 | recompute handle | `fwd_prep_l2n` (the recompute is a forward) | -- | as the forward |
 | `graph="replay"` | as eager | as eager | never (the graph bakes the arena) |
 
 The saved set gains `qk_rstd` (FP32 `[2, T_r, H_qk]`, `8 T_r H_qk` bytes;
-`KCP_SAVED_VERSION` 2); the normalized rows are never saved
-(`2 x 256 T_r H_qk` bytes: workspace in the forward's tape walk and every
-backward phase; in the kept-tape backward they are hand-off tensors,
-`bwd.kept_tapes`).  The byte queries take `use_qk_l2norm_in_kernel=`;
+`KCP_SAVED_VERSION` 2); with `save_mode="full"` it also keeps the normalized
+rows (`2 x 256 T_r H_qk` bytes, fresh tensors `fwd_prep_l2n` writes; the
+same bits `qk_apply` rebuilds from the saved `r`), so the full backward
+launches nothing before #6.  Otherwise the rows are never saved: workspace in
+the forward's tape walk and every backward phase of the replay forms; in the
+kept-tape backward they are hand-off tensors, `bwd.kept_tapes`.  The byte queries take `use_qk_l2norm_in_kernel=`;
 `LAST_CALL[...]` records `qk_l2norm`, `qk_source`, `rstd_source` and
 `arena_tapes`.  The recompute handle's entry key includes the flag.  Until
 the registry renders the three programs the kernel backend refuses the
