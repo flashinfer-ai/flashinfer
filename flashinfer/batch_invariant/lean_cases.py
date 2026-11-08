@@ -258,7 +258,25 @@ STEP_OF_P = {
     "MXW48": "mma32mxw48",
     "MXW48K64": "mma64mxw48",
 }
-CHUNK_SUFFIX = {"": "", "32": "_fp8", "MX8": "_mx", "BS": "_fp4", "BS128": "_fp4k128"}
+CHUNK_SUFFIX = {
+    "": "",
+    "32": "_fp8",
+    "MX8": "_mx",
+    "BS": "_fp4",
+    "BS128": "_fp4k128",
+    "MXW48": "_mxw48",
+}
+#: The mixed classes' lower bound's region and its edges (the rule's own table)
+MIXED_CHUNK_EXTRA = [
+    (256, 16384),
+    (512, 16384),
+    (1024, 16384),
+    (512, 32768),
+    (384, 65536),
+    (512, 16384 + 128 * 3),
+    (512, 15360),
+    (520, 16384),
+]
 
 _MX_EXTRA = (
     (
@@ -454,16 +472,16 @@ FORMATS: Tuple[LeanFormat, ...] = (
         "gemmMxW48Dispatch",
         "ConfigOKMxW48",
         "gemmMainloopInnerMxW48",
-        "chunksForMx",
-        None,
-        "chunksmx",
+        "chunksForMxW48",
+        "chunkTableMxW48",
+        "chunksmxw48",
         True,
         ("k",),
         ("sm_100", "sm_103"),
         tuple(GEMM_MXW48_CASES),
         tuple(GEMM_MX_LOOP_CASES),
         tuple(GEMM_MXW48_OUT_CASES),
-        tuple(MX_CHUNK_EXTRA),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
     LeanFormat(
@@ -475,16 +493,16 @@ FORMATS: Tuple[LeanFormat, ...] = (
         "gemmMxW48K64Dispatch",
         "ConfigOKMxW48K64",
         "gemmMainloopInnerMxW48K64",
-        "chunksForMx",
+        "chunksForMxW48",
         None,
-        "chunksmx",
+        "chunksmxw48",
         True,
         ("k",),
         ("sm_107",),
         tuple(GEMM_MXW48_K64_CASES),
         tuple(GEMM_MX_LOOP_CASES),
         tuple(GEMM_MXW48_K64_OUT_CASES),
-        tuple(MX_CHUNK_EXTRA),
+        tuple(MX_CHUNK_EXTRA + MIXED_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
 )

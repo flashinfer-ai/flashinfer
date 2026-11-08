@@ -41,6 +41,8 @@ def main : IO Unit := do
     IO.println s!"gemmmx8out {steps} {fmt} {(outputKfoldMX8 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (N, K, _) in chunkTableMx do
     IO.println s!"chunksmx {N} {K} {chunksForMx N K}"
+  for (N, K, _) in chunkTableMxW48 do
+    IO.println s!"chunksmxw48 {N} {K} {chunksForMxW48 N K}"
   for (steps, C) in gemmmx8k64Cases do
     let t := if C == 1 then kfoldMX8K64 ⟨0⟩ ⟨0⟩ steps else kchunkMX8K64 ⟨0⟩ ⟨0⟩ C (steps / C)
     IO.println s!"gemmmx8k64 {steps} {C} {(outputElem false "bf16" t).sexpr}"

@@ -823,6 +823,13 @@ def chunksForFp8 (N K : Nat) : Nat := chunksForStep 32 N K
 scales, the K extent of one scale-factor atom column). -/
 def chunksForMx (N K : Nat) : Nat := chunksForStep 128 N K
 
+/-- The mixed classes' rule (`schedule.chunks_for(N, K, "mxfp4w8a")`, the same for the SM107 class): the MX rule raised to a
+lower bound of 8 chunks for narrow, long weights -- at most 512 columns (so few weight tiles that the unsplit kernel runs on a
+fraction of the part) and at least 16384 elements of K in whole runs of 8 granules of 128. A function of (N, K) only, the same on
+every part; the bound is declared empirical. `Cases.lean` checks it against the Python rule (`chunk_rule_matches_mxw48`). -/
+def chunksForMxW48 (N K : Nat) : Nat :=
+  if N ≤ 512 ∧ 16384 ≤ K ∧ K % 1024 = 0 then max (chunksForMx N K) 8 else chunksForMx N K
+
 /-- The NVFP4 rules: 64-element granules at the sm_100 / sm_103 step (four 16-element block scales: one atom column, one
 step), 128 at the sm_107 step (two atom columns, one step). -/
 def chunksForFp4 (N K : Nat) : Nat := chunksForStep 64 N K
@@ -837,6 +844,7 @@ def fp4ClassK128 (N K : Nat) : Bool := chunksForFp4K128 N K == 1
 theorem chunksFor_no_M (N K : Nat) : chunksFor N K = chunksFor N K := rfl
 theorem chunksForFp8_no_M (N K : Nat) : chunksForFp8 N K = chunksForFp8 N K := rfl
 theorem chunksForMx_no_M (N K : Nat) : chunksForMx N K = chunksForMx N K := rfl
+theorem chunksForMxW48_no_M (N K : Nat) : chunksForMxW48 N K = chunksForMxW48 N K := rfl
 theorem chunksForFp4_no_M (N K : Nat) : chunksForFp4 N K = chunksForFp4 N K := rfl
 theorem fp4ClassK128_no_M (N K : Nat) : fp4ClassK128 N K = fp4ClassK128 N K := rfl
 

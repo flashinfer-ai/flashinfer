@@ -332,6 +332,19 @@ def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the
     assert bi.fingerprint(
         "mm_mxfp4w8a_mxfp8a", N=128, K=8192, out_dtype=torch.float16, arch="sm_100"
     ).startswith("gemm-mxfp4w8a-kchunk4-scaled-")
+    # a weight in the mixed classes' lower-bound region carries the split class (8 chunks) on both parts; the MX rule would give 2
+    assert bi.fingerprint(
+        "mm_mxfp4w8a_mxfp8a", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
+    ).startswith("gemm-mxfp4w8a-kchunk8-scaled-")
+    assert bi.fingerprint(
+        "mm_mxfp4w8a_mxfp8a", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_107"
+    ).startswith("gemm-mxfp4w8a-k64-kchunk8-scaled-")
+    assert bi.fingerprint(
+        "mm_mxfp8", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
+    ).startswith("gemm-mxfp8-kchunk2-")
+    assert bi.fingerprint(
+        "mm_mxfp4w8a_mxfp8a", N=1024, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
+    ).startswith("gemm-mxfp4w8a-kfold-scaled-")
     # the output dtype and the raw K are dimensions of the specification; M and the layout of the scale buffers are not
     distinct = {
         bi.fingerprint("mm_mxfp4w8a_mxfp8a", N=4096, K=K, out_dtype=od, arch=arch)
@@ -383,6 +396,37 @@ def test_chunk_rule_and_granules():
         assert chunk_unit(fmt) == 128
         for N, K in [(4096, 4096), (128, 4096), (64, 8192), (128, 8192), (64, 16640)]:
             assert chunks_for(N, K, fmt) == chunks_for(N, K, "mxfp8")
+        # the mixed classes' own lower bound: 8 chunks for N <= 512, K >= 16384 in whole runs of 8 granules; the MX rule elsewhere
+        assert [
+            chunks_for(N, K, fmt)
+            for N, K in (
+                (256, 16384),
+                (512, 16384),
+                (512, 32768),
+                (384, 65536),
+                (128, 16384),
+            )
+        ] == [8, 8, 8, 8, 8]
+        assert [
+            chunks_for(N, K, fmt)
+            for N, K in (
+                (1024, 16384),
+                (520, 16384),
+                (512, 8192),
+                (512, 15360),
+                (512, 16384 + 384),
+                (64, 65536),
+            )
+        ] == [1, 1, 1, 1, 1, 64]
+        for N, K in (
+            (1024, 16384),
+            (520, 16384),
+            (512, 8192),
+            (2048, 2048),
+            (64, 65536),
+        ):
+            assert chunks_for(N, K, fmt) == chunks_for(N, K, "mxfp8")
+    assert chunks_for(512, 16384, "mxfp8") == 2 and chunks_for(512, 16384, "mxfp4") == 2
     assert k_granule("mxfp4w8a") == 128 and k_granule("mxfp4w8a_k64") == 32
     assert (
         k_granule("mxfp8") == 32
