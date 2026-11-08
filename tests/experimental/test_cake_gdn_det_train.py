@@ -68,6 +68,7 @@ import hashlib
 import json
 import math
 import re
+import time
 import types
 from pathlib import Path
 
@@ -2957,6 +2958,161 @@ def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
             **{"d" + name: leaves[name].grad for name in ("q", "k", "v", "g", "beta")},
         }
         _assert_bitwise(got, eager, OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- #
+# cached device tables across streams and CUDA graph captures
+# --------------------------------------------------------------------------- #
+# cache: (sequence lengths, heads, pins) of a call that reads that cached table; "wavefront" turns the pair's rule on
+TABLE_CACHE_ROWS = {
+    "chunk": ((300, 77, 640), (2, 4), {}),
+    "walk": ((300, 77, 640), (2, 4), {"lpt": False}),
+    "wavefront": (WAVEFRONT_ROWS["serial"][0], WAVEFRONT_ROWS["serial"][2], WAVEFRONT_PINS),
+}  # fmt: skip
+
+
+def _fresh_table_caches(monkeypatch) -> None:
+    """Empty device-table caches (the chunk tables, the identity walks, the wavefront orders, the captured tables)."""
+    for name in ("_META_FRONT", "_HOST_META", "_WALKS", "_GRAPH_TABLES"):
+        monkeypatch.setattr(cake_chain, name, {})
+    cake_chain._wavefront_order_tensor.cache_clear()
+
+
+def _table_cache_size(cache: str) -> int:
+    if cache == "chunk":
+        return len(cake_chain._HOST_META)
+    if cache == "walk":
+        return len(cake_chain._WALKS)
+    return cake_chain._wavefront_order_tensor.cache_info().currsize
+
+
+def _issue(inputs, cu_seqlens, cu_seqlens_cpu, *, backward=True, **pins) -> dict:
+    """One call on the current stream without a synchronization (``cu_seqlens`` already on the device): the output
+    and, with ``backward``, the gradients."""
+    leaves = {
+        name: inputs[name].detach().clone().requires_grad_(backward)
+        for name in ("q", "k", "v", "g", "beta")
+    }
+    o, _ = cake_gdn_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                        scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+                        use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
+    if not backward:
+        return {"o": o}
+    (o.float() * inputs["do"].float()).sum().backward()
+    return {
+        "o": o.detach(),
+        **{"d" + name: leaves[name].grad for name in ("q", "k", "v", "g", "beta")},
+    }
+
+
+@pytest.mark.parametrize("cache", sorted(TABLE_CACHE_ROWS))
+def test_a_cached_table_is_read_after_its_write_on_another_stream(
+    cache, device, monkeypatch
+) -> None:
+    # Stream s1 sleeps, then its call rebuilds one cached table (its write queued behind the sleep); a call on stream
+    # s2 then hits that table.  The s2 call must wait for the write: its work is still queued while s1 sleeps, and both
+    # calls give the bits of a call on the written table.
+    seq_lens, heads, pins = TABLE_CACHE_ROWS[cache]
+    if cache == "wavefront":
+        _wavefront_rule(monkeypatch)
+    _fresh_table_caches(monkeypatch)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=113)
+    want = _run(inputs, seq_lens, **pins)
+    assert _table_cache_size(cache) == 1
+    if cache == "chunk":
+        monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+        monkeypatch.setattr(cake_chain, "_HOST_META", {})
+    elif cache == "walk":
+        monkeypatch.setattr(cake_chain, "_WALKS", {})
+    else:
+        cake_chain._wavefront_order_tensor.cache_clear()
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+    s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    s1.wait_stream(torch.cuda.current_stream(device))
+    s2.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(s1):
+        torch.cuda._sleep(2_000_000_000)
+        first = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
+    assert _table_cache_size(cache) == 1  # s1 rebuilt the table
+    with torch.cuda.stream(s2):
+        second = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
+        done = torch.cuda.Event()
+        done.record(s2)
+    time.sleep(0.1)
+    queued = not done.query()
+    torch.cuda.synchronize()
+    assert queued, "the call on s2 ran before the table write on s1"
+    _assert_bitwise(first, want, OUTPUT_NAMES)
+    _assert_bitwise(second, want, OUTPUT_NAMES)
+
+
+def test_tables_built_inside_a_capture_are_not_cached(device, monkeypatch) -> None:
+    # A layout's first call inside a CUDA graph capture writes its tables only when the graph replays: the capture
+    # caches none of them, so an eager call of that layout before any replay builds its own; the replays match too.
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=127)
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+    _fresh_table_caches(monkeypatch)
+    want = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False)["o"]
+    torch.cuda.synchronize()
+    _fresh_table_caches(monkeypatch)
+    # another layout of the same plan loads the stages before the capture
+    other = _cu((640, 300, 77))
+    _issue(inputs, torch.tensor(other, dtype=torch.int64, device=device), torch.tensor(other, dtype=torch.int64),
+           backward=False)  # fmt: skip
+    torch.cuda.synchronize()
+    cached = (
+        len(cake_chain._META_FRONT),
+        len(cake_chain._HOST_META),
+        len(cake_chain._WALKS),
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False)["o"]
+    assert (
+        len(cake_chain._META_FRONT),
+        len(cake_chain._HOST_META),
+        len(cake_chain._WALKS),
+    ) == cached
+    eager = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False)["o"]
+    torch.cuda.synchronize()
+    assert torch.equal(eager, want)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(o, want)
+
+
+def test_a_capture_keeps_the_cached_tables_it_reads(device, monkeypatch) -> None:
+    # A capture of a warmed-up layout reads its cached tables.  Evicting every cached table afterwards and reusing the
+    # freed memory (zero-filled) must leave the replays unchanged: the capture keeps the tables it reads.
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=131)
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+    _fresh_table_caches(monkeypatch)
+    want = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False, lpt=False)["o"]
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False, lpt=False)["o"]
+    assert len(cake_chain._GRAPH_TABLES) == 2  # the chunk tables and the identity walk
+    for name in ("_META_FRONT", "_HOST_META", "_WALKS"):
+        getattr(cake_chain, name).clear()
+    gc.collect()
+    junk = [
+        torch.zeros(n, dtype=torch.int32, device=device) for n in range(64, 16384, 64)
+    ]
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(o, want)
+    del junk
 
 
 def test_wavefront_gradients_accumulate_into_a_nonzero_grad(

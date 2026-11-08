@@ -163,6 +163,15 @@ before the stage returns (also when a launch raises), so the call can be
 captured in a CUDA graph (warm it up first, like any captured call).
 `streams=1` keeps every launch on the caller's stream; the bits are the same.
 
+The host-table route caches device tables between calls: a layout's chunk and
+segment tables, the wavefront pair's tile order and the identity walk of the
+forward scan.  A table is written on the stream of the call that builds it, and
+a call on another stream waits for that write (an event recorded after it)
+before its launches read the table.  A CUDA graph capture does not cache the
+tables it builds, since they are written only when the graph replays, and keeps
+the cached tables it reads for the life of the process, since every replay
+reads them.
+
 ## Plan pins (keyword-only)
 
 | keyword | default | effect |
