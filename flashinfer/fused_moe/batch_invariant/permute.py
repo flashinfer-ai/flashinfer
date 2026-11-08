@@ -517,19 +517,26 @@ class PlanMultiKernel:
         )
 
 
-ROW_WARPS_PER_SM_TARGET = 128  # the row copies' warp count target per SM (a short row count is latency-bound in one warp's serial slabs)
+# The row copies' placement rule: a warp keeps at least ROW_SLABS_PER_WARP 32-vector slabs of its row (the serial work that
+# hides a row's index load and address arithmetic), unless the launch holds fewer than ROW_WARPS_PER_SM_SMALL warps per SM
+# (half the SM's resident warps: such a launch is latency-bound, so the row splits down to one slab per warp).
+ROW_SLABS_PER_WARP = 4
+ROW_WARPS_PER_SM_SMALL = 32
 
 
 def warps_per_row(n_rows: int, n_vec: int, sms: int) -> int:
     """The row copies' placement at (rows, 16-byte vectors per row): a power of two of warps per row, at most 8 and at most
-    one 32-vector slab per warp, doubled while the launch holds fewer than ``ROW_WARPS_PER_SM_TARGET`` warps per SM (a long
-    row count is bandwidth-bound with one warp per row). ``sms``: the device's SM count."""
+    one 32-vector slab per warp, doubled while every warp keeps ``ROW_SLABS_PER_WARP`` slabs of the row, or while the launch
+    holds fewer than ``ROW_WARPS_PER_SM_SMALL`` warps per SM. ``sms``: the device's SM count."""
     slabs = max(1, -(-n_vec // LANES))
     cap = 1
     while cap * 2 <= min(8, slabs):
         cap *= 2
     w = 1
-    while w * 2 <= cap and n_rows * w * 2 <= ROW_WARPS_PER_SM_TARGET * sms:
+    while w * 2 <= cap and (
+        slabs // (w * 2) >= ROW_SLABS_PER_WARP
+        or n_rows * w * 2 <= ROW_WARPS_PER_SM_SMALL * sms
+    ):
         w *= 2
     return w
 
