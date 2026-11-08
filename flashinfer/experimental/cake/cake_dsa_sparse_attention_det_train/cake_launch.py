@@ -200,6 +200,8 @@ def bwd_main(run, values, grid):
         values["cnt64"],
         values["redo_mark"],
         values["redo_count"],
+        values["dq_mode"],
+        values["dq_partial"],
         grid[0],
         grid[1],
         grid[2],
@@ -258,6 +260,31 @@ def bwd_fold(run, values, grid):
     )
 
 
+def bwd_compact(run, values, grid):
+    run(
+        values["indices"],
+        values["topk_length"],
+        values["key_scratch"],
+        values["pass_counts"],
+        values["num_tokens"],
+        values["topk"],
+        values["idx_stride"],
+        values["indices_offset"],
+        values["has_topk_length"],
+        values["token_base"],
+        values["token_step"],
+        values["pass_lo"],
+        values["pass_hi"],
+        grid[0],
+        grid[1],
+        grid[2],
+    )
+
+
+def bwd_compact_grid(num_queries, num_kv, topk, num_dst):
+    return (max(1, -(-(num_queries) // 4)), 1, 1)
+
+
 def index_prep(run, values, grid):
     run(
         values["indices"],
@@ -282,10 +309,6 @@ def index_prep(run, values, grid):
         grid[1],
         grid[2],
     )
-
-
-def index_prep_grid(num_queries, num_kv, topk, num_dst):
-    return (max(1, -(-(num_queries) // 4)), 1, 1)
 
 
 def nope_fwd(run, values, grid):
@@ -592,6 +615,8 @@ STAGE_ARGS: dict[str, list[str]] = {
         "cnt64",
         "redo_mark",
         "redo_count",
+        "dq_mode",
+        "dq_partial",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -652,6 +677,8 @@ STAGE_ARGS: dict[str, list[str]] = {
         "cnt64",
         "redo_mark",
         "redo_count",
+        "dq_mode",
+        "dq_partial",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -677,6 +704,65 @@ STAGE_ARGS: dict[str, list[str]] = {
         "out_f32",
         "dst_row_stride",
         "accumulate",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ],
+    "bwd_compact": [
+        "indices",
+        "topk_length",
+        "key_scratch",
+        "pass_counts",
+        "num_tokens",
+        "topk",
+        "idx_stride",
+        "indices_offset",
+        "has_topk_length",
+        "token_base",
+        "token_step",
+        "pass_lo",
+        "pass_hi",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ],
+    "bwd_main_pass": [
+        "q_latent",
+        "q_rope",
+        "dout",
+        "dq_latent",
+        "dq_rope",
+        "kv_latent",
+        "k_rope",
+        "lse",
+        "delta",
+        "indices",
+        "topk_length",
+        "dkv_acc",
+        "dkr_acc",
+        "dkv_stride",
+        "dkr_stride",
+        "dkr_col0",
+        "dkv_dst_map",
+        "dkv_has_map",
+        "num_queries",
+        "num_kv",
+        "topk",
+        "idx_stride",
+        "indices_offset",
+        "has_topk_length",
+        "token_base",
+        "token_step",
+        "scale_log2",
+        "sm_scale",
+        "e_lat",
+        "e_rope",
+        "cnt",
+        "cnt64",
+        "redo_mark",
+        "redo_count",
+        "dq_mode",
+        "dq_partial",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -935,6 +1021,8 @@ LAUNCH = {
     "bwd_redo_prep": bwd_redo_prep,
     "bwd_redo": bwd_main,
     "bwd_fold": bwd_fold,
+    "bwd_compact": bwd_compact,
+    "bwd_main_pass": bwd_main,
     "index_prep": index_prep,
     "nope_fwd": nope_fwd,
     "nope_bwd_delta": nope_bwd_delta,
@@ -956,7 +1044,9 @@ GRID = {
     "bwd_redo_prep": bwd_grid_grid,
     "bwd_redo": fwd_grid,
     "bwd_fold": bwd_grid_grid,
-    "index_prep": index_prep_grid,
+    "bwd_compact": bwd_compact_grid,
+    "bwd_main_pass": fwd_grid,
+    "index_prep": bwd_compact_grid,
     "nope_fwd": fwd_grid,
     "nope_bwd_delta": fwd_grid,
     "nope_bwd_norm": bwd_norm_grid,

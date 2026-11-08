@@ -163,7 +163,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(640, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_h64_det_train_f947d21a4e7b4d35d0a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count)
+kernel_cake_dsa_h64_det_train_f947d21a4e7b4d35d0a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count, int dq_mode, float* __restrict__ dq_partial)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -828,6 +828,7 @@ kernel_cake_dsa_h64_det_train_f947d21a4e7b4d35d0a5(const __grid_constant__ CUten
                 int _parity_dq_done = (int)((unsigned int)(int)tk_1 % 2);
                 mbarrier_wait(dq_done_addr, _parity_dq_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
+                long long pbase = (long long)tok * 36864ll + (long long)((w * 32 + lane_0) * 4);
                 float dq_1_0[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
@@ -1200,8 +1201,11 @@ kernel_cake_dsa_h64_det_train_f947d21a4e7b4d35d0a5(const __grid_constant__ CUten
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
+                int stq = 1;
                 if (w == 0) {
                     if (elect_sync()) {
+                        if (stq != 0) {
+                        }
                         asm volatile("cp.async.bulk.commit_group;");
                         asm volatile("cp.async.bulk.wait_group 0;");
                     }

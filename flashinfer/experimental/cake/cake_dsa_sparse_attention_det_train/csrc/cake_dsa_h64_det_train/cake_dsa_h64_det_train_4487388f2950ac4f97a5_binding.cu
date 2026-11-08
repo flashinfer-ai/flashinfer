@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count);
+extern "C" __global__ void kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count, int dq_mode, float* __restrict__ dq_partial);
 
 namespace cake_binding_kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5 {
 
@@ -327,7 +327,7 @@ CUtensorMap EncodeTma_k_rope(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorView a_dq_latent, TensorView a_dq_rope, TensorView a_kv_latent, TensorView a_k_rope, TensorView a_lse, TensorView a_delta, TensorView a_indices, TensorView a_topk_length, TensorView a_dkv_acc, TensorView a_dkr_acc, int64_t a_dkv_stride, int64_t a_dkr_stride, int64_t a_dkr_col0, TensorView a_dkv_dst_map, int64_t a_dkv_has_map, int64_t a_num_queries, int64_t a_num_kv, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_has_topk_length, int64_t a_token_base, int64_t a_token_step, double a_scale_log2, double a_sm_scale, TensorView a_e_lat, TensorView a_e_rope, TensorView a_cnt, TensorView a_cnt64, TensorView a_redo_mark, TensorView a_redo_count, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorView a_dq_latent, TensorView a_dq_rope, TensorView a_kv_latent, TensorView a_k_rope, TensorView a_lse, TensorView a_delta, TensorView a_indices, TensorView a_topk_length, TensorView a_dkv_acc, TensorView a_dkr_acc, int64_t a_dkv_stride, int64_t a_dkr_stride, int64_t a_dkr_col0, TensorView a_dkv_dst_map, int64_t a_dkv_has_map, int64_t a_num_queries, int64_t a_num_kv, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_has_topk_length, int64_t a_token_base, int64_t a_token_step, double a_scale_log2, double a_sm_scale, TensorView a_e_lat, TensorView a_e_rope, TensorView a_cnt, TensorView a_cnt64, TensorView a_redo_mark, TensorView a_redo_count, int64_t a_dq_mode, TensorView a_dq_partial, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_q_latent.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_q_latent, "q_latent");
@@ -406,6 +406,11 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
   check_dtype(a_redo_mark, DLDataType{kDLInt, 32, 1}, "redo_mark");
   check_cuda_tensor(a_redo_count, "redo_count");
   check_dtype(a_redo_count, DLDataType{kDLInt, 32, 1}, "redo_count");
+  TVM_FFI_CHECK(a_dq_mode >= -2147483648LL && a_dq_mode <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'dq_mode' = " << a_dq_mode
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_dq_partial, "dq_partial");
+  check_dtype(a_dq_partial, DLDataType{kDLFloat, 32, 1}, "dq_partial");
   check_same_device(a_q_rope, a_q_latent, "q_rope", "q_latent");
   check_same_device(a_dout, a_q_latent, "dout", "q_latent");
   check_same_device(a_dq_latent, a_q_latent, "dq_latent", "q_latent");
@@ -437,6 +442,8 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
   check_same_device(a_redo_mark, a_q_latent, "redo_mark", "q_latent");
   check_contiguous(a_redo_count, "redo_count");
   check_same_device(a_redo_count, a_q_latent, "redo_count", "q_latent");
+  check_contiguous(a_dq_partial, "dq_partial");
+  check_same_device(a_dq_partial, a_q_latent, "dq_partial", "q_latent");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -486,7 +493,9 @@ void Run(TensorView a_q_latent, TensorView a_q_rope, TensorView a_dout, TensorVi
   void* v_cnt64 = DataPtr(a_cnt64);
   void* v_redo_mark = DataPtr(a_redo_mark);
   void* v_redo_count = DataPtr(a_redo_count);
-  void* kernel_args[] = {&v_q_latent, &v_q_rope, &v_dout, &v_dq_latent, &v_dq_rope, &v_kv_latent, &v_k_rope, &v_lse, &v_delta, &v_indices, &v_topk_length, &v_dkv_acc, &v_dkr_acc, &v_dkv_stride, &v_dkr_stride, &v_dkr_col0, &v_dkv_dst_map, &v_dkv_has_map, &v_num_queries, &v_num_kv, &v_topk, &v_idx_stride, &v_indices_offset, &v_has_topk_length, &v_token_base, &v_token_step, &v_scale_log2, &v_sm_scale, &v_e_lat, &v_e_rope, &v_cnt, &v_cnt64, &v_redo_mark, &v_redo_count};
+  int32_t v_dq_mode = static_cast<int32_t>(a_dq_mode);
+  void* v_dq_partial = DataPtr(a_dq_partial);
+  void* kernel_args[] = {&v_q_latent, &v_q_rope, &v_dout, &v_dq_latent, &v_dq_rope, &v_kv_latent, &v_k_rope, &v_lse, &v_delta, &v_indices, &v_topk_length, &v_dkv_acc, &v_dkr_acc, &v_dkv_stride, &v_dkr_stride, &v_dkr_col0, &v_dkv_dst_map, &v_dkv_has_map, &v_num_queries, &v_num_kv, &v_topk, &v_idx_stride, &v_indices_offset, &v_has_topk_length, &v_token_base, &v_token_step, &v_scale_log2, &v_sm_scale, &v_e_lat, &v_e_rope, &v_cnt, &v_cnt64, &v_redo_mark, &v_redo_count, &v_dq_mode, &v_dq_partial};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(640, 1, 1);

@@ -172,7 +172,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(640, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count)
+kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ dkv_acc, int* __restrict__ dkr_acc, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int* __restrict__ e_lat, int* __restrict__ e_rope, unsigned int* __restrict__ cnt, unsigned long long* __restrict__ cnt64, int* __restrict__ redo_mark, int* __restrict__ redo_count, int dq_mode, float* __restrict__ dq_partial)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -830,6 +830,7 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                 int _parity_dq_done = (int)((unsigned int)(int)tk_1 % 2);
                 mbarrier_wait(dq_done_addr, _parity_dq_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
+                long long pbase = (long long)tok * 36864ll + (long long)((w * 32 + lane_0) * 4);
                 float dq_1_0[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x8.b32"
@@ -1202,17 +1203,20 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
+                int stq = 1;
                 if (w == 0) {
                     if (elect_sync()) {
-                        tma_store_4d((&dq_latent), 0, 0, 0, token, k_blk_addr);
-                        tma_store_4d((&dq_latent), 0, 0, 1, token, k_blk_addr + 8192);
-                        tma_store_4d((&dq_latent), 0, 0, 2, token, k_blk_addr + 16384);
-                        tma_store_4d((&dq_latent), 0, 0, 3, token, k_blk_addr + 24576);
-                        tma_store_4d((&dq_latent), 0, 0, 4, token, k_blk_addr + 32768);
-                        tma_store_4d((&dq_latent), 0, 0, 5, token, k_blk_addr + 40960);
-                        tma_store_4d((&dq_latent), 0, 0, 6, token, k_blk_addr + 49152);
-                        tma_store_4d((&dq_latent), 0, 0, 7, token, k_blk_addr + 57344);
-                        tma_store_4d((&dq_rope), 0, 0, 0, token, k_blk_addr + 65536);
+                        if (stq != 0) {
+                            tma_store_4d((&dq_latent), 0, 0, 0, token, k_blk_addr);
+                            tma_store_4d((&dq_latent), 0, 0, 1, token, k_blk_addr + 8192);
+                            tma_store_4d((&dq_latent), 0, 0, 2, token, k_blk_addr + 16384);
+                            tma_store_4d((&dq_latent), 0, 0, 3, token, k_blk_addr + 24576);
+                            tma_store_4d((&dq_latent), 0, 0, 4, token, k_blk_addr + 32768);
+                            tma_store_4d((&dq_latent), 0, 0, 5, token, k_blk_addr + 40960);
+                            tma_store_4d((&dq_latent), 0, 0, 6, token, k_blk_addr + 49152);
+                            tma_store_4d((&dq_latent), 0, 0, 7, token, k_blk_addr + 57344);
+                            tma_store_4d((&dq_rope), 0, 0, 0, token, k_blk_addr + 65536);
+                        }
                         asm volatile("cp.async.bulk.commit_group;");
                         asm volatile("cp.async.bulk.wait_group 0;");
                     }
