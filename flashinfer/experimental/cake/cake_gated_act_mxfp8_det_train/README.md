@@ -73,7 +73,7 @@ orientation, the values and scales are zero-size tensors on the input device.
 
 Each architecture has six routes, named by direction and outputs: `fwd_row`, `fwd_col`,
 `fwd_both`, `bwd_row`, `bwd_col` and `bwd_both`.  A route holds 3 to 7 programs.  The package
-has 69 distinct programs and 81 per-architecture libraries in `build.json`.  Each library is
+has 67 distinct programs and 81 per-architecture libraries in `build.json`.  Each library is
 compiled with the exact `-gencode` flag of `sm_100a`, `sm_103a` or `sm_107a`.  There is no
 family fallback.
 
