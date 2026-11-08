@@ -571,6 +571,13 @@ HOST_TRIM_DEFAULT = (
 # (the A/B record).  The same kernels with the same arguments but data pointers in the same order: bitwise.
 DEFAULT_WS_VALUES = (0, 1)
 DEFAULT_WS_DEFAULT = 1
+# Kept-set pool: 1 (shipped) = the kept set of a checkpoint pass (the hand-off's tape set or rows set, :func:`_tape_alloc`)
+# comes from a package-private CUDA memory pool per device (:func:`_kept_pool`), so the set that lives from a recompute
+# to the node's backward never splits a block the caching allocator's default pool frees and reallocates around it
+# (the arena of a workspace=None call); 0 = the default pool (the previous form), via _kcp_test_knobs only (the A/B
+# record).  Placement only, the same kernels with the same arguments but data pointers: bitwise.
+KEPT_POOLS = (0, 1)
+KEPT_POOL_DEFAULT = 1
 # Forward prologue (fwd_prologue): "trim2" (shipped) = "trim" plus the intra record's table rule once per plan and
 # path (:func:`_intra_writes_tables_kept`) and no second capability check of a default call's in-kernel Q / K L2 norm
 # on the device the first one checked; "trim" = the forward's operand checks once per operand signature
@@ -658,6 +665,7 @@ P2_KNOBS = {  # knob -> admitted values
     "saved_carry": SAVED_CARRIES,
     "fwd_o_fuse": FWD_O_FUSES,
     "default_ws": DEFAULT_WS_VALUES,
+    "kept_pool": KEPT_POOLS,
     "fwd_prologue": FWD_PROLOGUES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
@@ -5077,7 +5085,9 @@ class CakeKDANondetKcpOptions:
     the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
     remaining launches, bitwise; ``_kcp_test_knobs`` only), ``default_ws`` (``1`` shipped: a ``workspace=None`` call
     runs on a workspace the package keeps, whose device storage lives for the call alone, :func:`_default_acquire`;
-    ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
+    ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``kept_pool`` (``1``
+    shipped: a checkpoint pass's kept set comes from the package-private pool of its device, :func:`_kept_pool`; ``0`` =
+    the caching allocator's default pool, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
     (``"under_b1"`` shipped: the saved-mode backward's K1 tape replay after the b1 issue where :func:`_tape_order`
     admits it, else before ``kcp_dav``; ``"first"`` = before ``kcp_dav`` in every backward, the same launches,
     bitwise; ``_kcp_test_knobs`` only), ``bwd_k3_stream`` (``"side"`` shipped: the backward's dm-form K3 on the side
@@ -5121,6 +5131,7 @@ class CakeKDANondetKcpOptions:
     saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
     fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
     default_ws: int = DEFAULT_WS_DEFAULT  # shipped 1 = a workspace=None call runs on a package-kept workspace (host objects kept, device storage per call); 0 = a new workspace per call, _kcp_test_knobs only
+    kept_pool: int = KEPT_POOL_DEFAULT  # shipped 1 = a checkpoint pass's kept set comes from the package-private pool of its device (_kept_pool); 0 = the default pool, _kcp_test_knobs only
     fwd_prologue: str = FWD_PROLOGUE_DEFAULT  # "trim2" shipped = "trim" with less host work before the first launch; "trim" = the operand checks once per operand signature; "base" = the previous host prologue; the same checks and launches (FWD_PROLOGUES), _kcp_test_knobs only
 
     def check(self) -> CakeKDANondetKcpOptions:
@@ -5253,6 +5264,7 @@ def _validate_options(kwargs: dict[str, Any]) -> CakeKDANondetKcpOptions:
                         "saved_carry",
                         "fwd_o_fuse",
                         "default_ws",
+                        "kept_pool",
                     )
                     else str(raw.pop(key))
                 )
@@ -5710,6 +5722,9 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
         # bytes (cake_kda_nondet_train_kcp_handoff_bytes(..., saved_rows=...)): the set actually kept, not the request
         "saved_rows": call.scratch.get("saved_rows"),
         "saved_rows_bytes": call.scratch.get("saved_rows_bytes"),
+        # whether the forward's kept set (the tape set or a rows set) came from the package-private pool of its device
+        # (_kept_pool); None without a kept set
+        "kept_pool": call.scratch.get("kept_pool"),
         # the place of a backward's K1 tape replay ("first" / "under_b1": the order run, _tape_order; None on a forward)
         # and why a backward under the knob value "under_b1" ran "first" (None otherwise)
         "bwd_tape_order": call.scratch.get("bwd_tape_order"),
@@ -6383,15 +6398,62 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
     }
 
 
+# The package-private pools of the checkpoint passes' kept sets (the knob kept_pool, shipped 1): one torch.cuda.MemPool
+# per device index, made at the first kept set of a checkpoint pass on that device and kept for the process.  A recompute
+# keeps its set from inside the call -- whose workspace=None arena is allocated at the call's start and freed at its end
+# (_default_acquire / _default_release) -- to the node's backward, which then allocates the larger backward arena.  In
+# the caching allocator's default pool the set lands in the remainder of the block the forward arena was cut from, so
+# that block cannot serve the backward arena and the reserved memory grows by up to an arena per call (measured on
+# GB300, CP4, H = 64, 65536 tokens per pack: +5.0 GiB steady with the gate, +10.1 GiB with the raw gate, the allocated
+# peak +0.8 GiB).  In its own pool the set reuses its own blocks: the pool holds the largest set kept at a time (the wy
+# rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
+# other allocations cannot use.  A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd
+# call) keeps its rows in the default pool: they live until each layer's backward, and their blocks then serve the
+# next step's other allocations.
+_MEM_POOL = getattr(torch.cuda, "MemPool", None)
+_USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
+_KEPT_POOLS: dict[int, Any] = {}
+
+
+def _kept_pool(call: CakeKDANondetKcpCall) -> Any:
+    """The pool the kept set of ``call`` comes from: the package-private pool of its device (:data:`_KEPT_POOLS`)
+    when the knob ``kept_pool`` is 1, this thread runs a checkpoint pass (:func:`_checkpoint_pass`) outside a
+    CUDA-graph capture and the torch has ``torch.cuda.MemPool``; ``None`` (the caching allocator's default pool)
+    otherwise.  Placement only: the launches and their arguments but the data pointers are the same."""
+    if (
+        not call.opts.kept_pool
+        or _MEM_POOL is None
+        or _USE_MEM_POOL is None
+        or call.device.type != "cuda"
+    ):
+        return None
+    if torch.cuda.is_current_stream_capturing() or _checkpoint_pass() is None:
+        return None
+    index = call.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    pool = _KEPT_POOLS.get(index)
+    if pool is None:
+        pool = _KEPT_POOLS.setdefault(index, _MEM_POOL())
+    return pool
+
+
 def _tape_alloc(
     call: CakeKDANondetKcpCall,
     names: tuple[str, ...] = cake_kcp_plan.KCP_HANDOFF_BUFFERS,
 ) -> dict[str, torch.Tensor]:
     """Fresh per-call tensors of the buffers ``names`` (the tape set by default, or a rows set of
     :data:`cake_kcp_plan.KCP_SAVED_ROWS`; every element a launch of the forward reads is written by one of the
-    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests)."""
+    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests), from the pool
+    :func:`_kept_pool` picks (``scratch["kept_pool"]``: whether it was the package-private one)."""
     shapes = _tape_shapes(call)
-    tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+    pool = _kept_pool(call)
+    call.scratch["kept_pool"] = pool is not None
+    if pool is None:
+        tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+    else:
+        with _USE_MEM_POOL(pool, call.device):
+            tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
@@ -9364,6 +9426,13 @@ def _handoff_phase(*inputs: Any) -> str | None:
             break
     else:
         return None
+    return _checkpoint_pass()
+
+
+def _checkpoint_pass() -> str | None:
+    """The checkpoint pass of this thread from its innermost default saved-tensor hooks and graph task alone
+    (:func:`_handoff_phase` without its grad-mode and input checks): ``"original"``, ``"recompute"``,
+    ``"reentrant"`` or ``None``."""
     if _TOP_HOOKS is None:
         return None
     try:

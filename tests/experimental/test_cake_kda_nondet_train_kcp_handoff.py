@@ -1507,6 +1507,7 @@ def _run_rank_rows(
         grad: bool = True,
         twice: bool = False,
         entry=None,
+        knobs=None,
     ):
         """One step of the autograd entry with ``saved_rows=rows`` and ``checkpoint_handoff=mode``, direct or under a
         non-reentrant checkpoint: the outputs and gradients of each backward (``twice``: two, the first with
@@ -1515,11 +1516,13 @@ def _run_rank_rows(
         moves of SAVED_ROWS_STATS and HANDOFF_STATS.  ``poison_rows``: NaN-filled kept rows before the forward's
         launches (``_HANDOFF_POISON``); ``poison_arena``: the caller workspace's local arena NaN-filled between the
         forward and the backward (direct); ``hooks``: a saved-tensor hooks context around the forward; ``grad=False``:
-        the forward under no_grad and no backward."""
+        the forward under no_grad and no backward; ``knobs``: the call's ``_kcp_test_knobs``."""
         if poison_free:
             _poison(device)
         lv = leaves()
         kw = {}
+        if knobs is not None:
+            kw["_kcp_test_knobs"] = knobs
         if handle is not None:
             kw["recompute_handle"] = handle
         if keep is not None:
@@ -1695,6 +1698,10 @@ def _run_rank_rows(
         (res_f,), recs = run(form)
         measure(form, res_f, light)
         flags[f"{form}_kept"] = kept(recs, form)
+        # outside a checkpoint the rows stay in the caching allocator's default pool
+        flags[f"{form}_default_pool"] = (
+            T_r == 0 or recs["orig"].get("kept_pool") is False
+        )
         flags[f"{form}_launches"] = launches(recs, recs_light, form)
         flags[f"{form}_stats"] = (
             recs["rows"] == rows_stats(form, 1, 1)
@@ -1788,6 +1795,21 @@ def _run_rank_rows(
             and recs["handoff"] == {}
         )
         flags[f"{form}_handoff_launches"] = launches(recs, recs_light_ck, form)
+        # both passes keep the set in the package-private pool of the device (the knob kept_pool, shipped 1); with
+        # kept_pool=0 in the default pool, bitwise the same
+        flags[f"{form}_handoff_kept_pool"] = T_r == 0 or (
+            recs["orig"].get("kept_pool") is True
+            and recs["fwd"].get("kept_pool") is True
+            and device.index in cake_kcp._KEPT_POOLS
+        )
+        previous_knobs = cake_kcp_plan.enable_test_knobs(True)
+        try:
+            (res_k,), recs_k = run(form, mode="on", ckpt=True, knobs={"kept_pool": 0})
+        finally:
+            cake_kcp_plan.enable_test_knobs(previous_knobs)
+        flags[f"{form}_handoff_kept_pool0_bitwise"] = _same(res_k, res_c) and (
+            T_r == 0 or recs_k["fwd"].get("kept_pool") is False
+        )
         for keep in ("states", "transfer"):
             (res_h,), recs_h = run(
                 form, mode="on", ckpt=True, handle=handle_type(), keep=keep
@@ -2076,7 +2098,9 @@ def test_saved_rows_gpu_rows(row) -> None:
     NaN-filled between the forward and the backward (and the light path so poisoned; each poisoned run bitwise its
     unpoisoned twin), over two backwards (``retain_graph``, the second bitwise the first; also on the lean arena),
     as the checkpoint hand-off's rows form (``checkpoint_handoff="on"``) with and without a recompute handle of both
-    tiers (the recompute issues no collective) and with a poisoned arena, with ``"off"`` and ``"auto"`` in a
+    tiers (the recompute issues no collective; both passes keep the rows in the package-private pool of the device,
+    and with the test knob ``kept_pool=0`` in the default pool, bitwise the same; a plain node keeps them in the
+    default pool) and with a poisoned arena, with ``"off"`` and ``"auto"`` in a
     checkpoint pass, under ``save_on_cpu`` (refused, the light set; a run that cannot run fails the row), with ranks
     that keep different sets, through the facade, through the functional entries and under ``graph="replay"``
     (eager, capture, replays); the rows kept by the forwards and read by the backward with the byte query's bytes
@@ -2640,6 +2664,53 @@ def test_handoff_phase_probe_reads_the_checkpoint_passes() -> None:
     with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
         fn(torch.ones(4, requires_grad=True))
     assert seen == [None], seen
+
+
+def test_kept_pool_knob_and_rule() -> None:
+    """``kept_pool`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a public
+    keyword, validated against :data:`cake_kcp.KEPT_POOLS`, shipped 1.  :func:`cake_kcp._kept_pool` picks the
+    package-private pool of the device in both passes of a non-reentrant checkpoint with the knob at 1, and the
+    default pool (``None``) outside a checkpoint pass, with the knob at 0 and off CUDA."""
+    from torch.utils.checkpoint import checkpoint
+
+    assert cake_kcp.KEPT_POOL_DEFAULT == 1 and cake_kcp.KEPT_POOLS == (0, 1)
+    assert cake_kcp.P2_KNOBS["kept_pool"] == cake_kcp.KEPT_POOLS
+    on = cake_kcp._options({})
+    assert on.kept_pool == 1
+    previous = cake_kcp_plan.enable_test_knobs(False)
+    try:
+        with pytest.raises(ValueError, match="enable_test_knobs"):
+            cake_kcp._options({"_kcp_test_knobs": {"kept_pool": 0}})
+        with pytest.raises(TypeError):
+            cake_kcp._options({"kept_pool": 0})
+        cake_kcp_plan.enable_test_knobs(True)
+        off = cake_kcp._options({"_kcp_test_knobs": {"kept_pool": 0}})
+        assert off.kept_pool == 0
+        for bad in (2, -1):
+            with pytest.raises(ValueError):
+                cake_kcp._options({"_kcp_test_knobs": {"kept_pool": bad}})
+    finally:
+        cake_kcp_plan.enable_test_knobs(previous)
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda", torch.cuda.current_device()))
+    for device in devices:
+        call_on = types.SimpleNamespace(opts=on, device=device)
+        call_off = types.SimpleNamespace(opts=off, device=device)
+        seen: list = []
+
+        def fn(x, call_on=call_on, call_off=call_off, seen=seen):
+            seen.append((cake_kcp._kept_pool(call_on), cake_kcp._kept_pool(call_off)))
+            return x * x
+
+        assert cake_kcp._kept_pool(call_on) is None  # outside a checkpoint pass
+        x = torch.ones(4, device=device, requires_grad=True)
+        checkpoint(fn, x, use_reentrant=False).sum().backward()
+        if device.type != "cuda":
+            assert seen == [(None, None), (None, None)], seen
+            continue
+        pool = cake_kcp._KEPT_POOLS[device.index]
+        assert seen == [(pool, None), (pool, None)], seen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
