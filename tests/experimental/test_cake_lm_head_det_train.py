@@ -14208,16 +14208,20 @@ def _clear_binding_caches() -> None:
 
 
 def _record_every_hidden_count(monkeypatch) -> list:
-    """Record each hidden valid-row count either backend module's forwards begin (the module's name per count)."""
+    """Record each hidden valid-row count either backend module's forwards begin, with or without a temperature (the
+    module's name per count)."""
     begun: list = []
     for name, module in (("cake_backend", cake_backend), ("opt_in", opt_in)):
-        real = module._hidden_count_begin
+        for fn in ("_hidden_count_begin", "_hidden_count_begin_temperature"):
+            real = getattr(module, fn, None)
+            if real is None:
+                continue
 
-        def begin(*args, _real=real, _name=name, **kwargs):
-            begun.append(_name)
-            return _real(*args, **kwargs)
+            def begin(*args, _real=real, _name=name, **kwargs):
+                begun.append(_name)
+                return _real(*args, **kwargs)
 
-        monkeypatch.setattr(module, "_hidden_count_begin", begin)
+            monkeypatch.setattr(module, fn, begin)
     return begun
 
 
@@ -14341,15 +14345,16 @@ def test_device_cache_miss_template_views_the_hidden_count_buffers(monkeypatch, 
         _assert_same_bits(fast, result, keys=keys)
 
 
-def _default_pass(inp, C, entry, kind, tau):
-    """One default call of ``entry`` (no ``memory_mode``) on fresh leaves: ``kind`` ``"nograd"`` -- the forward under
-    gradient mode off with ``W`` requiring a gradient (a reentrant checkpoint's first pass) -- else a step under
-    :func:`_checkpointed` (``"plain"``: no checkpoint), its backward freeing the graph.  ``tau``: the
-    log-probability entry's temperature (``None``: none).  ``(result, peak)``, the peak above the bytes allocated
-    before (outputs and gradients included)."""
+def _default_pass(inp, C, entry, kind, tau, memory_mode=None):
+    """One default call of ``entry`` (no ``memory_mode``; ``memory_mode`` given: that form, through the same step) on
+    fresh leaves: ``kind`` ``"nograd"`` -- the forward under gradient mode off with ``W`` requiring a gradient (a
+    reentrant checkpoint's first pass) -- else a step under :func:`_checkpointed` (``"plain"``: no checkpoint), its
+    backward freeing the graph.  ``tau``: the log-probability entry's temperature (``None``: none).  ``(result,
+    peak)``, the peak above the bytes allocated before (outputs and gradients included)."""
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     logps = []
+    mode = {} if memory_mode is None else dict(memory_mode=memory_mode)
 
     def head(a, b):
         if entry == "loss":
@@ -14364,16 +14369,17 @@ def _default_pass(inp, C, entry, kind, tau):
                 chunk_size=C,
                 return_logp=True,
                 backend="cake",
+                **mode,
             )
             logps.append(logp.detach())
             return loss
         if tau is None:
             logp = opt_in.cake_lm_head_det_train_logprob(
-                a, b, inp.labels, chunk_size=C, backend="cake"
+                a, b, inp.labels, chunk_size=C, backend="cake", **mode
             )
         else:
             logp = opt_in.cake_lm_head_det_train_logprob_temperature(
-                a, b, inp.labels, chunk_size=C, backend="cake", temperature=tau
+                a, b, inp.labels, chunk_size=C, backend="cake", temperature=tau, **mode
             )
         logps.append(logp.detach())
         return (logp * inp.dlogp).sum()
@@ -14441,7 +14447,10 @@ def test_device_default_fast_kept_calls_keep_the_hidden_count(
     keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
     tau_kw = {} if tau is None else dict(temperature=tau)
     _budget_step(inp, C, entry, memory_mode="fast", **tau_kw)  # binds
-    fast, fast_peak, _ = _budget_step(inp, C, entry, memory_mode="fast", **tau_kw)
+    fast, _, _ = _budget_step(inp, C, entry, memory_mode="fast", **tau_kw)
+    # the explicit fast form's plain step through the same step as the default passes (the log-probability entry's
+    # upstream product included)
+    _, fast_peak = _default_pass(inp, C, entry, "plain", tau, memory_mode="fast")
     expected = "opt_in" if entry == "loss" else "cake_backend"
     begun = _record_every_hidden_count(monkeypatch)
     host_counts = _record_host_counts(monkeypatch)
@@ -14460,7 +14469,7 @@ def test_device_default_fast_kept_calls_keep_the_hidden_count(
         del result
     # a cache miss of each form (the caches cleared): the default call templates on the count's buffers
     _clear_binding_caches()
-    _, fast_miss, _ = _budget_step(inp, C, entry, memory_mode="fast", **tau_kw)
+    _, fast_miss = _default_pass(inp, C, entry, "plain", tau, memory_mode="fast")
     _clear_binding_caches()
     torch.cuda.empty_cache()
     result, miss = _default_pass(inp, C, entry, "plain", tau)
