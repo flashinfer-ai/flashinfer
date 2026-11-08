@@ -1739,6 +1739,11 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     ('sm_100a', False, False, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
     ('sm_100a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    # ---- sm_100a: the GB T-exact rule of round 12 - the 4096 -> 12288 weight gradient at T 16231 (the ragged rule's
+    #      exact 16-way stream-K program with the tail-first order, in 2-row raster groups in place of the default 16),
+    #      measured on GB200 against the plan without it on two nodes; the raster changes which four output tiles take
+    #      the stream-K tail, so the outputs of those tiles differ from that plan's (each plan is deterministic) ----
+    ('sm_100a', True, True, False, False, False, 4096, 16231, 12288): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True, "group_m": 2},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
