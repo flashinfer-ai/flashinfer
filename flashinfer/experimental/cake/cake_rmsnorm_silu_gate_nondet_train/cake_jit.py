@@ -32,8 +32,9 @@ A role is one kernel of a call: ``fwd`` (the forward: ``rstd`` from
 ``rsqrt.approx`` and the SiLU gate from ``ex2.approx`` and ``rcp.approx``,
 every row's arithmetic fixed, so ``y`` is the same bits on every call) and
 ``bwd_bf16`` / ``bwd_f32`` (the backward: ``dx``, ``dz`` and the weight
-gradient in one kernel; ``dx`` and ``dz`` are the deterministic backward's
-arithmetic in every backward program; the chunked programs sum the FP32
+gradient in one kernel; ``dx`` and ``dz`` are one row arithmetic in every
+backward program, within one BF16 ulp of FP64 plus 1/64 ulp of the tensor's
+largest finite magnitude; the chunked programs sum the FP32
 partial of each chunk of rows exactly, as integers, into a weight gradient
 rounded to FP32 from the FP64 value of the exact sum, then to BF16 for a
 BF16 one, so every output is the same bits at any grid and in any order of
@@ -110,9 +111,9 @@ in L2), the CTA that arrives last rounding the sum once.  A small-row
 backward (whose BF16 band a call with ``compute_grad_weight=False`` also
 takes) is one thread-block cluster of 16 CTAs that sums the weight gradient
 on chip in a fixed order and rounds it once, with no workspace: the exact
-tiny backward (``<role>_t512``: 4 teams of the deterministic backward's
-128-thread CTA a CTA, up to 512 rows; ``dx``, ``dz`` and the weight gradient
-the deterministic pair's bits) and, for a BF16 weight gradient, the short
+tiny backward (``<role>_t512``: 4 teams of the 128-thread CTA of the
+deterministic backward at FlashInfer ``2e989556`` a CTA, up to 512 rows; the
+weight gradient that pair's bits) and, for a BF16 weight gradient, the short
 backward (``bwd_bf16_short``: 256-thread CTAs with the row-claims backward's
 row arithmetic, each CTA finishing 8 columns from every CTA's FP32 partials
 in rank order in FP64, up to 256 rows).
@@ -128,8 +129,8 @@ on, one CTA per block below it; a
 small-row backward one cluster of ``cluster`` CTAs (``launch.cluster``)
 whatever the rows, up to its rule's ``max_rows``.  The static and the
 claimed backward cut the rows into blocks of ``rows_per_block`` rows and the
-blocks into the deterministic backward's
-chunks (:func:`backward_chunks`): ``blocks_per_chunk = max(1, ceil(blocks /
+blocks into the chunks of the deterministic backward at ``2e989556``
+(:func:`backward_chunks`): ``blocks_per_chunk = max(1, ceil(blocks /
 chunk_limit))`` consecutive blocks a chunk, ``C = ceil(blocks /
 blocks_per_chunk)`` chunks, and launch :func:`backward_ctas` ``G = min(C,
 ctas_per_sm * SMs)`` CTAs; the host passes ``blocks_per_chunk`` to the
@@ -1146,9 +1147,9 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # The exact small-row backward into a BF16 weight gradient (or none, with
     # compute_grad_weight=False):
-    # one cluster of 16 CTAs of 4 teams of the deterministic backward's
-    # 128-thread CTA (team q of CTA r runs the 8-row block r + 16q), dx, dz
-    # and the weight gradient the deterministic pair's bits, CTA r summing
+    # one cluster of 16 CTAs of 4 teams of the 128-thread CTA of the
+    # deterministic backward at 2e989556 (team q of CTA r runs the 8-row
+    # block r + 16q), the weight gradient that pair's bits, CTA r summing
     # the columns 8r to 8r + 7 in the pair's reduce order in FP64, no
     # workspace (build {"out": "bf16", "teams": 4}), up to 512 rows;
     # BACKWARD_BANDS gives it its rows.
@@ -1569,9 +1570,9 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # The exact small-row backward into a FP32 weight gradient:
-    # one cluster of 16 CTAs of 4 teams of the deterministic backward's
-    # 128-thread CTA (team q of CTA r runs the 8-row block r + 16q), dx, dz
-    # and the weight gradient the deterministic pair's bits, CTA r summing
+    # one cluster of 16 CTAs of 4 teams of the 128-thread CTA of the
+    # deterministic backward at 2e989556 (team q of CTA r runs the 8-row
+    # block r + 16q), the weight gradient that pair's bits, CTA r summing
     # the columns 8r to 8r + 7 in the pair's reduce order in FP64, no
     # workspace (build {"out": "f32", "teams": 4}), up to 512 rows;
     # BACKWARD_BANDS gives it its rows.
@@ -1710,12 +1711,12 @@ ROUTES: dict[str, dict[str, str]] = {
 # tiny forward, but the mid forward from 6001 to 8192 rows per SM, where the
 # pipelined forward still launches a CTA per block.  The tiny forward ends
 # where beside a kernel holding 16 SMs it still ends no later than the
-# deterministic package's forward: 38 rows per SM on sm_100a and 39 on
-# sm_103a (from there, beside 16 CTAs of 1024 threads with the max-shared
-# carveout, it ends up to 2 microseconds later; the pipelined forward, which
-# is that forward, runs from there, up to 85 rows per SM on sm_100a and 6000
-# on sm_103a), and 65 on sm_107a.  Host plan only: a new cut needs no new
-# program.
+# deterministic package's forward: 38 rows per SM on sm_100a and 36 on
+# sm_103a (past 38, beside 16 CTAs of 1024 threads with the max-shared
+# carveout, it can end up to 2 microseconds later, and sm_103a keeps two rows
+# per SM of margin; the pipelined forward, which is that forward, runs from
+# there, up to 85 rows per SM on sm_100a and 6000 on sm_103a), and 65 on
+# sm_107a.  Host plan only: a new cut needs no new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (38, "fwd_tiny"),
@@ -1727,7 +1728,7 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
         (None, "fwd_mid"),
     ),
     "sm_103a": (
-        (39, "fwd_tiny"),
+        (36, "fwd_tiny"),
         (6000, "fwd_pipe"),
         (8192, "fwd_mid"),
         (None, "fwd_pipe"),
@@ -1942,8 +1943,8 @@ def backward_chunks(name: str, rows: int) -> tuple[int, int]:
     """``(blocks_per_chunk, chunks)`` of the static or claimed backward module
     ``name`` for ``rows`` rows: blocks of ``rows_per_block`` rows,
     ``blocks_per_chunk = max(1, ceil(blocks / chunk_limit))`` consecutive
-    blocks a chunk (the deterministic backward's chunks) and ``ceil(blocks /
-    blocks_per_chunk)`` chunks."""
+    blocks a chunk (the chunks of the deterministic backward at ``2e989556``)
+    and ``ceil(blocks / blocks_per_chunk)`` chunks."""
 
     rule = MODULES[name]["grid_rule"]
     if rule["kind"] != "chunks":

@@ -265,11 +265,10 @@ by every call, so one workspace serves every later call on its stream.
    CUDA Graph checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
-   and run the backward of their own package.  A backward workspace holds the
-   raw partial sums of one package and serves only that package (FP32 for the
-   deterministic package, a ``torch.uint8`` buffer for the non-deterministic
-   one): each backward refuses the other package's workspace (``ValueError``),
-   also in a call with no rows.
+   and run the backward of their own package.  A backward workspace serves only
+   its own package (FP32 for the deterministic package, a ``torch.uint8``
+   buffer for the non-deterministic one): each backward refuses the other
+   package's workspace (``ValueError``), also in a call with no rows.
 5. The former names are gone, with no alias or shim: the former modules fail
    at import, and the former names without a mode word are attributes of
    neither ``flashinfer`` nor either module.
@@ -353,7 +352,10 @@ the row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 257
 rows to 1294 rows per SM, SM107 above 24 to 68 rows per SM), where its last
 bits may vary from run to run.  ``y`` is the deterministic package's bits
 where a pipelined forward runs (below) and not elsewhere; ``dx`` and ``dz`` are
-in every band, and outside the row-claims bands and the
+the same bits in every band, within one BF16 unit in the last place of the
+FP64 value plus 1/64 of a unit of the tensor's largest finite magnitude (the
+deterministic package's backward need not give these bits), and outside the
+row-claims bands and the
 short backward's band (a BF16 weight gradient up to 256 rows) ``dw`` is the
 bits of the deterministic package at FlashInfer commit 2e989556, except where
 the exact sum lies within that package's FP64 sum's error of a rounding
@@ -372,7 +374,7 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
   of several modules chosen by bands of rows per SM: where ``x`` and ``z``
   hold packed rows (row ``n`` at element ``128 n``, as contiguous inputs do;
-  fewer than 2^24 rows) a tiny forward up to 38 rows per SM on SM100, 39 on
+  fewer than 2^24 rows) a tiny forward up to 38 rows per SM on SM100, 36 on
   SM103 and 65 on SM107, one 128-thread CTA per 8-row block; for other
   layouts a short forward up to 12 rows per SM on SM100 and SM103 (59 on
   SM107), one CTA per 16-row block.  Past them the bands run the mid forward
@@ -410,23 +412,24 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   on a small MIG instance, the short forward's grid at the end of its band has
   more CTAs than the SMs beside 16 held ones take in one wave, and this bound
   of the short forward is not shown there.
-* The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
-  backward's row arithmetic in every band.  A call of few rows runs one
+* The backward is one kernel.  ``dx`` and ``dz`` use one row arithmetic in
+  every band.  A call of few rows runs one
   thread-block cluster of 16 CTAs that sums the weight gradient on chip in a
   fixed order and takes no workspace.  The short backward (256-thread CTAs
   with the row-claims backward's row arithmetic; CTA ``r`` adds every CTA's
   FP32 partials of the columns ``8r`` to ``8r + 7`` in rank order in FP64)
   runs a BF16 weight gradient (or ``compute_grad_weight=False``) up to 256
-  rows.  The exact tiny backward (4 teams of the deterministic backward's
-  128-thread CTA a CTA, adding the deterministic backward's chunk partials in
-  its reduction order in FP64) runs an FP32 weight gradient up to 512 rows on
-  every architecture, and a BF16 one (or ``compute_grad_weight=False``) from
-  257 up to 512 rows on SM100 and SM107; SM103 has no BF16 exact tiny
-  backward.  Past those rows the rows (``T * H``) and the SM count pick the
-  kernel by bands of rows per SM.  The chunked
-  backwards launch at most 8 CTAs per SM; they sum the deterministic
-  backward's chunk partials exactly in 64-bit integer windows and round that
-  sum to FP32 from its FP64 value (then to BF16 for a BF16 weight gradient),
+  rows.  The exact tiny backward (4 teams of the 128-thread CTA of the
+  deterministic backward at FlashInfer 2e989556 a CTA, adding that backward's
+  chunk partials in its reduction order in FP64) runs an FP32 weight gradient
+  up to 512 rows on every architecture, and a BF16 one (or
+  ``compute_grad_weight=False``) from 257 up to 512 rows on SM100 and SM107;
+  SM103 has no BF16 exact tiny backward.  Past those rows the rows (``T * H``)
+  and the SM count pick the kernel by bands of rows per SM.  The chunked
+  backwards launch at most 8 CTAs per SM; they sum the chunk partials of the
+  deterministic backward at FlashInfer 2e989556 exactly in 64-bit integer
+  windows and round that sum to FP32 from its FP64 value (then to BF16 for a
+  BF16 weight gradient),
   so the weight gradient does not depend on the grid or on the order in which
   CTAs finish.  A static backward (CTA ``b`` runs the chunks ``b``, ``b +
   grid``, ...) runs an FP32 weight gradient up to 256 rows per SM on SM100 and

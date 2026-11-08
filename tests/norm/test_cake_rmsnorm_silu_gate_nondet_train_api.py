@@ -30,13 +30,15 @@ gradient in the row-claims bands of ``BACKWARD_BANDS`` (``bwd_bf16_rc``,
 ``bwd_bf16_rc_mid``), whose CTAs claim row blocks at run time and add FP64
 atomics, so its last bits may vary from run to run; there every launch's
 ``dw`` is checked against the budgets below instead of the first launch's
-bits.  The backward writes ``dx`` and ``dz`` with the deterministic
-backward's row arithmetic, so they are the deterministic package's bits on
-every path checked here, in every band.  ``y`` is not: the forward computes
-``rstd`` and the SiLU gate with approximate FP32 intrinsics.  Nor, near
-rounding boundaries, is ``dw``: the chunked backwards add the deterministic
-chunk partials of the weight gradient exactly, as integers, and the
-row-claims backwards add FP32 runs of rows in FP64.  So every output is also
+bits.  The backward writes ``dx`` and ``dz`` with one row arithmetic in
+every band, held to FP64 (within one BF16 ulp plus 1/64 ulp of the tensor's
+largest finite magnitude, :func:`assert_dx_dz_within_fp64`) on every path
+checked here; they need not be the deterministic package's bits.  Nor is
+``y``: the forward computes ``rstd`` and the SiLU gate with approximate FP32
+intrinsics.  Nor, near rounding boundaries, is ``dw``: the chunked backwards
+add the chunk partials of the weight gradient of the deterministic package
+at FlashInfer ``2e989556`` exactly, as integers, and the row-claims
+backwards add FP32 runs of rows in FP64.  So every output is also
 compared with the deterministic package through an error budget against the
 backend suite's FP64 reference (:func:`assert_error_within_det`):
 on the same inputs, the relative L2 error of an output and its largest error
@@ -84,8 +86,8 @@ package's public forward and backward only.  This module checks:
   workspace with nonzero bytes reused across shapes, two streams, a side
   stream, CUDA Graph replays, autograd and non-reentrant checkpointing) every
   output repeats bit for bit (an accumulated ``dw`` from the same starting
-  value too) but a BF16 ``dw`` in the row-claims bands, ``dx`` and ``dz`` are
-  the deterministic package's bits, ``y``, ``dx``, ``dz`` and ``dw`` lie
+  value too) but a BF16 ``dw`` in the row-claims bands, ``dx`` and ``dz`` lie
+  within one BF16 ulp of FP64, ``y``, ``dx``, ``dz`` and ``dw`` lie
   within the error budget (``y`` also within one BF16 ulp of FP64,
   :func:`assert_y_within_fp64`), and ``dw`` within the weight-gradient budget of
   the deterministic ``dw`` (in the row-claims bands on every launch); so do
@@ -111,8 +113,8 @@ package's public forward and backward only.  This module checks:
   passing the packed-rows test exactly when their rows follow one another;
   and weight gradients in the subnormal range (identical rows whose FP32 terms
   underflow) lie within the weight-gradient budget widened by the underflow
-  allowance the package documents (``dx`` and ``dz`` the deterministic
-  package's bits, a BF16 ``dw`` the deterministic ``dw``'s bits).
+  allowance the package documents (``dx`` and ``dz`` within one BF16 ulp of
+  FP64, ``dx`` with an absolute floor below BF16's smallest subnormal).
 
 The numerical contract of the non-deterministic kernels against the FP64
 reference is ``test_cake_rmsnorm_silu_gate_nondet_train.py``'s; its data
@@ -376,18 +378,28 @@ def assert_same_classes(what, got, ref) -> None:
         assert torch.equal(cls(got), cls(ref)), f"{what}: {name} positions vs FP64"
 
 
-def assert_det_bits(what, got, det) -> None:
-    """``got`` (``dx`` or ``dz``) is the deterministic package's ``det``
-    bits."""
-    assert torch.equal(got, det), f"{what} vs the deterministic package"
-
-
-def assert_det_bits_beside_nans(what, got, det) -> None:
-    """``got`` has ``det``'s ``NaN`` positions and its bits everywhere
-    else."""
-    nan = torch.isnan(det)
-    assert torch.equal(torch.isnan(got), nan), f"{what}: NaN positions vs det"
-    assert torch.equal(got[~nan], det[~nan]), f"{what} vs the deterministic package"
+def assert_dx_dz_within_fp64(what, got, want, *, floor=0.0) -> None:
+    """``got`` (``dx`` or ``dz``, or a sum of them) is ``NaN`` where the FP64
+    reference ``want`` is ``NaN``, its infinity where it is infinite, and
+    elsewhere within one BF16 ulp of it plus 1/64 ulp of its largest finite
+    magnitude (cancellation in ``dx``), or ``floor`` where that is larger.
+    The deterministic package's backward need not give this package's
+    ``dx`` and ``dz`` bits, so each package holds its own to FP64."""
+    got = got.detach().double().reshape(-1)
+    want = want.double().reshape(-1)
+    assert torch.equal(got.isnan(), want.isnan()), f"{what}: NaN elements"
+    inf = want.isinf()
+    assert torch.equal(got.isinf(), inf), f"{what}: infinite elements"
+    assert torch.equal(got[inf], want[inf]), f"{what}: infinite elements"
+    finite = want.isfinite()
+    scale = want[finite].abs().max().item() if bool(finite.any()) else 0.0
+    bound = want.abs() * suite.BF16_RTOL + max(scale * suite.BF16_RTOL / 64, floor)
+    err = (got - want).abs()
+    bad = finite & ~(err <= bound)
+    assert not bad.any(), (
+        f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond one BF16 ulp "
+        f"of FP64; worst err {err[bad].max().item():.3e}"
+    )
 
 
 def assert_dw_repeats_within_det(what, dw, first, det, ref, mag, *, varies) -> None:
@@ -946,8 +958,8 @@ def test_nondet_entry_points_run_this_package(
     modules that ``module_for_rows`` picks: ``y``, ``dx``, ``dz`` and ``dw``
     repeat bit for bit (``dw`` where its band repeats it,
     :func:`assert_dw_repeats_within_det`) and lie within the error budget of
-    the deterministic package's outputs, ``dx`` and ``dz`` are its bits,
-    ``dw`` (of each call) also within one BF16 rounding plus the FP32
+    the deterministic package's outputs, ``dx`` and ``dz`` within one BF16
+    ulp of FP64, ``dw`` (of each call) also within one BF16 rounding plus the FP32
     accumulation budget of the deterministic ``dw``.  The two workspace kinds
     do not substitute, and a refusal launches nothing: this backward refuses
     an FP32 tensor (the deterministic package's workspace), naming both modes'
@@ -971,8 +983,8 @@ def test_nondet_entry_points_run_this_package(
         assert_same_bits(what, got, want)
     y64, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
     dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS)
-    assert_det_bits("dx", dx, dx_d)
-    assert_det_bits("dz", dz, dz_d)
+    assert_dx_dz_within_fp64("dx", dx, dx64)
+    assert_dx_dz_within_fp64("dz", dz, dz64)
     outputs = zip(
         ("y", "dx", "dz", "dw"),
         (y, dx, dz, dw),
@@ -1149,8 +1161,8 @@ def test_accuracy_matrix_within_the_deterministic_error(
         assert_dw_repeats_within_det(
             "dw", got[2], first[2], dets[2], dw64, mag, varies=varies
         )
-        assert_det_bits("dx", got[0], dets[0])
-        assert_det_bits("dz", got[1], dets[1])
+        assert_dx_dz_within_fp64("dx", got[0], dx64)
+        assert_dx_dz_within_fp64("dz", got[1], dz64)
     for what, got, det, ref in zip(
         ("dx", "dz", "dw"), first, dets, (dx64, dz64, dw64), strict=True
     ):
@@ -1172,9 +1184,9 @@ def test_accumulation_within_the_deterministic_error(determinism_setting) -> Non
     gradients (recorded by a hook), each the functional backward's bits (in
     a row-claims band each within the budgets of
     :func:`assert_dw_repeats_within_det` instead), and twice the functional
-    backward's ``dx`` and ``dz`` bits, ``x.grad`` and ``z.grad`` twice the
-    deterministic package's ``dx`` and ``dz`` (bits) and within the error
-    budget of those."""
+    backward's ``dx`` and ``dz`` bits, ``x.grad`` and ``z.grad`` within one
+    BF16 ulp of twice the FP64 ``dx`` and ``dz`` and within the error budget
+    of twice the deterministic package's."""
     x, z, w, dy = suite.make(1031, 48, seed=6)
     x2, z2, _, dy2 = suite.make(1031, 48, seed=7)
     rows = 1031 * 48
@@ -1231,8 +1243,8 @@ def test_accumulation_within_the_deterministic_error(determinism_setting) -> Non
             suite.magnitudes(dy, x, z, EPS),
             varies=suite._dw_varies(rows),
         )
-    assert_det_bits("x.grad", xa.grad, dx_d + dx_d)
-    assert_det_bits("z.grad", za.grad, dz_d + dz_d)
+    assert_dx_dz_within_fp64("x.grad", xa.grad, 2 * dx64)
+    assert_dx_dz_within_fp64("z.grad", za.grad, 2 * dz64)
     assert_error_within_det("x.grad", xa.grad, dx_d + dx_d, 2 * dx64)
     assert_error_within_det("z.grad", za.grad, dz_d + dz_d, 2 * dz64)
 
@@ -1243,8 +1255,8 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
 ) -> None:
     """Without the weight gradient (with this package's workspace or none,
     and through autograd with a weight that needs no gradient), ``dx`` and
-    ``dz`` are the bits of a backward with the weight gradient and the
-    deterministic package's bits, within its error budget."""
+    ``dz`` are the bits of a backward with the weight gradient, within one
+    BF16 ulp of FP64 and within the deterministic package's error budget."""
     x, z, w, dy = suite.make(257, 48, seed=12)
     _, dx64, dz64, _ = suite.fp64_reference(dy, x, z, w, EPS)
     dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS, compute_grad_weight=False)
@@ -1257,8 +1269,8 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
         assert dw is None
         assert_same_bits("dx", dx, want_dx)
         assert_same_bits("dz", dz, want_dz)
-        assert_det_bits("dx", dx, dx_d)
-        assert_det_bits("dz", dz, dz_d)
+        assert_dx_dz_within_fp64("dx", dx, dx64)
+        assert_dx_dz_within_fp64("dz", dz, dz64)
     assert_error_within_det("dx", want_dx, dx_d, dx64)
     assert_error_within_det("dz", want_dz, dz_d, dz64)
     # autograd with a weight that needs no gradient
@@ -1266,8 +1278,8 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
     nd_gated_rmsnorm(xa, za, w, EPS).backward(dy)
     assert_same_bits("x.grad", xa.grad, want_dx)
     assert_same_bits("z.grad", za.grad, want_dz)
-    assert_det_bits("x.grad", xa.grad, dx_d)
-    assert_det_bits("z.grad", za.grad, dz_d)
+    assert_dx_dz_within_fp64("x.grad", xa.grad, dx64)
+    assert_dx_dz_within_fp64("z.grad", za.grad, dz64)
 
 
 @requires_device
@@ -1283,7 +1295,7 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     output repeats bit for bit (an accumulated ``dw`` from the same starting
     value too; a BF16 ``dw`` in a row-claims band instead meets the checks
     that follow on each call), ``dx`` and
-    ``dz`` are the deterministic package's bits, ``dx``, ``dz`` and ``dw`` lie
+    ``dz`` lie within one BF16 ulp of FP64, ``dx``, ``dz`` and ``dw`` lie
     within the error budget of the deterministic package's,
     ``dw`` within the budget of the deterministic ``dw`` and of the FP64
     reference, and the workspace is zero after every call."""
@@ -1358,10 +1370,10 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
         dets = det_backward(
             dy, x, z, w, EPS, grad_weight=gw(), accumulate_grad_weight=accumulate
         )
-        assert_det_bits(f"dx {case}", dx, dets[0])
-        assert_det_bits(f"dz {case}", dz, dets[1])
         mag = suite.magnitudes(dy, x, z, EPS)
         _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
+        assert_dx_dz_within_fp64(f"dx {case}", dx, dx64)
+        assert_dx_dz_within_fp64(f"dz {case}", dz, dz64)
         want = dw64 + start
         for what, got, det, ref in zip(
             ("dx", "dz"), (dx, dz), dets[:2], (dx64, dz64), strict=True
@@ -1383,13 +1395,14 @@ def test_two_streams_repeat_the_current_stream_bits(determinism_setting) -> None
     current stream (``dw`` where its band repeats it; in a row-claims band
     within the budgets of :func:`assert_dw_repeats_within_det` instead),
     which lies within the error budget of the deterministic
-    package's, and every ``dx`` and ``dz`` the deterministic package's bits."""
+    package's, and every ``dx`` and ``dz`` within one BF16 ulp of FP64."""
     cases = [suite.make(4097, 48, seed=30), suite.make(1031, 16, seed=31)]
     refs = [nd_backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
     dets = [det_backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
-    dw64s, mags = [], []
+    dxz64s, dw64s, mags = [], [], []
     for (x, z, w, dy), ref, det_out in zip(cases, refs, dets, strict=True):
         _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
+        dxz64s.append((dx64, dz64))
         dw64s.append(dw64)
         mags.append(suite.magnitudes(dy, x, z, EPS))
         for what, got, det, want in zip(
@@ -1423,8 +1436,8 @@ def test_two_streams_repeat_the_current_stream_bits(determinism_setting) -> None
                 mags[i],
                 varies=varies,
             )
-            assert_det_bits(f"stream {i}: dx", got[0], dets[i][0])
-            assert_det_bits(f"stream {i}: dz", got[1], dets[i][1])
+            assert_dx_dz_within_fp64(f"stream {i}: dx", got[0], dxz64s[i][0])
+            assert_dx_dz_within_fp64(f"stream {i}: dz", got[1], dxz64s[i][1])
 
 
 @requires_device
@@ -1434,7 +1447,7 @@ def test_side_stream_repeats_the_current_stream_bits(determinism_setting) -> Non
     current stream (``dw`` where its band repeats it; in a row-claims band
     within the budgets of :func:`assert_dw_repeats_within_det` instead),
     which lie within the error budget of the deterministic
-    package's; ``dx`` and ``dz`` are the deterministic package's bits."""
+    package's; ``dx`` and ``dz`` lie within one BF16 ulp of FP64."""
     x, z, w, dy = suite.make(2049, 48, seed=9)
     want_y = nd_forward(x, z, w, EPS)
     want = nd_backward(dy, x, z, w, EPS)
@@ -1464,8 +1477,8 @@ def test_side_stream_repeats_the_current_stream_bits(determinism_setting) -> Non
         assert_dw_repeats_within_det(
             "dw", outputs[2], want[2], dets[2], dw64, mag, varies=varies
         )
-        assert_det_bits("dx", outputs[0], dets[0])
-        assert_det_bits("dz", outputs[1], dets[1])
+        assert_dx_dz_within_fp64("dx", outputs[0], dx64)
+        assert_dx_dz_within_fp64("dz", outputs[1], dz64)
 
 
 @requires_device
@@ -1475,7 +1488,7 @@ def test_cuda_graph_replay_repeats_the_eager_bits(determinism_setting) -> None:
     (``dw`` where its band repeats it; in a row-claims band within the
     budgets of :func:`assert_dw_repeats_within_det` instead), which lie
     within the error budget of the deterministic package's; ``dx``
-    and ``dz`` are the deterministic package's bits."""
+    and ``dz`` lie within one BF16 ulp of FP64."""
     T, H = 300, 48
     x, z, w, dy = suite.make(T, H, seed=10)
     xs, zs, dys = x.clone(), z.clone(), dy.clone()
@@ -1513,9 +1526,9 @@ def test_cuda_graph_replay_repeats_the_eager_bits(determinism_setting) -> None:
             assert_same_bits(f"replay {k}: {what}", got, want)
         assert_y_within_fp64(y, xn, zn, w, EPS, what=f"y, replay {k}")
         dets = (det_forward(xn, zn, w, EPS), *det_backward(dyn, xn, zn, w, EPS))
-        assert_det_bits(f"replay {k}: dx", dx, dets[1])
-        assert_det_bits(f"replay {k}: dz", dz, dets[2])
         refs = suite.fp64_reference(dyn, xn, zn, w, EPS)
+        assert_dx_dz_within_fp64(f"replay {k}: dx", dx, refs[1])
+        assert_dx_dz_within_fp64(f"replay {k}: dz", dz, refs[2])
         for what, got, det, ref in zip(names, eager, dets, refs, strict=True):
             assert_error_within_det(f"replay {k}: {what}", got, det, ref)
         assert_dw_repeats_within_det(
@@ -1539,7 +1552,8 @@ def test_autograd_and_checkpoint_repeat_the_functional_bits(
     and a BF16 ``dw``; ``dw`` where its band repeats it, in a row-claims band
     within the budgets of :func:`assert_dw_repeats_within_det` instead),
     which lie within the error budget of the deterministic
-    package's outputs, ``dx`` and ``dz`` its bits, ``dw`` also within the
+    package's outputs, ``dx`` and ``dz`` within one BF16 ulp of FP64, ``dw``
+    also within the
     weight-gradient budget of the deterministic ``dw``."""
     x, z, w, dy = suite.make(513, 48, seed=8)
     want = (nd_forward(x, z, w, EPS), *nd_backward(dy, x, z, w, EPS))
@@ -1562,8 +1576,8 @@ def test_autograd_and_checkpoint_repeat_the_functional_bits(
         assert_dw_repeats_within_det(
             f"{what}: dw", wg, want[3], dets[3], refs[3], mag, varies=varies
         )
-        assert_det_bits(f"{what}: dx", xg, dets[1])
-        assert_det_bits(f"{what}: dz", zg, dets[2])
+        assert_dx_dz_within_fp64(f"{what}: dx", xg, refs[1])
+        assert_dx_dz_within_fp64(f"{what}: dz", zg, refs[2])
 
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     y = nd_gated_rmsnorm(xa, za, wa, EPS)
@@ -2021,8 +2035,8 @@ def test_backward_gate_edges_keep_the_fp64_classes(
     for what, g, a in zip(("dx", "dz", "dw"), got, again, strict=True):
         if what != "dw" or not varies:
             assert_same_bits(what, a, g)
-    assert_det_bits_beside_nans("dx", got[0], dets[0])
-    assert_det_bits_beside_nans("dz", got[1], dets[1])
+    assert_dx_dz_within_fp64("dx", got[0], dx64)
+    assert_dx_dz_within_fp64("dz", got[1], dz64)
     checked = [
         ("dx", got[0], dets[0], dx64),
         ("dz", got[1], dets[1], dz64),
@@ -2043,8 +2057,8 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     accumulating ones from the same starting value: every output is the
     first launch's bits (the accumulated ``dw`` too; where a BF16 ``dw`` may
     vary, in a row-claims band, every launch's ``dw`` and accumulated ``dw``
-    meets the budgets that follow instead), ``dx`` and ``dz`` the
-    deterministic package's bits, and the workspace is zero after every call;
+    meets the budgets that follow instead), ``dx`` and ``dz`` within one BF16
+    ulp of FP64, and the workspace is zero after every call;
     ``dx``, ``dz``, ``dw`` and the accumulated ``dw`` lie
     within the error budget of the deterministic package's, ``dw`` within the
     weight-gradient budget of the deterministic ``dw`` and the accumulated one
@@ -2076,8 +2090,8 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
         assert_dw_repeats_within_det(
             "dw", got[2], first[2], dets[2], dw64, mag, varies=varies
         )
-        assert_det_bits("dx", got[0], dets[0])
-        assert_det_bits("dz", got[1], dets[1])
+        assert_dx_dz_within_fp64("dx", got[0], dx64)
+        assert_dx_dz_within_fp64("dz", got[1], dz64)
         assert not bool(ws.any()), "the workspace is not zero"
     for what, got, det, ref in zip(
         ("dx", "dz", "dw"), first, dets, (dx64, dz64, dw64), strict=True
@@ -2311,8 +2325,8 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
     other column lies within the error budget of the deterministic package's
     and within the weight-gradient budget of the deterministic ``dw``, and
     ``dx`` and ``dz`` have the FP64 reference's ``NaN``, ``+inf`` and ``-inf``
-    positions, the deterministic package's ``NaN`` positions and its bits
-    everywhere else, and their finite elements lie within the error budget,
+    positions, their other elements within one BF16 ulp of FP64 and within
+    the error budget,
     on every repeat the same bits (but a BF16 ``dw`` in a row-claims band,
     whose every launch meets the weight gradient's checks instead), with the
     workspace zero after every call."""
@@ -2362,8 +2376,8 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
         if not varies:
             assert_same_bits("dw", got[2], first_run[2])
         dws.append(got[2])
-        assert_det_bits_beside_nans("dx", got[0], dets[0])
-        assert_det_bits_beside_nans("dz", got[1], dets[1])
+        assert_dx_dz_within_fp64("dx", got[0], dx64)
+        assert_dx_dz_within_fp64("dz", got[1], dz64)
         assert not bool(ws.any()), "the workspace is not zero"
     for what, got, det, ref in zip(
         ("dx", "dz"), first_run[:2], dets[:2], (dx64, dz64), strict=True
@@ -2435,9 +2449,9 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     (``+inf``, ``-inf`` and ``NaN``) in every band, every other column lies
     within the error budget of the deterministic package's and within the
     weight-gradient budget of the deterministic ``dw``, and ``dx`` and ``dz``
-    have the FP64 reference's ``NaN``, ``+inf`` and ``-inf`` positions, the
-    deterministic package's ``NaN`` positions and its bits everywhere else,
-    on every repeat the same bits (but a BF16 ``dw`` in a row-claims band,
+    have the FP64 reference's ``NaN``, ``+inf`` and ``-inf`` positions and
+    their other elements within one BF16 ulp of FP64, on every repeat the
+    same bits (but a BF16 ``dw`` in a row-claims band,
     whose every launch meets the weight gradient's checks instead), with the
     workspace zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
@@ -2494,8 +2508,8 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
         if not varies:
             assert_same_bits("dw", got[2], first_run[2])
         dws.append(got[2])
-        assert_det_bits_beside_nans("dx", got[0], dets[0])
-        assert_det_bits_beside_nans("dz", got[1], dets[1])
+        assert_dx_dz_within_fp64("dx", got[0], dx64)
+        assert_dx_dz_within_fp64("dz", got[1], dz64)
         assert not bool(ws.any()), "the workspace is not zero"
     for what, got, det, ref in zip(
         ("dx", "dz"), first_run[:2], dets[:2], (dx64, dz64), strict=True
@@ -2661,8 +2675,8 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     same module and every repeat (but a BF16 ``dw`` of the row-claims mid
     backward, which lies within the budgets of
     :func:`assert_dw_repeats_within_det` on every launch instead), with the
-    workspace zero after every call, ``dx`` and ``dz`` the deterministic
-    package's bits on the flat rows; each module's outputs lie within the error
+    workspace zero after every call, ``dx`` and ``dz`` within one BF16 ulp of
+    FP64; each module's outputs lie within the error
     budget of the deterministic package's on the flat rows, ``dw`` also within
     the weight-gradient budget of the deterministic ``dw``."""
     arch = loader.device_arch(torch.cuda.current_device())
@@ -2713,8 +2727,8 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
                     dy, x, z, w, EPS, grad_weight=out(), workspace=ws
                 )
                 got = (dx.reshape(rows, D), dz.reshape(rows, D), dw)
-                assert_det_bits(f"{layout}: dx", got[0], dets[0])
-                assert_det_bits(f"{layout}: dz", got[1], dets[1])
+                assert_dx_dz_within_fp64(f"{layout}: dx", got[0], dx64)
+                assert_dx_dz_within_fp64(f"{layout}: dz", got[1], dz64)
                 assert not bool(ws.any()), (layout, "the workspace is not zero")
             if want is None:
                 want = wants[module] = got
@@ -2784,8 +2798,9 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
     ``|dw64| * 2^-7 + sum|terms| * 2^-20`` (for FP32 normal gates, terms and
     sums) does not hold for either package: the backward launches
     ``module_for_rows``' module, every output repeats bit for bit, ``dx`` and
-    ``dz`` are the deterministic package's bits and a BF16 ``dw`` the
-    deterministic ``dw``'s bits, ``dx``, ``dz`` and a BF16 ``dw`` lie within
+    ``dz`` lie within one BF16 ulp of FP64 (``dx``, whose FP64 values lie
+    below BF16's smallest subnormal, with an absolute floor of ``2^-134``),
+    ``dx``, ``dz`` and a BF16 ``dw`` lie within
     the error budget of the deterministic package's, and every ``dw`` lies
     within that budget widened by the
     documented underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row
@@ -2819,10 +2834,9 @@ def test_subnormal_weight_gradient_within_the_floored_budget(
             first = (dx, dz, dw)
         for what, g, f in zip(("dx", "dz", "dw"), (dx, dz, dw), first, strict=True):
             assert_same_bits(what, g, f)
-        assert_det_bits("dx", dx, dets[0])
-        assert_det_bits("dz", dz, dets[1])
-        if dw_dtype == torch.bfloat16:
-            assert_same_bits("dw vs the deterministic package", dw, dets[2])
+        # dx's FP64 values lie below BF16's smallest subnormal (2^-133)
+        assert_dx_dz_within_fp64("dx", dx, dx64, floor=2.0**-134)
+        assert_dx_dz_within_fp64("dz", dz, dz64)
         excess = (dw.double() - dw64).abs() - budget - allowance
         assert not bool((excess > 0).any()), (
             f"dw beyond the floored budget by {excess.max().item():.3e}"

@@ -1708,7 +1708,8 @@ def test_registry_records_reference_the_build_manifest():
 
 # (rows, SMs, blocks per chunk, chunks, CTAs) of the static and the claimed
 # backwards: 8-row blocks, at most 8192 chunks of the fewest consecutive
-# blocks each (the deterministic backward's chunks), at most 8 CTAs per SM.
+# blocks each (the chunks of the deterministic backward at FlashInfer 2e989556),
+# at most 8 CTAs per SM.
 BACKWARD_GRIDS = [
     (1, 148, 1, 1, 1),
     (48, 148, 1, 6, 6),
@@ -1833,7 +1834,7 @@ FORWARD_BANDS = {
         (None, "fwd_mid"),
     ),
     "sm_103a": (
-        (39, "fwd_tiny"),
+        (36, "fwd_tiny"),
         (6000, "fwd_pipe"),
         (8192, "fwd_mid"),
         (None, "fwd_pipe"),
@@ -2075,7 +2076,7 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         assert got == routes[packed], (rows, packed)
         got = loader.module_for_rows("sm_100a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
-    # the forward on sm_103a: packed rows the tiny forward up to 39 rows per
+    # the forward on sm_103a: packed rows the tiny forward up to 36 rows per
     # SM, the pipelined forward up to 6000, the mid forward up to 8192, the
     # pipelined forward past it; other layouts the short forward up to 12, the
     # pipelined forward up to 100, the mid forward up to 250, the extra-long
@@ -2086,8 +2087,8 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         (1, "fwd_tiny", "fwd_short"),
         (12 * sm_count, "fwd_tiny", "fwd_short"),
         (12 * sm_count + 1, "fwd_tiny", "fwd_pipe"),
-        (39 * sm_count, "fwd_tiny", "fwd_pipe"),
-        (39 * sm_count + 1, "fwd_pipe", "fwd_pipe"),
+        (36 * sm_count, "fwd_tiny", "fwd_pipe"),
+        (36 * sm_count + 1, "fwd_pipe", "fwd_pipe"),
         (100 * sm_count + 1, "fwd_pipe", "fwd_mid"),
         (250 * sm_count + 1, "fwd_pipe", "fwd_xlong"),
         (550 * sm_count + 1, "fwd_pipe", "fwd_mid"),
@@ -2439,7 +2440,7 @@ PIPE_FORWARD_GRIDS = [
     (8192 * 148 - 1, 148, 75776),  # below 8192 rows per SM: a CTA a block
     (8192 * 148, 148, 38184),  # from 8192 rows per SM: 75776 blocks, 43 waves
     (32737 * 48, 148, 49728),  # 98211 blocks, 56 waves of 888
-    (39 * 152 + 1, 152, 371),  # GB300 packed band's first row: 371 blocks
+    (36 * 152 + 1, 152, 343),  # GB300 packed band's first row: 343 blocks
     (6000 * 152, 152, 57000),  # its last row: 57000 blocks
     (8192 * 152 + 1, 152, 39216),  # GB300 last band's first row: 43 waves
     (350 * 212 + 1, 212, 4638),  # R200 pipelined band's first row: 4638 blocks
@@ -2681,8 +2682,8 @@ ROW_LANES = 16
 # teams' row blocks: the short backward of a BF16 weight gradient (on every
 # architecture; one 256-thread team a CTA, CTA ``r`` running the 16-row blocks
 # ``r``, ``r + 16``, ...) and the exact tiny backwards (``_t512``: 4 teams of
-# the deterministic backward's 128-thread CTA a CTA, team ``q`` of CTA ``r``
-# running the 8-row block ``r + 16 q``).  A row block holds
+# the 128-thread CTA of the deterministic backward at 2e989556 a CTA, team ``q``
+# of CTA ``r`` running the 8-row block ``r + 16 q``).  A row block holds
 # :func:`_cluster_block_rows` rows.
 SMALL_ROW_BACKWARDS = {
     "bwd_bf16_short": (256, 1, 16),

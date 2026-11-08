@@ -21,32 +21,33 @@ weight-gradient partials exactly as 64-bit integer windows, the last CTA
 rounding the sum once, or, for a BF16 weight gradient in its row-claims bands,
 add FP32 runs of rows to FP64 accumulators with atomics) against the
 deterministic package
-(``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
-fixed-order weight-gradient reduction), each called through its own public
+(``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
+the exact fixed-point weight-gradient sum), each called through its own public
 entry points.
 
 Every row times, for both modes, on identical generated inputs:
 
 - ``fwd``: one forward call (preallocated output);
 - ``bwd``: one backward call into a BF16 weight gradient, the final weight
-  gradient included (the deterministic reduction kernel, or the last CTA of
-  the non-deterministic kernel), with a preallocated caller workspace;
+  gradient included (the last CTA of either backward), with a preallocated
+  caller workspace;
 - ``ckpt``: the activation-checkpointed step through autograd,
   ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
 Each package picks its kernels from the rows and the SM count.  The
 non-deterministic forward of packed rows (the benchmark's inputs) runs its tiny
-forward up to 38 rows per SM on SM100, 39 on SM103 and 65 on SM107 and past
+forward up to 38 rows per SM on SM100, 36 on SM103 and 65 on SM107 and past
 that its mid, long, extra-long or pipelined forward (its copy of the
 deterministic forward) by bands of rows per SM (``cake_jit.FORWARD_BANDS``).
 Its backward runs one cluster of 16 CTAs for few rows, else one kernel by bands
 of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient (the one
 timed here) runs, on SM100, the short backward (one cluster, a fixed-order sum)
-up to 256 rows, the exact tiny backward (one cluster, the deterministic pair's
-bits) up to 512 rows, a row-claims backward (256-thread CTAs of 16-row blocks,
-4 per SM) up to 800 rows per SM, the row-claims mid backward (5 CTAs per SM) up
-to 1329 rows per SM and past that the claimed backward (at most 8 CTAs per SM
+up to 256 rows, the exact tiny backward (one cluster, the bits of the
+deterministic pair at FlashInfer 2e989556) up to 512 rows, a row-claims
+backward (256-thread CTAs of 16-row blocks, 4 per SM) up to 800 rows per SM,
+the row-claims mid backward (5 CTAs per SM) up to 1329 rows per SM and past
+that the claimed backward (at most 8 CTAs per SM
 over chunks of rows); on SM103 the short backward up to 256 rows, a row-claims
 backward up to 700 rows per SM, the row-claims mid backward up to 1294 rows per
 SM and the claimed backward past that; on SM107 the short backward up to 256
@@ -71,10 +72,10 @@ non-deterministic calls without a caller workspace keep, one per device,
 stream and kernel that takes one and a reserve per device, come from the calls before it) and
 the caller workspace of each mode (``workspace``: the non-deterministic one
 29192 bytes on SM100 and SM103 and 36360 on SM107, whatever the rows).  Output columns check the non-deterministic
-results against the deterministic ones: ``y``, ``dx`` and ``dz`` bitwise (the
-non-deterministic forward's approximate intrinsics need not give the
-deterministic ``y`` bits), ``dw`` as the largest distance in BF16 units in the
-last place, and the number of distinct ``dw`` bit patterns over ``--repeats``
+results against the deterministic ones: ``y`` bitwise (the non-deterministic
+forward's approximate intrinsics need not give the deterministic ``y`` bits),
+``dx``, ``dz`` and ``dw`` as the largest distance in BF16 units in the last
+place, and the number of distinct ``dw`` bit patterns over ``--repeats``
 backward calls (1 for the deterministic package; 1 for the non-deterministic
 package too, except in its row-claims bands, where the BF16 ``dw``'s last bits
 may vary from run to run, so the count may exceed 1).
@@ -275,11 +276,10 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
     # The non-deterministic outputs against the deterministic ones.
     reference, candidate = outputs["deterministic"], outputs["nondeterministic"]
     result["y_bitwise_equal"] = bool(torch.equal(reference[0], candidate[0]))
-    result["dx_bitwise_equal"] = bool(torch.equal(reference[1], candidate[1]))
-    result["dz_bitwise_equal"] = bool(torch.equal(reference[2], candidate[2]))
-    result["dw_max_ulps_apart"] = int(
-        (_ordered(reference[3]) - _ordered(candidate[3])).abs().max().item()
-    )
+    for i, grad in enumerate(("dx", "dz", "dw"), 1):
+        result[f"{grad}_max_ulps_apart"] = int(
+            (_ordered(reference[i]) - _ordered(candidate[i])).abs().max().item()
+        )
     # deterministic GPU time over non-deterministic GPU time
     for stage in STAGES:
         result[f"{stage}_speedup"] = (
@@ -314,9 +314,9 @@ def _format(result: dict) -> list[str]:
             f"dw patterns {m['dw_patterns']}/{m['repeats']}"
         )
     lines.append(
-        f"{head} out  | y/dx/dz bitwise equal: {result['y_bitwise_equal']}/"
-        f"{result['dx_bitwise_equal']}/{result['dz_bitwise_equal']}  "
-        f"dw at most {result['dw_max_ulps_apart']} BF16 ulp apart"
+        f"{head} out  | y bitwise equal: {result['y_bitwise_equal']}  "
+        f"dx/dz/dw at most {result['dx_max_ulps_apart']}/"
+        f"{result['dz_max_ulps_apart']}/{result['dw_max_ulps_apart']} BF16 ulp apart"
     )
     return lines
 

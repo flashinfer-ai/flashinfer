@@ -39,13 +39,16 @@ within the family's budget.  Each forward program's arithmetic is fixed,
 but the programs may associate a row's sum of squares differently (the row
 count and the SM count pick the program), so ``y`` repeats bit for bit for the
 same inputs on the same device.  The backward writes ``dx`` and ``dz``
-with the deterministic backward's arithmetic and computes the FP32 partial of
-each chunk of rows as the deterministic backward does; it adds the partials
+with one row arithmetic in every band (within one BF16 ulp of the FP64 value
+plus 1/64 ulp of the tensor's largest finite magnitude; the deterministic
+package's backward need not give these bits) and computes the FP32 partial of
+each chunk of rows as the deterministic backward at FlashInfer ``2e989556``
+does; it adds the partials
 exactly, as signed 64-bit integer windows of the FP32 values (an addition of
 integers does not depend on its order), and rounds the exact sum once into
-``dw`` (FP32, then BF16 for a BF16 ``dw``), so ``dw`` is the deterministic
-package's bits except where the exact sum lies within its FP64 sum's error of
-a rounding boundary.  An infinite or ``NaN`` partial makes its column's
+``dw`` (FP32, then BF16 for a BF16 ``dw``), so ``dw`` is that package's bits
+except where the exact sum lies within its FP64 sum's error of a rounding
+boundary.  An infinite or ``NaN`` partial makes its column's
 ``dw`` infinite or ``NaN`` with the class the FP64 sum gives it (a ``NaN``'s
 sign and payload need not be its).  A call of few rows runs a small-row
 backward instead (``cake_jit.BACKWARD_BANDS``, by architecture and
@@ -53,8 +56,8 @@ weight-gradient dtype; ``compute_grad_weight=False`` takes the BF16 bands):
 one thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same
 arithmetic, that sums the weight gradient on chip in a fixed order and rounds
 it once, the same bits on every call.  The exact tiny backward (4 teams of
-the deterministic backward's 128-thread CTA a CTA) adds the deterministic
-backward's chunk partials in its reduction order in FP64; the short backward
+the 128-thread CTA of the deterministic backward at ``2e989556`` a CTA) adds
+that backward's chunk partials in its reduction order in FP64; the short backward
 of a BF16 weight gradient (256-thread CTAs) has each
 CTA finish 8 columns from every CTA's FP32 partials in rank order in FP64.
 Where a
@@ -145,7 +148,7 @@ Host design (the input layout rules are the deterministic package's):
   pipelined forward.  The plain forward (the call role ``fwd``: one
   64-thread CTA per block of 8 rows) is routed by no band; it stays in
   ``ROUTES`` because the support query needs every role routed.  The tiny
-  forward (packed rows, up to 38 rows per SM on sm_100a, 39 on sm_103a and
+  forward (packed rows, up to 38 rows per SM on sm_100a, 36 on sm_103a and
   65 on sm_107a) launches one 128-thread CTA per block of 8 rows, with the
   short forward's arithmetic, so the same ``y`` bits; the short forward
   (other layouts, up to 12 rows per SM on sm_100a and sm_103a, 59 on
@@ -969,12 +972,13 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
 
     One kernel (``cake_jit.BACKWARD_BANDS`` picks the module by
     architecture, weight-gradient dtype and rows).  Most bands run at most
-    ``ctas_per_sm`` CTAs per SM over the deterministic backward's chunks of
-    rows (a static backward, CTA ``b`` running the chunks ``b``, ``b +
+    ``ctas_per_sm`` CTAs per SM over the chunks of rows of the deterministic
+    backward at FlashInfer ``2e989556`` (a static backward, CTA ``b`` running the chunks ``b``, ``b +
     grid``, ..., or, in the last band, the claimed backward, whose CTAs claim
     runs of chunks from the workspace's claim counter): ``dx`` and ``dz`` are
-    the deterministic backward's arithmetic, each chunk's FP32 weight-gradient
-    partial is the deterministic backward's, and the partials are added
+    one row arithmetic (within one BF16 ulp of FP64 plus 1/64 ulp of the
+    tensor's largest finite magnitude), each chunk's FP32 weight-gradient
+    partial is that backward's, and the partials are added
     exactly as 64-bit integer windows in the workspace; the CTA that arrives
     last rounds the exact sum once into ``dw`` (adding ``grad_weight``'s value
     first when accumulating; FP32, then BF16 for a BF16 ``dw``) and zeroes the
