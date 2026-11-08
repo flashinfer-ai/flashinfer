@@ -136,7 +136,8 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
@@ -192,6 +193,9 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
         int kv_head = head / group_size;
         int q_base = q_block * 64;
         if (warp == 0) {
+            if (count < 0) {
+                asm volatile("trap;" ::: "memory");
+            }
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(q_full_addr, 16384);
                 asm volatile(
@@ -675,6 +679,7 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             pos += 1;
             if (pos == 2) { pos = 0; _phase_full ^= 1; }
             float o_scale[2];
+            float shift[2];
             float m_prev[2];
             m_prev[0] = m_state[0];
             m_state[0] = fmaxf(m_state[0], fmaxf(fmaxf(qk_acc[0], qk_acc[1]), fmaxf(qk_acc[4], qk_acc[5])));
@@ -685,7 +690,6 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             m_state[0] = fmaxf(m_state[0], _shfl_xor_sync_0);
             float _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, m_state[0], 1);
             m_state[0] = fmaxf(m_state[0], _shfl_xor_sync_1);
-            o_scale[0] = 1.0f;
             m_prev[1] = m_state[1];
             m_state[1] = fmaxf(m_state[1], fmaxf(fmaxf(qk_acc[2], qk_acc[3]), fmaxf(qk_acc[6], qk_acc[7])));
             m_state[1] = fmaxf(m_state[1], fmaxf(fmaxf(qk_acc[10], qk_acc[11]), fmaxf(qk_acc[14], qk_acc[15])));
@@ -695,73 +699,65 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             m_state[1] = fmaxf(m_state[1], _shfl_xor_sync_2);
             float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, m_state[1], 1);
             m_state[1] = fmaxf(m_state[1], _shfl_xor_sync_3);
-            o_scale[1] = 1.0f;
-            int moved = __any_sync(0xFFFFFFFF, m_state[0] != m_prev[0] || m_state[1] != m_prev[1]);
-            if (moved != 0) {
-                if (m_state[0] != m_prev[0]) {
-                    float _exp2_4 = approx_exp2(__fmaf_rn(m_prev[0], softmax_scale_log2, -(m_state[0] * softmax_scale_log2)));
-                    o_scale[0] = _exp2_4;
-                }
-                if (m_state[1] != m_prev[1]) {
-                    float _exp2_5 = approx_exp2(__fmaf_rn(m_prev[1], softmax_scale_log2, -(m_state[1] * softmax_scale_log2)));
-                    o_scale[1] = _exp2_5;
-                }
-                {
-                    float2 _pair_scale_even2_6 = make_float2(o_scale[0], o_scale[0]);
-                    float2 _pair_scale_odd2_6 = make_float2(o_scale[1], o_scale[1]);
-                    float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&out_acc[0]);
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
-                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-                }
+            float _exp2_4 = approx_exp2(__fmaf_rn(m_prev[0], softmax_scale_log2, -(m_state[0] * softmax_scale_log2)));
+            o_scale[0] = ((m_state[0] != m_prev[0]) ? _exp2_4 : 1.0f);
+            float _exp2_5 = approx_exp2(__fmaf_rn(m_prev[1], softmax_scale_log2, -(m_state[1] * softmax_scale_log2)));
+            o_scale[1] = ((m_state[1] != m_prev[1]) ? _exp2_5 : 1.0f);
+            {
+                float2 _pair_scale_even2_6 = make_float2(o_scale[0], o_scale[0]);
+                float2 _pair_scale_odd2_6 = make_float2(o_scale[1], o_scale[1]);
+                float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&out_acc[0]);
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_6));
+                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_6[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
             }
-            float row0_shift = m_state[0] * softmax_scale_log2;
-            float row1_shift = m_state[1] * softmax_scale_log2;
-            float e0_0 = approx_exp2(__fmaf_rn(qk_acc[0], softmax_scale_log2, -row0_shift));
-            float e1_0 = approx_exp2(__fmaf_rn(qk_acc[1], softmax_scale_log2, -row0_shift));
+            shift[0] = m_state[0] * softmax_scale_log2;
+            shift[1] = m_state[1] * softmax_scale_log2;
+            float e0_0 = approx_exp2(__fmaf_rn(qk_acc[0], softmax_scale_log2, -shift[0]));
+            float e1_0 = approx_exp2(__fmaf_rn(qk_acc[1], softmax_scale_log2, -shift[0]));
             qk_acc[0] = e0_0;
             qk_acc[1] = e1_0;
             float row_sum_0 = e0_0 + e1_0;
-            float e0_1 = approx_exp2(__fmaf_rn(qk_acc[2], softmax_scale_log2, -row1_shift));
-            float e1_1 = approx_exp2(__fmaf_rn(qk_acc[3], softmax_scale_log2, -row1_shift));
+            float e0_1 = approx_exp2(__fmaf_rn(qk_acc[2], softmax_scale_log2, -shift[1]));
+            float e1_1 = approx_exp2(__fmaf_rn(qk_acc[3], softmax_scale_log2, -shift[1]));
             qk_acc[2] = e0_1;
             qk_acc[3] = e1_1;
             float row_sum_1 = e0_1 + e1_1;
-            float e0_2 = approx_exp2(__fmaf_rn(qk_acc[4], softmax_scale_log2, -row0_shift));
-            float e1_2 = approx_exp2(__fmaf_rn(qk_acc[5], softmax_scale_log2, -row0_shift));
+            float e0_2 = approx_exp2(__fmaf_rn(qk_acc[4], softmax_scale_log2, -shift[0]));
+            float e1_2 = approx_exp2(__fmaf_rn(qk_acc[5], softmax_scale_log2, -shift[0]));
             qk_acc[4] = e0_2;
             qk_acc[5] = e1_2;
-            float e0_3 = approx_exp2(__fmaf_rn(qk_acc[6], softmax_scale_log2, -row1_shift));
-            float e1_3 = approx_exp2(__fmaf_rn(qk_acc[7], softmax_scale_log2, -row1_shift));
+            float e0_3 = approx_exp2(__fmaf_rn(qk_acc[6], softmax_scale_log2, -shift[1]));
+            float e1_3 = approx_exp2(__fmaf_rn(qk_acc[7], softmax_scale_log2, -shift[1]));
             qk_acc[6] = e0_3;
             qk_acc[7] = e1_3;
             #pragma unroll
@@ -771,81 +767,6 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             }
             d_state[0] = __fmaf_rn(d_state[0], o_scale[0], row_sum_0 + e0_2 + e1_2);
             d_state[1] = __fmaf_rn(d_state[1], o_scale[1], row_sum_1 + e0_3 + e1_3);
-            float e0_4 = approx_exp2(__fmaf_rn(qk_acc[8], softmax_scale_log2, -row0_shift));
-            float e1_4 = approx_exp2(__fmaf_rn(qk_acc[9], softmax_scale_log2, -row0_shift));
-            qk_acc[8] = e0_4;
-            qk_acc[9] = e1_4;
-            float row_sum_2 = e0_4 + e1_4;
-            float e0_5 = approx_exp2(__fmaf_rn(qk_acc[10], softmax_scale_log2, -row1_shift));
-            float e1_5 = approx_exp2(__fmaf_rn(qk_acc[11], softmax_scale_log2, -row1_shift));
-            qk_acc[10] = e0_5;
-            qk_acc[11] = e1_5;
-            float row_sum_3 = e0_5 + e1_5;
-            float e0_6 = approx_exp2(__fmaf_rn(qk_acc[12], softmax_scale_log2, -row0_shift));
-            float e1_6 = approx_exp2(__fmaf_rn(qk_acc[13], softmax_scale_log2, -row0_shift));
-            qk_acc[12] = e0_6;
-            qk_acc[13] = e1_6;
-            float e0_7 = approx_exp2(__fmaf_rn(qk_acc[14], softmax_scale_log2, -row1_shift));
-            float e1_7 = approx_exp2(__fmaf_rn(qk_acc[15], softmax_scale_log2, -row1_shift));
-            qk_acc[14] = e0_7;
-            qk_acc[15] = e1_7;
-            #pragma unroll
-            for (int _lp = 0; _lp < 4; _lp++) {
-                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 8], qk_acc[_lp*2+1 + 8]));
-                p_frag[_lp + 4] = *(uint32_t*)&_h2;
-            }
-            d_state[0] = d_state[0] + (row_sum_2 + e0_6 + e1_6);
-            d_state[1] = d_state[1] + (row_sum_3 + e0_7 + e1_7);
-            float e0_8 = approx_exp2(__fmaf_rn(qk_acc[16], softmax_scale_log2, -row0_shift));
-            float e1_8 = approx_exp2(__fmaf_rn(qk_acc[17], softmax_scale_log2, -row0_shift));
-            qk_acc[16] = e0_8;
-            qk_acc[17] = e1_8;
-            float row_sum_4 = e0_8 + e1_8;
-            float e0_9 = approx_exp2(__fmaf_rn(qk_acc[18], softmax_scale_log2, -row1_shift));
-            float e1_9 = approx_exp2(__fmaf_rn(qk_acc[19], softmax_scale_log2, -row1_shift));
-            qk_acc[18] = e0_9;
-            qk_acc[19] = e1_9;
-            float row_sum_5 = e0_9 + e1_9;
-            float e0_10 = approx_exp2(__fmaf_rn(qk_acc[20], softmax_scale_log2, -row0_shift));
-            float e1_10 = approx_exp2(__fmaf_rn(qk_acc[21], softmax_scale_log2, -row0_shift));
-            qk_acc[20] = e0_10;
-            qk_acc[21] = e1_10;
-            float e0_11 = approx_exp2(__fmaf_rn(qk_acc[22], softmax_scale_log2, -row1_shift));
-            float e1_11 = approx_exp2(__fmaf_rn(qk_acc[23], softmax_scale_log2, -row1_shift));
-            qk_acc[22] = e0_11;
-            qk_acc[23] = e1_11;
-            #pragma unroll
-            for (int _lp = 0; _lp < 4; _lp++) {
-                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 16], qk_acc[_lp*2+1 + 16]));
-                p_frag[_lp + 8] = *(uint32_t*)&_h2;
-            }
-            d_state[0] = d_state[0] + (row_sum_4 + e0_10 + e1_10);
-            d_state[1] = d_state[1] + (row_sum_5 + e0_11 + e1_11);
-            float e0_12 = approx_exp2(__fmaf_rn(qk_acc[24], softmax_scale_log2, -row0_shift));
-            float e1_12 = approx_exp2(__fmaf_rn(qk_acc[25], softmax_scale_log2, -row0_shift));
-            qk_acc[24] = e0_12;
-            qk_acc[25] = e1_12;
-            float row_sum_6 = e0_12 + e1_12;
-            float e0_13 = approx_exp2(__fmaf_rn(qk_acc[26], softmax_scale_log2, -row1_shift));
-            float e1_13 = approx_exp2(__fmaf_rn(qk_acc[27], softmax_scale_log2, -row1_shift));
-            qk_acc[26] = e0_13;
-            qk_acc[27] = e1_13;
-            float row_sum_7 = e0_13 + e1_13;
-            float e0_14 = approx_exp2(__fmaf_rn(qk_acc[28], softmax_scale_log2, -row0_shift));
-            float e1_14 = approx_exp2(__fmaf_rn(qk_acc[29], softmax_scale_log2, -row0_shift));
-            qk_acc[28] = e0_14;
-            qk_acc[29] = e1_14;
-            float e0_15 = approx_exp2(__fmaf_rn(qk_acc[30], softmax_scale_log2, -row1_shift));
-            float e1_15 = approx_exp2(__fmaf_rn(qk_acc[31], softmax_scale_log2, -row1_shift));
-            qk_acc[30] = e0_15;
-            qk_acc[31] = e1_15;
-            #pragma unroll
-            for (int _lp = 0; _lp < 4; _lp++) {
-                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 24], qk_acc[_lp*2+1 + 24]));
-                p_frag[_lp + 12] = *(uint32_t*)&_h2;
-            }
-            d_state[0] = d_state[0] + (row_sum_6 + e0_14 + e1_14);
-            d_state[1] = d_state[1] + (row_sum_7 + e0_15 + e1_15);
             mbarrier_wait(full_addr + (pos) * 8, _phase_full);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
@@ -927,6 +848,31 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                 : "+f"(out_acc[60]), "+f"(out_acc[(60) + 1]), "+f"(out_acc[(60) + 2]), "+f"(out_acc[(60) + 3])
                 : "r"(p_frag[0]), "r"(p_frag[1]), "r"(p_frag[2]), "r"(p_frag[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+            float e0_4 = approx_exp2(__fmaf_rn(qk_acc[8], softmax_scale_log2, -shift[0]));
+            float e1_4 = approx_exp2(__fmaf_rn(qk_acc[9], softmax_scale_log2, -shift[0]));
+            qk_acc[8] = e0_4;
+            qk_acc[9] = e1_4;
+            float row_sum_2 = e0_4 + e1_4;
+            float e0_5 = approx_exp2(__fmaf_rn(qk_acc[10], softmax_scale_log2, -shift[1]));
+            float e1_5 = approx_exp2(__fmaf_rn(qk_acc[11], softmax_scale_log2, -shift[1]));
+            qk_acc[10] = e0_5;
+            qk_acc[11] = e1_5;
+            float row_sum_3 = e0_5 + e1_5;
+            float e0_6 = approx_exp2(__fmaf_rn(qk_acc[12], softmax_scale_log2, -shift[0]));
+            float e1_6 = approx_exp2(__fmaf_rn(qk_acc[13], softmax_scale_log2, -shift[0]));
+            qk_acc[12] = e0_6;
+            qk_acc[13] = e1_6;
+            float e0_7 = approx_exp2(__fmaf_rn(qk_acc[14], softmax_scale_log2, -shift[1]));
+            float e1_7 = approx_exp2(__fmaf_rn(qk_acc[15], softmax_scale_log2, -shift[1]));
+            qk_acc[14] = e0_7;
+            qk_acc[15] = e1_7;
+            #pragma unroll
+            for (int _lp = 0; _lp < 4; _lp++) {
+                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 8], qk_acc[_lp*2+1 + 8]));
+                p_frag[_lp + 4] = *(uint32_t*)&_h2;
+            }
+            d_state[0] = d_state[0] + (row_sum_2 + e0_6 + e1_6);
+            d_state[1] = d_state[1] + (row_sum_3 + e0_7 + e1_7);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
                 : "r"(kv_addr + pos * 16384 + (unsigned int)((lane / 16 / 8 * 512 + (16 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (16 + lane % 16 & 7) << 4) / 16) * 16))
@@ -1007,6 +953,31 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                 : "+f"(out_acc[60]), "+f"(out_acc[(60) + 1]), "+f"(out_acc[(60) + 2]), "+f"(out_acc[(60) + 3])
                 : "r"(p_frag[4]), "r"(p_frag[(4) + 1]), "r"(p_frag[(4) + 2]), "r"(p_frag[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+            float e0_8 = approx_exp2(__fmaf_rn(qk_acc[16], softmax_scale_log2, -shift[0]));
+            float e1_8 = approx_exp2(__fmaf_rn(qk_acc[17], softmax_scale_log2, -shift[0]));
+            qk_acc[16] = e0_8;
+            qk_acc[17] = e1_8;
+            float row_sum_4 = e0_8 + e1_8;
+            float e0_9 = approx_exp2(__fmaf_rn(qk_acc[18], softmax_scale_log2, -shift[1]));
+            float e1_9 = approx_exp2(__fmaf_rn(qk_acc[19], softmax_scale_log2, -shift[1]));
+            qk_acc[18] = e0_9;
+            qk_acc[19] = e1_9;
+            float row_sum_5 = e0_9 + e1_9;
+            float e0_10 = approx_exp2(__fmaf_rn(qk_acc[20], softmax_scale_log2, -shift[0]));
+            float e1_10 = approx_exp2(__fmaf_rn(qk_acc[21], softmax_scale_log2, -shift[0]));
+            qk_acc[20] = e0_10;
+            qk_acc[21] = e1_10;
+            float e0_11 = approx_exp2(__fmaf_rn(qk_acc[22], softmax_scale_log2, -shift[1]));
+            float e1_11 = approx_exp2(__fmaf_rn(qk_acc[23], softmax_scale_log2, -shift[1]));
+            qk_acc[22] = e0_11;
+            qk_acc[23] = e1_11;
+            #pragma unroll
+            for (int _lp = 0; _lp < 4; _lp++) {
+                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 16], qk_acc[_lp*2+1 + 16]));
+                p_frag[_lp + 8] = *(uint32_t*)&_h2;
+            }
+            d_state[0] = d_state[0] + (row_sum_4 + e0_10 + e1_10);
+            d_state[1] = d_state[1] + (row_sum_5 + e0_11 + e1_11);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
                 : "r"(kv_addr + pos * 16384 + (unsigned int)((lane / 16 / 8 * 512 + (32 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (32 + lane % 16 & 7) << 4) / 16) * 16))
@@ -1087,6 +1058,31 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                 : "+f"(out_acc[60]), "+f"(out_acc[(60) + 1]), "+f"(out_acc[(60) + 2]), "+f"(out_acc[(60) + 3])
                 : "r"(p_frag[8]), "r"(p_frag[(8) + 1]), "r"(p_frag[(8) + 2]), "r"(p_frag[(8) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
+            float e0_12 = approx_exp2(__fmaf_rn(qk_acc[24], softmax_scale_log2, -shift[0]));
+            float e1_12 = approx_exp2(__fmaf_rn(qk_acc[25], softmax_scale_log2, -shift[0]));
+            qk_acc[24] = e0_12;
+            qk_acc[25] = e1_12;
+            float row_sum_6 = e0_12 + e1_12;
+            float e0_13 = approx_exp2(__fmaf_rn(qk_acc[26], softmax_scale_log2, -shift[1]));
+            float e1_13 = approx_exp2(__fmaf_rn(qk_acc[27], softmax_scale_log2, -shift[1]));
+            qk_acc[26] = e0_13;
+            qk_acc[27] = e1_13;
+            float row_sum_7 = e0_13 + e1_13;
+            float e0_14 = approx_exp2(__fmaf_rn(qk_acc[28], softmax_scale_log2, -shift[0]));
+            float e1_14 = approx_exp2(__fmaf_rn(qk_acc[29], softmax_scale_log2, -shift[0]));
+            qk_acc[28] = e0_14;
+            qk_acc[29] = e1_14;
+            float e0_15 = approx_exp2(__fmaf_rn(qk_acc[30], softmax_scale_log2, -shift[1]));
+            float e1_15 = approx_exp2(__fmaf_rn(qk_acc[31], softmax_scale_log2, -shift[1]));
+            qk_acc[30] = e0_15;
+            qk_acc[31] = e1_15;
+            #pragma unroll
+            for (int _lp = 0; _lp < 4; _lp++) {
+                __half2 _h2 = __float22half2_rn(make_float2(qk_acc[_lp*2 + 24], qk_acc[_lp*2+1 + 24]));
+                p_frag[_lp + 12] = *(uint32_t*)&_h2;
+            }
+            d_state[0] = d_state[0] + (row_sum_6 + e0_14 + e1_14);
+            d_state[1] = d_state[1] + (row_sum_7 + e0_15 + e1_15);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
                 : "r"(kv_addr + pos * 16384 + (unsigned int)((lane / 16 / 8 * 512 + (48 + lane % 16) * 8 + (lane / 16 % 8 * 16 ^ (48 + lane % 16 & 7) << 4) / 16) * 16))
@@ -1269,82 +1265,13 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
             store = (int)_barrier_vote_7;
             if (store != 0) {
                 __threadfence();
-                for (int other = 0; other < split_parts; other++) {
-                    long long base = (long long)(split_slot - split_part + other) * 8704 + (long long)tid;
+                if (split_parts == 2) {
+                    long long base = (long long)(split_slot - split_part + 1 - split_part) * 8704 + (long long)tid;
                     float m_o0 = partial_ws[base + 8192];
                     float m_o1 = partial_ws[base + 8192 + 128];
                     float d_o0 = partial_ws[base + 8448];
                     float d_o1 = partial_ws[base + 8448 + 128];
-                    if (other == 0) {
-                        m_state[0] = m_o0;
-                        m_state[1] = m_o1;
-                        d_state[0] = d_o0;
-                        d_state[1] = d_o1;
-                        out_acc[0] = partial_ws[base];
-                        out_acc[1] = partial_ws[base + 128];
-                        out_acc[2] = partial_ws[base + 256];
-                        out_acc[3] = partial_ws[base + 384];
-                        out_acc[4] = partial_ws[base + 512];
-                        out_acc[5] = partial_ws[base + 640];
-                        out_acc[6] = partial_ws[base + 768];
-                        out_acc[7] = partial_ws[base + 896];
-                        out_acc[8] = partial_ws[base + 1024];
-                        out_acc[9] = partial_ws[base + 1152];
-                        out_acc[10] = partial_ws[base + 1280];
-                        out_acc[11] = partial_ws[base + 1408];
-                        out_acc[12] = partial_ws[base + 1536];
-                        out_acc[13] = partial_ws[base + 1664];
-                        out_acc[14] = partial_ws[base + 1792];
-                        out_acc[15] = partial_ws[base + 1920];
-                        out_acc[16] = partial_ws[base + 2048];
-                        out_acc[17] = partial_ws[base + 2176];
-                        out_acc[18] = partial_ws[base + 2304];
-                        out_acc[19] = partial_ws[base + 2432];
-                        out_acc[20] = partial_ws[base + 2560];
-                        out_acc[21] = partial_ws[base + 2688];
-                        out_acc[22] = partial_ws[base + 2816];
-                        out_acc[23] = partial_ws[base + 2944];
-                        out_acc[24] = partial_ws[base + 3072];
-                        out_acc[25] = partial_ws[base + 3200];
-                        out_acc[26] = partial_ws[base + 3328];
-                        out_acc[27] = partial_ws[base + 3456];
-                        out_acc[28] = partial_ws[base + 3584];
-                        out_acc[29] = partial_ws[base + 3712];
-                        out_acc[30] = partial_ws[base + 3840];
-                        out_acc[31] = partial_ws[base + 3968];
-                        out_acc[32] = partial_ws[base + 4096];
-                        out_acc[33] = partial_ws[base + 4224];
-                        out_acc[34] = partial_ws[base + 4352];
-                        out_acc[35] = partial_ws[base + 4480];
-                        out_acc[36] = partial_ws[base + 4608];
-                        out_acc[37] = partial_ws[base + 4736];
-                        out_acc[38] = partial_ws[base + 4864];
-                        out_acc[39] = partial_ws[base + 4992];
-                        out_acc[40] = partial_ws[base + 5120];
-                        out_acc[41] = partial_ws[base + 5248];
-                        out_acc[42] = partial_ws[base + 5376];
-                        out_acc[43] = partial_ws[base + 5504];
-                        out_acc[44] = partial_ws[base + 5632];
-                        out_acc[45] = partial_ws[base + 5760];
-                        out_acc[46] = partial_ws[base + 5888];
-                        out_acc[47] = partial_ws[base + 6016];
-                        out_acc[48] = partial_ws[base + 6144];
-                        out_acc[49] = partial_ws[base + 6272];
-                        out_acc[50] = partial_ws[base + 6400];
-                        out_acc[51] = partial_ws[base + 6528];
-                        out_acc[52] = partial_ws[base + 6656];
-                        out_acc[53] = partial_ws[base + 6784];
-                        out_acc[54] = partial_ws[base + 6912];
-                        out_acc[55] = partial_ws[base + 7040];
-                        out_acc[56] = partial_ws[base + 7168];
-                        out_acc[57] = partial_ws[base + 7296];
-                        out_acc[58] = partial_ws[base + 7424];
-                        out_acc[59] = partial_ws[base + 7552];
-                        out_acc[60] = partial_ws[base + 7680];
-                        out_acc[61] = partial_ws[base + 7808];
-                        out_acc[62] = partial_ws[base + 7936];
-                        out_acc[63] = partial_ws[base + 8064];
-                    } else {
+                    if (split_part == 0) {
                         float m_new0 = fmaxf(m_state[0], m_o0);
                         float m_new1 = fmaxf(m_state[1], m_o1);
                         float a0 = approx_exp2(__fmaf_rn(m_state[0], softmax_scale_log2, -(m_new0 * softmax_scale_log2)));
@@ -1483,6 +1410,362 @@ kernel_cake_vsa_sm120_5645b831eaa1960fa011(const __grid_constant__ CUtensorMap q
                         out_acc[62] = __fmaf_rn(out_acc[62], a1, o_other_62 * b1);
                         float o_other_63 = partial_ws[base + 8064];
                         out_acc[63] = __fmaf_rn(out_acc[63], a1, o_other_63 * b1);
+                    } else {
+                        float n_new0 = fmaxf(m_o0, m_state[0]);
+                        float n_new1 = fmaxf(m_o1, m_state[1]);
+                        float c0 = approx_exp2(__fmaf_rn(m_o0, softmax_scale_log2, -(n_new0 * softmax_scale_log2)));
+                        float e0 = approx_exp2(__fmaf_rn(m_state[0], softmax_scale_log2, -(n_new0 * softmax_scale_log2)));
+                        float c1 = approx_exp2(__fmaf_rn(m_o1, softmax_scale_log2, -(n_new1 * softmax_scale_log2)));
+                        float e1 = approx_exp2(__fmaf_rn(m_state[1], softmax_scale_log2, -(n_new1 * softmax_scale_log2)));
+                        m_state[0] = n_new0;
+                        m_state[1] = n_new1;
+                        d_state[0] = __fmaf_rn(d_o0, c0, d_state[0] * e0);
+                        d_state[1] = __fmaf_rn(d_o1, c1, d_state[1] * e1);
+                        float o_first_0 = partial_ws[base];
+                        out_acc[0] = __fmaf_rn(o_first_0, c0, out_acc[0] * e0);
+                        float o_first_1 = partial_ws[base + 128];
+                        out_acc[1] = __fmaf_rn(o_first_1, c0, out_acc[1] * e0);
+                        float o_first_2 = partial_ws[base + 256];
+                        out_acc[2] = __fmaf_rn(o_first_2, c1, out_acc[2] * e1);
+                        float o_first_3 = partial_ws[base + 384];
+                        out_acc[3] = __fmaf_rn(o_first_3, c1, out_acc[3] * e1);
+                        float o_first_4 = partial_ws[base + 512];
+                        out_acc[4] = __fmaf_rn(o_first_4, c0, out_acc[4] * e0);
+                        float o_first_5 = partial_ws[base + 640];
+                        out_acc[5] = __fmaf_rn(o_first_5, c0, out_acc[5] * e0);
+                        float o_first_6 = partial_ws[base + 768];
+                        out_acc[6] = __fmaf_rn(o_first_6, c1, out_acc[6] * e1);
+                        float o_first_7 = partial_ws[base + 896];
+                        out_acc[7] = __fmaf_rn(o_first_7, c1, out_acc[7] * e1);
+                        float o_first_8 = partial_ws[base + 1024];
+                        out_acc[8] = __fmaf_rn(o_first_8, c0, out_acc[8] * e0);
+                        float o_first_9 = partial_ws[base + 1152];
+                        out_acc[9] = __fmaf_rn(o_first_9, c0, out_acc[9] * e0);
+                        float o_first_10 = partial_ws[base + 1280];
+                        out_acc[10] = __fmaf_rn(o_first_10, c1, out_acc[10] * e1);
+                        float o_first_11 = partial_ws[base + 1408];
+                        out_acc[11] = __fmaf_rn(o_first_11, c1, out_acc[11] * e1);
+                        float o_first_12 = partial_ws[base + 1536];
+                        out_acc[12] = __fmaf_rn(o_first_12, c0, out_acc[12] * e0);
+                        float o_first_13 = partial_ws[base + 1664];
+                        out_acc[13] = __fmaf_rn(o_first_13, c0, out_acc[13] * e0);
+                        float o_first_14 = partial_ws[base + 1792];
+                        out_acc[14] = __fmaf_rn(o_first_14, c1, out_acc[14] * e1);
+                        float o_first_15 = partial_ws[base + 1920];
+                        out_acc[15] = __fmaf_rn(o_first_15, c1, out_acc[15] * e1);
+                        float o_first_16 = partial_ws[base + 2048];
+                        out_acc[16] = __fmaf_rn(o_first_16, c0, out_acc[16] * e0);
+                        float o_first_17 = partial_ws[base + 2176];
+                        out_acc[17] = __fmaf_rn(o_first_17, c0, out_acc[17] * e0);
+                        float o_first_18 = partial_ws[base + 2304];
+                        out_acc[18] = __fmaf_rn(o_first_18, c1, out_acc[18] * e1);
+                        float o_first_19 = partial_ws[base + 2432];
+                        out_acc[19] = __fmaf_rn(o_first_19, c1, out_acc[19] * e1);
+                        float o_first_20 = partial_ws[base + 2560];
+                        out_acc[20] = __fmaf_rn(o_first_20, c0, out_acc[20] * e0);
+                        float o_first_21 = partial_ws[base + 2688];
+                        out_acc[21] = __fmaf_rn(o_first_21, c0, out_acc[21] * e0);
+                        float o_first_22 = partial_ws[base + 2816];
+                        out_acc[22] = __fmaf_rn(o_first_22, c1, out_acc[22] * e1);
+                        float o_first_23 = partial_ws[base + 2944];
+                        out_acc[23] = __fmaf_rn(o_first_23, c1, out_acc[23] * e1);
+                        float o_first_24 = partial_ws[base + 3072];
+                        out_acc[24] = __fmaf_rn(o_first_24, c0, out_acc[24] * e0);
+                        float o_first_25 = partial_ws[base + 3200];
+                        out_acc[25] = __fmaf_rn(o_first_25, c0, out_acc[25] * e0);
+                        float o_first_26 = partial_ws[base + 3328];
+                        out_acc[26] = __fmaf_rn(o_first_26, c1, out_acc[26] * e1);
+                        float o_first_27 = partial_ws[base + 3456];
+                        out_acc[27] = __fmaf_rn(o_first_27, c1, out_acc[27] * e1);
+                        float o_first_28 = partial_ws[base + 3584];
+                        out_acc[28] = __fmaf_rn(o_first_28, c0, out_acc[28] * e0);
+                        float o_first_29 = partial_ws[base + 3712];
+                        out_acc[29] = __fmaf_rn(o_first_29, c0, out_acc[29] * e0);
+                        float o_first_30 = partial_ws[base + 3840];
+                        out_acc[30] = __fmaf_rn(o_first_30, c1, out_acc[30] * e1);
+                        float o_first_31 = partial_ws[base + 3968];
+                        out_acc[31] = __fmaf_rn(o_first_31, c1, out_acc[31] * e1);
+                        float o_first_32 = partial_ws[base + 4096];
+                        out_acc[32] = __fmaf_rn(o_first_32, c0, out_acc[32] * e0);
+                        float o_first_33 = partial_ws[base + 4224];
+                        out_acc[33] = __fmaf_rn(o_first_33, c0, out_acc[33] * e0);
+                        float o_first_34 = partial_ws[base + 4352];
+                        out_acc[34] = __fmaf_rn(o_first_34, c1, out_acc[34] * e1);
+                        float o_first_35 = partial_ws[base + 4480];
+                        out_acc[35] = __fmaf_rn(o_first_35, c1, out_acc[35] * e1);
+                        float o_first_36 = partial_ws[base + 4608];
+                        out_acc[36] = __fmaf_rn(o_first_36, c0, out_acc[36] * e0);
+                        float o_first_37 = partial_ws[base + 4736];
+                        out_acc[37] = __fmaf_rn(o_first_37, c0, out_acc[37] * e0);
+                        float o_first_38 = partial_ws[base + 4864];
+                        out_acc[38] = __fmaf_rn(o_first_38, c1, out_acc[38] * e1);
+                        float o_first_39 = partial_ws[base + 4992];
+                        out_acc[39] = __fmaf_rn(o_first_39, c1, out_acc[39] * e1);
+                        float o_first_40 = partial_ws[base + 5120];
+                        out_acc[40] = __fmaf_rn(o_first_40, c0, out_acc[40] * e0);
+                        float o_first_41 = partial_ws[base + 5248];
+                        out_acc[41] = __fmaf_rn(o_first_41, c0, out_acc[41] * e0);
+                        float o_first_42 = partial_ws[base + 5376];
+                        out_acc[42] = __fmaf_rn(o_first_42, c1, out_acc[42] * e1);
+                        float o_first_43 = partial_ws[base + 5504];
+                        out_acc[43] = __fmaf_rn(o_first_43, c1, out_acc[43] * e1);
+                        float o_first_44 = partial_ws[base + 5632];
+                        out_acc[44] = __fmaf_rn(o_first_44, c0, out_acc[44] * e0);
+                        float o_first_45 = partial_ws[base + 5760];
+                        out_acc[45] = __fmaf_rn(o_first_45, c0, out_acc[45] * e0);
+                        float o_first_46 = partial_ws[base + 5888];
+                        out_acc[46] = __fmaf_rn(o_first_46, c1, out_acc[46] * e1);
+                        float o_first_47 = partial_ws[base + 6016];
+                        out_acc[47] = __fmaf_rn(o_first_47, c1, out_acc[47] * e1);
+                        float o_first_48 = partial_ws[base + 6144];
+                        out_acc[48] = __fmaf_rn(o_first_48, c0, out_acc[48] * e0);
+                        float o_first_49 = partial_ws[base + 6272];
+                        out_acc[49] = __fmaf_rn(o_first_49, c0, out_acc[49] * e0);
+                        float o_first_50 = partial_ws[base + 6400];
+                        out_acc[50] = __fmaf_rn(o_first_50, c1, out_acc[50] * e1);
+                        float o_first_51 = partial_ws[base + 6528];
+                        out_acc[51] = __fmaf_rn(o_first_51, c1, out_acc[51] * e1);
+                        float o_first_52 = partial_ws[base + 6656];
+                        out_acc[52] = __fmaf_rn(o_first_52, c0, out_acc[52] * e0);
+                        float o_first_53 = partial_ws[base + 6784];
+                        out_acc[53] = __fmaf_rn(o_first_53, c0, out_acc[53] * e0);
+                        float o_first_54 = partial_ws[base + 6912];
+                        out_acc[54] = __fmaf_rn(o_first_54, c1, out_acc[54] * e1);
+                        float o_first_55 = partial_ws[base + 7040];
+                        out_acc[55] = __fmaf_rn(o_first_55, c1, out_acc[55] * e1);
+                        float o_first_56 = partial_ws[base + 7168];
+                        out_acc[56] = __fmaf_rn(o_first_56, c0, out_acc[56] * e0);
+                        float o_first_57 = partial_ws[base + 7296];
+                        out_acc[57] = __fmaf_rn(o_first_57, c0, out_acc[57] * e0);
+                        float o_first_58 = partial_ws[base + 7424];
+                        out_acc[58] = __fmaf_rn(o_first_58, c1, out_acc[58] * e1);
+                        float o_first_59 = partial_ws[base + 7552];
+                        out_acc[59] = __fmaf_rn(o_first_59, c1, out_acc[59] * e1);
+                        float o_first_60 = partial_ws[base + 7680];
+                        out_acc[60] = __fmaf_rn(o_first_60, c0, out_acc[60] * e0);
+                        float o_first_61 = partial_ws[base + 7808];
+                        out_acc[61] = __fmaf_rn(o_first_61, c0, out_acc[61] * e0);
+                        float o_first_62 = partial_ws[base + 7936];
+                        out_acc[62] = __fmaf_rn(o_first_62, c1, out_acc[62] * e1);
+                        float o_first_63 = partial_ws[base + 8064];
+                        out_acc[63] = __fmaf_rn(o_first_63, c1, out_acc[63] * e1);
+                    }
+                } else {
+                    for (int other = 0; other < split_parts; other++) {
+                        long long base_1 = (long long)(split_slot - split_part + other) * 8704 + (long long)tid;
+                        float m_o0_1 = partial_ws[base_1 + 8192];
+                        float m_o1_1 = partial_ws[base_1 + 8192 + 128];
+                        float d_o0_1 = partial_ws[base_1 + 8448];
+                        float d_o1_1 = partial_ws[base_1 + 8448 + 128];
+                        if (other == 0) {
+                            m_state[0] = m_o0_1;
+                            m_state[1] = m_o1_1;
+                            d_state[0] = d_o0_1;
+                            d_state[1] = d_o1_1;
+                            out_acc[0] = partial_ws[base_1];
+                            out_acc[1] = partial_ws[base_1 + 128];
+                            out_acc[2] = partial_ws[base_1 + 256];
+                            out_acc[3] = partial_ws[base_1 + 384];
+                            out_acc[4] = partial_ws[base_1 + 512];
+                            out_acc[5] = partial_ws[base_1 + 640];
+                            out_acc[6] = partial_ws[base_1 + 768];
+                            out_acc[7] = partial_ws[base_1 + 896];
+                            out_acc[8] = partial_ws[base_1 + 1024];
+                            out_acc[9] = partial_ws[base_1 + 1152];
+                            out_acc[10] = partial_ws[base_1 + 1280];
+                            out_acc[11] = partial_ws[base_1 + 1408];
+                            out_acc[12] = partial_ws[base_1 + 1536];
+                            out_acc[13] = partial_ws[base_1 + 1664];
+                            out_acc[14] = partial_ws[base_1 + 1792];
+                            out_acc[15] = partial_ws[base_1 + 1920];
+                            out_acc[16] = partial_ws[base_1 + 2048];
+                            out_acc[17] = partial_ws[base_1 + 2176];
+                            out_acc[18] = partial_ws[base_1 + 2304];
+                            out_acc[19] = partial_ws[base_1 + 2432];
+                            out_acc[20] = partial_ws[base_1 + 2560];
+                            out_acc[21] = partial_ws[base_1 + 2688];
+                            out_acc[22] = partial_ws[base_1 + 2816];
+                            out_acc[23] = partial_ws[base_1 + 2944];
+                            out_acc[24] = partial_ws[base_1 + 3072];
+                            out_acc[25] = partial_ws[base_1 + 3200];
+                            out_acc[26] = partial_ws[base_1 + 3328];
+                            out_acc[27] = partial_ws[base_1 + 3456];
+                            out_acc[28] = partial_ws[base_1 + 3584];
+                            out_acc[29] = partial_ws[base_1 + 3712];
+                            out_acc[30] = partial_ws[base_1 + 3840];
+                            out_acc[31] = partial_ws[base_1 + 3968];
+                            out_acc[32] = partial_ws[base_1 + 4096];
+                            out_acc[33] = partial_ws[base_1 + 4224];
+                            out_acc[34] = partial_ws[base_1 + 4352];
+                            out_acc[35] = partial_ws[base_1 + 4480];
+                            out_acc[36] = partial_ws[base_1 + 4608];
+                            out_acc[37] = partial_ws[base_1 + 4736];
+                            out_acc[38] = partial_ws[base_1 + 4864];
+                            out_acc[39] = partial_ws[base_1 + 4992];
+                            out_acc[40] = partial_ws[base_1 + 5120];
+                            out_acc[41] = partial_ws[base_1 + 5248];
+                            out_acc[42] = partial_ws[base_1 + 5376];
+                            out_acc[43] = partial_ws[base_1 + 5504];
+                            out_acc[44] = partial_ws[base_1 + 5632];
+                            out_acc[45] = partial_ws[base_1 + 5760];
+                            out_acc[46] = partial_ws[base_1 + 5888];
+                            out_acc[47] = partial_ws[base_1 + 6016];
+                            out_acc[48] = partial_ws[base_1 + 6144];
+                            out_acc[49] = partial_ws[base_1 + 6272];
+                            out_acc[50] = partial_ws[base_1 + 6400];
+                            out_acc[51] = partial_ws[base_1 + 6528];
+                            out_acc[52] = partial_ws[base_1 + 6656];
+                            out_acc[53] = partial_ws[base_1 + 6784];
+                            out_acc[54] = partial_ws[base_1 + 6912];
+                            out_acc[55] = partial_ws[base_1 + 7040];
+                            out_acc[56] = partial_ws[base_1 + 7168];
+                            out_acc[57] = partial_ws[base_1 + 7296];
+                            out_acc[58] = partial_ws[base_1 + 7424];
+                            out_acc[59] = partial_ws[base_1 + 7552];
+                            out_acc[60] = partial_ws[base_1 + 7680];
+                            out_acc[61] = partial_ws[base_1 + 7808];
+                            out_acc[62] = partial_ws[base_1 + 7936];
+                            out_acc[63] = partial_ws[base_1 + 8064];
+                        } else {
+                            float m_new0_1 = fmaxf(m_state[0], m_o0_1);
+                            float m_new1_1 = fmaxf(m_state[1], m_o1_1);
+                            float a0_1 = approx_exp2(__fmaf_rn(m_state[0], softmax_scale_log2, -(m_new0_1 * softmax_scale_log2)));
+                            float b0_1 = approx_exp2(__fmaf_rn(m_o0_1, softmax_scale_log2, -(m_new0_1 * softmax_scale_log2)));
+                            float a1_1 = approx_exp2(__fmaf_rn(m_state[1], softmax_scale_log2, -(m_new1_1 * softmax_scale_log2)));
+                            float b1_1 = approx_exp2(__fmaf_rn(m_o1_1, softmax_scale_log2, -(m_new1_1 * softmax_scale_log2)));
+                            m_state[0] = m_new0_1;
+                            m_state[1] = m_new1_1;
+                            d_state[0] = __fmaf_rn(d_state[0], a0_1, d_o0_1 * b0_1);
+                            d_state[1] = __fmaf_rn(d_state[1], a1_1, d_o1_1 * b1_1);
+                            float o_other_64 = partial_ws[base_1];
+                            out_acc[0] = __fmaf_rn(out_acc[0], a0_1, o_other_64 * b0_1);
+                            float o_other_65 = partial_ws[base_1 + 128];
+                            out_acc[1] = __fmaf_rn(out_acc[1], a0_1, o_other_65 * b0_1);
+                            float o_other_66 = partial_ws[base_1 + 256];
+                            out_acc[2] = __fmaf_rn(out_acc[2], a1_1, o_other_66 * b1_1);
+                            float o_other_67 = partial_ws[base_1 + 384];
+                            out_acc[3] = __fmaf_rn(out_acc[3], a1_1, o_other_67 * b1_1);
+                            float o_other_68 = partial_ws[base_1 + 512];
+                            out_acc[4] = __fmaf_rn(out_acc[4], a0_1, o_other_68 * b0_1);
+                            float o_other_69 = partial_ws[base_1 + 640];
+                            out_acc[5] = __fmaf_rn(out_acc[5], a0_1, o_other_69 * b0_1);
+                            float o_other_70 = partial_ws[base_1 + 768];
+                            out_acc[6] = __fmaf_rn(out_acc[6], a1_1, o_other_70 * b1_1);
+                            float o_other_71 = partial_ws[base_1 + 896];
+                            out_acc[7] = __fmaf_rn(out_acc[7], a1_1, o_other_71 * b1_1);
+                            float o_other_72 = partial_ws[base_1 + 1024];
+                            out_acc[8] = __fmaf_rn(out_acc[8], a0_1, o_other_72 * b0_1);
+                            float o_other_73 = partial_ws[base_1 + 1152];
+                            out_acc[9] = __fmaf_rn(out_acc[9], a0_1, o_other_73 * b0_1);
+                            float o_other_74 = partial_ws[base_1 + 1280];
+                            out_acc[10] = __fmaf_rn(out_acc[10], a1_1, o_other_74 * b1_1);
+                            float o_other_75 = partial_ws[base_1 + 1408];
+                            out_acc[11] = __fmaf_rn(out_acc[11], a1_1, o_other_75 * b1_1);
+                            float o_other_76 = partial_ws[base_1 + 1536];
+                            out_acc[12] = __fmaf_rn(out_acc[12], a0_1, o_other_76 * b0_1);
+                            float o_other_77 = partial_ws[base_1 + 1664];
+                            out_acc[13] = __fmaf_rn(out_acc[13], a0_1, o_other_77 * b0_1);
+                            float o_other_78 = partial_ws[base_1 + 1792];
+                            out_acc[14] = __fmaf_rn(out_acc[14], a1_1, o_other_78 * b1_1);
+                            float o_other_79 = partial_ws[base_1 + 1920];
+                            out_acc[15] = __fmaf_rn(out_acc[15], a1_1, o_other_79 * b1_1);
+                            float o_other_80 = partial_ws[base_1 + 2048];
+                            out_acc[16] = __fmaf_rn(out_acc[16], a0_1, o_other_80 * b0_1);
+                            float o_other_81 = partial_ws[base_1 + 2176];
+                            out_acc[17] = __fmaf_rn(out_acc[17], a0_1, o_other_81 * b0_1);
+                            float o_other_82 = partial_ws[base_1 + 2304];
+                            out_acc[18] = __fmaf_rn(out_acc[18], a1_1, o_other_82 * b1_1);
+                            float o_other_83 = partial_ws[base_1 + 2432];
+                            out_acc[19] = __fmaf_rn(out_acc[19], a1_1, o_other_83 * b1_1);
+                            float o_other_84 = partial_ws[base_1 + 2560];
+                            out_acc[20] = __fmaf_rn(out_acc[20], a0_1, o_other_84 * b0_1);
+                            float o_other_85 = partial_ws[base_1 + 2688];
+                            out_acc[21] = __fmaf_rn(out_acc[21], a0_1, o_other_85 * b0_1);
+                            float o_other_86 = partial_ws[base_1 + 2816];
+                            out_acc[22] = __fmaf_rn(out_acc[22], a1_1, o_other_86 * b1_1);
+                            float o_other_87 = partial_ws[base_1 + 2944];
+                            out_acc[23] = __fmaf_rn(out_acc[23], a1_1, o_other_87 * b1_1);
+                            float o_other_88 = partial_ws[base_1 + 3072];
+                            out_acc[24] = __fmaf_rn(out_acc[24], a0_1, o_other_88 * b0_1);
+                            float o_other_89 = partial_ws[base_1 + 3200];
+                            out_acc[25] = __fmaf_rn(out_acc[25], a0_1, o_other_89 * b0_1);
+                            float o_other_90 = partial_ws[base_1 + 3328];
+                            out_acc[26] = __fmaf_rn(out_acc[26], a1_1, o_other_90 * b1_1);
+                            float o_other_91 = partial_ws[base_1 + 3456];
+                            out_acc[27] = __fmaf_rn(out_acc[27], a1_1, o_other_91 * b1_1);
+                            float o_other_92 = partial_ws[base_1 + 3584];
+                            out_acc[28] = __fmaf_rn(out_acc[28], a0_1, o_other_92 * b0_1);
+                            float o_other_93 = partial_ws[base_1 + 3712];
+                            out_acc[29] = __fmaf_rn(out_acc[29], a0_1, o_other_93 * b0_1);
+                            float o_other_94 = partial_ws[base_1 + 3840];
+                            out_acc[30] = __fmaf_rn(out_acc[30], a1_1, o_other_94 * b1_1);
+                            float o_other_95 = partial_ws[base_1 + 3968];
+                            out_acc[31] = __fmaf_rn(out_acc[31], a1_1, o_other_95 * b1_1);
+                            float o_other_96 = partial_ws[base_1 + 4096];
+                            out_acc[32] = __fmaf_rn(out_acc[32], a0_1, o_other_96 * b0_1);
+                            float o_other_97 = partial_ws[base_1 + 4224];
+                            out_acc[33] = __fmaf_rn(out_acc[33], a0_1, o_other_97 * b0_1);
+                            float o_other_98 = partial_ws[base_1 + 4352];
+                            out_acc[34] = __fmaf_rn(out_acc[34], a1_1, o_other_98 * b1_1);
+                            float o_other_99 = partial_ws[base_1 + 4480];
+                            out_acc[35] = __fmaf_rn(out_acc[35], a1_1, o_other_99 * b1_1);
+                            float o_other_100 = partial_ws[base_1 + 4608];
+                            out_acc[36] = __fmaf_rn(out_acc[36], a0_1, o_other_100 * b0_1);
+                            float o_other_101 = partial_ws[base_1 + 4736];
+                            out_acc[37] = __fmaf_rn(out_acc[37], a0_1, o_other_101 * b0_1);
+                            float o_other_102 = partial_ws[base_1 + 4864];
+                            out_acc[38] = __fmaf_rn(out_acc[38], a1_1, o_other_102 * b1_1);
+                            float o_other_103 = partial_ws[base_1 + 4992];
+                            out_acc[39] = __fmaf_rn(out_acc[39], a1_1, o_other_103 * b1_1);
+                            float o_other_104 = partial_ws[base_1 + 5120];
+                            out_acc[40] = __fmaf_rn(out_acc[40], a0_1, o_other_104 * b0_1);
+                            float o_other_105 = partial_ws[base_1 + 5248];
+                            out_acc[41] = __fmaf_rn(out_acc[41], a0_1, o_other_105 * b0_1);
+                            float o_other_106 = partial_ws[base_1 + 5376];
+                            out_acc[42] = __fmaf_rn(out_acc[42], a1_1, o_other_106 * b1_1);
+                            float o_other_107 = partial_ws[base_1 + 5504];
+                            out_acc[43] = __fmaf_rn(out_acc[43], a1_1, o_other_107 * b1_1);
+                            float o_other_108 = partial_ws[base_1 + 5632];
+                            out_acc[44] = __fmaf_rn(out_acc[44], a0_1, o_other_108 * b0_1);
+                            float o_other_109 = partial_ws[base_1 + 5760];
+                            out_acc[45] = __fmaf_rn(out_acc[45], a0_1, o_other_109 * b0_1);
+                            float o_other_110 = partial_ws[base_1 + 5888];
+                            out_acc[46] = __fmaf_rn(out_acc[46], a1_1, o_other_110 * b1_1);
+                            float o_other_111 = partial_ws[base_1 + 6016];
+                            out_acc[47] = __fmaf_rn(out_acc[47], a1_1, o_other_111 * b1_1);
+                            float o_other_112 = partial_ws[base_1 + 6144];
+                            out_acc[48] = __fmaf_rn(out_acc[48], a0_1, o_other_112 * b0_1);
+                            float o_other_113 = partial_ws[base_1 + 6272];
+                            out_acc[49] = __fmaf_rn(out_acc[49], a0_1, o_other_113 * b0_1);
+                            float o_other_114 = partial_ws[base_1 + 6400];
+                            out_acc[50] = __fmaf_rn(out_acc[50], a1_1, o_other_114 * b1_1);
+                            float o_other_115 = partial_ws[base_1 + 6528];
+                            out_acc[51] = __fmaf_rn(out_acc[51], a1_1, o_other_115 * b1_1);
+                            float o_other_116 = partial_ws[base_1 + 6656];
+                            out_acc[52] = __fmaf_rn(out_acc[52], a0_1, o_other_116 * b0_1);
+                            float o_other_117 = partial_ws[base_1 + 6784];
+                            out_acc[53] = __fmaf_rn(out_acc[53], a0_1, o_other_117 * b0_1);
+                            float o_other_118 = partial_ws[base_1 + 6912];
+                            out_acc[54] = __fmaf_rn(out_acc[54], a1_1, o_other_118 * b1_1);
+                            float o_other_119 = partial_ws[base_1 + 7040];
+                            out_acc[55] = __fmaf_rn(out_acc[55], a1_1, o_other_119 * b1_1);
+                            float o_other_120 = partial_ws[base_1 + 7168];
+                            out_acc[56] = __fmaf_rn(out_acc[56], a0_1, o_other_120 * b0_1);
+                            float o_other_121 = partial_ws[base_1 + 7296];
+                            out_acc[57] = __fmaf_rn(out_acc[57], a0_1, o_other_121 * b0_1);
+                            float o_other_122 = partial_ws[base_1 + 7424];
+                            out_acc[58] = __fmaf_rn(out_acc[58], a1_1, o_other_122 * b1_1);
+                            float o_other_123 = partial_ws[base_1 + 7552];
+                            out_acc[59] = __fmaf_rn(out_acc[59], a1_1, o_other_123 * b1_1);
+                            float o_other_124 = partial_ws[base_1 + 7680];
+                            out_acc[60] = __fmaf_rn(out_acc[60], a0_1, o_other_124 * b0_1);
+                            float o_other_125 = partial_ws[base_1 + 7808];
+                            out_acc[61] = __fmaf_rn(out_acc[61], a0_1, o_other_125 * b0_1);
+                            float o_other_126 = partial_ws[base_1 + 7936];
+                            out_acc[62] = __fmaf_rn(out_acc[62], a1_1, o_other_126 * b1_1);
+                            float o_other_127 = partial_ws[base_1 + 8064];
+                            out_acc[63] = __fmaf_rn(out_acc[63], a1_1, o_other_127 * b1_1);
+                        }
                     }
                 }
             }

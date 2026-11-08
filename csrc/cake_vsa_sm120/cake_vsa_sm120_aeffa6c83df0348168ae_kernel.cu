@@ -216,6 +216,9 @@ kernel_cake_vsa_sm120_aeffa6c83df0348168ae(const __grid_constant__ CUtensorMap q
         int kv_head = head / group_size;
         int q_base = q_block * 64;
         if (warp % 4 == 0) {
+            if (count < 0) {
+                asm volatile("trap;" ::: "memory");
+            }
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(q_full_addr + (g) * 8, 16384);
                 asm volatile(

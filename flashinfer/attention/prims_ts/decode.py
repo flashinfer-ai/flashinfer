@@ -25,6 +25,13 @@ from typing import TYPE_CHECKING, Literal, Optional, Union, cast
 import torch
 
 from ._compile_cache import build_and_load_attention_kernel
+from ._scales import (
+    GlobalScale,
+    fake_scale,
+    normalize_scale,
+    resolve_scale,
+    scale_types,
+)
 
 from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.utils import (
@@ -111,6 +118,9 @@ class _DecodeLaunchSpec:
     policy: tuple[tuple[str, object], ...]
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
     requested_splits: Optional[int] = None
+    # Split-counter entries reserved at the buffer tail (at least two device
+    # waves), so plans sharing one buffer keep counters at the same bytes.
+    scratch_reserve: int = 0
 
 
 @dataclass(frozen=True)
@@ -151,6 +161,7 @@ class _DecodeCompileSpec:
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None
     runtime_kv_lengths: bool = False
+    scale_types: tuple[bool, bool] = (False, False)
 
 
 @dataclass(frozen=True)
@@ -172,8 +183,8 @@ class _DecodeRuntime:
     v_token_stride: int
     k_sf_page_stride: int
     v_sf_page_stride: int
-    softmax_scale: float
-    output_scale: float
+    softmax_scale: GlobalScale
+    output_scale: GlobalScale
 
 
 @dataclass(frozen=True)
@@ -209,6 +220,8 @@ class _DecodePlanState:
     kv_prefix_mode: Literal["dynamic", "planned_full"]
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
     policy: tuple[tuple[str, object], ...]
+    softmax_scale: GlobalScale
+    output_scale: GlobalScale
     storage_page_size: Optional[int] = None
     lse_mode: str = "none"
     use_attention_sinks: bool = False
@@ -285,12 +298,14 @@ def _append_workspace_section(
     byte_end: int,
     shape: tuple[int, ...],
     dtype: torch.dtype,
+    reserve_elems: int = 0,
 ) -> tuple[_WorkspaceSection, int]:
     byte_offset = _align_up(byte_end)
     byte_size = math.prod(shape) * _dtype_itemsize(dtype)
+    reserved = max(byte_size, reserve_elems * _dtype_itemsize(dtype))
     return (
         _WorkspaceSection(byte_offset, byte_size, shape, dtype),
-        byte_offset + byte_size,
+        byte_offset + reserved,
     )
 
 
@@ -300,7 +315,13 @@ def _make_decode_workspace_layout(
     *,
     use_separate_reduction_kernel: bool,
     use_split_kv: bool = False,
+    scratch_reserve: int = 0,
 ) -> _DecodeWorkspaceLayout:
+    """Lay out partials first, then zero-at-rest state.
+
+    The state (Q offsets, sinks, ``scratch_reserve`` split counters) comes
+    last; binding anchors it to the buffer end (see ``_bind_decode_workspace``).
+    """
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = out_dtype
     if use_separate_reduction_kernel and out_dtype in (
@@ -318,11 +339,11 @@ def _make_decode_workspace_layout(
     partial_stats, byte_end = _append_workspace_section(
         byte_end, partial_stats_shape, torch.float32
     )
-    split_kv_counter, byte_end = _append_workspace_section(
-        byte_end, counter_shape, torch.int32
-    )
     cu_seqlens_q, byte_end = _append_workspace_section(byte_end, (1,), torch.int32)
     attention_sinks, byte_end = _append_workspace_section(byte_end, (1,), torch.float32)
+    split_kv_counter, byte_end = _append_workspace_section(
+        byte_end, counter_shape, torch.int32, scratch_reserve
+    )
     return _DecodeWorkspaceLayout(
         partial_o=partial_o,
         partial_stats=partial_stats,
@@ -373,16 +394,27 @@ def _workspace_section_view(
 def _bind_decode_workspace(
     workspace_buffer: torch.Tensor, layout: _DecodeWorkspaceLayout
 ) -> _DecodeWorkspaceViews:
+    # Anchor the zero-at-rest state (Q offsets, sinks, counters) to the buffer
+    # end so plans sharing one buffer keep it at the same bytes; partials stay
+    # at offset 0.
+    shift = max(
+        workspace_buffer.numel() * workspace_buffer.element_size() - layout.total_bytes,
+        0,
+    )
+    shift -= shift % _WORKSPACE_ALIGNMENT
+
+    def state_view(section: _WorkspaceSection) -> torch.Tensor:
+        return _workspace_section_view(
+            workspace_buffer,
+            replace(section, byte_offset=section.byte_offset + shift),
+        )
+
     return _DecodeWorkspaceViews(
         partial_o=_workspace_section_view(workspace_buffer, layout.partial_o),
         partial_stats=_workspace_section_view(workspace_buffer, layout.partial_stats),
-        split_kv_counter=_workspace_section_view(
-            workspace_buffer, layout.split_kv_counter
-        ),
-        cu_seqlens_q=_workspace_section_view(workspace_buffer, layout.cu_seqlens_q),
-        attention_sinks=_workspace_section_view(
-            workspace_buffer, layout.attention_sinks
-        ),
+        split_kv_counter=state_view(layout.split_kv_counter),
+        cu_seqlens_q=state_view(layout.cu_seqlens_q),
+        attention_sinks=state_view(layout.attention_sinks),
     )
 
 
@@ -1153,6 +1185,7 @@ def _decode_scratch_shapes(
     num_kv_heads: int,
     head_dim: int,
     seq_len_q: int,
+    requested_splits: Optional[int] = None,
 ):
     """Return split-workspace shapes for a static config and batch extent."""
 
@@ -1179,13 +1212,26 @@ def _decode_scratch_shapes(
         num_q_groups = cute.sym_int()
     else:
         num_q_groups = seq_len_q * geometry.head_ctas_per_token
-    partial_o_shape = (
-        batch_size,
-        num_kv_heads,
-        int(cfg.max_splits_kv),
-        head_ratio * seq_len_q,
-        head_dim,
-    )
+    partial_o_shape: tuple[int, ...]
+    if cfg.uses_compact_split_grid:
+        # Partials are packed by the launch fanout: slot (b * Hkv + h) *
+        # requested + split. The slot count is a runtime extent, so the
+        # compiled kernel does not depend on the plan's batch or fanout.
+        if requested_splits is None:
+            import cutlass.cute as cute
+
+            num_slots = cute.sym_int()
+        else:
+            num_slots = batch_size * num_kv_heads * int(requested_splits)
+        partial_o_shape = (num_slots, head_ratio * seq_len_q, head_dim)
+    else:
+        partial_o_shape = (
+            batch_size,
+            num_kv_heads,
+            int(cfg.max_splits_kv),
+            head_ratio * seq_len_q,
+            head_dim,
+        )
     partial_stats_shape = (
         partial_o_shape[:-1]
         if cfg.use_separate_reduction_kernel
@@ -1204,6 +1250,7 @@ def _decode_launch_spec_from_config(
     head_dim: int,
     seq_len_q: int,
     max_active_clusters: int,
+    requested_splits: Optional[int] = None,
 ) -> _DecodeLaunchSpec:
     """Derive policy and scratch geometry from one finalized FMHA config."""
 
@@ -1214,13 +1261,20 @@ def _decode_launch_spec_from_config(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         seq_len_q=seq_len_q,
+        requested_splits=requested_splits,
     )
+    # Every plan, split or not, reserves counters for two device-wide waves of
+    # logical Q CTAs, so plans sharing one buffer keep the same state bytes.
+    # Larger counts keep their exact size; outside the sparse route (own slice),
+    # only separate-reduction plans reach them, and those never read the counters.
+    scratch_reserve = max(2 * int(max_active_clusters), math.prod(scratch_shapes[2]))
 
     return _DecodeLaunchSpec(
         config=cfg,
         max_active_clusters=int(max_active_clusters),
         policy=_decode_policy_from_config(cfg),
         scratch_shapes=scratch_shapes,
+        scratch_reserve=scratch_reserve,
     )
 
 
@@ -1457,6 +1511,8 @@ def _resolve_decode_launch_spec(
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
         requested_splits = min(requested_splits, sm_count)
         # GMEM capacity is a device bound, independent of the runtime fanout.
+        # It only bounds the fanout: compact partials are strided by the
+        # runtime fanout, so capacity does not size scratch.
         # Keep Q/batch fusion within CUDA's grid-Z limit; larger grids retain
         # the original exact-fanout launch. Cluster sizes remain resident topology.
         compact_grid = batch_size * q_ctas(cfg) <= 65535
@@ -1480,7 +1536,17 @@ def _resolve_decode_launch_spec(
         head_dim=head_dim,
         seq_len_q=seq_len_q,
         max_active_clusters=int(max_active_clusters),
+        requested_splits=requested_splits if cfg.use_split_kv else None,
     )
+    # Fused GMEM split plans publish through the counters, so they must fit the
+    # shared reserve. Separate-reduction plans (e.g. FP8 page-4 encoded-subpage,
+    # which always splits) never touch the counters and may exceed it.
+    assert (
+        use_q_token_kv_block_sparse_route
+        or not cfg.use_split_kv
+        or cfg.use_separate_reduction_kernel
+        or resolved.scratch_reserve == 2 * int(max_active_clusters)
+    ), "fused GMEM split counters exceed the shared workspace reserve"
     # Report the runtime fanout separately from the SM-bound workspace capacity.
     policy = dict(resolved.policy)
     policy["splits_kv"] = requested_splits
@@ -1505,6 +1571,7 @@ def _make_decode_compile_spec(
     flat_native_kv_tma: bool = False,
     lse_mode: str = "none",
     runtime_kv_lengths: bool = False,
+    scale_types: tuple[bool, bool] = (False, False),
     packed_query: Optional[bool] = None,
     kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic",
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic",
@@ -1560,6 +1627,7 @@ def _make_decode_compile_spec(
         kv_lengths_mode=kv_lengths_mode,
         direct_q1_spec=direct_q1_spec,
         runtime_kv_lengths=runtime_kv_lengths,
+        scale_types=scale_types,
     )
 
 
@@ -1652,8 +1720,8 @@ def _get_compiled_decode(
         v_token_stride: cutlass.Int64,
         k_sf_page_stride: cutlass.Int64,
         v_sf_page_stride: cutlass.Int64,
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         requested_splits: cutlass.Int32,
         max_q_len: cutlass.Int32,
         direct_q1_inputs: tuple,
@@ -1740,8 +1808,8 @@ def _get_compiled_decode(
             partial_stats.iterator,
             split_kv_counter.iterator,
             attention_sinks.iterator,
-            softmax_scale,
-            output_scale,
+            softmax_scale.iterator if compile_spec.scale_types[0] else softmax_scale,
+            output_scale.iterator if compile_spec.scale_types[1] else output_scale,
             Int32(0),
             Int32(static_max_active_clusters),
             stream,
@@ -1788,8 +1856,6 @@ def _get_compiled_decode(
             partial_o: cute.Tensor,
             partial_stats: cute.Tensor,
             attention_sinks: cute.Tensor,
-            softmax_scale: cutlass.Float32,
-            output_scale: cutlass.Float32,
             requested_splits: cutlass.Int32,
             max_q_len: cutlass.Int32,
             direct_q1_inputs: tuple,
@@ -1843,8 +1909,6 @@ def _get_compiled_decode(
                 partial_o.iterator,
                 partial_stats.iterator,
                 attention_sinks.iterator,
-                softmax_scale,
-                output_scale,
                 stream,
                 static_cfg,
                 static_full_split_prefix,
@@ -2058,8 +2122,8 @@ def _get_compiled_decode(
                 Int64(1),
                 Int64(1),
                 Int64(1),
-                Float32(1.0),
-                Float32(1.0),
+                fake_scale(compile_spec.scale_types[0]),
+                fake_scale(compile_spec.scale_types[1]),
                 Int32(1),
                 Int32(0),
                 direct_q1_fake,
@@ -2081,7 +2145,7 @@ def _get_compiled_decode(
             compiled_reducer = build_and_load_attention_kernel(
                 "decode",
                 "reducer",
-                compile_spec,
+                replace(compile_spec, scale_types=(False, False)),
                 _COMPILE_OPTIONS,
                 lambda: cute.compile(
                     reduction_tensor_adapter,
@@ -2092,8 +2156,6 @@ def _get_compiled_decode(
                     partial_o_fake,
                     partial_stats_fake,
                     attention_sinks_fake,
-                    Float32(1.0),
-                    Float32(1.0),
                     Int32(1),
                     Int32(0),
                     direct_q1_fake,
@@ -2143,9 +2205,14 @@ def get_prims_ts_batch_decode_workspace_size(
     ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
     FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
     including ``batch_size``, changes because the internal section offsets can
-    move even when the compiled callable is reused. Fixed-Q launches use
-    ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
-    static ``max_q_len`` bound used for workspace geometry and JIT policy.
+    move even when the compiled callable is reused. Alternatively, plans for one
+    device may share one buffer of at least the largest size returned for them:
+    zero the whole buffer once, bind the same full tensor to every plan (not
+    slices), and plan and launch them on one stream. PrimTS may use any byte
+    of the passed buffer: its zero-at-rest control state sits at the buffer
+    end, and launches leave it zero. Fixed-Q launches use ``seq_len_q``.
+    Packed-Q launches provide ``qo_indptr`` and the explicit static
+    ``max_q_len`` bound used for workspace geometry and JIT policy.
     ``max_kv_len`` must be no larger than ``2,147,483,392`` so the padded
     256-token K/V tile endpoint remains representable as signed Int32.
     ``storage_page_size`` defaults to the semantic ``page_size``. A larger
@@ -2251,8 +2318,8 @@ def _prepare_decode_runtime(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     out_dtype: torch.dtype,
-    softmax_scale: Optional[float],
-    output_scale: float,
+    softmax_scale: Optional[GlobalScale],
+    output_scale: GlobalScale,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
 ) -> _DecodeRuntime:
@@ -2304,11 +2371,12 @@ def _prepare_decode_runtime(
         k_cache=k_cache,
         logical_head_dim=head_dim,
     )
-    effective_softmax_scale = _validate_scale(
+    effective_softmax_scale = normalize_scale(
         1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale,
         "softmax_scale",
+        device,
     )
-    effective_output_scale = _validate_scale(output_scale, "output_scale")
+    effective_output_scale = normalize_scale(output_scale, "output_scale", device)
     output_shape = _decode_output_shape(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -2408,8 +2476,6 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             sinks,
-            runtime.softmax_scale,
-            runtime.output_scale,
             requested_splits,
             max_q_len,
             (),
@@ -2473,8 +2539,8 @@ def _prepare_decode_runtime_unchecked(
     kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     out_dtype: torch.dtype,
-    softmax_scale: Optional[float],
-    output_scale: float,
+    softmax_scale: Optional[GlobalScale],
+    output_scale: GlobalScale,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
 ) -> _DecodeRuntime:
@@ -2522,9 +2588,9 @@ def _prepare_decode_runtime_unchecked(
         softmax_scale=(
             1.0 / math.sqrt(int(q.shape[-1]))
             if softmax_scale is None
-            else float(softmax_scale)
+            else softmax_scale
         ),
-        output_scale=float(output_scale),
+        output_scale=output_scale,
     )
 
 
@@ -2673,6 +2739,8 @@ class PrimsTSBatchDecodePlan:
     _workspace: _DecodeWorkspaceViews
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
+    _softmax_scale: GlobalScale
+    _output_scale: GlobalScale
     _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
     _lse_mode: str = "none"
@@ -2689,8 +2757,8 @@ class PrimsTSBatchDecodePlan:
         query: torch.Tensor,
         *,
         out: torch.Tensor,
-        softmax_scale: Optional[float] = None,
-        output_scale: float = 1.0,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: Optional[GlobalScale] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -2702,6 +2770,11 @@ class PrimsTSBatchDecodePlan:
         It is allocated if omitted; ``return_lse`` controls only tuple return.
         Supply output/LSE buffers and ``validate=False`` for allocation-free
         capture. See the module guide for scale and buffer ownership contracts.
+
+        Omitted scales inherit the preparation defaults. Each override must
+        retain its planned host-float or CUDA FP32 tensor type. Tensor scales
+        have shape () or (1,), reside on the query device, and must remain finite and
+        positive; validation checks metadata without reading device values.
 
         ``attention_sinks`` is a compact CUDA float32 ``[Hq]`` vector of
         natural-log sink logits after QK scaling, with zero V contribution.
@@ -2730,11 +2803,12 @@ class PrimsTSBatchDecodePlan:
                 "validated by the PrimTS plan"
             )
 
-        softmax_scale = _validate_scale(
-            1.0 / math.sqrt(self._head_dim) if softmax_scale is None else softmax_scale,
-            "softmax_scale",
+        softmax_scale = resolve_scale(
+            softmax_scale, self._softmax_scale, "softmax_scale", self._device
         )
-        output_scale = _validate_scale(output_scale, "output_scale")
+        output_scale = resolve_scale(
+            output_scale, self._output_scale, "output_scale", self._device
+        )
         lse = prepare_lse(
             lse, q=query, mode=self._lse_mode, return_lse=return_lse, validate=validate
         )
@@ -2758,8 +2832,8 @@ class PrimsTSBatchDecodePlan:
         self,
         query: torch.Tensor,
         out: torch.Tensor,
-        softmax_scale: float,
-        output_scale: float,
+        softmax_scale: GlobalScale,
+        output_scale: GlobalScale,
         direct_q1_inputs: Optional[tuple[Optional[torch.Tensor], ...]] = None,
         lse: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -2826,8 +2900,6 @@ class PrimsTSBatchDecodePlan:
                 self._workspace.attention_sinks
                 if attention_sinks is None
                 else attention_sinks,
-                softmax_scale,
-                output_scale,
                 self._requested_splits,
                 self.q_capacity,
                 direct_inputs,
@@ -2893,6 +2965,7 @@ def _resolve_decode_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
 
 
@@ -3627,6 +3700,8 @@ def _prepare_prims_ts_batch_decode_plan(
     allow_head_aware_locators: bool = False,
     use_attention_sinks: bool = False,
     lse_mode: Literal["none", "base2"] = "none",
+    softmax_scale: Optional[GlobalScale] = None,
+    output_scale: GlobalScale = 1.0,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3716,6 +3791,12 @@ def _prepare_prims_ts_batch_decode_plan(
     )
     resolved_device, device_index = _resolve_cuda_device(query.device)
     _validate_runtime_device(resolved_device)
+    softmax_scale = normalize_scale(
+        head_dim**-0.5 if softmax_scale is None else softmax_scale,
+        "softmax_scale",
+        resolved_device,
+    )
+    output_scale = normalize_scale(output_scale, "output_scale", resolved_device)
 
     policy_args = (
         device_index,
@@ -3775,6 +3856,7 @@ def _prepare_prims_ts_batch_decode_plan(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     _validate_workspace_buffer(
         workspace_buffer,
@@ -3837,6 +3919,7 @@ def _prepare_prims_ts_batch_decode_plan(
         direct_q1_spec=direct_q1_spec,
         flat_native_kv_tma=flat_native_kv_tma,
         lse_mode=lse_mode,
+        scale_types=scale_types(softmax_scale, output_scale),
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)
@@ -3873,6 +3956,8 @@ def _prepare_prims_ts_batch_decode_plan(
         _workspace=workspace,
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
+        _softmax_scale=softmax_scale,
+        _output_scale=output_scale,
         _direct_q1_inputs=direct_q1_inputs,
         _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
         _lse_mode=lse_mode,
@@ -3909,6 +3994,8 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     split_kv: bool = True,
     use_attention_sinks: bool = False,
     lse_mode: Literal["none", "base2"] = "none",
+    softmax_scale: Optional[GlobalScale] = None,
+    output_scale: GlobalScale = 1.0,
 ) -> PrimsTSBatchDecodePlan:
     """Validate and prepare a reusable dense-block-table PrimTS launch.
 
@@ -3961,6 +4048,12 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     split_kv : bool
         Permit automatic split fanout (True, default), or force S1 (False).
         Independent of packed/fixed Q. Match workspace sizing's value.
+    softmax_scale, output_scale : float or torch.Tensor, optional
+        Independent QK and V/output multipliers, defaulting to ``head_dim**-0.5``
+        and one. Each operand is a host float or a contiguous CUDA FP32 tensor
+        of shape () or (1,) on the query device. Types select the compiled signature;
+        values are retained as run defaults. Softmax uses natural units. Tensor
+        contents must stay finite and positive and may change during replay.
 
     Returns
     -------
@@ -3998,6 +4091,8 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         kv_scale_factors=kv_scale_factors,
         split_kv=split_kv,
         use_q_token_kv_block_sparse_route=False,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
     )
@@ -4066,6 +4161,8 @@ class BatchDecodePagedTSWrapper:
         split_kv: bool = True,
         validate: bool = True,
         initialize_workspace: bool = True,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: GlobalScale = 1.0,
     ) -> None:
         """Select/cache a bounded paged-decode execution and bind reusable scratch.
 
@@ -4079,7 +4176,14 @@ class BatchDecodePagedTSWrapper:
         scratch may be passed without a size query. Planning initializes control
         storage unless initialize_workspace=False transfers that to the caller.
         Active split counts are automatic runtime operands for main/reduction
-        kernels; users never supply the count."""
+        kernels; users never supply the count.
+
+        ``softmax_scale`` and ``output_scale`` independently accept host floats
+        or contiguous CUDA FP32 tensors of shape ``()`` or ``(1,)``. Their types select
+        the compiled signature; run() inherits these defaults. Device values
+        must be finite and positive and may change in place during graph replay.
+        Softmax scales use natural, not base-2, units.
+        """
 
         if packed_query and max_q_len is None:
             raise ValueError("packed Q requires max_q_len in plan()")
@@ -4152,6 +4256,12 @@ class BatchDecodePagedTSWrapper:
         device, device_index = _resolve_cuda_device(device)
         if validate:
             _validate_runtime_device(device)
+        softmax_scale = normalize_scale(
+            head_dim**-0.5 if softmax_scale is None else softmax_scale,
+            "softmax_scale",
+            device,
+        )
+        output_scale = normalize_scale(output_scale, "output_scale", device)
 
         policy_args = (
             device_index,
@@ -4225,7 +4335,21 @@ class BatchDecodePagedTSWrapper:
             if fixed_uniform_kv and spec.requested_splits == cfg.splits_kv:
                 # The live bound equals this declared topology; partial activity
                 # is still derived from the owned lengths, as before runtime buckets.
-                spec = replace(spec, config=replace(cfg, runtime_split_kv=False))
+                # Static kernels use the capacity-strided layout; same bytes
+                # since requested == capacity.
+                static_cfg = replace(cfg, runtime_split_kv=False)
+                spec = replace(
+                    spec,
+                    config=static_cfg,
+                    scratch_shapes=_decode_scratch_shapes(
+                        static_cfg,
+                        batch_size=batch_size,
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        seq_len_q=seq_len_q,
+                    ),
+                )
         compile_spec = _make_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -4241,6 +4365,7 @@ class BatchDecodePagedTSWrapper:
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
             lse_mode=lse_mode,
+            scale_types=scale_types(softmax_scale, output_scale),
             runtime_kv_lengths=not fixed_uniform_kv
             and (cfg.runtime_split_kv or not cfg.use_split_kv),
         )
@@ -4255,6 +4380,7 @@ class BatchDecodePagedTSWrapper:
             out_dtype,
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
+            scratch_reserve=spec.scratch_reserve,
         )
         if workspace_buffer is None:
             initialize_workspace = True
@@ -4287,6 +4413,8 @@ class BatchDecodePagedTSWrapper:
         )
 
         candidate = _DecodePlanState(
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             device=device,
             device_index=device_index,
             batch_size=batch_size,
@@ -4339,8 +4467,8 @@ class BatchDecodePagedTSWrapper:
         *,
         kv_scale_factors: Optional[PagedKVScaleFactors] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        softmax_scale: Optional[float] = None,
-        output_scale: float = 1.0,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: Optional[GlobalScale] = None,
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
@@ -4379,14 +4507,19 @@ class BatchDecodePagedTSWrapper:
         ``validate=True`` performs structural and value validation. It
         reads per-run metadata values back to the host.
         ``validate=False`` treats every run argument as a trusted binding,
-        performs no explicit wrapper validation, and remains free of metadata
+        skips metadata validation and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
         and optional output allocation are unavoidable in both modes.
 
         Supply seq_lens_kv on every run unless plan() owns its CUDA copy. Packed queries require qo_indptr; fixed Q
         rejects it under validation. Q/K/V dtypes, cache layout and model semantics
-        must match plan(). softmax_scale is the finite positive host effective QK scale
-        (default 1/sqrt(D)); output_scale is the host V/output scale (default 1).
+        must match plan(). softmax_scale is the effective QK scale in regular,
+        not log2, units (default 1/sqrt(D)); output_scale is the V/output scale
+        (default 1). Omitted scales inherit plan() values. Each override must
+        keep its planned float/tensor type. Tensor scales are contiguous CUDA
+        FP32 shape () or (1,) inputs on the plan device; their finite-positive values
+        are a caller precondition and are never read back to the host. Scale
+        metadata and argument types are checked in both validation modes.
 
         Enabled attention_sinks requires compact CUDA FP32 [Hq] natural-log logits
         after QK scaling. Values must be finite or -inf and add zero V contribution;
@@ -4396,6 +4529,12 @@ class BatchDecodePagedTSWrapper:
             raise TypeError("validate must be a bool")
 
         state = self._require_plan_state()
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", state.device
+        )
+        output_scale = resolve_scale(
+            output_scale, state.output_scale, "output_scale", state.device
+        )
         if state.planned_seq_lens_kv_device is not None:
             if seq_lens_kv is not None:
                 raise ValueError(
@@ -4543,8 +4682,8 @@ def batch_decode_with_paged_kv_cache(
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
     kv_layout: Literal["HND", "NHD"] = "HND",
-    softmax_scale: Optional[float] = None,
-    output_scale: float = 1.0,
+    softmax_scale: Optional[GlobalScale] = None,
+    output_scale: GlobalScale = 1.0,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -4603,8 +4742,12 @@ def batch_decode_with_paged_kv_cache(
         Left sliding-window extent, or ``-1`` to disable the window.
     kv_layout : {"HND", "NHD"}
         Layout of the paged K/V cache.
-    softmax_scale, output_scale : float, optional
-        QK and value/output scaling factors.
+    softmax_scale, output_scale : float or torch.Tensor, optional
+        Independent QK and value/output multipliers, defaulting to
+        ``head_dim**-0.5`` and one. Each may be a host float or a contiguous CUDA
+        FP32 tensor of shape () or (1,) on the query device. Softmax uses natural
+        units. Tensor values must be finite and positive; they are read only
+        by the kernel, without device-to-host synchronization.
     out : torch.Tensor, optional
         Caller-owned output tensor.
     out_dtype : torch.dtype, optional
@@ -4793,6 +4936,8 @@ def batch_decode_with_paged_kv_cache(
         workspace_buffer=workspace_buffer,
         validate=validate,
         initialize_workspace=allocate_workspace,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
     )
     return wrapper.run(
         q,

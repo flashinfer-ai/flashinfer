@@ -17,10 +17,10 @@ Independent reference for the DSA indexer top-k contract
 (flashinfer-ai/flashinfer#5676): input generators, an FP64 / FP32 scorer, the
 exact global selection with the issue's tie rule, the accumulation-error
 bound and the judgement of a result against the reference.  Shared by
-``tests/experimental/test_cake_dsa_indexer.py``,
-``tests/experimental/test_cake_dsa_indexer_fp8.py``,
-``tests/experimental/test_cake_dsa_indexer_api.py`` and
-``benchmarks/bench_cake_dsa_indexer.py``.
+``tests/experimental/test_cake_dsa_indexer_det_train.py``,
+``tests/experimental/test_cake_dsa_indexer_det_train_fp8.py``,
+``tests/experimental/test_cake_dsa_indexer_det_train_api.py`` and
+``benchmarks/bench_cake_dsa_indexer_det_train.py``.
 
 Nothing here knows how the kernels partition queries or keys.
 

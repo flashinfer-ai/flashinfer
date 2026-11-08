@@ -1098,10 +1098,19 @@ def _create_build_metadata():
         return version
 
     # In git repo (editable) or file doesn't exist, create/update it
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer package."""\n')
-        f.write(f'__version__ = "{version}"\n')
-        f.write(f'__git_commit__ = "{git_version}"\n')
+    content = (
+        '"""Build metadata for flashinfer package."""\n'
+        f'__version__ = "{version}"\n'
+        f'__git_commit__ = "{git_version}"\n'
+    )
+    # Concurrent AOT provider builds import this module at start-up while
+    # others import flashinfer, so a reader must never see a truncated file:
+    # skip an identical rewrite and replace the file atomically otherwise.
+    if build_meta_file.exists() and build_meta_file.read_text() == content:
+        return version
+    tmp_file = build_meta_file.with_name(f"{build_meta_file.name}.{os.getpid()}.tmp")
+    tmp_file.write_text(content)
+    os.replace(tmp_file, build_meta_file)
 
     print(f"Created build metadata file with version {version}")
     return version
@@ -1239,7 +1248,10 @@ def build_sdist(sdist_directory, config_settings=None):
 # well: flashinfer/experimental/<pkg>/csrc/** and flashinfer/data/csrc/experimental/**.
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
-# 100 MB. The Python modules, build.json manifests and route catalogs stay, so
+# 100 MB. The Cake training backends one level deeper,
+# flashinfer/experimental/cake/<pkg>/csrc/**, are not matched and ship in every
+# wheel: they back the stable flashinfer.cake_<op>_<det|nondet>_train[_kcp]
+# facades (#8928). The Python modules, build.json manifests and route catalogs stay, so
 # `import flashinfer` is unchanged and an experimental kernel load fails on
 # first use; the marker file below says why and where the sources are.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"

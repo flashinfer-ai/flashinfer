@@ -692,10 +692,15 @@ kernel_cake_dsv4_8625d6529808d0d51fc2(const __grid_constant__ CUtensorMap tmap_q
                         int row1_3 = ((raw_rows_3[1] >= 0) ? raw_rows_3[1] : 0);
                         int row2_3 = ((raw_rows_3[2] >= 0) ? raw_rows_3[2] : 0);
                         int row3_3 = ((raw_rows_3[3] >= 0) ? raw_rows_3[3] : 0);
+                        int v_rows[4];
+                        v_rows[0] = ((global_last_tile == 0) ? raw_rows_3[0] : row0_3);
+                        v_rows[1] = ((global_last_tile == 0) ? raw_rows_3[1] : row1_3);
+                        v_rows[2] = ((global_last_tile == 0) ? raw_rows_3[2] : row2_3);
+                        v_rows[3] = ((global_last_tile == 0) ? raw_rows_3[3] : row3_3);
                         if (global_last_tile == 0) {
-                            tma_gather4_gmem2smem(v_dst_1 + group_3 * 512, (&tmap_swa_kv), v_col_1, row0_3, row1_3, row2_3, row3_3, kv_full_addr + (load_kv_stage) * 8);
+                            tma_gather4_gmem2smem(v_dst_1 + group_3 * 512, (&tmap_swa_kv), v_col_1, v_rows[0], v_rows[1], v_rows[2], v_rows[3], kv_full_addr + (load_kv_stage) * 8);
                         } else {
-                            tma_gather4_gmem2smem(v_dst_1 + group_3 * 512, (&tmap_compressed_kv), v_col_1, row0_3, row1_3, row2_3, row3_3, kv_full_addr + (load_kv_stage) * 8);
+                            tma_gather4_gmem2smem(v_dst_1 + group_3 * 512, (&tmap_compressed_kv), v_col_1, v_rows[0], v_rows[1], v_rows[2], v_rows[3], kv_full_addr + (load_kv_stage) * 8);
                         }
                     }
                     load_kv_stage += 1;

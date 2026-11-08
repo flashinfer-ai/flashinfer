@@ -811,6 +811,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                     PrivateCounters[1154 + block] = (unsigned int)0;
                 }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp = warp + 8;
             unsigned int values[4];
             float reduced[40];
@@ -1068,6 +1069,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                     if (elect_sync()) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             if (a_rows32 == 0) {
@@ -1131,7 +1133,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                             tma_3d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B1), k_1 * 128, n_offset, task_1[1], ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB1), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                         } else {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B2), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B2), 0, task_1[1] * task_1[6] + n_offset, (unsigned int)k_1 * 2, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB2), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                         }
                         if (cta_rank == 0) {
@@ -2254,6 +2256,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp_3 = warp - 8;
             unsigned int values_1[4];
             float reduced_1[40];
