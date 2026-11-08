@@ -3920,9 +3920,7 @@ def test_functional_two_streams(monkeypatch, row):
 def test_functional_first_call_on_fresh_slab(monkeypatch, stage, tp, tokens):
     """A one-shot call that is the process's first control-word request (no slab yet) creates the slab, takes
     its lane and reproduces a prepared runner bitwise (no lock re-entry)."""
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else None
-    if device is None:
-        pytest.skip("requires a GPU")
+    device = _require_program(stage, tp, tokens)
     if stage == "front":
         args, kwargs = _front_args(device, tp, tokens, 31), {}
         call, prepare = kimi_k3_latent_moe_front, prepare_kimi_k3_latent_moe_front
