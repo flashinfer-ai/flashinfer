@@ -497,6 +497,8 @@ __global__ void RopeQuantizeKernel(
   uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
   uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
 
+  if (by < k_rope_end && tx * vec_size >= rope_dim) return;
+
   vec_t<float, vec_size> cos, sin;
   if (bx * bdy + ty < nnz) {
     const uint32_t idx = bx * bdy + ty;
@@ -1291,73 +1293,86 @@ cudaError_t RopeQuantize(
 
   // Use nested macros for runtime->compile-time dispatch for required constexpr values
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-    constexpr uint32_t vec_size = 32 / sizeof(DType);
-    uint32_t bdx = (rope_dim + vec_size - 1) / vec_size;
-    bdx = std::max(1u, bdx);
-    uint32_t num_threads = std::max(128U, bdx);
-    uint32_t bdy = std::max(1u, num_threads / bdx);
-    uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-    uint32_t rope_chunk_size = rope_dim;
-    uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-    uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-    uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
-                              num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
-    void* args[] = {(void*)&q_rope_in,
-                    (void*)&k_rope_in,
-                    (void*)&q_nope_in,
-                    (void*)&k_nope_in,
-                    (void*)&q_rope_out,
-                    (void*)&k_rope_out,
-                    (void*)&q_nope_out,
-                    (void*)&k_nope_out,
-                    (void*)&cos_sin_cache,
-                    (void*)&pos_ids,
-                    (void*)&nnz,
-                    (void*)&num_qo_heads,
-                    (void*)&num_kv_heads,
-                    (void*)&rope_dim,
-                    (void*)&no_rope_dim,
-                    (void*)&q_rope_in_stride_n,
-                    (void*)&q_rope_in_stride_h,
-                    (void*)&q_nope_in_stride_n,
-                    (void*)&q_nope_in_stride_h,
-                    (void*)&q_rope_out_stride_n,
-                    (void*)&q_rope_out_stride_h,
-                    (void*)&q_nope_out_stride_n,
-                    (void*)&q_nope_out_stride_h,
-                    (void*)&k_rope_in_stride,
-                    (void*)&k_rope_in_stride_h,
-                    (void*)&k_nope_in_stride,
-                    (void*)&k_nope_in_stride_h,
-                    (void*)&k_rope_out_stride,
-                    (void*)&k_rope_out_stride_h,
-                    (void*)&k_nope_out_stride,
-                    (void*)&k_nope_out_stride_h,
-                    (void*)&quant_scale_q,
-                    (void*)&quant_scale_kv};
-    auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType>;
-    dim3 nblks(nblks_x, total_blocks_y);
-    dim3 nthrs(bdx, bdy);
+    // NeoX vectors must stay within one half of the rotary dimension so
+    // their rotation partners and signs are uniform and cache loads are aligned.
+    uint32_t aligned_vec_size = 32 / sizeof(DType);
+    if constexpr (!INTERLEAVE) {
+      while ((rope_dim / 2) % aligned_vec_size != 0) aligned_vec_size /= 2;
+    }
+    DISPATCH_ALIGNED_VEC_SIZE(aligned_vec_size, vec_size, {
+      uint32_t bdx = (rope_dim + vec_size - 1) / vec_size;
+      if constexpr (!INTERLEAVE) {
+        // Align sub-warp heads to warp boundaries so an in-place rotation
+        // cannot overwrite a partner that another warp has not loaded yet.
+        uint32_t padded_bdx = 1;
+        while (padded_bdx < bdx) padded_bdx *= 2;
+        bdx = padded_bdx;
+      }
+      uint32_t num_threads = std::max(128U, bdx);
+      uint32_t bdy = std::max(1u, num_threads / bdx);
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+      uint32_t rope_chunk_size = rope_dim;
+      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
+                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
+      void* args[] = {(void*)&q_rope_in,
+                      (void*)&k_rope_in,
+                      (void*)&q_nope_in,
+                      (void*)&k_nope_in,
+                      (void*)&q_rope_out,
+                      (void*)&k_rope_out,
+                      (void*)&q_nope_out,
+                      (void*)&k_nope_out,
+                      (void*)&cos_sin_cache,
+                      (void*)&pos_ids,
+                      (void*)&nnz,
+                      (void*)&num_qo_heads,
+                      (void*)&num_kv_heads,
+                      (void*)&rope_dim,
+                      (void*)&no_rope_dim,
+                      (void*)&q_rope_in_stride_n,
+                      (void*)&q_rope_in_stride_h,
+                      (void*)&q_nope_in_stride_n,
+                      (void*)&q_nope_in_stride_h,
+                      (void*)&q_rope_out_stride_n,
+                      (void*)&q_rope_out_stride_h,
+                      (void*)&q_nope_out_stride_n,
+                      (void*)&q_nope_out_stride_h,
+                      (void*)&k_rope_in_stride,
+                      (void*)&k_rope_in_stride_h,
+                      (void*)&k_nope_in_stride,
+                      (void*)&k_nope_in_stride_h,
+                      (void*)&k_rope_out_stride,
+                      (void*)&k_rope_out_stride_h,
+                      (void*)&k_nope_out_stride,
+                      (void*)&k_nope_out_stride_h,
+                      (void*)&quant_scale_q,
+                      (void*)&quant_scale_kv};
+      auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType>;
+      dim3 nblks(nblks_x, total_blocks_y);
+      dim3 nthrs(bdx, bdy);
 
-    cudaLaunchAttribute attribute[1];
-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
-    cudaLaunchConfig_t config;
-    config.gridDim = nblks;
-    config.blockDim = nthrs;
-    config.stream = stream;
-    config.dynamicSmemBytes = 0;
-    config.attrs = attribute;
-    config.numAttrs = 1;
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+      cudaLaunchConfig_t config;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.stream = stream;
+      config.dynamicSmemBytes = 0;
+      config.attrs = attribute;
+      config.numAttrs = 1;
 
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-        &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, q_rope_out, k_rope_out,
-        q_nope_out, k_nope_out, cos_sin_cache, pos_ids, nnz, num_qo_heads, num_kv_heads, rope_dim,
-        no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h,
-        q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h,
-        k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride, k_nope_in_stride_h,
-        k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride, k_nope_out_stride_h,
-        quant_scale_q, quant_scale_kv));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, q_rope_out, k_rope_out,
+          q_nope_out, k_nope_out, cos_sin_cache, pos_ids, nnz, num_qo_heads, num_kv_heads, rope_dim,
+          no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+          q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+          q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+          k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
+          k_nope_out_stride_h, quant_scale_q, quant_scale_kv));
+    });
   });
 
   return cudaSuccess;
