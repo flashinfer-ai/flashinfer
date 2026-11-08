@@ -165,7 +165,9 @@ as torch computes it for BF16 ``X`` ``[T, 4, H]``,
 ``cake_mhc_head_det_train_backward`` writes the gradient
 ``dX[:, i, :] = BF16(dY / 4)`` of each stream or adds it into a caller's
 ``dX`` (``accumulate=True``), and ``cake_mhc_head_det`` is the autograd form.
-Its non-deterministic counterpart is the module
+Every output (``Y``, the written ``dX`` and the accumulated ``dX``) repeats bit
+for bit for identical inputs, also in the recompute of an activation
+checkpoint. Its non-deterministic counterpart is the module
 ``flashinfer.cake_mhc_head_nondet_train`` (below).
 
 .. currentmodule:: flashinfer.cake_mhc_head_det_train
