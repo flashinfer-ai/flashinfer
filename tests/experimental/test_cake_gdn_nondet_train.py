@@ -3240,7 +3240,8 @@ def test_chain_plan_tables_stay_within_the_budgets(
     # the deeper tables of CHAIN_PLAN (this architecture's constants, else sm_107a's; no saving floor): the forward runs
     # the pre-scan, the stitch and fwd_ho on a deeper forward table, the backward the fused pre-scan and dhu_tc2 on a
     # deeper adjoint table; the bits repeat run to run and stay within the budgets of the tables without CHAIN_PLAN;
-    # plan pins keep the planner's tables (the same bits with and without CHAIN_PLAN)
+    # plan pins keep the planner's tables (the same bits with and without CHAIN_PLAN).  The tables are the call's: its
+    # value-head group selects a form of cake_plan.ADJOINT_FORMS (GB200's H 1 / HV 3 keeps the planner's tables)
     index = cake_chain._device_index(device)
     arch = cake_backend.device_arch(index)
     const = cake_chain.CHAIN_PLAN.get(arch, cake_chain.CHAIN_PLAN["sm_107a"])
@@ -3248,12 +3249,13 @@ def test_chain_plan_tables_stay_within_the_budgets(
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=313)
     monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
-    (fwd0, bwd0), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    group = heads[1] // heads[0]
+    (fwd0, bwd0), _tc = cake_chain.host_plans(seq_lens, heads[1], index, group=group)
     base = _run(inputs, seq_lens)
     pins = {"scan_config": tuple(fwd0.config), "segment_chunks": fwd0.segment_len}
     base_pinned = _run(inputs, seq_lens, **pins)
     monkeypatch.setattr(cake_chain, "CHAIN_PLAN", forced)
-    (fwd, bwd), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    (fwd, bwd), _tc = cake_chain.host_plans(seq_lens, heads[1], index, group=group)
     stages = _record_launches(monkeypatch)
     runs = [_run(inputs, seq_lens) for _ in range(2)]
     _assert_same_bits(runs[1], runs[0], OUTPUT_NAMES)
