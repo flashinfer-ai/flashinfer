@@ -58,6 +58,13 @@ def get_seed_and_offset(
     generator: Optional[torch.Generator] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[int, int]:
+    """Reserve a four-aligned RNG range and return its seed and starting offset.
+
+    Reservations through this helper are serialized across host threads. The
+    lock does not coordinate with PyTorch RNG operations or other mutations of
+    the same generator; callers must serialize such mixed use, including when
+    using the default generator.
+    """
     if generator is None:
         generator = get_default_generators(device)
     # Serialize FlashInfer reservations: get_state/set_state alone do not
