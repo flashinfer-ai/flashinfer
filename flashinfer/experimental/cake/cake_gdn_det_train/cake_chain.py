@@ -490,6 +490,15 @@ class SegmentTable:
 
 
 @dataclass(frozen=True)
+class TableReady:
+    """The write of a cached device table (:func:`_table_ready`): the raw handle of the stream that wrote it and an
+    event recorded on that stream after the write."""
+
+    stream: int
+    event: torch.cuda.Event
+
+
+@dataclass(frozen=True)
 class ChunkMeta:
     """The chunk and segment tables of one layout.  ``order`` (host route): table sequence ``vs`` is the caller's
     sequence ``order[vs]``, its chunks at their original token offsets (``None``: the caller's order);
@@ -497,7 +506,8 @@ class ChunkMeta:
     ``bwd_groups``: the two-stream sequence groups of the forward / adjoint scan (``None``: one stream).
     ``bwd_wavefront``: the adjoint scan stage of the wavefront pair where the table's side of the wavefront rule
     holds (:func:`_wavefront_table`; ``None``: the separate launches); ``bwd_tc``: the adjoint table is priced for
-    ``dhu_tc2`` (:func:`tc_plan_pricing`, :func:`chain_plan_pricing`), which runs it."""
+    ``dhu_tc2`` (:func:`tc_plan_pricing`, :func:`chain_plan_pricing`), which runs it.  ``ready``: the write of a
+    cached table (:func:`_use_table`; ``None``: a table built for its call)."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -513,6 +523,7 @@ class ChunkMeta:
     bwd_groups: StreamGroups | None = None
     bwd_wavefront: str | None = None
     bwd_tc: bool = False
+    ready: TableReady | None = None
 
 
 @dataclass(frozen=True)
@@ -627,16 +638,71 @@ def build_chunk_meta(
                      segments[1], order, order_index)  # fmt: skip
 
 
-@lru_cache(maxsize=256)
+# --------------------------------------------------------------------------- #
+# cached device tables
+# --------------------------------------------------------------------------- #
+# A cached device table (a host-built layout's chunk and segment tables, the wavefront pair's tile order, the identity
+# walk of fwd_ho) is written on the stream of the call that builds it, by a non-blocking copy or a launch, and read by
+# later calls on any stream.  The build records an event after the write; a hit on another stream waits for that event
+# and records the table's use on its stream, so the caching allocator reuses an evicted table only after that stream's
+# launches.  A table built inside a CUDA graph capture is written only when the graph replays, so it is not cached.  A
+# capture reads a cached table without waiting (a capturing stream cannot wait for an event recorded outside the
+# capture), so the table's write must be done when the capture starts: torch.cuda.graph synchronizes the device first.
+# That covers only work queued before the capture; a table another thread builds during the capture must have its
+# stream synchronized before the capture reads it.  The table is then kept for the process, since every replay reads it.
+_HOST_META: dict = {}
+_HOST_META_LIMIT = 256
+_GRAPH_TABLES: dict[int, torch.Tensor] = {}
+
+
+def _table_ready(device_index: int) -> TableReady:
+    """The :class:`TableReady` of a table just written on the current stream."""
+    stream = torch.cuda.current_stream(device_index)
+    event = torch.cuda.Event()
+    event.record(stream)
+    return TableReady(stream.cuda_stream, event)
+
+
+def _use_table(
+    table: torch.Tensor, ready: TableReady | None, device_index: int
+) -> None:
+    """Make a cached table (``table``: any view of it) safe to read by the current stream's next launches: under a
+    CUDA graph capture keep it for the process; on a stream other than the one that wrote it, wait for the write and
+    record the use.  ``ready`` ``None``: a table built for its call, nothing to do."""
+    if ready is None:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        _GRAPH_TABLES.setdefault(table.untyped_storage().data_ptr(), table)
+    elif torch._C._cuda_getCurrentRawStream(device_index) != ready.stream:
+        stream = torch.cuda.current_stream(device_index)
+        stream.wait_event(ready.event)
+        table.record_stream(stream)
+
+
 def _host_chunk_meta(
     seq_lens: tuple[int, ...],
     plans: tuple[ScanPlan, ScanPlan],
     device_index: int,
     lpt: bool,
 ) -> ChunkMeta:
-    return build_chunk_meta(
+    """:func:`build_chunk_meta` on the device, cached for the ``_HOST_META_LIMIT`` most recently used keys (outside a
+    CUDA graph capture)."""
+    key = (seq_lens, plans, device_index, lpt)
+    meta = _HOST_META.pop(key, None)
+    if meta is not None:
+        _HOST_META[key] = meta
+        _use_table(meta.chunk_start, meta.ready, device_index)
+        return meta
+    meta = build_chunk_meta(
         seq_lens, torch.device("cuda", device_index), scan_plans=plans, lpt=lpt
     )
+    if torch.cuda.is_current_stream_capturing():
+        return meta
+    meta = replace(meta, ready=_table_ready(device_index))
+    if len(_HOST_META) >= _HOST_META_LIMIT:
+        _HOST_META.pop(next(iter(_HOST_META)), None)
+    _HOST_META[key] = meta
+    return meta
 
 
 def segments_upper_bound(num_chunks_max: int, num_seqs: int, segment_len: int) -> int:
@@ -1123,7 +1189,12 @@ _FRESH = FreshWorkspaces()
 
 
 def _workspaces(options: ChainOptions) -> Workspaces:
-    return _POOLED if options.host_cache else _FRESH
+    """The pooled per-stream workspaces under ``host_cache``, else fresh buffers.  A CUDA graph capture takes fresh
+    buffers (from the graph's memory pool): pooled ones would be shared with the other graphs captured on that stream
+    and with eager calls on it, and an eviction would free them while the graph still writes them."""
+    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+        return _POOLED
+    return _FRESH
 
 
 @cache
@@ -2058,7 +2129,9 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 
     Every tensor a side stream reads or writes is allocated on the caller's stream before the fork and stays
     referenced by the stage until the join (``main.wait_stream(side)``, also when a launch raises), so the caching
-    allocator reuses its memory only after the side stream's work: no ``record_stream``."""
+    allocator reuses its memory only after the side stream's work: no ``record_stream``.  A cached device table it
+    reads was built on some stream; the caller's stream waited for its write and recorded its use before the fork
+    (:func:`_use_table`)."""
     key = (device_index, main.cuda_stream)
     stream = _SIDE_STREAMS.get(key)
     if stream is None:
@@ -2195,12 +2268,14 @@ def _wavefront_order_tensor(
     order: tuple[int, ...] | None,
     segment_len: int,
     device_index: int,
-) -> torch.Tensor:
-    """:func:`_wavefront_walk` on the device, built once per table."""
+) -> tuple[torch.Tensor, TableReady]:
+    """:func:`_wavefront_walk` on the device, built once per table (outside a CUDA graph capture: the wavefront pair
+    is not captured), and its write."""
     table = torch.tensor(
         _wavefront_walk(seq_lens, order, segment_len), dtype=torch.int32
     )
-    return table.pin_memory().to(torch.device("cuda", device_index), non_blocking=True)
+    table = table.pin_memory().to(torch.device("cuda", device_index), non_blocking=True)
+    return table, _table_ready(device_index)
 
 
 def _wavefront_events(
@@ -2352,16 +2427,18 @@ _WALKS: dict = {}
 def _walk(device, segs: SegmentTable, options: ChainOptions) -> torch.Tensor:
     """The walk of ``fwd_ho`` (CTA group ``b // HV`` runs segment ``walk[b]``): the table's own (longest first) when it
     has one, else the identity, a constant table per (device, segment count) kept between calls under
-    ``host_cache``."""
+    ``host_cache`` (one built inside a CUDA graph capture is not kept)."""
     if segs.walk is not None:
         return segs.walk
     num_segments = segs.num_segments
     key = (_device_index(device), int(num_segments))
-    walk = _WALKS.get(key) if options.host_cache else None
-    if walk is None:
-        walk = torch.arange(int(num_segments), dtype=torch.int32, device=device)
-        if options.host_cache:
-            _WALKS[key] = walk
+    hit = _WALKS.get(key) if options.host_cache else None
+    if hit is not None:
+        _use_table(hit[0], hit[1], key[0])
+        return hit[0]
+    walk = torch.arange(int(num_segments), dtype=torch.int32, device=device)
+    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+        _WALKS[key] = (walk, _table_ready(key[0]))
     return walk
 
 
@@ -2764,9 +2841,10 @@ def cake_gdn_det_train_backward(
                                     device)  # fmt: skip
             flags.zero_()
             flags = flags.view(torch.uint32)  # the pair's u32 counts
-            order = _wavefront_order_tensor(
+            order, ready = _wavefront_order_tensor(
                 meta.seq_lens, meta.order, int(segs.segment_len), index
             )
+            _use_table(order, ready, index)
             main = torch.cuda.current_stream(index)
             side = _side_stream(index, main)
             fork, join = _wavefront_events(index, main)
@@ -3012,6 +3090,7 @@ def _chunk_meta(
     if options.host_cache:
         meta = _META_FRONT.get(key)
         if meta is not None:
+            _use_table(meta.chunk_start, meta.ready, int(index))
             return meta
     if cu_seqlens is None:
         seq_lens = (int(seq_len),) * int(batch)
@@ -3033,7 +3112,9 @@ def _chunk_meta(
     scan = _wavefront_table(meta, int(num_v_heads), int(index))
     if scan is not None:
         meta = replace(meta, bwd_wavefront=scan)
-    if options.host_cache:
+    # a table built inside a CUDA graph capture (see "cached device tables") is not kept
+    capturing = meta.chunk_start.is_cuda and torch.cuda.is_current_stream_capturing()
+    if options.host_cache and not capturing:
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
             del _META_FRONT[next(iter(_META_FRONT))]
         _META_FRONT[key] = meta
