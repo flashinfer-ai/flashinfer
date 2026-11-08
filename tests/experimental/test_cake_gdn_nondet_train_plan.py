@@ -85,6 +85,20 @@ def test_piece_table(key: tuple[str, int]) -> None:
         )
 
 
+def test_the_backward_split_reads_the_shared_table() -> None:
+    # the one-wave split of the adjoint walk takes its piece length from the shared table
+    for (row, sms), (length, _counts, _first) in EXPECTED.items():
+        hv, lens = ROWS[row]
+        chunks = cake_plan.chunk_counts(lens)
+        assert cake_chain.bwd_piece_table(chunks, hv, sms) == length
+        assert cake_chain.bwd_piece_table(chunks, hv, sms) == cake_plan.piece_length(
+            chunks, hv, sms
+        )
+    for hv, lens, sms in ((6, (4096,) * 64, 148), (6, (64,) * 3, 148), (6, (), 148)):
+        chunks = cake_plan.chunk_counts(lens)
+        assert cake_chain.bwd_piece_table(chunks, hv, sms) is None
+
+
 def test_more_sms_give_shorter_pieces() -> None:
     hv, lens = ROWS["issue"]
     lengths = [cake_plan.pieces(lens, hv, sms).length for sms in (148, 152, 160, 212)]

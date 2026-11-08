@@ -114,7 +114,7 @@ from typing import Any, cast
 
 import torch
 
-from . import cake_backend, cake_jit
+from . import cake_backend, cake_jit, cake_plan
 
 __all__ = [
     "CHUNK",
@@ -2025,23 +2025,9 @@ def bwd_piece_table(chunks, num_v_heads: int, sm_count: int) -> int | None:
     sequence of ``P`` pieces puts its last piece and its ``P - 2`` middle pieces in the first wave, a sequence of one
     piece its whole walk); the second wave, ``sum_d (P_d - 1) * HV`` CTAs, fits too.  ``None`` where no ``L`` splits a
     sequence (more sequences x value heads than SMs, or every sequence one piece at the smallest fitting ``L``).
-    Depends on the shapes, ``HV`` and the SM count alone."""
-    chunks = [int(n) for n in chunks]
-    hv, sms = int(num_v_heads), int(sm_count)
-    if not chunks or hv <= 0 or len(chunks) * hv > sms or max(chunks) < 2:
-        return None
-
-    def ctas(length: int) -> int:
-        return sum(max(-(-n // length) - 1, 1) for n in chunks) * hv
-
-    lo, hi = 1, max(chunks)  # ctas(max(chunks)) = N x HV fits
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if ctas(mid) <= sms:
-            hi = mid
-        else:
-            lo = mid + 1
-    return lo if max(chunks) > lo else None
+    Depends on the shapes, ``HV`` and the SM count alone: the piece table the forward and the backward share
+    (:func:`cake_plan.piece_length`)."""
+    return cake_plan.piece_length(chunks, num_v_heads, sm_count)
 
 
 def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) -> dict:
@@ -2115,9 +2101,11 @@ def _adjoint_split_length(
         return None
     if _adjoint_chain_stage(arch) is None:
         return None
-    chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
     priced = adjoint_split_pricing(
-        chunks, int(num_v_heads), _device_props(index)[0], arch
+        cake_plan.chunk_counts(seq_lens),
+        int(num_v_heads),
+        _device_props(index)[0],
+        arch,
     )
     return int(priced["segment_len"]) if priced["select"] else None
 
