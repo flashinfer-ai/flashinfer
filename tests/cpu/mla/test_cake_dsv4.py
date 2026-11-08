@@ -2415,6 +2415,42 @@ class _RecordingLauncher:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
+    "route,num_heads,max_q_len,batch_size,sparse_topk",
+    [
+        ("bf16_h8_h16_source_exact", 16, 5, 3, 260),
+        ("fp8_h8_h16_source_exact", 8, 5, 3, 192),
+        ("fp8_h64_source_exact", 64, 257, 2, 640),
+    ],
+)
+def test_source_exact_programs_bind_the_metadata_rows(
+    arch, route, num_heads, max_q_len, batch_size, sparse_topk
+):
+    """The source-exact programs launch one CTA per request position: the grid
+    is ``max_q_len`` x ``batch_size`` whatever the metadata rows ``T``.  Each
+    binds ``num_query_tokens`` and runs a position at or past ``T`` as padding,
+    so a padded ragged call (``cum_seq_lens_q`` describing more rows than ``T``)
+    reads and writes rows below ``T`` only."""
+    plan = get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+    assert ("parameter", "num_query_tokens") in plan, plan
+    launches = []
+    for tokens in (1, max_q_len * batch_size):
+        L = _RecordingLauncher(
+            arch,
+            num_query_tokens=tokens,
+            num_heads=num_heads,
+            sparse_topk=sparse_topk,
+            max_q_len=max_q_len,
+            batch_size=batch_size,
+        )
+        cake._dispatch_route(route, L)
+        launches.append(L.calls)
+    assert [name for name, _ in launches[0]] == [route]
+    assert launches[0] == launches[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_producer,expected_splits",
     [
         # Three live KV tiles run the four-owner producer (fourth tile fully

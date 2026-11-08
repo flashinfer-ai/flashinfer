@@ -676,6 +676,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "batch_size"],
         ["parameter", "has_sinks"],
         ["parameter", "total_work_items"],
+        ["parameter", "num_query_tokens"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
