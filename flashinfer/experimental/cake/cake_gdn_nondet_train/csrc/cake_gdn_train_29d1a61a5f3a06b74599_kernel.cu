@@ -52,7 +52,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_gdn_train_c0999bd9faec942831d6(float* __restrict__ seg_state, float* __restrict__ init_state, float* __restrict__ state_out, int* __restrict__ seq_seg_start, int* __restrict__ seg_flag, int num_v_heads, int use_init, int reverse)
+kernel_cake_gdn_train_29d1a61a5f3a06b74599(float* __restrict__ seg_state, float* __restrict__ init_state, float* __restrict__ state_out, int* __restrict__ seq_seg_start, int* __restrict__ seg_flag, int num_v_heads, int use_init, int reverse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -83,6 +83,7 @@ kernel_cake_gdn_train_c0999bd9faec942831d6(float* __restrict__ seg_state, float*
     const int s_hlo_addr = smem + 98304;
 
     // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     int seq = blockIdx.x;
     int hv = blockIdx.y;
     int vb0 = blockIdx.z * 32;
@@ -840,6 +841,7 @@ kernel_cake_gdn_train_c0999bd9faec942831d6(float* __restrict__ seg_state, float*
         }
         __syncthreads();
     }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"

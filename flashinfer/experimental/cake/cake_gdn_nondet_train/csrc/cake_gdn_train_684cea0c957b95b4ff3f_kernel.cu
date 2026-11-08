@@ -52,7 +52,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_gdn_train_df2a0e535ca9a0e8f86f(float* __restrict__ seg_state, float* __restrict__ init_state, float* __restrict__ state_out, int* __restrict__ seq_seg_start, int* __restrict__ seg_flag, int num_v_heads, int use_init)
+kernel_cake_gdn_train_684cea0c957b95b4ff3f(float* __restrict__ seg_state, float* __restrict__ init_state, float* __restrict__ state_out, int* __restrict__ seq_seg_start, int* __restrict__ seg_flag, int num_v_heads, int use_init)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -77,6 +77,7 @@ kernel_cake_gdn_train_df2a0e535ca9a0e8f86f(float* __restrict__ seg_state, float*
     const int s_x_addr = smem + 0;
 
     // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     int seq = blockIdx.x;
     int hv = blockIdx.y;
     int row = tid / 2;
@@ -2578,6 +2579,7 @@ kernel_cake_gdn_train_df2a0e535ca9a0e8f86f(float* __restrict__ seg_state, float*
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_x_addr + nxt + (slot + 16)), "r"(__float_as_uint(x[4])), "r"(__float_as_uint(x[5])), "r"(__float_as_uint(x[6])), "r"(__float_as_uint(x[7])) : "memory");
         __syncthreads();
     }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"
