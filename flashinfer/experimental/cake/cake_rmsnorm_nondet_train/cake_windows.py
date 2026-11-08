@@ -525,7 +525,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         "bwd_h5120": (
             (0, 4, "cake_rmsnorm_train_dbc680f356be4cd643de"),
             (4, 16, "cake_rmsnorm_train_cc082d1fc7f42b4b3f2c"),
-            (16, 1024, "cake_rmsnorm_train_505283a5225ac45bc095"),
+            (16, 64, "cake_rmsnorm_train_505283a5225ac45bc095"),
+            (64, 1024, "cake_rmsnorm_train_2fc4932fbde0bc848b32"),
             (1024, 5120, "cake_rmsnorm_train_2fc4932fbde0bc848b32"),
             (5120, 61952, "cake_rmsnorm_train_7ffb443a63a92ab6b0e0"),
             (61952, 393216, "cake_rmsnorm_train_b523a764b029e5ca1aaf"),
@@ -535,7 +536,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (0, 4, "cake_rmsnorm_train_d47138228b123e55fe5d"),
             (4, 5, "cake_rmsnorm_train_05396cd3a077d3772fdc"),
             (5, 16, "cake_rmsnorm_train_244b7d841d62d9721c99"),
-            (16, 1024, "cake_rmsnorm_train_3a7bd162c370762719b3"),
+            (16, 192, "cake_rmsnorm_train_3a7bd162c370762719b3"),
+            (192, 1024, "cake_rmsnorm_train_79811a76205d7d7dd197"),
             (1024, 5120, "cake_rmsnorm_train_79811a76205d7d7dd197"),
             (5120, 61952, "cake_rmsnorm_train_f9f7d4cd75ef91cc8374"),
             (61952, 196608, "cake_rmsnorm_train_90598c14b4e396f5c8b0"),
@@ -545,7 +547,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (0, 4, "cake_rmsnorm_train_e37752b056dd4e4a0bee"),
             (4, 6, "cake_rmsnorm_train_fdfb73350c1a926a4929"),
             (6, 16, "cake_rmsnorm_train_d70f2562a592151ec4f9"),
-            (16, 1024, "cake_rmsnorm_train_38b1c6bc8fa558bccc49"),
+            (16, 896, "cake_rmsnorm_train_38b1c6bc8fa558bccc49"),
+            (896, 1024, "cake_rmsnorm_train_5c804aed7ad14b99e1d0"),
             (1024, 4096, "cake_rmsnorm_train_5c804aed7ad14b99e1d0"),
             (4096, 32768, "cake_rmsnorm_train_322574af704b51aef0bb"),
             (32768, 65536, "cake_rmsnorm_train_f5806bd223b2ad27230a"),
@@ -1194,6 +1197,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "bwd_h5120": (
             (4, "unmeasured"),
             (16, "unmeasured"),
+            (64, "unmeasured"),
             (1024, "unmeasured"),
             (5120, "same"),
             (61952, "same"),
@@ -1203,6 +1207,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4, "unmeasured"),
             (5, "unmeasured"),
             (16, "unmeasured"),
+            (192, "unmeasured"),
             (1024, "unmeasured"),
             (5120, "same"),
             (61952, "same"),
@@ -1212,6 +1217,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4, "unmeasured"),
             (6, "unmeasured"),
             (16, "unmeasured"),
+            (896, "unmeasured"),
             (1024, "unmeasured"),
             (4096, "same"),
             (32768, "unmeasured"),
@@ -1700,7 +1706,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
         "bwd_h5120": (
             (0, 4, 100),
             (4, 16, 100),
-            (16, 1024, 100),
+            (16, 64, 100),
+            (64, 1024, 132),
             (1024, 5120, 132),
             (5120, 61952, 132),
             (61952, 393216, 132),
@@ -1710,7 +1717,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (0, 4, 100),
             (4, 6, 100),
             (6, 16, None),
-            (16, 1024, 100),
+            (16, 896, 100),
+            (896, 1024, 132),
             (1024, 4096, 132),
             (4096, 32768, 132),
             (32768, 65536, 100),
@@ -1797,7 +1805,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (0, 4, 100),
             (4, 5, 100),
             (5, 16, 100),
-            (16, 1024, 100),
+            (16, 192, 100),
+            (192, 1024, 132),
             (1024, 5120, 132),
             (5120, 61952, 132),
             (61952, 196608, 132),
@@ -2212,14 +2221,19 @@ T 0 to 1216, instead of the whole-SM det pair this package ran there before: on 
 took 5.82, 8.13 and 9.34 us at T 64, 256 and 304 where the det pair took 7.65, 10.24 and
 10.53 us, with 0.965 to 0.982 times the det pair's dw error against an FP64 reference
 (relative L2 or worst element, the larger over six input families).  On sm_103a
-``bwd_h5120``, ``bwd_w32_h5120``, ``bwd_h6144`` and
-``bwd_w32_h6144`` from T 17 to 1024 run the deterministic package's column-task
-program of the route in its ticket form (the form whose ``dx`` and ``dw`` the
-fixed-claim form reproduces bit for bit), which ran at 1.01 to 1.50 times the
-speed of the programs it replaces at every sampled T from 17 to 1024 on GB300 (FI
-bench, CUDA-graph span, 4 sessions), with an FP64 ``dw`` error of 0.73x to 0.75x the
-det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``; from T 1536 the det pair
-of the window above is faster.  On sm_107a ``bwd_h512`` up to T 576,
+``bwd_h5120`` from T 17 to 64, ``bwd_w32_h5120`` from T 17 to 192, ``bwd_h6144``
+from T 17 to 896 and ``bwd_w32_h6144`` from T 17 to 1024 run the deterministic
+package's column-task program of the route in its ticket form (the form whose ``dx``
+and ``dw`` the fixed-claim form reproduces bit for bit), with an FP64 ``dw`` error of
+0.73x to 0.75x the det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``: on GB300
+(FI bench, CUDA-graph span, L2 flushed before every call; one or two runs per T) no
+sampled T up to those token counts had a backward call, a forward and backward call or
+a checkpointed step (two forward calls and a backward call) slower than with the
+programs it replaces beyond the run-to-run band in all its runs.  Above them the det
+pair of the window above runs: at T 96 on ``bwd_h5120``, T 256 on ``bwd_w32_h5120`` and
+T 1024 on ``bwd_h6144`` (and at some larger sampled T) a forward and backward call or a
+checkpointed step with the ticket form was slower in both runs, though its backward
+call alone was faster there.  On sm_107a ``bwd_h512`` up to T 576,
 ``bwd_w32_h512`` up to T 384,
 ``bwd_h1536`` from T 15 to 320, ``bwd_w32_h1536`` from T 1 to 320, ``bwd_h2048`` from
 T 31 and ``bwd_w32_h2048`` up to T 256, ``bwd_h4096`` from T 1 and ``bwd_w32_h4096`` up
@@ -2454,14 +2468,19 @@ T 0 to 1216, instead of the whole-SM det pair this package ran there before: on 
 took 5.82, 8.13 and 9.34 us at T 64, 256 and 304 where the det pair took 7.65, 10.24 and
 10.53 us, with 0.965 to 0.982 times the det pair's dw error against an FP64 reference
 (relative L2 or worst element, the larger over six input families).  On sm_103a
-``bwd_h5120``, ``bwd_w32_h5120``, ``bwd_h6144`` and
-``bwd_w32_h6144`` from T 17 to 1024 run the deterministic package's column-task
-program of the route in its ticket form (the form whose ``dx`` and ``dw`` the
-fixed-claim form reproduces bit for bit), which ran at 1.01 to 1.50 times the
-speed of the programs it replaces at every sampled T from 17 to 1024 on GB300 (FI
-bench, CUDA-graph span, 4 sessions), with an FP64 ``dw`` error of 0.73x to 0.75x the
-det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``; from T 1536 the det pair
-of the window above is faster.  On sm_107a ``bwd_h512`` up to T 576,
+``bwd_h5120`` from T 17 to 64, ``bwd_w32_h5120`` from T 17 to 192, ``bwd_h6144``
+from T 17 to 896 and ``bwd_w32_h6144`` from T 17 to 1024 run the deterministic
+package's column-task program of the route in its ticket form (the form whose ``dx``
+and ``dw`` the fixed-claim form reproduces bit for bit), with an FP64 ``dw`` error of
+0.73x to 0.75x the det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``: on GB300
+(FI bench, CUDA-graph span, L2 flushed before every call; one or two runs per T) no
+sampled T up to those token counts had a backward call, a forward and backward call or
+a checkpointed step (two forward calls and a backward call) slower than with the
+programs it replaces beyond the run-to-run band in all its runs.  Above them the det
+pair of the window above runs: at T 96 on ``bwd_h5120``, T 256 on ``bwd_w32_h5120`` and
+T 1024 on ``bwd_h6144`` (and at some larger sampled T) a forward and backward call or a
+checkpointed step with the ticket form was slower in both runs, though its backward
+call alone was faster there.  On sm_107a ``bwd_h512`` up to T 576,
 ``bwd_w32_h512`` up to T 384,
 ``bwd_h1536`` from T 15 to 320, ``bwd_w32_h1536`` from T 1 to 320, ``bwd_h2048`` from
 T 31 and ``bwd_w32_h2048`` up to T 256, ``bwd_h4096`` from T 1 and ``bwd_w32_h4096`` up
@@ -2782,14 +2801,19 @@ T 0 to 1216, instead of the whole-SM det pair this package ran there before: on 
 took 5.82, 8.13 and 9.34 us at T 64, 256 and 304 where the det pair took 7.65, 10.24 and
 10.53 us, with 0.965 to 0.982 times the det pair's dw error against an FP64 reference
 (relative L2 or worst element, the larger over six input families).  On sm_103a
-``bwd_h5120``, ``bwd_w32_h5120``, ``bwd_h6144`` and
-``bwd_w32_h6144`` from T 17 to 1024 run the deterministic package's column-task
-program of the route in its ticket form (the form whose ``dx`` and ``dw`` the
-fixed-claim form reproduces bit for bit), which ran at 1.01 to 1.50 times the
-speed of the programs it replaces at every sampled T from 17 to 1024 on GB300 (FI
-bench, CUDA-graph span, 4 sessions), with an FP64 ``dw`` error of 0.73x to 0.75x the
-det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``; from T 1536 the det pair
-of the window above is faster.  On sm_107a ``bwd_h512`` up to T 576,
+``bwd_h5120`` from T 17 to 64, ``bwd_w32_h5120`` from T 17 to 192, ``bwd_h6144``
+from T 17 to 896 and ``bwd_w32_h6144`` from T 17 to 1024 run the deterministic
+package's column-task program of the route in its ticket form (the form whose ``dx``
+and ``dw`` the fixed-claim form reproduces bit for bit), with an FP64 ``dw`` error of
+0.73x to 0.75x the det pair's at T 64 on ``bwd_h6144`` and ``bwd_w32_h5120``: on GB300
+(FI bench, CUDA-graph span, L2 flushed before every call; one or two runs per T) no
+sampled T up to those token counts had a backward call, a forward and backward call or
+a checkpointed step (two forward calls and a backward call) slower than with the
+programs it replaces beyond the run-to-run band in all its runs.  Above them the det
+pair of the window above runs: at T 96 on ``bwd_h5120``, T 256 on ``bwd_w32_h5120`` and
+T 1024 on ``bwd_h6144`` (and at some larger sampled T) a forward and backward call or a
+checkpointed step with the ticket form was slower in both runs, though its backward
+call alone was faster there.  On sm_107a ``bwd_h512`` up to T 576,
 ``bwd_w32_h512`` up to T 384,
 ``bwd_h1536`` from T 15 to 320, ``bwd_w32_h1536`` from T 1 to 320, ``bwd_h2048`` from
 T 31 and ``bwd_w32_h2048`` up to T 256, ``bwd_h4096`` from T 1 and ``bwd_w32_h4096`` up
@@ -2865,15 +2889,15 @@ route not listed is unmeasured.
 * ``sm_103a`` ``bwd_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 1080] -, (1080, 5120] -, (5120, 12288] -, (12288, 40960] -, (40960, 97280] -, (97280, 720896] -, (720896, 1572864] -, (1572864, inf) -
 * ``sm_103a`` ``bwd_h4096``: (0, 4] >= 100, (4, 16] >= 100, (16, 32] -, (32, 152] -, (152, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 32768] >= 132, (32768, 65536] >= 100, (65536, 262144] >= 100, (262144, inf) -
 * ``sm_103a`` ``bwd_h512``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] -, (64, 1024] -, (1024, 4096] -, (4096, 32768] -, (32768, inf) -
-* ``sm_103a`` ``bwd_h5120``: (0, 4] >= 100, (4, 16] >= 100, (16, 1024] >= 100, (1024, 5120] >= 132, (5120, 61952] >= 132, (61952, 393216] >= 132, (393216, inf) >= 132
-* ``sm_103a`` ``bwd_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 16] -, (16, 1024] >= 100, (1024, 4096] >= 132, (4096, 32768] >= 132, (32768, 65536] >= 100, (65536, 131072] >= 100, (131072, inf) >= 100
+* ``sm_103a`` ``bwd_h5120``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] >= 100, (64, 1024] >= 132, (1024, 5120] >= 132, (5120, 61952] >= 132, (61952, 393216] >= 132, (393216, inf) >= 132
+* ``sm_103a`` ``bwd_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 16] -, (16, 896] >= 100, (896, 1024] >= 132, (1024, 4096] >= 132, (4096, 32768] >= 132, (32768, 65536] >= 100, (65536, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_residual_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 31] -, (31, 32] >= 100, (32, 48] -, (48, 56] >= 100, (56, 304] >= 100, (304, 1920] >= 100, (1920, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_w32_h1536``: (0, 4] >= 100, (4, 6] >= 100, (6, 64] -, (64, 214] -, (214, 1024] >= 132, (1024, 4096] >= 100, (4096, 14928] >= 132, (14928, 15566] >= 100, (15566, 37888] >= 100, (37888, 40448] -, (40448, 76352] >= 100, (76352, 131072] -, (131072, inf) -
 * ``sm_103a`` ``bwd_w32_h2048``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] -, (64, 171] -, (171, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 58496] >= 100, (58496, 61952] >= 100, (61952, 68160] >= 100, (68160, 131072] -, (131072, inf) >= 132
 * ``sm_103a`` ``bwd_w32_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 1080] -, (1080, 5120] -, (5120, 12288] -, (12288, 40960] -, (40960, 97280] -, (97280, 720896] -, (720896, 1572864] -, (1572864, inf) -
 * ``sm_103a`` ``bwd_w32_h4096``: (0, 4] >= 100, (4, 16] >= 100, (16, 32] -, (32, 152] -, (152, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 48640] >= 132, (48640, 65536] >= 100, (65536, 262144] -, (262144, inf) -
 * ``sm_103a`` ``bwd_w32_h512``: (0, 4] >= 100, (4, 16] >= 100, (16, 227] -, (227, 960] -, (960, 32768] -, (32768, inf) -
-* ``sm_103a`` ``bwd_w32_h5120``: (0, 4] >= 100, (4, 5] >= 100, (5, 16] >= 100, (16, 1024] >= 100, (1024, 5120] >= 132, (5120, 61952] >= 132, (61952, 196608] >= 132, (196608, inf) >= 132
+* ``sm_103a`` ``bwd_w32_h5120``: (0, 4] >= 100, (4, 5] >= 100, (5, 16] >= 100, (16, 192] >= 100, (192, 1024] >= 132, (1024, 5120] >= 132, (5120, 61952] >= 132, (61952, 196608] >= 132, (196608, inf) >= 132
 * ``sm_103a`` ``bwd_w32_h6144``: (0, 4] >= 100, (4, 12] >= 100, (12, 16] -, (16, 1024] >= 100, (1024, 4096] >= 132, (4096, 49152] >= 132, (49152, 83392] >= 132, (83392, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_w32_residual_h6144``: (0, 4] >= 100, (4, 10] >= 100, (10, 31] -, (31, 32] >= 100, (32, 48] -, (48, 320] >= 100, (320, 1824] >= 100, (1824, 131072] >= 100, (131072, inf) >= 100
 * ``sm_107a`` ``bwd_h1536``: (0, 4] >= 100, (4, 16] >= 100, (16, 320] -, (320, 1024] -, (1024, 16384] >= 100, (16384, 45056] >= 100, (45056, 65536] >= 100, (65536, inf) -
@@ -3015,16 +3039,18 @@ Beside those, leave some SMs free of the resident kernel.
   (1024, 4096] 78c26a53 (det pair) = (4096, 48640] 626aed74 (det pair) ?
   (48640, 65536] cb164a27 (det pair) ? (65536, 262144] 2911faf7 = (262144, inf) 131a495c
 * ``sm_103a`` ``bwd_h5120``: (0, 4] dbc680f3 (one cluster) ? (4, 16] cc082d1f ?
-  (16, 1024] 505283a5 ? (1024, 5120] 2fc4932f (det pair) =
-  (5120, 61952] 7ffb443a (det pair) = (61952, 393216] b523a764 = (393216, inf) 9e4c0825
+  (16, 64] 505283a5 ? (64, 1024] 2fc4932f (det pair) ? (1024, 5120] 2fc4932f (det pair)
+  = (5120, 61952] 7ffb443a (det pair) = (61952, 393216] b523a764 =
+  (393216, inf) 9e4c0825
 * ``sm_103a`` ``bwd_w32_h5120``: (0, 4] d4713822 (one cluster) ?
-  (4, 5] 05396cd3 (one cluster) ? (5, 16] 244b7d84 ? (16, 1024] 3a7bd162 ?
-  (1024, 5120] 79811a76 (det pair) = (5120, 61952] f9f7d4cd (det pair) =
-  (61952, 196608] 90598c14 = (196608, inf) f165933c
+  (4, 5] 05396cd3 (one cluster) ? (5, 16] 244b7d84 ? (16, 192] 3a7bd162 ?
+  (192, 1024] 79811a76 (det pair) ? (1024, 5120] 79811a76 (det pair) =
+  (5120, 61952] f9f7d4cd (det pair) = (61952, 196608] 90598c14 = (196608, inf) f165933c
 * ``sm_103a`` ``bwd_h6144``: (0, 4] e37752b0 (one cluster) ?
-  (4, 6] fdfb7335 (one cluster) ? (6, 16] d70f2562 ? (16, 1024] 38b1c6bc ?
-  (1024, 4096] 5c804aed (det pair) = (4096, 32768] 322574af (det pair) ?
-  (32768, 65536] f5806bd2 ? (65536, 131072] 7236b737 ? (131072, inf) 582b2a20
+  (4, 6] fdfb7335 (one cluster) ? (6, 16] d70f2562 ? (16, 896] 38b1c6bc ?
+  (896, 1024] 5c804aed (det pair) ? (1024, 4096] 5c804aed (det pair) =
+  (4096, 32768] 322574af (det pair) ? (32768, 65536] f5806bd2 ? (65536, 131072] 7236b737
+  ? (131072, inf) 582b2a20
 * ``sm_103a`` ``bwd_residual_h6144``: (0, 4] deeb1876 (one cluster) ?
   (4, 6] 94c547ec (one cluster) ? (6, 31] 7b0f5a6a = (31, 32] 07135550 =
   (32, 48] 7b0f5a6a = (48, 56] 864e84f3 ? (56, 304] 07135550 ? (304, 1920] 864e84f3 ?
