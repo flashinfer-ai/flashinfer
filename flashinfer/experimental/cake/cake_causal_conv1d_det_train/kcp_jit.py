@@ -437,7 +437,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp": {
+    "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -468,6 +468,9 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
+        # Built with ``split=True, pair=True`` (the token arithmetic on packed
+        # ``f32x2`` channel pairs, bitwise the scalar build's ``dx`` and partial
+        # rows), as are the two other ``split`` records.
         # The ``split`` build of the cooperative fallback above (route
         # ``kcp_bwd_split``, FlashInfer issue #8365): an ordinary launch with no
         # grid-wide barrier that ends at its partial row; the record's
@@ -490,8 +493,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+        "kernel": "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -499,7 +502,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+        "library": "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
         # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
         # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
         "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
@@ -534,7 +537,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp": {
+    "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp": {
         "arches": [
             "sm_107a",
         ],
@@ -576,8 +579,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+        "kernel": "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -585,7 +588,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+        "library": "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
         # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
         # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
         "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
@@ -615,7 +618,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp": {
+    "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -664,8 +667,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        "kernel": "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -673,7 +676,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        "library": "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
         # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
         "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
@@ -795,8 +798,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_split": [
-            "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
-            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+            "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
+            "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
@@ -811,8 +814,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_split": [
-            "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
-            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+            "cake_causal_conv1d_det_train_83900e631708e690fbb0_kcp",
+            "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
@@ -827,8 +830,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_split": [
-            "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
-            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+            "cake_causal_conv1d_det_train_2fc855aa2942ba7bb841_kcp",
+            "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
