@@ -74,6 +74,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
         num_sched_stages: Optional[int] = 2,
+        num_activation_stages: Optional[int] = None,
         transform_buffer: Literal["smem", "tmem"] = "tmem",
         accumulator_overlap: bool = False,
         transform_k_tile: Literal[64, 128] = 128,
@@ -190,6 +191,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             num_sched_stages=(
                 2 if num_sched_stages is None else num_sched_stages
             ),
+            num_activation_stages=num_activation_stages,
             transform_buffer=transform_buffer,
             accumulator_overlap=accumulator_overlap,
             transform_k_tile=transform_k_tile,
