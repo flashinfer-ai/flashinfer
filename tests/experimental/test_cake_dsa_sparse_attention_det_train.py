@@ -1349,6 +1349,9 @@ def test_key_passes_give_the_bits_of_one_launch(monkeypatch, dkv, redo):
     if redo:
         monkeypatch.setattr(cake_backend, "GRID_SHIFT", 24)
         monkeypatch.setattr(cake_backend, "MIN_BUMP", 25)
+        # the eager backward below plans under the patched grid: its cache keys on shapes alone and may hold
+        # a plan of these shapes under the shipped grid; this test's plans are not kept for later tests
+        monkeypatch.setattr(cake_backend, "BINDING_CACHE", cake_backend._BindingCache())
 
     def run(passes):
         acc = torch.zeros(S, D_QK, device="cuda") if dkv == "acc" else None
