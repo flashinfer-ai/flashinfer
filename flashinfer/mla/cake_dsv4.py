@@ -103,10 +103,9 @@ Host contract (flashinfer#4671 hardening)
   pieces into ``O`` (one ``run_sequence`` call) with the merge their rule's
   ``merge_by_splits`` names for ``s`` and their rows
   (:func:`_k64_split_merge`): on SM107, for 128 heads, a merge built for
-  ``s`` pieces alone, one CTA per row and head (nine and five pieces, and
-  three at 9-14 rows) or one warp per row and head and two heads per CTA
-  (three pieces at 16 or 17 rows), else the merge of any ``s``, one CTA per
-  row and head. It carves
+  ``s`` pieces alone, one CTA per row and head (nine and five pieces) or one
+  warp per row and head and two heads per CTA (three pieces at 16 or 17
+  rows), else the merge of any ``s``, one CTA per row and head. It carves
   ``cake_dsv4_workspace_layout(R, H, s)`` for its ``R = T - W`` split rows
   and stores the pieces in token-major order: piece ``j`` of row ``t`` is
   ``p = (t - W) * s + j``, its BF16 partial O the rows ``[p, :, :]`` of
@@ -2493,7 +2492,6 @@ _K64_SPLIT_HEADS = 128
 _K64_SPLIT_COUNT_MERGES: Mapping[str, int] = {
     f"{_K64_SPLIT_MERGE}_c9": 1,
     f"{_K64_SPLIT_MERGE}_c5": 1,
-    f"{_K64_SPLIT_MERGE}_c3": 1,
     f"{_K64_SPLIT_MERGE}_s3": 2,
 }
 
@@ -2536,21 +2534,22 @@ class _K64SplitRule:
 # in each of 8 rounds.  The launches of 9-15 rows do not take the three-piece
 # merge: in a test harness on a 212-SM VR200, a 15-row batch of mixed row
 # lengths ran slower with it in every round.  The launches of nine and five
-# pieces and of three pieces at 9-14 rows merge with the merge built for
-# their count alone (``merge_by_splits``: ``_c9``, ``_c5``, ``_c3``): in a
-# test harness on a 216-SM R200 that ran FlashInfer's launches with the
-# merge program replaced, it ran 0.065-0.340 us per call faster than the
-# merge of any count at 4-8 and 12-15 rows, faster beyond the A/A difference
-# in each of 8 rounds, with bitwise identical output (at 1 row it measured
-# -0.034 us, within the A/A difference).  The launches of 15 rows keep the
-# merge of any count: on a 208-SM R200, ``_c3`` ran 0.159-0.173 us per call
-# slower there in every round.  On a 212-SM VR200 no launch differed beyond
-# the A/A difference.  With the merge of any count, a launch whose every row
-# fits in one piece (at most ceil(9 / s) tiles: short requests, piece 0
-# writes O itself) still runs the merge kernel and measured 0.81-0.86x (0.97x
-# of two pieces at 15 rows of at most three tiles); the host does not read
-# row lengths, so those launches split as well.  Without PDL the 17-row
-# launch measured 0.98x with two pieces: no launch without PDL splits.
+# pieces merge with the merge built for their count alone
+# (``merge_by_splits``: ``_c9``, ``_c5``): in a test harness on a 216-SM
+# R200 that ran FlashInfer's launches with the merge program replaced, it
+# ran 0.065-0.340 us per call faster than the merge of any count at 4-8
+# rows, faster beyond the A/A difference in each of 8 rounds, with bitwise
+# identical output (at 1 row it measured -0.034 us, within the A/A
+# difference); on a 212-SM VR200 no launch differed beyond the A/A
+# difference.  The three-piece launches of 9-15 rows keep the merge of any
+# count: the merge built for three pieces alone ran slower than it on a
+# 208-SM R200 and on a 212-SM VR200.  With the merge of any count, a launch
+# whose every row fits in one piece (at most ceil(9 / s) tiles: short
+# requests, piece 0 writes O itself) still runs the merge kernel and measured
+# 0.81-0.86x (0.97x of two pieces at 15 rows of at most three tiles); the
+# host does not read row lengths, so those launches split as well.  Without
+# PDL the 17-row launch measured 0.98x with two pieces: no launch without
+# PDL splits.
 _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
     "sm_107a": _K64SplitRule(
         num_tiles=9,
@@ -2560,8 +2559,6 @@ _K64_SPLIT_RULES: Mapping[str, _K64SplitRule] = {
         merge_by_splits=(
             (9, 1, f"{_K64_SPLIT_MERGE}_c9"),
             (5, 5, f"{_K64_SPLIT_MERGE}_c5"),
-            (3, 9, f"{_K64_SPLIT_MERGE}_c3"),
-            (3, 15, _K64_SPLIT_MERGE),
             (3, 16, f"{_K64_SPLIT_MERGE}_s3"),
         ),
     ),
@@ -2859,12 +2856,12 @@ def run_cake_dsv4(
     rows per launch and on SM100 when the longest request has at least 257
     query tokens (``_pdl_variant``).  On SM107, PDL launches of few metadata
     rows run a split-KV producer and a merge when the workspace holds their
-    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; all
-    but their three-piece launches of 15 rows merge with a merge built for
-    their piece count where the registry has it, :func:`_k64_split_merge`)
-    and FP8/H64 over items of four to nine tiles (``_K64_SPLIT_RULES_H64``)
-    (:func:`_k64_split`; :func:`cake_dsv4_workspace_requirement` includes
-    it).
+    carve: FP8/H128 over items 1025-1152 wide (``_K64_SPLIT_RULES``; their
+    launches of nine and five pieces and of three pieces at 16 or 17 rows
+    merge with a merge built for their piece count where the registry has
+    it, :func:`_k64_split_merge`) and FP8/H64 over items of four to nine
+    tiles (``_K64_SPLIT_RULES_H64``) (:func:`_k64_split`;
+    :func:`cake_dsv4_workspace_requirement` includes it).
 
     On SM107 the FP8 low-head prefill route runs launches of at most 64 query
     rows (fewer on a part with fewer than 216 SMs) on its early-PV sibling and

@@ -5,10 +5,9 @@ tiles) with at most 17 metadata rows and PDL run a split-KV producer and a
 merge kernel (:func:`flashinfer.mla.cake_dsv4._k64_split`); launches of
 three pieces per row and 16 or 17 rows merge with the merge built for three
 pieces (one warp per row and head, two heads per CTA, grid ``(rows, 64)``),
-those of nine and five pieces and of three at 9-14 rows with the merge built
-for their count alone and those of three at 15 rows with the merge of any
-count (grid ``(rows, 128)``)
-(:func:`flashinfer.mla.cake_dsv4._k64_split_merge`).
+those of nine and five pieces with the merge built for their count alone
+and those of three at 9-15 rows with the merge of any count (grid
+``(rows, 128)``) (:func:`flashinfer.mla.cake_dsv4._k64_split_merge`).
 These tests call ``trtllm_batch_decode_sparse_mla_dsv4(backend="cake")`` on
 such launches and check that the launch splits and merges as planned, that
 the output matches the fp32 reference of the hardening suite at its contract
@@ -77,10 +76,9 @@ COMPRESSED_WIDTH = 1024
 WIDTH = hardening.SWA_WINDOW + COMPRESSED_WIDTH
 TILE = 128
 # Routed row counts and the pieces per row the SM107 rule plans for them.
-# 1 and 4, 5 and 8, 9 and 14 rows bound the launches that merge with the
-# merge for nine, five and three pieces alone, 15 rows is the launch that
-# merges with the merge of any count, 16 and 17 rows those that merge with the
-# three-piece merge.
+# 1 and 4, 5 and 8 rows bound the launches that merge with the merge for nine
+# and five pieces alone, 9 and 15 rows those that merge with the merge of any
+# count, 16 and 17 rows those that merge with the three-piece merge.
 ROUTED = [
     (1, 9),
     (2, 9),
@@ -101,18 +99,15 @@ REPEATS = 20
 # MERGE_S3_ROWS rows merge with it.
 MERGE_S3 = f"{cake._K64_SPLIT_MERGE}_s3"
 MERGE_S3_ROWS = 16
-# The merges built for nine, five and three pieces alone (one CTA per row and
-# head, the per-element operations of the merge of any count): the 128-head
-# launches of nine and five pieces and of three at 9 to MERGE_C3_ROWS rows
-# merge with them.
-MERGE_C = {splits: f"{cake._K64_SPLIT_MERGE}_c{splits}" for splits in (9, 5, 3)}
-MERGE_C3_ROWS = 14
+# The merges built for nine and five pieces alone (one CTA per row and head,
+# the per-element operations of the merge of any count): the 128-head
+# launches of nine and five pieces merge with them.
+MERGE_C = {splits: f"{cake._K64_SPLIT_MERGE}_c{splits}" for splits in (9, 5)}
 # Every row count whose launch merges with the merge built for its count
 # alone, with its pieces per row.
 PER_COUNT = [
     *((rows, 9) for rows in range(1, 5)),
     *((rows, 5) for rows in range(5, 9)),
-    *((rows, 3) for rows in range(9, MERGE_C3_ROWS + 1)),
 ]
 
 
@@ -121,7 +116,7 @@ def _merge_of(rows: int, splits: int, num_heads: int = HEADS) -> tuple:
     pieces each."""
     if num_heads == HEADS and splits == 3 and rows >= MERGE_S3_ROWS:
         return (MERGE_S3, (rows, num_heads // 2, 1))
-    if num_heads == HEADS and (splits != 3 or rows <= MERGE_C3_ROWS):
+    if num_heads == HEADS and splits in MERGE_C:
         return (MERGE_C[splits], (rows, num_heads, 1))
     return (cake._K64_SPLIT_MERGE, (rows, num_heads, 1))
 
@@ -337,7 +332,7 @@ def test_split_launch_matches_reference(monkeypatch, rows, splits, layout, lengt
 
 
 @pytest.mark.parametrize(
-    "rows,splits", [(1, 9), (4, 9), (8, 5), (9, 3), (14, 3), (15, 3), (16, 3), (17, 3)]
+    "rows,splits", [(1, 9), (4, 9), (8, 5), (15, 3), (16, 3), (17, 3)]
 )
 @pytest.mark.parametrize("sink", ["none", "large", "empty_piece_zero"])
 def test_split_launch_sinks(monkeypatch, rows, splits, sink):
@@ -361,7 +356,7 @@ def test_split_launch_sinks(monkeypatch, rows, splits, sink):
     hardening._assert_valid(out, case)
 
 
-@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (14, 3), (15, 3), (17, 3)])
+@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (15, 3), (17, 3)])
 def test_split_launch_zero_length_rows(monkeypatch, rows, splits):
     """Rows without an attendable column (zero active length, or every index
     ``-1``) write zeros; the other rows of the launch match the reference."""
@@ -453,7 +448,7 @@ def test_split_launch_metadata_forms(monkeypatch, rows, splits, form):
 
 @pytest.mark.parametrize(
     "rows,splits",
-    [(1, 9), (4, 9), (5, 5), (8, 5), (9, 3), (14, 3), (15, 3), (16, 3), (17, 3)],
+    [(1, 9), (4, 9), (5, 5), (8, 5), (15, 3), (16, 3), (17, 3)],
 )
 def test_split_launch_is_deterministic(monkeypatch, rows, splits):
     """Eager calls and CUDA graph replays of one split launch, with the piece
@@ -524,9 +519,9 @@ def test_per_count_merge_matches_the_merge_of_any_count(
     monkeypatch, rows, splits, layout, lengths
 ):
     """A launch that merges with the merge built for its count alone (nine
-    pieces at 1-4 rows, five at 5-8, three at 9-14) matches the reference and
-    writes, bit for bit, the output of the same launch merged with the merge
-    of any count over the same grid."""
+    pieces at 1-4 rows, five at 5-8) matches the reference and writes, bit
+    for bit, the output of the same launch merged with the merge of any count
+    over the same grid."""
     _skip_unless_sm107()
     case = _case(rows, splits, layout=layout, lengths=lengths)
     workspace = _workspace(case)

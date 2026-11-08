@@ -1327,7 +1327,6 @@ def test_sm107a_registers_the_fp8_decode_route_only():
         "fp8_h128_prefill_source_persistent_uniform_k64",
         "fp8_h128_prefill_source_persistent_uniform_k64_split",
         "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce",
-        "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce_c3",
         "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce_c5",
         "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce_c9",
         "fp8_h128_prefill_source_persistent_uniform_k64_split_reduce_s3",
@@ -5272,28 +5271,21 @@ _SPLIT_PIECES = {
     **dict.fromkeys(range(5, 9), 5),
     **dict.fromkeys(range(9, 18), 3),
 }
-# The merges built for one piece count: the merge for nine, five and three
-# pieces alone (``_c{s}``, one CTA per row and head) and the three-piece merge
+# The merges built for one piece count: the merge for nine and five pieces
+# alone (``_c{s}``, one CTA per row and head) and the three-piece merge
 # (``_s3``, one warp per row and head, two heads per CTA).
 _SPLIT_MERGE_C9 = f"{_UNIFORM_ROUTE}_k64_split_reduce_c9"
 _SPLIT_MERGE_C5 = f"{_UNIFORM_ROUTE}_k64_split_reduce_c5"
-_SPLIT_MERGE_C3 = f"{_UNIFORM_ROUTE}_k64_split_reduce_c3"
 _SPLIT_MERGE_S3 = f"{_UNIFORM_ROUTE}_k64_split_reduce_s3"
-_SPLIT_COUNT_MERGES = (
-    _SPLIT_MERGE_C9,
-    _SPLIT_MERGE_C5,
-    _SPLIT_MERGE_C3,
-    _SPLIT_MERGE_S3,
-)
+_SPLIT_COUNT_MERGES = (_SPLIT_MERGE_C9, _SPLIT_MERGE_C5, _SPLIT_MERGE_S3)
 # The merge and its heads per CTA of each row count's 128-head split launch
 # where the registry routes the per-count merges to programs of their own:
-# the merge for nine pieces at 1-4 rows, for five at 5-8 and for three at
-# 9-14, the merge of any count at 15 and the three-piece merge at 16-17.
+# the merge for nine pieces at 1-4 rows and for five at 5-8, the merge of any
+# count at 9-15 and the three-piece merge at 16-17.
 _SPLIT_MERGES = {
     **dict.fromkeys(range(1, 5), (_SPLIT_MERGE_C9, 1)),
     **dict.fromkeys(range(5, 9), (_SPLIT_MERGE_C5, 1)),
-    **dict.fromkeys(range(9, 15), (_SPLIT_MERGE_C3, 1)),
-    15: (f"{_UNIFORM_ROUTE}_k64_split_reduce", 1),
+    **dict.fromkeys(range(9, 16), (f"{_UNIFORM_ROUTE}_k64_split_reduce", 1)),
     **dict.fromkeys(range(16, 18), (_SPLIT_MERGE_S3, 2)),
 }
 
@@ -5318,16 +5310,15 @@ def _split_plan(**shape):
 def test_k64_split_rule_is_sm107a_only():
     """Only SM107 splits, and only with PDL, the uniform route's 128-head
     launches of at most 17 rows over nine-tile items, at most 40 pieces (51
-    for three per row); the launches of nine and five pieces and of three at
-    9-14 rows merge with the merge for their count alone, those of three at 16
-    and 17 rows with the three-piece merge."""
+    for three per row); the launches of nine and five pieces merge with the
+    merge for their count alone, those of three at 16 and 17 rows with the
+    three-piece merge."""
     assert _UNIFORM_ROUTE == cake._K64_SPLIT_ROUTE
     assert f"{_UNIFORM_ROUTE}_k64_split" == cake._K64_SPLIT_VARIANT
     assert f"{_UNIFORM_ROUTE}_k64_split_reduce" == cake._K64_SPLIT_MERGE
     assert {
         _SPLIT_MERGE_C9: 1,
         _SPLIT_MERGE_C5: 1,
-        _SPLIT_MERGE_C3: 1,
         _SPLIT_MERGE_S3: 2,
     } == cake._K64_SPLIT_COUNT_MERGES
     rule = cake._K64SplitRule(
@@ -5338,8 +5329,6 @@ def test_k64_split_rule_is_sm107a_only():
         merge_by_splits=(
             (9, 1, _SPLIT_MERGE_C9),
             (5, 5, _SPLIT_MERGE_C5),
-            (3, 9, _SPLIT_MERGE_C3),
-            (3, 15, cake._K64_SPLIT_MERGE),
             (3, 16, _SPLIT_MERGE_S3),
         ),
     )
@@ -5359,8 +5348,8 @@ def test_k64_split_rule_is_sm107a_only():
         (4, "_c9"),
         (5, "_c5"),
         (8, "_c5"),
-        (9, "_c3"),
-        (14, "_c3"),
+        (9, ""),
+        (14, ""),
         (15, ""),
         (16, "_s3"),
         (17, "_s3"),
@@ -5369,11 +5358,11 @@ def test_k64_split_rule_is_sm107a_only():
 def test_k64_split_merge_at_the_rule_boundaries(monkeypatch, tokens, suffix):
     """At both ends of every merge band of the SM107 128-head rule, with the
     registry routing every per-count merge to a program of its own, a split
-    launch merges with the merge for nine pieces at 1 and 4 rows, for five at
-    5 and 8 and for three at 9 and 14 (one head per CTA), with the merge of
-    any count at 15 and with the three-piece merge at 16 and 17 (two heads per
-    CTA); the same launch with 64 heads, or on SM100 / SM103, merges with the
-    merge of any count."""
+    launch merges with the merge for nine pieces at 1 and 4 rows and for five
+    at 5 and 8 (one head per CTA), with the merge of any count at 9, 14 and
+    15 and with the three-piece merge at 16 and 17 (two heads per CTA); the
+    same launch with 64 heads, or on SM100 / SM103, merges with the merge of
+    any count."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _fake_split_variants(routed=True))
@@ -5545,9 +5534,8 @@ def test_split_launch_runs_the_producer_then_the_merge(monkeypatch, tokens):
     """A split launch issues the split producer over 2 CTAs per piece and the
     merge, in one run, both on the piece views: the three-piece merge over one
     CTA per (row, two heads) at three pieces per row and 16 or 17 rows, the
-    merge for its count alone (nine and five pieces, three at 9-14 rows) and
-    the merge of any count (three pieces at 15 rows) over one CTA per (row,
-    head)."""
+    merge for its count alone (nine and five pieces) and the merge of any
+    count (three pieces at 9-15 rows) over one CTA per (row, head)."""
     import flashinfer.jit.cake_dsv4 as jit
 
     monkeypatch.setattr(jit, "VARIANTS", _fake_split_variants(routed=True))
@@ -5614,12 +5602,12 @@ _SPLIT_MERGE_PLAN = _plan(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_split_programs_take_the_plans_the_host_binds(arch):
-    """SM107 routes both split keys and the four per-count merges to programs
-    of their own, no two the same: the producer's plan is the uniform plan
-    with the split additions and every merge's plan is the merge kernel
-    signature.  SM100 / SM103 route the six keys to the uniform program.  On
-    SM107 the 128-head launch of every row count merges with the merge of
-    ``_SPLIT_MERGES``."""
+    """SM107 routes both split keys and the three per-count merges to
+    programs of their own, no two the same: the producer's plan is the
+    uniform plan with the split additions and every merge's plan is the merge
+    kernel signature.  SM100 / SM103 route the five keys to the uniform
+    program.  On SM107 the 128-head launch of every row count merges with
+    the merge of ``_SPLIT_MERGES``."""
     import flashinfer.jit.cake_dsv4 as jit
 
     variants = jit.VARIANTS[arch]
@@ -5808,9 +5796,10 @@ def test_run_cake_dsv4_split_launch_binds_the_piece_views(monkeypatch, tokens):
     producer stores its pieces through the [T * s, H, 512] partial-O view at
     byte 263168 and the LSE right after it, final O of single-piece rows
     through O; the merge (the three-piece merge over (T, H / 2) at three
-    pieces per row and 16 or 17 rows, else the merge for its count alone or,
-    at 15 rows, the merge of any count over (T, H)) reads the same views and
-    writes O; both bind the call's PDL and run in one run_sequence call."""
+    pieces per row and 16 or 17 rows, else the merge for its count alone, nine
+    and five pieces, or the merge of any count, three pieces at 9-15 rows,
+    over (T, H)) reads the same views and writes O; both bind the call's PDL
+    and run in one run_sequence call."""
     splits = _SPLIT_PIECES[tokens]
     pieces = tokens * splits
     inputs = _split_inputs(tokens)
@@ -5912,7 +5901,7 @@ def test_split_without_the_count_merge_merges_with_the_merge_of_any_count(
     any count over (T, 128): the same producer launch and the same merge
     arguments as with the per-count merges routed, under which a launch of
     16 or 17 rows differs only in its merge key and its grid (T, 64), one of
-    1-14 rows only in its merge key and one of 15 rows not at all."""
+    1-8 rows only in its merge key and one of 9-15 rows not at all."""
     inputs = _split_inputs(tokens)
     got = _run_split(monkeypatch, inputs, count_merge=count_merge)
     own = _run_split(monkeypatch, inputs)
@@ -6727,16 +6716,14 @@ def test_sm107a_lowhead_row_tiles_pick_their_program_per_launch(monkeypatch):
 @pytest.mark.cpu_only
 def test_only_the_128_head_rule_names_a_count_merge():
     """The 128-head SM107 rule names the merge for nine pieces from 1 row, for
-    five from 5 and for three from 9, the merge of any count for three pieces
-    from 15 rows and the three-piece merge from 16; no 64-head rule names a
-    merge, no rule names two merges for one (pieces, fewest rows), every
-    per-count merge a rule names is built for the pieces of its entry, and
-    the per-count merges are exactly those the rules name."""
+    five from 5 and the three-piece merge from 16 (three pieces at 9-15 rows
+    keep the merge of any count); no 64-head rule names a merge, no rule
+    names two merges for one (pieces, fewest rows), every per-count merge a
+    rule names is built for the pieces of its entry, and the per-count merges
+    are exactly those the rules name."""
     assert cake._K64_SPLIT_RULES["sm_107a"].merge_by_splits == (
         (9, 1, _SPLIT_MERGE_C9),
         (5, 5, _SPLIT_MERGE_C5),
-        (3, 9, _SPLIT_MERGE_C3),
-        (3, 15, cake._K64_SPLIT_MERGE),
         (3, 16, _SPLIT_MERGE_S3),
     )
     for rules in cake._K64_SPLIT_RULES_H64.values():
@@ -6763,9 +6750,9 @@ def test_k64_split_merge_pairs_each_key_with_its_grid(monkeypatch, arch, count_m
     """For every split SM107 plans (128 heads over nine tiles, 64 heads over
     every width class), the per-count merges are chosen exactly for the
     128-head launches on SM107 that ``_SPLIT_MERGES`` gives them (nine pieces
-    at 1-4 rows, five at 5-8, three at 9-14 and, the three-piece merge with
-    two heads per CTA, 16-17) where the registry routes them to programs of
-    their own; every other launch (64 heads, three pieces at 15 rows, another
+    at 1-4 rows, five at 5-8 and, the three-piece merge with two heads per
+    CTA, 16-17) where the registry routes them to programs of their own;
+    every other launch (64 heads, three pieces at 9-15 rows, another
     architecture, the keys unrouted or retired onto the uniform route's or
     the merge's program) merges with the merge of any count, one head per
     CTA.  No launch pairs the three-piece merge with a grid of H heads or
@@ -6809,9 +6796,9 @@ def test_k64_split_merge_follows_the_fewest_rows(monkeypatch):
     launch's pieces with the most fewest rows at most its rows wins in any
     order: with ((3, 1, three-piece),) every three-piece launch takes the
     three-piece merge, with ((3, 17, three-piece),) only the 17-row launch,
-    with the merge for three pieces from 1 row and the three-piece merge from
-    12 the launches of 9-11 rows the first and of 12-17 the second, and with
-    () none.  Removing one per-count entry of the SM107 rule returns exactly
+    with the three-piece merge from 1 row and the merge of any count from 12
+    the launches of 9-11 rows the first and of 12-17 the second, and with ()
+    none.  Removing one per-count entry of the SM107 rule returns exactly
     the launches it serves to the merge of any count; the split plans do not
     change."""
     import dataclasses
@@ -6834,7 +6821,7 @@ def test_k64_split_merge_follows_the_fewest_rows(monkeypatch):
         }
 
     any_count = (cake._K64_SPLIT_MERGE, 1)
-    c3, s3 = (_SPLIT_MERGE_C3, 1), (_SPLIT_MERGE_S3, 2)
+    s3 = (_SPLIT_MERGE_S3, 2)
 
     def three_pieces(merge_of_rows):
         return {
@@ -6846,9 +6833,9 @@ def test_k64_split_merge_follows_the_fewest_rows(monkeypatch):
     assert merges(((3, 17, _SPLIT_MERGE_S3),)) == three_pieces(
         lambda t: s3 if t == 17 else any_count
     )
-    two = ((3, 1, _SPLIT_MERGE_C3), (3, 12, _SPLIT_MERGE_S3))
+    two = ((3, 1, _SPLIT_MERGE_S3), (3, 12, cake._K64_SPLIT_MERGE))
     for entries in (two, two[::-1]):
-        assert merges(entries) == three_pieces(lambda t: s3 if t >= 12 else c3)
+        assert merges(entries) == three_pieces(lambda t: any_count if t >= 12 else s3)
     assert merges(()) == dict.fromkeys(_SPLIT_PIECES, any_count)
     full = merges(rule.merge_by_splits)
     assert full == _SPLIT_MERGES
