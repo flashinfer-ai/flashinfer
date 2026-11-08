@@ -6055,12 +6055,10 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
 
 
 #: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables): the lean
-#: one-wave forward of eight epilogue warps on sm_100a, the plain one on sm_103a.
+#: one-wave forward of eight epilogue warps.
 K1_FORWARD_PROGRAM_ROWS = {
     part: {
         (K, 512, T): "dense_proj_gemm_wave_lean_kk_n224_ef_e8"
-        if part[0] == "sm_100a"
-        else "dense_proj_gemm_wave_kk_n224"
         for K in (4096, 5120)
         for T in (16172, 16231, 16384)
     }
@@ -6134,6 +6132,7 @@ K1_WGRAD_SK_ROWS = {
         for T in (16172, 16231, 16384)
         for dt in ("bf16", "f32")
     },
+    ("sm_103a", 152): {(5120, 1024, 16384, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t"},
 }
 K1_ORDERED_ROWS = {
     ("sm_107a", 212): {
@@ -6170,7 +6169,6 @@ def test_k1_program_tables():
         for (arch, _), rows in table.items():
             for template in rows.values():
                 assert template in cake_jit.KERNELS[arch], (arch, template)
-    assert cake_backend.wave_forward_template(224) == "dense_proj_gemm_wave_kk_n224"
     assert cake_backend.dgrad_program_template(False) == _KD
     assert cake_backend.dgrad_program_template(True) == _KD_TMA
     assert (
@@ -6355,22 +6353,22 @@ def test_k1_program_rows_bind_their_program(monkeypatch, arch):
     assert cake_backend._k1_forward_program_of(X, W, out) is None
 
 
-def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch):
-    """The weight-gradient entry point runs, for a row of :data:`K1_WGRAD_SK_RULES_BY_SM` on a 148-SM sm_100a part,
-    the stream-K program with one unit per CTA pair (74), the unit length the line's K blocks over the units, the
-    arena's slots and flag words, and the program's argument order; a non-default ``sk`` or ``cta_rows``, another SM
-    count and one token off the row keep the other tables."""
-    entry_fn = _cpu_k1_launches(monkeypatch, "sm_100a")
+@pytest.mark.parametrize("arch, sms", sorted(K1_WGRAD_SK_ROWS))
+def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch, arch, sms):
+    """The weight-gradient entry point runs, for a row of :data:`K1_WGRAD_SK_RULES_BY_SM` on its part (148-SM
+    sm_100a, 152-SM sm_103a), the stream-K program with one unit per CTA pair (74, 76), the unit length the line's K
+    blocks over the units, the arena's slots and flag words, and the program's argument order; a non-default ``sk`` or
+    ``cta_rows``, another SM count and one token off the row keep the other tables."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
-    facts = dataclasses.replace(det_backend.device_facts(), sm_count=148)
+    facts = dataclasses.replace(det_backend.device_facts(), sm_count=sms)
     monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
     bf16 = torch.bfloat16
-    for (d_in, d_out, T, dt), template in sorted(
-        K1_WGRAD_SK_ROWS[("sm_100a", 148)].items()
-    ):
+    units = sms // 2
+    for (d_in, d_out, T, dt), template in sorted(K1_WGRAD_SK_ROWS[(arch, sms)].items()):
         G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
         out = torch.empty(d_out, d_in, dtype=torch.float32 if dt == "f32" else bf16)
-        module = cake_jit.KERNELS["sm_100a"][template]
+        module = cake_jit.KERNELS[arch][template]
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) == module
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, True, None) is None
         assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", 128) is None
@@ -6386,13 +6384,13 @@ def test_k1_wgrad_sk_rows_bind_their_program(monkeypatch):
         line = (d_in // 256) * (d_out // 256) * -(-T // 64)
         arena = cake_backend._ATOMIC_ARENAS[(0, 0)]
         values = dict(A=X.unsqueeze(0), B=G.unsqueeze(0), out=out, ws=arena.buffers["k1_slots"],
-                      flags=arena.buffers["k1_tickets"], M=d_in, N=d_out, K=T, num_l=1, num_units=74,
-                      unit_len=-(-line // 74), ldo=d_in, out_l=d_out * d_in, enable_pdl=0)  # fmt: skip
+                      flags=arena.buffers["k1_tickets"], M=d_in, N=d_out, K=T, num_l=1, num_units=units,
+                      unit_len=-(-line // units), ldo=d_in, out_l=d_out * d_in, enable_pdl=0)  # fmt: skip
         plan = cake_jit.arg_plan_of(cake_jit.MODULES[module])
-        want = cake_backend._order_atomic_arguments(module, plan, values, (148, 1, 1))
+        want = cake_backend._order_atomic_arguments(module, plan, values, (sms, 1, 1))
         _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
     assert int(arena.buffers["k1_tickets"].view(torch.int32).count_nonzero()) == 0
-    facts = dataclasses.replace(facts, sm_count=152)
+    facts = dataclasses.replace(facts, sm_count=sms + 4)
     monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
     assert cake_backend._k1_wgrad_sk_program_of(G, X, out, "auto", None) is None
 
@@ -13699,6 +13697,7 @@ K1_WGRAD_CHANGED_ROWS = {
         (5120, 32, "f32", 16384): ("det", None, None), (5120, 48, "bf16", 16231): ("det", None, None),
         (5120, 64, "f32", 16231): ("det", None, None), (5120, 64, "f32", 16384): ("det", None, None),
         (5120, 128, "f32", 16231): ("det", None, None), (5120, 128, "f32", 16384): ("det", None, None),
+        (5120, 1024, "f32", 16384): ("sk", 256, None),
     },
     ("sm_107a", 212): {
         (4096, 32, "f32", 16172): ("ordered", 64, 4),

@@ -1647,12 +1647,6 @@ def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> t
     )
 
 
-#: The registry template of this package's one-wave forward program of ``tile_n`` tokens per work item
-#: (:data:`K1_FORWARD_PROGRAM_RULES_BY_SM`).
-def wave_forward_template(tile_n: int) -> str:
-    return f"{cake_jit.TEMPLATE_PREFIXES[8]}kk_n{int(tile_n)}"
-
-
 #: The registry template of this package's input-gradient program of 256-wide output tiles with FP32 output
 #: (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`): row stores, or TMA stores of the tile from shared memory (``tma_store``).
 def dgrad_program_template(tma_store: bool) -> str:
@@ -1661,7 +1655,6 @@ def dgrad_program_template(tma_store: bool) -> str:
     )
 
 
-_WAVE_N224 = "dense_proj_gemm_wave_kk_n224"
 _WAVE_LEAN_N224_E8 = "dense_proj_gemm_wave_lean_kk_n224_ef_e8"
 _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
@@ -1670,19 +1663,19 @@ _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 #: ``(arch, sm_count) -> {(K, N, T): template}``: on a part of exactly ``sm_count`` SMs,
 #: :func:`cake_dense_gemm_nondet_train_projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16
 #: ``out[T, N]`` (unit inner stride) at exactly these extents and token count runs the one-wave forward program
-#: ``template`` (:func:`wave_forward_template`): one CTA pair per work item of 512 output features by ``tile_n``
-#: tokens over the whole K (``ceil(N / 512) * ceil(T / tile_n)`` items, 74 at 224 tokens per item for these rows, one
-#: wave of the SM pairs), each output element one ascending FP32 chain over K, no split of K, no workspace: the
-#: deterministic package's bits, the same on every run.  It comes before :data:`K1_FORWARD_RULES_BY_SM`; every other
+#: ``template`` (``dense_proj_gemm_wave_lean_kk_n224_ef_e8``): one CTA pair per work item of 512 output features by 224
+#: tokens over the whole K (``ceil(N / 512) * ceil(T / 224)`` items, 74 for these rows, one wave of the SM pairs), each
+#: output element one ascending FP32 chain over K, no split of K, no workspace: the deterministic package's bits, the
+#: same on every run.  It comes before :data:`K1_FORWARD_RULES_BY_SM`; every other
 #: part, row, token count, layout and output dtype keeps that table and the deterministic plan.  Measured at exactly
 #: these rows and token counts on one part of each SM count against this package's program of the row in the same
 #: process: faster in eager launches and in CUDA graph replays in 5 of 5 paired groups, the output equal to the
-#: deterministic plan's bit for bit, and the same bits on 20 repeats.  On 148-SM and 152-SM ``sm_100a`` parts the rows
-#: run the lean form of the program (``wave_lean_kk_n224_ef_e8``: the same items, ring, MMAs and order of the sums, so
-#: the same bits; the start path of cuBLAS's nvjet kernels, each role waiting on the cluster barrier only before its
-#: first operation that needs it, the epilogue freeing the tensor memory, and eight epilogue warps): 0.95 to 0.98 times
-#: the time of the plain form in eager launches and in CUDA graph replays, 5 of 5 paired groups on every row of a B200
-#: and a GB200 part.
+#: deterministic plan's bit for bit, and the same bits on 20 repeats.  The program is the lean form of the one-wave
+#: forward (the same items, ring, MMAs and order of the sums as its plain form, so the same bits; the start path of
+#: cuBLAS's nvjet kernels, each role waiting on the cluster barrier only before its first operation that needs it, the
+#: epilogue freeing the tensor memory, and eight epilogue warps): 0.95 to 0.98 times the time of the plain form on
+#: every row of a B200 and a GB200 part and 0.967 to 0.982 times on a GB300 part, in eager launches and in CUDA graph
+#: replays, 5 of 5 paired groups.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
@@ -1696,8 +1689,9 @@ K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int],
         (5120, 512, 16231): _WAVE_LEAN_N224_E8, (5120, 512, 16384): _WAVE_LEAN_N224_E8,
     },
     ("sm_103a", 152): {
-        (4096, 512, 16172): _WAVE_N224, (4096, 512, 16231): _WAVE_N224, (4096, 512, 16384): _WAVE_N224,
-        (5120, 512, 16172): _WAVE_N224, (5120, 512, 16231): _WAVE_N224, (5120, 512, 16384): _WAVE_N224,
+        (4096, 512, 16172): _WAVE_LEAN_N224_E8, (4096, 512, 16231): _WAVE_LEAN_N224_E8,
+        (4096, 512, 16384): _WAVE_LEAN_N224_E8, (5120, 512, 16172): _WAVE_LEAN_N224_E8,
+        (5120, 512, 16231): _WAVE_LEAN_N224_E8, (5120, 512, 16384): _WAVE_LEAN_N224_E8,
     },
 }
 # fmt: on
@@ -2009,7 +2003,10 @@ _SK_FLAG_WORDS = 512
 #: the row (cuBLAS, cuBLASLt with split K, DeepGEMM, QuACK) and against this package's program of the row, in the same
 #: process: 5.0 to 7.6 % faster than the former and 4.3 to 7.8 % faster than the latter in eager launches and in CUDA
 #: graph replays in every paired group, the same bits on 20 repeats, within 1.1 times the reference's median error on
-#: the six input kinds of :data:`K1_DSM_RANGES_BY_SM`'s check.
+#: the six input kinds of :data:`K1_DSM_RANGES_BY_SM`'s check.  On a 152-SM ``sm_103a`` part (76 units) the FP32
+#: program at ``5120 -> 1024`` and 16384 tokens, measured the same way on one GB300 node: 6.0 to 6.7 % faster than the
+#: fastest non-Cake program and 3.3 to 4.2 % faster than this package's program of the row, the same bits on 20
+#: repeats and within the same check.
 # fmt: off
 K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
@@ -2017,6 +2014,7 @@ K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], s
         (5120, 1024, 16384, "bf16"): _SK_N256_T, (5120, 1024, 16172, "f32"): _SK_N256_F32_T,
         (5120, 1024, 16231, "f32"): _SK_N256_F32_T, (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
     },
+    ("sm_103a", 152): {(5120, 1024, 16384, "f32"): _SK_N256_F32_T},
 }
 # fmt: on
 
