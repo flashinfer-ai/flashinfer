@@ -451,10 +451,6 @@ kernel_cake_gated_act_mxfp8_aab49b49d63a9174b1f5(__nv_bfloat16* __restrict__ gat
                 packed[1] = ((j == 1) ? pair : packed[1]);
                 packed[2] = ((j == 2) ? pair : packed[2]);
                 packed[3] = ((j == 3) ? pair : packed[3]);
-                packed[4] = ((j == 4) ? pair : packed[4]);
-                packed[5] = ((j == 5) ? pair : packed[5]);
-                packed[6] = ((j == 6) ? pair : packed[6]);
-                packed[7] = ((j == 7) ? pair : packed[7]);
             }
         }
     }
