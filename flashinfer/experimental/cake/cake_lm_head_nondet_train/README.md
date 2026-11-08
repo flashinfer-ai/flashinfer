@@ -401,8 +401,9 @@ it handles these rows on the device, without a host synchronization:
   for an ignored row), except when every valid row's `dlogp` is zero: the
   first valid row (the partition's `order[0]`; the first chunk counts at least
   one live row) then still runs one GEMM tile as a live row, and its `dX` row
-  is `+0` for finite inputs but NaN when that row's `X`, logits or `lse` (or
-  `W`) are non-finite.  `dX` of a live row is the same mathematics as without
+  is `+0` for finite inputs but can be NaN when that row's `X`, logits or `lse`
+  (or `W`) are non-finite (a `-inf` logit with a finite `lse` and `W` still
+  gives `+0`).  `dX` of a live row is the same mathematics as without
   the skip.  `dW` sums the same nonzero products over the live rows in the new
   row order (FP32 accumulation; bits may differ within the accuracy budgets).
 * The skip applies to a compacted backward that reuses the forward's row index
@@ -446,9 +447,10 @@ Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
 makes `dW` NaN without the skip (`0 * inf`); with the skip it still does when
 the row falls within the 63 rows after a chunk's live rows (the weight-gradient
-GEMM's last 64-row K step), and not elsewhere.  With the skip its `dX` row is
-exact `+0` (except the first valid row when every `dlogp` is zero, above);
-without the skip a zero-gradient row's `dX` row can be NaN (`0 * NaN`).
+GEMM's last 64-row K step), or is the first valid row that runs as a live row
+when every `dlogp` is zero (above), and not elsewhere.  With the skip its `dX`
+row is exact `+0` (except the first valid row when every `dlogp` is zero,
+above); without the skip a zero-gradient row's `dX` row can be NaN (`0 * NaN`).
 
 Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
 
