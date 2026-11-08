@@ -40,19 +40,23 @@ non-deterministic forward of packed rows (the benchmark's inputs) runs its tiny
 forward up to 140 rows per SM on SM100, 120 on SM103 and 65 on SM107 and past
 that a persistent forward (the mid, long or extra-long one) by bands of rows
 per SM (``cake_jit.FORWARD_BANDS``).
-Its backward runs one cluster of 16 CTAs up to 512 rows (with a BF16 or an
-FP32 weight gradient or ``compute_grad_weight=False``), else one kernel by
+Its backward runs one cluster of 16 CTAs for few rows, else one kernel by
 bands of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient
-(the one timed here) runs a row-claims backward (256-thread CTAs of 16-row
-blocks, 4 per SM) up to 800 rows per SM on SM100 and 700 on SM103, the
-row-claims mid backward (5 CTAs per SM) up to 1329 rows per SM on SM100 and
-1294 on SM103, and past that the claimed backward (at most 8 CTAs per SM over
-chunks of rows); on SM107 the static backward up to 24 rows per SM, the
-row-claims backward up to 68 and the claimed backward past that.  An FP32
-weight gradient runs the static backward up to 256 rows per SM on SM100 and
-SM103 (64 on SM107) and the claimed backward past that.  At ``--heads 48``
-the default token counts reach every forward kernel of packed rows and every
-BF16 backward kernel that a 148-SM B200 routes (2048 tokens: the extra-long
+(the one timed here) runs, on SM100, the short backward (one cluster, a
+fixed-order sum) up to 256 rows, the exact tiny backward (one cluster, the
+deterministic pair's bits) up to 512 rows, a row-claims backward (256-thread
+CTAs of 16-row blocks, 4 per SM) up to 800 rows per SM, the row-claims mid
+backward (5 CTAs per SM) up to 1329 rows per SM and past that the claimed
+backward (at most 8 CTAs per SM over chunks of rows); on SM103 the short
+backward up to 256 rows, a row-claims backward up to 700 rows per SM, the
+row-claims mid backward up to 1294 rows per SM and the claimed backward past
+that; on SM107 the exact tiny backward up to 512 rows, the static backward up
+to 24 rows per SM, the row-claims backward up to 68 and the claimed backward
+past that.  An FP32 weight gradient runs the exact tiny backward up to 512
+rows, the static backward up to 256 rows per SM on SM100 and SM103 (64 on
+SM107) and the claimed backward past that.  At ``--heads 48`` the default
+token counts reach every forward kernel of packed rows and every BF16
+backward kernel that a 148-SM B200 routes (2048 tokens: the extra-long
 forward).
 
 Timing uses CUPTI kernel activity with a cold L2
@@ -117,10 +121,17 @@ API = {
 }
 MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
-# The issue's token counts and a spread around them, then small and irregular ones
-# (at 48 heads on a 148-SM B200, BF16 weight gradient: 1, 5 and 7 tokens reach
-# the small-row backward; 16, 129, 1031 and 2048 the row-claims backward; 4097
-# the row-claims mid backward; 30000 to 33000 the claimed backward).
+# The issue's token counts and a spread around them, then small and irregular ones.
+# The BF16 backward each reaches at 48 heads (``cake_jit.BACKWARD_BANDS``):
+# - 148-SM B200 (sm_100a): 1 and 5 tokens the short backward; 7 the exact tiny
+#   backward; 16, 129, 1031 and 2048 the row-claims backward; 4097 the
+#   row-claims mid backward; 30000 to 33000 the claimed backward.
+# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7, 16, 129, 1031
+#   and 2048 the row-claims backward; 4097 the row-claims mid backward; 30000
+#   to 33000 the claimed backward.
+# - 212-SM R200 (sm_107a): 1, 5 and 7 tokens the exact tiny backward; 16 the
+#   static backward; 129 the row-claims backward; 1031 and more the claimed
+#   backward.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 

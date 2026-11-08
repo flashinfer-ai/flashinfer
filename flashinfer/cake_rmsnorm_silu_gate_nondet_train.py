@@ -38,8 +38,9 @@ values.
 same inputs on the same device give the same bits on every call, whatever the
 grid, the order in which CTAs run and the work beside the call on other
 streams.  A BF16 weight gradient repeats bit for bit too, except in the
-row-claims bands (below), where its last bits may vary from run to run.  The
-kernels are those of the standalone package
+row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 257 rows to
+1294 rows per SM, SM107 above 24 to 68 rows per SM), where its last bits may
+vary from run to run.  The kernels are those of the standalone package
 ``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``:
 
 - The forward computes ``rstd`` with ``rsqrt.approx`` and the SiLU gate with
@@ -57,19 +58,26 @@ kernels are those of the standalone package
   differ between bands while each program repeats them for the same inputs
   on the same device.
 - The backward is one kernel; ``dx`` and ``dz`` are the deterministic
-  backward's arithmetic in every band.  A call of few rows (up to 512 rows,
-  with a BF16 or an FP32 weight gradient or with
-  ``compute_grad_weight=False``) runs one thread-block cluster of 16 CTAs,
-  which adds the weight-gradient partials of each column in a fixed order in
-  FP64, rounds that sum to FP32 (then to BF16 for a BF16 weight gradient) and
-  uses no workspace.  Past that the rows (``T * H``) and the SM count pick
-  the kernel by bands of rows per SM.  The chunked backwards run over the
-  deterministic backward's chunks of rows (8-row blocks, ``max(1, ceil(blocks
-  / 8192))`` blocks a chunk), at most 8 CTAs per SM: each chunk's FP32
-  weight-gradient partial is the deterministic backward's, and the partials
-  are added exactly, as signed 64-bit integer windows of their FP32 values (an
-  addition of integers does not depend on its order); the CTA that arrives
-  last rounds the exact sum once into the weight gradient.  So that weight
+  backward's arithmetic in every band.  A call of few rows runs one
+  thread-block cluster of 16 CTAs, which adds the weight-gradient partials of
+  each column in a fixed order in FP64, rounds that sum to FP32 (then to BF16
+  for a BF16 weight gradient) and uses no workspace.  The short backward
+  (256-thread CTAs, every CTA's FP32 partials added in rank order) runs a
+  BF16 weight gradient or ``compute_grad_weight=False`` up to 256 rows on
+  SM100 and SM103; its weight gradient repeats its bits, which need not be the
+  deterministic package's.  The exact tiny backward (the deterministic
+  backward's chunk partials in its reduction order: the deterministic pair's
+  bits) runs an FP32 weight gradient up to 512 rows on every architecture and
+  a BF16 one (or ``compute_grad_weight=False``) from 257 up to 512 rows on
+  SM100 and up to 512 rows on SM107.  Past those rows the rows (``T * H``)
+  and the SM count pick the kernel by bands of rows per SM.  The chunked
+  backwards run over the deterministic backward's chunks of rows (8-row
+  blocks, ``max(1, ceil(blocks / 8192))`` blocks a chunk), at most 8 CTAs per
+  SM: each chunk's FP32 weight-gradient partial is the deterministic
+  backward's, and the partials are added exactly, as signed 64-bit integer
+  windows of their FP32 values (an addition of integers does not depend on its
+  order); the CTA that arrives last rounds the exact sum once into the weight
+  gradient.  So that weight
   gradient is the same bits at any grid, the deterministic package's bits
   except where the exact sum lies within the deterministic FP64 sum's error of
   a rounding boundary, and an infinite or ``NaN`` partial gives its column the
@@ -86,7 +94,7 @@ kernels are those of the standalone package
 - A BF16 weight gradient runs a row-claims backward where it saves at least
   3 % of a checkpointed training step (2 x forward + backward): on SM100 from
   513 rows up to 1329 rows per SM (the row-claims backward up to 800 rows per
-  SM, the row-claims mid backward past it), on SM103 from 513 rows up to 1294
+  SM, the row-claims mid backward past it), on SM103 from 257 rows up to 1294
   rows per SM (the row-claims backward up to 700 rows per SM, the row-claims
   mid backward past it) and on SM107 above 24 up to 68 rows per SM (the
   row-claims backward).  Its 256-thread CTAs take 16-row blocks (4 CTAs per
@@ -142,8 +150,8 @@ backward kernels) holds, for a chunked backward, the integer windows of the
 exact sum, 128 FP32 class words, the arrival ticket and the claim counter,
 and, for a row-claims backward, its FP64 accumulators and the same two words
 (4104 bytes); every launch of the backward uses one, also with
-``compute_grad_weight=False``, but the one-cluster backward of a call of few
-rows, which reads none.  The kernel leaves it zero: allocate it once, reuse it
+``compute_grad_weight=False``, but the one-cluster backwards of a call of few
+rows, which read none.  The kernel leaves it zero: allocate it once, reuse it
 across calls, shapes, both weight-gradient dtypes and CUDA Graph replays
 without a reset, and give each stream that may run a backward at the same
 time its own buffer.  A buffer that did not come from that factory, or that
@@ -154,7 +162,7 @@ buffer: this package's backward refuses that buffer (``ValueError``) in every
 call, and the deterministic backward refuses this one in a call with rows.
 Calls without a workspace use one buffer per device, stream and backward
 kernel that takes one (one for each static, row-claims and claimed backward
-its architecture routes; none for the one-cluster backward),
+its architecture routes; none for the one-cluster backwards),
 kept for later calls; the autograd node retains nothing else.  They also keep a reserve of 64 zero-filled buffers per device (about
 1.8 MiB on SM100 and SM103, 2.2 MiB on SM107, filled outside any capture): a call during CUDA Graph capture takes
 one per capture and capture stream from it and keeps it for the life of the
@@ -426,15 +434,18 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     rounds the exact sum once into ``dw`` (adding ``grad_weight``'s value first
     when accumulating), so ``dw`` is the deterministic backward's bits except
     where the exact sum lies within that backward's FP64 sum error of a
-    rounding boundary.  A call of few rows (up to 512 rows, with a BF16 or an
-    FP32 ``dw`` or with ``compute_grad_weight=False``) runs one cluster of 16
-    CTAs (``dx`` and ``dz`` the same arithmetic) that adds the partials of a
-    ``dw`` column in a fixed order in FP64 and uses no workspace.  A BF16
-    ``dw`` in the row-claims bands (on SM100 513 rows to 1329 rows per SM, on
-    SM103 513 rows to 1294 rows per SM, on SM107 above 24 to 68 rows per SM)
-    runs a row-claims backward, which adds FP32 runs of rows to FP64
-    accumulators with atomics: that ``dw`` stays within the family's error
-    budget, but its last bits may vary from run to run.  Every other output
+    rounding boundary.  A call of few rows runs one cluster of 16 CTAs
+    (``dx`` and ``dz`` the same arithmetic) that adds the partials of a ``dw``
+    column in a fixed order in FP64 and uses no workspace: up to 256 rows on
+    SM100 and SM103 with a BF16 ``dw`` or ``compute_grad_weight=False`` (the
+    short backward, whose ``dw`` repeats its bits, which need not be the
+    deterministic backward's), else up to 512 rows (the exact tiny backward,
+    the deterministic backward's bits; SM103 runs it for an FP32 ``dw``
+    only).  A BF16 ``dw`` in the row-claims bands (on SM100 513 rows to 1329
+    rows per SM, on SM103 257 rows to 1294 rows per SM, on SM107 above 24 to
+    68 rows per SM) runs a row-claims backward, which adds FP32 runs of rows
+    to FP64 accumulators with atomics: that ``dw`` stays within the family's
+    error budget, but its last bits may vary from run to run.  Every other output
     repeats bit for bit, whatever the grid and the order in which CTAs run.
     The deterministic backward is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`.
@@ -465,8 +476,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
         A call with no rows leaves the accumulator as it is.
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
-        it.  A call of few rows runs the one-cluster backward, which uses
-        no workspace (a ``workspace`` passed is checked and left as it is).
+        it.  It takes the BF16 bands: a call of up to 512 rows (256 on SM103)
+        runs a one-cluster backward, which uses no workspace (a ``workspace``
+        passed is checked and left as it is).
         With more rows the kernel touches neither ``grad_weight`` nor the
         workspace's windows or accumulators, but its CTAs still take the
         arrival ticket (and in the claimed and the row-claims backwards claim

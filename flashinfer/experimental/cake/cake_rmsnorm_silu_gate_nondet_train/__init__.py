@@ -53,7 +53,10 @@ one thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same
 arithmetic, that sums the weight gradient on chip in a fixed order and rounds
 it once, the same bits on every call.  The exact tiny backward (4 teams of
 the deterministic backward's 128-thread CTA a CTA) adds the deterministic
-backward's chunk partials in its reduction order in FP64.  Where a
+backward's chunk partials in its reduction order in FP64; the short backward
+of a BF16 weight gradient on sm_100a and sm_103a (256-thread CTAs) has each
+CTA finish 8 columns from every CTA's FP32 partials in rank order in FP64.
+Where a
 row-claims backward saves at least 3 % of a checkpointed training step, a
 BF16 weight gradient runs it instead (256-thread CTAs of 16-row blocks, the
 CTAs past one wave claiming blocks from the workspace's claim counter): ``dx``
@@ -191,7 +194,8 @@ Host design (the input layout rules are the deterministic package's):
   warms the block two ahead.  A small-row backward is one cluster of 16 CTAs
   (``cake_jit.backward_ctas`` 16) scheduled together on the SMs of one GPC,
   team ``q`` of the exact tiny backward's CTA ``r`` running the 8-row block
-  ``r + 16 q``.  No kernel is cooperative; no
+  ``r + 16 q``, CTA ``r`` of the short backward the 16-row blocks ``r``,
+  ``r + 16``, ....  No kernel is cooperative; no
   call synchronizes the host or the device, and every kernel runs on the
   current torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548): a kernel
