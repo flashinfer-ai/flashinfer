@@ -31,7 +31,7 @@ the floor of the FP64 reference's largest magnitude, ``dw`` within
 FP32 weight gradient (accumulated or not) must be the same bits on every
 launch and on every path: streams, CUDA Graph replays, autograd,
 ``compute_grad_weight``, grids smaller than the work (the static, the claimed,
-the row-claims and the fused backwards at 1, 3 and 7 CTAs; a fused backward's
+the row-claims and the fused backwards at 1, 3 and 7 CTAs; the fused backward's
 weight gradient the bits of its grid, whose chunks follow it), a workspace
 reused across shapes; so must a BF16 weight gradient in every band of
 ``BACKWARD_BANDS``
@@ -160,16 +160,16 @@ ROW_CLAIMS_GRID_RULES = {
 }
 ROW_CLAIMS_LAYOUT = (("dw_sums", 0, 4 * D), ("dw_done", 4096, 2))
 ROW_CLAIMS_WORKSPACE_BYTES = 4104
-# The fused backwards (the deterministic package's backward program under this
-# package's names: ``bwd_f32_fused`` on every architecture, ``bwd_bf16_fused``
-# on sm_107a) and their grid rule: at most 4 CTAs per SM claiming 16-row
-# blocks; and their workspace: 2304 u64 fixed-point digits (``acc``), a u32
-# flag word a column (``flags``) and the u32 arrival ticket and claim counter
-# (``done``), 18952 bytes.
+# The fused backward (the deterministic package's backward program under this
+# package's name: ``bwd_bf16_fused``, a BF16 weight gradient on sm_107a; an
+# FP32 weight gradient runs no fused backward) and its grid rule: at most 4
+# CTAs per SM claiming 16-row blocks; and its workspace: 2304 u64 fixed-point
+# digits (``acc``), a u32 flag word a column (``flags``) and the u32 arrival
+# ticket and claim counter (``done``), 18952 bytes.
 FUSED_ROLES = {
-    "sm_100a": ("bwd_f32_fused",),
-    "sm_103a": ("bwd_f32_fused",),
-    "sm_107a": ("bwd_bf16_fused", "bwd_f32_fused"),
+    "sm_100a": (),
+    "sm_103a": (),
+    "sm_107a": ("bwd_bf16_fused",),
 }
 FUSED_GRID_RULE = {"ctas_per_sm": 4, "kind": "claimed_row_blocks", "rows_per_block": 16}
 FUSED_LAYOUT = (("acc", 0, 18 * D), ("flags", 18432, D), ("done", 18944, 2))
@@ -378,8 +378,8 @@ def _varies(name: str) -> bool:
     ``_rc_mid``), whose CTAs claim 16-row blocks at run time and add the FP32
     runs of their rows with FP64 atomics.  Every other backward repeats its
     bits: the small-row backwards sum on chip in a fixed order, the static and
-    the claimed backwards add their partials exactly, as integers, and so do
-    the fused backwards their chunks' terms, as fixed-point digits."""
+    the claimed backwards add their partials exactly, as integers, and so
+    does the fused backward its chunks' terms, as fixed-point digits."""
     return loader.MODULES[name]["grid_rule"]["kind"] == "row_claims"
 
 
@@ -647,14 +647,13 @@ def test_layouts(layout):
 # head-major) fall back to a prefetch per thread.
 # One token of many heads (its token stride passed as 0) and contiguous tokens
 # are packed rows.  The row-claims backward (``bwd_bf16_rc``) and the fused
-# backwards (``_fused``) warm no rows and run the same checks.
+# backward (``bwd_bf16_fused``) warm no rows and run the same checks.
 BULK_BANDS = (
     "bwd_bf16_rc",
     "bwd_bf16_rc_mid",
     "bwd_bf16_mid",
     "bwd_f32_mid",
     "bwd_bf16_fused",
-    "bwd_f32_fused",
 )
 BULK_BAND_CASES = [
     pytest.param(band, layout, id=f"{band}-{layout}")
@@ -832,7 +831,7 @@ def test_compute_grad_weight_false_touches_no_weight_state(monkeypatch):
 
 # The band roles of the backwards that run on a workspace: the static
 # backwards (the call roles), the row-claims backwards of a BF16 weight
-# gradient, the claimed backwards and the fused backwards.
+# gradient, the claimed backwards and the fused backward.
 GRID_BANDS = (
     "bwd_bf16",
     "bwd_f32",
@@ -841,7 +840,6 @@ GRID_BANDS = (
     "bwd_bf16_mid",
     "bwd_f32_mid",
     "bwd_bf16_fused",
-    "bwd_f32_fused",
 )
 
 
@@ -1904,9 +1902,10 @@ def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
     ("rows", "sm_count", "blocks", "ctas4", "_ctas5"), ROW_CLAIMS_GRIDS
 )
 def test_fused_backward_cta_rule(rows, sm_count, blocks, ctas4, _ctas5):
-    """The fused backwards (every routed module whose grid rule is
-    ``claimed_row_blocks``, ``FUSED_ROLES``): ``min(ceil(rows / 16), 4 *
-    SMs)`` CTAs (``ROW_CLAIMS_GRIDS`` at 4 CTAs per SM; past one wave the CTAs
+    """The fused backward (every routed module whose grid rule is
+    ``claimed_row_blocks``, ``FUSED_ROLES``: ``bwd_bf16_fused`` on sm_107a):
+    ``min(ceil(rows / 16), 4 * SMs)`` CTAs (``ROW_CLAIMS_GRIDS`` at 4 CTAs per
+    SM; past one wave the CTAs
     claim the blocks at run time), a grid of that many CTAs, and no chunks."""
     assert -(-rows // 16) == blocks, rows
     found = set()

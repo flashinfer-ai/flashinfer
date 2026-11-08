@@ -27,8 +27,9 @@ call of this package runs it.
 Numerical contract.  ``y``, ``dx``, ``dz`` and an FP32 weight gradient repeat
 bit for bit: the same inputs on the same device give the same bits on every
 call, whatever the order in which CTAs run and the work beside the call on
-other streams, and whatever the grid but in the fused bands (whose grid, and
-so whose bits, the rows and the SM count fix).  A BF16 weight gradient
+other streams, and whatever the grid but in the fused band of a BF16 weight
+gradient on sm_107a (whose grid, and so whose bits, the rows and the SM count
+fix).  A BF16 weight gradient
 repeats bit for bit too, except in the row-claims bands of
 ``cake_jit.BACKWARD_BANDS`` (the roles ``bwd_bf16_rc`` and
 ``bwd_bf16_rc_mid``, on sm_100a and sm_103a only), where its last bits may
@@ -41,7 +42,7 @@ within the family's budget.  Each forward program's arithmetic is fixed,
 but the programs may associate a row's sum of squares differently (the row
 count and the SM count pick the program), so ``y`` repeats bit for bit for the
 same inputs on the same device.  The backward writes ``dx`` and ``dz``
-with one row arithmetic in every band but the fused ones (within one BF16 ulp
+with one row arithmetic in every band but the fused one (within one BF16 ulp
 of the FP64 value plus 1/64 ulp of the tensor's largest finite magnitude; the
 deterministic package's backward need not give these bits) and computes the FP32 partial of
 each chunk of rows as the deterministic backward at FlashInfer ``2e989556``
@@ -64,8 +65,9 @@ of a BF16 weight gradient (256-thread CTAs) has each
 CTA finish 8 columns from every CTA's FP32 partials in rank order in FP64.
 Where the deterministic package's backward makes the checkpointed training
 step (2 x forward + backward) faster than this package's own backwards, a
-call runs this package's copy of it instead, the fused backward
-(``bwd_f32_fused`` on every architecture, ``bwd_bf16_fused`` on sm_107a):
+call with a BF16 weight gradient on sm_107a runs this package's copy of it
+instead, the fused backward (``bwd_bf16_fused``; an FP32 weight gradient
+runs no fused backward):
 256-thread CTAs of 16-row blocks, 16 lanes a row, at most 4 CTAs per SM
 claiming the blocks in chunks whose rows are fixed by the row count and the
 grid, each chunk's weight-gradient terms added exactly into fixed-point
@@ -113,7 +115,7 @@ Host design (the input layout rules are the deterministic package's):
   on sm_107a the static modules' last copy holds occupancy words instead),
   128 FP32 class words and the two 32-bit words of the arrival ticket and the
   claim counter; for a row-claims backward two: its 4 x 128 FP64
-  accumulators and the same two words (4104 bytes); for a fused backward
+  accumulators and the same two words (4104 bytes); for the fused backward
   three: its 2304 64-bit fixed-point digits, a 32-bit flag word a column and
   the same two words (18952 bytes).  Every launch of the static, the
   claimed, the row-claims and the fused backwards takes a ticket (and the
@@ -215,17 +217,17 @@ Host design (the input layout rules are the deterministic package's):
   sm_100a and sm_103a) run
   256-thread CTAs of 16-row blocks and launch ``G = min(blocks, ctas_per_sm
   * SMs)`` CTAs (4 per SM; 5 for ``_rc_mid``), those past one wave claiming
-  blocks from the claim counter.  The fused backwards run 256-thread CTAs of
-  16-row blocks and launch ``G = min(blocks, 4 * SMs)`` CTAs, which claim the
-  blocks in chunks whose rows are fixed by the row count and ``G``.
+  blocks from the claim counter.  The fused backward (sm_107a) runs
+  256-thread CTAs of 16-row blocks and launches ``G = min(blocks, 4 * SMs)``
+  CTAs, which claim the blocks in chunks whose rows are fixed by the row
+  count and ``G``.
   ``cake_jit.BACKWARD_BANDS`` routes every
   backward module of a role by the rows (``T * H``), the first band that
   holds (small-row bands by a count of rows, the others by rows per SM): the
   small-row backwards, then the fused backward where it makes the
-  checkpointed training step faster than this package's own backwards (an
-  FP32 weight gradient up to 60 rows per SM on sm_100a, 56 on sm_103a and 48
-  on sm_107a, a BF16 one up to 60 on sm_107a), a static backward up to at
-  most 4 row blocks a
+  checkpointed training step faster than this package's own backwards (a
+  BF16 weight gradient up to 60 rows per SM on sm_107a), a static backward
+  up to at most 4 row blocks a
   CTA (256 rows per SM; on sm_107a over 4 window copies plus occupancy words,
   one wave at most), for a BF16
   weight gradient on sm_100a and sm_103a the row-claims backwards where they
@@ -593,8 +595,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
     (``T * H``) on ``device``: the largest workspace of the architecture's
     backward modules (the integer windows of the exact weight-gradient sum, the
     FP32 class words and the arrival ticket and claim counter; a row-claims
-    module's FP64 accumulators and a fused module's fixed-point digits and
-    flag words fit within it), whatever ``rows``: 29192 bytes
+    module's FP64 accumulators and, on sm_107a, the fused module's fixed-point
+    digits and flag words fit within it), whatever ``rows``: 29192 bytes
     (about 29 KiB) on sm_100a and sm_103a, 36360 (about 36 KiB) on sm_107a.
     """
 
@@ -1022,11 +1024,12 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     exactly as 64-bit integer windows in the workspace; the CTA that arrives
     last rounds the exact sum once into ``dw`` (adding ``grad_weight``'s value
     first when accumulating; FP32, then BF16 for a BF16 ``dw``) and zeroes the
-    workspace.  The fused bands (``bwd_f32_fused``; ``bwd_bf16_fused`` on
-    sm_107a) run this package's copy of the deterministic package's backward
-    instead, which adds each chunk's weight-gradient terms exactly into
-    fixed-point digits in the workspace: ``dx``, ``dz`` and ``dw`` the
-    deterministic package's bits, the same for the rows and the SM count.
+    workspace.  The fused band of a BF16 weight gradient on sm_107a
+    (``bwd_bf16_fused``) runs this package's copy of the deterministic
+    package's backward instead, which adds each chunk's weight-gradient terms
+    exactly into fixed-point digits in the workspace: ``dx``, ``dz`` and
+    ``dw`` the deterministic package's bits, the same for the rows and the SM
+    count.
     For a BF16 weight gradient on sm_100a and sm_103a the row-claims bands
     (``bwd_bf16_rc``, ``bwd_bf16_rc_mid``) run a row-claims backward instead,
     which adds FP32 runs of rows to FP64 accumulators with atomics: ``dx`` and

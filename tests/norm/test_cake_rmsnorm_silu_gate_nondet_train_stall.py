@@ -76,15 +76,15 @@ CTAs claim the blocks from the workspace's claim counter, so a CTA that
 starts late takes fewer blocks; each CTA adds its FP32 runs of rows (the
 row-claims mid backward: as FP32 two-sum pairs) to FP64 accumulators of the
 workspace with atomics and takes a ticket, and the CTA that arrives last
-rounds the sum into ``dw``.  The fused backwards (``bwd_f32_fused`` on
-every architecture, ``bwd_bf16_fused`` on SM107; grid kind
-``claimed_row_blocks``: the deterministic package's backward program under
-this package's names) cut the rows into blocks of 16 rows and launch
-``G = min(blocks, 4 * SMs)`` CTAs of 256 threads; where the rows have more
-blocks than the grid has CTAs, the CTAs claim runs of blocks from the
-workspace's claim counter, in halving rounds and then single blocks, so a
-CTA that starts late takes fewer blocks (their bands end below that, at most
-60 rows per SM, so there CTA ``b`` runs block ``b``); each CTA adds its
+rounds the sum into ``dw``.  The fused backward (``bwd_bf16_fused``, a BF16
+weight gradient on SM107; grid kind ``claimed_row_blocks``: the
+deterministic package's backward program under this package's name) cuts
+the rows into blocks of 16 rows and launches ``G = min(blocks, 4 * SMs)``
+CTAs of 256 threads; where the rows have more blocks than the grid has CTAs,
+the CTAs claim runs of blocks from the workspace's claim counter, in halving
+rounds and then single blocks, so a CTA that starts late takes fewer blocks
+(its band ends below that, at most 60 rows per SM, so there CTA ``b`` runs
+block ``b``); each CTA adds its
 blocks' weight-gradient terms exactly into fixed-point digits of the
 workspace and takes a ticket, and the CTA that arrives last rounds the sum
 once into ``dw``, so it repeats its bits and is the deterministic package's.
@@ -101,7 +101,7 @@ launch record's ``dynamic_smem_bytes``: the two halves of the 8 x 128 FP32
 fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128 columns,
 7168 bytes, and the run cell, the arrival flag and the 8-entry claim table,
 160 bytes, 15520 bytes rounded up), each CTA of the row-claims backwards
-20736 bytes and each CTA of the fused backwards 26368 bytes, so a side
+20736 bytes and each CTA of the fused backward 26368 bytes, so a side
 kernel holding every SM with a small carveout can
 delay its start until the side kernel exits (no test here asserts that delay;
 documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The
@@ -139,10 +139,10 @@ grid has CTAs) of either weight-gradient dtype, at its first such whole
 tokens and at the most tokens whose rows give each CTA the band end's whole
 row blocks a CTA (the band's last whole tokens where that is not past the
 first; a weight-gradient dtype with no such band skips); in each row-claims
-band (SM100 and SM103; SM107 routes none) and in each fused band (its CTAs
-claim 16-row blocks at run time where the rows have more blocks than the
-grid has CTAs; in its rows each CTA runs one block, so the share of one row
-block is 1), at its first and its last whole tokens.  The persistent forwards
+band (SM100 and SM103; SM107 routes none) and in the fused band (SM107; its
+CTAs claim 16-row blocks at run time where the rows have more blocks than
+the grid has CTAs; in its rows each CTA runs one block, so the share of one
+row block is 1), at its first and its last whole tokens.  The persistent forwards
 beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
 the share of one CTA's blocks in the call (a CTA whose slot the side kernel
 holds walks all of its blocks once it starts), plus ``PROPORTIONAL_SLACK``,
@@ -187,9 +187,9 @@ measurement that counts (to the last one when none does).  The small-row
 backwards (``SHORT_BACKWARD_PROBES``, BF16 and FP32 weight gradients) keep
 their speed beside the one-thread kernel and, beside the short forward's side
 kernels, end no later than the backward they replace (the module of the
-role's first band past its small-row bands, at the same rows: the fused
-backward, but for a BF16 weight gradient on SM100 and SM103 the row-claims
-backward) by the short
+role's first band past its small-row bands, at the same rows: for a BF16
+weight gradient the row-claims backward on SM100 and SM103 and the fused
+backward on SM107, for an FP32 one the static backward) by the short
 forward's bound and measurement rule: there a measurement
 counts only when the small-row backward's and the replaced backward's alone
 medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest alone
@@ -1680,10 +1680,10 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 # slack and SHORT_MAX_ALONE_SPREAD.  And "past": the first whole tokens of H
 # heads past the role's last small-row band (by the band ends of
 # BACKWARD_BANDS: 6 tokens past 256 rows, 11 tokens past 512), where the
-# module of the role's next band takes over from the small-row backward (on
-# SM100 and SM103 for a BF16 weight gradient the row-claims backward, else the
-# fused backward); it runs in the keeps-speed and the max-shared start tests
-# only.
+# module of the role's next band takes over from the small-row backward (for
+# a BF16 weight gradient the row-claims backward on SM100 and SM103 and the
+# fused backward on SM107, for an FP32 one the static backward); it runs in
+# the keeps-speed and the max-shared start tests only.
 SHORT_BACKWARD_PROBES = ("1x48", "5x48", "second_band", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
@@ -1860,8 +1860,8 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
 # kernel exits (observed on R200): there it
 # must end at most MAX_ALL_SM_EXTRA_MS after the backward it replaces (the
 # module of the role's first band past its small-row bands, on SM107 the
-# fused backward, 26368 bytes a CTA, for both weight-gradient dtypes) beside
-# it.
+# fused backward, 26368 bytes a CTA, for a BF16 weight gradient and the static
+# backward, 15616 bytes a CTA, for an FP32 one) beside it.
 SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)
 
 

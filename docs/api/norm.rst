@@ -352,15 +352,15 @@ the row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 257
 rows to 1294 rows per SM; SM107 has none), where its last
 bits may vary from run to run.  ``y`` is the deterministic package's bits
 where a pipelined forward runs (below) and not elsewhere; ``dx`` and ``dz`` are
-the same bits in every band but the fused ones (below), within one BF16 unit
-in the last place of the FP64 value plus 1/64 of a unit of the tensor's
-largest finite magnitude in every band (the deterministic package's backward
-need not give these bits), and outside the row-claims bands, the
-short backward's band (a BF16 weight gradient up to 256 rows) and the fused
-bands ``dw`` is the
+the same bits in every band but the fused one (below: a BF16 weight gradient
+on SM107), within one BF16 unit in the last place of the FP64 value plus 1/64
+of a unit of the tensor's largest finite magnitude in every band (the
+deterministic package's backward need not give these bits), and outside the
+row-claims bands, the short backward's band (a BF16 weight gradient up to 256
+rows) and the fused band ``dw`` is the
 bits of the deterministic package at FlashInfer commit 2e989556, except where
 the exact sum lies within that package's FP64 sum's error of a rounding
-boundary.  In the fused bands ``dx``, ``dz`` and ``dw`` are the bits of the
+boundary.  In the fused band ``dx``, ``dz`` and ``dw`` are the bits of the
 deterministic package in this release, the same for the rows and the SM
 count.  In the short
 backward's band ``dw`` is that kernel's own fixed-order sum, the same bits on
@@ -368,9 +368,8 @@ every call, which need not be the deterministic package's.  The FP64 error of
 each output (relative L2 and the largest error relative to the largest
 reference value) is at most 1.1 times the deterministic package's on the same
 inputs, and within the deterministic package's absolute bounds; for an FP32
-weight gradient outside the fused bands the 1.1 times bound holds against the
-deterministic package at FlashInfer 2e989556, and against the deterministic
-package in this release
+weight gradient the 1.1 times bound holds against the deterministic package at
+FlashInfer 2e989556, and against the deterministic package in this release
 (which sums FP32 runs of rows exactly, so its FP32 weight gradient is the more
 accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
 
@@ -417,7 +416,7 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   more CTAs than the SMs beside 16 held ones take in one wave, and this bound
   of the short forward is not shown there.
 * The backward is one kernel.  ``dx`` and ``dz`` use one row arithmetic in
-  every band but the fused ones.  A call of few rows runs one
+  every band but the fused one.  A call of few rows runs one
   thread-block cluster of 16 CTAs that sums the weight gradient on chip in a
   fixed order and takes no workspace.  The short backward (256-thread CTAs
   with the row-claims backward's row arithmetic; CTA ``r`` adds every CTA's
@@ -438,7 +437,7 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   CTAs finish.  A static backward (CTA ``b`` runs the chunks ``b``, ``b +
   grid``, ...) runs an FP32 weight gradient up to 256 rows per SM on SM100 and
   SM103 and up to 64 on SM107, and a BF16 weight gradient up to 64 rows per SM
-  on SM107, past the fused bands; on SM107 it keeps 4 copies of the
+  on SM107, past the fused band; on SM107 it keeps 4 copies of the
   weight-gradient windows plus occupancy words.  Past the static and the
   row-claims bands a claimed
   backward runs, whose CTAs claim runs of chunks at run time, so a CTA slowed
@@ -447,12 +446,12 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   ``x`` and ``z`` hold packed rows, on SM107 the block two ahead.
 * Where the deterministic package's backward makes the checkpointed training
   step (2 x forward + backward) faster than this package's own backwards, a
-  call runs this package's copy of it, the fused backward: an FP32 weight
-  gradient past 512 rows up to 60 rows per SM on SM100, 56 on SM103 and 48
-  on SM107, and a BF16 one (or ``compute_grad_weight=False``) past 512 rows
-  up to 60 rows per SM on SM107.  Its 256-thread CTAs (16 lanes a row,
-  16-row blocks, ``min(ceil(rows / 16), 4 * SMs)`` of them) claim the blocks
-  in chunks whose rows are fixed by the row count and the grid and add each
+  call runs this package's copy of it, the fused backward: a BF16 weight
+  gradient (or ``compute_grad_weight=False``) past 512 rows up to 60 rows per
+  SM on SM107.  An FP32 weight gradient runs no fused backward.  Its
+  256-thread CTAs (16 lanes a row, 16-row blocks,
+  ``min(ceil(rows / 16), 4 * SMs)`` of them) claim the blocks in chunks whose
+  rows are fixed by the row count and the grid and add each
   chunk's weight-gradient terms exactly into fixed-point digits in the
   workspace; the CTA that arrives last rounds the sum once.  Its ``dx``,
   ``dz`` and weight gradient are the deterministic package's bits in this
@@ -498,9 +497,9 @@ accurate) the bound is ``|dw_det| * 2^-7 + sum(|terms|) * 2^-20``.
   is a zero-filled ``torch.uint8`` tensor of 29192 bytes on SM100 and SM103
   and 36360 bytes on SM107, whatever the token count (the largest layout of
   the architecture's backward kernels; a row-claims backward lays its FP64
-  accumulators and two counter words in the first 4104 bytes, a fused
-  backward its fixed-point digits, a flag word a column and two counter
-  words in the first 18952 bytes), that serves
+  accumulators and two counter words in the first 4104 bytes, the fused
+  backward on SM107 its fixed-point digits, a flag word a column and two
+  counter words in the first 18952 bytes), that serves
   every backward kernel of its architecture and is zero after every call: zero it
   once and reuse it, one per
   concurrently running stream.  A buffer that anything else wrote into is

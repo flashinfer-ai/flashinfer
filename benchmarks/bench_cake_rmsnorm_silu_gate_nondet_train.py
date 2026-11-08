@@ -19,8 +19,9 @@ package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
 approximate FP32 intrinsics, and one backward kernel whose CTAs add the
 weight-gradient partials exactly as 64-bit integer windows, the last CTA
 rounding the sum once, or, for a BF16 weight gradient in its row-claims bands,
-add FP32 runs of rows to FP64 accumulators with atomics; in its fused bands
-it runs its copy of the deterministic package's backward) against the
+add FP32 runs of rows to FP64 accumulators with atomics; in its fused band,
+a BF16 weight gradient on SM107, it runs its copy of the deterministic
+package's backward) against the
 deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
 the exact fixed-point weight-gradient sum), each called through its own public
@@ -56,7 +57,6 @@ rows, the exact tiny backward up to 512 rows, the fused backward (its copy of
 the deterministic package's backward) up to 60 rows per SM, the static
 backward up to 64 and the claimed backward past that.
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
-fused backward up to 60 rows per SM on SM100 (56 on SM103, 48 on SM107), the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
 every forward kernel of packed rows and every BF16 backward kernel that a
