@@ -338,6 +338,29 @@
     },
     {
       "arch": "sm_103a",
+      "closure_sha256": "cdcf8cfc17d0c6c9ba7070801f9cbb9ece402151f494539e94e67c12889e1296",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_mhc_det_train_head_bwd__lw64_t512_h4096_sm_103a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mhc_det_train_head_bwd__lw64_t512_h4096_sm_103a.so",
+      "sha256": {
+        "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h4096_binding.cu": "ebdcebbe02589b1848543ccb0d8e144f980a8e261f4f1d18143ea60043ac1a13",
+        "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h4096_kernel.cu": "dc340de14609d860bce4ae5da93b298e5ff9b189ff5c1431582ca6674037ba44"
+      },
+      "sources": [
+        "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h4096_kernel.cu",
+        "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h4096_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
       "closure_sha256": "58fe73326212ac3dc4a116631f029db8e05ffb606dd5b55814cd38f8d55a4d1a",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
@@ -380,29 +403,6 @@
       "sources": [
         "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h7168_kernel.cu",
         "csrc/cake_mhc_det_train_head_bwd__lw64_t512_h7168_binding.cu"
-      ]
-    },
-    {
-      "arch": "sm_103a",
-      "closure_sha256": "b90bc25808c986e59d767ddd9cc3c418e3542808684ff7b494159984dc7bdd80",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
-      "min_cuda": "12.9",
-      "name": "cake_mhc_det_train_head_bwd__lw64_t640_h4096_sm_103a",
-      "nvcc_flags": [
-        "--prec-div=true",
-        "--prec-sqrt=true",
-        "--ftz=false"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_mhc_det_train_head_bwd__lw64_t640_h4096_sm_103a.so",
-      "sha256": {
-        "csrc/cake_mhc_det_train_head_bwd__lw64_t640_h4096_binding.cu": "1f2cab474caeea095cedf38b16df17ce91aba02535d101153e1cdad51ca4f8b8",
-        "csrc/cake_mhc_det_train_head_bwd__lw64_t640_h4096_kernel.cu": "dbc52fcf1811bb594084587fc552015add85e4b5865fce63181062d64341d160"
-      },
-      "sources": [
-        "csrc/cake_mhc_det_train_head_bwd__lw64_t640_h4096_kernel.cu",
-        "csrc/cake_mhc_det_train_head_bwd__lw64_t640_h4096_binding.cu"
       ]
     },
     {

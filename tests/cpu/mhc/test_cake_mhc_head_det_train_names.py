@@ -90,9 +90,10 @@ RECORDS = {
     "cake_mhc_det_train_head_fwd__lw256_t128_h4096": ("head_fwd", ("sm_107a",), 128, 16, 4096),
     "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
     "cake_mhc_det_train_head_bwd__lw64_t480_h4096": ("head_bwd", ("sm_100a",), 480, 4, 4096),
-    "cake_mhc_det_train_head_bwd__lw64_t640_h4096": ("head_bwd", ("sm_103a",), 640, 4, 4096),
-    "cake_mhc_det_train_head_bwd__lw64_t512_h5120": ("head_bwd", ("sm_103a",), 512, 4, 5120),
-    "cake_mhc_det_train_head_bwd__lw64_t512_h7168": ("head_bwd", ("sm_103a",), 512, 4, 7168),
+    **{
+        f"cake_mhc_det_train_head_bwd__lw64_t512_h{h}": ("head_bwd", ("sm_103a",), 512, 4, h)
+        for h in (4096, 5120, 7168)
+    },
     "cake_mhc_det_train_head_bwd__lw64_t256_h5120": ("head_bwd", ("sm_100a",), 256, 4, 5120),
     "cake_mhc_det_train_head_bwd__lw64_t256_h7168": ("head_bwd", ("sm_100a",), 256, 4, 7168),
     "cake_mhc_det_train_head_bwd__lw256_t128_h4096": ("head_bwd", ("sm_107a",), 128, 16, 4096),
