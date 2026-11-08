@@ -52,20 +52,28 @@ bf16((I + L)^-1)`` by tcgen05 and TF32x3 merges with the prep's rstd_q /
 rstd_k / g_cs / qn / kn bits, one persistent CTA per SM), the forward
 register scans ``fwd_h_r<vb>k<ks>`` with their pre-scans and split scans (the
 segment-parallel route; the serial and split scans serve the backward's
-recompute), ``stitch``
+recompute), ``fwd_summary`` (the affine map ``[B | M]`` of each middle piece
+of the split forward, tcgen05, beside its first wave), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
 output in one tcgen05 kernel), ``fwd_ho_vh2`` (the same scan and output split
 over the two value halves, two CTAs per segment and value head; the same
 bits; on ``sm_107a`` record ``fwd_ho_vh2_sm_107a``, on ``sm_100a`` and
 ``sm_103a``, which never run it, the ``fwd_ho`` program), ``fwd_ho_a`` (the
 fused scan and output on ``wy_a``'s A, qn and kn: u and w formed in the CTA,
-the h / v_new / w tapes by its ``tape`` word), ``dv_local``, the adjoint register scans
+the h / v_new / w tapes by its ``tape`` word), ``fwd_fused`` (the fused scan
+and output on the WY stage's w / u, both waves of the split forward: the first
+pieces' end states into the stitch's segment state by ``split_out``, the h /
+v_new tapes by its ``tape`` word), ``dv_local``, the adjoint register scans
 ``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
 pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA) and
 ``dhu_pre_dvl32_r64k1`` (the same pre-scan adding its FP32 ``dv_local`` tiles
 to ``dv2``, which then rounds once), ``dhu_tc2`` (the serial adjoint scan with
 ``dv_local`` fused, tcgen05, TMA ring fills) and ``dhu_tc2_dvl32`` (the same
-scan adding the FP32 ``dv_local`` accumulator to ``dv2``), ``dqkwg``,
+scan adding the FP32 ``dv_local`` accumulator to ``dv2``), the one-wave split
+of the adjoint walk (``dhu_tc2_dvl32_modes`` / ``dhu_tc2_dvl32_gm``, the
+composition of its end adjoints ``piece_chain``, and ``stitch_mt``: the
+stitch reading each map's M half transposed, which composes them on the split
+forward's maps under M-share), ``dqkwg``,
 ``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` / ``finalize_mlp``, ``tail_g2`` /
 ``tail_g2_bf16`` (``dqkwg``, the WY pullback and the finalize of a value-head
 group of two in one tcgen05 cluster kernel; each value head's ``dq`` / ``dk``
@@ -111,10 +119,12 @@ STAGES = (
     "fwd_h_pre_r64k1",
     "fwd_h_r32k2_split",
     "fwd_h_r64k1_split",
+    "fwd_summary",
     "stitch",
     "fwd_ho",
     "fwd_ho_vh2",
     "fwd_ho_a",
+    "fwd_fused",
     "dv_local",
     "dhu_r32k2",
     "dhu_r32k1",
@@ -127,6 +137,7 @@ STAGES = (
     "dhu_tc2_dvl32",
     "dhu_tc2_dvl32_modes",
     "dhu_tc2_dvl32_gm",
+    "stitch_mt",
     "piece_chain",
     "dqkwg",
     "wy_bwd",
@@ -728,6 +739,44 @@ MODULES: dict[str, dict[str, Any]] = {
         "scan": {"k_split": 1, "v_block": 64},
         "stage": "fwd_h_r64k1_split",
     },
+    "fwd_summary": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "u_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "b_out"],
+            ["buffer", "m_out"],
+            ["buffer", "seg_flag"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "walk"],
+            ["buffer", "m_slot"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "b_head"],
+            ["parameter", "b_row"],
+            ["parameter", "m_head"],
+            ["parameter", "m_row"],
+            ["parameter", "m_col"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_6db0d789ecd47ef8e98e",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 133376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_6db0d789ecd47ef8e98e",
+        "stage": "fwd_summary",
+    },
     "stitch": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -935,6 +984,54 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_aa4bcb291b491239d72c",
         "stage": "fwd_ho_a",
+    },
+    "fwd_fused": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "u_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "h0"],
+            ["buffer", "seg_start"],
+            ["buffer", "h_tma"],
+            ["buffer", "v_new_tma"],
+            ["buffer", "v_new"],
+            ["buffer", "o_tma"],
+            ["buffer", "o_out"],
+            ["buffer", "final_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "walk"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_initial_state"],
+            ["parameter", "store_final_state"],
+            ["parameter", "use_seg_start"],
+            ["parameter", "scale"],
+            ["parameter", "tape"],
+            ["buffer", "seg_state"],
+            ["buffer", "seg_flag"],
+            ["parameter", "split_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_4b170e3482d035f65cd8",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 207104,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_train_4b170e3482d035f65cd8",
+        "stage": "fwd_fused",
     },
     "dv_local": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -1444,6 +1541,33 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_f2b9d7db2234ed86559f",
         "stage": "dhu_tc2_dvl32_gm",
+    },
+    "stitch_mt": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "seg_state"],
+            ["buffer", "init_state"],
+            ["buffer", "state_out"],
+            ["buffer", "seq_seg_start"],
+            ["buffer", "seg_flag"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_init"],
+            ["parameter", "reverse"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_be470a9f111f3b3123de",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 131072,
+            "use_pdl": True,
+        },
+        "library": "cake_gdn_train_be470a9f111f3b3123de",
+        "stage": "stitch_mt",
     },
     "piece_chain": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

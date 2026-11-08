@@ -16,8 +16,10 @@ limitations under the License.
 The host plan of one call that the forward and the backward share: the one-wave piece table of the sequences
 (:func:`pieces`), cached with the device's SM count per sequence-length table (:func:`host_plan`), the frozen tape
 level of each architecture (:data:`TAPE_LEVELS`, :func:`tape_state`), the backward forms that a measurement fixes for a
-device and head shape (:data:`ADJOINT_FORMS`, :func:`adjoint_form`), and the placeholder that keeps a saved list's
-arity where a call saves no tensor (:func:`placeholder`).
+device and head shape (:data:`ADJOINT_FORMS`, :func:`adjoint_form`), the shape class of the forward's one-wave split
+(:data:`FORWARD_SPLIT_MIN_PIECE`, :func:`forward_split_length`), the M-share flag of a piece table
+(:data:`M_SHARE_COSTS`, :func:`m_share`), and the placeholder that keeps a saved list's arity where a call saves no
+tensor (:func:`placeholder`).
 
 A long sequence's scan splits into pieces of at most ``L`` chunks: the smallest ``L`` whose first wave fits one CTA
 per SM, ``sum_d max(P_d - 1, 1) * HV <= sm_count`` with ``P_d = ceil(n_d / L)`` pieces of sequence ``d`` (``n_d``
@@ -41,16 +43,22 @@ from . import cake_backend, cake_jit
 
 __all__ = [
     "ADJOINT_FORMS",
+    "FORWARD_SPLIT_MIN_PIECE",
     "LEVEL_STATE",
     "STATE_NAMES",
     "TAPE_LEVELS",
     "HostPlan",
     "Pieces",
     "chunk_counts",
+    "forward_split_length",
     "host_plan",
     "piece_length",
     "pieces",
     "adjoint_form",
+    "M_SHARE_COSTS",
+    "M_SHARE_MIN_SAVING",
+    "m_share",
+    "m_share_saving",
     "placeholder",
     "tape_state",
 ]
@@ -89,6 +97,76 @@ def adjoint_form(
     """The form :data:`ADJOINT_FORMS` fixes for a call of ``num_heads`` / ``num_v_heads`` heads on a device of
     ``arch`` with ``sm_count`` SMs, ``None`` where the pricing decides."""
     return ADJOINT_FORMS.get((arch, int(sm_count), int(num_heads), int(num_v_heads)))
+
+
+# M-share: where a call's forward runs the split forward and its backward the one-wave split of the adjoint walk on the
+# same piece table, the taped forward keeps its segment state, whose M half holds each middle piece's map as the forward
+# applies it (``x -> M x + B``), and the backward's first wave walks the middle pieces from zero for their start adjoint
+# alone (the dvl32 walk with OUT, no tapes, no seed) beside the last pieces' walks, instead of the summary that walks the
+# adjoint's map from the identity as well; the stitch then composes the end adjoints with ``M^T``, the adjoint of the
+# forward's map (its ``transpose_m`` build).  The first wave's costs, by (architecture, SM count), measured on the device
+# at the gating rows: the step (us) of the last pieces' taped walk beside the middle pieces (``walk``), of the summary
+# (``summary``) and of the walk from zero (``gonly``), and the time (us) each first wave takes beyond its longer launch
+# (``corun_summary``, ``corun_gonly``).  sm_100a on B200 (148 SMs); a device without an entry keeps the summary.
+M_SHARE_COSTS: Mapping[tuple[str, int], Mapping[str, float]] = MappingProxyType(
+    {
+        ("sm_100a", 148): MappingProxyType(
+            {
+                "walk": 2.236,
+                "summary": 2.679,
+                "gonly": 1.930,
+                "corun_summary": 2.3,
+                "corun_gonly": 17.1,
+            }
+        ),
+    }
+)
+# the smallest priced saving (us) of the backward's first wave that takes M-share
+M_SHARE_MIN_SAVING = 15.0
+
+
+def _wave1_pieces(chunks: Sequence[int], length: int) -> tuple[int, int]:
+    """The longest last piece (or one-piece sequence) and the longest middle piece, in chunks, of sequences of ``chunks``
+    chunks cut into ``ceil(n / length)`` pieces balanced to within one chunk (piece ``s`` of ``P`` ends at chunk
+    ``(s + 1) n // P``)."""
+    last = middle = 0
+    for n in (int(c) for c in chunks):
+        count = max(-(-n // length), 1)
+        last = max(last, n - ((count - 1) * n) // count)
+        for piece in range(1, count - 1):
+            middle = max(middle, ((piece + 1) * n) // count - (piece * n) // count)
+    return last, middle
+
+
+def m_share_saving(
+    chunks: Sequence[int], num_v_heads: int, arch: str, sm_count: int
+) -> float | None:
+    """The priced saving (us) of M-share in the backward's first wave over sequences of ``chunks`` chunks with
+    ``num_v_heads`` value heads on a device of ``arch`` with ``sm_count`` SMs (:data:`M_SHARE_COSTS`): the first wave
+    with the summary, ``max(last walk, middle summary) + corun_summary``, less the first wave with the walks from zero,
+    ``max(last walk, middle gonly) + corun_gonly``.  ``None`` without a cost entry, without a split or without a middle
+    piece."""
+    costs = M_SHARE_COSTS.get((arch, int(sm_count)))
+    if costs is None:
+        return None
+    length = piece_length(chunks, num_v_heads, sm_count)
+    if length is None:
+        return None
+    last, middle = _wave1_pieces(chunks, length)
+    if middle == 0:
+        return None
+    walk = last * costs["walk"]
+    with_summary = max(walk, middle * costs["summary"]) + costs["corun_summary"]
+    with_gonly = max(walk, middle * costs["gonly"]) + costs["corun_gonly"]
+    return with_summary - with_gonly
+
+
+def m_share(chunks: Sequence[int], num_v_heads: int, arch: str, sm_count: int) -> bool:
+    """Whether a call over sequences of ``chunks`` chunks takes M-share (:data:`M_SHARE_COSTS`): its priced saving
+    reaches :data:`M_SHARE_MIN_SAVING`.  The flag of the piece table: the forward keeps the maps and the backward reads
+    them only where both run their split on that table (the chain checks)."""
+    saving = m_share_saving(chunks, num_v_heads, arch, sm_count)
+    return saving is not None and saving >= M_SHARE_MIN_SAVING
 
 
 def chunk_counts(seq_lens: Sequence[int]) -> tuple[int, ...]:
@@ -153,6 +231,28 @@ def pieces(seq_lens: Sequence[int], num_v_heads: int, sm_count: int) -> Pieces:
     """The one-wave piece table of sequences of ``seq_lens`` tokens with ``num_v_heads`` value heads on a device of
     ``sm_count`` SMs (cached per chunk-count table)."""
     return _pieces(chunk_counts(seq_lens), int(num_v_heads), int(sm_count))
+
+
+# The shape class of the forward's one-wave split, per architecture: the shortest piece (chunks) of the host piece
+# table (:func:`pieces`) on which a call's forward runs the split forward instead of the prep forward's split scan.
+# The split's fixed costs (the front, the middle pieces' summary, the stitch and a second wave) pay back on long pieces
+# only.  Measured on B200 (148 SMs) and GB300 (152; fwd+bwd and checkpoint, the larger ratio to the best FROST arm
+# over the FI-bench and log-spaced gates), the split lowers that ratio at the long rows (two to six sequences of 11k..131k tokens
+# at HV 6: pieces of 132..158 chunks) and at the pair row of HV 24 (three sequences of about 11k tokens: 63 chunks) and
+# raises it at the pair rows of HV 12 and 6 (38 and 20 chunks; HV 3 has 11).  The class reads the host piece table
+# alone (the sequence lengths, HV and the SM count), never tensor contents.
+FORWARD_SPLIT_MIN_PIECE: Mapping[str, int] = MappingProxyType(
+    {"sm_100a": 48, "sm_103a": 48}
+)
+
+
+def forward_split_length(arch: str, table: Pieces) -> int | None:
+    """The piece length of the forward's one-wave split of a call on ``arch`` with the host piece table ``table``:
+    ``table.length`` where the table splits and its pieces reach the architecture's :data:`FORWARD_SPLIT_MIN_PIECE`,
+    ``None`` elsewhere (the prep forward's split scan)."""
+    if not table.split or table.length < FORWARD_SPLIT_MIN_PIECE.get(arch, 1 << 30):
+        return None
+    return table.length
 
 
 @dataclass(frozen=True)
