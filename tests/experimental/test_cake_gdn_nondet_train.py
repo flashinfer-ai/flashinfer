@@ -336,6 +336,24 @@ FUSED_TAIL_STAGES = {
 }
 
 
+# The stages the package launches with programmatic dependent launch (their kernels wait on the producer grid first
+# and trigger the dependent launch last): the backward chain of the one-wave adjoint split and of the FP32 dv_local
+# adjoint pair, and the stitch in every use.
+PDL_STAGES = frozenset(
+    {
+        "stitch",
+        "dhu_tc2_dvl32",
+        "dhu_tc2_dvl32_modes",
+        "dhu_tc2_dvl32_gm",
+        "piece_chain",
+        "tail_g2_f32x",
+        "tail_g2_f32x_bf16",
+        "tail_g3_f32x",
+        "tail_g3_f32x_bf16",
+    }
+)
+
+
 def test_registry_records_are_well_formed() -> None:
     assert len(cake_jit.STAGES) == 45 and len(set(cake_jit.STAGES)) == 45
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
@@ -354,7 +372,8 @@ def test_registry_records_are_well_formed() -> None:
         assert re.fullmatch(r"cake_gdn_train_[0-9a-f]{20}", rec["library"]), name
         assert rec["kernel_symbol"] == "kernel_" + rec["library"], name
         launch = rec["launch"]
-        assert launch["cooperative"] is False and launch["use_pdl"] is False, name
+        assert launch["cooperative"] is False, name
+        assert launch["use_pdl"] is (rec["stage"] in PDL_STAGES), name
         assert launch["cluster"] == (FUSED_TAIL_STAGES.get(rec["stage"], 1), 1, 1), name
         assert len(launch["block"]) == 3 and launch["block"][0] % 32 == 0, name
         assert launch["dynamic_smem_bytes"] >= 0, name
