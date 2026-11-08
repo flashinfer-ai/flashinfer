@@ -142,7 +142,7 @@ routed = {
     for arch in cake_jit.ARCHES
     for role in cake_jit.ROUTES[arch]
     for hidden in cake_jit.ROUTES[arch][role]
-    for rows in (1, cake_jit.SMALL_ELEMENTS // hidden + 1)
+    for rows in (1, cake_jit.small_elements(arch, role) // hidden + 1)
 }
 assert routed == set(libraries), (sorted(routed), sorted(libraries))
 for library, entry in sorted(libraries.items()):

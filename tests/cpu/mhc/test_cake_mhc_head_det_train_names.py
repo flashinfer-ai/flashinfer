@@ -235,10 +235,11 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
     whose thread count is the CTA's, ``kernel`` / ``library`` the record name, ``kernel_symbol``
     ``kernel_<library>``).  ``ROUTES[arch][role]`` maps every hidden size the architecture serves to the record of
     the role delivered for the architecture and built for that hidden size, or built for any where none is;
-    ``SMALL_ROUTES`` sends a call of at most ``SMALL_ELEMENTS`` values per stream to the unsuffixed library of its
-    role (the writing backward on sm_100a and sm_103a, every role on sm_107a); :func:`route_module` follows both and refuses any other call, and a record refuses a hidden
-    size it is not built for.  Every route stays inside the kernels' ``hv <= MAX_VECTORS`` and its largest grid
-    inside 31 bits."""
+    ``SMALL_ROUTES`` sends a call of at most ``small_elements(arch, role)`` values per stream (``SMALL_ELEMENTS``,
+    T 7168 at hidden 4096 for the sm_107a forward) to the unsuffixed library of its role (the writing backward on
+    sm_100a and sm_103a, every role on sm_107a); :func:`route_module` follows both and refuses any other call, and a
+    record refuses a hidden size it is not built for.  Every route stays inside the kernels' ``hv <= MAX_VECTORS``
+    and its largest grid inside 31 bits."""
     loader = importlib.import_module(f"{BACKEND}.cake_jit")
     assert set(loader.MODULES) == set(RECORDS)
     for name, (role, arches, threads, elems, hidden) in RECORDS.items():
@@ -290,10 +291,11 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
         },
     }
     assert loader.SMALL_ELEMENTS == 2048 * 4096
+    assert loader.SMALL_ELEMENTS_BY_ROUTE == {"sm_107a": {"head_fwd": 7168 * 4096}}
     for arch in loader.ARCHES:
         for role in ROLES:
             for hidden in loader.supported_hidden_sizes(arch):
-                largest = loader.SMALL_ELEMENTS // hidden
+                largest = loader.small_elements(arch, role) // hidden
                 routed = loader.ROUTES[arch][role][hidden]
                 to_small = loader.SMALL_ROUTES.get(arch, {}).get(role, routed)
                 assert loader.route_module(arch, role, hidden, largest + 1) == routed

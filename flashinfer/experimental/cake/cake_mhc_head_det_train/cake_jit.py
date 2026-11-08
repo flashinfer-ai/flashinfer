@@ -842,13 +842,19 @@ ROUTES: dict[str, dict[str, dict[int, str]]] = {
         },
     },
 }
-# A call of a served hidden size with at most ``SMALL_ELEMENTS`` values per
-# stream (T 2048 at hidden 4096) runs the unsuffixed library of its role where
-# this names one: on sm_100a and sm_103a the backward that writes ``dX`` (its
-# 256-bit vectors keep more bytes in flight per thread when the grid is small),
-# and on sm_107a every role, whose hidden-4096 libraries are timed on the large
-# problems.
+# A call of a served hidden size with at most :func:`small_elements` values per
+# stream runs the unsuffixed library of its role where this names one: on
+# sm_100a and sm_103a the backward that writes ``dX`` (its 256-bit vectors keep
+# more bytes in flight per thread when the grid is small), and on sm_107a every
+# role, whose hidden-4096 libraries are timed on the large problems.  The limit
+# is ``SMALL_ELEMENTS`` (T 2048 at hidden 4096) but where
+# ``SMALL_ELEMENTS_BY_ROUTE`` names another: the sm_107a forward's 128-thread
+# CTAs of 256-bit vectors overtake the unsuffixed forward only past T 7168 at
+# hidden 4096.
 SMALL_ELEMENTS = 2048 * 4096
+SMALL_ELEMENTS_BY_ROUTE: dict[str, dict[str, int]] = {
+    "sm_107a": {"head_fwd": 7168 * 4096},
+}
 SMALL_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {"head_bwd": "cake_mhc_det_train_head_bwd"},
     "sm_103a": {"head_bwd": "cake_mhc_det_train_head_bwd"},
@@ -913,9 +919,16 @@ def route_module(arch: str, role: str, hidden: int, rows: int) -> str:
             f"{HIDDEN_SIZES}"
         )
     small = SMALL_ROUTES.get(arch, {}).get(role)
-    if small is not None and int(rows) * int(hidden) <= SMALL_ELEMENTS:
+    if small is not None and int(rows) * int(hidden) <= small_elements(arch, role):
         return small
     return name
+
+
+def small_elements(arch: str, role: str) -> int:
+    """The most values per stream a call of ``role`` on ``arch`` has for
+    :data:`SMALL_ROUTES` to take it."""
+
+    return SMALL_ELEMENTS_BY_ROUTE.get(arch, {}).get(role, SMALL_ELEMENTS)
 
 
 def supported_hidden_sizes(arch: str) -> tuple[int, ...]:

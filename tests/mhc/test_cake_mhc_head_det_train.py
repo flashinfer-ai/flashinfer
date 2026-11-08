@@ -38,7 +38,7 @@ from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN = (4096, 5120, 7168)
-TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096)
+TOKENS = (1, 2, 3, 7, 65, 129, 257, 1000, 2049, 4096, 7169)
 BF16 = torch.bfloat16
 SUBNORMAL = 2.0**-133
 SPECIAL = (
