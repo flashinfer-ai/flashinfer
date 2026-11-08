@@ -28,9 +28,10 @@ row and rank:
 - the multi handle retains exactly the n history pools (``nbytes`` and the allocator's bytes after the forward);
 - ``graph="replay"`` of the multi forward / backward is bitwise the eager single calls on every call.
 
-Launch forms as ``test_cake_causal_conv1d_det_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when
-fewer than ``W`` CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the rendezvous from
-``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
+``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` adds a W = 16 per-document zigzag row.  Launch forms as
+``test_cake_causal_conv1d_det_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when fewer than ``W``
+CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the rendezvous from ``MASTER_ADDR`` /
+``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
 """
 
 from __future__ import annotations
@@ -69,6 +70,11 @@ ROWS = [
     ((3000,), 8, "zigzag", (256, 256, 256)),
     ((2048, 5, 3000, 1), 8, "zigzag_per_document", (384, 384, 384)),
     ((6, 1, 2, 3, 4000), 8, "ragged:1,1,1,3,0,2,4000,4", (256, 128, 256)),
+]
+# W = 16 per-document zigzag (a layer's three convolutions at 16-way context parallelism); kept out of ``ROWS``
+# (other suites import it).
+ROWS_SCALE = [
+    ((2048, 5, 3000, 1), 16, "zigzag_per_document", (384, 384, 384)),
 ]
 GRAPH_ROWS = [ROWS[0], ROWS[5], ROWS[8]]
 TENSORS = ("y", "dx", "dw")
@@ -479,7 +485,7 @@ def _launch(row, graph: bool) -> None:
     assert report["pass"], report
 
 
-@pytest.mark.parametrize("row", ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", ROWS + ROWS_SCALE, ids=_row_id)
 def test_multi_rows(row) -> None:
     """Bitwise against the single calls and per-phase collective counts (module docstring)."""
     _launch(row, graph=False)

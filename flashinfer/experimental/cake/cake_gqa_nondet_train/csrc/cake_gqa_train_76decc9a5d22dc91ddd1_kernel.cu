@@ -47,10 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
-
 #include <math_constants.h>
 
 
@@ -91,7 +87,7 @@ kernel_cake_gqa_train_76decc9a5d22dc91ddd1(float* __restrict__ dQ_accum, int* __
     int pair = blockIdx.y;
     int row0 = blockIdx.x * 64;
     int warp_row = row0 % 128 + warp * 8;
-    unsigned long long tile_base = ((unsigned long long)pair * (unsigned long long)rows_pad + (unsigned long long)(row0 - row0 % 128)) * 256;
+    unsigned long long tile_base = ((unsigned long long)pair * (unsigned long long)rows_pad + (unsigned long long)(row0 - row0 % 128)) * 256ull;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int limit = (row0 / 128 + 1) * 128;
     int started_count = 0;
@@ -164,9 +160,9 @@ kernel_cake_gqa_train_76decc9a5d22dc91ddd1(float* __restrict__ dQ_accum, int* __
                     out[j] = __as_u32(__float22bfloat162_rn(scaled));
                 }
                 if (tk < tokens_left) {
-                    unsigned long long dst = ((unsigned long long)token * (unsigned long long)H_q + (unsigned long long)(2 * pair)) * 256 + (unsigned long long)(hc_1 * 128 + (gb_1 * 8 + span_group) * 4);
+                    unsigned long long dst = ((unsigned long long)token * (unsigned long long)H_q + (unsigned long long)(2 * pair)) * 256ull + (unsigned long long)(hc_1 * 128 + (gb_1 * 8 + span_group) * 4);
                     reinterpret_cast<int2*>(reinterpret_cast<unsigned int*>(dQ + dst))[0] = reinterpret_cast<int2*>(out)[0];
-                    reinterpret_cast<int2*>(reinterpret_cast<unsigned int*>(dQ + (dst + 256)))[0] = reinterpret_cast<int2*>(out + (2))[0];
+                    reinterpret_cast<int2*>(reinterpret_cast<unsigned int*>(dQ + (dst + 256ull)))[0] = reinterpret_cast<int2*>(out + (2))[0];
                 }
             }
         }

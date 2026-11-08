@@ -2231,6 +2231,30 @@ _KV4_SIBLING_ROUTES = frozenset({"fp8_h64_prefill_source_persistent_m64_multi_ti
 # (:func:`_kv4_sibling_launchable`, :func:`_kv4_variant`).
 _KV4_SIBLING_OVERSIZED_SMEM_BYTES = {"sm_107a": 322688}
 
+# The TMEM-batch sibling ``<route>_kv4_bcl`` of the four-stage sibling on
+# SM107: the four-stage program whose correction warps rescale each output
+# stage in two 64-column TMEM load / multiply / store passes in place of eight
+# 16-column steps and whose softmax waits once for its two max-reduction loads,
+# with the four-stage program's arguments, grid, launch and shared memory and
+# the same output bits.  It takes the four-stage launches of one window and
+# every other launch keeps the four-stage program (:func:`_kv4_bcl_variant`):
+# 64-head MTP decode launches of calls whose longest request has 2-4 query
+# tokens, of at least 108 rows and at most two rows per SM of the device (432
+# at 216 SMs, 424 at 212, 416 at 208), over items of at most six tiles.  R200
+# (216 SMs) and VR200 (212 SMs), eight calls per CUDA graph over distinct
+# inputs behind an L2 flush / over one input, four-stage program -> TMEM-batch
+# program: q_len 2-4, widths 384-768, 108 rows to two per SM 0.996-1.011x /
+# 1.000-1.012x, no row slower beyond the spread of two runs of the same
+# program.  The window leaves out the launches on which the TMEM-batch program
+# trailed: one-token requests, 96-row launches over items 768 wide, items 1152
+# wide and 257- to 1024-token prefill.
+_KV4_BCL_HEADS = 64  # query heads
+_KV4_BCL_MIN_Q = 2  # query tokens of the call's longest request
+_KV4_BCL_MAX_Q = 4
+_KV4_BCL_MIN_TOKENS = 108  # query rows of the launch
+_KV4_BCL_MAX_TOKENS_PER_SM = 2  # query rows of the launch per SM of the device
+_KV4_BCL_MAX_TOPK = 768  # item width (sparse_topk), six tiles
+
 # The routes with an early-PV sibling ``<route>_overlap`` on SM107: the route's
 # program whose P x V MMAs start once the softmax has written the low half of
 # P and whose epilogues drain the output of the first V block while the MMA of
@@ -2404,6 +2428,48 @@ def _fp8_h64_kv4_edges(
         and arch is not None
         and _kv4_variant(route, arch=arch, device=device) != route
     )
+
+
+def _kv4_bcl_variant(
+    variant: str,
+    *,
+    arch: str,
+    num_heads: int,
+    max_q_len: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    device: torch.device,
+) -> str:
+    """The variant a launch over ``num_query_tokens`` rows of a call whose
+    longest request has ``max_q_len`` tokens runs once :func:`_kv4_variant`
+    chose ``variant``: its TMEM-batch sibling ``<variant>_bcl`` when
+    ``variant`` is the four-stage sibling of a route in
+    ``_KV4_SIBLING_ROUTES``, the call has ``_KV4_BCL_HEADS`` heads,
+    ``max_q_len`` is from ``_KV4_BCL_MIN_Q`` to ``_KV4_BCL_MAX_Q``, the items
+    are at most ``_KV4_BCL_MAX_TOPK`` wide, the launch has at least
+    ``_KV4_BCL_MIN_TOKENS`` rows, ``arch`` routes the TMEM-batch sibling to a
+    program other than the four-stage one and the launch has at most
+    ``_KV4_BCL_MAX_TOKENS_PER_SM`` rows per SM of ``device``, else
+    ``variant``.  The four-stage launch check :func:`_kv4_variant` applied
+    covers the TMEM-batch sibling, which takes the same shared memory."""
+    route = variant.removesuffix("_kv4")
+    if route == variant or route not in _KV4_SIBLING_ROUTES:
+        return variant
+    if num_heads != _KV4_BCL_HEADS:
+        return variant
+    if not _KV4_BCL_MIN_Q <= max_q_len <= _KV4_BCL_MAX_Q:
+        return variant
+    if sparse_topk > _KV4_BCL_MAX_TOPK or num_query_tokens < _KV4_BCL_MIN_TOKENS:
+        return variant
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    sibling = f"{variant}_bcl"
+    if programs.get(sibling, programs.get(variant)) == programs.get(variant):
+        return variant
+    if num_query_tokens > _KV4_BCL_MAX_TOKENS_PER_SM * _device_sm_count(device):
+        return variant
+    return sibling
 
 
 def _overlap_variant(
@@ -2843,6 +2909,12 @@ def run_cake_dsv4(
     the larger ones on its own program (``_overlap_variant``).  Each program
     builds and loads its module on its first launch: warm up launches on both
     sides of that ceiling eagerly before a capture.
+
+    On SM107 the four-stage multi-tile M64 program runs the 64-head launches of
+    108 query rows up to two per SM over items at most 768 wide, of calls whose
+    longest request has 2-4 query tokens, on its TMEM-batch sibling and every
+    other launch on its own program (``_kv4_bcl_variant``); warm up launches on
+    both sides of that window eagerly before a capture as well.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -3332,9 +3404,20 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # runs the multi-tile program's launches on its four-stage sibling
         # where this process can launch it (_kv4_variant); run_cake_dsv4
         # routed the FP8/H64 decode rows by the same check (_fp8_h64_kv4_edges).
+        # The four-stage launches of the TMEM-batch window (64-head MTP decode)
+        # run its TMEM-batch sibling (_kv4_bcl_variant).
         parts = L.partials(1)
-        program = _pdl_variant(
+        program = _kv4_bcl_variant(
             _kv4_variant(route, arch=L.arch, device=v["Q"].device),
+            arch=L.arch,
+            num_heads=H,
+            max_q_len=v["max_q_len"],
+            num_query_tokens=T,
+            sparse_topk=topk,
+            device=v["Q"].device,
+        )
+        program = _pdl_variant(
+            program,
             arch=L.arch,
             enable_pdl=v["enable_pdl"],
             num_query_tokens=T,
