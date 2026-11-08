@@ -7101,7 +7101,8 @@ def _cute_dsl_gemm_mxfp8_runner(
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype), enable_pdl)
+            extras = (str(out.dtype), enable_pdl)
+            return (*extras, "low_m_only") if low_m_only else extras
 
         def get_valid_tactics(
             self,
@@ -7684,6 +7685,9 @@ def _cudnn_mm_mxfp8_runner():
     """
 
     class CudnnMmMxfp8GemmRunner(TunableRunner):
+        # Plan enumeration can fail even when the backend is eligible.
+        _retry_empty_tactics = True
+
         def __init__(self):
             super().__init__()
             self._tuning_config = _MM_MXFP8_TUNING_CONFIG

@@ -497,7 +497,7 @@ import torch
 import torch.distributed as dist
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
 from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload, ManagedAutotuneCache
-from flashinfer.autotuner.autotuner import _all_ranks_hit_cache
+from flashinfer.autotuner.autotuner import _ProfilingCandidates, _all_ranks_hit_cache
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
@@ -518,6 +518,7 @@ class RunnerB(RunnerA):
 config = TuningConfig()
 inputs = [torch.zeros(8, 8)]
 runners = [RunnerA(), RunnerB()]
+candidates = _ProfilingCandidates.from_runners(runners, inputs)
 op = "test::distributed_cache_hit"
 tuner = AutoTuner.get()
 tuner.clear_cache()
@@ -549,21 +550,24 @@ try:
         if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
             if case == "partial_memory":
                 tuner._winner_cache()[key] = (0, None)
+                tuner._profiling_cache_candidates[(tuner._winner_cache_identity(), key)] = candidates
             elif case == "partial_file":
                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
+                tuner._file_config_selections[key.file_key] = {"candidate_keys": candidates.file_keys}
             else:
                 if case == "all_hit_different_runners" and rank == 1:
                     key = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
                                               runners[1].get_cache_key_extras(inputs))
                 cached_tactic = rank if case == "all_hit_different_tactics" else 0
                 store.publish(key.file_key, key.runner_class_name, cached_tactic, key_fields=key.key_fields,
-                              profiling_policy=policy)
+                              profiling_policy=policy, candidate_keys=candidates.file_keys)
         dist.barrier()
         if case == "all_hit_stale_memory":
             # The shared artifact is identical, but process-local memoized
             # winners may still differ before the final managed-cache reload.
             tuner._winner_cache()[key] = (rank % 2, None)
             tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
+            tuner._profiling_cache_candidates[(tuner._winner_cache_identity(), key)] = candidates
         search = tuner.search_cache
         first = True
         def ordered_search(*args, **kwargs):
@@ -585,7 +589,7 @@ try:
             # Model another deployment publishing between the two lookups.
             writer = ManagedAutotuneCache(store.manifest, root=store.root)
             writer.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
-                           profiling_policy=policy)
+                           profiling_policy=policy, candidate_keys=candidates.file_keys)
             result = search(*args, **kwargs)
             assert result[0]
             return result

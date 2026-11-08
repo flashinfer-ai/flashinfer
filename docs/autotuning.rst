@@ -180,14 +180,25 @@ sizes or sequence lengths -- and accumulate all configs in a single file:
 Cache Hit Behavior During Tuning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When ``autotune(True, cache=path)`` is active and a matching config is found in
-the cache file, the autotuner uses it directly **without re-profiling**.  This
-means:
+During tuning, ``AutoTuner.choose_one()`` can reuse the first eligible cached
+winner for multiple runners if its record covers every candidate and the
+measurement policy matches. Reordering or reducing candidates can reuse that
+winner. If an earlier cached result would shadow it during inference, the
+tuner profiles the candidates again and replaces the old selection.
 
-- Shapes that were already tuned are skipped, saving time.
-- Only truly new shapes trigger profiling.
-- A log message is printed once per ``(operation, runner)`` pair when a cache
-  hit is detected.
+A comparison that leaves a runner unmeasured because of a retryable failure
+can serve the current call with the best available measurement and allows a
+subsequent tune to retry. In single-process tuning it also preserves the
+previous cached result.
+
+Both JSON and managed v2 caches record this coverage on new multi-runner
+results. Existing files remain usable for inference
+and single-runner tuning, subject to the usual environment, policy, and
+tactic checks. If a multi-runner tune encounters an older entry with no
+coverage information, it profiles the eligible runners and saves the
+result with coverage. The SM107 MXFP8 low-M CuTe-DSL runner uses a distinct
+entry from the regular CuTe-DSL runner, so its first tune can miss an older
+entry.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

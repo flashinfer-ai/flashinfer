@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from flashinfer import (
     autotune,
@@ -9,14 +12,104 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
-from flashinfer.autotuner import AutoTuner
+from flashinfer import utils
+from flashinfer.autotuner import AutoTuner, TunableRunner
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.gemm import gemm_base
+from flashinfer.gemm import gemm_base, gemm_mm_mxfp8_cute_dsl
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
 
 _MIN_COS_SIM = 0.98
+
+
+def test_mm_mxfp8_auto_retunes_when_cudnn_becomes_eligible(monkeypatch):
+    # Exercise the real SM120 backend filters with CPU tensors and fake runners.
+    def capability(device):
+        return 12, 0
+
+    monkeypatch.setattr(utils, "get_compute_capability", capability)
+    monkeypatch.setattr(gemm_base, "get_compute_capability", capability)
+    monkeypatch.setattr(torch.version, "cuda", "13.4")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(gemm_base, "_check_cute_dsl_arch", lambda device: None)
+    monkeypatch.setattr(
+        gemm_mm_mxfp8_cute_dsl, "get_cuda_version", lambda: Version("13.4")
+    )
+    monkeypatch.setattr(
+        gemm_mm_mxfp8_cute_dsl, "_b12x_mxfp8_dsl_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        gemm_base, "_get_stream_cache_buf", lambda *args: torch.empty(0)
+    )
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+
+    profiled, dispatched = [], []
+
+    class Runner(TunableRunner):
+        def __init__(self, backend):
+            self.backend = backend
+
+        def get_cache_key_extras(self, inputs):
+            return (self.backend,)
+
+        def get_valid_tactics(self, inputs, profile):
+            return [0]
+
+        def forward(self, inputs, tactic=-1):
+            dispatched.append(self.backend)
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        profiled.append(runner.backend)
+        return {"cutlass": 3.0, "b12x": 2.0, "cudnn": 1.0}[runner.backend]
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(
+        gemm_base,
+        "get_cutlass_mxfp8_gemm_module",
+        lambda major: SimpleNamespace(
+            cutlass_mxfp8_gemm_runner=lambda: Runner("cutlass")
+        ),
+    )
+    monkeypatch.setattr(
+        gemm_base, "_b12x_gemm_mxfp8_runner", lambda *args: Runner("b12x")
+    )
+    monkeypatch.setattr(gemm_base, "_cudnn_mm_mxfp8_runner", lambda: Runner("cudnn"))
+
+    a = torch.zeros(128, 128, dtype=torch.float8_e4m3fn)
+    scale = torch.zeros(512, dtype=torch.uint8)
+    monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", False)
+    with autotune(tuning_buckets=(128,)):
+        mm_mxfp8(a, a.t(), scale, scale, backend="cutlass", use_8x4_sf_layout=False)
+        assert profiled == ["cutlass"]
+        profiled.clear()
+        mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+        assert profiled == ["b12x", "cutlass"]
+        assert dispatched[-1] == "b12x"
+        profiled.clear()
+
+        monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", True)
+        mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+        assert profiled == ["b12x", "cutlass", "cudnn"]
+        assert dispatched[-1] == "cudnn"
+
+    profiled.clear()
+    monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", False)
+    mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+    assert dispatched[-1] == "b12x"
+    assert profiled == []
+
+
+def test_mm_mxfp8_cute_dsl_low_m_runner_has_distinct_cache_extras():
+    pytest.importorskip("cutlass")
+    dtype = torch.bfloat16
+    regular = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 7, True, dtype)
+    low_m = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 7, True, dtype, low_m_only=True)
+    inputs = [None, None, None, None, dtype, torch.empty(0, dtype=dtype), None]
+
+    assert regular.get_cache_key_extras(inputs) == (str(dtype), True)
+    assert low_m.get_cache_key_extras(inputs) != regular.get_cache_key_extras(inputs)
 
 
 def _assert_cosine_similarity(
