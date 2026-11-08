@@ -129,6 +129,10 @@ dtype.  For a packed batch, `cu_seqlens_cpu` selects the route that builds the
 chunk and segment tables on the host; without it the `meta` kernel builds
 them on the device.  The device route plans its scans for a bound layout, so
 the two routes can pick different plans and agree to rounding, not bitwise.
+The device route's backward builds its tables again from `cu_seqlens` (the
+same kernel on the same offsets, so the same bits), so a call keeps no table
+of its own between the forward and the backward; changing `cu_seqlens` in
+place between the two raises `RuntimeError`, as for a saved tensor.
 
 The entry point checks its inputs before the first launch and raises
 `ValueError`: every tensor on the device of `q`, `k` of the shape of `q`,

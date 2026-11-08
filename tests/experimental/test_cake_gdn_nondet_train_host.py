@@ -344,6 +344,18 @@ def test_checkpointed_forward_retains_no_bytes(route, initial, device) -> None:
     )
 
 
+def test_device_route_rejects_offsets_changed_before_the_backward(device) -> None:
+    # the device route's backward builds its chunk tables again from cu_seqlens, so an
+    # in-place change of cu_seqlens between the forward and the backward raises, as for
+    # a saved tensor
+    problem = _Problem("device", device, seed=29, initial=False)
+    o, _ = problem.layer(problem.leaves(), checkpointed=False)
+    problem.cu.add_(0)
+    loss = (o.float() * problem.do.float()).sum()
+    with pytest.raises(RuntimeError, match="cu_seqlens was modified in place"):
+        loss.backward()
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Host time of a steady-state call
 

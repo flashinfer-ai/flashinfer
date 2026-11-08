@@ -4409,10 +4409,35 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
             ctx.plan_key = key
         elif plan.ops is not None:
             ctx.plan_key, ctx.plan = key, plan
+    if cu_seqlens is not None and cu_seqlens_cpu is None:
+        # the device route's tables are an allocation of this call (the ``meta``
+        # kernel's): the backward builds them again from the caller's
+        # ``cu_seqlens`` (:func:`_backward_meta`), so ``ctx`` holds no tensor
+        # outside the saved list and a checkpointed forward keeps nothing beyond
+        # its outputs (#7039)
+        ctx.meta = None
+        ctx.meta_source = (cu_seqlens, cu_seqlens._version, batch, seq_len, index,
+                           num_v_heads, num_v_heads // num_heads)  # fmt: skip
     output = fwd["output"]
     if output.dtype != q.dtype:
         output = output.to(q.dtype)
     return output, (fwd["final_state"] if output_final_state else None)
+
+
+def _backward_meta(ctx) -> ChunkMeta:
+    """The device route's chunk and segment tables for the backward: the forward's,
+    built again by the ``meta`` kernel from the caller's ``cu_seqlens`` (the same
+    launch on the same values, so the same bits; no host sync).  Like a saved
+    tensor, ``cu_seqlens`` may not change in place between the two calls."""
+    cu_seqlens, version, batch, seq_len, index, num_v_heads, group = ctx.meta_source
+    if cu_seqlens._version != version:
+        raise RuntimeError(
+            "cake_gdn_nondet: cu_seqlens was modified in place between the forward "
+            "and the backward; without cu_seqlens_cpu the backward builds its chunk "
+            "tables from it"
+        )
+    return _chunk_meta(cu_seqlens, None, batch, seq_len, index, num_v_heads,
+                       ctx.options, group)  # fmt: skip
 
 
 def _function_backward(ctx, do, dht, grad_qkv=None):
@@ -4447,6 +4472,8 @@ def _general_backward(ctx, saved, do, dht, grad_qkv):
         for name, t in zip(cake_plan.STATE_NAMES, state_tensors, strict=True)
         if name in kept
     )
+    if tape["meta"] is None:  # the device route (see _function_forward)
+        tape["meta"] = _backward_meta(ctx)
     do = do.contiguous()
     key = ctx.plan_key
     recorder = None
