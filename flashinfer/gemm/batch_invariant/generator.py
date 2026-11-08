@@ -102,7 +102,7 @@ TILES_M_BLOCKSCALED = {False: (128,), True: (256,)}
 #: 128-row CTA tile of the one-row-per-thread promotion (MMA M 128 1-CTA / 256 2-CTA), tile N dividing the 128-column weight
 #: scale block (the register running sum bounds it at 128), the 16-wide tile on the 1-CTA instruction only; no split variant,
 #: no in-CTA fold, no swapped record.
-TILES_N_FP8BS = (16, 32, 64, 128)
+TILES_N_FP8BS = (16, 32, 64, 128, 256)
 TILES_M_FP8BS = TILES_M_BLOCKSCALED
 MAX_CLUSTER_DIM_BLOCKSCALED = 4
 #: In-cluster split-K (block-scaled body): the ``cluster_k`` CTAs of a (cluster_k, 1, 1) cluster each fold one K chunk and

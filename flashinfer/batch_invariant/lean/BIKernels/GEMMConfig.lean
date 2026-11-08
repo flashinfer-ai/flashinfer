@@ -114,7 +114,7 @@ split, swapped tile or in-CTA chunk fold (the class has no split variant). The g
 emitted record against it. -/
 def ConfigOKFp8BS (c : Config) : Bool :=
   (if c.twoCta then c.tm == 256 else c.tm == 128) &&
-  (c.tn == 16 || c.tn == 32 || c.tn == 64 || c.tn == 128) && (32 ≤ c.tn || !c.twoCta) &&
+  (c.tn == 16 || c.tn == 32 || c.tn == 64 || c.tn == 128 || c.tn == 256) && (32 ≤ c.tn || !c.twoCta) &&
   (c.clusterM == 1 || c.clusterM == 2 || c.clusterM == 4 || c.clusterM == 8 || c.clusterM == 16) &&
   (c.clusterN == 1 || c.clusterN == 2 || c.clusterN == 4 || c.clusterN == 8 || c.clusterN == 16) &&
   (c.clusterM * c.clusterN ≤ 16) && (!c.twoCta || c.clusterM % 2 == 0) &&

@@ -94,13 +94,19 @@ BAR_GROUP = (
     BAR_EPILOGUE,
     BAR_EPILOGUE + 2,
 )  # one named barrier per promotion warpgroup (the C stage hand-off to its TMA store)
+NUM_B_BLOCKS = 2  # B block scales per ring stage: a tile up to 256 wide spans two 128-column weight scale blocks (one per promotion group)
+PROMO_BATCH = 2  # subtiles of a group's half loaded from TMEM before their fmas: the register budget's bound at the 256-wide tile
 NUM_SCALE_STAGES = 16  # the scale ring's depth: blocks whose scales wait in smem ahead of the promotion; deeper than the operand
 # ring plus the accumulator ring, so the operand stage is always the producer's binding wait (empirical)
 
 
 def scale_ring_bytes(knobs: Knobs) -> int:
     """Smem of the scale ring: per stage the CTA tile's A row scales and one B block scale, fp32."""
-    return NUM_SCALE_STAGES * (knobs.cta_tile_mn[0] + 1) * (ACC_DTYPE.width // 8)
+    return (
+        NUM_SCALE_STAGES
+        * (knobs.cta_tile_mn[0] + NUM_B_BLOCKS)
+        * (ACC_DTYPE.width // 8)
+    )
 
 
 def acc_stages_for(knobs: Knobs) -> int:
@@ -239,11 +245,14 @@ def blockscale_producer_loop(
                     _elem(mSFA, (row, handle.count)),
                     _elem(sSFA, (i, scale_state.index)),
                 )
-            if lane == 0:
+            if (
+                lane < NUM_B_BLOCKS
+            ):  # the tile's B block scales, one lane each (clamped to the tensor)
+                nb_l = cutlass.min(nb + lane, NB - 1)
                 cute.copy(
                     atom_g2s,
-                    _elem(mSFB, (nb, handle.count)),
-                    _elem(sSFB, (scale_state.index,)),
+                    _elem(mSFB, (nb_l, handle.count)),
+                    _elem(sSFB, (lane, scale_state.index)),
                 )
             scale_pipeline.producer_commit(
                 scale_state
@@ -346,14 +355,22 @@ def blockscale_epilogue_loop(
         assert tTR_cC[(None, None, None, 0, s, 0, 0, 0)].layout(0)[0] == offs[0][0], (
             "a subtile changes the output row"
         )
-    assert (
-        cute.size(epi_tile[1]) * subtile_cnt <= SCALE_BLOCK_N
-        and SCALE_BLOCK_N % (cute.size(epi_tile[1]) * subtile_cnt) == 0
+    assert cols_g <= SCALE_BLOCK_N and SCALE_BLOCK_N % cols_g == 0, (
+        cols_g
+    )  # a group's columns lie in one weight scale block
+    assert subtile_cnt * cute.size(epi_tile[1]) <= NUM_B_BLOCKS * SCALE_BLOCK_N
+    blk_per_group = (
+        cols_g // SCALE_BLOCK_N
+    )  # 1 at the 256-wide tile (group g = block g), else 0
+    assert per_group % PROMO_BATCH == 0 or per_group < PROMO_BATCH, (
+        per_group,
+        PROMO_BATCH,
     )
+    batch = min(per_group, PROMO_BATCH)
     VW = per_group * V  # this group's elements per thread
     bufs = [
-        cute.make_rmem_tensor(frag_shape, ACC_DTYPE) for _ in range(per_group)
-    ]  # the block partial of the group's subtiles
+        cute.make_rmem_tensor(frag_shape, ACC_DTYPE) for _ in range(batch)
+    ]  # the block partial of a batch of the group's subtiles
     tTR_rSum = cute.make_rmem_tensor(
         (VW,), ACC_DTYPE
     )  # the running sum of this group's half, in registers
@@ -413,7 +430,8 @@ def blockscale_epilogue_loop(
                 scale_state
             )  # block kb's scales are in the ring
             scale = CuteF32.mul(
-                sSFA[(irow, scale_state.index)], sSFB[scale_state.index]
+                sSFA[(irow, scale_state.index)],
+                sSFB[(gsel * blk_per_group, scale_state.index)],
             )  # mul.rn(s_a[m, kb], s_b[n // 128, kb]), once
             scale_pipeline.consumer_release(
                 scale_state
@@ -424,25 +442,27 @@ def blockscale_epilogue_loop(
                 tTR_tAcc = cute.group_modes(
                     tTR_tAcc_base[(None, None, None, None, None, acc_state.index)], 3, 5
                 )
-                for k in cutlass.range_constexpr(
-                    per_group
-                ):  # the group's subtiles, loads first
-                    cute.copy(
-                        tiled_copy_t2r,
-                        tTR_tAcc[(None, None, None, gsel * per_group + k)],
-                        bufs[k],
-                    )
-                for k in cutlass.range_constexpr(per_group):
-                    for e in cutlass.range_constexpr(0, V, 2):
-                        # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
-                        # the same operands (a packing placement, as the attention body's)
-                        r0, r1 = CuteF32.fma2(
-                            (scale, scale),
-                            (bufs[k][e], bufs[k][e + 1]),
-                            (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                for b0 in cutlass.range_constexpr(
+                    0, per_group, batch
+                ):  # the group's subtiles in batches: a batch's loads first
+                    for j in cutlass.range_constexpr(batch):
+                        cute.copy(
+                            tiled_copy_t2r,
+                            tTR_tAcc[(None, None, None, gsel * per_group + b0 + j)],
+                            bufs[j],
                         )
-                        tTR_rSum[k * V + e] = r0
-                        tTR_rSum[k * V + e + 1] = r1
+                    for j in cutlass.range_constexpr(batch):
+                        k = b0 + j
+                        for e in cutlass.range_constexpr(0, V, 2):
+                            # acc = fma(scale, P_kb, acc) for two elements per fma.rn.f32x2: each lane the same correctly rounded fma on
+                            # the same operands (a packing placement, as the attention body's)
+                            r0, r1 = CuteF32.fma2(
+                                (scale, scale),
+                                (bufs[j][e], bufs[j][e + 1]),
+                                (tTR_rSum[k * V + e], tTR_rSum[k * V + e + 1]),
+                            )
+                            tTR_rSum[k * V + e] = r0
+                            tTR_rSum[k * V + e + 1] = r1
             cute.arch.fence_view_async_tmem_load()  # this warp's reads of the partial are complete
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(
@@ -680,7 +700,7 @@ class BlockScaleFp8Gemm:
         )
         sSFB = smem.allocate_tensor(
             element_type=ACC_DTYPE,
-            layout=cute.make_layout((NUM_SCALE_STAGES,)),
+            layout=cute.make_layout((NUM_B_BLOCKS, NUM_SCALE_STAGES)),
             byte_alignment=16,
         )
         a_full_mcast_mask = None

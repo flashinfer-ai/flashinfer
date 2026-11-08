@@ -271,12 +271,12 @@ def test_fingerprint_is_a_function_of_k_and_the_output_format():
 
 def test_space_is_the_block_scale_tiles_on_a_k_major_weight():
     space = knob_product(in_fmt=FMT)
-    assert len(space) == 264
+    assert len(space) == 336
     assert {k.tile_m for k in space} == {128, 256}
-    assert {k.tile_n for k in space} == {16, 32, 64, 128}
+    assert {k.tile_n for k in space} == {16, 32, 64, 128, 256}
     assert all(not k.use_2cta_instrs for k in space if k.tile_n == 16)
     assert all(k.cluster_k == 1 and not k.swap_ab and not k.cta_chunks for k in space)
-    assert len(enumerate_space(1000, 7168, 7168, b_major="k", in_fmt=FMT)) == 264
+    assert len(enumerate_space(1000, 7168, 7168, b_major="k", in_fmt=FMT)) == 336
     assert enumerate_space(1000, 7168, 7168, b_major="n", in_fmt=FMT) == []
     assert enumerate_space(1000, 7168, 7168 + 64, b_major="k", in_fmt=FMT) == []
     for N, K in DS_PAIRS:
@@ -289,8 +289,8 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """R3 membership, and the structure the heuristic's block-scale terms give the pick at every nominal part: never the
     2-CTA pair (its promotion runs in lockstep, `heuristic.estimate_cycles`); at a few tokens the narrowest tile whose
     tiles fit the part in one wave (the per-block hand-off chain costs the same at every width) in the 4-wide N-cluster
-    when its clusters fit (the token box's zero-fill shared by the multicast); at many rows the 128 x 128 tile once its
-    tiles alone fill the part."""
+    when its clusters fit (the token box's zero-fill shared by the multicast); at many rows a wide tile, 128 or 256 columns, once
+    the 128-wide tiles alone fill the part."""
     cap4 = capacity_for(family, sm_count, nominal=True)[4]
     for N, K in DS_PAIRS:
         for M in DS_MS:
@@ -305,7 +305,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
             assert not pick.use_2cta_instrs, where
             if M <= 32:
                 # the narrowest tile whose tiles fit one wave, in 4-wide N-clusters when those fit the part's cluster capacity
-                tiles = {tn: -(-N // tn) for tn in (16, 32, 64, 128)}
+                tiles = {tn: -(-N // tn) for tn in (16, 32, 64, 128, 256)}
                 in_clusters = [tn for tn, t in tiles.items() if (t + 3) // 4 <= cap4]
                 if in_clusters:
                     assert (pick.tile_n, pick.cluster_n) == (in_clusters[0], 4), where
@@ -316,9 +316,9 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                     ), where
             wide_tiles = -(-M // 128) * -(-N // 128)
             if M >= 1024 and wide_tiles >= 2 * sm_count:
-                # the 128 x 128 tiles alone fill the part twice over: the widest tile (a narrower N, or a single partial wave, keeps
-                # the SMs busy with narrower tiles)
-                assert (pick.tile_m, pick.tile_n) == (128, 128), where
+                # the 128-wide tiles alone fill the part twice over: a wide tile, 128 or 256 columns (a narrower N, or a single
+                # partial wave, keeps the SMs busy with narrower tiles)
+                assert pick.tile_m in (128, 256) and pick.tile_n >= 128, where
 
 
 def test_tactic_encoding_round_trips():
@@ -506,10 +506,10 @@ def test_config_agreement(M, N, K):
 @needs_device
 @pytest.mark.parametrize("M,N,K", FULL_SPACE_SHAPES)
 def test_whole_space_agreement(M, N, K, request):
-    """Every record of the enumerated space (264) computes the exact model's bits; the whole space under ``--full``, a
+    """Every record of the enumerated space (336) computes the exact model's bits; the whole space under ``--full``, a
     sample otherwise (the instruction variants are covered by `test_config_agreement` every run)."""
     space = enumerate_space(M, N, K, b_major="k", in_fmt=FMT)
-    assert len(space) == 264
+    assert len(space) == 336
     full = False
     # registered by tests/conftest.py's parametrize plugin; absent when the file runs outside the repo's conftest
     with contextlib.suppress(ValueError):
