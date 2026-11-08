@@ -195,7 +195,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             "a": common_depth,
             "scale": common_depth,
             "transformed_a": common_depth,
-            "b": 2,
+            "b": 4,
             "acc": 2,
         }
 
@@ -258,6 +258,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
         num_sched_stages: int = 2,
+        num_activation_stages: Optional[int] = None,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
@@ -306,6 +307,9 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 "clc_bundle_size is only meaningful for the dynamic CLC "
                 "scheduler; mixed FC12 requires force_static_sched=True."
             )
+        if num_activation_stages is not None and num_activation_stages < 2:
+            raise ValueError("num_activation_stages must be at least 2.")
+
         self.mma_tiler_mnk = mma_tiler_mnk
         self.transform_buffer = transform_buffer
         self.overlapping_accum = accumulator_overlap
@@ -378,7 +382,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         # knobs to the runner.
         self.num_a_stage = pipeline_stages["a"]
         self.num_scale_stage = pipeline_stages["scale"]
-        self.num_b_stage = pipeline_stages["b"]
+        self.num_b_stage = pipeline_stages["b"] if num_activation_stages is None else num_activation_stages
         self.num_transformed_a_stage = pipeline_stages["transformed_a"]
         self.num_acc_stage = pipeline_stages["acc"]
         self.tmem_col_budget = self.get_tmem_col_budget(
