@@ -26,6 +26,7 @@ codegen argument. Pattern follows tests/jit/test_cute_dsl_cache.py:
 3. Symbol safety: names stay within [A-Za-z0-9_] (filename + TVM-FFI symbol).
 """
 
+import importlib
 import inspect
 import re
 
@@ -66,6 +67,14 @@ from flashinfer.gdn_kernels.blackwell.gdn_prefill import (  # noqa: E402
 )
 
 _SYMBOL_SAFE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class _ForbidCompile:
+    def __getitem__(self, options):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("cute.compile ran despite valid disk artifacts")
 
 
 # ---------------------------------------------------------------------------
@@ -635,3 +644,153 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
     )
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
     torch.testing.assert_close(state1, state2, atol=0, rtol=0)
+
+
+def _make_prefill_call(use_cp, cu_seqlens_dtype=torch.int64):
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    shape = (128, 2, 128)
+    q, k, v = (
+        torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+        * 0.1
+        for _ in range(3)
+    )
+    k = torch.nn.functional.normalize(k, dim=-1)
+    alpha = torch.full(shape[:2], 0.9, device="cuda")
+    beta = torch.full(shape[:2], 0.5, device="cuda")
+    cu_seqlens = torch.tensor([0, 128], device="cuda", dtype=cu_seqlens_dtype)
+
+    def run():
+        return chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            use_cp=use_cp,
+            backend="flashinfer",
+        )
+
+    return run
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_delta_rule_prefill_disk_cache_round_trip(monkeypatch, tmp_path, use_cp):
+    major, _ = torch.cuda.get_device_capability()
+    if major not in (8, 9, 12) and not (major == 10 and use_cp):
+        pytest.skip("requires a delta-rule DSL prefill path")
+    if major == 10 and int((torch.version.cuda or "0").split(".")[0]) < 13:
+        pytest.skip("Blackwell CP prefill requires CUDA 13 or later")
+
+    import cutlass.cute as cute
+
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+    from flashinfer.jit import env as jit_env
+
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(custom_compile_cache, "_in_mem_compile_cache", {})
+
+    offset_types = (torch.int64,) if use_cp else (torch.int64, torch.int32)
+    cases = []
+    artifacts = set()
+    for dtype in offset_types:
+        run = _make_prefill_call(use_cp, dtype)
+        cases.append((run, run()))
+        current_artifacts = set(tmp_path.rglob("*.o"))
+        assert artifacts < current_artifacts, f"expected a new artifact for {dtype}"
+        artifacts = current_artifacts
+
+    custom_compile_cache._in_mem_compile_cache.clear()
+    monkeypatch.setattr(cute, "compile", _ForbidCompile())
+    for run, expected in cases:
+        torch.testing.assert_close(run(), expected, atol=0, rtol=0)
+
+
+def _make_wy_call(variant):
+    module = importlib.import_module(
+        f"flashinfer.gdn_kernels.gdn_decode_bf16_wy_{variant}"
+    )
+    suffix = "" if variant == "output_only" else f"_{variant}"
+    entry = getattr(module, f"gated_delta_rule_mtp{suffix}")
+
+    dtype = getattr(module, "IO_TORCH", torch.bfloat16)
+    state_dtype = getattr(module, "ST_TORCH", torch.bfloat16)
+    ring_dtype = getattr(module, "RING_TORCH", torch.bfloat16)
+    batch, tokens, heads, dim = 2, 4, 2, 128
+    generator = torch.Generator(device="cuda").manual_seed(17)
+
+    def rand(*shape, dtype=dtype):
+        return torch.randn(shape, generator=generator, dtype=dtype, device="cuda") * 0.1
+
+    q, k, v = (rand(batch, tokens, heads, dim) for _ in range(3))
+    a, b = (rand(batch, tokens, heads) for _ in range(2))
+    A_log, dt_bias = rand(heads), rand(heads)
+    initial_state = rand(batch, heads, dim, dim, dtype=state_dtype)
+    indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    buffers = {}
+    options = {}
+    if variant != "output_only":
+        slots = getattr(module, "RING_SLOTS", module.W_RING)
+        ring_shape = (batch, heads, slots, dim)
+        buffers.update(
+            k_cache=torch.zeros(ring_shape, dtype=ring_dtype, device="cuda"),
+            u_cache=torch.zeros(ring_shape, dtype=ring_dtype, device="cuda"),
+            g_cache=torch.zeros(ring_shape[:-1], dtype=torch.float32, device="cuda"),
+            hist_len=torch.zeros(batch, dtype=torch.int32, device="cuda"),
+        )
+    if variant == "ucache_flush":
+        buffers["hist_len"][0] = module.W_RING - tokens + 1
+        buffers["cache_base"] = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        options["backend"] = "hmma"
+
+    def run():
+        state = initial_state.clone()
+        ring = {name: tensor.clone() for name, tensor in buffers.items()}
+        out = entry(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=indices,
+            disable_state_update=True,
+            **ring,
+            **options,
+        )
+        return out, state, ring
+
+    return module, run
+
+
+@pytest.mark.parametrize("variant", ["output_only", "ucache", "ucache_flush"])
+def test_wy_disk_cache_round_trip(monkeypatch, tmp_path, variant):
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("requires an SM90+ WY kernel")
+
+    import cutlass.cute as cute
+
+    from flashinfer.jit import env as jit_env
+
+    module, run = _make_wy_call(variant)
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(module, "_CACHE", {})
+
+    expected = run()
+    if variant == "ucache_flush":
+        assert expected[2]["cache_base"][0].item() > 0
+
+    module._CACHE.clear()
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE")
+    torch.testing.assert_close(run(), expected, atol=0, rtol=0)
+    assert len(list(tmp_path.rglob("*.o"))) == 1
+    module._CACHE.clear()
+    monkeypatch.setattr(cute, "compile", _ForbidCompile())
+    torch.testing.assert_close(run(), expected, atol=0, rtol=0)

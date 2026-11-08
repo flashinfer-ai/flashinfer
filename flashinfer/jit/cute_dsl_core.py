@@ -127,20 +127,24 @@ class JitSpecCuteDsl(JitSpec):
         source_sha256: str,
         *,
         enable_tvm_ffi: bool = True,
+        target_arch: Optional[str] = None,
     ):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
         self.enable_tvm_ffi = enable_tvm_ffi
-        self.module_dir_name = sanitize_symbol_name(
-            f"{module_name}_{_get_compile_arch()}_cute_dsl"
+        arch = (
+            _get_compile_arch()
+            if target_arch is None
+            else sanitize_symbol_name(target_arch.replace("_", ""))
         )
+        self.module_dir_name = sanitize_symbol_name(f"{module_name}_{arch}_cute_dsl")
         self.name = f"{self.module_dir_name}/{self.kernel_name}"
         self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
         self.expected_meta: dict[str, Any] = {
-            "arch": _get_compile_arch(),
+            "arch": arch,
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,
         }
@@ -327,6 +331,7 @@ def build_and_load_cute_dsl_kernel(
     extra_key_files: Sequence[str] = (),
     *,
     enable_tvm_ffi: bool = True,
+    target_arch: Optional[str] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -351,6 +356,9 @@ def build_and_load_cute_dsl_kernel(
     enable_tvm_ffi : bool
         Whether ``compile_fn`` compiles with TVM-FFI (see
         :class:`JitSpecCuteDsl`).
+    target_arch : str, optional
+        Explicit GPU architecture used by ``compile_fn``. When omitted, use
+        the CuTe-DSL environment or current device to key the artifact.
 
     Returns
     -------
@@ -379,5 +387,6 @@ def build_and_load_cute_dsl_kernel(
         compile_fn,
         source_sha256,
         enable_tvm_ffi=enable_tvm_ffi,
+        target_arch=target_arch,
     )
     return spec.build_and_load()

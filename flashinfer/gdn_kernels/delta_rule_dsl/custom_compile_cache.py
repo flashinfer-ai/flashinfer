@@ -4,10 +4,13 @@ import tempfile
 import warnings
 from collections.abc import Hashable
 from functools import lru_cache
+from pathlib import Path
 
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import DumpDir
+
+from ..cute_dsl_cache import build_and_load_gdn_kernel
 
 
 _in_mem_compile_cache: dict = {}
@@ -177,19 +180,66 @@ def _sm12x_ptx_check(compiled_fn):
         )
 
 
+@functools.cache
+def _disk_cache_sources(module: str) -> tuple[str, ...]:
+    package, _, filename = module.rpartition(".")
+    blackwell = "flashinfer.gdn_kernels.blackwell"
+    # Experimental kernels also share the process-local cache. Their sources
+    # are outside the persistent prefill modules.
+    if package not in (__package__, blackwell):
+        return ()
+    # The architecture-specific kernels share JIT helpers and inherit kernels
+    # from other files in this package.
+    directory = Path(__file__).resolve().parent
+    sources = tuple(sorted(str(path) for path in directory.glob("*.py")))
+    if package == blackwell:
+        source = directory.parent / "blackwell" / f"{filename}.py"
+        sources += (str(source),)
+    return sources
+
+
+def _compile(func, args, options, kwargs):
+    if not _needs_sm12x_ptx_check(options):
+        return cute.compile[options](func, *args, **kwargs)
+    with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
+        compiled = cute.compile[_ptx_check_compile_options(options, tempdir)](
+            func, *args, **kwargs
+        )
+        _sm12x_ptx_check(compiled)
+        return compiled
+
+
 def cached_compile(func, *args, compile_options=None, **kwargs):
-    cache_key = (func._get_compile_key(), _compile_options_key(compile_options))
+    kernel_key = func._get_compile_key()
+    cache_key = (kernel_key, _compile_options_key(compile_options))
     compiled_fn = _in_mem_compile_cache.get(cache_key)
 
     if compiled_fn is None:
-        _needs_ptx_check = _needs_sm12x_ptx_check(compile_options)
-        if not _needs_ptx_check:
-            compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
+
+        def compile_kernel():
+            return _compile(func, args, compile_options, kwargs)
+
+        arch = _option_value(compile_options, cute.GPUArch)
+        kernel_type = type(func)
+        module = kernel_type.__module__
+        sources = _disk_cache_sources(module)
+        if not arch or kwargs or not isinstance(kernel_key[0], tuple) or not sources:
+            # The class hierarchy tuple marks a manual key. Inferred instance
+            # attributes can contain process-local state.
+            compiled_fn = compile_kernel()
         else:
-            with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
-                compile_options = _ptx_check_compile_options(compile_options, tempdir)
-                compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
-                _sm12x_ptx_check(compiled_fn)
+            compiled_fn = build_and_load_gdn_kernel(
+                f"gdn_{module.rsplit('.', 1)[1]}",
+                kernel_type.__name__,
+                cache_key,
+                args,
+                compile_kernel,
+                extra_key_files=sources,
+                enable_tvm_ffi=_has_option_value(
+                    compile_options, cute.EnableTVMFFI, True
+                ),
+                target_arch=arch,
+            )
 
         _in_mem_compile_cache[cache_key] = compiled_fn
 

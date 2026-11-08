@@ -32,8 +32,11 @@ New cache adopters (other CuTe-DSL op families) should replicate this
 pattern for their own name functions.
 """
 
+import errno
 import inspect
 import re
+from functools import partial
+from unittest.mock import Mock
 
 import pytest
 
@@ -58,6 +61,197 @@ from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
     NVFP44Over6Config,
     nvfp4_4over6_cache_key,
 )
+
+
+def test_explicit_target_keys_cute_dsl_artifact(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core, env as jit_env
+
+    monkeypatch.setattr(cute_dsl_core, "_get_compile_arch", lambda: "sm90a")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    explicit = cute_dsl_core.JitSpecCuteDsl(
+        "gdn", "kernel", lambda: None, "sources", target_arch="sm_120a"
+    )
+    default = cute_dsl_core.JitSpecCuteDsl("gdn", "kernel", lambda: None, "sources")
+
+    assert explicit.expected_meta["arch"] == "sm120a"
+    assert explicit.object_path.parent.name == "gdn_sm120a_cute_dsl"
+    assert default.expected_meta["arch"] == "sm90a"
+    assert default.object_path != explicit.object_path
+
+
+def test_gdn_disk_name_tracks_layout_and_specialization():
+    import torch
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.gdn_kernels.cute_dsl_cache import _kernel_name
+
+    def name(rows, dtype=torch.bfloat16, *, dynamic=False, alignment=16, flag=False):
+        tensor = from_dlpack(torch.empty((rows, 16), dtype=dtype), alignment)
+        if dynamic:
+            tensor.mark_layout_dynamic(leading_dim=1)
+        return _kernel_name("prefill", (flag,), (tensor,), "compiler settings")
+
+    assert name(3) == name(3)
+    assert name(3) != name(5)
+    assert name(3, dynamic=True) == name(5, dynamic=True)
+    assert name(3) != name(3, torch.float16)
+    assert name(3) != name(3, alignment=8)
+    assert name(3) != name(3, flag=True)
+
+
+@pytest.fixture
+def gdn_compile(monkeypatch):
+    from flashinfer.gdn_kernels import cute_dsl_cache
+
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    return partial(
+        cute_dsl_cache.build_and_load_gdn_kernel,
+        "gdn",
+        "kernel",
+        (),
+        (),
+        target_arch="sm_120a",
+        extra_key_files=(),
+        enable_tvm_ffi=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "setting,value",
+    [
+        ("compiler_opt", "warnings"),
+        ("enable_tvm_ffi", True),
+        ("dryrun", True),
+        ("keep_tokens", frozenset({"ptx"})),
+        ("print_ir", True),
+        ("print_after_preprocessor", True),
+        ("no_cache", True),
+    ],
+)
+def test_gdn_compile_override_uses_process_cache(
+    monkeypatch, gdn_compile, setting, value
+):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    from flashinfer.gdn_kernels import cute_dsl_cache
+
+    monkeypatch.setattr(CuTeDSL._get_dsl().envar, setting, value)
+    disk_cache = Mock()
+    monkeypatch.setattr(cute_dsl_cache, "build_and_load_cute_dsl_kernel", disk_cache)
+    compiled = object()
+    assert gdn_compile(lambda: compiled) is compiled
+    disk_cache.assert_not_called()
+
+
+def test_gdn_disk_name_tracks_compiler_settings(monkeypatch, gdn_compile):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    from flashinfer.gdn_kernels import cute_dsl_cache
+
+    disk_cache = Mock(side_effect=lambda module, name, *args, **kwargs: name)
+    monkeypatch.setattr(cute_dsl_cache, "build_and_load_cute_dsl_kernel", disk_cache)
+    env = CuTeDSL._get_dsl().envar
+    monkeypatch.setattr(env, "enable_assertions", False)
+    baseline = gdn_compile(lambda: None)
+    assert gdn_compile(lambda: None) == baseline
+    monkeypatch.setattr(env, "enable_assertions", True)
+    assert gdn_compile(lambda: None) != baseline
+
+
+@pytest.mark.parametrize("disable_jit", [False, True])
+def test_gdn_read_only_cache_lock(monkeypatch, tmp_path, gdn_compile, disable_jit):
+    from flashinfer.jit import cute_dsl_core, env as jit_env
+
+    def read_only_lock_dir():
+        raise PermissionError(errno.EACCES, "cannot create cache lock directory")
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", read_only_lock_dir)
+    compiled = object()
+    compile_fn = Mock(return_value=compiled)
+    if disable_jit:
+        monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+        with pytest.raises(PermissionError, match="cache lock directory"):
+            gdn_compile(compile_fn)
+        compile_fn.assert_not_called()
+    else:
+        assert gdn_compile(compile_fn) is compiled
+        compile_fn.assert_called_once_with()
+
+
+def test_gdn_compiler_permission_error_propagates(monkeypatch, tmp_path, gdn_compile):
+    from flashinfer.jit import env as jit_env
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    compile_fn = Mock(side_effect=PermissionError(errno.EACCES, "compiler failed"))
+    with pytest.raises(PermissionError, match="compiler failed"):
+        gdn_compile(compile_fn)
+    compile_fn.assert_called_once_with()
+
+
+def _gdn_test_kernel(module):
+    from flashinfer.gdn_kernels.delta_rule_dsl.custom_compile_cache import (
+        KeyedCompileMixin,
+    )
+
+    class Kernel(KeyedCompileMixin):
+        def __init__(self):
+            self.manual_cache_key()
+
+    Kernel.__module__ = module
+    return Kernel()
+
+
+def test_experimental_gdn_kernel_stays_in_process(monkeypatch):
+    import cutlass.cute as cute
+
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache as cache
+
+    kernel = _gdn_test_kernel("flashinfer.experimental.gdn_sm120_cute.consumer")
+    options = (cute.GPUArch("sm_120a"),)
+    compiled = object()
+    monkeypatch.setattr(cache, "_in_mem_compile_cache", {})
+    monkeypatch.setattr(cache, "_compile", lambda *args: compiled)
+
+    def forbid_persistence(*args, **kwargs):
+        raise AssertionError("experimental GDN artifacts are outside this cache")
+
+    monkeypatch.setattr(cache, "build_and_load_gdn_kernel", forbid_persistence)
+    assert cache.cached_compile(kernel, compile_options=options) is compiled
+    assert cache.get_cached_compile(kernel, options) is compiled
+
+
+def test_gdn_ptx_rejection_does_not_publish_artifact(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import cutlass.cute as cute
+
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache as cache
+    from flashinfer.jit import env as jit_env
+
+    class InvalidCompiler:
+        def __getitem__(self, options):
+            assert any(isinstance(opt, cute.KeepPTX) and opt.value for opt in options)
+            return self
+
+        def __call__(self, *args, **kwargs):
+            return SimpleNamespace(__ptx__=cache._TMA_CLUSTER_LOAD)
+
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("CUTE_DSL_COMPILER_OPT", raising=False)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(cache, "_in_mem_compile_cache", {})
+    monkeypatch.setattr(cute, "compile", InvalidCompiler())
+
+    kernel = _gdn_test_kernel(cache.__name__)
+    options = (cute.GPUArch("sm_120a"), cute.EnableTVMFFI(True))
+    with pytest.raises(RuntimeError, match="unsupported cluster-scoped TMA loads"):
+        cache.cached_compile(kernel, compile_options=options)
+    assert cache.get_cached_compile(kernel, options) is None
+    assert not list(tmp_path.rglob("*.o"))
+
 
 NVFP4_KERNEL_GETTERS = [
     _get_compiled_kernel_nvfp4,
