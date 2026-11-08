@@ -748,8 +748,9 @@ def cake_gqa_nondet_train_backward(
         # stream; a side stream fills them while the current stream runs bwd_pre and the main kernels, and the current
         # stream waits for it before their first read: the same kernels write the same integers, off the critical path.
         # The host queues the work in the order the current stream needs it (its time before the first main kernel is
-        # on the critical path): the plan kernel, bwd_pre, the host-boundary range check (queued while bwd_pre runs),
-        # the main kernels, and last the fold order, which only bwd_fold reads.
+        # on the critical path): the plan kernel, bwd_pre, the host-boundary range check, the main kernels, and last the
+        # fold order, which only bwd_fold reads.  The range check runs on the current stream after bwd_pre: it reads the
+        # tables, and the main kernels must not start before it.
         stream = torch.cuda.current_stream(device_index)
         tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
         fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
@@ -769,8 +770,7 @@ def cake_gqa_nondet_train_backward(
                         dims,
                         device_index,
                     )
-                    if seqlens is None:
-                        planned = side.record_event()
+                    planned = side.record_event()
             _launch(
                 "bwd_pre",
                 {
@@ -785,16 +785,14 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
-            if tables is not None and seqlens is not None:
-                with torch.cuda.stream(side):
-                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
-                    planned = side.record_event()
+            if planned is not None:
+                stream.wait_event(planned)
             if tables is None:
                 tables = _tile_plan(
                     cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
                 )
-                if seqlens is not None:
-                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
+            if seqlens is not None:
+                _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
             tile_base, pair_base, pair_order = tables
             # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
             # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
@@ -828,8 +826,6 @@ def cake_gqa_nondet_train_backward(
                 "zero_tile": plan["zero_tile"],
             }
             h_chunk = plan["h_chunk"]
-            if planned is not None:
-                stream.wait_event(planned)
             for h0 in range(0, heads_kv, h_chunk):
                 hc = min(h_chunk, heads_kv - h0)
                 for index, (n0, n1) in enumerate(plan["ranges"]):
@@ -1017,10 +1013,10 @@ def _fold_index(
 @functools.cache
 def _side_stream(device_index: int, stream_id: int) -> torch.cuda.Stream:
     """The high-priority side stream of the caller stream ``stream_id`` of device ``device_index``: the backward's
-    tile tables (the one-CTA ``bwd_plan``), the host-boundary range check and, while the main kernels run, the
-    row-map fold order.  One cached stream per caller stream, from PyTorch's high-priority stream pool (a pool that
-    cycles, so two caller streams may share one stream past its size: their work then queues on it in order); high
-    priority: the fold order's kernels take the first SMs the main kernels free."""
+    tile tables (the one-CTA ``bwd_plan``) and, while the main kernels run, the row-map fold order.  One cached
+    stream per caller stream, from PyTorch's high-priority stream pool (a pool that cycles, so two caller streams
+    may share one stream past its size: their work then queues on it in order); high priority: the fold order's
+    kernels take the first SMs the main kernels free."""
     return torch.cuda.Stream(device_index, priority=-1)
 
 
