@@ -242,7 +242,7 @@ kernel_cake_causal_conv1d_train_ffa1f5752a2f183cd02f(__nv_bfloat16* __restrict__
     int _max_0 = ((1) > (g_ct / 16) ? (1) : (g_ct / 16));
     int ks = ((4) < (_max_0) ? (4) : (_max_0));
     int soff = rank % ks * C * 4;
-    long long cstride = C64 * 4;
+    long long cstride = C64 * 4ll;
     int sub = tid / ct_vec;
     int v = tid - sub * ct_vec;
     int c0 = (ct * ct_vec + v) * 8;
@@ -321,7 +321,7 @@ kernel_cake_causal_conv1d_train_ffa1f5752a2f183cd02f(__nv_bfloat16* __restrict__
                 for (int j = 0; j < 8; j++) {
                     {
                         uint2 _vld_3;
-                        _vld_3 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j) * 4);
+                        _vld_3 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j) * 4ll);
                         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -334,7 +334,7 @@ kernel_cake_causal_conv1d_train_ffa1f5752a2f183cd02f(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 8; j_1++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_1) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_1) * 4ll);
                         wr[j_1 * 4 + 0] = _v4.x;
                         wr[j_1 * 4 + 1] = _v4.y;
                         wr[j_1 * 4 + 2] = _v4.z;
@@ -895,7 +895,7 @@ kernel_cake_causal_conv1d_train_ffa1f5752a2f183cd02f(__nv_bfloat16* __restrict__
                 for (int j_3 = 0; j_3 < 8; j_3++) {
                     {
                         uint2 _vld_50;
-                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_3) * 4);
+                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_3) * 4ll);
                         uint32_t* _vpairs_50 = reinterpret_cast<uint32_t*>(&_vld_50);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -908,7 +908,7 @@ kernel_cake_causal_conv1d_train_ffa1f5752a2f183cd02f(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_4 = 0; j_4 < 8; j_4++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_4) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_4) * 4ll);
                         wr_1[j_4 * 4 + 0] = _v4.x;
                         wr_1[j_4 * 4 + 1] = _v4.y;
                         wr_1[j_4 * 4 + 2] = _v4.z;
