@@ -76,9 +76,11 @@ beside a group of three's cluster tail runs the same way over its segments
 adjoint walk of a host-built table is either the serial table or the exact
 one-wave split (:func:`bwd_piece_table`, :func:`adjoint_split_pricing`, both
 priced at their full cost): the last piece of every sequence walks beside the
-affine maps of its middle pieces (``dhu_tc2_dvl32_modes`` / ``dhu_tc2_dvl32_gm``),
-the stitch composes the other pieces' end adjoints and a second wave walks
-them, so neither the plan nor its cost depends on the gates.
+affine maps of its middle pieces (``dhu_tc2_dvl32_modes`` / ``dhu_tc2_dvl32_gm``,
+the maps on a side stream, or after them on the caller's stream where the
+host's fork and join would cost more than the overlap buys, or with
+``streams=1``), the stitch composes the other pieces' end adjoints and a
+second wave walks them, so neither the plan nor its cost depends on the gates.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -546,6 +548,19 @@ def _launch(stage, gx, gy, gz, *values):
     if order is not None:
         values = tuple(values[i] for i in order)
     cake_backend.launch_stage(stage, (gx, gy, gz), values, device_index=device_index)
+
+
+def _bound_launch(stage, gx, gy, gz, *values):
+    """:func:`_launch` with its device, argument order and grid resolved now: the returned call only launches (on the
+    stream current when it runs).  Two launches meant to start together are bound first and fired back to back."""
+    device_index = _tensor_index(values[0])
+    order = _order(stage, cake_backend.device_arch(device_index))
+    if order is not None:
+        values = tuple(values[i] for i in order)
+    grid = (gx, gy, gz)
+    return lambda: cake_backend.launch_stage(
+        stage, grid, values, device_index=device_index
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1977,8 +1992,11 @@ SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
 # summaries beside the last pieces' walks (``summary``); the step of the serial walk at an empty and at a full wave
 # (``serial_low`` / ``serial_full``, interpolated by the fill); the composition's fixed cost and its cost per
 # composed piece (``stitch`` / ``stitch_piece``); the split's fixed cost (its extra launches and the stream fork and
-# join).  sm_100a measured on B200 (148 SMs), sm_107a on R200 (212 SMs; ``serial_full`` extrapolated from the 144-CTA
-# rows, the fullest serial wave of the bench rows there).
+# join); the host's cost of wave 1's fork and join (``fork``): where the overlap that the side stream buys, the shorter
+# of wave 1's two launches, is at most ``fork``, wave 1 runs on the caller's stream, summaries first (the same kernels
+# and bits; the host's fork and join, not the GPU, then decides wave 1's time: measured on GB200's Grace host at the
+# group-of-three pair rows).  sm_100a measured on B200 (148 SMs), sm_107a on R200 (212 SMs; ``serial_full``
+# extrapolated from the 144-CTA rows, the fullest serial wave of the bench rows there).
 ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
     "sm_100a": {
         "walk": 2.69,
@@ -1988,6 +2006,7 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "stitch": 10.5,
         "stitch_piece": 3.0,
         "fixed": 15.0,
+        "fork": 0.0,
     },
     "sm_107a": {
         "walk": 2.0,
@@ -1997,6 +2016,7 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "stitch": 8.1,
         "stitch_piece": 3.4,
         "fixed": 15.0,
+        "fork": 0.0,
     },
 }
 
@@ -2031,7 +2051,8 @@ def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) ->
     (``ADJOINT_SPLIT_COSTS``, microseconds): the split pays wave 1 (its longest last piece or one-piece sequence at the
     walk's step, its longest middle piece at the summary's), the stitch over the most pieces of a sequence, wave 2 (its
     longest other piece) and its fixed cost; the serial table pays its longest sequence at the step of its fill.
-    ``select`` where the split is cheaper; ``segment_len`` is ``L`` (0 without a split)."""
+    ``select`` where the split is cheaper; ``segment_len`` is ``L`` (0 without a split); ``one_stream`` where wave 1
+    runs on the caller's stream: it has summaries and the shorter of its two launches is at most the ``fork`` cost."""
     chunks = tuple(int(n) for n in chunks)
     hv, sms = int(num_v_heads), int(sm_count)
     out: dict[str, Any] = {
@@ -2039,6 +2060,7 @@ def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) ->
         "segment_len": 0,
         "split_us": None,
         "serial_us": None,
+        "one_stream": False,
     }
     costs = ADJOINT_SPLIT_COSTS.get(arch)
     if costs is None or not chunks:
@@ -2068,7 +2090,15 @@ def adjoint_split_pricing(chunks, num_v_heads: int, sm_count: int, arch: str) ->
         + front * costs["walk"]
         + costs["fixed"]
     )
-    out.update(select=split < out["serial_us"], segment_len=length, split_us=split)
+    one_stream = middle > 0 and min(
+        last * costs["walk"], middle * costs["summary"]
+    ) <= costs.get("fork", 0.0)
+    out.update(
+        select=split < out["serial_us"],
+        segment_len=length,
+        split_us=split,
+        one_stream=one_stream,
+    )
     return out
 
 
@@ -2097,18 +2127,27 @@ def _adjoint_split_length(
         return None
     if _adjoint_chain_stage(arch) is None:
         return None
-    chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
-    priced = adjoint_split_pricing(
-        chunks, int(num_v_heads), _device_props(index)[0], arch
-    )
+    priced = _adjoint_split_priced(seq_lens, num_v_heads, index, arch)
     return int(priced["segment_len"]) if priced["select"] else None
+
+
+def _adjoint_split_priced(
+    seq_lens, num_v_heads: int, device_index: int, arch: str
+) -> dict:
+    """:func:`adjoint_split_pricing` of a host layout on device ``device_index`` of architecture ``arch``."""
+    chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
+    return adjoint_split_pricing(
+        chunks, int(num_v_heads), _device_props(int(device_index))[0], arch
+    )
 
 
 @dataclass(frozen=True)
 class AdjointSplit:
     """The entry tables of the one-wave split of the adjoint walk over a table's adjoint segments (the pieces): rows
     ``[segment index, mode bits]`` of each launch of the ``dhu_tc2_dvl32`` forms (:func:`adjoint_split_tables`), and the
-    stitch's ``seg_flag`` (``[segments, HV]``: 0 at each sequence's last piece, whose B half the stitch copies)."""
+    stitch's ``seg_flag`` (``[segments, HV]``: 0 at each sequence's last piece, whose B half the stitch copies);
+    ``one_stream``: wave 1 on the caller's stream, summaries first (:func:`adjoint_split_pricing`), instead of the
+    summaries on a side stream beside the last pieces' walks (the same kernels and bits)."""
 
     walk: torch.Tensor
     summary: torch.Tensor
@@ -2117,6 +2156,7 @@ class AdjointSplit:
     num_walk: int
     num_summary: int
     num_front: int
+    one_stream: bool = False
 
 
 def adjoint_split_lists(
@@ -2145,8 +2185,11 @@ def adjoint_split_lists(
     return walk_i, walk_m, summary_i, [0] * len(summary_i), front_i, front_m
 
 
-def adjoint_split_tables(seq_seg_start, num_v_heads: int, device) -> AdjointSplit:
-    """:class:`AdjointSplit` of a segment table (:func:`adjoint_split_lists`), copied to ``device`` in one transfer."""
+def adjoint_split_tables(
+    seq_seg_start, num_v_heads: int, device, one_stream: bool = False
+) -> AdjointSplit:
+    """:class:`AdjointSplit` of a segment table (:func:`adjoint_split_lists`), copied to ``device`` in one transfer;
+    ``one_stream`` as given."""
     seq_seg_start = [int(x) for x in seq_seg_start]
     walk_i, walk_m, summary_i, summary_m, front_i, front_m = adjoint_split_lists(
         seq_seg_start
@@ -2175,6 +2218,7 @@ def adjoint_split_tables(seq_seg_start, num_v_heads: int, device) -> AdjointSpli
         num_walk=len(walk_i),
         num_summary=len(summary_i),
         num_front=len(front_i),
+        one_stream=bool(one_stream),
     )
 
 
@@ -2185,9 +2229,11 @@ def _host_adjoint_split(
     num_v_heads: int,
     device_index: int,
     lpt: bool,
+    one_stream: bool = False,
 ) -> AdjointSplit:
     """:func:`adjoint_split_tables` of the adjoint segments :func:`build_chunk_meta` builds for ``seq_lens`` (the
-    sequences in :func:`lpt_sequence_order` with ``lpt``) at ``segment_len``."""
+    sequences in :func:`lpt_sequence_order` with ``lpt``) at ``segment_len``, wave 1 on one stream with
+    ``one_stream``."""
     order = lpt_sequence_order(seq_lens) if lpt else None
     seq_seg_start = [0]
     for seq in order if order is not None else range(len(seq_lens)):
@@ -2196,7 +2242,7 @@ def _host_adjoint_split(
             seq_seg_start[-1] + len(segment_bounds(n, int(segment_len))) - 1
         )
     return adjoint_split_tables(
-        seq_seg_start, num_v_heads, torch.device("cuda", device_index)
+        seq_seg_start, num_v_heads, torch.device("cuda", device_index), one_stream
     )
 
 
@@ -2806,11 +2852,12 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
                         scale: float, table, workspaces: Workspaces, index: int, device) -> None:  # fmt: skip
     """The adjoint walk of a table's segments as the one-wave split (:class:`AdjointSplit`): wave 1, the last and
     one-piece walks (``dhu_tc2_dvl32_modes``, caller's stream) beside the middle pieces' summaries
-    (``dhu_tc2_dvl32_gm``, side stream, joined back); the composition of the pieces' end adjoints (the stitch with
-    ``reverse``, or ``piece_chain``: each sequence's last piece ends at ``dht``, the piece before it at the B half its walk
-    stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other pieces' walks from those end
-    adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's start adjoint (with
-    ``has_initial_state``)."""
+    (``dhu_tc2_dvl32_gm``, side stream, joined back; both launches bound before the fork and fired back to back), or
+    with ``one_stream`` the summaries then the walks on the caller's stream; the composition of the pieces' end
+    adjoints (the stitch with ``reverse``, or ``piece_chain``: each sequence's last piece ends at ``dht``, the piece
+    before it at the B half its walk stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other
+    pieces' walks from those end adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's
+    start adjoint (with ``has_initial_state``)."""
     hv = num_v_heads
     seg_state = workspaces.take(table, "b_seg_state", (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), torch.float32,
                                 device)  # fmt: skip
@@ -2818,31 +2865,35 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     common = (meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
               hv)  # fmt: skip
 
+    def bound(stage, entries, count, dht, use_final, store_initial):
+        return _bound_launch(stage, count, hv, 1, qn, kn, w, do, g_cs, dht, dh, dv2, dh0, seg_state, *common,
+                             use_final, store_initial, scale, entries[0], entries[1])  # fmt: skip
+
     def walk(stage, entries, count, dht, use_final, store_initial):
-        _launch(stage, count, hv, 1, qn, kn, w, do, g_cs, dht, dh, dv2, dh0, seg_state, *common, use_final,
-                store_initial, scale, entries[0], entries[1])  # fmt: skip
+        bound(stage, entries, count, dht, use_final, store_initial)()
 
     if split1.num_summary:
-        main = torch.cuda.current_stream(index)
-        side = _side_stream(index, main)
-        fork = torch.cuda.Event()
-        fork.record(main)
-        try:
-            with torch.cuda.stream(side):
-                side.wait_event(fork)
-                walk(
-                    "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
-                )
-            walk(
-                "dhu_tc2_dvl32_modes",
-                split1.walk,
-                split1.num_walk,
-                dht32,
-                use_dht,
-                store0,
-            )
-        finally:
-            main.wait_stream(side)  # the join
+        summaries = bound(
+            "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
+        )
+        walks = bound(
+            "dhu_tc2_dvl32_modes", split1.walk, split1.num_walk, dht32, use_dht, store0
+        )
+        if split1.one_stream:
+            summaries()
+            walks()
+        else:
+            main = torch.cuda.current_stream(index)
+            side = _side_stream(index, main)
+            fork = torch.cuda.Event()
+            fork.record(main)
+            try:
+                with torch.cuda.stream(side):
+                    side.wait_event(fork)
+                    summaries()
+                walks()
+            finally:
+                main.wait_stream(side)  # the join
     else:
         walk(
             "dhu_tc2_dvl32_modes", split1.walk, split1.num_walk, dht32, use_dht, store0
@@ -3447,10 +3498,21 @@ def _chunk_meta(
         meta = replace(meta, bwd_tc=True)
     split_len = _adjoint_split_length(seq_lens, int(num_v_heads), int(index), options)
     if split_len is not None and int(plans[1].segment_len) == split_len:
+        # wave 1 on one stream where the pricing says so or where the caller keeps every launch on its stream
+        one_stream = options.streams == 1 or bool(
+            _adjoint_split_priced(
+                seq_lens, num_v_heads, index, cake_backend.device_arch(int(index))
+            )["one_stream"]
+        )
         meta = replace(
             meta,
             bwd_split=_host_adjoint_split(
-                seq_lens, split_len, int(num_v_heads), int(index), options.lpt
+                seq_lens,
+                split_len,
+                int(num_v_heads),
+                int(index),
+                options.lpt,
+                one_stream,
             ),
         )
     if options.streams == 2:

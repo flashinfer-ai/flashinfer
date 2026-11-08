@@ -4089,6 +4089,42 @@ def test_adjoint_split_pricing_on_the_bench_rows(row) -> None:
     )
 
 
+def test_adjoint_split_one_stream_rule(monkeypatch) -> None:
+    # wave 1 runs on one stream where the shorter of its two launches costs at most the host's fork and join (``fork``):
+    # with GB200's costs and a fork cost of 65 us on 152 SMs the pair rows (1, 3) and (2, 6) (pieces of 10 and 20
+    # chunks) take one stream and (4, 12) (38 chunks) two; the delivered entries keep two streams on every bench row,
+    # and a row without summaries (no sequence of three pieces) never forks
+    chunks = tuple(-(-n // 64) for n in (11000, 12000, 9768))
+    for arch in cake_chain.ADJOINT_SPLIT_COSTS:
+        for (seq_lens, num_v_heads), _ in PIECE_ROWS.values():
+            row = tuple(-(-n // 64) for n in seq_lens)
+            rec = cake_chain.adjoint_split_pricing(row, num_v_heads, 148, arch)
+            assert rec["one_stream"] is False, (arch, seq_lens, num_v_heads, rec)
+    costs = {"walk": 2.38, "summary": 2.79, "serial_low": 2.18, "serial_full": 2.42, "stitch": 9.3,
+             "stitch_piece": 3.1, "fixed": 15.0}  # fmt: skip
+    for fork, want in (
+        (65.0, {3: True, 6: True, 12: False}),
+        (0.0, {3: False, 6: False, 12: False}),
+    ):
+        monkeypatch.setattr(
+            cake_chain, "ADJOINT_SPLIT_COSTS", {"sm_100a": {**costs, "fork": fork}}
+        )
+        for num_v_heads, one in want.items():
+            rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 152, "sm_100a")
+            assert rec["segment_len"] > 0 and rec["one_stream"] is one, (
+                fork,
+                num_v_heads,
+                rec,
+            )
+    monkeypatch.setattr(
+        cake_chain, "ADJOINT_SPLIT_COSTS", {"sm_100a": {**costs, "fork": 1e9}}
+    )
+    rec = cake_chain.adjoint_split_pricing(chunks, 48, 152, "sm_100a")
+    assert (
+        _pieces(chunks, rec["segment_len"]) == (2, 2, 2) and rec["one_stream"] is False
+    ), rec
+
+
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_host_plans_take_the_split_or_the_serial_table(arch, monkeypatch) -> None:
     # on an architecture of ADJOINT_SPLIT_ARCHS a host layout's adjoint table is the one-wave split or a serial table,
@@ -4229,6 +4265,42 @@ def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
     ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
     _assert_close_to_reference(runs[True], ref, names)
     _assert_within_budget(runs[True], runs[False], names)
+
+
+@pytest.mark.parametrize("how", ["fork_cost", "streams_1"])
+def test_adjoint_split_one_stream_gives_the_two_stream_bits(
+    how, device, monkeypatch
+) -> None:
+    # wave 1 on the caller's stream, chosen by the pricing's fork cost or by a caller that keeps every launch on its
+    # stream, runs the summaries then the walks there: the same bits as the summaries on the side stream
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7011)
+    main = torch.cuda.current_stream(device).cuda_stream
+    runs, gm_streams = {}, {}
+    for one in (False, True):
+        with monkeypatch.context() as m:
+            arch = _split_device(m, device, split=True)
+            pins = {}
+            if one and how == "fork_cost":
+                m.setitem(cake_chain.ADJOINT_SPLIT_COSTS[arch], "fork", 1e9)
+            if one and how == "streams_1":
+                pins["streams"] = 1
+            launches = _record_streams(m)
+            runs[one] = _run(inputs, seq_lens, **pins)
+            stages = [stage for stage, _ in launches]
+            assert (
+                stages.count("dhu_tc2_dvl32_gm") == 1
+                and stages.count("dhu_tc2_dvl32_modes") == 2
+            ), stages
+            gm_streams[one] = {
+                stream for stage, stream in launches if stage == "dhu_tc2_dvl32_gm"
+            }
+            # wave 1's walks follow its summaries on one stream; on two streams they are launched after them too
+            assert stages.index("dhu_tc2_dvl32_gm") < stages.index(
+                "dhu_tc2_dvl32_modes"
+            ), stages
+    assert gm_streams[True] == {main} and main not in gm_streams[False], gm_streams
+    _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
 
 
 def test_adjoint_split_packed_views_give_the_contiguous_bits(
