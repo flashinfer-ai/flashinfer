@@ -44,7 +44,7 @@ Below, "same call" means the same inputs, device architecture, package version a
 | `dbias` | same as `dweight` | same as `dweight` | FP32 output with `"fp32"`: measured worst 1.49e-7 rel-L2 |
 
 - With `silu_grad_preactivation="bf16"` (the default), SiLU' is evaluated at the BF16-rounded preactivation, the same boundary flash-linear-attention uses. With `"fp32"`, it is evaluated at the unrounded FP32 preactivation and the final reduction runs in FP64. The `"fp32"` program is slower.
-- Single-tile rows run narrower channel tiles. Every backward route runs 32-channel-vector tiles at C 224 and C 520-1016. Every forward route runs 32-vector tiles at C 576-768, except whole 18-vector tiles at C 576 and whole 40-vector tiles at C 640. The backward tile plan sets the `dweight` and `dbias` summation order. The forward tile plan never changes `y` bits. This version changes only forward tile plans, so every output keeps the previous version's bits, and the accuracy bounds are unchanged.
+- Single-tile rows run narrower channel tiles. Every backward route runs 32-channel-vector tiles at C 224 and C 520-1016. Every forward route runs 32-vector tiles at C 576-768, except whole 18-vector tiles at C 576 and whole 40-vector tiles at C 640. The backward tile plan sets the `dweight` and `dbias` summation order. The forward tile plan never changes `y` bits. At those backward widths, `dweight` and `dbias` bits differ from versions before the 32-vector backward tiles. `y` and `dx` keep their bits, and the accuracy bounds are unchanged.
 - Because the backward recomputes the preactivation, a checkpointed (recomputed) forward gives the same `y` bits. The backward from it gives the same gradient bits.
 
 ### Keyword controls

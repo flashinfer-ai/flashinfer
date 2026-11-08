@@ -1453,6 +1453,15 @@ def test_forward_programs_switch_on_channel_count(kind) -> None:
         for T in floored
         for C in (T - 8, T, T + 8)
     ]
+    # The narrow rows at the floor of a floored program whose channels they reach:
+    # that program on the narrow plan (NARROW_SPLIT_TABLE), y bit for bit the
+    # fallback's on the one-tile plan.
+    rows += [
+        (floor, "perf", C)
+        for floored, floor in _token_floors(arch, kind).values()
+        for C in NARROW_SPLIT_TABLE["fwd"]
+        if C >= min(floored)
+    ]
     launched = set()
     for S, docs, C in rows:
         selected = loader.selected_modules(arch, kind, C=C, S=S)

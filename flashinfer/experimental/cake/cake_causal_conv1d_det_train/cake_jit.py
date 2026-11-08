@@ -3841,10 +3841,11 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 # (a reduce program runs on its backward record's plan): each has its own rule.
 SPLIT_ROLES = ("fwd", "bwd")
 # The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
-# token sub-tiles, the last tile partial) instead of one tile of ``cv = C /
-# vec`` vectors, per role, at 128 threads (:func:`_narrow_tile`): the backward
-# at 64 < cv < 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C =
-# 224), the forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
+# token sub-tiles, the last tile partial), or the whole tiles of
+# :data:`NARROW_TILE_WIDTHS`, instead of one tile of ``cv = C / vec`` vectors,
+# per role, at 128 threads (:func:`_narrow_tile`): the backward at 64 < cv <
+# 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C = 224), the
+# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
 # vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
 # the programs are unchanged.  Every route of both roles takes the rule.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
@@ -3854,8 +3855,10 @@ NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
 NARROW_TILE_THREADS = 128
 # The narrow rows that run whole tiles of another width instead of 32
 # vectors, per role: ``cv -> ct_vec`` (a divisor of ``cv``).  The forward
-# runs C = 576 as (18, 7, 4) and C = 640 as (40, 3, 2), measured faster than
-# the 32-vector tiles on every forward route; ``y`` keeps its bits.
+# runs C = 576 as (18, 7, 4) and C = 640 as (40, 3, 2): on B200 and GB300,
+# paired probes against the 32-vector tiles on the fwd / fwd_dt / fwd_bias
+# routes read 1.01-1.20x at C = 576 and 1.02-1.12x at C = 640 for the
+# forward; ``y`` keeps its bits.
 NARROW_TILE_WIDTHS: dict[str, dict[int, int]] = {"fwd": {72: 18, 80: 40}, "bwd": {}}
 
 
