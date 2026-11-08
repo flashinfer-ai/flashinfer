@@ -290,7 +290,7 @@ into zeroed accumulators with unordered global reductions (FP32, or FP64 under
 bitwise reproducible from run to run.  The KCP backward overlaps the halo
 exchange: its main program runs before the exchange is waited, as if no
 fragment had tail rows, with CTAs that claim their tokens at run time (Cluster
-Launch Control), so a kernel resident on another stream slows it in
+Launch Control), so a kernel resident on another stream slows it about in
 proportion to the SMs it holds; a tail-row program then writes ``dx`` of the
 last three rows of each fragment that receives tail rows.  ``dx`` is bitwise
 the deterministic KCP backward's; the rank-local FP32 ``dweight`` partial is

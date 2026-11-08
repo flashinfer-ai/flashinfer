@@ -40,8 +40,8 @@ Contract: the context of the KDA step (``CakeKDADetKcpContext`` from
 ``all_to_all_single`` per direction, with recompute handles for communication-free checkpoint recomputes, #7818),
 the recompute-handle rules and the multi-tensor calls are the deterministic KCP package's.  The backward overlaps
 the halo exchange: its main program runs before the exchange is waited (no cooperative attribute, no grid barrier;
-its CTAs claim their tokens at run time, so a kernel resident on another stream slows it in proportion to the SMs it
-holds) and adds the FP32 ``dweight`` runs into zeroed accumulators with unordered global reductions; a tail-row
+its CTAs claim their tokens at run time, so a kernel resident on another stream slows it about in proportion to the
+SMs it holds) and adds the FP32 ``dweight`` runs into zeroed accumulators with unordered global reductions; a tail-row
 program then writes ``dx`` of the fragments' last rows from the received rows.  ``y`` and ``dx`` are bitwise the
 deterministic KCP entry point's;
 the rank-local FP32 ``dweight`` partial stays within the deterministic error budget but is not bitwise reproducible
