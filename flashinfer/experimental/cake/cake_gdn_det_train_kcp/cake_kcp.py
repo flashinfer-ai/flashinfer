@@ -1392,13 +1392,23 @@ def _public_args(args: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
+# the imported registry module (_registry), read on every call and launch
+_REGISTRY_MODULE: Any = None
+
+
 def _registry() -> Any | None:
-    """The package registry (:mod:`.cake_jit`: records, ``select_record``, ``launch_grid``), ``None`` without it."""
-    try:
-        from . import cake_jit  # noqa: PLC0415 - the registry; optional at import time
-    except ImportError:
-        return None
-    return cake_jit
+    """The package registry (:mod:`.cake_jit`: records, ``select_record``, ``launch_grid``), ``None`` without it.
+
+    Imported once: later reads return the module object without the import machinery (a failed import is retried
+    on the next read)."""
+    global _REGISTRY_MODULE
+    if _REGISTRY_MODULE is None:
+        try:
+            from . import cake_jit  # noqa: PLC0415 - the registry; optional at import time
+        except ImportError:
+            return None
+        _REGISTRY_MODULE = cake_jit
+    return _REGISTRY_MODULE
 
 
 # The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
@@ -4663,10 +4673,13 @@ def _forward(
     replay: bool,
     hand_off: bool = False,
     s_in: torch.Tensor | None = None,
-    fuse_o: bool = False,
-) -> None:
+    fuse_o: bool | Callable[[], bool] = False,
+) -> bool:
     """The forward sequence.  ``fuse_o``: every tape-walk launch runs the output walk ``kcp_fwdh_out`` on its launch
-    list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`).  ``save``: the saved set is
+    list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`); a callable is the decision
+    itself, taken right after #1 is issued (its host work runs under #1's device time; no launch before the first
+    walk reads it) -- or before #1 when a captured call or a held ``h`` / ``v_new`` tape needs it there.  Returns the
+    decision.  ``save``: the saved set is
     kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive tensor; ``M_seg`` at ``P > 1`` with
     ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward
     of a replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
@@ -4679,16 +4692,14 @@ def _forward(
     read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so every published bit is the
     same under either schedule."""
     tb, opts = call.tb, call.opts
-    if fuse_o and (hand_off or replay):
-        raise ValueError(
-            "fuse_o: a hand-off or replay forward writes the tapes its backward reads"
-        )
-    # the walk every tape-walk launch site of this forward runs
-    walk_program = "kcp_fwdh_out" if fuse_o else "kcp_fwdh_tape"
-    if fuse_o and opts.graph == "off":
-        # a caller-held arena may still bind the h / v_new tapes a split forward or a kept backward left
-        # (FWD_TAPES_ARENA_AFTER_FWD): this forward writes neither, so they go before #1
-        call.release_tapes(("h_tape", "v_new"))
+    held = getattr(call.ws, "_tapes", None)
+    if callable(fuse_o) and (
+        opts.graph != "off" or held is None or "h_tape" in held or "v_new" in held
+    ):
+        # decided before #1: a captured call, or a held h / v_new tape this forward may have to drop first
+        fuse_o = bool(fuse_o())
+    if not callable(fuse_o):
+        _forward_fuse_o(call, fuse_o, hand_off=hand_off, replay=replay)
     # before the first launch: the backend record reads it
     call.scratch["hand_off"] = bool(hand_off)
     wait_first = call.schedule == "wait_first"
@@ -4723,6 +4734,11 @@ def _forward(
     )
     call.scratch["prep_form"] = "full" if backward_tapes else "fwd"
     call.local("fwd_prep", backward_tapes=backward_tapes)
+    if callable(fuse_o):
+        fuse_o = bool(fuse_o())
+        _forward_fuse_o(call, fuse_o, hand_off=hand_off, replay=replay)
+    # the walk every tape-walk launch site of this forward runs
+    walk_program = "kcp_fwdh_out" if fuse_o else "kcp_fwdh_tape"
     if call.l2n and call.opts.knob("record_qk") and not call.backward:
         _record_qk(call)
     if call.l2n and not replay and opts.graph == "off":
@@ -4739,7 +4755,7 @@ def _forward(
         _replay_from_states(call, have_m=False, program=walk_program)
         if call.opts.knob("record_states"):
             call.scratch["states"] = {"S_in": gather_states(s_in, tb.s_in_tiles)}
-        return
+        return fuse_o
     _summaries(call)
     # the c1 receive tensor and S_in (the c2 receive buffer) are first written by their collectives: allocated after
     # the summaries' walks (the forward's peak moment), not at the top of the sequence where they would sit unwritten
@@ -4817,6 +4833,23 @@ def _forward(
         }
     # #5 is launched by _fwd_body (never in a replay; not by a recompute whose output is provably dead) once this
     # frame and its views of the pools are gone
+    return fuse_o
+
+
+def _forward_fuse_o(
+    call: CakeGDNDetKcpCall, fuse_o: bool, *, hand_off: bool, replay: bool
+) -> None:
+    """The checks and the arena step of a forward's ``fuse_o`` decision (:func:`_forward`, before #1 or right after
+    it is issued)."""
+    if fuse_o and (hand_off or replay):
+        raise ValueError(
+            "fuse_o: a hand-off or replay forward writes the tapes its backward reads"
+        )
+    if fuse_o and call.opts.graph == "off":
+        # a caller-held arena may still bind the h / v_new tapes a split forward or a kept backward left
+        # (FWD_TAPES_ARENA_AFTER_FWD): this forward writes neither, so they go before #1 (a deferred decision is
+        # taken after #1 only when neither is bound)
+        call.release_tapes(("h_tape", "v_new"))
 
 
 def _record_qk(call: CakeGDNDetKcpCall, regen: bool = False) -> None:
@@ -5686,27 +5719,40 @@ def _fwd_body(
     call.scratch["hand_off_reason"] = hand_off_reason
     if hand_off:
         _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
-    # #5's decision comes before the forward, which folds #5 into its tape walks when it launches (``fuse_o``): the
+    # #5's decision: the forward folds #5 into its tape walks when it launches (``fuse_o``), so _forward takes it
+    # before its first walk -- right after #1 is issued (it reads only host state that #1 does not change).  The
     # frame proof reads the count the Function saves after this forward (memoised per count; this forward packs
     # nothing), asserted against the saved set below
-    n_saved = _saved_count(call, save)
-    launch, reason = True, "always"
-    if (
-        autograd_node
-        and call.opts.recompute_output == "auto"
-        and call.opts.graph == "off"
-    ):
-        if not executable:
-            # autograd creates no node and packs nothing: the holders still waiting are a later op's
-            reason = "not_executable"
-        else:
-            # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = frame_proof(n_saved)
-            launch = not dead
-            if reason in _RECOMPUTE_FRAME_REASONS:
-                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
-    fuse_o = _fuse_o(call, launch=launch, hand_off=hand_off)
-    _forward(call, save=save, replay=False, hand_off=hand_off, s_in=s_in, fuse_o=fuse_o)
+    decision: dict[str, Any] = {}
+
+    def decide() -> bool:
+        n_saved = decision["n_saved"] = _saved_count(call, save)
+        launch, reason = True, "always"
+        if (
+            autograd_node
+            and call.opts.recompute_output == "auto"
+            and call.opts.graph == "off"
+        ):
+            if not executable:
+                # autograd creates no node and packs nothing: the holders still waiting are a later op's
+                reason = "not_executable"
+            else:
+                # the Function saves the five operands and saved.tensors() right after this forward returns
+                dead, reason = frame_proof(n_saved)
+                launch = not dead
+                if reason in _RECOMPUTE_FRAME_REASONS:
+                    RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
+        decision["launch"], decision["reason"] = launch, reason
+        return _fuse_o(call, launch=launch, hand_off=hand_off)
+
+    fuse_o = _forward(
+        call, save=save, replay=False, hand_off=hand_off, s_in=s_in, fuse_o=decide
+    )
+    n_saved, launch, reason = (
+        decision["n_saved"],
+        decision["launch"],
+        decision["reason"],
+    )
     stage_m = None
     if hand_off and call.tb.P > 1 and not call.opts.save_transfer:
         # the transfer walk's M_seg^T plane: the backward's merges read it and no saved M_seg replaces it; the view
@@ -6176,12 +6222,12 @@ class CakeGDNDetKcpFunction(torch.autograd.Function):
         saved = (
             None
             if meta is None
-            else dataclasses.replace(
-                CakeGDNDetKcpSaved.from_tensors(tensors, meta[0], meta[1], ctx),
-                # this node's own set: forgotten tensor by tensor at the last reader
-                release_in_backward=True,
-            )
+            else CakeGDNDetKcpSaved.from_tensors(tensors, meta[0], meta[1], ctx)
         )
+        if saved is not None:
+            # this node's own set (built just above, referenced nowhere else): forgotten tensor by tensor at the
+            # last reader -- set in place rather than through a second construction (frozen dataclass)
+            object.__setattr__(saved, "release_in_backward", True)
         # the set above holds the only Python references to the saved tensors
         del tensors
         if (
@@ -6231,15 +6277,12 @@ PACKED_SPLIT_STATS: dict[str, int] = {
 def _qkv_views(
     qkv: torch.Tensor, H_qk: int, HV: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    lead = tuple(qkv.shape[:-1])
-    a = H_qk * D
-    # narrow along the channel axis: the views of ``qkv[..., :a]`` / ``[a:2a]`` / ``[2a:]`` (same storage offset,
-    # shape and strides) without the indexing parser
-    return (
-        qkv.narrow(-1, 0, a).view(*lead, H_qk, D),
-        qkv.narrow(-1, a, a).view(*lead, H_qk, D),
-        qkv.narrow(-1, 2 * a, HV * D).view(*lead, HV, D),
+    # the channel axis as [heads, 128], split by heads: the views of ``qkv[..., :a]`` / ``[a:2a]`` / ``[2a:]``
+    # (a = H_qk * 128; same storage offset, shape and strides) in two view ops
+    q, k, v = qkv.unflatten(-1, (2 * H_qk + HV, D)).split_with_sizes(
+        (H_qk, H_qk, HV), dim=-2
     )
+    return q, k, v
 
 
 class CakeGDNDetKcpPackedQKVSplitFunction(torch.autograd.Function):
@@ -6394,8 +6437,12 @@ def cake_gdn_det_kcp(
             opts = dataclasses.replace(opts, save_transfer=False)
     # autograd's own executability test for the node (grad mode and an operand requiring grad, flags only): read
     # here because inside Function.forward grad mode is always off
-    executable = torch.is_grad_enabled() and any(
-        t.requires_grad for t in (q, k, v, g, beta)
+    executable = torch.is_grad_enabled() and (
+        q.requires_grad
+        or k.requires_grad
+        or v.requires_grad
+        or g.requires_grad
+        or beta.requires_grad
     )
     return CakeGDNDetKcpFunction.apply(
         q, k, v, g, beta, ctx, scale, workspace, opts, executable, recompute_handle

@@ -7370,7 +7370,7 @@ def test_keyword_options_are_validated_once_per_keyword_set(monkeypatch) -> None
 
 
 def test_packed_qkv_views_are_the_sliced_views() -> None:
-    """The packed split's views (``narrow`` on the channel axis) are the ``[..., :a]`` / ``[a:2a]`` / ``[2a:]``
+    """The packed split's views (the channel axis unflattened to heads and split) are the ``[..., :a]`` / ``[a:2a]`` / ``[2a:]``
     slices' views: the same storage offset, shape and strides, with and without a batch axis."""
     kcp = _package("cake_kcp")
     for lead in ((37,), (1, 37)):
@@ -7389,3 +7389,103 @@ def test_packed_qkv_views_are_the_sliced_views() -> None:
                 y.stride(),
                 y.storage_offset(),
             )
+
+
+# --------------------------------------------------------------------------- the deferred #5 decision, the registry read, the packed views
+# A forward takes its #5 decision (_fuse_o; the frame proof of recompute_output="auto") right after #1 is issued.
+
+DECISION_FORMS = {
+    "light": {},
+    "split": {"test_knobs": {"fused_o": 0}},
+    "l2n": {"use_qk_l2norm_in_kernel": True},
+    "P2": {"segments": 2},
+}
+
+
+@pytest.mark.parametrize("ckpt", (False, True), ids=("direct", "checkpoint"))
+@pytest.mark.parametrize("form", ("light", "split", "l2n", "P2"))
+def test_output_decision_follows_the_first_launch(monkeypatch, form, ckpt) -> None:
+    """A forward takes its #5 decision (``_fuse_o``; under a checkpoint also the frame proof of
+    ``recompute_output="auto"``) right after #1 is issued, on a fresh and on a caller-held workspace, and before #1
+    when the caller-held workspace still binds the ``h`` / ``v_new`` tapes of an earlier split forward: out and the
+    five gradients, the launch logs (sequence, records, ``fwd_o`` / ``fwd_o_reason``) and RECOMPUTE_OUTPUT_STATS are
+    those of the decision taken before #1."""
+    kcp, ctx, ops = _ckpt_setup()
+    knobs = DECISION_FORMS[form]
+    prep = "fwd_prep_l2n" if knobs.get("use_qk_l2norm_in_kernel") else "fwd_prep"
+    seen: list = []
+    real_fuse, real_forward = kcp._fuse_o, kcp._forward
+
+    def fuse(call, *, launch, hand_off):
+        held_hv = bool({"h_tape", "v_new"} & set(call.ws._tapes))
+        seen.append((tuple(call.sequence), held_hv))
+        return real_fuse(call, launch=launch, hand_off=hand_off)
+
+    def early(call, *a, fuse_o=False, **k):
+        if callable(fuse_o):
+            fuse_o = bool(fuse_o())
+        return real_forward(call, *a, fuse_o=fuse_o, **k)
+
+    def arm(deferred: bool, held):
+        ws = None if held is False else kcp.CakeGDNDetKcpWorkspace()
+        if held == "split":
+            # a split forward leaves h / v_new bound in the caller-held workspace
+            kcp.cake_gdn_det_train_kcp_forward(
+                *[ops[n] for n in LEAVES],
+                ctx,
+                backend="fake",
+                workspace=ws,
+                test_knobs={"fused_o": 0},
+            )
+            assert {"h_tape", "v_new"} <= set(ws._tapes)
+        with monkeypatch.context() as m:
+            m.setattr(kcp, "_fuse_o", fuse)
+            if not deferred:
+                m.setattr(kcp, "_forward", early)
+            seen.clear()
+            stats0 = dict(kcp.RECOMPUTE_OUTPUT_STATS)
+            res = _ckpt_autograd(kcp, ctx, ops, ckpt=ckpt, workspace=ws, **knobs)
+            stats = {k: v - stats0[k] for k, v in kcp.RECOMPUTE_OUTPUT_STATS.items()}
+            log = {kind: dict(kcp.LAST_CALL[kind]) for kind in ("fwd", "bwd")}
+            return res, log, stats, list(seen)
+
+    for held in (False, True, "split"):
+        ref, ref_log, ref_stats, ref_seen = arm(False, held)
+        got, got_log, got_stats, got_seen = arm(True, held)
+        _assert_same(got, ref, f"held={held}")
+        assert got_log == ref_log, held
+        assert got_stats == ref_stats, held
+        assert ref_seen and all(s == () for s, _ in ref_seen), (held, ref_seen)
+        assert [hv for _, hv in got_seen] == [hv for _, hv in ref_seen], held
+        # every forward of this setup holds tokens: #1 is its first launch
+        for s, hv in got_seen:
+            assert s == (() if hv else (prep,)), (held, s, hv)
+        if held == "split":  # the first forward found them bound
+            assert got_seen[0][1], got_seen
+        elif held is False:
+            # a fresh workspace per call binds none at a forward's start
+            assert not any(hv for _, hv in got_seen), got_seen
+    assert kcp.kept_registry_size() == 0
+
+
+def test_registry_is_the_imported_cake_jit() -> None:
+    """``_registry()`` returns the module ``import`` returns for the package's ``cake_jit`` (imported once); the
+    facade's backend package is the package module."""
+    kcp = _package("cake_kcp")
+    jit = importlib.import_module(f"{kcp.__package__}.cake_jit")
+    assert kcp._registry() is jit
+    assert kcp._registry() is jit
+    api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
+    pkg = importlib.import_module(kcp.__package__)
+    assert api._pkg() is pkg and api._pkg() is pkg
+
+
+def test_packed_qkv_views_refuse_an_in_place_change() -> None:
+    """The split's views are outputs of one custom autograd node: while the packed row requires grad, autograd
+    refuses an in-place change to any of them (its custom-function view rule)."""
+    kcp = _package("cake_kcp")
+    qkv = torch.randn(37, (2 * 2 + 6) * 128).to(torch.bfloat16).requires_grad_(True)
+    for i in range(3):
+        views = kcp.cake_gdn_det_train_kcp_packed_qkv_views(qkv, H_qk=2, HV=6)
+        with pytest.raises(RuntimeError):
+            views[i].mul_(2)

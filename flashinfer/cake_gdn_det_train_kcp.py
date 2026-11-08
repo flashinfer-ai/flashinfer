@@ -100,10 +100,16 @@ from .api_logging import flashinfer_api
 DEFAULT_SCALE = 128**-0.5
 
 
-def _pkg():
-    from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
+_PACKAGE: Any = None  # the backend package once imported (every facade call reads it)
 
-    return cake_gdn_det_train_kcp
+
+def _pkg():
+    global _PACKAGE
+    if _PACKAGE is None:
+        from .experimental.cake import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
+
+        _PACKAGE = cake_gdn_det_train_kcp
+    return _PACKAGE
 
 
 class _PackageKeywordsSignature(inspect.Signature):
