@@ -137,8 +137,10 @@ Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d
 the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per direction
 instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied out into
 each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with the
-single call's arguments (in the overlapped backward the first tensor's main programs run before the wait and its
-tail-row program after it), so outputs and gradients (``dweight`` included) are bitwise one single call per tensor.
+single call's arguments.  In the overlapped backward only the first tensor takes the overlapped form (its main
+programs before the wait, its tail-row program after it); the other tensors run the waiting form's main programs
+after the wait, whose ``dx`` and ``dweight`` are bitwise the overlapped form's.  So outputs and gradients
+(``dweight`` included) are bitwise one single call per tensor.
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
 uses the trimmed host path's per-context cache (the ``host_trim`` test knob selects the single call's path only).
 """
@@ -1563,25 +1565,35 @@ def _bwd_main(
 # The overlapped backward's all ``-1`` ``tail_row_off`` rows of the trimmed host path, per device index: grow-only
 # buffers, none ever freed.  A captured graph keeps the pointer of the rows it read, and the host cache may drop the
 # entry that named them (:func:`cake_causal_conv1d_det_train_kcp_host_cache_clear`, ``HOST_CACHE_MAX``); unlike the
-# context's tables, nothing else holds them.
+# context's tables, nothing else holds them.  Every context and stream of the device reads them (the host cache is not
+# per stream either), so a new buffer is filled on the device's private ``_NO_TAIL_STREAMS`` stream and the host
+# waits for that fill before any call names the buffer: no program on any stream reads it unfilled.
 _NO_TAIL: dict[int, list[torch.Tensor]] = {}
+_NO_TAIL_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _no_tail(e: dict[str, Any], device: torch.device) -> torch.Tensor:
     """The overlapped backward's ``tail_row_off`` of the host-cache entry: int32 ``[n_frag, 3]``, every entry ``-1``:
     the first ``n_frag`` rows of the device's largest ``_NO_TAIL`` buffer (a new one, at least twice the last, when
-    that is too small), named by the entry at its first overlapped call, then reused.  During a graph capture that
-    finds no buffer large enough (the eager first call of a graph key made one) the call's own table, as in the
-    untrimmed path."""
+    that is too small, filled before this returns), named by the entry at its first overlapped call, then reused.
+    During a graph capture that finds no buffer large enough (the eager first call of a graph key made one) the call's
+    own table, filled on the capturing stream as in the untrimmed path."""
     table = e.get("no_tail")
     if table is None:
         n = e["n_frag"]
-        bufs = _NO_TAIL.setdefault(e["device_index"], [])
+        idx = e["device_index"]
+        bufs = _NO_TAIL.setdefault(idx, [])
         if not bufs or bufs[-1].shape[0] < n:
             if torch.cuda.is_current_stream_capturing():
                 return torch.full((n, HALO), -1, dtype=torch.int32, device=device)
             rows = max(n, 2 * bufs[-1].shape[0] if bufs else 64)
-            bufs.append(torch.full((rows, HALO), -1, dtype=torch.int32, device=device))
+            side = _NO_TAIL_STREAMS.get(idx)
+            if side is None:
+                side = _NO_TAIL_STREAMS[idx] = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(side):
+                buf = torch.full((rows, HALO), -1, dtype=torch.int32, device=device)
+            side.synchronize()
+            bufs.append(buf)
         table = e["no_tail"] = bufs[-1][:n]
     return table
 

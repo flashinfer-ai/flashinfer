@@ -163,7 +163,9 @@ One `all_to_all_single` per direction and call:
 
 The multi entry exchanges the rows of its `n` tensors side by side in one
 collective per direction and copies each tensor's rows into its own pool after
-the wait; each tensor then runs the single call's programs, so its outputs and
+the wait; each tensor then runs the single call's programs (in the overlapped
+backward only the first tensor takes the overlapped form; the others run the
+waiting form, whose `dx` and `dweight` are bitwise the same), so its outputs and
 gradients are bitwise those of one single call per tensor with the same
 `cooperative`.  With one rank no collective is issued.
 

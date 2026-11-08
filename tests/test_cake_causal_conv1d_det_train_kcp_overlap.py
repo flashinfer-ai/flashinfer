@@ -26,7 +26,9 @@ single-GPU suites, on both host paths:
   program, the first tensor's split and reduce programs, wait, its tail-row program, then the other tensors' split
   and reduce programs;
 - ``dx`` and ``dweight`` of each of ``REPEATS`` overlapped calls are bitwise those of the waiting split launch, and
-  ``dx`` is bitwise the cooperative launch's.
+  ``dx`` is bitwise the cooperative launch's;
+- the trimmed host path's shared all ``-1`` ``tail_row_off`` rows outlive the host cache, and a new buffer of them is
+  filled before any stream can read it.
 """
 
 from __future__ import annotations
@@ -267,3 +269,31 @@ def test_overlapped_no_tail_rows_outlive_the_host_cache(monkeypatch) -> None:
         monkeypatch.undo()
         conv_kcp._set_test_knobs(None)
         conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+
+
+def test_overlapped_no_tail_rows_are_filled_before_any_stream_reads_them(
+    monkeypatch,
+) -> None:
+    """Every context and stream of a device shares the ``_NO_TAIL`` rows, so a new buffer is ``-1`` when
+    ``_no_tail`` returns even while the calling stream is still busy: a call on another stream never reads it
+    unfilled.  The calling stream sleeps far past the read on the other stream."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(conv_kcp, "_NO_TAIL", {})
+    busy, other = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    tables = []
+    try:
+        for n in (5, 64, 65):  # the first buffer, a fitting entry, a grown buffer
+            entry = {"n_frag": n, "device_index": device.index}
+            with torch.cuda.stream(busy):
+                torch.cuda._sleep(1 << 30)
+                table = conv_kcp._no_tail(entry, device)
+            with torch.cuda.stream(other):
+                filled = bool((table == -1).all())
+            assert filled, n
+            assert table.shape == (n, conv_kcp.HALO) and entry["no_tail"] is table, n
+            tables.append(table)
+        assert tables[1].data_ptr() == tables[0].data_ptr()
+        assert len(conv_kcp._NO_TAIL[device.index]) == 2
+    finally:
+        torch.cuda.synchronize(device)
+        monkeypatch.undo()
