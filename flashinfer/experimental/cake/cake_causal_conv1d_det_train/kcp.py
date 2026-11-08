@@ -107,7 +107,9 @@ tail row again: it recomputes their ``dpre`` from ``x``, the history rows and ``
 instructions and folds the received rows with the main program's FMAs in its order, before the one BF16 rounding.  So
 ``dx`` is bitwise the waiting launch's, and ``dweight`` keeps its bits: the received rows enter ``dx`` only, and the
 partial rows and their reduction are the same.  The exchange, its wait and the collectives are unchanged; the call
-launches one more program when the rank receives tail rows.  ``cooperative=True`` waits before its launch as before
+launches one more program when the rank receives tail rows.  The multi entry overlaps its first tensor this way and
+launches the other tensors' programs after the wait, so it too adds one program, not one per tensor.
+``cooperative=True`` waits before its launch as before
 (a cooperative grid waits for the communication kernel anyway).  The private test knob ``bwd_overlap`` (``1``
 shipped, ``0`` = wait before the main program) selects the previous order for the A/B record.
 
@@ -1954,9 +1956,10 @@ def cake_causal_conv1d_det_train_kcp_multi_backward(
 
     The head programs of every tensor run first, their send rows travel packed in one exchange, and after the wait
     each tensor's received rows are copied out and folded by that tensor's main backward programs (own partial
-    workspace, fixed order); in the overlapped backward (``cooperative=False`` at more than one rank) every tensor's
-    main programs run while the exchange is in flight and each tensor's tail-row program folds its copied-out rows
-    after the wait.  ``hists`` are the forward's pools.  Every rank calls this function once per layer, in
+    workspace, fixed order); in the overlapped backward (``cooperative=False`` at more than one rank) the first
+    tensor's main programs run while the exchange is in flight and its tail-row program folds its copied-out rows
+    after the wait, before the other tensors' main programs (one tail-row program per call, as in the single
+    entry).  ``hists`` are the forward's pools.  Every rank calls this function once per layer, in
     the same order.  ``graph`` and ``cooperative`` (one launch form for every tensor) as in
     :func:`cake_causal_conv1d_det_train_kcp_backward`.
     """
@@ -2058,33 +2061,32 @@ def _kcp_backward_multi(
         return dx_out, dw_out
     overlap = _overlapped(cooperative, work)
     if overlap:
-        # every tensor's main programs while the exchange is in flight (the head pool: a valid, unread dpre_tail)
-        for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), head in zip(
-            calls, heads, strict=True
-        ):
-            _bwd_main(
-                e,
-                x_flat,
-                w,
-                dy_flat,
-                hist_t,
-                dx,
-                dw,
-                head,
-                None,
-                S=S,
-                C=C,
-                device=device,
-                deferred=True,
-            )
+        # the first tensor's main programs while the exchange is in flight (its head pool: a valid, unread
+        # dpre_tail); the others wait, so that the call adds one tail-row program, not one per tensor
+        S, C, x_flat, w, dy_flat, hist_t, dx, dw, e = calls[0]
+        _bwd_main(
+            e,
+            x_flat,
+            w,
+            dy_flat,
+            hist_t,
+            dx,
+            dw,
+            heads[0],
+            None,
+            S=S,
+            C=C,
+            device=device,
+            deferred=True,
+        )
     if work is not None:
         work.wait()
     if recv is not None:
         tails = _unpack(recv, [c[1] for c in calls]) if len(calls) > 1 else [recv]
-    for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail in zip(
-        calls, tails, strict=True
+    for i, ((S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail) in enumerate(
+        zip(calls, tails, strict=True)
     ):
-        if overlap:
+        if overlap and i == 0:
             _bwd_tail(
                 e, x_flat, w, dy_flat, hist_t, dx, tail, S=S, C=C, device=device
             )

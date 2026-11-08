@@ -142,7 +142,9 @@ fragment with a tail row again, recomputing their `dpre` with the main
 program's instructions and folding the received rows with its FMAs in its
 order.  `dx` and `dweight` keep the bits of the waiting launch; the exchange
 and its wait are unchanged, and one more program runs when the rank receives
-tail rows.  `cooperative=True` waits before its launch.
+tail rows.  The multi entry overlaps only its first tensor this way and runs
+the other tensors' programs after the wait, so it also adds one program per
+call.  `cooperative=True` waits before its launch.
 
 ### Halo exchange
 

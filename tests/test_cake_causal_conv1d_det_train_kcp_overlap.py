@@ -22,7 +22,9 @@ single-GPU suites, on both host paths:
 
 - the order of the launches and the wait: head program (when the rank has head rows), split program, reduce program,
   wait, tail-row program (when the rank receives tail rows); with the ``bwd_overlap`` knob ``0`` the wait comes first
-  and no tail-row program runs; ``cooperative=True`` waits first as before;
+  and no tail-row program runs; ``cooperative=True`` waits first as before; the multi entry: every tensor's head
+  program, the first tensor's split and reduce programs, wait, its tail-row program, then the other tensors' split
+  and reduce programs;
 - ``dx`` and ``dweight`` of each of ``REPEATS`` overlapped calls are bitwise those of the waiting split launch, and
   ``dx`` is bitwise the cooperative launch's.
 """
@@ -134,8 +136,9 @@ def _want(ctx, *, overlap: bool, cooperative: bool, n: int = 1) -> list[str]:
     main = ["kcp_bwd"] if cooperative else ["kcp_bwd_split", "reduce"]
     if not overlap:
         return head + ["wait"] + main * n
-    tail = ["kcp_bwd_halo"] * n if int(ctx.halo.n_tail_rows) else []
-    return head + main * n + ["wait"] + tail
+    # the multi entry overlaps its first tensor only: one tail-row program per call
+    tail = ["kcp_bwd_halo"] if int(ctx.halo.n_tail_rows) else []
+    return head + main + ["wait"] + tail + main * (n - 1)
 
 
 @pytest.mark.parametrize(
