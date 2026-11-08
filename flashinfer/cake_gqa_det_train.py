@@ -28,7 +28,8 @@ The mode is part of the name: no entry takes a ``deterministic`` keyword
 (passing one is a ``TypeError``).  Every sum of the forward and the backward
 has one fixed order: ``out``, ``lse``, dQ and every dK / dV form (BF16, FP32
 window, FP32 row-map adds with repeated destination rows) repeat bit for bit
-run to run, for one shape, one ``max_seqlen_k`` and one workspace budget.
+run to run, for one shape, one ``max_seqlen_k``, one workspace budget and the
+same host boundaries (given or not).
 The backward's main kernel sums dK and dV of each key block in tensor
 memory and stores dS^T into a workspace; dQ is a GEMM over that workspace.
 The backward runs in chunks that fit the workspace's ``budget_bytes`` (default
@@ -69,6 +70,7 @@ Usage::
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
@@ -137,6 +139,8 @@ def cake_gqa_det(
     max_seqlen_k: Optional[int] = None,
     workspace: Optional[Any] = None,
     return_lse: bool = False,
+    cu_seqlens_q_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
+    cu_seqlens_k_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     r"""Packed-varlen causal GQA attention, head dimension 256, with autograd (``CakeGQADetFunction``).
 
@@ -167,6 +171,14 @@ def cake_gqa_det(
         default workspace.
     return_lse : bool
         Also return the FP32 natural-log LSE ``[H_q, T_q]`` (no gradient flows through it).
+    cu_seqlens_q_host, cu_seqlens_k_host : sequence of int or torch.Tensor, optional
+        Host copies of ``cu_seqlens_q`` / ``cu_seqlens_k`` (lists or 1-D CPU tensors; both or neither; never copied
+        to the device).  With them the backward plans its dS^T workspace chunks from each key block's exact tile
+        count: fewer, fuller chunks on long layouts and a workspace of the exact size; without them it bounds the
+        counts from ``T_q`` and ``B``.  The kernels read the device boundaries: host boundaries that disagree only
+        move the chunks (and the dQ rounding) while every device key segment fits the host plan's key blocks and
+        every chunk holds its device tiles; otherwise a device-side assert fires before the main kernel runs
+        (reported at the next synchronization; the CUDA context is unusable after it).  The dQ bits depend on them.
 
     Returns
     -------
@@ -175,7 +187,8 @@ def cake_gqa_det(
     Notes
     -----
     The forward and the backward are fixed-order: ``out``, ``lse`` and every gradient repeat bit for bit run to run
-    (one shape, one ``max_seqlen_k``, one workspace budget); neither raises PyTorch's determinism alert.
+    (one shape, one ``max_seqlen_k``, one workspace budget, the same host boundaries); neither raises PyTorch's
+    determinism alert.
     """
     return _pkg().cake_gqa_det(
         q,
@@ -189,6 +202,8 @@ def cake_gqa_det(
         max_seqlen_k=max_seqlen_k,
         workspace=workspace,
         return_lse=return_lse,
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
     )
 
 
@@ -264,6 +279,8 @@ def cake_gqa_det_train_backward(
     row_map: Optional[torch.Tensor] = None,
     max_seqlen_k: Optional[int] = None,
     workspace: Optional[Any] = None,
+    cu_seqlens_q_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
+    cu_seqlens_k_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     r"""Backward without autograd: ``(dq, dk, dv)`` from the forward's ``out`` and ``lse``.
 
@@ -298,6 +315,8 @@ def cake_gqa_det_train_backward(
         As in :func:`cake_gqa_det`.
     workspace : optional
         As in :func:`cake_gqa_det`.
+    cu_seqlens_q_host, cu_seqlens_k_host : sequence of int or torch.Tensor, optional
+        As in :func:`cake_gqa_det`.
 
     Returns
     -------
@@ -305,10 +324,11 @@ def cake_gqa_det_train_backward(
 
     Notes
     -----
-    Bitwise reproducible run to run for one shape, one ``max_seqlen_k`` and one workspace ``budget_bytes``: dK and dV
-    of a key block are summed in tensor memory in one order, dS^T goes to the workspace and dQ is a GEMM over it with
-    each output tile summed in one order, and the row-map destinations are folded in ascending window order.  A call whose dS^T exceeds the budget runs in chunks (KV heads
-    first, then key-block ranges); the budget moves the dQ rounding, not its accuracy.  Raises no PyTorch
+    Bitwise reproducible run to run for one shape, one ``max_seqlen_k``, one workspace ``budget_bytes`` and the same
+    host boundaries (given or not): dK and dV of a key block are summed in tensor memory in one order, dS^T goes to
+    the workspace and dQ is a GEMM over it with each output tile summed in one order, and the row-map destinations
+    are folded in ascending window order.  A call whose dS^T exceeds the budget runs in chunks (KV heads first, then
+    key-block ranges); the budget and the host boundaries move the dQ rounding, not its accuracy.  Raises no PyTorch
     determinism alert.
     """
     return _pkg().cake_gqa_det_train_backward(
@@ -330,6 +350,8 @@ def cake_gqa_det_train_backward(
         row_map=row_map,
         max_seqlen_k=max_seqlen_k,
         workspace=workspace,
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
     )
 
 
@@ -374,6 +396,8 @@ def cake_gqa_det_train_workspace_bytes(
     max_seqlen_k: Optional[int] = None,
     row_map: bool = False,
     budget_bytes: Optional[int] = None,
+    cu_seqlens_q_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
+    cu_seqlens_k_host: Optional[Union[Sequence[int], torch.Tensor]] = None,
 ) -> int:
     r"""Bytes of backward workspace one call needs.
 
@@ -395,6 +419,8 @@ def cake_gqa_det_train_workspace_bytes(
         ``num_heads_kv``, else ``ValueError``).
     budget_bytes : int, optional
         As in :func:`cake_gqa_det_train_workspace`.
+    cu_seqlens_q_host, cu_seqlens_k_host : sequence of int or torch.Tensor, optional
+        As in :func:`cake_gqa_det`: the exact dS^T chunk of the backward call that gets them.
 
     Returns
     -------
@@ -406,6 +432,8 @@ def cake_gqa_det_train_workspace_bytes(
         "num_heads_kv": num_heads_kv,
         "max_seqlen_k": max_seqlen_k,
         "row_map": row_map,
+        "cu_seqlens_q_host": cu_seqlens_q_host,
+        "cu_seqlens_k_host": cu_seqlens_k_host,
     }
     if budget_bytes is not None:
         kwargs["budget_bytes"] = budget_bytes

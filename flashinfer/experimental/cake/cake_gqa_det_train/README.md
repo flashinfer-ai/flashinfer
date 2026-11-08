@@ -72,10 +72,11 @@ with atomics.  Run to run, for one input:
 | row-map adds into `dk_acc` / `dv_acc` | repeats bit for bit: destination row `r` becomes `((dst + w_j1) + w_j2) + ...` over its window rows `j1 < j2 < ...` |
 
 The bits depend only on the shapes (`T_q`, `T_k`, `H_q`, `H_kv`, the segment
-lengths), `max_seqlen_k` and the workspace budget: not on the stream, the
-workspace's earlier calls or kernels running beside it.  A different budget
-can move the last bits of `dq` (not its accuracy); `out`, `lse`, dK and dV do
-not depend on it.  Under `torch.use_deterministic_algorithms(True)`, strict or
+lengths), `max_seqlen_k`, the workspace budget and, for `dq`, the host
+boundaries (given or not): not on the stream, the workspace's earlier calls or
+kernels running beside it.  A different budget or other host boundaries can
+move the last bits of `dq` (not its accuracy); `out`, `lse`, dK and dV depend
+on neither.  Under `torch.use_deterministic_algorithms(True)`, strict or
 with `warn_only=True`, nothing alerts or warns and the bits do not change.
 This is the `det` package of the family; its names carry the mode word and no
 entry takes a `deterministic=` keyword.
@@ -94,7 +95,12 @@ entry takes a `deterministic=` keyword.
 
 Numerics: FP32 accumulation for the scores, `dP`, dK, dV, dQ and the row
 sums; P and dS are rounded to BF16 only as MMA operands.  Every launch is a
-plain stream-ordered launch: nothing cooperative, no PDL.
+plain stream-ordered launch: nothing cooperative, no PDL.  The backward builds
+the tile tables (`bwd_plan`) and the row-map fold order (a stable sort of the
+row map) on a high-priority side stream of the device, forked from the
+current stream and joined back by CUDA events before their first read, so
+they overlap `bwd_pre` and the main kernels; they hold the same integers as
+on the current stream.
 
 ## Workspace budget and memory
 
@@ -108,11 +114,33 @@ else one KV head and the widest even key-block range that fits; at least one
 KV head and two key blocks, even past the budget.  Each extra key-block chunk
 re-reads and rewrites the FP32 dQ accumulator once.
 
+A caller that holds the boundaries on the host can pass them as
+`cu_seqlens_q_host` / `cu_seqlens_k_host` (lists or 1-D CPU tensors, both or
+neither; to `cake_gqa_det`, the backward and
+`cake_gqa_det_train_workspace_bytes`).  The plan then counts each key
+block's exact tiles (the numbering `bwd_plan` computes) instead of the bound
+above, takes the key blocks from the longest key segment, and cuts them into
+the widest even ranges that fit the budget; every range uses one stride, the
+tile count of the fullest range.  The long layouts run in fewer chunks
+(main-kernel and dQ launches with 24 query and 4 KV heads at the default
+budget: 12 to 8 on a CP8 zigzag rank of 300k tokens with 16 segments, 16 to 8
+on issue row 3, 8 to 2 on issue row 1) and with a dS^T workspace of the exact
+size.  The kernels still read the device boundaries.  Before the main kernel a
+device-side assert checks that every device segment's keys lie within the key
+blocks and that every range holds at most its stride of tiles in the device
+numbering.  Host boundaries within both bounds give the device boundaries'
+gradients (only the chunks, and with them the dQ rounding, may differ); past
+them the assert fires instead of leaving key blocks out or writing past a
+chunk.  PyTorch reports a device-side assert at the next synchronization, and
+the process's CUDA context is unusable after it.  The dQ bits depend on
+whether the host boundaries are given (and on their values).
+
 Beside the dS^T chunk, the backward scratch is FP32 `[H_q / 2, rows_pad, 256]`
 plus two `[H_q / 2, rows_pad]` with `rows_pad = round_up(2 T_q + 128 B, 128)`,
 and the row-map form adds two FP32 window gradients `[T_k, H_kv, 256]`.
 `cake_gqa_det_train_workspace_bytes(T_q, H_q, B, total_k=, num_heads_kv=,
-max_seqlen_k=, row_map=, budget_bytes=)` returns the total.  A workspace keeps
+max_seqlen_k=, row_map=, budget_bytes=, cu_seqlens_q_host=,
+cu_seqlens_k_host=)` returns the total (exact with the host boundaries).  A workspace keeps
 only the scratch, at the largest size seen (`.nbytes`, `.release()`); the dS^T
 chunk and the window gradients come from PyTorch's caching allocator for each
 backward call and are freed when it returns; they are never filled under
@@ -125,7 +153,8 @@ forward uses a new one with the same `budget_bytes`, and the same bits.
 ## Checkpointing
 
 Autograd saves `(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)` through
-`ctx.save_for_backward` only; `ctx` holds scalars, the `dkv_acc` callable and
+`ctx.save_for_backward` only; `ctx` holds scalars, the host boundaries as
+lists, the `dkv_acc` callable and
 a weak reference to the workspace.  Under
 `torch.utils.checkpoint(..., use_reentrant=False)` a forward retains nothing,
 and the replay gives the gradients of the run without checkpointing bit for
