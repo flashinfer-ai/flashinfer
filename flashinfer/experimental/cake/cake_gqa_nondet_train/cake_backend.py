@@ -745,9 +745,11 @@ def cake_gqa_nondet_train_backward(
     }
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         # The tile tables and the fold order read cu_seqlens and row_map only.  Their buffers come from the current
-        # stream; a side stream fills them while the current stream runs bwd_pre (and, for the fold order, the main
-        # kernels), and the current stream waits for it before their first read: the same kernels write the same
-        # integers, off the critical path.
+        # stream; a side stream fills them while the current stream runs bwd_pre and the main kernels, and the current
+        # stream waits for it before their first read: the same kernels write the same integers, off the critical path.
+        # The host queues the work in the order the current stream needs it (its time before the first main kernel is
+        # on the critical path): the plan kernel, bwd_pre, the host-boundary range check (queued while bwd_pre runs),
+        # the main kernels, and last the fold order, which only bwd_fold reads.
         stream = torch.cuda.current_stream(device_index)
         tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
         fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
@@ -756,24 +758,19 @@ def cake_gqa_nondet_train_backward(
             if tables is not None or fold is not None:
                 side = _side_stream(device_index, stream.stream_id)
                 side.wait_stream(stream)
+            if tables is not None:
                 with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
-                    if tables is not None:
-                        _launch_plan(
-                            cu_seqlens_q,
-                            cu_seqlens_k,
-                            plan["key_blocks"],
-                            total_q,
-                            tables,
-                            dims,
-                            device_index,
-                        )
-                        if seqlens is not None:
-                            _check_ranges(
-                                tables[0], cu_seqlens_k, plan, segments, total_q
-                            )
+                    _launch_plan(
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        plan["key_blocks"],
+                        total_q,
+                        tables,
+                        dims,
+                        device_index,
+                    )
+                    if seqlens is None:
                         planned = side.record_event()
-                    if fold is not None:
-                        _fold_index(row_map, *fold)
             _launch(
                 "bwd_pre",
                 {
@@ -788,6 +785,10 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
+            if tables is not None and seqlens is not None:
+                with torch.cuda.stream(side):
+                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
+                    planned = side.record_event()
             if tables is None:
                 tables = _tile_plan(
                     cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
@@ -843,6 +844,9 @@ def cake_gqa_nondet_train_backward(
                     }
                     _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
                     _launch("bwd_dq", at, dims, device_index, **chunk)
+            if fold is not None:
+                with torch.cuda.stream(side):
+                    _fold_index(row_map, *fold)
         finally:
             # Joined on every path (an exception included): the side stream reads and writes buffers of this call.
             if side is not None:
@@ -935,8 +939,11 @@ def _check_ranges(
     exact past 2^31 tiles: a range past ``tile_stride`` fails the check instead of wrapping into it."""
     ranges = plan["ranges"]
     marks = _range_marks(tile_base, segments, total_q, plan["key_blocks"])
-    edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
-    fits = torch.diff(edges).max() <= plan["tile_stride"]
+    if len(ranges) == 1:  # one range: one subtraction (fewer PyTorch ops to queue)
+        fits = marks[ranges[0][1]] - marks[ranges[0][0]] <= plan["tile_stride"]
+    else:
+        edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
+        fits = torch.diff(edges).max() <= plan["tile_stride"]
     keys = torch.diff(cu_seqlens_k).max() <= cake_jit.BWD_TILE_KEYS * plan["key_blocks"]
     torch._assert_async(
         fits & keys,
