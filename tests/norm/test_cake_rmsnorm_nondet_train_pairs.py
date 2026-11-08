@@ -172,6 +172,19 @@ def test_backward_records_are_chunk_claiming_kernels_or_their_reduce() -> None:
                 assert record["launch"]["use_pdl"] is True
                 assert record["logical"]["partial"] == "partial"
                 continue
+            if record["grid_rule"]["kind"] == "fixed":
+                # the one-cluster kernel of a route's smallest token counts: one
+                # launch of a fixed grid (one thread-block cluster), no claim
+                # ticket, no completion count and no FP64 sums
+                assert record["role"].startswith("bwd_tiny"), (arch, route, name)
+                assert record["workspace_rule"] == {
+                    "counters": 0,
+                    "kind": "claim_sum_f64",
+                    "sum_bytes": 0,
+                }
+                assert record["grid_rule"]["ctas"] in (1, 2, 4, 8), (arch, name)
+                assert record["launch"]["cooperative"] is False
+                continue
             assert record["workspace_rule"]["kind"] in loader.WORKSPACE_KINDS
             single = record["workspace_rule"]["kind"] == "claim_sum_f64"
             # the claim ticket, then the completion counts (none for a single
@@ -235,7 +248,12 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
     for w_dtype in loader.weight_dtypes(arch, hidden, "bwd", residual):
         for name in loader.route_modules(arch, hidden, "bwd", residual, w_dtype):
             record = loader.MODULES[name]
-            if record["workspace_rule"] is None:
+            # the one-cluster kernel (a fixed grid) has no chunk table, claim
+            # ticket or sums; its record is checked above
+            if (
+                record["workspace_rule"] is None
+                or record["grid_rule"]["kind"] == "fixed"
+            ):
                 continue
             rule = record["grid_rule"]
             single = record["workspace_rule"]["kind"] == "claim_sum_f64"
@@ -401,6 +419,9 @@ def _pair_led_route() -> tuple[str, int, int]:
                     if loader.MODULES[name]["workspace_rule"] is not None
                     and loader.MODULES[name]["workspace_rule"]["kind"]
                     == "claim_sum_f64"
+                    # the one-cluster records (a fixed grid) are not counted:
+                    # the layout check skips them
+                    and loader.MODULES[name]["grid_rule"]["kind"] != "fixed"
                     and _window(loader.MODULES[name])[1] is not None
                     and _window(loader.MODULES[name])[1] <= 256
                 )
