@@ -46,10 +46,10 @@ packed rows (``x`` and ``z`` hold row ``n`` at element ``128 n``) by
 ``FORWARD_BANDS``, of other layouts by ``STRIDED_FORWARD_BANDS``, bands of
 rows per SM (the tiny forward, which reads packed rows only, the short
 forward, the forward and the mid, long and extra-long forwards, each where
-the architecture's bands name it); the backward by its
-small-row roles (``BAND_ROLES``) in the rows of their ``BACKWARD_BANDS``
-bands, past them its mid role (the claimed backward) where the rows have
-more chunks than ``more_chunks_than_per_sm`` per SM, else the call role.
+the architecture's bands name it); the backward by ``BACKWARD_BANDS``,
+bands of rows: its small-row roles (``BAND_ROLES``), its call role (the
+static backward), its long role (the second static backward) and its mid
+role (the claimed backward).
 The forward's programs: the tiny forward (16 threads to a row, one 8-row
 block per 128-thread CTA, the gate before the sum of squares, packed rows
 only; the short forward's arithmetic and bits), the short forward (16
@@ -66,14 +66,21 @@ forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the ot
 between the programs, and so between the bands of one architecture, while
 each program gives the same bits for the same inputs on the same device.
 
-The backward's call role is the static backward (CTA ``b`` runs the chunks
-``b``, ``b + grid``, ... and claims nothing); its mid role is the claimed
-backward (the CTAs claim runs of chunks from the
-workspace's claim counter at run time, so a CTA slowed beside another kernel
-takes fewer), which runs where the rows have more chunks than the static
-backward's grid has CTAs.  The small-row backward (whose BF16 band a call
-with ``compute_grad_weight=False`` also takes) is one thread-block cluster of
-16 CTAs with the backward's row arithmetic (``dx`` and ``dz`` the same bits)
+The backward's call role and its long role are static backwards (CTA ``b``
+runs the chunks ``b``, ``b + grid``, ... and claims nothing); its mid role is
+the claimed backward (the CTAs claim runs of chunks from the workspace's
+claim counter at run time, so a CTA slowed beside another kernel takes
+fewer).  Each is a build per architecture.  On sm_100a and sm_103a: the
+static backward with no prefetch; the second static backward and the claimed
+backward warm the CTA's next block in L2, thread 0 with one bulk prefetch
+per tensor where ``dy``, ``x`` and ``z`` hold packed rows (head stride 128
+and token stride ``H * 128``; other layouts: a prefetch per thread).  On
+sm_107a: the static backwards add their windows to 4 (the call role) or 2
+(the long role) copies with an occupancy word per copy (``sparse``), and
+the claimed backward warms the block two ahead.  The small-row backward
+(whose BF16 band a call with ``compute_grad_weight=False`` also takes) is
+one thread-block cluster of 16 CTAs with the backward's row arithmetic
+(``dx`` and ``dz`` the same bits)
 that sums the weight gradient on chip in a fixed order and rounds once, with
 no workspace: the exact tiny backward (``<role>_t512``: 4 teams of the
 deterministic backward's 128-thread CTA a CTA, up to 512 rows, its weight
@@ -93,20 +100,23 @@ chunks (:func:`backward_chunks`): ``blocks_per_chunk = max(1, ceil(blocks /
 chunk_limit))`` consecutive blocks a chunk, ``C = ceil(blocks /
 blocks_per_chunk)`` chunks, and launch :func:`backward_ctas` ``G = min(C,
 ctas_per_sm * SMs)`` CTAs; the host passes ``blocks_per_chunk`` to the
-kernel.  Either backward is correct, with the same bits, at any grid; the cut
-between them is a matter of speed.  No module is cooperative.  A kernel
+kernel.  Every backward is correct, with the same bits, at any grid; the
+cuts between them are a matter of speed.  No module is cooperative.  A kernel
 resident on another stream delays a call roughly in proportion to the SM
 slots it holds, and one that holds resources a kernel needs on every SM can
 still delay its start; a persistent forward CTA or a static backward CTA
 whose slot such a kernel holds runs all of its blocks once it starts.
 
-The workspace of the static and the claimed backward is three buffers
+The workspace of the static and the claimed backwards is three buffers
 (:func:`workspace_layout`, :func:`workspace_bytes`): ``dw_win``, the 64-bit
 integer windows of the exact sum (``slots`` copies of 7 windows of 128
-columns), ``dw_spec``, 128 FP32 class words for infinite and NaN partials,
+columns, 3, 4 or 5 slots; with ``sparse`` the last copy holds the occupancy
+words), ``dw_spec``, 128 FP32 class words for infinite and NaN partials,
 and ``dw_done``, two 32-bit words (the arrival ticket and the claim counter).
 All of it is zero when a launch starts and zero again when it ends, so a
-zero-filled workspace stays reusable for any later call on its stream.  Every
+zero-filled workspace stays reusable for any later call on its stream, and
+one of the largest module's size serves every backward module of an
+architecture.  Every
 launch of those backwards takes the ticket, also one that computes no weight
 gradient, so each needs the workspace; the small-row backwards take none
 (:func:`workspace_bytes` is 0).
@@ -468,18 +478,17 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd_tiny",
     },
-    # The static backward into a BF16 weight gradient: 128 threads, 16 lanes
-    # per row (8-row blocks), the deterministic backward's chunks, CTA b
-    # running the chunks b, b + grid, ... with no claim, the chunk partials
-    # summed exactly in integer windows (build {"chunks_per_step": 0,
-    # "min_blocks": 8, "out": "bf16", "prefetch_ahead": 0, "schedule":
-    # "static", "slots": 4}); where every chunk has a CTA of a grid of 8 CTAs
-    # per SM.
-    "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d": {
+    # The static backward into a BF16 weight gradient on sm_100a and sm_103a:
+    # 128 threads, 16 lanes per row (8-row blocks), the deterministic
+    # backward's chunks, CTA b running the chunks b, b + grid, ... with no
+    # claim and no prefetch, the chunk partials summed exactly in integer
+    # windows; BACKWARD_BANDS runs it from 513 to 49488 rows (build {"bulk": 0,
+    # "chunks_per_step": 0, "min_blocks": 8, "out": "bf16", "prefetch_ahead":
+    # 0, "schedule": "static", "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2": {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -515,8 +524,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
             "rows_per_block": 8,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
+        "kernel": "cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -524,7 +533,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
+        "library": "cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2",
         "logical": {
             "accumulate": "accumulate",
             "blocks_per_chunk": "blocks_per_chunk",
@@ -556,16 +565,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_win": 3584,
         },
     },
-    # The claimed backward into a BF16 weight gradient: the static backward's
-    # rows and sums, its CTAs claiming runs of chunks from the claim counter,
-    # thread 0 warming the rows of the block two ahead in L2 (build
-    # {"chunks_per_step": 0, "min_blocks": 8, "out": "bf16", "prefetch_ahead":
-    # 2, "schedule": "claimed", "slots": 4}); where the rows have more chunks
-    # than 8 per SM.
-    "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c": {
+    # The static backward into a BF16 weight gradient on sm_107a: the static
+    # schedule with the windows in 4 copies and an occupancy word per copy
+    # (sparse: a CTA adds only the windows its columns use, the last CTA reads
+    # only the occupied ones); BACKWARD_BANDS runs it from 513 rows while every
+    # chunk has a CTA of a grid of 8 CTAs per SM (build {"bulk": 0,
+    # "chunks_per_step": 0, "min_blocks": 8, "out": "bf16", "prefetch_ahead":
+    # 0, "schedule": "static", "slots": 5, "sparse": 1}).
+    "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410": {
         "arches": [
-            "sm_100a",
-            "sm_103a",
             "sm_107a",
         ],
         "arg_plan": [
@@ -600,11 +608,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "chunk_limit": 8192,
             "ctas_per_sm": 8,
             "kind": "chunks",
-            "more_chunks_than_per_sm": 8,
             "rows_per_block": 8,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
+        "kernel": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -612,7 +619,349 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
+        "library": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 4480,
+        },
+    },
+    # The second static backward into a BF16 weight gradient on sm_100a and
+    # sm_103a: the static schedule, thread 0 warming the CTA's next block in L2
+    # with one bulk prefetch per tensor where dy, x and z hold packed rows
+    # (head stride 128, token stride H * 128; other layouts: a prefetch per
+    # thread); BACKWARD_BANDS runs it from 49489 to 245760 rows (build {"bulk":
+    # 1, "chunks_per_step": 0, "min_blocks": 8, "out": "bf16",
+    # "prefetch_ahead": 1, "schedule": "static", "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16_long",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 3584,
+        },
+    },
+    # The second static backward into a BF16 weight gradient on sm_107a: the
+    # sparse static schedule over 2 window copies; BACKWARD_BANDS runs it past
+    # the one-wave band up to 98352 rows (build {"bulk": 0, "chunks_per_step":
+    # 0, "min_blocks": 8, "out": "bf16", "prefetch_ahead": 0, "schedule":
+    # "static", "slots": 3, "sparse": 1}).
+    "cake_rmsnorm_silu_gate_train_f5a44b8ba8bccb590488": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_f5a44b8ba8bccb590488",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_f5a44b8ba8bccb590488",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_f5a44b8ba8bccb590488",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16_long",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 2688,
+        },
+    },
+    # The claimed backward into a BF16 weight gradient on sm_100a and sm_103a:
+    # the static backward's rows and sums, its CTAs claiming runs of chunks
+    # from the claim counter, thread 0 warming the next block in L2 as the
+    # second static backward does; BACKWARD_BANDS runs it past 245760 rows
+    # (build {"bulk": 1, "chunks_per_step": 0, "min_blocks": 8, "out": "bf16",
+    # "prefetch_ahead": 1, "schedule": "claimed", "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16_mid",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 3584,
+        },
+    },
+    # The claimed backward into a BF16 weight gradient on sm_107a: the static
+    # backward's rows and sums, its CTAs claiming runs of chunks from the claim
+    # counter, thread 0 warming the rows of the block two ahead in L2;
+    # BACKWARD_BANDS runs it past 98352 rows (build {"bulk": 0,
+    # "chunks_per_step": 0, "min_blocks": 8, "out": "bf16", "prefetch_ahead":
+    # 2, "schedule": "claimed", "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "logical": {
             "accumulate": "accumulate",
             "blocks_per_chunk": "blocks_per_chunk",
@@ -719,15 +1068,18 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_bf16_t512",
     },
-    # The static backward into a FP32 weight gradient: the BF16 static
-    # backward's schedule and sums, the weight gradient rounded once to FP32
-    # (build {"chunks_per_step": 0, "min_blocks": 8, "out": "f32",
-    # "prefetch_ahead": 0, "schedule": "static", "slots": 4}).
-    "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe": {
+    # The static backward into a FP32 weight gradient on sm_100a and sm_103a:
+    # 128 threads, 16 lanes per row (8-row blocks), the deterministic
+    # backward's chunks, CTA b running the chunks b, b + grid, ... with no
+    # claim and no prefetch, the chunk partials summed exactly in integer
+    # windows, the weight gradient rounded once to FP32; BACKWARD_BANDS runs it
+    # from 513 to 49488 rows (build {"bulk": 0, "chunks_per_step": 0,
+    # "min_blocks": 8, "out": "f32", "prefetch_ahead": 0, "schedule": "static",
+    # "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f": {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -763,8 +1115,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
             "rows_per_block": 8,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
+        "kernel": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -772,7 +1124,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
+        "library": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
         "logical": {
             "accumulate": "accumulate",
             "blocks_per_chunk": "blocks_per_chunk",
@@ -804,14 +1156,16 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_win": 3584,
         },
     },
-    # The claimed backward into a FP32 weight gradient: the BF16 claimed
-    # backward's schedule and sums, the weight gradient rounded once to FP32
-    # (build {"chunks_per_step": 0, "min_blocks": 8, "out": "f32",
-    # "prefetch_ahead": 2, "schedule": "claimed", "slots": 4}).
-    "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776": {
+    # The static backward into a FP32 weight gradient on sm_107a: the static
+    # schedule with the windows in 4 copies and an occupancy word per copy
+    # (sparse: a CTA adds only the windows its columns use, the last CTA reads
+    # only the occupied ones), the weight gradient rounded once to FP32;
+    # BACKWARD_BANDS runs it from 513 rows while every chunk has a CTA of a
+    # grid of 8 CTAs per SM (build {"bulk": 0, "chunks_per_step": 0,
+    # "min_blocks": 8, "out": "f32", "prefetch_ahead": 0, "schedule": "static",
+    # "slots": 5, "sparse": 1}).
+    "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59": {
         "arches": [
-            "sm_100a",
-            "sm_103a",
             "sm_107a",
         ],
         "arg_plan": [
@@ -846,11 +1200,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "chunk_limit": 8192,
             "ctas_per_sm": 8,
             "kind": "chunks",
-            "more_chunks_than_per_sm": 8,
             "rows_per_block": 8,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
+        "kernel": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -858,7 +1211,353 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
+        "library": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_f32",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 4480,
+        },
+    },
+    # The second static backward into a FP32 weight gradient on sm_100a and
+    # sm_103a: the static schedule, thread 0 warming the CTA's next block in L2
+    # with one bulk prefetch per tensor where dy, x and z hold packed rows
+    # (head stride 128, token stride H * 128; other layouts: a prefetch per
+    # thread), the weight gradient rounded once to FP32; BACKWARD_BANDS runs it
+    # from 49489 to 245760 rows (build {"bulk": 1, "chunks_per_step": 0,
+    # "min_blocks": 8, "out": "f32", "prefetch_ahead": 1, "schedule": "static",
+    # "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_348592b55aa04975cc33": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_348592b55aa04975cc33",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_348592b55aa04975cc33",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_348592b55aa04975cc33",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_f32_long",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 3584,
+        },
+    },
+    # The second static backward into a FP32 weight gradient on sm_107a: the
+    # sparse static schedule over 2 window copies, the weight gradient rounded
+    # once to FP32; BACKWARD_BANDS runs it past the one-wave band up to 98352
+    # rows (build {"bulk": 0, "chunks_per_step": 0, "min_blocks": 8, "out":
+    # "f32", "prefetch_ahead": 0, "schedule": "static", "slots": 3, "sparse":
+    # 1}).
+    "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_f32_long",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 2688,
+        },
+    },
+    # The claimed backward into a FP32 weight gradient on sm_100a and sm_103a:
+    # the static backward's rows and sums, its CTAs claiming runs of chunks
+    # from the claim counter, thread 0 warming the next block in L2 as the
+    # second static backward does, the weight gradient rounded once to FP32;
+    # BACKWARD_BANDS runs it past 245760 rows (build {"bulk": 1,
+    # "chunks_per_step": 0, "min_blocks": 8, "out": "f32", "prefetch_ahead": 1,
+    # "schedule": "claimed", "slots": 4, "sparse": 0}).
+    "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
+        "logical": {
+            "accumulate": "accumulate",
+            "blocks_per_chunk": "blocks_per_chunk",
+            "dw": "dw",
+            "dw_done": "dw_done",
+            "dw_spec": "dw_spec",
+            "dw_win": "dw_win",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_f32_mid",
+        "workspace": {
+            "dw_done": 2,
+            "dw_spec": 128,
+            "dw_win": 3584,
+        },
+    },
+    # The claimed backward into a FP32 weight gradient on sm_107a: the static
+    # backward's rows and sums, its CTAs claiming runs of chunks from the claim
+    # counter, thread 0 warming the rows of the block two ahead in L2, the
+    # weight gradient rounded once to FP32; BACKWARD_BANDS runs it past 98352
+    # rows (build {"bulk": 0, "chunks_per_step": 0, "min_blocks": 8, "out":
+    # "f32", "prefetch_ahead": 2, "schedule": "claimed", "slots": 4, "sparse":
+    # 0}).
+    "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "dw_win"],
+            ["buffer", "dw_spec"],
+            ["buffer", "dw_done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["parameter", "blocks_per_chunk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunk_limit": 8192,
+            "ctas_per_sm": 8,
+            "kind": "chunks",
+            "rows_per_block": 8,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
         "logical": {
             "accumulate": "accumulate",
             "blocks_per_chunk": "blocks_per_chunk",
@@ -974,11 +1673,13 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
-        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2",
+        "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193",
+        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
-        "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
-        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
+        "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "bwd_f32_long": "cake_rmsnorm_silu_gate_train_348592b55aa04975cc33",
+        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
     "sm_103a": {
@@ -987,11 +1688,13 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
-        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_train_7e9f1c0cadbc18c390d2",
+        "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_9e8bf507c9563bb24193",
+        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_2a3bbf332a501a11ca31",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
-        "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
-        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
+        "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "bwd_f32_long": "cake_rmsnorm_silu_gate_train_348592b55aa04975cc33",
+        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
     "sm_107a": {
@@ -1000,11 +1703,13 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd_mid": "cake_rmsnorm_silu_gate_train_cf7a87977aaad1a9822f",
         "fwd_short": "cake_rmsnorm_silu_gate_train_3cb6aa31e140d9b13052",
         "fwd_tiny": "cake_rmsnorm_silu_gate_train_04bb67629537ef270bd4",
-        "bwd_bf16": "cake_rmsnorm_silu_gate_train_dbd89240614cc19b630d",
-        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_a654fd29fe5e116dee0c",
+        "bwd_bf16": "cake_rmsnorm_silu_gate_train_6d7cf79fb3d679d07410",
+        "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_f5a44b8ba8bccb590488",
+        "bwd_bf16_mid": "cake_rmsnorm_silu_gate_train_51408d05160a7056aad8",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
-        "bwd_f32": "cake_rmsnorm_silu_gate_train_b978b545dca0d0ccafbe",
-        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_7e2a23cc1b1359f7b776",
+        "bwd_f32": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
+        "bwd_f32_long": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
+        "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
 }
@@ -1070,28 +1775,63 @@ STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
 }
 
-# The small-row backward programs of each backward role on each architecture,
-# by the rows of a call: ``(last, role)`` bands in increasing ``last``; a call
-# of ``rows`` rows runs the module of the first band's routed ``role`` with
-# ``rows <= last`` (``last`` at most the module's ``max_rows``), and past the
-# last band the static or the claimed backward.  The exact tiny backward of
-# 4 teams (``_t512``) runs up to its ``max_rows``, 512 rows; past it the
-# static backward is the fastest program that starts beside a kernel resident
-# on every SM (an 8-team, 1024-thread CTA of 64 registers a thread fills an
-# SM's register file, so it waits for any resident CTA to exit).  Host plan
+# The backward programs of each backward role on each architecture, by the
+# rows of a call: ``(last, role)`` bands in order; a call of ``rows`` rows
+# runs the module of the first band's routed ``role`` whose ``last`` holds:
+# ``rows <= last`` for a row count, ``ONE_WAVE`` while the module's grid has
+# a CTA for every chunk (``chunks <= ctas_per_sm * sm_count``), and ``None``
+# (the last band) always.  The exact tiny backward of 4 teams (``_t512``)
+# runs up to its ``max_rows``, 512 rows (past it the static backward is the
+# fastest program that starts beside a kernel resident on every SM: an
+# 8-team, 1024-thread CTA of 64 registers a thread fills an SM's register
+# file, so it waits for any resident CTA to exit); then the static backward
+# (the call role), the second static backward (``_long``) and the claimed
+# backward (``_mid``), each the build its architecture routes.  The cuts are
+# the measured fastest program at each row count (CUPTI, cold L2).  Host plan
 # only: a new cut needs no new program.
-BACKWARD_BANDS: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
+ONE_WAVE = "one_wave"
+BACKWARD_BANDS: dict[str, dict[str, tuple[tuple[int | str | None, str], ...]]] = {
     "sm_100a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"),),
-        "bwd_f32": ((512, "bwd_f32_t512"),),
+        "bwd_bf16": (
+            (512, "bwd_bf16_t512"),
+            (49488, "bwd_bf16"),
+            (245760, "bwd_bf16_long"),
+            (None, "bwd_bf16_mid"),
+        ),
+        "bwd_f32": (
+            (512, "bwd_f32_t512"),
+            (49488, "bwd_f32"),
+            (245760, "bwd_f32_long"),
+            (None, "bwd_f32_mid"),
+        ),
     },
     "sm_103a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"),),
-        "bwd_f32": ((512, "bwd_f32_t512"),),
+        "bwd_bf16": (
+            (512, "bwd_bf16_t512"),
+            (49488, "bwd_bf16"),
+            (245760, "bwd_bf16_long"),
+            (None, "bwd_bf16_mid"),
+        ),
+        "bwd_f32": (
+            (512, "bwd_f32_t512"),
+            (49488, "bwd_f32"),
+            (245760, "bwd_f32_long"),
+            (None, "bwd_f32_mid"),
+        ),
     },
     "sm_107a": {
-        "bwd_bf16": ((512, "bwd_bf16_t512"),),
-        "bwd_f32": ((512, "bwd_f32_t512"),),
+        "bwd_bf16": (
+            (512, "bwd_bf16_t512"),
+            ("one_wave", "bwd_bf16"),
+            (98352, "bwd_bf16_long"),
+            (None, "bwd_bf16_mid"),
+        ),
+        "bwd_f32": (
+            (512, "bwd_f32_t512"),
+            ("one_wave", "bwd_f32"),
+            (98352, "bwd_f32_long"),
+            (None, "bwd_f32_mid"),
+        ),
     },
 }
 
@@ -1103,11 +1843,11 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 # The kernels of a call, routed on every architecture.  The forward's other
-# roles (``fwd_short``, ``fwd_mid``, ``fwd_long``, ``fwd_xlong``) run in the
-# rows of their ``FORWARD_BANDS`` bands; a backward role's small-row roles
-# (``BAND_ROLES``) in those of its ``BACKWARD_BANDS`` bands and its mid role
-# (``<role>_mid``, the claimed backward) past them where the rows have more
-# chunks than its rule's ``more_chunks_than_per_sm`` per SM.
+# roles (``fwd_tiny``, ``fwd_short``, ``fwd_mid``, ``fwd_long``,
+# ``fwd_xlong``) run in the rows of their ``FORWARD_BANDS`` bands; a backward
+# role, its small-row roles (``BAND_ROLES``), its long role (``<role>_long``,
+# the second static backward) and its mid role (``<role>_mid``, the claimed
+# backward) in the rows of their ``BACKWARD_BANDS`` bands.
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
 # The backward's small-row roles, which ``BACKWARD_BANDS`` routes by the rows.
 BAND_ROLES = (
@@ -1172,16 +1912,6 @@ def backward_chunks(name: str, rows: int) -> tuple[int, int]:
     return per_chunk, -(-blocks // per_chunk)
 
 
-def _claims(name: str, rows: int, sm_count: int) -> bool:
-    """Whether the claimed backward ``name`` runs for ``rows`` rows: where the
-    rows have more chunks than its rule's ``more_chunks_than_per_sm`` per
-    SM."""
-
-    rule = MODULES[name]["grid_rule"]
-    chunks = backward_chunks(name, rows)[1]
-    return chunks > int(rule["more_chunks_than_per_sm"]) * int(sm_count)
-
-
 def module_for_rows(
     arch: str, role: str, rows: int, sm_count: int, *, packed: bool = True
 ) -> str:
@@ -1190,11 +1920,10 @@ def module_for_rows(
     its ``FORWARD_BANDS[arch]`` bands (``STRIDED_FORWARD_BANDS[arch]`` when
     ``packed`` is false: ``x`` or ``z`` does not hold row ``n`` at element
     ``128 n``) with ``rows <= last * sm_count`` (or no ``last``); for a
-    backward role the module of the first of its
-    ``BACKWARD_BANDS[arch]`` bands with ``rows <= last``, else its mid module
-    (the claimed backward) when ``arch`` routes one and the rows have more
-    than ``more_chunks_than_per_sm * sm_count`` chunks; else
-    :func:`route_module`."""
+    backward role the module of the first of its ``BACKWARD_BANDS[arch]``
+    bands whose ``last`` holds: ``rows <= last``, ``ONE_WAVE`` (the module's
+    chunks for ``rows`` rows at most ``ctas_per_sm * sm_count``) or ``None``;
+    else :func:`route_module`."""
 
     if role == "fwd":
         table = FORWARD_BANDS if packed else STRIDED_FORWARD_BANDS
@@ -1203,11 +1932,15 @@ def module_for_rows(
                 return route_module(arch, band)
         return route_module(arch, role)
     for last, band in BACKWARD_BANDS.get(arch, {}).get(role, ()):
-        if int(rows) <= int(last):
-            return route_module(arch, band)
-    claimed = ROUTES.get(arch, {}).get(f"{role}_mid")
-    if claimed is not None and _claims(claimed, rows, sm_count):
-        return claimed
+        name = route_module(arch, band)
+        if last is None:
+            return name
+        if last == ONE_WAVE:
+            per_sm = int(MODULES[name]["grid_rule"]["ctas_per_sm"])
+            if backward_chunks(name, rows)[1] <= per_sm * int(sm_count):
+                return name
+        elif int(rows) <= int(last):
+            return name
     return route_module(arch, role)
 
 
