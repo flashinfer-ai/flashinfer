@@ -10808,7 +10808,8 @@ def backward_logprob_keep(
 # included) the checkpointed forward computes the loss only while the recomputation in the backward forms the
 # accumulators (one gradient pass per step instead of two).  CPU offload or other saved-tensor hooks innermost and a
 # torch whose checkpoint lacks the hook structure read below keep the fused forward.  The log-probability entry forms
-# no gradient in its forward and is unchanged.  ``"forward"``: every call with an input that requires a gradient forms
+# no gradient in its forward; under ``"auto"`` its checkpoint recomputation takes the checkpointed call's row results
+# (:class:`_LogprobKept`).  ``"forward"``: every call with an input that requires a gradient forms
 # them in its forward, also when no backward follows.  The outputs are the same bits either way (the same kernels on
 # the same operands, in the same order).
 GRADIENT_PLACEMENTS = ("auto", "forward")
@@ -11108,6 +11109,99 @@ def _hand_over(ctx, ckpt: _CheckpointPass, handed, result):
     if handed is not None:
         with _CHECKPOINT_LOCK:
             handed[0].handed[(ckpt.graph, handed[1])] = state
+
+
+# The log-probability entries inside a non-reentrant ``torch.utils.checkpoint`` (gradient placement ``"auto"``): the
+# checkpointed forward keeps its call's row results -- ``logp``, the FP32 row statistic ``lse``, the valid-row index
+# and the compact temperature, O(T) bytes -- in the checkpoint frame, and the recomputation in the backward takes them
+# instead of running the logits GEMMs again: it returns a copy of the same ``logp`` and saves the same row results, so
+# the backward reads the bits the plain call's backward reads.  A recomputed call takes them only when it repeats its
+# checkpointed call (paired per frame and graph by call order) on the same input tensors (the same objects, unchanged
+# since: version counters) under the same options; otherwise, under the placement ``"forward"``, or after the kept
+# ``logp`` was modified in place, it runs the forward.
+class _LogprobKept(NamedTuple):
+    """A checkpointed log-probability call's row results, kept for its recomputation."""
+
+    key: tuple  # the call's options and its inputs' metadata and version counters
+    refs: tuple  # weak references to the call's input tensors (None for an absent one)
+    # an alias of the returned logp (its version counter tells an in-place change)
+    logp: torch.Tensor
+    logp_version: int
+    saved: tuple  # the tensors the forward saves past X, W and labels
+    extra: Any = None  # a non-tensor the backward reads (the scalar temperature)
+
+
+class _LogprobCalls:
+    """The log-probability entry calls of one checkpoint frame: per call of the checkpointed forward (in order) its kept
+    row results (``None``: kept none) and per graph the recomputation's call count."""
+
+    __slots__ = ("calls", "recomputed", "__weakref__")
+
+    def __init__(self) -> None:
+        self.calls: list = []
+        self.recomputed: dict = {}
+
+
+_LOGPROB_CHECKPOINT_CALLS: "weakref.WeakKeyDictionary[Any, _LogprobCalls]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _logprob_call_key(inputs: tuple, options: tuple) -> tuple:
+    """What a recomputed log-probability call must match to take its checkpointed call's row results."""
+    meta = tuple(None if t is None else (_meta_key(t), t._version) for t in inputs)
+    return meta + (repr(options),)
+
+
+def _logprob_checkpoint_keep(
+    ctx, ckpt: _CheckpointPass, key: tuple, inputs: tuple, logp, saved, extra=None
+) -> None:
+    """Record a log-probability call of the checkpointed forward, with its row results when a backward can follow
+    (placement ``"auto"``, an input requiring a gradient)."""
+    if ckpt.frame is None:
+        return
+    kept = None
+    if gradient_placement() == "auto" and any(ctx.needs_input_grad[:2]):
+        kept = _LogprobKept(
+            key,
+            tuple(None if t is None else weakref.ref(t) for t in inputs),
+            logp.detach(),
+            logp._version,
+            tuple(_detached(t) for t in saved),
+            extra,
+        )
+    with _CHECKPOINT_LOCK:
+        calls = _LOGPROB_CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            calls = _LOGPROB_CHECKPOINT_CALLS[ckpt.frame] = _LogprobCalls()
+        calls.calls.append(kept)
+
+
+def _logprob_checkpoint_take(
+    ckpt: _CheckpointPass, key: tuple, inputs: tuple
+) -> Optional[_LogprobKept]:
+    """The kept row results of the checkpointed call a call of the recomputation repeats (``None``: run the
+    forward)."""
+    if ckpt.frame is None:
+        return None
+    with _CHECKPOINT_LOCK:
+        calls = _LOGPROB_CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            return None
+        index = calls.recomputed.get(ckpt.graph, 0)
+        calls.recomputed[ckpt.graph] = index + 1
+        kept = calls.calls[index] if index < len(calls.calls) else None
+    if (
+        kept is None
+        or kept.key != key
+        or kept.logp._version != kept.logp_version
+        or any(
+            (ref is None) != (t is None) or (ref is not None and ref() is not t)
+            for ref, t in zip(kept.refs, inputs, strict=True)
+        )
+    ):
+        return None
+    return kept
 
 
 def _split_state(ctx, inputs, forward):
@@ -11433,20 +11527,36 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
         dz_arm = _resolve_logprob_dz(logprob_dz)
-        result = forward_logprob(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            hidden_count=hidden,
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-        )
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        ckpt = _checkpoint_pass() if _TOP_SAVED_HOOKS(False) is not None else None
+        if ckpt is not None:
+            inputs = (X, W, labels)
+            key = _logprob_call_key(
+                inputs,
+                (chunk_size, backend, compact, hidden, _tuning_key(tuning), lbl_arm),
+            )
+            kept = None if ckpt.first else _logprob_checkpoint_take(ckpt, key, inputs)
         ctx.set_materialize_grads(False)
+        if ckpt is not None and kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM (see _LogprobKept)
+            logp, (lse, row_index) = kept.logp.clone(), kept.saved
+        else:
+            result = forward_logprob(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                hidden_count=hidden,
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+            )
+            logp, lse, row_index = result.logp, result.lse, result.row_index
+            if ckpt is not None and ckpt.first:
+                _logprob_checkpoint_keep(ctx, ckpt, key, inputs, logp, (lse, row_index))
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
-        ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.save_for_backward(X, W, labels, lse, row_index)
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -11458,7 +11568,7 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
         ctx.hidden_count = hidden
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
@@ -11539,43 +11649,71 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
         dz_arm = _resolve_logprob_dz(logprob_dz)
-        # the temperature is validated once, before any launch (both arms' explicit switches are known here)
-        tau = _resolve_temperature(
-            temperature,
-            int(X.shape[0]) if X.ndim else 0,
-            X.device,
-            check=bool(check_temperature),
-        )
-        _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
-        result = forward_logprob_temperature(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            hidden_count=hidden,
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-            temperature=tau,
-        )
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        ckpt = _checkpoint_pass() if _TOP_SAVED_HOOKS(False) is not None else None
+        if ckpt is not None:
+            tau_in = temperature if isinstance(temperature, torch.Tensor) else None
+            inputs = (X, W, labels, tau_in)
+            key = _logprob_call_key(
+                inputs,
+                (
+                    chunk_size,
+                    backend,
+                    compact,
+                    hidden,
+                    _tuning_key(tuning),
+                    lbl_arm,
+                    logprob_dz,
+                    None if tau_in is not None else temperature,
+                    bool(check_temperature),
+                ),
+            )
+            kept = None if ckpt.first else _logprob_checkpoint_take(ckpt, key, inputs)
         ctx.set_materialize_grads(False)
+        if ckpt is not None and kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM (see _LogprobKept)
+            logp, saved, temperature_scalar = kept.logp.clone(), kept.saved, kept.extra
+        else:
+            # the temperature is validated once, before any launch (both arms' explicit switches are known here)
+            tau = _resolve_temperature(
+                temperature,
+                int(X.shape[0]) if X.ndim else 0,
+                X.device,
+                check=bool(check_temperature),
+            )
+            _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
+            result = forward_logprob_temperature(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                hidden_count=hidden,
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+                temperature=tau,
+            )
+            logp = result.logp
+            saved = (
+                result.lse,
+                result.row_index,
+                result.temperature_rows,
+                tau.value if tau is not None and tau.kind == "tensor" else None,
+            )
+            temperature_scalar = (
+                tau.value if tau is not None and tau.kind == "scalar" else None
+            )
+            if ckpt is not None and ckpt.first:
+                _logprob_checkpoint_keep(
+                    ctx, ckpt, key, inputs, logp, saved, temperature_scalar
+                )
         # the valid-row index rides along: the backward plans its chunks without counting the rows again; so does the
         # compact temperature the forward's kernels read (no second gather) and the resolved temperature itself -- the
         # caller's per-token [T] tensor (saved, not copied) or the scalar -- which the zero-gradient row skip gathers
         # in its own row order
-        ctx.save_for_backward(
-            X,
-            W,
-            labels,
-            result.lse,
-            result.row_index,
-            result.temperature_rows,
-            tau.value if tau is not None and tau.kind == "tensor" else None,
-        )
-        ctx.temperature_scalar = (
-            tau.value if tau is not None and tau.kind == "scalar" else None
-        )
+        ctx.save_for_backward(X, W, labels, *saved)
+        ctx.temperature_scalar = temperature_scalar
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -11587,7 +11725,7 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         ctx.hidden_count = hidden
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
