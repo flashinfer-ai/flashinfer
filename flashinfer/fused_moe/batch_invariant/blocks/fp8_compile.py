@@ -19,14 +19,10 @@ from cutlass import Int32
 from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N, Knobs
-from .compile import GRID_PLACEHOLDER, gather_suffix
+from .compile import GRID_PLACEHOLDER
 from .epilogue import GROUP
 from .fp8_epilogue import GEMM2_CHAIN, Fp8Chain
-from .fp8_kernel import (
-    IN_FMT,
-    ScaledGatherGroupedBlockGemmFp8,
-    ScaledGroupedBlockGemmFp8,
-)
+from .fp8_kernel import IN_FMT, ScaledGroupedBlockGemmFp8
 from .scheduler import MAX_E
 
 MODULE = "batch_invariant_moe_fp8"
@@ -35,15 +31,12 @@ OUT_DT_FP8 = dict(OUT_DT, e4m3=cutlass.Uint8)
 OUT_ALIGN_FP8 = dict(ALIGN, e4m3=16)
 
 
-def kernel_name(
-    cfg: Knobs, chain: Fp8Chain, gather: bool = False, a_producer: str = "gather4"
-) -> str:
+def kernel_name(cfg: Knobs, chain: Fp8Chain) -> str:
     """The object's name: the chain (kind, activation, scale, output format, parameters) and the record without its
-    ``grid_clusters``; the gather variants (the A rows gathered by the kernel) append ``_gather`` / ``_gather_ldgsts``."""
+    ``grid_clusters``."""
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"grouped_e4m3_{chain.describe()}_{knobs.describe()}"
-        + gather_suffix(gather, a_producer)
     )
 
 
@@ -76,11 +69,8 @@ def can_implement_grouped_fp8(
     )
 
 
-def compile_grouped_fp8_fn(
-    cfg: Knobs, chain: Fp8Chain, gather: bool = False, a_producer: str = "gather4"
-) -> Callable[[], Any]:
-    """The zero-argument compile closure of one grouped fp8 specialisation. ``gather``: the variant whose A rows the kernel
-    gathers (``kernel(xq2, src, k_div, b3, out2, counts, alpha, sa, si, grid)``) in place of the permuted ``a3``."""
+def compile_grouped_fp8_fn(cfg: Knobs, chain: Fp8Chain) -> Callable[[], Any]:
+    """The zero-argument compile closure of one grouped fp8 specialisation."""
     in_dt, al = IN_DT[IN_FMT], ALIGN[IN_FMT]
     out_dt, oal = OUT_DT_FP8[chain.out_fmt], OUT_ALIGN_FP8[chain.out_fmt]
 
@@ -92,29 +82,12 @@ def compile_grouped_fp8_fn(
             cute.sym_int(32),
         )
         sym_no = cute.sym_int(32, divisibility=oal)
-        if gather:
-            x_fake = cute.runtime.make_fake_tensor(
-                in_dt,
-                (cute.sym_int(32), sym_k),
-                (cute.sym_int64(divisibility=al), 1),
-                assumed_align=16,
-            )
-            src_fake = cute.runtime.make_fake_tensor(
-                Int32, (cute.sym_int(32),), (1,), assumed_align=16
-            )
-            a_args = (x_fake, src_fake, Int32(1))
-
-            def cls(cfg_, ch_):
-                return ScaledGatherGroupedBlockGemmFp8(cfg_, ch_, a_producer=a_producer)
-        else:
-            a_fake = cute.runtime.make_fake_tensor(
-                in_dt,
-                (sym_m, sym_k, 1),
-                (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
-                assumed_align=16,
-            )
-            a_args = (a_fake,)
-            cls = ScaledGroupedBlockGemmFp8
+        a_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_m, sym_k, 1),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
         b_fake = cute.runtime.make_fake_tensor(
             in_dt,
             (sym_n, sym_k, sym_e),
@@ -140,8 +113,8 @@ def compile_grouped_fp8_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         return cute.compile(
-            cls(cfg, chain),
-            *a_args,
+            ScaledGroupedBlockGemmFp8(cfg, chain),
+            a_fake,
             b_fake,
             o_fake,
             c_fake,
@@ -157,16 +130,11 @@ def compile_grouped_fp8_fn(
 
 
 @functools.cache
-def get_compiled_grouped_fp8(
-    cfg: Knobs, chain: Fp8Chain, gather: bool = False, a_producer: str = "gather4"
-) -> Any:
+def get_compiled_grouped_fp8(cfg: Knobs, chain: Fp8Chain) -> Any:
     """``kernel(a3, b3, out2, counts, alpha, sa, si, grid)``: A ``(Tk, K, 1)`` K-major e4m3, B ``(N, K, E)`` K-major e4m3, out
     ``(Tk, Nout)`` row-major (uint8 bytes for the e4m3 chains, bf16 / f32 otherwise), counts ``(E,)`` int32, ``alpha (E,)`` the
     per-expert weight scales, ``sa (1,)`` the A operand's scale, ``si (1,)`` the intermediate multiplier, ``grid`` the persistent
-    grid in clusters. ``gather``: the variant ``kernel(xq2, src, k_div, b3, out2, counts, alpha, sa, si, grid)`` whose A row
-    ``p`` is ``xq[src[p] // k_div]`` gathered by the kernel (the same bits)."""
+    grid in clusters."""
     return jit.build_and_load(
-        MODULE,
-        kernel_name(cfg, chain, gather, a_producer),
-        compile_grouped_fp8_fn(cfg, chain, gather, a_producer),
+        MODULE, kernel_name(cfg, chain), compile_grouped_fp8_fn(cfg, chain)
     )

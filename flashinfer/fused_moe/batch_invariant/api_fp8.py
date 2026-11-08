@@ -16,7 +16,7 @@ the dataflow.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -302,116 +302,6 @@ def grouped_gemm_fp8(
     return out
 
 
-def grouped_gemm_fp8_gather(
-    xq: torch.Tensor,
-    src: torch.Tensor,
-    k_div: int,
-    w: torch.Tensor,
-    s_w: torch.Tensor,
-    s_a: torch.Tensor,
-    inv: torch.Tensor,
-    counts: torch.Tensor,
-    config: Knobs,
-    chain: Fp8Chain,
-    Tk: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    a_producer: Optional[str] = None,
-) -> torch.Tensor:
-    """``out[p] = chain(xq[src[p] // k_div] @ w[e(p)].T, alpha = mul(s_a, s_w[e(p)]))`` for the expert segments ``counts``:
-    :func:`grouped_gemm_fp8` with the A rows gathered by the kernel (the TMA's gather4 mode) from the unpermuted ``xq [T, K]``
-    e4m3 -- no permuted activation tensor, no gather launch; ``src [Tk]`` int32 the slot of every expanded row
-    (``permute_plan``); ``a_producer`` the kernel's A producer, ``ldgsts`` (16-byte cp.async chunks; the default
-    ``api.GATHER_A_PRODUCER``) or ``gather4`` (the TMA). The same bits as :func:`grouped_gemm_fp8` on the materialised
-    permutation."""
-    from .api import GATHER_A_PRODUCER
-    from .blocks.fp8_compile import can_implement_grouped_fp8, get_compiled_grouped_fp8
-
-    if (
-        xq.dtype != torch.float8_e4m3fn
-        or w.dtype != torch.float8_e4m3fn
-        or xq.dim() != 2
-        or w.dim() != 3
-    ):
-        raise TypeError("grouped_gemm_fp8_gather takes e4m3 xq [T, K] and w [E, N, K]")
-    T, K = xq.shape
-    E, N, K2 = w.shape
-    src = src.reshape(-1)
-    Tk = src.shape[0] if Tk is None else Tk
-    if (
-        K != K2
-        or xq.stride(1) != 1
-        or not w.is_contiguous()
-        or xq.stride(0) % ALIGN_E4M3
-        or K % ALIGN_E4M3
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8_gather: K-contiguous, 16-byte-aligned operands of one K "
-            f"(xq {tuple(xq.shape)} strides {tuple(xq.stride())}, w {tuple(w.shape)})"
-        )
-    if (
-        counts.dtype != torch.int32
-        or tuple(counts.shape) != (E,)
-        or not counts.is_contiguous()
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8_gather: counts must be a contiguous int32 [E]"
-        )
-    if (
-        src.dtype != torch.int32
-        or not src.is_contiguous()
-        or src.shape[0] < Tk
-        or k_div < 1
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8_gather: src must be a contiguous int32 [Tk] and k_div >= 1"
-        )
-    if (
-        s_w.dtype != torch.float32
-        or s_w.numel() != E
-        or s_a.numel() != 1
-        or inv.numel() != 1
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8_gather: s_w [E] fp32, s_a and inv 1-element fp32"
-        )
-    if not can_implement_grouped_fp8(config, N, K, E, chain):
-        raise ValueError(
-            f"grouped_gemm_fp8_gather: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()})"
-        )
-    n_out = N // 2 if chain.pair else N
-    out_dtype = _OUT_DTYPE[chain.out_fmt]
-    if out is None:
-        out = torch.empty(Tk, n_out, dtype=out_dtype, device=xq.device)
-    oal = 16 // out.element_size()
-    if (
-        tuple(out.shape) != (Tk, n_out)
-        or out.dtype != out_dtype
-        or out.stride(1) != 1
-        or out.stride(0) % oal
-    ):
-        raise ValueError(
-            "grouped_gemm_fp8_gather: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
-        )
-    out_k = out.view(torch.uint8) if chain.out_fmt == "e4m3" else out
-    if Tk == 0:
-        return out
-    get_compiled_grouped_fp8(
-        config, chain, gather=True, a_producer=a_producer or GATHER_A_PRODUCER
-    )(
-        xq,
-        src,
-        int(k_div),
-        w.permute(1, 2, 0),
-        out_k,
-        counts,
-        s_w.reshape(-1).to(torch.float32),
-        s_a.reshape(1).to(torch.float32),
-        inv.reshape(1).to(torch.float32),
-        persistent_clusters(xq.device, config),
-    )
-    return out
-
-
 def fused_moe_fp8(
     xq: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -422,15 +312,11 @@ def fused_moe_fp8(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    gather: Union[bool, str] = False,
 ):
     """The W8A8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 (the caller's static quantization, ``x = q / m_x``),
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r`` with the class's
     chains and rounding (:mod:`.spec_fp8`), the ``k`` slots folded in slot order in fp32 and converted once. ``config1`` /
-    ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default).
-    ``gather``: ``False`` (the default) materialises the permutation (the gather launch, then :func:`grouped_gemm_fp8`); ``True``
-    or a producer name (``ldgsts`` / ``gather4``) makes GEMM1 gather the tokens' rows itself (:func:`grouped_gemm_fp8_gather`: no
-    gather launch, no permuted activation tensor), a placement with the same bits that measured at parity at best."""
+    ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule_fp8 import default_configs_fp8
@@ -488,31 +374,14 @@ def fused_moe_fp8(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    x_perm = None
-    if gather:
-        a = grouped_gemm_fp8_gather(
-            xq,
-            src,
-            k,
-            w.w1q,
-            w.s_w1,
-            w.s_x,
-            w.m_inter,
-            counts,
-            config1,
-            w.chain1,
-            Tk=Tk,
-            a_producer=gather if isinstance(gather, str) else None,
-        )  # [Tk, I] e4m3 (GEMM1 gathers the tokens' rows)
-    else:
-        x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
-        if Tk:
-            get_compiled_gather(
-                k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev))
-            )(xq, src, x_perm, Tk, H)
-        a = grouped_gemm_fp8(
-            x_perm, w.w1q, w.s_w1, w.s_x, w.m_inter, counts, config1, w.chain1
-        )  # [Tk, I] e4m3
+    x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
+    if Tk:
+        get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
+            xq, src, x_perm, Tk, H
+        )
+    a = grouped_gemm_fp8(
+        x_perm, w.w1q, w.s_w1, w.s_x, w.m_inter, counts, config1, w.chain1
+    )  # [Tk, I] e4m3
     y = grouped_gemm_fp8(
         a, w.w2q, w.s_w2, w.s_inter, w.m_inter, counts, config2, GEMM2_CHAIN
     )  # [Tk, H] bf16
