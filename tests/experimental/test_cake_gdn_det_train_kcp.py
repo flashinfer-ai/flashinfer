@@ -1898,9 +1898,10 @@ def test_registry_seed() -> None:
             "kcp_dhu_offset",
             "kcp_dhu_tape",
             "kcp_affine_merge",
+            "fwd_prep_l2n",
         )
-    )  # the vh=64 forms of the state walks #2 (L8A, the output walk too) / #7 and the c8 / c16 merges are the only
-    # multi-record programs
+    )  # the vh=64 forms of the state walks #2 (L8A, the output walk too) / #7, the c8 / c16 merges and the forward
+    # form of #1_l2n (fwd_prep_l2n_fwd) are the only multi-record programs
     assert set(gj.TEST_MODULES) == {
         "kcp_transfer_walk_three_mma",
         "kcp_transfer_walk_plain_tf32",
@@ -1945,9 +1946,12 @@ def test_registry_seed() -> None:
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ]
-        assert rec["select_rule"]["kind"] in ("always", "columns", "ctas_per_head"), (
-            name
-        )
+        assert rec["select_rule"]["kind"] in (
+            "always",
+            "columns",
+            "ctas_per_head",
+            "prep_form",
+        ), name
         assert ("test_knobs" in rec) == (name in gj.TEST_MODULES), name
         if not manifest_rendered:
             with pytest.raises(RuntimeError, match="no rendered library"):
