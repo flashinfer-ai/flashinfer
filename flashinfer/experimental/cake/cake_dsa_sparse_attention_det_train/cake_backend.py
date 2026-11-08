@@ -3155,11 +3155,11 @@ def cake_dsa_sparse_attention_det_varlen(
 # The NoPE main stages run a persistent token loop: CTA ``b`` takes tokens ``b, b + grid, ...`` of the launch's
 # ``num_queries`` tokens (``token = token_base + token_step * (blockIdx.x + k * gridDim.x)``), so every grid
 # <= ``num_queries`` is legal and gives the same bits (the dK + dV integers are order-free, dQ is summed per token in
-# a fixed tile order).  One persistent CTA per SM while the launch's int32 dkv window (``num_kv`` x 2048 B) is within
-# 64 MiB; beyond it a CTA per token.
+# a fixed tile order).  The main stage: one persistent CTA per SM while the launch's int32 dkv window (``num_kv`` x
+# 2048 B) is within 64 MiB, beyond it a CTA per token.  The redo: one persistent CTA per SM whatever the key count
+# (its marked pairs are few, and with no marked row every CTA returns at once).
 NOPE_PERSISTENT_DKV_BYTES = 64 << 20
 NOPE_DKV_BYTES_PER_KEY = 2048
-NOPE_PERSISTENT_STAGES = ("nope_bwd_main", "nope_bwd_redo")
 
 
 def nope_bwd_launch_grid(num_queries: int, num_kv_in_pass: int, sm_count: int) -> int:
@@ -3170,6 +3170,20 @@ def nope_bwd_launch_grid(num_queries: int, num_kv_in_pass: int, sm_count: int) -
     if int(num_kv_in_pass) * NOPE_DKV_BYTES_PER_KEY <= NOPE_PERSISTENT_DKV_BYTES:
         return max(1, min(int(num_queries), int(sm_count)))
     return int(num_queries)
+
+
+def nope_bwd_redo_launch_grid(num_queries: int, sm_count: int) -> int:
+    """Grid (x) of the NoPE redo launch over ``num_queries`` tokens -- the kernel's ``redo_launch_grid``, mirrored:
+    one persistent CTA per SM (``min(num_queries, sm_count)``, at least one) whatever the key count, so a redo with no
+    marked row costs one wave instead of a CTA per token."""
+    return max(1, min(int(num_queries), int(sm_count)))
+
+
+# The NoPE backward stages launched with a persistent grid instead of the generated rule, and their grid.
+NOPE_PERSISTENT_GRIDS: dict[str, Callable[[int, int, int], int]] = {
+    "nope_bwd_main": nope_bwd_launch_grid,
+    "nope_bwd_redo": lambda num_queries, num_kv, sm_count: nope_bwd_redo_launch_grid(num_queries, sm_count),
+}
 
 
 _SM_COUNTS: dict[int, int] = {}
@@ -3387,11 +3401,8 @@ def _plan_nope(
         backward_order = cake_jit.NOPE_BACKWARD_STAGES
         sm_count = _sm_count(_device_index(device))
         for stage in backward_order:
-            grid = (
-                (nope_bwd_launch_grid(T, S, sm_count), 1, 1)
-                if stage in NOPE_PERSISTENT_STAGES
-                else None
-            )
+            rule = NOPE_PERSISTENT_GRIDS.get(stage)
+            grid = (rule(T, S, sm_count), 1, 1) if rule is not None else None
             entries[stage] = _stage_entry(stage, arch, scalars, program, grid)
     return _Plan(
         module_name=module_name,

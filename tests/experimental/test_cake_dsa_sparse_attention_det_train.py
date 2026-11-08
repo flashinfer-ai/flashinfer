@@ -1169,6 +1169,40 @@ def test_forced_redo_of_most_rows_repeats_bit_for_bit(monkeypatch, nope):
     print("FORCED_REDO rel-L2 vs the shipped grid", rel_l2(dkv, ref_dkv))
 
 
+def test_nope_redo_persistent_grid_gives_the_bits_of_a_cta_per_token(monkeypatch):
+    """The NoPE redo launches one persistent CTA per SM (``nope_bwd_redo_launch_grid``) whatever the key count; with
+    most rows recomputed by the redo (``GRID_SHIFT = 24``) it gives the bits of a redo launched with a CTA per token."""
+    _require_program(backward=True, program=cake_jit.NOPE_PROGRAM)
+    inp = make_inputs([256], [1024], seed=SEED + 32, topk=256)
+    T = inp.total_q
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    assert cake_backend.nope_bwd_redo_launch_grid(T, sm_count) == min(T, sm_count)
+    assert cake_backend.nope_bwd_redo_launch_grid(T, 1 << 20) == T
+    assert cake_backend.nope_bwd_redo_launch_grid(0, sm_count) == 1
+    monkeypatch.setattr(cake_backend, "GRID_SHIFT", 24)
+    monkeypatch.setattr(cake_backend, "MIN_BUMP", 25)
+
+    def run():
+        runner = cake_backend.prepare_dsa_nope_train(
+            inp.q_latent, inp.kv_latent, inp.idx_global,
+            topk_length=inp.topk_length, dout=inp.dout,
+        )  # fmt: skip
+        runner.forward()
+        out = [t.clone() for t in runner.backward()]
+        return runner, out
+
+    persistent, got = run()
+    assert tuple(persistent.launches["nope_bwd_redo"].grid) == (min(T, sm_count), 1, 1)
+    assert _globals(persistent)[cake_backend.REDO_WORD] > inp.total_k // 4
+    grids = dict(cake_backend.NOPE_PERSISTENT_GRIDS)
+    grids["nope_bwd_redo"] = lambda num_queries, num_kv, sms: num_queries
+    monkeypatch.setattr(cake_backend, "NOPE_PERSISTENT_GRIDS", grids)
+    per_token, want = run()
+    assert tuple(per_token.launches["nope_bwd_redo"].grid) == (T, 1, 1)
+    for a, b in zip(got, want, strict=True):
+        assert _same_bits(a, b)
+
+
 def _inside(x: torch.Tensor, y: torch.Tensor) -> bool:
     """Whether the bytes of ``x`` lie inside the bytes of ``y``."""
     lo, hi = y.data_ptr(), y.data_ptr() + y.numel() * y.element_size()
