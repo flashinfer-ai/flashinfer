@@ -646,8 +646,9 @@ def build_chunk_meta(
 # later calls on any stream.  The build records an event after the write; a hit on another stream waits for that event
 # and records the table's use on its stream, so the caching allocator reuses an evicted table only after that stream's
 # launches.  A table built inside a CUDA graph capture is written only when the graph replays, so it is not cached.  A
-# capture reads a cached table without waiting (torch.cuda.graph synchronizes the device before it captures), and the
-# table is kept for the process, since every replay reads it.
+# capture reads a cached table without waiting (a capturing stream cannot wait for an event recorded outside the
+# capture), so the table's write must be done when the capture starts: torch.cuda.graph synchronizes the device first.
+# The table is then kept for the process, since every replay reads it.
 _HOST_META: dict = {}
 _HOST_META_LIMIT = 256
 _GRAPH_TABLES: dict[int, torch.Tensor] = {}
@@ -698,7 +699,7 @@ def _host_chunk_meta(
         return meta
     meta = replace(meta, ready=_table_ready(device_index))
     if len(_HOST_META) >= _HOST_META_LIMIT:
-        del _HOST_META[next(iter(_HOST_META))]
+        _HOST_META.pop(next(iter(_HOST_META)), None)
     _HOST_META[key] = meta
     return meta
 
@@ -1187,7 +1188,12 @@ _FRESH = FreshWorkspaces()
 
 
 def _workspaces(options: ChainOptions) -> Workspaces:
-    return _POOLED if options.host_cache else _FRESH
+    """The pooled per-stream workspaces under ``host_cache``, else fresh buffers.  A CUDA graph capture takes fresh
+    buffers (from the graph's memory pool): pooled ones would be shared with the other graphs captured on that stream
+    and with eager calls on it, and an eviction would free them while the graph still writes them."""
+    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+        return _POOLED
+    return _FRESH
 
 
 @cache
@@ -2110,7 +2116,9 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 
     Every tensor a side stream reads or writes is allocated on the caller's stream before the fork and stays
     referenced by the stage until the join (``main.wait_stream(side)``, also when a launch raises), so the caching
-    allocator reuses its memory only after the side stream's work: no ``record_stream``."""
+    allocator reuses its memory only after the side stream's work: no ``record_stream``.  A cached device table it
+    reads was built on some stream; the caller's stream waited for its write and recorded its use before the fork
+    (:func:`_use_table`)."""
     key = (device_index, main.cuda_stream)
     stream = _SIDE_STREAMS.get(key)
     if stream is None:
@@ -3091,7 +3099,8 @@ def _chunk_meta(
     if scan is not None:
         meta = replace(meta, bwd_wavefront=scan)
     # a table built inside a CUDA graph capture (see "cached device tables") is not kept
-    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+    capturing = meta.chunk_start.is_cuda and torch.cuda.is_current_stream_capturing()
+    if options.host_cache and not capturing:
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
             del _META_FRONT[next(iter(_META_FRONT))]
         _META_FRONT[key] = meta

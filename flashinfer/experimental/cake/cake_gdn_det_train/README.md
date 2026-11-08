@@ -166,11 +166,13 @@ captured in a CUDA graph (warm it up first, like any captured call).
 The host-table route caches device tables between calls: a layout's chunk and
 segment tables, the wavefront pair's tile order and the identity walk of the
 forward scan.  A table is written on the stream of the call that builds it, and
-a call on another stream waits for that write (an event recorded after it)
-before its launches read the table.  A CUDA graph capture does not cache the
-tables it builds, since they are written only when the graph replays, and keeps
-the cached tables it reads for the life of the process, since every replay
-reads them.
+an eager call on another stream waits for that write (an event recorded after
+it) before its launches read the table.  A CUDA graph capture does not cache the
+tables it builds, since they are written only when the graph replays.  It reads
+the cached tables without waiting, so their writes must be done when the
+capture starts (`torch.cuda.graph` synchronizes the device first), and keeps
+them for the life of the process, since every replay reads them.  A capture
+also takes its own workspaces instead of the pooled per-stream ones.
 
 ## Plan pins (keyword-only)
 
@@ -183,7 +185,7 @@ reads them.
 | `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
-| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
+| `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls (a CUDA graph capture takes its own workspaces) |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order (the same bits) |
 | `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream (the same bits) |
 
