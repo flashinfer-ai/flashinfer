@@ -171,6 +171,7 @@ __all__ = [
     "FWD_HO_VH2_ARCHS",
     "FWD_HO_VH2_STEP",
     "FWD_A_ARCHS",
+    "FWD_A_SERIAL_KEEP",
     "WY_A_MAX_GROUP",
     "SPLIT_R_FORM",
     "TC_PLAN",
@@ -205,6 +206,7 @@ __all__ = [
     "fwd_ho_vh2_engaged",
     "fwd_ho_vh2_splits",
     "fwd_a_route",
+    "fwd_serial_keep_pricing",
     "host_plans",
     "lpt_sequence_order",
     "lpt_walk",
@@ -317,6 +319,10 @@ _FWD_FUSED_ARGS = (*_FWD_HO_ARGS, "tape", "seg_state", "seg_flag", "split_out")
 _FWD_SUMMARY_ARGS = ("kn_tma", "w_tma", "u_tma", "g_cs", "b_out", "m_out", "seg_flag", "chunk_start", "chunk_len",
                      "seg_chunk_start", "walk", "m_slot", "num_heads", "num_v_heads", "b_head", "b_row", "m_head",
                      "m_row", "m_col")  # fmt: skip
+# the same map formed from wy_a's A, kn, v and beta (u and w formed in the CTA: the split forward on wy_a's A)
+_FWD_SUMMARY_A_ARGS = ("kn_tma", "v_tma", "a_tma", "g_cs", "beta", "b_out", "m_out", "seg_flag", "chunk_start",
+                       "chunk_len", "seg_chunk_start", "walk", "m_slot", "num_heads", "num_v_heads", "b_head", "b_row",
+                       "m_head", "m_row", "m_col")  # fmt: skip
 _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_seg_chunk_start", "fwd_seg_seq",
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
@@ -334,6 +340,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "fwd_ho_a": _FWD_A_ARGS,
     "fwd_fused": _FWD_FUSED_ARGS,
     "fwd_summary": _FWD_SUMMARY_ARGS,
+    "fwd_summary_a": _FWD_SUMMARY_A_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "stitch_mt": _STITCH_ARGS,
@@ -3124,6 +3131,20 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
 # route's time under both gate regimes, the same bits run to run; the split forward stays off there.
 FWD_A_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 WY_A_MAX_GROUP = 3
+# On an architecture of ``FWD_A_SERIAL_KEEP`` (price factor, fill) a host-built table without plan pins keeps a SERIAL
+# forward table where the register planner takes a split one, prices its cheapest serial table at most the factor above
+# it (the planner record's ``priced`` entries, :func:`fwd_serial_keep_pricing`) and the serial table's CTAs (sequences x
+# HV) fill at least the fill fraction of the SMs; ``CHAIN_PLAN`` then deepens no forward table there and
+# :func:`fwd_a_route` serves the row.  A planner table that is serial already keeps every rule.  R200
+# (sm_107a, 212 SMs; 4 fresh processes, CUPTI, cold L2) against the split tables: the 3 sequences of 11000 / 12000 /
+# 9768 tokens with HV 48 (144 serial CTAs, ratio 1.06) run fwd 0.71-0.85, fwd+bwd 0.89-0.95, checkpoint 0.82-0.90 and
+# bwd 1.00 of the split table's time under both gate regimes, the same bits run to run; with HV 24 (72 CTAs, ratio
+# 1.51) the serial table is slower (fwd 1.25, fwd+bwd 1.08, checkpoint 1.08 under the bandwidth gate), with HV 12
+# (2.74) 21-34 % slower.  The crossover between 1.06 and 1.51 is not measured: 1.10 keeps the measured win, and the
+# fill of 0.65 (138 CTAs on 212 SMs) keeps it off the layouts of fewer serial CTAs the price alone admits (4 sequences
+# of 4096 tokens with HV 24: 96 CTAs, ratio 1.08, whose split table the forward's value-half split prices), measured
+# nowhere.  On B200 the planner keeps the serial table of the HV 48 layout itself.
+FWD_A_SERIAL_KEEP: dict[str, tuple[float, float]] = {"sm_107a": (1.10, 0.65)}
 # fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
 FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
 
@@ -3141,6 +3162,75 @@ def fwd_a_route(
     if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
         return False
     return _available("wy_a", arch) and _available("fwd_ho_a", arch)
+
+
+@lru_cache(maxsize=4096)
+def _fwd_scan_record(total_tokens, seq_lens, num_v_heads, device_index, sset, props):
+    """The register planner's pricing record of a host layout's forward table without plan pins."""
+    _plan, rec = choose_scan_plan("fwd_h", total_tokens, len(seq_lens), num_v_heads, device_index, seq_lens,
+                                  sset)  # fmt: skip
+    return rec
+
+
+def fwd_serial_keep_pricing(
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    plan: ScanPlan,
+    *,
+    total_tokens: int | None = None,
+) -> dict:
+    """The forward table rule of :data:`FWD_A_SERIAL_KEEP` on a host layout whose planner forward table without plan
+    pins is ``plan``: ``{"select", "ratio", "fill", "serial", "limit", "min_fill"}``, ``serial`` the planner's cheapest
+    serial table, ``ratio`` its price over the price of ``plan`` and ``fill`` its CTAs over the SMs (``select``: ``plan``
+    splits a sequence, ``ratio`` is at most the architecture's ``limit`` and ``fill`` at least its ``min_fill``).  Host
+    work only."""
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    seq_lens = tuple(int(n) for n in seq_lens)
+    limit, min_fill = FWD_A_SERIAL_KEEP.get(arch, (None, None))
+    rec: dict[str, Any] = {
+        "select": False,
+        "ratio": None,
+        "fill": None,
+        "serial": None,
+        "limit": limit,
+        "min_fill": min_fill,
+    }
+    chunks = tuple(-(-n // CHUNK) for n in seq_lens)
+    if (
+        limit is None
+        or min_fill is None
+        or not chunks
+        or plan.segment_len <= 0
+        or max(chunks) <= plan.segment_len
+    ):
+        return rec
+    tokens = sum(seq_lens) if total_tokens is None else int(total_tokens)
+    priced = _fwd_scan_record(tokens, seq_lens, int(num_v_heads), index, stage_set(arch),
+                              _device_props(index)).get("priced") or []  # fmt: skip
+    chosen = [
+        cost
+        for config, seg_len, cost in priced
+        if tuple(config) == tuple(plan.config) and seg_len == plan.segment_len and cost
+    ]
+    serial = [
+        (cost, tuple(config))
+        for config, seg_len, cost in priced
+        if seg_len == 0 and cost is not None
+    ]
+    if not chosen or not serial:
+        return rec
+    cost, config = min(serial)
+    ratio = cost / chosen[0]
+    fill = len(seq_lens) * int(num_v_heads) / _device_props(index)[0]
+    rec.update(
+        select=ratio <= limit and fill >= min_fill,
+        ratio=round(ratio, 4),
+        fill=round(fill, 4),
+        serial=ScanPlan(config, 0),
+    )
+    return rec
 
 
 def _fwd_a_inputs(
@@ -3358,6 +3448,18 @@ def _forward_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output
 FWD_SPLIT_ARCHS = ("sm_100a", "sm_103a")
 # fwd_fused's tape word per tape entry
 FWD_FUSED_TAPE = {"h": 1, "v_new": 2}
+# On an architecture of ``FWD_SPLIT_A_ARCHS`` the split forward runs on wy_a's A alone (no WY stage, u and w never
+# formed in memory): both waves are ``fwd_ho_a`` (the serial route's fused scan and output, with the h / v_new / w
+# tapes of :data:`FWD_A_TAPE`) on the split tables, and the middle pieces' maps are ``fwd_summary_a`` (the same maps
+# and layout as ``fwd_summary``, u and w formed in the CTA).  ``fwd_ho_a`` has no ``split_out``: wave 1 stores the end
+# state of each first piece as its sequence's final state, which is copied into the B half of the segment state, the
+# first pieces' flags zeroed, before the stitch.  B200 (148 SMs, CUPTI, cold L2, the issue row of three sequences of
+# 131071 / 87531 / 43385 tokens at HV 6): 145-193 us less per taped forward and 193-238 us less per forward without a
+# tape than the waves on the WY stage's w / u; sm_103a keeps those until a GB300 measurement.
+FWD_SPLIT_A_ARCHS = ("sm_100a",)
+# the stages of the split forward on wy_a's A, and of the split forward on the WY stage's w / u
+FWD_SPLIT_A_STAGES = ("wy_a", "fwd_ho_a", "fwd_summary_a", "stitch")
+FWD_SPLIT_W_STAGES = ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch")
 # fwd_summary's output layout into the stitch's [B | M] FP32 [K][V + K] block: b_head, b_row, m_head, m_row, m_col
 _SUMMARY_LAYOUT = (
     HEAD_DIM * 2 * HEAD_DIM,
@@ -3375,8 +3477,11 @@ class ForwardSplit:
     ``seq_chunk_start`` with each split sequence ending at the end of its first piece, so wave 1 stores that piece's
     end state), the walks of wave 1 (``first``: each split sequence's first piece), of the summary (``middle``) and of
     wave 2 (``rest``: every other piece, and the one piece of every unsplit sequence), and ``slot`` (the identity: the
-    summary's map of piece ``s`` goes to segment ``s``).  ``one_stream``: the summary then wave 1 on the caller's
-    stream instead of the summary on a side stream (the same kernels and bits)."""
+    summary's map of piece ``s`` goes to segment ``s``); ``first_index`` (``first`` as int64) and ``first_seq`` (int64,
+    the sequence of each first piece; ``None`` where every sequence splits, in table order) index the copy of wave 1's
+    end states into the segment state when the waves run ``fwd_ho_a`` (:data:`FWD_SPLIT_A_ARCHS`).  ``one_stream``:
+    the summary then wave 1 on the caller's stream instead of the summary on a side stream (the same kernels and
+    bits)."""
 
     seg_chunk_start: torch.Tensor
     seg_seq: torch.Tensor
@@ -3386,6 +3491,8 @@ class ForwardSplit:
     middle: torch.Tensor
     rest: torch.Tensor
     slot: torch.Tensor
+    first_index: torch.Tensor
+    first_seq: torch.Tensor | None
     num_segments: int
     num_first: int
     num_middle: int
@@ -3439,8 +3546,19 @@ def forward_split_tables(
     for part in parts:
         views.append(table[offset : offset + len(part)])
         offset += len(part)
-    return ForwardSplit(*views, num_segments=num_segments, num_first=len(lists[4]), num_middle=len(lists[5]),
-                        num_rest=len(lists[6]), length=int(length), one_stream=bool(one_stream))  # fmt: skip
+    # the int64 indices of the copy of wave 1's end states (fwd_ho_a waves): first pieces and their sequences
+    first = lists[4]
+    first_seq = [lists[1][s] for s in first]
+    index = torch.tensor(
+        first + (first_seq if first_seq != list(range(len(chunks))) else []),
+        dtype=torch.int64,
+    )
+    index = index.pin_memory().to(device, non_blocking=True)
+    first_index = index[: len(first)]
+    first_seq_index = index[len(first) :] if index.numel() > len(first) else None
+    return ForwardSplit(*views, first_index=first_index, first_seq=first_seq_index, num_segments=num_segments,
+                        num_first=len(first), num_middle=len(lists[5]), num_rest=len(lists[6]), length=int(length),
+                        one_stream=bool(one_stream))  # fmt: skip
 
 
 def forward_split_length(
@@ -3513,9 +3631,15 @@ def fwd_split_route(
         return False
     if not _fwd_a_inputs(meta, q, k, v, beta, normalize_qk, options):
         return False
-    return all(
-        _available(stage, arch)
-        for stage in ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch")
+    return _fwd_split_a(arch) or all(
+        _available(stage, arch) for stage in FWD_SPLIT_W_STAGES
+    )
+
+
+def _fwd_split_a(arch: str) -> bool:
+    """Whether the split forward on ``arch`` runs on wy_a's A (:data:`FWD_SPLIT_A_ARCHS`, its stages delivered)."""
+    return arch in FWD_SPLIT_A_ARCHS and all(
+        _available(stage, arch) for stage in FWD_SPLIT_A_STAGES
     )
 
 
@@ -3523,6 +3647,10 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
                    tape) -> dict[str, Any]:  # fmt: skip
     """The forward of :func:`fwd_split_route`'s calls (:data:`FWD_SPLIT_ARCHS`); the tape of
     :func:`cake_gdn_nondet_train_forward`."""
+    if _fwd_split_a(arch):
+        return _forward_split_a(q, k, v, g32, beta32, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
+                                output_final_state=output_final_state, normalize_qk=normalize_qk, options=options,
+                                tape=tape)  # fmt: skip
     split = cast("ForwardSplit", meta.fwd_split)
     num_heads, num_v_heads = q.shape[-2], v.shape[-2]
     total_tokens = q.numel() // (num_heads * HEAD_DIM)
@@ -3728,6 +3856,187 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
             _fire(wave1)
         finally:
             main.wait_stream(side)  # the join
+    _fire(stitch)
+    _fire(wave2)
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
+    return {
+        "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
+        "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
+        "w": w, "u": u, "v": v_in, "beta32": beta32, "meta": meta, "scale": float(scale),
+        "output": o, "final_state": final_state if output_final_state else None, "initial_state": initial_state,
+        "h": h, "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_split",
+        "m_share": seg_state if m_share else None,
+        "m_share_shape": tuple(seg_state.shape) if meta.m_share else None,
+    }  # fmt: skip
+
+
+def _forward_split_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk,
+                     options, tape) -> dict[str, Any]:  # fmt: skip
+    """The split forward on wy_a's A (:data:`FWD_SPLIT_A_ARCHS`): ``wy_a``, then wave 1 (``fwd_ho_a`` on the first
+    pieces, their end states as the final states) beside the middle pieces' maps (``fwd_summary_a``, side stream), the
+    copy of those end states into the segment state, the stitch and wave 2 (``fwd_ho_a`` on every other piece from its
+    stitched start state); the tape of :func:`cake_gdn_nondet_train_forward`, as the serial route's (u a placeholder)."""
+    split = cast("ForwardSplit", meta.fwd_split)
+    num_heads, num_v_heads = q.shape[-2], v.shape[-2]
+    total_tokens = q.numel() // (num_heads * HEAD_DIM)
+    device = q.device
+    index = _tensor_index(q)
+    f32, bf16 = torch.float32, q.dtype
+    if not (_tma_rows(q) and _tma_rows(k)):
+        q, k = _dense(q), _dense(k)
+    # fwd_ho_a's and fwd_summary_a's tensor maps read v in place where the stages that read v by rows do, else a copy
+    copy_v = _v_rows(v) is None
+    pieces = [(q.shape, bf16), (k.shape, bf16), ((total_tokens, num_heads), f32), ((total_tokens, num_heads), f32),
+              ((total_tokens, num_v_heads), f32), ((total_tokens, num_v_heads, CHUNK), bf16)]  # fmt: skip
+    if copy_v:
+        pieces.append((v.shape, v.dtype))
+    state = [((total_tokens, num_v_heads, HEAD_DIM), bf16), (v.shape, v.dtype),
+             ((meta.num_chunks, num_v_heads, HEAD_DIM, HEAD_DIM), bf16), (v.shape, v.dtype)]  # fmt: skip
+    # the state the tape keeps are views of the forward's one allocation (w from the waves' tape, never u), the rest
+    # placeholders, as on the serial route
+    kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
+    on_tape = [name in kept for name in cake_plan.STATE_NAMES]
+    views = _carve(
+        device, pieces + [s for s, on in zip(state, on_tape, strict=True) if on]
+    )
+    qn, kn, rstd_q, rstd_k, g_cs, A = views[:6]
+    v_dense = views[6] if copy_v else None
+    kept_views = iter(views[len(pieces) :])
+    w, u, h, v_new = (
+        next(kept_views) if on else cake_plan.placeholder(shape, dtype, device)
+        for (shape, dtype), on in zip(state, on_tape, strict=True)
+    )
+    o = torch.empty(v.shape, dtype=v.dtype, device=device)
+    workspaces = _workspaces(options)
+    table = workspaces.table(index)
+    word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
+    rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
+    h_t = (
+        h
+        if "h" in kept
+        else workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    )
+    v_new_t = v_new if "v_new" in kept else rows
+    w_t = w if "w" in kept else rows
+    hv = num_v_heads
+    state_shape = (meta.num_seqs, hv, HEAD_DIM, HEAD_DIM)
+    if output_final_state:
+        final_state = torch.empty(state_shape, dtype=f32, device=device)
+        first_final = final_state
+    else:
+        final_state = workspaces.take(
+            table, "f_zero_state", (0, hv, HEAD_DIM, HEAD_DIM), f32, device
+        )
+        # wave 1 stores the first pieces' end states as final states: a buffer of every sequence's rows
+        first_final = workspaces.take(table, "f_first_final", state_shape, f32, device)
+    initial_rows = _table_rows(initial_state, meta)
+    if initial_rows is not None:
+        h0 = initial_rows.contiguous()
+        if h0.dtype != f32:
+            h0 = h0.float()
+        use_init = 1
+    else:
+        h0, use_init = final_state, 0
+    # under M-share (``meta.m_share``) a taped forward's segment state is an allocation of its own, kept on the tape
+    m_share = tape and meta.m_share
+    seg_shape = (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM)
+    seg_state = (
+        torch.empty(seg_shape, dtype=f32, device=device)
+        if m_share
+        else workspaces.take(table, "f_seg_state", seg_shape, f32, device)
+    )
+    seg_flag = workspaces.take(
+        table, "f_seg_flag", (split.num_segments, hv), torch.int32, device
+    )
+    seg_start = workspaces.take(
+        table, "f_seg_start", (split.num_segments, hv, HEAD_DIM, HEAD_DIM), f32, device
+    )
+    sm_count = _device_props(index)[0]
+    v_in = v_dense if copy_v else v
+
+    def wave(walk, count, ends, init, use_seg, store_final, final):
+        return _prepared("fwd_ho_a", count * hv, 1, 1, qn, kn, v_in, A, g_cs, beta32, h0, seg_start, h_t, h_t,
+                         v_new_t, v_new_t, o, o, final, w_t, w_t, meta.chunk_start, meta.chunk_len,
+                         split.seg_chunk_start, split.seg_seq, ends, walk, num_heads, hv, init, store_final, use_seg,
+                         float(scale), word)  # fmt: skip
+
+    front = _prepared("wy_a", min(sm_count, meta.num_chunks * num_heads), 1, 1, k, k, q, g32, beta32,
+                      A.view(torch.uint32), rstd_k, rstd_q, g_cs, qn.view(torch.uint32), kn.view(torch.uint32),
+                      meta.chunk_start, meta.chunk_len, meta.num_chunks, num_heads, hv)  # fmt: skip
+    wave1 = (
+        wave(split.first, split.num_first, split.first_end, use_init, 0, 1, first_final)
+        if split.num_first
+        else None
+    )
+    summary = (
+        _prepared(
+            "fwd_summary_a",
+            split.num_middle * hv,
+            1,
+            1,
+            kn,
+            v_in,
+            A,
+            g_cs,
+            beta32,
+            seg_state,
+            seg_state,
+            seg_flag,
+            meta.chunk_start,
+            meta.chunk_len,
+            split.seg_chunk_start,
+            split.middle,
+            split.slot,
+            num_heads,
+            hv,
+            *_SUMMARY_LAYOUT,
+        )  # fmt: skip
+        if split.num_middle
+        else None
+    )
+    stitch = _prepared("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, h0, seg_start, split.seq_seg_start,
+                       seg_flag, hv, use_init, 0)  # fmt: skip
+    wave2 = wave(
+        split.rest,
+        split.num_rest,
+        meta.seq_chunk_start,
+        0,
+        1,
+        1 if output_final_state else 0,
+        final_state,
+    )
+    if copy_v:
+        _dense(v, v_dense)
+    _fire(front)
+    if split.num_first:
+        # the first pieces' segments hold their end states (flag 0: a state, not a map) for the stitch
+        seg_flag.index_fill_(0, split.first_index, 0)
+    if summary is None or wave1 is None or split.one_stream:
+        for launch in (summary, wave1):
+            if launch is not None:
+                _fire(launch)
+    else:
+        main = torch.cuda.current_stream(index)
+        side = _side_stream(index, main)
+        fork = torch.cuda.Event()
+        fork.record(main)
+        try:
+            with torch.cuda.stream(side):
+                side.wait_event(fork)
+                _fire(summary)
+            _fire(wave1)
+        finally:
+            main.wait_stream(side)  # the join
+    if split.num_first:
+        ends = (
+            first_final
+            if split.first_seq is None
+            else first_final.index_select(0, split.first_seq)
+        )
+        seg_state[:, :, :, :HEAD_DIM].index_copy_(0, split.first_index, ends)
     _fire(stitch)
     _fire(wave2)
     if output_final_state:
@@ -4861,12 +5170,12 @@ def host_plans(
     group: int | None = None,
 ) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
     """The forward and adjoint tables of a host layout (``seq_lens``, tokens per sequence) on device ``device_index``
-    and whether the adjoint table is priced for ``dhu_tc2`` (``ChunkMeta.bwd_tc``): the planner's tables, the adjoint
-    table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split tables of ``CHAIN_PLAN``; plan pins (and a
-    ``dhu_scan`` pin) keep the planner's tables.  ``group`` is the call's value-head group ``HV / H`` (``None``: a
-    group the R form of :func:`split_r_form` does not serve), the one input besides the layout that changes a table:
-    on an architecture of ``SPLIT_R_FORM`` a group of three keeps a planner's split adjoint table that the R form
-    groups.  Host work only."""
+    and whether the adjoint table is priced for ``dhu_tc2`` (``ChunkMeta.bwd_tc``): the planner's tables, the serial
+    forward table of ``FWD_A_SERIAL_KEEP``, the adjoint table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split
+    tables of ``CHAIN_PLAN``; plan pins (and a ``dhu_scan`` pin) keep the planner's tables.  ``group`` is the call's
+    value-head group ``HV / H`` (``None``: a group the R form of :func:`split_r_form` does not serve), the one input
+    besides the layout that changes a table: on an architecture of ``SPLIT_R_FORM`` a group of three keeps a planner's
+    split adjoint table that the R form groups.  Host work only."""
     return _host_plans(
         seq_lens,
         num_v_heads,
@@ -4895,7 +5204,14 @@ def _host_plans(
         total_tokens = sum(seq_lens)
     plans = scan_plans(int(total_tokens), len(seq_lens), int(num_v_heads), index, seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
-    bwd_tc = kept = False
+    bwd_tc = kept = keep_serial = False
+    if options.pins == (None, None):
+        # the serial forward table of FWD_A_SERIAL_KEEP (fwd_a_route serves it; CHAIN_PLAN deepens no forward table)
+        keep = fwd_serial_keep_pricing(
+            seq_lens, int(num_v_heads), index, plans[0], total_tokens=total_tokens
+        )
+        if keep["select"]:
+            plans, keep_serial = (keep["serial"], plans[1]), True
     if TC_PLAN and options.pins == (None, None) and options.dhu_scan is None:
         chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
         bwd = plans[1]
@@ -4930,7 +5246,11 @@ def _host_plans(
             for kind in ("fwd", "bwd"):
                 plan = plans[0] if kind == "fwd" else plans[1]
                 serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
-                if (serial and stream_split is not None) or (kind == "bwd" and kept):
+                if (
+                    (serial and stream_split is not None)
+                    or (kind == "bwd" and kept)
+                    or (kind == "fwd" and keep_serial)
+                ):
                     continue
                 deeper = chain_plan_pricing(kind, chunks, int(num_v_heads), index, plan)
                 if not deeper["select"]:
@@ -5013,6 +5333,7 @@ def _chunk_meta(
         id(cake_plan.ADJOINT_FORMS),
         FWD_SPLIT_ARCHS,
         tuple(sorted(cake_plan.FORWARD_SPLIT_MIN_PIECE.items())),
+        tuple(sorted(FWD_A_SERIAL_KEEP.items())),
         tuple(sorted(M_SHARE_ARCHS)),
         id(cake_plan.M_SHARE_COSTS),
         cake_plan.M_SHARE_MIN_SAVING,
