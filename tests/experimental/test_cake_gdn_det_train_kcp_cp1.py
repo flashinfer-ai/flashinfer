@@ -1030,3 +1030,102 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
         for n in light:
             assert torch.equal(full[n], light[n]), (i, n)
+
+
+# --------------------------------------------------------------------------- eager pool / ticket sizing after launch #1 (one GPU)
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
+    ids=("light", "full", "l2n", "P2"),
+)
+@pytest.mark.parametrize("ckpt", (False, True), ids=("direct", "checkpoint"))
+def test_eager_pools_and_tickets_are_sized_after_the_first_launch(
+    device, monkeypatch, ckpt, knobs
+) -> None:
+    """The kernels backend, one rank, an autograd forward + backward directly and under a non-reentrant checkpoint:
+    at the first launch of every eager call the call's (fresh) workspace holds no pool (and no ticket slot unless the
+    first program is persistent: #6 of a backward on saved or kept tapes) and its sizing is pending; out and the five gradients, the launch records (program, grid) and sequences of the last
+    forward and backward, their workspace bytes and the CUDA peak above the inputs are those of the package with
+    the sizing done in ``ensure`` (``defer=False``), the peak within the allocator's block rounding; every run
+    repeats bitwise."""
+    from torch.utils.checkpoint import checkpoint
+
+    kcp = importlib.import_module(
+        "flashinfer.experimental.cake.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    cu = _cu((2048 + 37, 1000, 129))
+    inputs = make_inputs(cu, 16, 48)
+    ctx = _local_context(cu, device)
+    ctx.prepare(16, 48, P=knobs.get("segments"))
+    dout = inputs["dout"].to(device)
+    leaves0 = [inputs[n].to(device) for n in OPERANDS]
+    first: list = []
+    real_run = kcp.KernelBackend.run
+
+    def run(self, name, args):
+        call = args["_call"]
+        if all(c is not call for c, *_ in first):
+            ws = call.ws
+            first.append(
+                (call, name, sorted(ws._pools), ws._tickets is not None, ws._pending is not None)
+            )
+        return real_run(self, name, args)
+
+    monkeypatch.setattr(kcp.KernelBackend, "run", run)
+    real_ensure = kcp.CakeGDNDetKcpWorkspace.ensure
+
+    def step(defer: bool) -> tuple[dict, dict, int]:
+        def ensure(self, *a, defer=False, **k):  # noqa: ARG001 - the undeferred sizing
+            return real_ensure(self, *a, defer=False, **k)
+
+        if not defer:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", ensure)
+        try:
+            leaves = [x.detach().clone().requires_grad_(True) for x in leaves0]
+
+            def fn(*xs):
+                return gdn_api.cake_gdn_det_kcp(*xs, ctx, **knobs)
+
+            torch.cuda.synchronize(device)
+            base = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+            grads = torch.autograd.grad(out, leaves, dout)
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device) - base
+        finally:
+            monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", real_ensure)
+        res = {"out": out.detach()}
+        res.update({n: gr.detach() for n, gr in zip(GRAD_NAMES, grads, strict=True)})
+        log = {
+            kind: {
+                key: kcp.LAST_CALL[kind][key]
+                for key in ("records", "sequence", "workspace_bytes", "pool_bytes", "tape_bytes")
+            }
+            for kind in ("fwd", "bwd")
+        }
+        return res, log, peak
+
+    ref, ref_log, ref_peak = step(False)
+    n_ref = len(first)
+    assert n_ref >= 2 and all(tk and not pend and pools for _, _, pools, tk, pend in first)
+    got, got_log, got_peak = step(True)
+    deferred = first[n_ref:]
+    assert len(deferred) == n_ref
+    for call, name, pools, tk, pend in deferred:
+        assert call.T_r > 0 and pend and pools == [], (call.backward, name, pools)
+        # the ticket slots exist at the first launch only when it is a persistent program (#6 on saved / kept tapes)
+        assert tk == (name in kcp.TICKET_SITES), (call.backward, name, tk)
+        assert call.ws._pending is None
+    for n in TENSORS:
+        assert torch.equal(got[n], ref[n]), n
+    assert got_log == ref_log
+    # the same tensors are live at every moment; the caching allocator may round a reused block differently when
+    # the allocation order changes (a large block keeps an unsplit remainder below 1 MiB)
+    assert abs(got_peak - ref_peak) <= 4 << 20, (got_peak, ref_peak)
+    again, again_log, _ = step(True)
+    for n in TENSORS:
+        assert torch.equal(again[n], got[n]), n
+    assert again_log == got_log

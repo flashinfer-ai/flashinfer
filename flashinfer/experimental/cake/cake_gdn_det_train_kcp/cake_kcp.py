@@ -2651,6 +2651,10 @@ class CakeGDNDetKcpWorkspace:
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
         )
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
+        # an eager call's pool and ticket sizing, deferred by ensure(defer=True) until the call's first launch has been
+        # issued (CakeGDNDetKcpCall.kernel) or a pool is first read (a ticket read sizes the ticket slots alone):
+        # (tables, backward, skip, device)
+        self._pending: tuple | None = None
         # the Q / K head count of the in-kernel L2 norm tapes (QK_TAPES / QK_RSTD: [T, H_qk, ...]); the last ensure()'s
         self.qk_heads: int | None = None
         if ctx is not None:
@@ -2681,9 +2685,13 @@ class CakeGDNDetKcpWorkspace:
         fused_walks: int = 1,
         P: int | None = None,
         skip: Sequence[str] = (),
+        defer: bool = False,
     ) -> _Tables:
         """Size the pools for ``(ctx, HV)`` and bind the tape geometry; returns the tables (``P``: the segments
-        override of the plan).  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
+        override of the plan).  ``defer`` (eager calls): the pools and the ticket slots are sized by :meth:`settle`,
+        which runs after the call's first launch is issued (or at the first read of a pool, a ticket or the byte
+        counts, and at the end of the call), so their host work overlaps that launch's device time; the sizes, names
+        and contents are the same.  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
         pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` under
         ``save_transfer`` and ``stage_m`` when the saved set carries ``M_seg``); a skipped pool is not allocated, a
         held one is left as it is, and a later ``ensure()`` without the name sizes it.  A workspace built from
@@ -2698,17 +2706,38 @@ class CakeGDNDetKcpWorkspace:
                 f"CakeGDNDetKcpWorkspace: lives on {self.device}, the call is on {device}"
             )
         validate_heads(H_qk, HV)
+        self.settle()  # an earlier call's deferred sizing first (same order as an undeferred ensure)
         tb = self.tables(ctx, HV, fused_walks=fused_walks, P=P)
+        if defer:
+            self._pending = (tb, bool(backward), tuple(skip), device)
+        else:
+            self._size_pools(tb, backward, skip, device)
+        geometry = (int(ctx.R), int(ctx.NC_pad), int(HV), int(ctx.T_r))
+        if self.geometry != geometry:
+            self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
+            self.geometry = geometry
+        if self.qk_heads != int(H_qk):
+            for name in (*QK_TAPES, QK_RSTD):  # the L2 norm tapes are [T, H_qk, ...]
+                self._tapes.pop(name, None)
+            self.qk_heads = int(H_qk)
+        return tb
+
+    def _size_pools(
+        self, tb: _Tables, backward: bool, skip: Sequence[str], device: torch.device
+    ) -> None:
         for name, n in tb.pool_sizes(backward).items():
             if name in skip:
                 continue
             cur = self._pools.get(name)
             if cur is None or cur.numel() < n:
                 self._pools[name] = (
-                    _identity_tile(ctx, n, self.state_dtype, device)
+                    _identity_tile(tb.ctx, n, self.state_dtype, device)
                     if name == "eye"
                     else _alloc((n,), self.state_dtype, device)
                 )
+        self._size_tickets(device)
+
+    def _size_tickets(self, device: torch.device) -> None:
         if (
             self._tickets is None
         ):  # once per workspace: the kernels keep every word at zero afterwards
@@ -2720,15 +2749,13 @@ class CakeGDNDetKcpWorkspace:
             )
             skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
             self._tickets = base[skew : skew + words]
-        geometry = (int(ctx.R), int(ctx.NC_pad), int(HV), int(ctx.T_r))
-        if self.geometry != geometry:
-            self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
-            self.geometry = geometry
-        if self.qk_heads != int(H_qk):
-            for name in (*QK_TAPES, QK_RSTD):  # the L2 norm tapes are [T, H_qk, ...]
-                self._tapes.pop(name, None)
-            self.qk_heads = int(H_qk)
-        return tb
+
+    def settle(self) -> None:
+        """Size the pools and ticket slots an ``ensure(defer=True)`` left pending (no-op otherwise)."""
+        pending = self._pending
+        if pending is not None:
+            self._pending = None
+            self._size_pools(*pending)
 
     def ticket(self, site: str) -> torch.Tensor:
         """The 128-byte u32 ticket slot of persistent launch site ``site`` (one of :data:`TICKET_SITES`): the
@@ -2737,6 +2764,10 @@ class CakeGDNDetKcpWorkspace:
             raise KeyError(
                 f"CakeGDNDetKcpWorkspace: {site!r} is not a persistent launch site {TICKET_SITES}"
             )
+        if self._tickets is None and self._pending is not None:
+            # a persistent program's slot before the deferred pools: a call whose first launch is persistent (the
+            # backward's #6 on saved or kept tapes) sizes the slots alone and still issues that launch before the pools
+            self._size_tickets(self._pending[3])
         if self._tickets is None:
             raise KeyError(
                 "CakeGDNDetKcpWorkspace: no ticket slots yet (ensure() first)"
@@ -2745,6 +2776,8 @@ class CakeGDNDetKcpWorkspace:
         return self._tickets[i : i + TICKET_SLOT_WORDS]
 
     def pool(self, name: str, n: int | None = None) -> torch.Tensor:
+        if self._pending is not None:
+            self.settle()
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -2755,10 +2788,14 @@ class CakeGDNDetKcpWorkspace:
         return t if n is None else t[:n]
 
     def has(self, name: str) -> bool:
+        if self._pending is not None:
+            self.settle()
         return name in self._pools
 
     def release_pool(self, name: str) -> bool:
         """Drop pool ``name`` (sized again by the next ``ensure``); ``True`` when it was held."""
+        if self._pending is not None:
+            self.settle()
         return self._pools.pop(name, None) is not None
 
     def tape(self, name: str) -> torch.Tensor:
@@ -2804,6 +2841,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def bytes(self) -> int:
+        self.settle()
         return (
             sum(t.numel() * t.element_size() for t in self._pools.values())
             + self.tape_bytes
@@ -2812,6 +2850,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def ticket_bytes(self) -> int:
+        self.settle()
         t = self._tickets
         return 0 if t is None else t.numel() * t.element_size()
 
@@ -2821,6 +2860,7 @@ class CakeGDNDetKcpWorkspace:
 
     @property
     def pool_bytes(self) -> dict[str, int]:
+        self.settle()
         return {k: t.numel() * t.element_size() for k, t in self._pools.items()}
 
 
@@ -3186,6 +3226,10 @@ class CakeGDNDetKcpCall:
             self._deferred.append((name, args))
             return
         self.backend.run(name, args)
+        ws = getattr(self, "ws", None)  # (a test's stand-in call may carry no workspace)
+        if ws is not None and ws._pending is not None:
+            # S4: the pools and ticket slots of this eager call are sized now, under the first launch's device time
+            ws.settle()
 
     def _walk_common(self, walk: Sequence[int]) -> dict[str, Any]:
         tb = self.tb
@@ -4893,6 +4937,9 @@ def _sig(t: Any) -> tuple:
 def _arena_sig(ws: Any) -> tuple:
     """(name, pointer, size) of every pool and tape buffer of the workspace arena, in name order, and of the ticket
     slots (one buffer; a capture bakes their addresses like the pools')."""
+    settle = getattr(ws, "settle", None)
+    if settle is not None:
+        settle()
     tickets = getattr(ws, "_tickets", None)
     return (
         tuple(sorted((n, t.data_ptr(), t.numel()) for n, t in ws._pools.items())),
@@ -5069,6 +5116,8 @@ def _prepare(
         fused_walks=int(opts.knob("fused_walks")),
         P=P,
         skip=skip,
+        # eager: pools and ticket slots are sized after the first launch (a capture bakes their addresses first)
+        defer=opts.graph == "off",
     )
     ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     if dout is not None:
@@ -5294,6 +5343,8 @@ def _fwd_entry(
         executable=executable,
         s_in=s_in,
     )
+    # a rank without tokens may issue no launch: the deferred pool / ticket sizing completes here at the latest
+    call.ws.settle()
     _record("fwd", call)
     if opts.graph != "off":
         _graph_eager("fwd", entry)
@@ -5763,6 +5814,8 @@ def _bwd_body(
 ) -> tuple[torch.Tensor, ...]:
     """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``."""
     _backward(call, saved)
+    # a rank without tokens may issue no launch: the deferred pool / ticket sizing completes here at the latest
+    call.ws.settle()
     return tuple(call.grads[n] for n in ("dq", "dk", "dv", "dbeta", "dg"))
 
 

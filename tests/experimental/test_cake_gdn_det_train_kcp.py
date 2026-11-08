@@ -2768,8 +2768,10 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
 
     class Recording(kcp.FakeBackend):
         def run(self, name, args):
+            # every pool the call holds at any of its launches (an eager call sizes its pools after its first launch)
             if not seen_pools or seen_pools[-1] is None:
-                seen_pools.append(set(args["_call"].ws._pools))
+                seen_pools.append(set())
+            seen_pools[-1] |= set(args["_call"].ws._pools)
             super().run(name, args)
 
     previous = kcp._BACKENDS.get("fake")
@@ -6841,3 +6843,288 @@ def test_chunk_tokens_follow_the_contexts_chunk_table(monkeypatch) -> None:
     monkeypatch.setattr(kcp, "_chunk_tokens", lambda c, table: sum(table) - 1)
     with pytest.raises(ValueError, match="chunks cover"):
         _ckpt_autograd(kcp, ctx, ops, ckpt=False, use_qk_l2norm_in_kernel=True)
+
+
+# --------------------------------------------------------------------------- eager pool / ticket sizing after launch #1
+# An eager call sizes its workspace pools and ticket slots after its first launch is issued (``ensure(defer=True)``,
+# :meth:`CakeGDNDetKcpWorkspace.settle`): no pool or ticket byte exists at that launch, and the launch log, the
+# results and the workspace's bytes are the package's with the sizing done in ``ensure`` (``defer=False``).
+
+DEFER_ROWS = {
+    # one rank (no exchange)
+    "one_rank": ([0, 100, 740, 817, 1817, 1946], 1, {"layout": "contiguous"}, (2, 6), 1.0),
+    # the W = 8 multi-rank row (per-document zigzag, every rank in the exchange)
+    "w8_zigzag": (MR_CU, MR_W, {"layout": "zigzag_per_document"}, MR_HEADS, MR_G_SCALE),
+    # a rank without tokens (it still owns heads and joins the exchange)
+    "zero_token_rank": (
+        [0, 1700, 3000],
+        4,
+        {"fragments": _ragged_fragments([0, 1700, 3000], [1200, 0, 900, 900])},
+        (2, 6),
+        MR_G_SCALE,
+    ),
+}
+
+
+def _defer_setup(row: str):
+    cu, W, part_kw, heads, g_scale = DEFER_ROWS[row]
+    kcp = _package("cake_kcp")
+    part = gp.cake_gdn_det_train_kcp_partition(
+        torch.tensor(cu, dtype=torch.int64), W, **part_kw
+    )
+    ops = dict(_inputs(cu, *heads))
+    ops["g"] = (ops["g"] * g_scale).contiguous()
+    return kcp, part, W, ops
+
+
+class _RawPeakWorkspace:
+    """A ``CakeGDNDetKcpWorkspace`` recording the most bytes it holds (pools + tapes + ticket slots, read from its
+    buffers directly: the byte properties would complete a deferred sizing) after every allocating / releasing
+    step."""
+
+    def __new__(cls, kcp):
+        class Raw(kcp.CakeGDNDetKcpWorkspace):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.peak = 0
+
+            def _held(self) -> int:
+                n = sum(t.numel() * t.element_size() for t in self._pools.values())
+                n += sum(t.numel() * t.element_size() for t in self._tapes.values())
+                t = self._tickets
+                return n + (0 if t is None else t.numel() * t.element_size())
+
+            def _upd(self):
+                self.peak = max(self.peak, self._held())
+
+            def ensure(self, *a, **k):
+                tb = super().ensure(*a, **k)
+                self._upd()
+                return tb
+
+            def settle(self):
+                super().settle()
+                self._upd()
+
+            def tape(self, name):
+                t = super().tape(name)
+                self._upd()
+                return t
+
+            def pool(self, name, n=None):
+                t = super().pool(name, n)
+                self._upd()
+                return t
+
+            def adopt_tape(self, name, t):
+                r = super().adopt_tape(name, t)
+                self._upd()
+                return r
+
+        return Raw()
+
+
+def _defer_run(kcp, part, W, ops, monkeypatch, *, defer: bool, knobs: dict, peak: bool):
+    """Forward + saved-set backward of every rank (fake backend, ``W`` threads when ``W > 1``) with the deferred
+    sizing as shipped (``defer``) or with ``ensure`` sizing at once: the global-order results, per rank the calls in
+    order (every eager call reaches ``_record``), the workspace state each call's first launch saw (``id(call)`` ->
+    pools held, ticket slots bound, sizing pending) and the peaks.  ``peak``: a caller-held
+    :class:`_RawPeakWorkspace` per rank (its forward and backward peaks per rank); else ``workspace=None`` (a fresh
+    workspace per call)."""
+    holder: dict = {}
+    first: dict = {}
+    lock = threading.Lock()
+
+    def rank_of() -> int:
+        comm = holder.get("comm")
+        return getattr(comm.local, "rank", 0) if comm is not None else 0
+
+    class FirstLaunch(kcp.FakeBackend):
+        def run(self, name, args):
+            call = args["_call"]
+            ws = call.ws
+            with lock:
+                if id(call) not in first:
+                    first[id(call)] = (
+                        name,
+                        sorted(ws._pools),
+                        ws._tickets is not None,
+                        ws._pending is not None,
+                    )
+            super().run(name, args)
+
+    calls: dict[int, list] = {r: [] for r in range(W)}
+    real_record = kcp._record
+
+    def record(kind, call):
+        with lock:
+            calls[rank_of()].append(call)
+        return real_record(kind, call)
+
+    monkeypatch.setattr(kcp, "_record", record)
+    if not defer:
+        original = kcp.CakeGDNDetKcpWorkspace.ensure
+
+        def ensure(self, *a, defer=False, **k):  # noqa: ARG001 - the undeferred sizing
+            return original(self, *a, defer=False, **k)
+
+        monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", ensure)
+    ctxs = [
+        gp.cake_gdn_det_train_kcp_build_context(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(W)
+    ]
+    wss = [_RawPeakWorkspace(kcp) if peak else None for _ in range(W)]
+    peaks: dict[int, dict] = {}
+
+    def rank_fn(r, comm):
+        holder["comm"] = comm
+        loc = fake.slice_local(ops, part, r)
+        args = [loc[n] for n in LEAVES]
+        kw = dict(backend="fake", workspace=wss[r], **knobs)
+        out, saved = kcp.cake_gdn_det_train_kcp_forward(*args, ctxs[r], **kw)
+        fwd_peak = wss[r].peak if peak else None
+        if peak:
+            wss[r].peak = 0
+        grads = kcp.cake_gdn_det_train_kcp_backward(
+            *args, ctxs[r], loc["dout"], saved=saved, **kw
+        )
+        if peak:
+            peaks[r] = {"forward": fwd_peak, "backward": wss[r].peak}
+            assert wss[r]._pending is None, r
+        return out, grads
+
+    previous = kcp.set_backend("fake", FirstLaunch())
+    try:
+        if W == 1:
+            per_rank = [rank_fn(0, None)]
+        else:
+            per_rank = _run_threaded(kcp, W, rank_fn, monkeypatch)
+    finally:
+        kcp.set_backend("fake", previous)
+        monkeypatch.undo()
+    res = {"out": fake.gather_global(part, [o for o, _ in per_rank])}
+    for i, n in enumerate(EXPLICIT_GRADS):
+        res[n] = fake.gather_global(part, [g[i] for _, g in per_rank])
+    return res, calls, first, peaks
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"save_mode": "full"}, {"use_qk_l2norm_in_kernel": True}, {"segments": 2}],
+    ids=("light", "full", "l2n", "P2"),
+)
+@pytest.mark.parametrize("row", tuple(DEFER_ROWS))
+def test_eager_call_sizes_pools_and_tickets_after_the_first_launch(
+    monkeypatch, row, knobs
+) -> None:
+    """Every rank's forward and saved-set backward (light, ``save_mode="full"``, the in-kernel L2 norm, P = 2) with the
+    deferred sizing against ``ensure`` sizing at once: out and the five gradients are bitwise equal; each call issues
+    the same programs with the same records and grids; at the first launch of a call on a rank with tokens the
+    deferred workspace holds no pool (and no ticket slot unless that program is persistent) and its sizing is pending
+    (the undeferred one holds both);
+    after each call nothing is pending and every pool, tape and ticket byte equals the undeferred call's, also on a
+    rank without tokens; with a caller-held workspace the forward and backward peaks are the same bytes."""
+    if row != "one_rank" and knobs.get("segments") == 2:
+        pytest.skip("P = 2 needs fragments of more than one chunk (the one-rank row)")
+    kcp, part, W, ops = _defer_setup(row)
+    ref, ref_calls, ref_first, _ = _defer_run(
+        kcp, part, W, ops, monkeypatch, defer=False, knobs=knobs, peak=False
+    )
+    got, got_calls, got_first, _ = _defer_run(
+        kcp, part, W, ops, monkeypatch, defer=True, knobs=knobs, peak=False
+    )
+    for n in ("out",) + EXPLICIT_GRADS:
+        assert torch.equal(got[n], ref[n]), n
+    deferred = tokenless = 0
+    for r in range(W):
+        assert [c.backward for c in got_calls[r]] == [False, True], r
+        assert [c.backward for c in ref_calls[r]] == [False, True], r
+        for c1, c0 in zip(got_calls[r], ref_calls[r], strict=True):
+            what = (r, "bwd" if c1.backward else "fwd")
+            assert c1.sequence == c0.sequence, what
+            assert c1.records == c0.records, what
+            assert c1.ws._pending is None and c0.ws._pending is None, what
+            assert c1.ws.pool_bytes == c0.ws.pool_bytes, what
+            assert c1.ws.tape_bytes == c0.ws.tape_bytes, what
+            assert c1.ws.ticket_bytes == c0.ws.ticket_bytes > 0, what
+            assert (id(c1) in got_first) == (id(c0) in ref_first), what
+            if id(c0) in ref_first:
+                _, _, tk0, pend0 = ref_first[id(c0)]
+                assert tk0 and not pend0, what  # the reference sized at ensure
+            if c1.T_r == 0:
+                tokenless += 1
+                continue
+            # the call's first launch (#1, or the backward's first program) found no pool sized yet; the ticket
+            # slots exist then only when that program is persistent (#6 on saved or kept tapes takes its slot)
+            p1, pools1, tk1, pend1 = got_first[id(c1)]
+            assert pend1 and pools1 == [], (*what, p1, pools1)
+            assert tk1 == (p1 in kcp.TICKET_SITES), (*what, p1, tk1)
+            deferred += 1
+    assert deferred >= 2 and tokenless == (2 if row == "zero_token_rank" else 0)
+    # caller-held workspaces: the same peak bytes per rank, forward and backward
+    *_, peak0 = _defer_run(kcp, part, W, ops, monkeypatch, defer=False, knobs=knobs, peak=True)
+    *_, peak1 = _defer_run(kcp, part, W, ops, monkeypatch, defer=True, knobs=knobs, peak=True)
+    assert peak1 == peak0, (peak1, peak0)
+
+
+@pytest.mark.parametrize("reuse", (False, True, "auto"))
+@pytest.mark.parametrize("ckpt", (False, True), ids=("direct", "checkpoint"))
+def test_deferred_sizing_under_autograd_and_checkpoints(monkeypatch, ckpt, reuse) -> None:
+    """One rank, direct autograd and a non-reentrant checkpoint under every ``reuse_recompute_tapes`` form, with a
+    fresh and with a caller-held workspace: out and the five gradients are bitwise the undeferred package's, no
+    sizing is left pending and no kept entry is left."""
+    kcp, ctx, ops = _ckpt_setup()
+    for held in (False, True):
+        runs = {}
+        for defer in (False, True):
+            if not defer:
+                original = kcp.CakeGDNDetKcpWorkspace.ensure
+
+                def ensure(self, *a, defer=False, _o=original, **k):  # noqa: ARG001
+                    return _o(self, *a, defer=False, **k)
+
+                monkeypatch.setattr(kcp.CakeGDNDetKcpWorkspace, "ensure", ensure)
+            ws = kcp.CakeGDNDetKcpWorkspace() if held else None
+            runs[defer] = _ckpt_autograd(
+                kcp, ctx, ops, ckpt=ckpt, workspace=ws, reuse_recompute_tapes=reuse
+            )
+            if ws is not None:
+                assert ws._pending is None
+            monkeypatch.undo()
+        _assert_same(runs[True], runs[False], f"held={held}")
+    assert kcp.kept_registry_size() == 0
+
+
+def test_settle_completes_a_pending_sizing_before_any_read() -> None:
+    """``ensure(defer=True)`` sizes nothing; a pool read, ``has``, ``release_pool``, the byte properties and the next
+    ``ensure`` each complete the pending sizing first, and the result is the undeferred workspace's.  A ticket read
+    sizes the ticket slots alone (a persistent first launch issues before the pools); the pools stay pending."""
+    kcp, ctx, _ = _ckpt_setup()
+    want = kcp.CakeGDNDetKcpWorkspace()
+    want.ensure(ctx, 2, 6)
+    reads = {
+        "pool": lambda ws: ws.pool("eye"),
+        "ticket": lambda ws: ws.ticket(kcp.TICKET_SITES[0]),
+        "has": lambda ws: ws.has("eye"),
+        "bytes": lambda ws: ws.bytes,
+        "pool_bytes": lambda ws: ws.pool_bytes,
+        "ticket_bytes": lambda ws: ws.ticket_bytes,
+        "settle": lambda ws: ws.settle(),
+        "ensure": lambda ws: ws.ensure(ctx, 2, 6, defer=True),
+    }
+    for what, read in reads.items():
+        ws = kcp.CakeGDNDetKcpWorkspace()
+        ws.ensure(ctx, 2, 6, defer=True)
+        assert ws._pools == {} and ws._tickets is None and ws._pending is not None, what
+        assert ws.geometry == want.geometry and ws.qk_heads == want.qk_heads, what
+        read(ws)
+        if what == "ticket":
+            assert ws._tickets is not None and ws._pools == {} and ws._pending is not None, what
+        elif what != "ensure":
+            assert ws._pending is None, what
+        assert ws.pool_bytes == want.pool_bytes, what
+        assert ws.ticket_bytes == want.ticket_bytes, what
+        assert torch.equal(ws.pool("eye"), want.pool("eye")), what
+    ws = kcp.CakeGDNDetKcpWorkspace()
+    ws.ensure(ctx, 2, 6, defer=True)
+    assert ws.release_pool("eye") and ws._pending is None and not ws.has("eye")
