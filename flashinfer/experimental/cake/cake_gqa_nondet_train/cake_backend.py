@@ -745,21 +745,24 @@ def cake_gqa_nondet_train_backward(
     }
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         # The tile tables, the host-boundary checks and the fold order read cu_seqlens and row_map only.  Their buffers
-        # come from the current stream; two side streams fill them while the current stream runs bwd_pre, and the
-        # current stream waits for them before their first read: the same kernels write the same integers, off the
-        # critical path.  The first side stream runs the plan kernel and then the range check; the second runs the key
-        # check and then the fold order, which only bwd_fold reads.  Both checks are short chains of small kernels that
-        # run while bwd_pre does, and the main kernels start after both.  The host queues the work in the order the
-        # current stream needs it (its time before the first main kernel is on the critical path): the plan kernel,
-        # bwd_pre, the checks, the main kernels, and last the fold order.
+        # come from the current stream; side streams fill them while the current stream runs bwd_pre, and the current
+        # stream waits for them before their first read: the same kernels write the same integers, off the critical
+        # path.  One side stream runs the plan kernel and then the fold order, which only bwd_fold reads.  With host
+        # boundaries the checks join: the range check follows the plan kernel, and a second side stream runs the key
+        # check and then the fold order.  Both checks are short chains of small kernels that run while bwd_pre does,
+        # and the main kernels start after both.  The host queues the work in the order the current stream needs it
+        # (its time before the first main kernel is on the critical path): the plan kernel, bwd_pre, the checks, the
+        # main kernels, and last the fold order.
         stream = torch.cuda.current_stream(device_index)
         tables = _plan_buffer(plan["key_blocks"], total_q, segments, device)
         fold = _fold_buffers(total_k, device) if mode == "rowmap" else None
-        planned = keyed = side = side_fold = None
+        checked = tables is not None and seqlens is not None
+        planned = keyed = side = side_keys = None
         try:
-            if tables is not None:
+            if tables is not None or fold is not None:
                 side = _side_stream(device_index, stream.stream_id, 0)
                 side.wait_stream(stream)
+            if tables is not None:
                 with torch.cuda.stream(side), tvm_ffi.use_torch_stream():
                     _launch_plan(
                         cu_seqlens_q,
@@ -772,9 +775,9 @@ def cake_gqa_nondet_train_backward(
                     )
                     if seqlens is None:
                         planned = side.record_event()
-            if fold is not None or (tables is not None and seqlens is not None):
-                side_fold = _side_stream(device_index, stream.stream_id, 1)
-                side_fold.wait_stream(stream)
+            if checked:
+                side_keys = _side_stream(device_index, stream.stream_id, 1)
+                side_keys.wait_stream(stream)
             _launch(
                 "bwd_pre",
                 {
@@ -789,13 +792,13 @@ def cake_gqa_nondet_train_backward(
                 dims,
                 device_index,
             )
-            if tables is not None and seqlens is not None:
+            if checked:
                 with torch.cuda.stream(side):
                     _check_ranges(tables[0], plan, segments, total_q)
                     planned = side.record_event()
-                with torch.cuda.stream(side_fold):
+                with torch.cuda.stream(side_keys):
                     _check_keys(cu_seqlens_k, plan)
-                    keyed = side_fold.record_event()
+                    keyed = side_keys.record_event()
             if tables is None:
                 tables = _tile_plan(
                     cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
@@ -854,11 +857,11 @@ def cake_gqa_nondet_train_backward(
                     _launch(_MAIN_STAGE[mode], at, dims, device_index, **chunk)
                     _launch("bwd_dq", at, dims, device_index, **chunk)
             if fold is not None:
-                with torch.cuda.stream(side_fold):
+                with torch.cuda.stream(side if side_keys is None else side_keys):
                     _fold_index(row_map, *fold)
         finally:
             # Joined on every path (an exception included): the side streams read and write buffers of this call.
-            for other in (side, side_fold):
+            for other in (side, side_keys):
                 if other is not None:
                     stream.wait_stream(other)
         if fold is not None:
@@ -1033,10 +1036,11 @@ def _fold_index(
 @functools.cache
 def _side_stream(device_index: int, stream_id: int, slot: int) -> torch.cuda.Stream:
     """High-priority side stream ``slot`` of the caller stream ``stream_id`` of device ``device_index``: slot 0 runs
-    the backward's tile tables (the one-CTA ``bwd_plan``) and the host-boundary range check, slot 1 the key check and
-    the row-map fold order.  One cached stream per caller stream and slot, from PyTorch's high-priority stream pool (a
-    pool that cycles, so two caller streams may share one stream past its size: their work then queues on it in
-    order); high priority: their small kernels take the first SMs bwd_pre and the main kernels free."""
+    the backward's tile tables (the one-CTA ``bwd_plan``) and the host-boundary range check, slot 1 the host-boundary
+    key check; the row-map fold order runs on slot 1 with host boundaries, else on slot 0.  One cached stream per
+    caller stream and slot, from PyTorch's high-priority stream pool (a pool that cycles, so two caller streams may
+    share one stream past its size: their work then queues on it in order); high priority: their small kernels take
+    the first SMs bwd_pre and the main kernels free."""
     return torch.cuda.Stream(device_index, priority=-1)
 
 
