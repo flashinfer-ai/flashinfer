@@ -1344,7 +1344,11 @@ def _single_wgrad_swap(
 # (``_bg<G>``): the forward over all 64 heads (``_bg64``), the value-projection row over 8 heads with the evict_last
 # output stores (``_bg8_sol``), raster group 2 for the forward; each measured faster than cuBLASLt's batched kernel at
 # the three T on GB200 and GB300.  sm_103a reads the forward's rule through ``RULE_PARENT``; its value-projection key
-# follows below (raster group 2).
+# follows below (raster group 2).  The batched MLA value-projection forward (N 256, K 512) adds the same raster over 8 heads
+# (``_bg8``) to its quad-store register program at the training T alone (T-exact keys at T 16172 / 16231 / 16384, the
+# ragged rule's knobs + ``batch_group``): the same output bits, measured faster than cuBLASLt's batched kernel and the
+# program without the raster at those T on GB200 and GB300 (sm_103a through ``RULE_PARENT``); from T 1 to 4095 the
+# raster measured slower in the sustained frame, so the ragged rule keeps the program without it there.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1355,6 +1359,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16172): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16231): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16384): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
     ('sm_100a', False, True, False, False, False, 2048, 6144, None): {"group_m": 8, "pro": 0},
     ('sm_100a', False, True, False, False, False, 2048, 16384, None): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2, "pd": 2},
