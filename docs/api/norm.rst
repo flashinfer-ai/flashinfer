@@ -385,20 +385,31 @@ inputs, and within the deterministic package's absolute bounds.
   backward's chunk partials exactly in 64-bit integer windows and rounds that
   sum to FP32 from its FP64 value (then to BF16 for a BF16 weight gradient),
   so it does not depend on the grid or on the order in which CTAs finish.  Up
-  to 64 rows per SM every chunk has its own CTA; past that the CTAs claim runs
-  of chunks at run time, so a CTA slowed by a kernel on another stream takes
-  fewer.  Up to 512 rows, with a BF16 or an FP32 weight gradient or with
+  to 512 rows, with a BF16 or an FP32 weight gradient or with
   ``compute_grad_weight=False``, the backward is one thread-block cluster of
-  16 CTAs that sums on chip and takes no workspace.
+  16 CTAs that sums on chip and takes no workspace.  Past that it launches at
+  most 8 CTAs per SM, chosen by the rows (``T * H``); each gives the same bits
+  at any grid.  On SM100 and SM103 a static backward (CTA ``b`` runs the
+  chunks ``b``, ``b + grid``, ...) runs up to 49488 rows, a second static
+  backward up to 245760 rows and, past that, a claimed backward, whose CTAs
+  claim runs of chunks at run time, so a CTA slowed by a kernel on another
+  stream takes fewer; the last two warm each CTA's next block in L2 with one
+  bulk prefetch per tensor where ``dy``, ``x`` and ``z`` hold packed rows.  On
+  SM107 the static backward runs while every chunk has its own CTA (up to 64
+  rows per SM), with 4 copies of the weight-gradient windows plus occupancy
+  words, then the same with 2 copies up to 98352 rows, then the claimed
+  backward.
 * The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
-  is a zero-filled ``torch.uint8`` tensor of 29192 bytes whatever the token
-  count, zero after every call: zero it once and reuse it, one per
+  is a zero-filled ``torch.uint8`` tensor of 29192 bytes on SM100 and SM103
+  and 36360 bytes on SM107, whatever the token count, that serves every
+  backward kernel of its architecture and is zero after every call: zero it
+  once and reuse it, one per
   concurrently running stream.  A buffer that anything else wrote into is
   zeroed with ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.  Calls
   without a workspace use one per stream and backward module that takes one,
   kept for the process, and such eager calls also keep a reserve of
   zero-filled workspaces per device for CUDA Graph captures (about 1.8 MiB per
-  64 workspaces, at most 1024).  The autograd wrapper saves ``x``, ``z`` and
+  64 workspaces on SM100 and SM103, 2.2 MiB on SM107, at most 1024).  The autograd wrapper saves ``x``, ``z`` and
   ``weight`` by reference and ``eps``, no intermediate; no workspace is saved
   state.
 

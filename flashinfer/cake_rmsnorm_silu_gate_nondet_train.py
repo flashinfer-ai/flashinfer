@@ -64,9 +64,19 @@ streams.  The kernels are those of the standalone package
   gradient is the deterministic package's bits except where the exact sum lies
   within the deterministic FP64 sum's error of a rounding boundary, and an
   infinite or ``NaN`` partial gives its column the class the FP64 sum gives
-  it.  While every chunk has a CTA of one wave (8 CTAs per SM) CTA ``b`` runs
-  chunk ``b``; past that the CTAs claim runs of chunks from the workspace's
-  claim counter, so a CTA that starts late takes fewer.  A call of few rows
+  it.  The kernel launches at most 8 CTAs per SM and gives the same bits at
+  any grid; past the few-row band below, the rows (``T * H``) pick it.  On
+  SM100 and SM103 a static
+  backward (CTA ``b`` runs the chunks ``b``, ``b + grid``, ...) runs up to
+  49488 rows, a second static backward up to 245760 rows and, past that, a
+  claimed backward, whose CTAs claim runs of chunks from the workspace's
+  claim counter, so a CTA that starts late takes fewer; in the last two,
+  thread 0 warms the CTA's next block in L2 with one bulk prefetch per
+  tensor where ``dy``, ``x`` and ``z`` hold packed rows (other layouts keep
+  per-thread prefetches).  On SM107 the static backward runs while every
+  chunk has a CTA (up to 64 rows per SM), with its weight-gradient windows
+  in 4 copies plus occupancy words, then the same with 2 copies up to 98352
+  rows, then the claimed backward, which warms the block two ahead.  A call of few rows
   (up to 512 rows, with a BF16 or an FP32 weight gradient or with
   ``compute_grad_weight=False``) runs one
   thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same arithmetic,
@@ -108,7 +118,8 @@ Mode and dispatch rules:
 
 The non-deterministic backward's workspace
 (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace(T * H, device)``, a
-zero-filled ``torch.uint8`` tensor of 29192 bytes whatever ``T * H``) holds the
+zero-filled ``torch.uint8`` tensor of 29192 bytes on SM100 and SM103 and 36360
+bytes on SM107, whatever ``T * H``) holds the
 integer windows of the exact sum, 128 FP32 class words, the arrival ticket and
 the claim counter; every launch of that backward uses one, also with
 ``compute_grad_weight=False``, but the one-cluster backward of a call of few
@@ -122,10 +133,10 @@ backward.  It is not interchangeable with the deterministic package's FP32
 buffer: this package's backward refuses that buffer (``ValueError``) in every
 call, and the deterministic backward refuses this one in a call with rows.
 Calls without a workspace use one buffer per device, stream and backward
-kernel that takes one (two per weight-gradient dtype: one for the one-wave
-backward, one for the claimed backward; none for the one-cluster backward),
+kernel that takes one (three per weight-gradient dtype: one for each static
+backward and one for the claimed backward; none for the one-cluster backward),
 kept for later calls; the autograd node retains nothing else.  They also keep a reserve of 64 zero-filled buffers per device (about
-1.8 MiB, filled outside any capture): a call during CUDA Graph capture takes
+1.8 MiB on SM100 and SM103, 2.2 MiB on SM107, filled outside any capture): a call during CUDA Graph capture takes
 one per capture and capture stream from it and keeps it for the life of the
 process, so a replay launches no fill kernel (with none ready, the graph
 zero-fills a buffer of its own).
@@ -270,7 +281,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
     """Bytes of the caller-owned workspace of the non-deterministic backward
     for ``rows`` rows (``T * H``) on ``device``: the integer windows of the
     exact weight-gradient sum, 128 FP32 class words, the arrival ticket and the
-    claim counter, about 29 KiB whatever ``rows``.
+    claim counter, whatever ``rows``: about 29 KiB on SM100 and SM103 (29192
+    bytes) and 36 KiB on SM107 (36360 bytes).
 
     The deterministic package's FP32 buffer has
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`.
@@ -426,8 +438,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
         no workspace (a ``workspace`` passed is checked and left as it is).
         With more rows the kernel touches neither ``grad_weight`` nor the
         workspace's windows, but its CTAs still take the arrival ticket (and
-        past one wave claim their chunks from the claim counter), so it uses a
-        workspace too (and leaves it zero).
+        in the claimed backward claim their chunks from the claim counter), so
+        it uses a workspace too (and leaves it zero).
     workspace : torch.Tensor, optional
         Caller-owned zero-filled ``torch.uint8`` buffer from
         :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`, which the

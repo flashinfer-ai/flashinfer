@@ -67,17 +67,22 @@ Host design (the input layout rules are the deterministic package's):
   kernels cannot read is materialized once as a contiguous copy.
 - The backward's workspace is a zero-filled ``torch.uint8`` buffer of
   :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes` bytes
-  (29192 for every shipped backward that takes one) holding three buffers
-  (``cake_jit.workspace_layout``): the 64-bit integer windows of the exact
-  weight-gradient sum, 128 FP32 class words and the two 32-bit words of the
-  arrival ticket and the claim counter.  Every launch of the static and the
+  (whatever the rows: 29192 on sm_100a and sm_103a, 36360 on sm_107a, the
+  largest layout among the architecture's backward modules) holding three
+  buffers (``cake_jit.workspace_layout`` of the module, from the start of
+  the workspace): the 64-bit integer windows of the exact weight-gradient
+  sum (``slots`` copies of 7 x 128, 3, 4 or 5 by module; on sm_107a the
+  static modules' last copy holds occupancy words instead), 128 FP32 class
+  words and the two 32-bit words of the arrival ticket and the claim
+  counter.  Every launch of the static and the
   claimed backward takes a ticket (and the claimed one claims its chunks from
   the counter), also one with ``compute_grad_weight=False``, so it uses a
   workspace.  The small-row backwards take none: they read no workspace,
   and a caller workspace passed to one is checked as for any backward and
   left as it is.  The kernel leaves all of it zero, so a workspace zeroed once serves
-  every later call on its stream, of any shape and either weight-gradient
-  dtype, and every CUDA Graph replay, with no host write.  A caller workspace
+  every later call on its stream, of any shape, either weight-gradient
+  dtype and any backward module of its architecture, and every CUDA Graph
+  replay, with no host write.  A caller workspace
   must come from :func:`cake_rmsnorm_silu_gate_nondet_train_backward_workspace`
   (zero-filled), or be zeroed with
   :func:`cake_rmsnorm_silu_gate_nondet_train_reset_workspace` after anything
@@ -94,11 +99,13 @@ Host design (the input layout rules are the deterministic package's):
   ``compute_grad_weight=False`` included: it runs the BF16 weight gradient's
   modules) uses the zero-filled workspace of its (device, stream, backward
   module), allocated on first use and kept in ``_STREAM_WORKSPACES`` for later
-  calls: 29192 bytes each, at most one per backward module (two per
-  weight-gradient dtype: the static and the claimed backward) for every stream
-  that ran such a backward.  Such eager calls also keep a reserve of 64
-  zero-filled workspaces per device (29440 bytes each in one allocation of
-  about 1.8 MiB, filled outside any capture, at most 1024 per device), from
+  calls: 29192 bytes each on sm_100a and sm_103a and 36360 on sm_107a, at
+  most one per backward module (three per weight-gradient dtype: the static,
+  the second static ``_long`` and the claimed ``_mid`` backward) for every
+  stream that ran such a backward.  Such eager calls also keep a reserve of
+  64 zero-filled workspaces per device (in one allocation, 29440 bytes each,
+  about 1.8 MiB, on sm_100a and sm_103a and 36608 bytes each, about 2.2 MiB,
+  on sm_107a, filled outside any capture, at most 1024 per device), from
   which a call during CUDA Graph capture takes a workspace for good, so a
   replay launches no fill kernel: one per capture and capture stream when
   cuda-python (an optional import) gives the capture ids, else one per
@@ -144,11 +151,22 @@ Host design (the input layout rules are the deterministic package's):
   backward run 128-thread CTAs of 8-row blocks in the deterministic
   backward's chunks (``cake_jit.backward_chunks``) and launch
   ``cake_jit.backward_ctas`` ``G = min(chunks, ctas_per_sm * SMs)`` CTAs (8
-  CTAs per SM): the static backward, CTA ``b`` running the chunks ``b``,
-  ``b + G``, ..., while every chunk has a CTA, and the claimed backward past
-  that, thread 0 of every CTA claiming runs of chunks with a relaxed atomic
-  increment on the workspace's claim counter, so a CTA that starts late takes
-  fewer chunks; a small-row backward one cluster of 16 CTAs
+  CTAs per SM), each with the same bits at any grid: a static backward, CTA
+  ``b`` running the chunks ``b``, ``b + G``, ..., or the claimed backward,
+  thread 0 of every CTA claiming runs of chunks with a relaxed atomic
+  increment on the workspace's claim counter, so a CTA that starts late
+  takes fewer chunks.  ``cake_jit.BACKWARD_BANDS`` routes every backward
+  module of a role by the rows (``T * H``), the first band that holds: past
+  the small-row band, on sm_100a and sm_103a the static backward up to 49488
+  rows, a second static backward (``_long``) up to 245760 rows and the
+  claimed backward (``_mid``) past that, these two with thread 0 warming the
+  CTA's next block in L2 with one bulk prefetch per tensor where ``dy``,
+  ``x`` and ``z`` hold packed rows (head stride 128 and token stride ``H *
+  128``; other layouts keep the per-thread prefetches); on sm_107a the
+  static backward while every chunk has a CTA (up to 64 rows per SM), its
+  windows in 4 copies plus occupancy words, the same with 2 copies
+  (``_long``) up to 98352 rows and the claimed backward (``_mid``) past
+  that, warming the block two ahead.  A small-row backward is one cluster of 16 CTAs
   (``cake_jit.backward_ctas`` 16) scheduled together on the SMs of one GPC,
   team ``q`` of the exact tiny backward's CTA ``r`` running the 8-row block
   ``r + 16 q``.  No kernel is cooperative; no
@@ -456,8 +474,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes(
 ) -> int:
     """Bytes of the caller-owned backward workspace for ``rows`` rows
     (``T * H``) on ``device``: the integer windows of the exact weight-gradient
-    sum, the FP32 class words and the arrival ticket and claim counter, about
-    29 KiB whatever ``rows``.
+    sum, the FP32 class words and the arrival ticket and claim counter,
+    whatever ``rows``: 29192 bytes (about 29 KiB) on sm_100a and sm_103a,
+    36360 (about 36 KiB) on sm_107a.
     """
 
     if int(rows) < 0:
@@ -519,7 +538,8 @@ def cake_rmsnorm_silu_gate_nondet_train_reset_workspace(
 # static and the claimed backward needs one: it takes the arrival ticket, and
 # the claimed one claims its chunks; the small-row backwards need none): one per
 # (device, stream, backward module), zero-filled once and kept for the process
-# (29192 bytes each, one per backward module a stream ran).  Every backward
+# (``_workspace_bytes(arch)`` bytes each, 29192 on sm_100a and sm_103a and
+# 36360 on sm_107a, one per backward module a stream ran).  Every backward
 # leaves its workspace zero and the calls of one stream run in order, so they
 # share it (no allocation and no fill per call).  A call during CUDA Graph
 # capture uses a workspace of its capture instead (``_capture_workspace``), so
@@ -848,9 +868,11 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     weight gradient.
 
     One kernel of at most ``ctas_per_sm`` CTAs per SM over the deterministic
-    backward's chunks of rows (one chunk a CTA while every chunk has a CTA;
-    past that the CTAs claim runs of chunks from the workspace's claim
-    counter): ``dx`` and ``dz`` are the deterministic backward's arithmetic,
+    backward's chunks of rows (a static backward, CTA ``b`` running the
+    chunks ``b``, ``b + grid``, ..., or, in the last band, the claimed backward,
+    whose CTAs claim runs of chunks from the workspace's claim counter;
+    ``cake_jit.BACKWARD_BANDS`` picks the module by architecture and rows):
+    ``dx`` and ``dz`` are the deterministic backward's arithmetic,
     each chunk's FP32 weight-gradient partial is the deterministic backward's,
     and the partials are added exactly as 64-bit integer windows in the
     workspace; the CTA that arrives last rounds the exact sum once into ``dw``

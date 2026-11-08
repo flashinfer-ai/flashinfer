@@ -127,8 +127,9 @@ the same inputs on the same device.
 | `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
 | `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
 | `bwd_bf16_t512`, `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its band (at most 512) |
-| `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | past the bands, while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
-| `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time | past 8 chunks per SM |
+| `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... (the same bits at any grid); on `sm_100a` and `sm_103a` 4 copies of the weight-gradient windows, on `sm_107a` 4 copies plus occupancy words (the last CTA reads only the windows some CTA added into) | its backward band |
+| `bwd_bf16_long`, `bwd_f32_long` | second static backward: on `sm_100a` and `sm_103a` the static backward whose thread 0 also warms the CTA's next block in L2 with one bulk prefetch per tensor where `dy`, `x` and `z` hold packed rows (head stride 128 and token stride `H * 128`; other layouts keep the per-thread prefetches); on `sm_107a` the static backward with 2 copies of the windows plus occupancy words | its backward band |
+| `bwd_bf16_mid`, `bwd_f32_mid` | claimed backward: CTAs claim runs of chunks at run time; on `sm_100a` and `sm_103a` with the same bulk prefetch of the next block, on `sm_107a` warming the block two ahead | its backward band (the last) |
 
 The forward bands (rows per SM: a call of `rows` rows on a device of `SMs`
 SMs runs the first band with `rows <= last * SMs`): `FORWARD_BANDS` where `x`
@@ -142,14 +143,16 @@ other layouts:
 | `sm_103a` | 1-120 `tiny`, 121-250 `mid`, 251-550 `xlong`, past 550 `mid` | 1-12 `short`, 13-250 `mid`, 251-550 `xlong`, past 550 `mid` |
 | `sm_107a` | 1-65 `tiny`, 66-200 `mid`, 201-520 `xlong`, past 520 `mid` | 1-59 `short`, 60-200 `mid`, 201-520 `xlong`, past 520 `mid` |
 
-The small-row backward bands (`BACKWARD_BANDS`, rows per call; a call with
-`compute_grad_weight=False` takes the BF16 bands):
+The backward bands (`BACKWARD_BANDS`, rows per call, in order: a call runs
+the first band it fits; the `sm_107a` band "one wave" holds while every chunk
+has a CTA at 8 CTAs per SM, up to 64 rows per SM, 13568 rows on 212 SMs; a
+call with `compute_grad_weight=False` takes the BF16 bands):
 
 | architecture | BF16 weight gradient | FP32 weight gradient |
 | --- | --- | --- |
-| `sm_100a` | 1-512 `t512` | 1-512 `t512` |
-| `sm_103a` | 1-512 `t512` | 1-512 `t512` |
-| `sm_107a` | 1-512 `t512` | 1-512 `t512` |
+| `sm_100a` | 1-512 `bwd_bf16_t512`, 513-49488 `bwd_bf16`, 49489-245760 `bwd_bf16_long`, past 245760 `bwd_bf16_mid` | 1-512 `bwd_f32_t512`, 513-49488 `bwd_f32`, 49489-245760 `bwd_f32_long`, past 245760 `bwd_f32_mid` |
+| `sm_103a` | 1-512 `bwd_bf16_t512`, 513-49488 `bwd_bf16`, 49489-245760 `bwd_bf16_long`, past 245760 `bwd_bf16_mid` | 1-512 `bwd_f32_t512`, 513-49488 `bwd_f32`, 49489-245760 `bwd_f32_long`, past 245760 `bwd_f32_mid` |
+| `sm_107a` | 1-512 `bwd_bf16_t512`, one wave `bwd_bf16`, up to 98352 `bwd_bf16_long`, past 98352 `bwd_bf16_mid` | 1-512 `bwd_f32_t512`, one wave `bwd_f32`, up to 98352 `bwd_f32_long`, past 98352 `bwd_f32_mid` |
 
 The backward cuts the rows into 8-row blocks and the blocks into the
 deterministic backward's chunks: `blocks_per_chunk = max(1, ceil(blocks /
@@ -174,17 +177,27 @@ saved state: no tensor of it is kept by the autograd node.
 The static and the claimed backward need a workspace, also with
 `compute_grad_weight=False`; the small-row backwards read none, so a call in a
 small-row band uses no workspace.  A workspace is a zero-filled, contiguous `torch.uint8` CUDA tensor of
-29192 bytes whatever `T * H`, starting at a 16-byte aligned address:
+`cake_rmsnorm_silu_gate_nondet_train_backward_workspace_bytes` bytes whatever
+`T * H` (the largest layout among the architecture's backward programs:
+29192 bytes on `sm_100a` and `sm_103a`, 36360 on `sm_107a`), starting at a
+16-byte aligned address.  Each program lays its buffers from the start of it
+(`workspace_layout`), with `slots` copies of the integer windows:
 
 | buffer | dtype | elements | byte offset |
 | --- | --- | --- | --- |
-| `dw_win` (integer windows: 4 slots x 7 windows x 128 columns) | u64 | 3584 | 0 |
-| `dw_spec` (class words of infinite and NaN partials) | FP32 | 128 | 28672 |
-| `dw_done` (arrival ticket, claim counter) | u32 | 2 | 29184 |
+| `dw_win` (integer windows: `slots` x 7 windows x 128 columns) | u64 | `slots * 896` | 0 |
+| `dw_spec` (class words of infinite and NaN partials) | FP32 | 128 | `slots * 7168` |
+| `dw_done` (arrival ticket, claim counter) | u32 | 2 | `slots * 7168 + 512` |
+
+| program | `sm_100a`, `sm_103a` | `sm_107a` |
+| --- | --- | --- |
+| `bwd_bf16`, `bwd_f32` | 4 slots, 29192 bytes | 5 slots (4 window copies, then the occupancy words), 36360 bytes |
+| `bwd_bf16_long`, `bwd_f32_long` | 4 slots, 29192 bytes | 3 slots (2 window copies, then the occupancy words), 22024 bytes |
+| `bwd_bf16_mid`, `bwd_f32_mid` | 4 slots, 29192 bytes | 4 slots, 29192 bytes |
 
 Every launch leaves the whole workspace zero, so one workspace serves every
-later call on its stream (any shape, both weight-gradient dtypes, CUDA Graph
-replays) without a reset.  Give each stream that may run a backward at the
+later call on its stream (any shape, both weight-gradient dtypes, every
+backward program of its architecture, CUDA Graph replays) without a reset.  Give each stream that may run a backward at the
 same time its own workspace.  A buffer that did not come from
 `cake_rmsnorm_silu_gate_nondet_train_backward_workspace`, or that anything
 else wrote into, must be zeroed with
@@ -193,13 +206,15 @@ backward.  The deterministic package's FP32 workspace is refused with a
 `ValueError` that names both workspaces.
 
 Calls without a workspace use one per device, stream and backward program
-that takes one (29192 bytes each; on each stream at most one per backward
-program: the static and the claimed backward of each weight-gradient dtype),
-kept for the process.  Eager
+that takes one (of the size above: 29192 bytes on `sm_100a` and `sm_103a`,
+36360 on `sm_107a`; on each stream at most one per backward program: the two
+static and the claimed backward of each weight-gradient dtype), kept for the
+process.  Eager
 calls without a workspace also keep a reserve per device for CUDA Graph
-captures: 64 zero-filled workspaces in one allocation (29440 bytes each with
-256-byte alignment, about 1.8 MiB), refilled outside any capture, at most 1024
-per device.  A captured call without a workspace takes one from the reserve
+captures: 64 zero-filled workspaces in one allocation (with 256-byte
+alignment, 29440 bytes each, about 1.8 MiB, on `sm_100a` and `sm_103a`, and
+36608 bytes each, about 2.2 MiB, on `sm_107a`), refilled outside any capture,
+at most 1024 per device.  A captured call without a workspace takes one from the reserve
 and keeps it, so a replay launches no fill kernel: one for its capture and
 capture stream when cuda-python is installed (it gives the capture ids),
 otherwise one per captured call.  With none ready, the graph zero-fills a
