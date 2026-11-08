@@ -257,7 +257,12 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
     y, hist = _fwd(p.x_local, p.w, p.ctx)
-    dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    # The single backward program plans with the legacy rule too; the overlapped pair plans with its own work plan.
+    conv_kcp._set_test_knobs({"bwd_route": "single"})
+    try:
+        dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    finally:
+        conv_kcp._set_test_knobs(None)
     assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
     monkeypatch.undo()
     _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
@@ -291,7 +296,8 @@ def _one_sm_rows(device: torch.device) -> list[tuple[int, tuple[int, int, int]]]
 def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
     monkeypatch,
 ) -> None:
-    """FlashInfer issue #8365: the main backward launches ``ctas_per_sm x SM count`` CTAs, less ``ctas_per_sm`` when
+    """FlashInfer issue #8365, the single backward program (the ``bwd_route`` test knob ``"single"``): it launches
+    ``ctas_per_sm x SM count`` CTAs, less ``ctas_per_sm`` when
     the last channel-tile rank of that grid holds at least ``ctas_per_sm`` CTAs (so a kernel on another stream that
     keeps one SM's shared memory leaves the launch one wave), else the whole grid, on both host paths; ``dx`` is
     bitwise the deterministic backward's, ``dweight`` within budget of the FP64 oracle and the workspace reads back
@@ -330,7 +336,9 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
             )
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
             for host_trim in (1, 0):
-                conv_kcp._set_test_knobs({"host_trim": host_trim})
+                conv_kcp._set_test_knobs(
+                    {"host_trim": host_trim, "bwd_route": "single"}
+                )
                 conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 seen.clear()
                 dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)

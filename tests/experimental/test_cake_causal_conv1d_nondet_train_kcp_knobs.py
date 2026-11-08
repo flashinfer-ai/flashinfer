@@ -56,8 +56,16 @@ def test_backend_reads_no_environment_variable() -> None:
 @pytest.mark.cpu_only
 def test_graph_knob_is_validated() -> None:
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
-    assert conv_kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._set_test_knobs(None) == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -68,10 +76,12 @@ def test_graph_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._set_test_knobs({"graph": "off"}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
     finally:
         conv_kcp._set_test_knobs(None)
@@ -87,17 +97,24 @@ def test_host_trim_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 1}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._graph_mode(None) == "off"
         assert conv_kcp._set_test_knobs({"host_trim": 1, "graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
-        assert conv_kcp._set_test_knobs({}) == {"graph": "off", "host_trim": 1}
+        assert conv_kcp._set_test_knobs({}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_route": "overlap",
+        }
         for bad in (
             {"host_trim": 2},
             {"host_trim": "1"},
@@ -109,10 +126,59 @@ def test_host_trim_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 0}) == {
             "graph": "off",
             "host_trim": 0,
+            "bwd_route": "overlap",
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
+
+
+@pytest.mark.cpu_only
+def test_bwd_route_knob_is_validated() -> None:
+    """``bwd_route``: validated against ``BWD_ROUTES`` (``"overlap"`` shipped = the overlapped pair of programs around
+    the exchange's wait, ``"single"`` = the one backward program after it), independent of the other knobs; a
+    backward graph key holds it when not the default, a forward key never does."""
+    assert conv_kcp.BWD_ROUTES == ("overlap", "single")
+    assert conv_kcp.BWD_ROUTE_DEFAULT == "overlap"
+    assert conv_kcp._TEST_KNOBS["bwd_route"] == "overlap"
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    try:
+        assert conv_kcp._set_test_knobs({"bwd_route": "single"}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_route": "single",
+        }
+        assert conv_kcp._overlapped(1024, 8, 0) is False
+        for bad in ({"bwd_route": "dyn"}, {"bwd_route": None}, {"bwd_rout": "single"}):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+        conv_kcp._set_test_knobs({"bwd_route": "single", "graph": "replay"})
+        bwd = conv_kcp._graph_entry("bwd", ctx, ())
+        fwd = conv_kcp._graph_entry("fwd", ctx, ())
+        assert bwd.key[-1] == ("bwd_route", "single")
+        assert ("bwd_route", "single") not in fwd.key
+        conv_kcp._set_test_knobs({"graph": "replay"})
+        assert ("bwd_route", "overlap") not in conv_kcp._graph_entry("bwd", ctx, ()).key
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
+    assert conv_kcp._TEST_KNOBS["bwd_route"] == "overlap"
+
+
+@pytest.mark.cpu_only
+def test_overlapped_route_rule() -> None:
+    """The overlapped pair runs every backward call with tokens and at most ``DYN_MAX_CHANNELS`` channels and no SM
+    reserve; a reserve, a wider ``C`` or no tokens run the single program."""
+    limit = conv_kcp._loader.DYN_MAX_CHANNELS
+    assert limit == 65536
+    assert conv_kcp._overlapped(8, 1, 0) and conv_kcp._overlapped(limit, 1 << 20, 0)
+    assert not conv_kcp._overlapped(limit + 8, 4096, 0)
+    assert not conv_kcp._overlapped(1024, 0, 0)
+    assert not conv_kcp._overlapped(1024, 4096, 1)
 
 
 @pytest.mark.cpu_only
