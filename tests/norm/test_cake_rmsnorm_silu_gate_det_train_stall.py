@@ -17,8 +17,9 @@ Stall regression of the Cake SiLU-gated RMSNorm training forward and backward
 beside a kernel resident on another stream (the concurrent-launch contract of
 issues #7038 and #7548).
 
-The forward is one module.  Below ``persistent_from_rows_per_sm`` rows per SM
-it launches one CTA per row block; from there the fewest whole waves of
+Every forward module (one per architecture, and one for packed rows where
+routed) has the same grid rule.  Below ``persistent_from_rows_per_sm`` rows
+per SM it launches one CTA per row block; from there the fewest whole waves of
 ``ctas_per_sm`` CTAs per SM whose CTAs each walk at most
 ``max_blocks_per_cta`` row blocks (its record's grid rule).  The backward is
 one kernel of ``min(row blocks, ctas_per_sm * SMs)`` CTAs; past one block per

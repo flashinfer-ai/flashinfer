@@ -33,7 +33,12 @@ A role is one kernel of a call: ``fwd`` (the forward) and ``bwd_bf16`` /
 kernel, the weight gradient rounded once to FP32, then to BF16 for a BF16
 weight gradient).
 ``ROUTES[arch][role]`` names the one module a role runs on an architecture,
-whatever the row count (:func:`module_for_rows`).
+whatever the row count (:func:`module_for_rows`).  An architecture may also
+route ``fwd_packed`` (``PACKED_ROLES``): a forward that addresses the rows of
+contiguous ``[T, H, 128]`` inputs as one packed array, without the token and
+head strides.  :func:`forward_module` runs it for such inputs and ``fwd``
+otherwise; both compute a row with the same FP32 operations in the same order,
+so ``y`` is the same bits on either route.
 
 Grids (:func:`launch_grid`): the forward launches one CTA per block of
 ``rows_per_block`` rows below ``persistent_from_rows_per_sm`` rows per SM, and
@@ -59,7 +64,9 @@ late claims only the chunks left.
 The program name ``cake_rmsnorm_silu_gate_det_train_<20 hex>`` is the first twenty
 hex digits of the SHA-256 of the compact JSON ``{"build": <build keywords,
 resolved and sorted>, "module": <dotted kernel module>}`` of the kernel the
-program was rendered from; each record's comment names its build.
+program was rendered from (a forward keyword left at its default is not
+spelled, so a program keeps its name when the kernel gains a keyword); each
+record's comment names its build.
 """
 
 from __future__ import annotations
@@ -86,7 +93,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "x"],
@@ -136,6 +142,123 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "fwd",
+    },
+    # The sm_107a forward: the schedule above with the sum of squares as four
+    # FMA chains, rsqrt.approx.ftz and w loaded behind the first block's loads
+    # (build {"min_blocks": 6, "prefetch_ahead": 1, "prefetch_wave": 1,
+    # "rsqrt_ftz": 1, "sum_pairs": 1, "threads": 128, "w_late": 1}); whole
+    # waves of at most 2 blocks per CTA.
+    "cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "persistent_from_rows_per_sm": 8192,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd",
+    },
+    # The sm_107a forward of packed rows (contiguous ``[T, H, 128]`` x and z,
+    # fewer than 2^24 rows): the forward above with each row's offset taken
+    # from its index alone and one 32-byte store per lane (build
+    # {"min_blocks": 6, "packed_rows": 1, "prefetch_ahead": 1,
+    # "prefetch_wave": 1, "rsqrt_ftz": 1, "store_width": 256, "sum_pairs": 1,
+    # "threads": 128, "w_late": 1}); whole waves of at most 2 blocks per CTA.
+    "cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "persistent_from_rows_per_sm": 8192,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_packed",
     },
     # The backward, BF16 weight gradient: 256 threads, 16 lanes per row
     # (16-row blocks), at most 4 CTAs per SM, claimed chunks, the weight
@@ -313,7 +436,8 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_f32": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
     },
     "sm_107a": {
-        "fwd": "cake_rmsnorm_silu_gate_det_train_36610c51a93167071e05",
+        "fwd": "cake_rmsnorm_silu_gate_det_train_5120481dd90c794f29e4",
+        "fwd_packed": "cake_rmsnorm_silu_gate_det_train_8a371a49c065b60c88a9",
         "bwd_bf16": "cake_rmsnorm_silu_gate_det_train_6e19a9f1b7cac40444cb",
         "bwd_f32": "cake_rmsnorm_silu_gate_det_train_6b4739305d767297d565",
     },
@@ -327,6 +451,8 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 }
 # The kernels of a call, routed on every architecture.
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
+# The forwards of packed rows, routed on some architectures beside ``fwd``.
+PACKED_ROLES = ("fwd_packed",)
 GRID_KINDS = ("persistent_row_blocks", "claimed_row_blocks")
 # Elements of one normalized row.
 HEAD_DIM = 128
@@ -336,6 +462,9 @@ HEAD_DIM = 128
 ALIGNMENT_ELEMENTS = 16
 # The kernels index rows with 32-bit integers.
 INT32_MAX = 2**31 - 1
+# A forward of packed rows takes the offset of an element of row ``n`` as
+# ``n * 128 + column`` in 32-bit arithmetic: it serves fewer rows than this.
+PACKED_ROWS = 2**31 // HEAD_DIM
 
 
 def arch_for_capability(device_capability: Sequence[int]) -> str | None:
@@ -365,6 +494,37 @@ def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
     the rows."""
 
     return route_module(arch, role)
+
+
+def forward_module(
+    arch: str,
+    rows: int,
+    heads: int,
+    sm_count: int,
+    x_tok: int,
+    x_head: int,
+    z_tok: int,
+    z_head: int,
+) -> str:
+    """The forward module for ``rows`` rows of ``heads`` heads on ``arch`` with
+    ``sm_count`` SMs, given the token and head strides (in elements) the
+    kernel reads ``x`` and ``z`` with: the arch's ``fwd_packed`` module when it
+    routes one and the rows are packed (both head strides 128, both token
+    strides ``heads * 128``, fewer than ``PACKED_ROWS`` rows), else
+    :func:`module_for_rows` of ``fwd``.  Both give the same bits."""
+
+    packed = ROUTES.get(arch, {}).get("fwd_packed")
+    row = heads * HEAD_DIM
+    if (
+        packed is not None
+        and 0 < rows < PACKED_ROWS
+        and x_head == HEAD_DIM
+        and z_head == HEAD_DIM
+        and x_tok == row
+        and z_tok == row
+    ):
+        return packed
+    return module_for_rows(arch, "fwd", rows, sm_count)
 
 
 def workspace_elements(name: str) -> int:
@@ -497,11 +657,14 @@ __all__ = [
     "HEAD_DIM",
     "INT32_MAX",
     "MODULES",
+    "PACKED_ROLES",
+    "PACKED_ROWS",
     "ROLES",
     "ROUTES",
     "arch_for_capability",
     "device_arch",
     "device_sm_count",
+    "forward_module",
     "launch_grid",
     "library_name",
     "load",

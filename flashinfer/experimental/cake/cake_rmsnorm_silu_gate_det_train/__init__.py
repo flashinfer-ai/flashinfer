@@ -32,12 +32,16 @@ Host design (every control is a keyword; no environment variable):
 - ``weight`` is BF16 ``[128]``, shared by every token and head.
 - The forward saves nothing beyond its inputs; the backward recomputes the
   statistics and the gate from ``x`` and ``z``.
-- Forward: one module per architecture, 128-thread CTAs of 16-row blocks
-  (``cake_jit.launch_grid``): one CTA per block below 8192 rows per SM, and
-  from there the fewest whole waves of 6 CTAs per SM that give no CTA more
-  than 2 blocks, a CTA loading its next block while it computes the current
-  one.  ``rstd`` comes from the approximate FP32 reciprocal square
-  root, and ``silu(z) = z * (1 / (1 + 2^(-z * log2(e))))`` from the
+- Forward: 128-thread CTAs of 16-row blocks (``cake_jit.launch_grid``): one
+  CTA per block below 8192 rows per SM, and from there the fewest whole waves
+  of 6 CTAs per SM that give no CTA more than 2 blocks, a CTA loading its next
+  block while it computes the current one.  One module per architecture, and
+  on SM107 a second one for packed rows (``x`` and ``z`` both read as
+  contiguous ``[T, H, 128]``; ``cake_jit.forward_module``) that computes a row
+  with the same FP32 operations in the same order, so the layout changes no
+  bits.  The sum of squares runs in one fixed order per architecture (on
+  SM107 as four interleaved chains).  ``rstd`` comes from the approximate FP32
+  reciprocal square root, and ``silu(z) = z * (1 / (1 + 2^(-z * log2(e))))`` from the
   approximate FP32 base-2 exponential and reciprocal (each a few FP32 units in
   the last place from the exact value), then one rounding to BF16.  So ``y``
   can differ from the correctly rounded FP32 formula by one BF16 unit in the
@@ -364,7 +368,9 @@ def cake_rmsnorm_silu_gate_det_train_forward(
         "eps": float(eps),
     }
     index = _device_index(device)
-    name = module_for_rows(arch, "fwd", rows, device_sm_count(index))
+    name = _loader.forward_module(
+        arch, rows, heads, device_sm_count(index), x_tok, x_head, z_tok, z_head
+    )
     _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)

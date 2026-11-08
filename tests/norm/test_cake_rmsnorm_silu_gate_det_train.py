@@ -24,8 +24,9 @@ accumulation, checkpointing, side streams and CUDA Graphs.  ``y``, ``dx``,
 bits at every call with the same inputs: at the issue's shapes, small and odd
 shapes, the row counts at the edges of the forward's grids (one CTA a row
 block below ``persistent_from_rows_per_sm`` rows per SM, whole waves from
-there) and of the backward's grid on the device, on every layout, on two
-streams at once, in CUDA Graph replays and under
+there) and of the backward's grid on the device, on every layout (on an
+architecture that routes a forward of packed rows, on both forward routes), on
+two streams at once, in CUDA Graph replays and under
 ``torch.use_deterministic_algorithms``.  Far past
 one wave of the backward's grid (CTAs claiming row blocks) and with the grids
 of other SM counts the weight gradient lies within its FP64 budget.  The
@@ -665,6 +666,136 @@ def test_grid_edges_on_this_device(edge):
     assert_zero(ws)
 
 
+def _packed_route():
+    """``(arch, the packed forward)`` of this device; skips without one."""
+    arch, _ = _device()
+    name = loader.ROUTES[arch].get("fwd_packed")
+    if name is None:
+        pytest.skip(f"{arch} routes no forward of packed rows")
+    return arch, name
+
+
+# Contiguous shapes of both forward routes: the issue's, small and odd ones.
+ROUTE_SHAPES = ((30193, 48), (32737, 48), (2, 64), (3, 48), (17, 7), (255, 2))
+ROUTE_SHAPES += ((33, 1), (1031, 48), (4097, 16))
+ROUTE_DATA = ("normal", "near_zero", "saturated", "gate_edges", "non_finite")
+
+
+def _route_inputs(shape, data):
+    """``(x, z, w, tokens)`` of one ``ROUTE_SHAPES`` shape (``TxH``, contiguous)
+    or one ``GRID_EDGES`` row count (``edge:<name>``, flat ``[rows, 128]``)
+    with ``data``: ``make``'s, gate edge values, or infinite and NaN gates and
+    infinite ``x`` in every fifth row."""
+    if shape.startswith("edge:"):
+        T, H, layout = _edge_rows(shape[len("edge:") :]), 1, "flat"
+    else:
+        T, H = (int(v) for v in shape.split("x"))
+        layout = "contiguous"
+    kind = data if data in ("near_zero", "saturated") else "normal"
+    x, z, w, _ = make(T, H, layout=layout, data=kind, seed=41)
+    if data == "gate_edges":
+        _gate_edges(z, 42)
+    elif data == "non_finite":
+        zr, xr = z.view(-1, D), x.view(-1, D)
+        zr[::5, 7] = float("inf")
+        zr[1::5, 9] = float("-inf")
+        zr[2::5, 11] = float("nan")
+        xr[3::5, 13] = float("inf")
+    return x, z, w, T
+
+
+@pytest.mark.parametrize("data", ROUTE_DATA)
+@pytest.mark.parametrize(
+    "shape",
+    [*(f"{T}x{H}" for T, H in ROUTE_SHAPES), *(f"edge:{e}" for e in GRID_EDGES)],
+)
+def test_forward_routes_give_the_same_bits(shape, data, launches, monkeypatch):
+    """On an architecture that routes a forward of packed rows: ``REPEATS``
+    forwards of contiguous inputs run it (a single token runs ``fwd``) and give
+    the bits of the ``fwd`` program on the same inputs (``forward_module``
+    patched to ``fwd``), finite or not."""
+    arch, packed = _packed_route()
+    x, z, w, tokens = _route_inputs(shape, data)
+    strided = loader.ROUTES[arch]["fwd"]
+    launches.clear()
+    got = [forward(x, z, w, EPS) for _ in range(REPEATS)]
+    assert launches == [packed if tokens > 1 else strided] * REPEATS, launches
+    monkeypatch.setattr(
+        loader,
+        "forward_module",
+        lambda arch, rows, heads, sm_count, *strides: loader.module_for_rows(
+            arch, "fwd", rows, sm_count
+        ),
+    )
+    launches.clear()
+    want = forward(x, z, w, EPS)
+    assert launches == [strided], launches
+    for i, y in enumerate(got):
+        assert_same_bits(y, want, f"{shape} {data} call {i}")
+
+
+@pytest.mark.parametrize(
+    "layout,T,route",
+    [
+        ("contiguous", 65, "fwd_packed"),
+        ("flat", 65, "fwd_packed"),
+        ("misaligned", 65, "fwd_packed"),
+        ("contiguous", 1, "fwd"),
+        ("projection", 65, "fwd"),
+        ("head_major", 65, "fwd"),
+        ("broadcast", 65, "fwd"),
+    ],
+)
+def test_forward_route_follows_the_layout(layout, T, route, launches):
+    """On an architecture that routes a forward of packed rows, inputs the
+    kernel reads as packed rows (contiguous, flat, and misaligned ones once
+    copied) run it; a single token (token stride 0), a gate sliced from a
+    projection, head-major rows and a token-stride-0 broadcast run ``fwd``.
+    Each gives the bits of its rows as contiguous tensors."""
+    arch, _ = _packed_route()
+    H = 48
+    if layout == "broadcast":
+        x, z, w, _ = make(1, H, seed=43)
+        x, z = x.expand(T, H, D), z.expand(T, H, D)
+    else:
+        x, z, w, _ = make(T, H, layout=layout, seed=43)
+    launches.clear()
+    y = forward(x, z, w, EPS)
+    assert launches == [loader.ROUTES[arch][route]], (layout, launches)
+    xc, zc = (t.reshape(T, H, D).contiguous() for t in (x, z))
+    assert_same_bits(y.reshape(T, H, D), forward(xc, zc, w, EPS), layout)
+
+
+def test_forward_module_runs_packed_rows_only():
+    """``forward_module`` (host only): an architecture's ``fwd_packed`` program
+    for head strides of 128 and token strides of ``H * 128`` on both ``x`` and
+    ``z`` and fewer than ``PACKED_ROWS`` rows; ``fwd`` for any other strides, a
+    single token (token stride 0), a token-stride-0 broadcast and from
+    ``PACKED_ROWS`` rows, and always on an architecture without one."""
+    assert loader.PACKED_ROLES == ("fwd_packed",)
+    assert loader.PACKED_ROWS == 2**31 // D
+    H, last = 48, loader.PACKED_ROWS - 1
+    row = H * D
+    for arch in loader.ARCHES:
+        fwd = loader.ROUTES[arch]["fwd"]
+        packed = loader.ROUTES[arch].get("fwd_packed", fwd)
+        for rows, heads, strides, want in (
+            (65 * H, H, (row, D, row, D), packed),
+            (65, 1, (D, D, D, D), packed),
+            (last, 1, (D, D, D, D), packed),
+            (loader.PACKED_ROWS, 1, (D, D, D, D), fwd),
+            (2**31 - 1, 1, (D, D, D, D), fwd),
+            (H, H, (0, D, 0, D), fwd),
+            (65 * H, H, (0, D, 0, D), fwd),
+            (65 * H, H, (row, D, 2 * row + 16, D), fwd),
+            (65 * H, H, (2 * row + 16, D, row, D), fwd),
+            (65 * H, H, (D, 65 * D, D, 65 * D), fwd),
+            (65 * H, H, (row, D, D, 65 * D), fwd),
+        ):
+            got = loader.forward_module(arch, rows, heads, 148, *strides)
+            assert got == want, (arch, rows, heads, strides)
+
+
 def test_claimed_backward_matches_fp64():
     """65536 x 48 rows, many times one wave of the backward's row blocks on
     any device, so its CTAs claim chunks of blocks over several rounds:
@@ -852,14 +983,20 @@ def test_steps_neither_raise_nor_warn_under_deterministic_algorithms(warn_only):
 
 @pytest.mark.parametrize("T,H", [(1, 1), (17, 7), (1031, 48), (32737, 48)])
 def test_each_call_launches_one_module_of_its_role(T, H, launches):
-    """One module a role whatever the rows: the forward runs ``ROUTES[arch]
-    ["fwd"]``; a backward runs one kernel, ``bwd_bf16`` for a BF16 weight
+    """One module a role whatever the rows: the forward of contiguous inputs
+    runs ``forward_module`` of their strides (``ROUTES[arch]["fwd_packed"]``
+    where routed, except for a single token; else ``ROUTES[arch]["fwd"]``); a
+    backward runs one kernel, ``bwd_bf16`` for a BF16 weight
     gradient and for ``compute_grad_weight=False``, ``bwd_f32`` for an FP32
     one, accumulating or not; the reset launches no module."""
     arch, sms = _device()
     routes = loader.ROUTES[arch]
     for role in loader.ROLES:
         assert loader.module_for_rows(arch, role, T * H, sms) == routes[role]
+    tok = H * D if T > 1 else 0
+    forward_name = loader.forward_module(arch, T * H, H, sms, tok, D, tok, D)
+    packed = routes.get("fwd_packed", routes["fwd"])
+    assert forward_name == (packed if T > 1 else routes["fwd"])
     x, z, w, dy = make(T, H, seed=39)
     ws = workspace_for(T * H, x.device)
     bf16 = torch.zeros(D, dtype=torch.bfloat16, device=x.device)
@@ -898,7 +1035,10 @@ def test_each_call_launches_one_module_of_its_role(T, H, launches):
     for role, call in calls:
         launches.clear()
         call()
-        assert launches == ([] if role is None else [routes[role]]), (role, launches)
+        want = [] if role is None else [routes[role]]
+        if role == "fwd":
+            want = [forward_name]
+        assert launches == want, (role, launches)
     assert_zero(ws)
 
 
@@ -1626,7 +1766,8 @@ def test_empty_and_errors():
 
 def test_registry_records_reference_the_build_manifest():
     """Every call role (``ROLES``: the forward and the backward of each
-    weight-gradient dtype) ships one module per architecture, and no other
+    weight-gradient dtype) ships one module per architecture, an architecture
+    may also route a forward of packed rows (``PACKED_ROLES``), and no other
     role is routed; every module record names its ``build.json`` library
     (schema ``cake-build/1``), whose entries carry the package's kernel and
     binding sources and the precise-arithmetic flags."""
@@ -1641,7 +1782,8 @@ def test_registry_records_reference_the_build_manifest():
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
-        assert set(loader.ROUTES[arch]) == set(loader.ROLES), arch
+        roles = set(loader.ROUTES[arch])
+        assert set(loader.ROLES) <= roles <= {*loader.ROLES, *loader.PACKED_ROLES}
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             assert record["role"] == role and arch in record["arches"], (arch, role)
@@ -1705,10 +1847,12 @@ BACKWARD_ARGUMENTS = {
 def test_records_launch_alone_and_take_the_hosts_arguments():
     """Every record launches without a cluster, cooperatively or with
     programmatic dependent launch, and its kernel parameters map exactly onto
-    the logical arguments the host passes.  The forward: 128 threads, no
-    dynamic shared memory, no workspace, a ``persistent_row_blocks`` rule of
-    positive ``ctas_per_sm``, ``max_blocks_per_cta``,
-    ``persistent_from_rows_per_sm`` and ``rows_per_block``.
+    the logical arguments the host passes.  Each forward (``fwd`` and
+    ``fwd_packed``): 128 threads, no dynamic shared memory, no workspace, a
+    ``persistent_row_blocks`` rule of positive ``ctas_per_sm``,
+    ``max_blocks_per_cta``, ``persistent_from_rows_per_sm`` and
+    ``rows_per_block``; an architecture's two forwards launch alike and take
+    the same arguments.
     Each backward: 256 threads and the ``claimed_row_blocks`` rule of 4 CTAs
     per SM over 16-row blocks, and a workspace of 2 slots of 9 limbs, the same
     for both weight-gradient dtypes."""
@@ -1725,7 +1869,7 @@ def test_records_launch_alone_and_take_the_hosts_arguments():
                 assert key in logical, (name, kind, key)
         assert {key for kind, key in plan if kind != "grid"} == set(logical), name
         rule = record["grid_rule"]
-        if record["role"] == "fwd":
+        if record["role"] in ("fwd", *loader.PACKED_ROLES):
             assert rule["kind"] == "persistent_row_blocks", name
             positive = (
                 "ctas_per_sm",
@@ -1756,6 +1900,13 @@ def test_records_launch_alone_and_take_the_hosts_arguments():
         )
         for key in ("grid_rule", "workspace", "logical"):
             assert bf16[key] == f32[key], (arch, key)
+        if "fwd_packed" in loader.ROUTES[arch]:
+            fwd, packed = (
+                loader.MODULES[loader.route_module(arch, role)]
+                for role in ("fwd", "fwd_packed")
+            )
+            for key in ("grid_rule", "launch", "logical", "arg_plan", "ffi_entry"):
+                assert fwd[key] == packed[key], (arch, key)
 
 
 # Without a device: the grids of both rules at several SM counts (small
@@ -1813,10 +1964,17 @@ def test_forward_grid_is_one_cta_a_block_then_whole_waves(sm_count):
     more than ``max_blocks_per_cta`` blocks, whole waves of ``ctas_per_sm *
     SMs`` CTAs unless one CTA a block, and the fewest such waves (exactly ``k``
     waves at the fewest rows of ``k`` whole waves of ``max_blocks_per_cta``
-    blocks a CTA from there, ``k + 1`` from a row more).  ``module_for_rows``
-    names the one forward module whatever the rows."""
-    for arch in loader.ARCHES:
-        name = loader.route_module(arch, "fwd")
+    blocks a CTA from there, ``k + 1`` from a row more), for every forward
+    record.  ``module_for_rows`` names the one ``fwd`` module whatever the
+    rows."""
+    forwards = [
+        (arch, role)
+        for arch in loader.ARCHES
+        for role in ("fwd", *loader.PACKED_ROLES)
+        if role in loader.ROUTES[arch]
+    ]
+    for arch, role in forwards:
+        name = loader.route_module(arch, role)
         record = loader.MODULES[name]
         rule = record["grid_rule"]
         per_block = rule["rows_per_block"]
@@ -1824,7 +1982,8 @@ def test_forward_grid_is_one_cta_a_block_then_whole_waves(sm_count):
         wave = rule["ctas_per_sm"] * sm_count
         start, waves_rows = _persistent_waves_rows(rule, sm_count)
         for rows in _grid_rows(rule, sm_count):
-            assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+            if role == "fwd":
+                assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
             grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
             ctas, blocks = grid[0], -(-rows // per_block)
             what = (arch, rows, grid)
