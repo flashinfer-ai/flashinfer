@@ -71,8 +71,8 @@ CTAs, 512 for the 128-thread form) and
 :func:`bwd_slab_program` names the column-slab form per token count, SM count
 and architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
 per-architecture ``BWD_SLAB_PROGRAM``: the dynamic-schedule form ``dynr`` on
-sm_100a and sm_103a, ``xrsg`` on sm_107a; on sm_100a for ``1024 < T <= 4096``
-its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
+sm_100a and sm_103a, its late-claim form ``dynl`` on sm_107a; on sm_100a for
+``1024 < T <= 4096`` ``dynl`` too, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
 where the K7 units fit the SMs and at the chunk counts / runs it lists; at
 H 5120 / 7168 the per-size bands name ``dynl`` and ``xrsg_p160`` on sm_100a and
 ``xrsg_p160`` (at 5120 ``dynl`` above 960 tokens) on sm_103a, whose one-round
@@ -3929,6 +3929,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_det_train_bwd_slab__dynl": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -4245,65 +4246,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "program": "xrsg_p160",
             "rule": "bwd_slab_program",
         },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
-    "cake_mhc_det_train_bwd_slab__xrsg__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn_part"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "k7_chunks",
-            "kind": "slab_chunks",
-            "slabs": 64,
-        },
-        "hidden": 4096,
-        "kernel": "cake_mhc_det_train_bwd_slab__xrsg",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 232448,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_slab__xrsg",
-        "logical": {
-            "P": "parts",
-            "T": "rows",
-            "X": "x_flat",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dfn_part": "dfn_part",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "rpc": "rows_per_chunk",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": None,
         "workspace_rule": {
             "kind": "regions",
             "workspace": "bwd",
@@ -6620,7 +6562,6 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_mhc_det_train_bwd_slab__xrsg__h5120": {
         "arches": [
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -6751,6 +6692,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -8740,7 +8682,6 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_mhc_det_train_bwd_slab__xrsg__h7168": {
         "arches": [
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -8870,6 +8811,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_det_train_bwd_slab__dynl__h7168": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -9939,7 +9881,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
             "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7",
             "cake_mhc_det_train_bwd_token__rt64",
-            "cake_mhc_det_train_bwd_slab__xrsg__a7",
+            "cake_mhc_det_train_bwd_slab__dynl",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
             "cake_mhc_det_train_bwd_reduce__wpu4",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
@@ -9991,7 +9933,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120",
             "cake_mhc_det_train_bwd_token__rt64__h5120",
-            "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_slab__dynl__h5120",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120",
@@ -10035,7 +9977,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168",
             "cake_mhc_det_train_bwd_token__rt64__h7168",
-            "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_slab__dynl__h7168",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168",
@@ -10640,8 +10582,15 @@ BWD_ROW_BANDS = {
 # stays <= 1.01 (kernel sum) at the rows of record outside the bands, the identical-program control within
 # 0.99..1.01. Under the co-scheduled load (16 CTAs x 640 threads) xrsg takes up to 1.87 of its unloaded time, dynr up
 # to 1.29; with a 128-thread side CTA on every SM xrsg does not finish while the side load runs, dynr stays within
-# 1.03 and the path within 1.0625 (GB200 and GB300, 152 SMs). sm_107a has no such form (xrsg).
-BWD_SLAB_PROGRAM = {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"}
+# 1.03 and the path within 1.0625 (GB200 and GB300, 152 SMs). sm_107a routes the late-claim form "dynl" (below) at every
+# token count and hidden size: xrsg's 232,448-byte pool and 168 registers leave an R200 SM no room for a 128-thread side
+# CTA, so with one on every SM xrsg does not finish while the side load runs; dynl's 228,480-byte pool and 160 registers
+# leave that room, and under a load that holds SMs its late CTAs take fewer units. On R200 (216 and 212 SMs, 15 hidden
+# size / token count cells per board) dynl completes beside the side CTAs at every cell (1.003-1.060 of its unloaded
+# backward_finish) where xrsg completes at none; under the 16 x 640 load it takes 0.999-1.345 of its unloaded time where
+# xrsg takes 0.997-1.751; unloaded the backward path with dynl / with xrsg reads 0.980-1.008 at H 4096 (13 rows of
+# record), 0.998-1.014 at 5120 and 0.974-0.995 at 7168 (two sessions; bitwise).
+BWD_SLAB_PROGRAM = {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"}
 # BWD_SLAB_BANDS: the column-slab pass's token-count bands per architecture ((above, at_most, program), at_most None =
 # unbounded), checked before BWD_SLAB_PROGRAM. sm_100a routes "dynl" (dynr + claim="late": the load warp draws the
 # next unit when it loads the current unit's last tile, not one unit ahead; fn_group=4: the first round's groups of four
@@ -10881,9 +10830,11 @@ K6_CTAS_PER_SM = 2
 # on every SM) at the other T --, "dynr" (bitwise xrsg) above 4096; on sm_103a xrsg_p160 for T <= 960 and dynl for
 # 960 < T <= 1535 at 5120 (the same unloaded time on GB300, faster under a partial co-scheduled load), xrsg_p160 for
 # T <= 1151 at 7168, "dynr" above; where the K7 units of an xrsg_p160 row fit the SM count (one round) BWD_SLAB_FIT
-# launches dynr instead; xrsg on sm_107a. K8: the H 4096 maps except the sm_100a P refinements measured at the size
-# (every form bitwise; P only chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the
-# size at every T on sm_100a / sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
+# launches dynr instead; "dynl" on sm_107a at every T (bitwise xrsg; beside a 128-thread side CTA on every SM it
+# completes where xrsg does not; unloaded backward path 0.998-1.014 / 0.974-0.995 of xrsg's at 5120 / 7168, R200, two
+# sessions). K8: the H 4096 maps except the sm_100a P refinements measured at the size (every form bitwise; P only
+# chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T on sm_100a /
+# sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
@@ -10930,7 +10881,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         },
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "BWD_ROW_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
+        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
         "BWD_SLAB_BANDS": {
             "sm_100a": (
                 (0, 896, "xrsg_p160"),
@@ -11041,7 +10992,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         },
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "BWD_ROW_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
+        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
         "BWD_SLAB_BANDS": {
             "sm_100a": (
                 (0, 640, "xrsg_p160"),
