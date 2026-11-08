@@ -1800,7 +1800,9 @@ def test_forward_keeps_the_gate_tail_in_every_band(
     )[arch]
     if band >= len(table):
         pytest.skip(f"{arch} has {len(table)} {kind} forward bands")
-    rows = (int(table[band - 1][0]) * sms if band else 0) + 1
+    # The band's first row count; two rows in the first strided band, where one row
+    # is packed whatever its strides.
+    rows = int(table[band - 1][0]) * sms + 1 if band else 1 + (kind == "strided")
     x, z, w, _ = suite.make(
         rows, 1, layout="projection" if kind == "strided" else "flat", seed=23
     )
