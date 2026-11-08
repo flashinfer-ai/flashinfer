@@ -4204,14 +4204,20 @@ def test_adjoint_split_pricing_on_the_bench_rows(row) -> None:
 def test_adjoint_split_one_stream_rule(monkeypatch) -> None:
     # wave 1 runs on one stream where the shorter of its two launches costs at most the host's fork and join (``fork``):
     # with GB200's costs and a fork cost of 65 us on 152 SMs the pair rows (1, 3) and (2, 6) (pieces of 10 and 20
-    # chunks) take one stream and (4, 12) (38 chunks) two; the delivered entries keep two streams on every bench row,
-    # and a row without summaries (no sequence of three pieces) never forks
+    # chunks) take one stream and (4, 12) (38 chunks) two; the delivered entries without a fork cost keep two streams
+    # on every bench row, sm_103a's (GB300) takes one stream at the h1 and h2 rows only (on 148 and on 152 SMs), and a
+    # row without summaries (no sequence of three pieces) never forks
     chunks = tuple(-(-n // 64) for n in (11000, 12000, 9768))
-    for arch in cake_chain.ADJOINT_SPLIT_COSTS:
-        for (seq_lens, num_v_heads), _ in PIECE_ROWS.values():
+    for arch, arch_costs in cake_chain.ADJOINT_SPLIT_COSTS.items():
+        one_rows = {"h1", "h2"} if arch == "sm_103a" else set()
+        assert (arch_costs["fork"] > 0.0) is bool(one_rows), (arch, arch_costs)
+        for name, ((seq_lens, num_v_heads), _) in PIECE_ROWS.items():
             row = tuple(-(-n // 64) for n in seq_lens)
             rec = cake_chain.adjoint_split_pricing(row, num_v_heads, 148, arch)
-            assert rec["one_stream"] is False, (arch, seq_lens, num_v_heads, rec)
+            assert rec["one_stream"] is (name in one_rows), (arch, name, rec)
+    for num_v_heads, one in {3: True, 6: True, 12: False, 24: False}.items():
+        rec = cake_chain.adjoint_split_pricing(chunks, num_v_heads, 152, "sm_103a")
+        assert rec["segment_len"] > 0 and rec["one_stream"] is one, (num_v_heads, rec)
     costs = {"walk": 2.38, "summary": 2.79, "serial_low": 2.18, "serial_full": 2.42, "stitch": 9.3,
              "stitch_piece": 3.1, "fixed": 15.0}  # fmt: skip
     # the delivered device entry of GB200 (sm_100a, 152 SMs) is these costs with a fork cost of 65 us

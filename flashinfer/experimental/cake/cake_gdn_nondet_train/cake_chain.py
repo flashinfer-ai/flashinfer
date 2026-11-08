@@ -2011,7 +2011,7 @@ def split_r_form(
 # adjoint, which the split computes exactly up to that composition's rounding (no warm-up bound, so the plan and its
 # cost do not depend on the gates).  :func:`adjoint_split_pricing` selects it over the serial table, both at their
 # full cost.
-ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_107a"})
+ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
 ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
@@ -2026,8 +2026,9 @@ SPLIT_SEED, SPLIT_SEED_SEQ, SPLIT_TAPE, SPLIT_OUT = 1, 2, 4, 8
 # join); the host's cost of wave 1's fork and join (``fork``): where the overlap that the side stream buys, the shorter
 # of wave 1's two launches, is at most ``fork``, wave 1 runs on the caller's stream, summaries first (the same kernels
 # and bits; the host's fork and join, not the GPU, then decides wave 1's time: measured on GB200's Grace host at the
-# group-of-three pair rows).  sm_100a measured on B200 (148 SMs), sm_107a on R200 (212 SMs; ``serial_full``
-# extrapolated from the 144-CTA rows, the fullest serial wave of the bench rows there).
+# group-of-three pair rows).  sm_100a measured on B200 (148 SMs), sm_103a on GB300 (152 SMs; its ``fork`` from the
+# pair rows there: one stream at the (1, 3) and (2, 6) pairs, two from (4, 12) on; B300 not measured), sm_107a on R200
+# (212 SMs; ``serial_full`` extrapolated from the 144-CTA rows, the fullest serial wave of the bench rows there).
 ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
     "sm_100a": {
         "walk": 2.69,
@@ -2038,6 +2039,16 @@ ADJOINT_SPLIT_COSTS: dict[str, dict[str, float]] = {
         "stitch_piece": 3.0,
         "fixed": 15.0,
         "fork": 0.0,
+    },
+    "sm_103a": {
+        "walk": 2.24,
+        "summary": 2.64,
+        "serial_low": 2.13,
+        "serial_full": 2.19,
+        "stitch": 8.8,
+        "stitch_piece": 3.1,
+        "fixed": 15.0,
+        "fork": 65.0,
     },
     "sm_107a": {
         "walk": 2.0,
