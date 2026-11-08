@@ -38,13 +38,21 @@ backward without query rows launches nothing and does not alert.  The
 deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
 reserved name (planned) and does not exist yet.
 
-Run to run, with identical inputs on the same GPU:
+Run to run, with identical inputs on the same GPU, and the error of each output
+against an FP64 reference: relative L2 / worst element over max |reference|,
+median of 5 runs at T 1024, S 8192, top-k 2048 (B200; rope form, then NoPE
+form), next to the same error of the package at FlashInfer `2e989556`:
 
-| Output | Run to run |
-|---|---|
-| `out`, `lse` and the `o_lo` residual (forward) | repeats bit for bit |
-| `dq_latent`, `dq_rope` | repeats bit for bit |
-| `dkv_latent`, `dk_rope`, and the rows accumulated into `dkv_acc` | may vary (unordered FP32 atomic adds) |
+| Output | Run to run | Error vs FP64 | Error at `2e989556` |
+|---|---|---|---|
+| `out` | repeats bit for bit | 1.98e-3 / 4.28e-3; 2.01e-3 / 2.89e-3 | 1.98e-3 / 4.28e-3; 2.01e-3 / 2.89e-3 |
+| `lse` | repeats bit for bit | 8.30e-8 / 2.29e-7; 9.11e-8 / 2.10e-7 | 8.30e-8 / 2.29e-7; 9.11e-8 / 2.10e-7 |
+| the `o_lo` residual (forward) | repeats bit for bit | (internal) | (internal) |
+| `dq_latent`; the NoPE `dq` | repeats bit for bit | 1.97e-3 / 4.33e-3; 2.13e-3 / 3.24e-3 | 1.97e-3 / 4.33e-3; 2.13e-3 / 3.24e-3 |
+| `dq_rope` | repeats bit for bit | 2.35e-3 / 4.35e-3 | 2.35e-3 / 4.35e-3 |
+| `dkv_latent`; the NoPE `dkv` (fresh, or the `kv` gradient) | may vary (unordered FP32 atomic adds) | 1.65e-3 / 1.40e-3; 1.66e-3 / 1.86e-3 | 1.65e-3 / 1.40e-3; 1.66e-3 / 1.86e-3 |
+| `dk_rope` | may vary (unordered FP32 atomic adds) | 1.66e-3 / 1.93e-3 | 1.66e-3 / 1.93e-3 |
+| the rows accumulated into `dkv_acc` | may vary (unordered FP32 atomic adds) | as `dkv_latent` / `dk_rope` | as `dkv_latent` / `dk_rope` |
 
 | Before | Now |
 |---|---|

@@ -499,7 +499,11 @@ def _device_index(device: Optional[torch.device]) -> int:
 # the persistent grid up to 128 MiB (65,536 keys: 0.8-2.6 % faster backward); on SM107 the 128 MiB window is
 # 1.4-3.7 % slower, so it keeps 64 MiB, the window of an architecture without its own entry.
 NOPE_PERSISTENT_DKV_BYTES = 64 << 20
-NOPE_PERSISTENT_DKV_BYTES_BY_ARCH = {"sm_100a": 128 << 20, "sm_103a": 128 << 20, "sm_107a": 64 << 20}
+NOPE_PERSISTENT_DKV_BYTES_BY_ARCH = {
+    "sm_100a": 128 << 20,
+    "sm_103a": 128 << 20,
+    "sm_107a": 64 << 20,
+}
 NOPE_DKV_BYTES_PER_KEY = 2048
 
 
