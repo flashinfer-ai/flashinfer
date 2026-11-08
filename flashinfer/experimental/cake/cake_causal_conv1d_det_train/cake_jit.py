@@ -3852,6 +3852,11 @@ NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
     "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
+# The narrow rows that run whole tiles of another width instead of 32
+# vectors, per role: ``cv -> ct_vec`` (a divisor of ``cv``).  The forward
+# runs C = 576 as (18, 7, 4) and C = 640 as (40, 3, 2), measured faster than
+# the 32-vector tiles on every forward route; ``y`` keeps its bits.
+NARROW_TILE_WIDTHS: dict[str, dict[int, int]] = {"fwd": {72: 18, 80: 40}, "bwd": {}}
 
 
 def channel_split(
@@ -3896,10 +3901,12 @@ def channel_split(
     ``route`` is the launch's route (one of :data:`KINDS` of the role; the
     host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
     single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
-    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 1016
-    (three or four tiles) on every backward route, the forward's C = 576 to
-    768 on every forward route, so C = 640 runs (32, 4, 3) instead of (80,
-    1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
+    threads // 32, ceil(cv / 32))``, or the whole tiles of
+    :data:`NARROW_TILE_WIDTHS`: the backward's C = 224 and 520 to 1016 (three
+    or four tiles) on every backward route, the forward's C = 576 to 768 on
+    every forward route, so the forward runs C = 576 as (18, 7, 4), C = 640 as
+    (40, 3, 2) instead of (80, 1, 1) and C = 768 as (32, 4, 3).  ``y`` and
+    ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
     the narrow plan's fixed order (bitwise reproducible).  Without a route,
     the single tile stays.
     """
@@ -3945,7 +3952,7 @@ def _channel_split(
             and route in NARROW_TILE_ROUTES[role]
             and _narrow_tile(channel_vectors, threads, role)
         ):
-            ct_vec = 32
+            ct_vec = NARROW_TILE_WIDTHS[role].get(channel_vectors, 32)
     else:
         candidates = [
             width
@@ -3986,7 +3993,7 @@ def _fallback_split(channel_vectors: int, threads: int, role: str) -> int:
 
 
 def _narrow_tile(channel_vectors: int, threads: int, role: str) -> bool:
-    """Whether a single-tile row of ``role`` runs 32-vector tiles on its narrow routes."""
+    """Whether a single-tile row of ``role`` runs narrow tiles on its narrow routes."""
 
     if threads != NARROW_TILE_THREADS:
         return False

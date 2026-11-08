@@ -167,7 +167,8 @@ CASES = (
 # the route-specific code, which is the tap / bias load form and the store
 # form): the two new multi-sub-tile geometries, a whole-row tile, the
 # S = 5 row below one stage and a narrow single-tile row (C = 640: three
-# 32-vector tiles on every route).
+# 32-vector tiles on every backward route, two 40-vector tiles on every
+# forward route).
 ROUTE_CASES = (
     (1000, 512, "perf"),
     (4097, 1280, (1000, 0, 3, 3094)),
@@ -228,20 +229,24 @@ CHANNEL_SPLIT_TABLE = {
 }
 # The narrow single-tile rows at 128 threads x 8 channels, per role: C ->
 # (ct_vec, n_sub, n_ch_tiles) on the routes of ``NARROW_TILE_ROUTES`` (32-vector
-# tiles, the last partial); every other route and a call without a route keep
+# tiles, the last partial, or the forward's whole tiles of
+# ``NARROW_TILE_WIDTHS``); every other route and a call without a route keep
 # the one-tile plan of ``CHANNEL_SPLIT_TABLE`` (C / 8 vectors).
 NARROW_SPLIT_TABLE = {
     "bwd": {
         224: (32, 4, 1),
         520: (32, 4, 3),
+        576: (32, 4, 3),
         640: (32, 4, 3),
         648: (32, 4, 3),
         768: (32, 4, 3),
         776: (32, 4, 4),
         1016: (32, 4, 4),
     },
-    "fwd": {576: (32, 4, 3), 640: (32, 4, 3), 768: (32, 4, 3)},
+    "fwd": {576: (18, 7, 4), 640: (40, 3, 2), 768: (32, 4, 3)},
 }
+# The forward's narrow rows of other widths: cv -> ct_vec (whole tiles).
+FWD_NARROW_WIDTHS = {72: 18, 80: 40}
 # Single-tile rows outside each role's narrow set (one tile on every route).
 ONE_TILE_ROWS = {
     "bwd": (160, 192, 256, 512, 1024),
@@ -250,6 +255,7 @@ ONE_TILE_ROWS = {
 # Rows whose plan, launch and gradients the narrow-tile tests check per route.
 NARROW_CASES = (
     (1000, 224, "perf"),
+    (4097, 576, (1000, 0, 3, 3094)),
     (4097, 640, (1000, 0, 3, 3094)),
     (4097, 1016, (1000, 0, 3, 3094)),
 )
@@ -786,7 +792,8 @@ def test_channel_split_literal_table() -> None:
 
 
 def test_channel_split_narrow_tiles_per_route() -> None:
-    """The narrow single-tile rows of each role run 32-vector tiles on the routes of
+    """The narrow single-tile rows of each role run 32-vector tiles (the forward's
+    C 576 / 640: whole tiles of ``NARROW_TILE_WIDTHS``) on the routes of
     ``NARROW_TILE_ROUTES`` only: the literal table per route, the kept one-tile
     rows, every multiple of eight up to 8192 against the route-free rule, the
     plan's ``route`` and the refused routes."""
@@ -796,6 +803,7 @@ def test_channel_split_narrow_tiles_per_route() -> None:
         "fwd": ("fwd", "fwd_dt", "fwd_bias"),
         "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
     }
+    assert loader.NARROW_TILE_WIDTHS == {"fwd": FWD_NARROW_WIDTHS, "bwd": {}}
     for kind in loader.KINDS:
         role = loader.route_role(kind)
         narrow = kind in loader.NARROW_TILE_ROUTES[role]
@@ -822,12 +830,12 @@ def test_channel_split_narrow_tiles_per_route() -> None:
             got = loader.channel_split(C, geometry=geometry, role=role, route=kind)
             if role == "bwd":
                 in_set = 64 < cv < 128 or cv == 28
+                width = 32
             else:
                 in_set = 72 <= cv <= 96
-            assert got == ((32, 4, -(-cv // 32)) if narrow and in_set else base), (
-                kind,
-                C,
-            )
+                width = FWD_NARROW_WIDTHS.get(cv, 32)
+            want = (width, 128 // width, -(-cv // width))
+            assert got == (want if narrow and in_set else base), (kind, C)
     refused = (("bwd", "fwd"), ("fwd", "bwd_bias"), ("bwd", "dx"), (None, "bwd"))
     for role, kind in refused:
         with pytest.raises(ValueError):
@@ -2008,7 +2016,7 @@ def _clear_tile_rule_caches() -> None:
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
     """On the narrow single-tile rows each route launches its route's plan
-    (32-vector tiles on the ``NARROW_TILE_ROUTES``, one tile elsewhere) for the
+    (``NARROW_SPLIT_TABLE`` on the ``NARROW_TILE_ROUTES``, one tile elsewhere) for the
     backward and for the forward its inputs select; ``y`` and ``dx`` are bitwise
     the one-tile plan's, ``dweight`` / ``dbias`` are bitwise reproducible and
     within the route's tolerance of the reference."""
