@@ -594,9 +594,18 @@ def test_reducer_lever_follows_its_k_l_bound_and_the_column_count(arch, world_si
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch, world_size", DELIVERED)
 def test_reducer_lever_stops_at_its_m_n_limit(arch, world_size):
-    reducers = loader.LEVER_DISPATCH[arch].get("REDUCERS")
+    table = loader.LEVER_DISPATCH[arch]
+    reducers = table.get("REDUCERS")
     if reducers is None or world_size not in reducers["max_k_l"]:
         return
+    lockstep = table.get("LOCKSTEP", {}).get("suffix", "")
+
+    def reducer_part(lever: str) -> str:
+        # Large calls can also select the lockstep lever, whose suffix comes last.
+        if lockstep and lever.endswith(lockstep):
+            return lever[: -len(lockstep)]
+        return lever
+
     bound = reducers["max_k_l"][world_size]
     n = -(-bound * world_size // 256) * 256
     limit = reducers.get("mn_limit", {}).get(world_size)
@@ -604,12 +613,12 @@ def test_reducer_lever_stops_at_its_m_n_limit(arch, world_size):
         # Without a limit the reducer lever holds up to the largest M.
         m = loader.MAX_ROWS_TIMES_COLS // n
         lever = loader.lever_variant(world_size, m, n, bound, arch, sm_count=1)
-        assert lever == reducers["suffix"]
+        assert reducer_part(lever) == reducers["suffix"]
         return
     above = -(-limit // n)
     below = loader.lever_variant(world_size, above - 1, n, bound, arch, sm_count=1)
     at = loader.lever_variant(world_size, above, n, bound, arch, sm_count=1)
-    assert below == reducers["suffix"] and at == ""
+    assert reducer_part(below) == reducers["suffix"] and reducer_part(at) == ""
 
 
 @pytest.mark.cpu_only
