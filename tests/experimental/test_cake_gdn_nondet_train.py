@@ -5064,15 +5064,31 @@ def test_fwd_a_saved_list_keeps_its_arity(device) -> None:
 
 
 # --------------------------------------------------------------------------- the split forward on the piece table
-# Layouts whose forward segment table splits a sequence on every device of the package, with a piece length of at
-# least FWD_SPLIT_MIN_PIECE: split sequences beside sequences of one piece (one of them a single token), value-head
-# groups of three and two.
+# Layouts whose forward segment table splits a sequence on every device of the package: split sequences beside
+# sequences of one piece (one of them a single token), value-head groups of three and two.  Their pieces (30..42
+# chunks) are shorter than the split's shape class (cake_plan.FORWARD_SPLIT_MIN_PIECE): the tests of the split
+# forward's tables, bits and accuracy run them with the class lowered to FWD_SPLIT_TEST_MIN_PIECE (the same kernels and
+# tables on fewer tokens than a row of the class); test_fwd_split_shape_class pins the class itself.
 FWD_SPLIT_CASES = {
     "g3": ((2, 6), (40000, 20000, 1000, 64, 1)),
     "g2": ((4, 8), (30000, 9000, 100)),
 }
+FWD_SPLIT_TEST_MIN_PIECE = 16
+# the pair rows: three sequences of about 11k tokens
+PAIR_SEQ_LENS = (11000, 12000, 9768)
 # the pair row of one key head: pieces of about ten chunks, so the prep forward's split scan keeps it
-FWD_SPLIT_SHORT = ((1, 3), (11000, 12000, 9768))
+FWD_SPLIT_SHORT = ((1, 3), PAIR_SEQ_LENS)
+# (H, HV), sequence lengths and whether the forward runs the split, for the rows that set the split's shape class:
+# long sequences at HV 6 (pieces of 132..158 chunks) and the pair rows (HV 24: 63; HV 12: 38; HV 6: 20; HV 3: 11)
+FWD_SPLIT_CLASS_ROWS = {
+    "long3_hv6": ((2, 6), (131071, 87531, 43385), True),
+    "long2_hv6": ((2, 6), (128147, 131027), True),
+    "long6_hv6": ((2, 6), (126565, 32714, 33696, 15081, 22979, 10782), True),
+    "pair_hv24": ((8, 24), PAIR_SEQ_LENS, True),
+    "pair_hv12": ((4, 12), PAIR_SEQ_LENS, False),
+    "pair_hv6": ((2, 6), PAIR_SEQ_LENS, False),
+    "pair_hv3": ((1, 3), PAIR_SEQ_LENS, False),
+}
 # the host launch order: the middle pieces' summary (side stream) is issued before wave 1
 FWD_SPLIT_STAGES = ["wy_a", "wy_tc2", "fwd_summary", "fwd_fused", "stitch", "fwd_fused"]
 
@@ -5082,6 +5098,18 @@ def _fwd_split_or_skip(device) -> str:
     if arch not in cake_chain.FWD_SPLIT_ARCHS:
         pytest.skip(f"the split forward is not routed on {arch}")
     return arch
+
+
+@pytest.fixture
+def fwd_split_test_class(monkeypatch) -> None:
+    """The split forward's shape class lowered to FWD_SPLIT_TEST_MIN_PIECE (the layouts of FWD_SPLIT_CASES)."""
+    monkeypatch.setattr(
+        cake_plan,
+        "FORWARD_SPLIT_MIN_PIECE",
+        types.MappingProxyType(
+            {arch: FWD_SPLIT_TEST_MIN_PIECE for arch in cake_chain.FWD_SPLIT_ARCHS}
+        ),
+    )
 
 
 def _forward_stages(stages) -> list[str]:
@@ -5168,6 +5196,22 @@ def test_fwd_split_route_rule(monkeypatch) -> None:
     )
 
 
+@pytest.mark.parametrize("sm_count", [148, 152])
+@pytest.mark.parametrize("row", sorted(FWD_SPLIT_CLASS_ROWS))
+def test_fwd_split_shape_class(row, sm_count) -> None:
+    # the forward runs the split on the long rows and on the pair row of HV 24 at the SM counts of B200 (148) and
+    # GB200 / GB300 (152); the pair rows of HV 12, 6 and 3 keep the prep forward's split scan.  The class is read from
+    # the host piece table (lengths, HV, SM count) alone.
+    heads, seq_lens, split = FWD_SPLIT_CLASS_ROWS[row]
+    table = cake_plan.pieces(seq_lens, heads[1], sm_count)
+    assert table.split, table
+    for arch in cake_chain.FWD_SPLIT_ARCHS:
+        got = cake_plan.forward_split_length(arch, table)
+        assert (got is not None) is split, (arch, table.length)
+        assert got in (None, table.length)
+
+
+@pytest.mark.usefixtures("fwd_split_test_class")
 def test_fwd_split_tables_follow_the_plan(device) -> None:
     # the split tables ride on a host-built table whose forward scan splits, at the host plan's piece length; a pinned
     # scan table, a short piece and the device-built table carry none
@@ -5183,7 +5227,7 @@ def test_fwd_split_tables_follow_the_plan(device) -> None:
     plan = cake_plan.host_plan(tuple(seq_lens), heads[1], index)
     got = meta(heads, seq_lens).fwd_split
     assert got is not None and got.length == plan.pieces.length
-    assert got.length >= cake_chain.FWD_SPLIT_MIN_PIECE[arch]
+    assert got.length >= cake_plan.FORWARD_SPLIT_MIN_PIECE[arch]
     assert got.num_segments == sum(plan.pieces.counts)
     assert got.num_first + got.num_middle + len(seq_lens) == got.num_segments
     assert meta(heads, seq_lens, segment_chunks=0).fwd_split is None
@@ -5191,6 +5235,7 @@ def test_fwd_split_tables_follow_the_plan(device) -> None:
     assert meta(*FWD_SPLIT_SHORT).fwd_split is None
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
 def test_fwd_split_matches_the_fp64_recurrence(case, device, monkeypatch) -> None:
     # the split forward replaces the prep, the WY stage, the pre-scan and fwd_ho; o, the final state and every gradient
@@ -5212,6 +5257,7 @@ def test_fwd_split_matches_the_fp64_recurrence(case, device, monkeypatch) -> Non
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
 def test_fwd_split_within_the_budgets_of_the_prep_forward(
     case, device, monkeypatch
@@ -5228,6 +5274,7 @@ def test_fwd_split_within_the_budgets_of_the_prep_forward(
     _assert_within_budget(got, want, OUTPUT_NAMES + ("final_state",))
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
 def test_fwd_split_runs_give_the_same_bits(case, device) -> None:
     # every launch of the split forward has one writer per output element and a fixed order: run to run, and on one
@@ -5248,16 +5295,22 @@ def test_fwd_split_runs_give_the_same_bits(case, device) -> None:
         _assert_same_bits(got, want, names)
 
 
-def test_fwd_split_short_pieces_keep_the_prep_forward(device, monkeypatch) -> None:
-    # pieces shorter than FWD_SPLIT_MIN_PIECE: the prep forward's split scan
+@pytest.mark.parametrize(
+    "row",
+    [row for row, (*_, split) in sorted(FWD_SPLIT_CLASS_ROWS.items()) if not split],
+)
+def test_fwd_split_short_pieces_keep_the_prep_forward(row, device, monkeypatch) -> None:
+    # the pair rows outside the split's shape class (pieces shorter than FORWARD_SPLIT_MIN_PIECE): no launch of the
+    # split forward
     _fwd_split_or_skip(device)
-    heads, seq_lens = FWD_SPLIT_SHORT
+    heads, seq_lens, _split = FWD_SPLIT_CLASS_ROWS[row]
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=427)
     stages = _record_launches(monkeypatch)
     _run(inputs, seq_lens)
     assert "fwd_fused" not in stages and "fwd_summary" not in stages, stages
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 def test_fwd_split_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
     # a call that records no backward writes no h / v_new tape (word 0 on both waves); o and the final state are the
     # bits of the taped call (word 3: h and v_new; w is the WY stage's)
@@ -5295,6 +5348,7 @@ def test_fwd_split_tape_off_keeps_the_output_bits(device, monkeypatch) -> None:
         )
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 def test_fwd_split_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -> None:
     # wy_a always normalizes q / k: a call without the in-kernel normalization runs the prep forward's split scan on a
     # layout the split forward takes otherwise, with the bits of the package whose forward is the prep's everywhere
@@ -5316,6 +5370,7 @@ def test_fwd_split_unnormalized_q_k_keep_the_prep_forward(device, monkeypatch) -
     _assert_same_bits(got, want, OUTPUT_NAMES)
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("reentrant", [False, True], ids=["non-reentrant", "reentrant"])
 def test_fwd_split_checkpoint_writes_the_tape_once(
     reentrant, device, monkeypatch
@@ -5351,6 +5406,7 @@ def test_fwd_split_checkpoint_writes_the_tape_once(
     _assert_same_bits(got, want, OUTPUT_NAMES)
 
 
+@pytest.mark.usefixtures("fwd_split_test_class")
 @pytest.mark.parametrize("case", sorted(FWD_SPLIT_CASES))
 def test_fwd_split_packed_views_give_the_contiguous_bits(
     case, device, monkeypatch

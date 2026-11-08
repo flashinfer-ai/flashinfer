@@ -16,7 +16,8 @@ limitations under the License.
 The host plan of one call that the forward and the backward share: the one-wave piece table of the sequences
 (:func:`pieces`), cached with the device's SM count per sequence-length table (:func:`host_plan`), the frozen tape
 level of each architecture (:data:`TAPE_LEVELS`, :func:`tape_state`), the backward forms that a measurement fixes for a
-device and head shape (:data:`ADJOINT_FORMS`, :func:`adjoint_form`), the M-share flag of a piece table
+device and head shape (:data:`ADJOINT_FORMS`, :func:`adjoint_form`), the shape class of the forward's one-wave split
+(:data:`FORWARD_SPLIT_MIN_PIECE`, :func:`forward_split_length`), the M-share flag of a piece table
 (:data:`M_SHARE_COSTS`, :func:`m_share`), and the placeholder that keeps a saved list's arity where a call saves no
 tensor (:func:`placeholder`).
 
@@ -42,12 +43,14 @@ from . import cake_backend, cake_jit
 
 __all__ = [
     "ADJOINT_FORMS",
+    "FORWARD_SPLIT_MIN_PIECE",
     "LEVEL_STATE",
     "STATE_NAMES",
     "TAPE_LEVELS",
     "HostPlan",
     "Pieces",
     "chunk_counts",
+    "forward_split_length",
     "host_plan",
     "piece_length",
     "pieces",
@@ -220,6 +223,28 @@ def pieces(seq_lens: Sequence[int], num_v_heads: int, sm_count: int) -> Pieces:
     """The one-wave piece table of sequences of ``seq_lens`` tokens with ``num_v_heads`` value heads on a device of
     ``sm_count`` SMs (cached per chunk-count table)."""
     return _pieces(chunk_counts(seq_lens), int(num_v_heads), int(sm_count))
+
+
+# The shape class of the forward's one-wave split, per architecture: the shortest piece (chunks) of the host piece
+# table (:func:`pieces`) on which a call's forward runs the split forward instead of the prep forward's split scan.
+# The split's fixed costs (the front, the middle pieces' summary, the stitch and a second wave) pay back on long pieces
+# only.  Measured on B200 (148 SMs) and GB300 (152; fwd+bwd and checkpoint, the larger ratio to the best FROST arm
+# over the FI-bench and log-spaced gates), the split lowers that ratio at the long rows (two to six sequences of 11k..131k tokens
+# at HV 6: pieces of 132..158 chunks) and at the pair row of HV 24 (three sequences of about 11k tokens: 63 chunks) and
+# raises it at the pair rows of HV 12 and 6 (38 and 20 chunks; HV 3 has 11).  The class reads the host piece table
+# alone (the sequence lengths, HV and the SM count), never tensor contents.
+FORWARD_SPLIT_MIN_PIECE: Mapping[str, int] = MappingProxyType(
+    {"sm_100a": 48, "sm_103a": 48}
+)
+
+
+def forward_split_length(arch: str, table: Pieces) -> int | None:
+    """The piece length of the forward's one-wave split of a call on ``arch`` with the host piece table ``table``:
+    ``table.length`` where the table splits and its pieces reach the architecture's :data:`FORWARD_SPLIT_MIN_PIECE`,
+    ``None`` elsewhere (the prep forward's split scan)."""
+    if not table.split or table.length < FORWARD_SPLIT_MIN_PIECE.get(arch, 1 << 30):
+        return None
+    return table.length
 
 
 @dataclass(frozen=True)

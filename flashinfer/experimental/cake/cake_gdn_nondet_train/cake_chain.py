@@ -3232,13 +3232,12 @@ def _forward_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output
 # stitched start state (``fwd_fused``; a sequence of one piece runs whole there from its initial state, which the
 # stitch copies).  ``fwd_fused`` is ``fwd_ho``'s scan and output on the WY stage's w / u with the tape word of
 # :data:`FWD_FUSED_TAPE`: h and v_new when the call keeps a tape (w is the WY stage's), none without one.  The rows
-# whose piece length is below the architecture's :data:`FWD_SPLIT_MIN_PIECE` keep the prep forward (there the
-# stitch's walk over many short pieces costs more than the split saves); so does every call the serial route would
-# refuse (the conditions of :func:`fwd_a_route` but the serial table).  The piece table, the front and the waves are
-# the planned form of a (device, row): another form (the A-form waves on wy_a's A) takes the same tables.
+# outside the split's shape class, whose pieces are shorter than the architecture's
+# :data:`cake_plan.FORWARD_SPLIT_MIN_PIECE`, keep the prep forward (there the split's fixed costs exceed what it
+# saves); so does every call the serial route would refuse (the conditions of :func:`fwd_a_route` but the serial
+# table).  The piece table, the front and the waves are the planned form of a (device, row): another form (the A-form
+# waves on wy_a's A) takes the same tables.
 FWD_SPLIT_ARCHS = ("sm_100a", "sm_103a")
-# the shortest piece (chunks) the split forward runs, per architecture
-FWD_SPLIT_MIN_PIECE: dict[str, int] = {"sm_100a": 16, "sm_103a": 16}
 # fwd_fused's tape word per tape entry
 FWD_FUSED_TAPE = {"h": 1, "v_new": 2}
 # fwd_summary's output layout into the stitch's [B | M] FP32 [K][V + K] block: b_head, b_row, m_head, m_row, m_col
@@ -3330,19 +3329,17 @@ def forward_split_length(
     meta: ChunkMeta, arch: str, num_v_heads: int, device_index: int
 ) -> int | None:
     """The piece length of the split forward of a host-built ``meta`` on ``arch``: the host plan's
-    (:func:`cake_plan.pieces`) where ``meta``'s forward segment table splits a sequence and the length reaches the
-    architecture's :data:`FWD_SPLIT_MIN_PIECE`, else ``None``."""
+    (:func:`cake_plan.pieces`) where ``meta``'s forward segment table splits a sequence and the row is in the split's
+    shape class (:func:`cake_plan.forward_split_length`), else ``None``."""
     segs = meta.fwd_segments
     if arch not in FWD_SPLIT_ARCHS or meta.seq_lens is None:
         return None
     if not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs):
         return None
-    length = cake_plan.host_plan(
+    plan = cake_plan.host_plan(
         tuple(meta.seq_lens), int(num_v_heads), int(device_index)
-    ).pieces.length
-    if length <= 0 or length < FWD_SPLIT_MIN_PIECE.get(arch, 1 << 30):
-        return None
-    return length
+    )
+    return cake_plan.forward_split_length(arch, plan.pieces)
 
 
 def _m_share_planned(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bool:
@@ -4782,7 +4779,7 @@ def _chunk_meta(
         tuple(sorted(ADJOINT_SPLIT_ARCHS)),
         id(cake_plan.ADJOINT_FORMS),
         FWD_SPLIT_ARCHS,
-        tuple(sorted(FWD_SPLIT_MIN_PIECE.items())),
+        tuple(sorted(cake_plan.FORWARD_SPLIT_MIN_PIECE.items())),
         tuple(sorted(M_SHARE_ARCHS)),
         id(cake_plan.M_SHARE_COSTS),
         cake_plan.M_SHARE_MIN_SAVING,
