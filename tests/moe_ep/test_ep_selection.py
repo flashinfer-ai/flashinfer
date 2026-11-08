@@ -243,6 +243,161 @@ def test_capture_rejections_survive_replay_and_allow_fresh_search(
         )
 
 
+@pytest.mark.parametrize("reject_first", [False, True])
+def test_split_records_follow_backend_configuration_after_reordering(
+    monkeypatch, reject_first
+):
+    from flashinfer.moe_ep.core.selection import NoEligibleCandidate
+
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    measure = c.measure
+
+    def reject(*args, **kwargs):
+        if reject_first and plan.selected[0] == 0:
+            raise CaptureUnsupported("first backend cannot capture")
+        return measure(*args, **kwargs)
+
+    monkeypatch.setattr(c, "measure", reject)
+    with autotune_v2(persistent_cache=False):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+    choices = [dict(v, runner=2 - v["runner"]) for v in plan.enumerate()][::-1]
+    monkeypatch.setattr(plan, "enumerate", lambda: choices)
+    monkeypatch.setattr(plan, "backend_config", lambda index: {"backend": 2 - index})
+    c.measured.clear()
+    plan.prepared.clear()
+    with autotune_v2(mode="replay", persistent_cache=False):
+        result = tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        expected = [0, 20] if reject_first else [2, 11]
+        assert result["selection"] == expected
+        assert plan.prepared == [tuple(expected)]
+        assert not c.measured
+        if reject_first:
+            context = tuner.protocol_context(BACKEND_NAMESPACE)
+            with pytest.raises(NoEligibleCandidate, match="failed capture"):
+                protocol.check_replay(context, [2, 11], choices)
+            choices.pop(0)
+            with pytest.raises(CaptureUnsupported):
+                tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+
+
+@pytest.mark.parametrize("malformed", [None, 42, "invalid", {"unexpected": []}])
+def test_malformed_capture_rejection_record_is_ignored(malformed):
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    with autotune_v2(persistent_cache=False):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        for key, record in tuner.get_protocol_records(BACKEND_NAMESPACE).items():
+            record["capture_rejected"] = malformed
+            tuner.publish_protocol_record(BACKEND_NAMESPACE, key, record, persist=False)
+    c.measured.clear()
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            -1,
+        ]
+        protocol.check_replay(
+            tuner.protocol_context(BACKEND_NAMESPACE), [0, 11], plan.enumerate()
+        )
+        assert not c.measured
+    with autotune_v2(persistent_cache=False):
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            11,
+        ]
+        assert c.measured == [(0, 10), (0, 11), (2, 20)]
+
+
+@pytest.mark.parametrize("error_stage", ["prepare", "measure"])
+def test_capture_rejection_survives_a_later_trial_error(monkeypatch, error_stage):
+    from flashinfer.moe_ep.core.selection import NoEligibleCandidate
+
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    with autotune_v2(persistent_cache=False):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        measure, prepare = c.measure, plan.prepare
+
+        def fail_measure(*args, **kwargs):
+            if plan.selected == (0, 11):
+                raise CaptureUnsupported("cached tactic cannot capture")
+            if plan.selected == (0, 10) and error_stage == "measure":
+                raise RuntimeError("next trial failed")
+            return measure(*args, **kwargs)
+
+        def fail_prepare(selection):
+            if tuple(selection) == (0, 10) and error_stage == "prepare":
+                raise RuntimeError("next trial failed")
+            return prepare(selection)
+
+        monkeypatch.setattr(c, "measure", fail_measure)
+        monkeypatch.setattr(plan, "prepare", fail_prepare)
+        with pytest.raises(RuntimeError, match="next trial failed"):
+            tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+    c.measured.clear()
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            2,
+            20,
+        ]
+        assert not c.measured
+        with pytest.raises(NoEligibleCandidate, match="failed capture"):
+            protocol.check_replay(
+                tuner.protocol_context(BACKEND_NAMESPACE), [0, 11], plan.enumerate()
+            )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_capture_recovery_updates_each_ranks_store(tmp_path, rank, persistent):
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    options = dict(
+        cache_root=str(tmp_path), cache_scope="context", persistent_cache=persistent
+    )
+    with autotune_v2(**options):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        c.rank = rank
+        context = tuner.protocol_context(BACKEND_NAMESPACE)
+        for key, record in context.records().items():
+            context.publish(
+                key, {"contract": record["contract"], "capture_rejected": [10, 11, 20]}
+            )
+        c.measured.clear()
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            11,
+        ]
+        assert c.measured == [(0, 10), (0, 11), (2, 20)]
+    if persistent:
+        autotune_v2_reload()
+    else:
+        assert not list(tmp_path.rglob("*.json"))
+    c.measured.clear()
+    with autotune_v2(mode="replay", **options):
+        assert tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)["selection"] == [
+            0,
+            11,
+        ]
+        assert not c.measured
+        for record in tuner.get_protocol_records(BACKEND_NAMESPACE).values():
+            assert record["selection"][1] not in record["capture_rejected"]
+
+
 def test_disabled_and_skipped_do_not_measure():
     tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
     t = SimpleNamespace(hidden_states=torch.empty(1))

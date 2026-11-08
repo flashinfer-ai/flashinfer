@@ -369,7 +369,8 @@ class SplitProtocol:
                 plain(self.plan.backend_config(choice["runner"]))
             ),
             "runners": [
-                {k: v for k, v in peer.items() if k != "tactics"} for peer in peers
+                {k: v for k, v in peer.items() if k not in ("runner", "tactics")}
+                for peer in peers
             ],
             "measurement": self.settings,
             "fallback": context.tuner.protocol_context(
@@ -382,7 +383,9 @@ class SplitProtocol:
         records = [
             r
             for r in records
-            if isinstance(r, dict) and r.get("contract") == plain(contract)
+            if isinstance(r, dict)
+            and r.get("contract") == plain(contract)
+            and isinstance(r.get("capture_rejected", []), list)
         ]
         rejected = []
         for record in records:
@@ -453,12 +456,18 @@ class SplitProtocol:
                     if valid_score(record)
                     and isinstance(record.get("selection"), list)
                     and len(record["selection"]) == 2
-                    and record["selection"][0] == choice["runner"]
+                    and type(record["selection"][0]) is int
                     and record["selection"][1] in [plain(t) for t in tactics]
                     and record["selection"][1] not in rejected
                 ),
                 None,
             )
+            if cached is not None:
+                # The pinned backend is stable when its candidate position changes.
+                cached = {
+                    **cached,
+                    "selection": [choice["runner"], cached["selection"][1]],
+                }
             # A default tactic can resolve to a rejected configuration. Only
             # use that fallback for runners without a recorded capture failure.
             if not rejected and fallback_selection is None:
@@ -474,6 +483,16 @@ class SplitProtocol:
                 else tactics
             )
             passing = []
+
+            def publish():
+                record = {"contract": plain(contract), "capture_rejected": rejected}
+                if passing:
+                    record.update(min(passing, key=lambda v: v["p50_us"]))
+                # Each rank may have its own persistent store. Update all of
+                # them so reload cannot restore a rejection after recovery.
+                c.prepare(lambda: context.publish(key, record))
+                return record
+
             for tactic in trials:
                 selection = (choice["runner"], tactic)
                 c.prepare(lambda: plan.prepare(selection))
@@ -487,6 +506,8 @@ class SplitProtocol:
                 except CaptureUnsupported:
                     if plain(tactic) not in rejected:
                         rejected.append(plain(tactic))
+                    # A later preparation or launch error must not lose this failure.
+                    publish()
                     continue
                 if plain(tactic) in rejected:
                     rejected.remove(plain(tactic))
@@ -502,20 +523,9 @@ class SplitProtocol:
                 # the remaining agreed tactics still need to be tried.
                 if cached and tactic == cached_tactic:
                     break
-            record = {"contract": plain(contract), "capture_rejected": rejected}
+            record = publish()
             if passing:
-                winner = min(passing, key=lambda v: v["p50_us"])
-                winners.append(winner)
-                record.update(winner)
-            # Keep failures under the same workload and measurement contract.
-            # Refresh every rank's memory copy so a later successful retry can
-            # replace a rejection even when the ranks use separate disk stores.
-            c.publish(context, key, record)
-            c.prepare(
-                lambda: context.tuner.publish_protocol_record(
-                    context.namespace, key, record, persist=False
-                )
-            )
+                winners.append(record)
         if (
             not winners
             and not context.tuning_enabled

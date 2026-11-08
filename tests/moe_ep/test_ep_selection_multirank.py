@@ -286,7 +286,7 @@ def test_capture_rejection_blocks_backend_and_outer_replay(
     monkeypatch.setattr(problem, "INTERMEDIATE", 384)
     fleet, weights, config, t, global_weights = inputs_and_config(bootstrap)
     options = dict(
-        cache_root=str(tmp_path / "rejected"),
+        cache_root=str(tmp_path / f"rejected-rank{bootstrap.rank}"),
         measurement_policy=MeasurementPolicy(execution_mode="cuda_graph"),
     )
     layers, graphs = [], []
@@ -318,6 +318,7 @@ def test_capture_rejection_blocks_backend_and_outer_replay(
             assert "No split tactic completed" in layer.rejected_candidates[1]
         dist.barrier()
         autotune_v2_reload()
+        measure = Collective.measure
         with autotune_v2(mode="replay", **options):
             monkeypatch.setattr(
                 Collective, "measure", lambda *a, **k: pytest.fail("replay measured")
@@ -326,7 +327,20 @@ def test_capture_rejection_blocks_backend_and_outer_replay(
             with pytest.raises(RuntimeError, match="No EP candidate completed"):
                 create(forced)
             # A different outer key must also skip the rejected backend winner.
-            reordered = dataclasses.replace(config, candidates=config.candidates[::-1])
+            split = config.candidates[1]
+            moe = split.kernel.moe_config
+            split = dataclasses.replace(
+                split,
+                kernel=dataclasses.replace(
+                    split.kernel,
+                    moe_config=dataclasses.replace(
+                        moe, backend=BackendOptions(candidates=tuple(moe.backend)[::-1])
+                    ),
+                ),
+            )
+            reordered = dataclasses.replace(
+                config, candidates=(split, config.candidates[0])
+            )
             replay = create(reordered)
             assert replay.get_selected_plan()["candidate"] == 1
             assert_output(replay(t), t, global_weights)
@@ -334,6 +348,33 @@ def test_capture_rejection_blocks_backend_and_outer_replay(
             graphs.append(graph)
             with torch.cuda.graph(graph):
                 output = replay(t)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_output(output, t, global_weights)
+        # Successful retries must replace each rank's persisted rejection.
+        monkeypatch.setattr(SplitPlan, "forward", forward)
+        monkeypatch.setattr(Collective, "measure", measure)
+        forced_reordered = dataclasses.replace(reordered, candidate=0)
+        with autotune_v2(**options):
+            recovered = create(forced_reordered)
+            assert recovered.get_selected_plan()["candidate"] == 0
+        dist.barrier()
+        autotune_v2_reload()
+        with autotune_v2(mode="replay", **options):
+            monkeypatch.setattr(
+                Collective, "measure", lambda *a, **k: pytest.fail("replay measured")
+            )
+            records = AutoTuner.get().get_protocol_records(BACKEND_NAMESPACE)
+            assert records and all(
+                not r.get("capture_rejected") for r in records.values()
+            )
+            recovered = create(forced_reordered)
+            assert recovered.get_selected_plan()["candidate"] == 0
+            assert_output(recovered(t), t, global_weights)
+            graph = torch.cuda.CUDAGraph()
+            graphs.append(graph)
+            with torch.cuda.graph(graph):
+                output = recovered(t)
             graph.replay()
             torch.cuda.synchronize()
             assert_output(output, t, global_weights)
