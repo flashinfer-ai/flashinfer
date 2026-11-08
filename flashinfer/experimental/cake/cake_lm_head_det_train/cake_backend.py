@@ -6669,7 +6669,9 @@ def prepare_lm_head_det_loss(
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
-        raise ValueError("_chunk_views templates a cake-backend runner on its own workspace")
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner on its own workspace"
+        )
     if entry != "logprob" and (logprob_dz or logprob_lbl or logprob_keep):
         raise ValueError(
             "logprob_dz / logprob_lbl / logprob_keep select logits GEMM arms of the log-probability entry"
@@ -6853,9 +6855,7 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = carve(
-            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
         t["x_c"] = carve(
@@ -6906,9 +6906,7 @@ def prepare_lm_head_det_loss(
             else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = carve(
-            "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
         t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
@@ -7082,7 +7080,9 @@ def prepare_lm_head_det_loss_temperature(
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
-        raise ValueError("_chunk_views templates a cake-backend runner on its own workspace")
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner on its own workspace"
+        )
     if entry != "logprob" and (logprob_dz or logprob_lbl):
         raise ValueError(
             "logprob_dz / logprob_lbl select logits GEMM arms of the log-probability entry"
@@ -7301,9 +7301,7 @@ def prepare_lm_head_det_loss_temperature(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = carve(
-            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
         t["x_c"] = carve(
@@ -7358,9 +7356,7 @@ def prepare_lm_head_det_loss_temperature(
             else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = carve(
-            "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
         t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",

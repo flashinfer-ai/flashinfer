@@ -6726,7 +6726,9 @@ def test_memory_plan_forms():
         geometry=g,
         recompute=False,
     )
-    assert mp.form in ("fused", "fused_ip", "unfused") and not mp.fits and not mp.recompute
+    assert (
+        mp.form in ("fused", "fused_ip", "unfused") and not mp.fits and not mp.recompute
+    )
     for bad in (
         dict(rows=0),
         dict(rows=17000),
@@ -6764,7 +6766,8 @@ def test_memory_plan_fused_ip():
         pieces = opt_in._dw_split_pieces(a, step)
         assert pieces[0][0] == 0 and pieces[-1][1] == a, (V, pieces)
         assert all(m0 % step == 0 and m0 < m1 for m0, m1 in pieces), (V, pieces)
-        assert all(p[1] == q[0] for p, q in zip(pieces, pieces[1:])), (V, pieces)
+        links = zip(pieces[:-1], pieces[1:], strict=True)
+        assert all(p[1] == q[0] for p, q in links), (V, pieces)
         assert all(m1 <= 2 * m0 for m0, m1 in pieces[1:]), (V, pieces)
         assert pieces[0][1] <= max(step, -(-a // (16 * step)) * step), (V, pieces)
     blocks = opt_in._allocated_bytes
@@ -6797,10 +6800,17 @@ def test_memory_plan_fused_ip():
         phases = (
             dxacc + acc + bufs + rowvec,
             held + dx_out + blocks(4 * T),
-            dx_out + acc + logits + blocks(2 * r_last * H) + blocks(2 * p0 * H) + rowvec,
+            dx_out
+            + acc
+            + logits
+            + blocks(2 * r_last * H)
+            + blocks(2 * p0 * H)
+            + rowvec,
         )
         assert mp.predicted_bytes == max(phases), (H, R, mp, phases)
-        unfused = opt_in.memory_plan("loss", recompute=False, fuse_dw_cast=False, **args)
+        unfused = opt_in.memory_plan(
+            "loss", recompute=False, fuse_dw_cast=False, **args
+        )
         assert unfused.form == "unfused" and unfused.fits, unfused
         # the fused form's dW phase (the [V, H] output beside one accumulator) is what does not fit
         last_fused = (
@@ -9319,7 +9329,9 @@ def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective)
 
     monkeypatch.setattr(opt_in, "_dw_cast_split", spy)
     peaks = []
-    for _ in range(2):  # the first call also binds; the second launches from the remembered binding
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
         result, peak, mplan = _budget_step(inp, 4096, "loss")
         assert mplan is not None and mplan.form == "fused_ip" and mplan.fits, mplan
         _assert_same_bits(fast, result)
@@ -14157,7 +14169,13 @@ def test_hidden_count_check_bounds_the_work_before_the_count():
     assert not fits(16384, 1536) and not fits(65536, 1536)
     assert not fits(16384, 4096, need_dx=False)
     assert fits(8192, 1536) and fits(1, 1536)  # fewer than three chunks
-    for H, V in ((1536, DEFAULT_V), (3584, DEFAULT_V), (4096, DEFAULT_V), (5120, 248320), (6144, DEFAULT_V)):
+    for H, V in (
+        (1536, DEFAULT_V),
+        (3584, DEFAULT_V),
+        (4096, DEFAULT_V),
+        (5120, 248320),
+        (6144, DEFAULT_V),
+    ):
         for T in (12289, 16384, 32768, 65031):
             for need_dx in (True, False):
                 assert fits(T, H, V, need_dx) == (
@@ -14176,7 +14194,12 @@ def test_memory_plan_cache_miss_phase_never_sets_the_peak():
     log-probability entry plans its backward only."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     C = 4096
-    for H, V, T in ((6144, DEFAULT_V, 16384), (4096, DEFAULT_V, 16384), (4096, DEFAULT_V, 12289), (5120, 248320, 32768)):
+    for H, V, T in (
+        (6144, DEFAULT_V, 16384),
+        (4096, DEFAULT_V, 16384),
+        (4096, DEFAULT_V, 12289),
+        (5120, 248320, 32768),
+    ):
         for slabs in (0, 3):
             for R in (1, 1000, 4000, 4096, 4097, 6000, 8117, 10977, 15565, T):
                 if R > T:
@@ -14462,7 +14485,9 @@ def test_device_default_fast_kept_calls_keep_the_hidden_count(
         assert begun and set(begun) == {expected}, (kind, begun)
         assert host_counts == [], (kind, host_counts)
         _assert_same_bits(
-            fast, result, keys=keys if kind != "nograd" else keys[: 2 if entry == "loss" else 1]
+            fast,
+            result,
+            keys=keys if kind != "nograd" else keys[: 2 if entry == "loss" else 1],
         )
         if kind == "plain":
             assert peak <= fast_peak, (peak, fast_peak)

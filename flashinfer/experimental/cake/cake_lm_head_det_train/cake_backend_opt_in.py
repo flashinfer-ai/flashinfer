@@ -1022,7 +1022,7 @@ def _dw_split_pieces(rows: int, step: int) -> tuple[tuple[int, int], ...]:
     bounds = [0, p0]
     while bounds[-1] < rows:
         bounds.append(min(int(rows), 2 * bounds[-1]))
-    return tuple(zip(bounds[:-1], bounds[1:]))
+    return tuple(zip(bounds[:-1], bounds[1:], strict=True))
 
 
 @dataclass(frozen=True)
@@ -1804,9 +1804,7 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
     elif base == "gemm_dw_acc":
         v0, v1 = plan.dw_acc_rows(index)
         values.update(
-            A=logits[:rows_c]
-            if (v0, v1) == (0, p.vocab)
-            else logits[:rows_c, v0:v1],
+            A=logits[:rows_c] if (v0, v1) == (0, p.vocab) else logits[:rows_c, v0:v1],
             B=x_chunk,
             C=t["dw_acc_hi"] if isinstance(index, _UpperRows) else t["dw_acc"],
             STATS_OUT=t["stats"],
@@ -2059,7 +2057,9 @@ def _run_split_keys(
     def run_pair(key) -> None:
         run_key(key)
         pair = upper.get(_UpperRows(key[1])) if type(key[1]) is int else None
-        if pair is not None and pair[0] == key[0]:  # the chunk's first accumulate: its second right behind
+        if (
+            pair is not None and pair[0] == key[0]
+        ):  # the chunk's first accumulate: its second right behind
             run_key(pair)
 
     _run_keys(
@@ -2692,9 +2692,7 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = carve(
-            "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
         t["x_c"] = carve(
@@ -2753,9 +2751,7 @@ def prepare_lm_head_det_loss(
     if plan.keep_row_grad:
         t["d_rows"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
     if layout.get("workspace"):
-        t["workspace"] = carve(
-            "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
         t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
@@ -3705,7 +3701,9 @@ class _Binding:
                 t.get("dw_acc"),
                 _deferred_operands(plan, t),
                 (t["lse"], t["d_rows"], t["labels"]) if plan.keep_row_grad else None,
-                t.get("dw_acc_hi"),  # the split accumulator's upper rows (:attr:`Plan.dw_split`)
+                t.get(
+                    "dw_acc_hi"
+                ),  # the split accumulator's upper rows (:attr:`Plan.dw_split`)
             )
         return t["logp"], t["lse"]
 
@@ -4937,7 +4935,8 @@ def forward_loss(
         if (
             mplan.form == "fused_ip"
             and need_dw
-            and -(-(T if valid_count is None else valid_count) // int(problem.chunk)) > 1
+            and -(-(T if valid_count is None else valid_count) // int(problem.chunk))
+            > 1
         ):
             # the split FP32 accumulator (:attr:`Plan.dw_split`): the backward writes ``dW`` into its lower part (a
             # one-chunk call has no accumulator: the fused form)
@@ -5955,7 +5954,12 @@ def dw_cast(
         out.copy_(acc * g)
         return out
     form = _DwCastForm.of(
-        device, int(rows), H, fp32=out_dtype == torch.float32, multi=dw_acc is not None, gemm_tuning=gemm_tuning
+        device,
+        int(rows),
+        H,
+        fp32=out_dtype == torch.float32,
+        multi=dw_acc is not None,
+        gemm_tuning=gemm_tuning,
     )
     form.launch(dz_last, x_rows, dw_acc, out, g)
     return out
@@ -6021,7 +6025,9 @@ class _DwCastForm:
             raise NotImplementedError(
                 f"the registered program {module_name!r} lacks the stage {stage!r} (fuse_dw_cast)"
             )
-        index = device.index if device.index is not None else torch.cuda.current_device()
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
         return cls(
             module_name,
             record,
@@ -6070,7 +6076,12 @@ class _DwCastForm:
             ),
         )
         launch, arguments = _eager_launch(
-            self.record, self.module_name, self.stage, values, self.device, self.geometry
+            self.record,
+            self.module_name,
+            self.stage,
+            values,
+            self.device,
+            self.geometry,
         )
         with _ffi_stream_context(self.index):
             if launch.prepare is not None:
@@ -6142,7 +6153,9 @@ def _dw_cast_split(
         if grad is None
         else grad.detach().reshape(1).to(device=device, dtype=torch.float32)
     )
-    form = _DwCastForm.of(device, rows, H, fp32=False, multi=True, gemm_tuning=gemm_tuning)
+    form = _DwCastForm.of(
+        device, rows, H, fp32=False, multi=True, gemm_tuning=gemm_tuning
+    )
     if not in_place:
         dw = torch.empty((V, H), dtype=torch.bfloat16, device=device)
         form.launch(dz_last[:, :a], x_rows, lower, dw[:a], g)
@@ -6150,8 +6163,12 @@ def _dw_cast_split(
         return dw
     storage = lower.untyped_storage()
     if lower.storage_offset() or storage.nbytes() < 2 * V * H:
-        raise ValueError("the lower accumulator must own the start of a storage of at least 2 V H bytes")
-    dw = torch.empty(0, dtype=torch.bfloat16, device=device).set_(storage, 0, (V, H), (H, 1))
+        raise ValueError(
+            "the lower accumulator must own the start of a storage of at least 2 V H bytes"
+        )
+    dw = torch.empty(0, dtype=torch.bfloat16, device=device).set_(
+        storage, 0, (V, H), (H, 1)
+    )
     for k, (m0, m1) in enumerate(_dw_split_pieces(a, dw_block_step(form.geometry))):
         if k == 0:
             # the first piece's BF16 rows would overwrite FP32 rows it still reads: through a temporary, copied into
