@@ -409,7 +409,9 @@ def grouped_epilogue_loop(
         tRG_gC = cute.group_modes(tRG_gC, 3, cute.rank(tRG_gC))
         tRG_cC = cute.group_modes(tRG_cC, 3, cute.rank(tRG_cC))
         cta_row_rel = Int32(0)
-        if cutlass.const_expr(staged):  # this CTA's first row inside the cluster tile
+        if cutlass.const_expr(
+            cta_v is not None
+        ):  # this CTA's first row inside the cluster tile
             cta_row_rel = mma_m_in_cluster * Int32(st.mma_tiler[0]) + cta_v * Int32(
                 cta_m
             )
@@ -418,12 +420,14 @@ def grouped_epilogue_loop(
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         # a warp whose 32 rows all lie past the group's real end (a partial tile: the padded / stale rows) has nothing to
-        # store, so it skips its subtiles (warp-uniform: tcgen05.ld is a warp instruction); 128-row CTA tiles only
+        # store, so it skips its subtiles (warp-uniform: tcgen05.ld is a warp instruction); 128-row CTA tiles only; the
+        # warp's rows are counted from the cluster tile's first row, as the store predicates are (the peer CTA of a pair and
+        # the later CTAs of a cluster along M sit past the first 128 rows)
         warp_active = Boolean(True)
         if cutlass.const_expr(
             len(rows_in_frag) == 1 and st.cta_tile_shape_mnk[0] == 128
         ):  # not the 64-row CTA tiles
-            warp_active = rows_left > warp_row0
+            warp_active = rows_left > cta_row_rel + warp_row0
         for s in range(wg, subtile_cnt, epi_warpgroups):  # this warpgroup's subtiles
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)

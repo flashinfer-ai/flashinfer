@@ -1056,6 +1056,54 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
 
 
+def _poison_allocator(byte: int):
+    """Fill the caching allocator's cached blocks (the large pool and 256 small-pool segments) with one byte pattern, so the
+    ``torch.empty`` intermediates of the next call start with it (0x7F / 0xFF: bf16 NaN patterns; 0x00: zeros)."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info()[0]
+    blocks = [
+        torch.empty(
+            int(min(free // 2, 8 << 30)), dtype=torch.uint8, device="cuda"
+        ).fill_(byte)
+    ]
+    blocks += [
+        torch.empty(1 << 19, dtype=torch.uint8, device="cuda").fill_(byte)
+        for _ in range(256)
+    ]
+    torch.cuda.synchronize()
+    del blocks
+
+
+@needs_device
+@pytest.mark.parametrize("act", [_SWIGLU, ReLU2()], ids=["gated", "ungated"])
+def test_poisoned_intermediates_do_not_reach_the_bits(act):
+    """Unspecified bytes and timing never reach the output: the op's intermediates (the permuted rows, GEMM1's output, GEMM2's
+    output, the output itself) come from ``torch.empty``; with the caching allocator's blocks filled with NaN patterns before
+    every call and a bandwidth-bound kernel running on a side stream of the same device during the call, the layer gives the
+    bits of a clean run, ``RLK_STRESS_ITERS`` times (default 20), at a shape whose partial tiles leave padding rows in every
+    GEMM (the rows past a group's end that the epilogue skips or masks)."""
+    import os
+
+    T, k, H, I, E = 64, 8, 256, 64, 256
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=7, gated=act.is_gated, adversarial=True
+    )
+    layer, pack = _layer(k, E, I, act), _weights(w1, w2, act)
+    ref = bits(layer(_logits_pack(x, logits), pack).cpu())
+    side = torch.cuda.Stream()
+    junk = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    for i in range(int(os.environ.get("RLK_STRESS_ITERS", "20"))):
+        for byte in (0x7F, 0xFF, 0x00):
+            _poison_allocator(byte)
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    junk.add_(1)
+            out = layer(_logits_pack(x, logits), pack)
+            assert torch.equal(bits(out.cpu()), ref), (i, hex(byte))
+    torch.cuda.synchronize()
+
+
 @needs_device
 def test_combine_and_gather_warp_placements_keep_the_bits():
     """The combine's warps per token and the gather's warps per row are placements: every count gives the bits of one warp
