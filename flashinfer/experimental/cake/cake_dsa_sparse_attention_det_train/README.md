@@ -224,6 +224,65 @@ zeroes them while it reads `o_lo`).
 No entry synchronizes with the host unless a check that says so is enabled
 (`check_dst_map`, the varlen `check_cu_seqlens`).
 
+### Measured peak memory and backward time
+
+Measured on GB200 (`sm_100a`), GB300 (`sm_103a`), R200 (`sm_107a`).
+
+Peak allocated bytes of one forward + backward after a warm step (`runner`: a
+prepared runner with the package defaults; `autograd`: the public entry through
+autograd in the row's layout), for the rows of
+`benchmarks/bench_cake_dsa_sparse_attention_det_train.py`; `+/-` is this
+package's peak minus the non-deterministic package's at the same binding
+(positive: this package needs more).
+
+| row | path | sm_100a bytes | sm_100a +/- | sm_100a MiB +/- | sm_103a bytes | sm_103a +/- | sm_103a MiB +/- | sm_107a bytes | sm_107a +/- | sm_107a MiB +/- |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `doc_4096` | runner | 854,262,272 | -867,840 | -0.83 | 854,262,272 | -867,840 | -0.83 | 854,262,272 | -867,840 | -0.83 |
+| `doc_4096` | autograd | 878,199,296 | -10,485,248 | -10.00 | 878,199,296 | -10,485,248 | -10.00 | 878,199,296 | -10,485,248 | -10.00 |
+| `doc_16384` | runner | 3,417,047,552 | -3,472,896 | -3.31 | 3,417,047,552 | -3,472,896 | -3.31 | 3,417,047,552 | -3,472,896 | -3.31 |
+| `doc_16384` | autograd | 3,512,795,648 | -41,942,528 | -40.00 | 3,512,795,648 | -41,942,528 | -40.00 | 3,512,795,648 | -41,942,528 | -40.00 |
+| `doc_32768` | runner | 6,834,094,592 | -6,946,304 | -6.62 | 6,834,094,592 | -6,946,304 | -6.62 | 6,834,094,592 | -6,946,304 | -6.62 |
+| `doc_32768` | autograd | 7,025,590,784 | -83,885,568 | -80.00 | 7,025,590,784 | -83,885,568 | -80.00 | 7,025,590,784 | -83,885,568 | -80.00 |
+| `p8949_rope` | runner | 3,589,079,552 | -1,310,208 | -1.25 | 3,589,079,552 | -1,310,208 | -1.25 | 3,589,079,552 | -1,310,208 | -1.25 |
+| `p8949_rope` | autograd | 3,569,418,752 | -155,188,736 | -148.00 | 3,569,418,752 | -155,188,736 | -148.00 | 3,569,418,752 | -155,188,736 | -148.00 |
+| `doc_16231` | runner | 3,385,138,688 | -3,440,128 | -3.28 | 3,385,138,688 | -3,440,128 | -3.28 | 3,385,138,688 | -3,440,128 | -3.28 |
+| `doc_16231` | autograd | 4,031,366,656 | +0 | +0.00 | 4,031,366,656 | +0 | +0.00 | 4,031,366,656 | +0 | +0.00 |
+| `tail_2123x67923` | runner | 1,003,523,584 | +2,445,824 | +2.33 | 1,003,523,584 | +2,445,824 | +2.33 | 673,369,088 | +2,445,824 | +2.33 |
+| `tail_2123x67923` | autograd | 1,100,545,024 | +160,027,648 | +152.61 | 1,100,545,024 | +160,027,648 | +152.61 | 770,095,616 | +91,004,928 | +86.79 |
+| `packed_glm_a` | runner | 4,269,115,392 | +7,806,464 | +7.44 | 4,269,115,392 | -650,117,120 | -620.00 | 4,269,115,392 | -650,117,120 | -620.00 |
+| `packed_glm_a` | autograd | 4,613,186,560 | +0 | +0.00 | 4,613,186,560 | +0 | +0.00 | 4,613,186,560 | +0 | +0.00 |
+| `packed_glm_a_dstmap` | runner | 4,269,837,824 | +7,670,784 | +7.32 | 4,269,837,824 | -649,803,264 | -619.70 | 4,269,837,824 | -649,803,264 | -619.70 |
+| `packed_glm_a_dstmap` | autograd | 4,594,457,088 | +0 | +0.00 | 4,594,457,088 | +0 | +0.00 | 4,594,457,088 | +0 | +0.00 |
+| `chunk_4096x268757` | runner | 1,780,576,256 | +10,777,088 | +10.28 | 1,780,576,256 | +10,777,088 | +10.28 | 2,418,126,848 | +10,777,088 | +10.28 |
+| `chunk_4096x268757` | autograd | 2,088,977,920 | +480,832,000 | +458.56 | 2,088,977,920 | +480,832,000 | +458.56 | 2,088,977,920 | +480,832,000 | +458.56 |
+| `nope_doc_4096` | runner | 816,005,632 | +197,120 | +0.19 | 816,005,632 | +197,120 | +0.19 | 816,005,632 | +197,120 | +0.19 |
+| `nope_doc_4096` | autograd | 851,461,120 | +512 | +0.00 | 851,461,120 | +512 | +0.00 | 851,461,120 | +512 | +0.00 |
+| `nope_glm53_a` | runner | 3,770,834,944 | +12,939,776 | +12.34 | 3,770,834,944 | +12,939,776 | +12.34 | 3,770,834,944 | +12,939,776 | +12.34 |
+| `nope_glm53_a` | autograd | 3,899,448,832 | +0 | +0.00 | 3,899,448,832 | +0 | +0.00 | 3,899,448,832 | +0 | +0.00 |
+| `nope_chunk_4096x269564` | runner | 1,372,426,752 | +12,939,776 | +12.34 | 1,372,426,752 | +12,939,776 | +12.34 | 1,372,426,752 | +12,939,776 | +12.34 |
+| `nope_chunk_4096x269564` | autograd | 1,960,145,408 | +565,006,848 | +538.83 | 1,960,145,408 | +565,006,848 | +538.83 | 1,960,145,408 | +565,006,848 | +538.83 |
+| `p8949_nope` | runner | 3,367,043,584 | +3,146,240 | +3.00 | 3,367,043,584 | +3,146,240 | +3.00 | 3,367,043,584 | +3,146,240 | +3.00 |
+| `p8949_nope` | autograd | 3,498,115,584 | +512 | +0.00 | 3,498,115,584 | +512 | +0.00 | 3,498,115,584 | +512 | +0.00 |
+
+Rows where this package needs more memory than the non-deterministic package:
+`tail_2123x67923` runner (sm_100a, sm_103a, sm_107a); `tail_2123x67923`
+autograd (sm_100a, sm_103a, sm_107a); `packed_glm_a` runner (sm_100a);
+`packed_glm_a_dstmap` runner (sm_100a); `chunk_4096x268757` runner (sm_100a,
+sm_103a, sm_107a); `chunk_4096x268757` autograd (sm_100a, sm_103a, sm_107a);
+`nope_doc_4096` runner (sm_100a, sm_103a, sm_107a); `nope_doc_4096` autograd
+(sm_100a, sm_103a, sm_107a); `nope_glm53_a` runner (sm_100a, sm_103a, sm_107a);
+`nope_chunk_4096x269564` runner (sm_100a, sm_103a, sm_107a);
+`nope_chunk_4096x269564` autograd (sm_100a, sm_103a, sm_107a); `p8949_nope`
+runner (sm_100a, sm_103a, sm_107a); `p8949_nope` autograd (sm_100a, sm_103a,
+sm_107a).
+
+Backward time of the non-deterministic package divided by this package's
+(median of 3 same-GPU rounds; below 1: this package is slower): 0.852 to 0.997
+on sm_100a (13 rows), 0.884 to 1.003 on sm_103a (13 rows), 0.826 to 0.970 on
+sm_107a (13 rows).  The two are at parity on `p8949_nope` on sm_103a (1.003);
+on every other row this package's backward is slower.  The forward is the
+non-deterministic package's forward kernel.
+
 ## NoPE (zero-rope) program
 
 `forward_nope` / `backward_nope`, `prepare_dsa_nope_train` and the NoPE
