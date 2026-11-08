@@ -169,7 +169,7 @@ kernel_cake_rmsnorm_train_cf1d05546951bdbd9f5d(__nv_bfloat16* __restrict__ x, __
             if (gtid == 0) {
                 r[row] = rstd;
             }
-            long long obase = (long long)row * 6144;
+            long long obase = (long long)row * 6144ll;
             #pragma unroll
             for (int v_2 = 0; v_2 < 3; v_2++) {
                 unsigned int wwords[4];
