@@ -12802,8 +12802,10 @@ K1_DGRAD_PARTS = {
 }
 #: The programs of :data:`K1_DGRAD_RULES_BY_SM` and the output dtype each runs.
 K1_DGRAD_PROGRAMS = {
+    "kn_n128_f32_tma1_pd2_c1": "f32",
     "kn_n128_f32_tma2_s4_c1": "f32",
     "kn_n256_f32_v8_ef_pro7": "f32",
+    "kn_n256_tma2_pd2_lw_pro15": "bf16",
     "kn_n256_tma1_w8": "bf16",
     "kn_n256_tma1_w8r": "bf16",
     "kn_n256_tma1_w8rs": "bf16",
@@ -12813,7 +12815,7 @@ K1_DGRAD_ROW_COUNTS = {
     ("sm_100a", 148): 74,
     ("sm_100a", 152): 66,
     ("sm_103a", 152): 67,
-    ("sm_107a", 212): 0,
+    ("sm_107a", 212): 9,
 }
 #: The measured token counts of the input-gradient and named forward rows.
 K1_SCREEN_TOKENS = (16172, 16231, 16384)
@@ -12836,7 +12838,7 @@ def _plan_of_knobs(A, B, out, arch, sms, knobs, transposed_out=False):
 
 def test_k1_dgrad_rules_by_sm():
     """:data:`K1_DGRAD_RULES_BY_SM` holds input-gradient rows of at most 1024 out features at the measured token
-    counts only, on the measured parts (an empty ``sm_107a`` table), each naming a program of the deterministic package
+    counts only, on the measured parts, each naming a program of the deterministic package
     for its output dtype; the deterministic planner turns the knobs of each row (:func:`k1_program_knobs`) into exactly
     that program, with whole output tiles (no stream-K units).  :func:`k1_dgrad_knobs` keys exactly: another part,
     token count, row or output dtype gets no knobs (the deterministic plan)."""
@@ -12948,17 +12950,28 @@ def test_k1_dgrad_rows_bind_their_plan(monkeypatch, arch):
         assert cake_backend._k1_dgrad_knobs_of(G, W, out) == (), sms
 
 
+#: The program the rows of :data:`K1_FORWARD_RULES_BY_SM` that name one run per part, and the deterministic plan of
+#: those rows there: ``(arch, sm_count) -> (program, deterministic plan)``.
+K1_FORWARD_NAMED = {
+    ("sm_100a", 148): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
+    ("sm_100a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
+    ("sm_103a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
+    ("sm_107a", 212): ("kk_n128_hen_pro15", "kk_n256_ht_cg_pro15"),
+}
+
+
 def test_k1_forward_named_rows_plan_their_program():
-    """The rows of :data:`K1_FORWARD_RULES_BY_SM` that name a program (``kk_n256_ht_cg_pro15``, at the measured
+    """The rows of :data:`K1_FORWARD_RULES_BY_SM` that name a program (:data:`K1_FORWARD_NAMED`, at the measured
     token counts of ``4096 -> 512`` and ``5120 -> 512``) plan exactly that program with the knobs that name it, where
-    the deterministic plan of the row is ``kk_n256_pro7``."""
+    the deterministic plan of the row is the part's other program of :data:`K1_FORWARD_NAMED`."""
     named = 0
     bf16 = torch.bfloat16
     for (arch, sms), rows in cake_backend.K1_FORWARD_RULES_BY_SM.items():
         for (K, N, T), value in rows.items():
             if not isinstance(value, str):
                 continue
-            assert value == "kk_n256_ht_cg_pro15" and N == 512 and T in K1_SCREEN_TOKENS
+            program, plain = K1_FORWARD_NAMED[(arch, sms)]
+            assert value == program and N == 512 and T in K1_SCREEN_TOKENS
             knobs = cake_backend.k1_forward_knobs(
                 arch=arch, sm_count=sms, K=K, N=N, T=T
             )
@@ -12967,8 +12980,8 @@ def test_k1_forward_named_rows_plan_their_program():
             out = torch.empty(T, N, dtype=bf16)
             own = _plan_of_knobs(X, W.t(), out, arch, sms, knobs)
             default = _plan_of_knobs(X, W.t(), out, arch, sms, ())
-            assert own.template.endswith("_kk_n256_ht_cg_pro15"), (arch, sms, K, N, T)
-            assert default.template.endswith("_kk_n256_pro7"), (
+            assert own.template.endswith("_" + program), (arch, sms, K, N, T)
+            assert default.template.endswith("_" + plain), (
                 arch,
                 sms,
                 K,
@@ -12977,7 +12990,7 @@ def test_k1_forward_named_rows_plan_their_program():
                 default.template,
             )
             named += 1
-    assert named == 8
+    assert named == 14
 
 
 #: The B200 weight-gradient rows of :data:`K1_WGRAD_DET_RULES_BY_SM`: (d_in, d_out) -> program per output dtype.

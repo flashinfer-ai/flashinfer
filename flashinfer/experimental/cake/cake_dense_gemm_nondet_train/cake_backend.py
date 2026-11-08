@@ -1229,14 +1229,15 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: ``4096 -> 512`` at 3072 tokens on both parts and ``5120 -> 512`` at 4096 tokens on ``sm_103a`` (in one run a training
 #: step with eager launches was further above the deterministic plan than that plan against itself).
 #:
-#: A row whose entry is a program symbol of the deterministic package (``kk_n256_ht_cg_pro15``: its template without
-#: the ``dense_proj_det_gemm_`` prefix; 16172 to 16384 tokens, also on 148-SM ``sm_100a`` parts) runs that program,
-#: planned with the knobs that name it (:func:`k1_program_knobs`), where the deterministic plan of the row is
-#: ``kk_n256_pro7``.  Measured at exactly these rows and token counts on one part of each SM count, against the
-#: deterministic plan of the row in the same process: faster in eager launches and in CUDA graph replays in at least 4
-#: of 5 paired groups of a screen, the output equal to the deterministic plan's bit for bit, and the same bits on 20
-#: repeats.  The other rows of that screen (``5120 -> 512`` at 16172 and 16231 tokens on 152-SM ``sm_100a`` parts:
-#: faster in 3 of 5 groups in graph replays) keep the deterministic plan.
+#: A row whose entry is a program symbol of the deterministic package (its template without the
+#: ``dense_proj_det_gemm_`` prefix; 16172 to 16384 tokens) runs that program, planned with the knobs that name it
+#: (:func:`k1_program_knobs`): ``kk_n256_ht_cg_pro15`` on 148-SM ``sm_100a`` and 152-SM ``sm_100a`` / ``sm_103a``
+#: parts, where the deterministic plan of the row is ``kk_n256_pro7``, and ``kk_n128_hen_pro15`` on 212-SM ``sm_107a``
+#: parts, where it is ``kk_n256_ht_cg_pro15``.  Measured at exactly these rows and token counts on one part of each SM
+#: count, against the deterministic plan of the row in the same process: faster in eager launches and in CUDA graph
+#: replays in at least 4 of 5 paired groups of a screen (``sm_107a``: 5 of 5), the output equal to the deterministic
+#: plan's bit for bit, and the same bits on 20 repeats.  The other rows of that screen (``5120 -> 512`` at 16172 and
+#: 16231 tokens on 152-SM ``sm_100a`` parts: faster in 3 of 5 groups in graph replays) keep the deterministic plan.
 # fmt: off
 K1_FORWARD_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[int, int, int], Union[dict[str, Any], str]]
@@ -1255,6 +1256,11 @@ K1_FORWARD_RULES_BY_SM: dict[
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
         (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
+    },
+    ("sm_107a", 212): {
+        (4096, 512, 16172): "kk_n128_hen_pro15", (4096, 512, 16231): "kk_n128_hen_pro15",
+        (4096, 512, 16384): "kk_n128_hen_pro15", (5120, 512, 16172): "kk_n128_hen_pro15",
+        (5120, 512, 16231): "kk_n128_hen_pro15", (5120, 512, 16384): "kk_n128_hen_pro15",
     },
 }
 # fmt: on
@@ -1310,11 +1316,12 @@ def k1_program_knobs(program: str) -> tuple:
 #: and ``T`` runs the deterministic package's program ``program`` (its template without the ``dense_proj_det_gemm_``
 #: prefix), planned with the knobs that name it (:func:`k1_program_knobs`); every other part, row, token count, layout
 #: and output dtype runs the deterministic plan.  The table's programs (``kn_n128_f32_tma2_s4_c1``,
-#: ``kn_n256_tma1_w8`` / ``_w8r`` / ``_w8rs``, ``kn_n256_f32_v8_ef_pro7``) were measured at exactly these rows and token
-#: counts on one part of each SM count, against the deterministic plan of the row in the same process: faster in eager
-#: launches and in CUDA graph replays in at least 4 of 5 paired groups of a screen, the output equal to the
-#: deterministic plan's bit for bit, and the same bits on 20 repeats; the rows and token counts of that screen that
-#: missed keep the deterministic plan.  ``sm_107a`` parts have no measured row yet.
+#: ``kn_n256_tma1_w8`` / ``_w8r`` / ``_w8rs``, ``kn_n256_f32_v8_ef_pro7``; on 212-SM ``sm_107a`` parts
+#: ``kn_n128_f32_tma1_pd2_c1`` and ``kn_n256_tma2_pd2_lw_pro15``) were measured at exactly these rows and token counts on
+#: one part of each SM count, against the deterministic plan of the row in the same process: faster in eager launches
+#: and in CUDA graph replays in at least 4 of 5 paired groups of a screen (``sm_107a``: 5 of 5), the output equal to
+#: the deterministic plan's bit for bit, and the same bits on 20 repeats; the rows and token counts of that screen that
+#: missed keep the deterministic plan.
 # fmt: off
 K1_DGRAD_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
@@ -1427,7 +1434,13 @@ K1_DGRAD_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]
         (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
         (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
     },
-    ("sm_107a", 212): {},
+    ("sm_107a", 212): {
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma1_pd2_c1", (4096, 128, 16231, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (4096, 128, 16384, "f32"): "kn_n128_f32_tma1_pd2_c1", (5120, 128, 16172, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (5120, 128, 16231, "f32"): "kn_n128_f32_tma1_pd2_c1", (5120, 128, 16384, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (6144, 32, 16172, "bf16"): "kn_n256_tma2_pd2_lw_pro15", (6144, 32, 16231, "bf16"): "kn_n256_tma2_pd2_lw_pro15",
+        (6144, 32, 16384, "bf16"): "kn_n256_tma2_pd2_lw_pro15",
+    },
 }
 # fmt: on
 
