@@ -1868,7 +1868,9 @@ def replay_from_dump(
                         # that distinctly instead of calling it an incomplete dump.
                         result_dict["comparison_match"] = None
                         result_dict["comparison_error"] = (
-                            "No post-call state recorded for an in-place call; "
+                            "No post-call state recorded for an in-place call"
+                            if metadata.get("graph_snapshots")
+                            else "No post-call state recorded for an in-place call; "
                             "enable FLASHINFER_DUMP_GRAPH_SNAPSHOTS to compare"
                         )
                         _logger.info(

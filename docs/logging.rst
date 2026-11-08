@@ -703,6 +703,7 @@ This script demonstrates replaying a sequence of stateful API calls.
     # Print summary
     passed = 0
     failed = 0
+    unverified = 0
     for i, res in enumerate(results):
         func_name = res.get("metadata", {}).get("function_name", "unknown")
         dump_dir = Path(res.get("dump_dir", "")).name
@@ -710,6 +711,12 @@ This script demonstrates replaying a sequence of stateful API calls.
         if "error" in res:
             print(f"[{i+1}] {func_name} ({dump_dir}): ❌ Error: {res['error']}")
             failed += 1
+        elif res.get("comparison_error"):
+            print(
+                f"[{i+1}] {func_name} ({dump_dir}): ⚠️ Unverified: "
+                f"{res['comparison_error']}"
+            )
+            unverified += 1
         elif res.get("comparison_match", True):
             print(f"[{i+1}] {func_name} ({dump_dir}): ✅ Passed")
             passed += 1
@@ -717,7 +724,7 @@ This script demonstrates replaying a sequence of stateful API calls.
             print(f"[{i+1}] {func_name} ({dump_dir}): ❌ Mismatch")
             failed += 1
 
-    print(f"\nSummary: {passed} passed, {failed} failed")
+    print(f"\nSummary: {passed} passed, {failed} failed, {unverified} unverified")
 
     # For manual inspection, you can also access individual results
     # Find the 'run' call result (usually the last non-init, non-plan call)
