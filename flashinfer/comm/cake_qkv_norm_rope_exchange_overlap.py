@@ -118,7 +118,7 @@ ranks ship the cross-destination-band gate (``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_
 :func:`resolve_xband_min_m`; ``xband_min_m=0`` switches it off): a call whose
 destination band is not a multiple of 256 columns while every Q / K / V group is
 (e.g. hidden 3072 over 8 ranks) runs the 256-column pair tile across band edges
-from ``4096`` rows on, as one persistent launch of the cross-destination-band
+from ``2048`` rows on, as one persistent launch of the cross-destination-band
 build of the session's producer build (``loader.xband_variant``: its staged
 twin for a bulk build; its tiles carry both heads' destinations).  The default
 yields where that build is not delivered.  Neither changes the stored bits.
@@ -130,6 +130,20 @@ order and ``group_m`` stay the band policy's and the row-count gates read the
 band width.  The session loads the 128-column producer beside its own; the
 table yields where that producer is not delivered.  ``describe()`` reports the
 bound (``bn128_max_m``) and the tile width of such a prepared row (``block_n``).
+SM100 and SM103 groups of 8 ranks at hidden 4096 run their 2-CTA pair calls of
+at most ``512`` rows on the 128-column pair tile the same way
+(``plans.BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD``).
+
+On the band rows of ``plans.DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD`` the cells of
+``plans.DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD`` (SM100 and SM103 at hidden 3072)
+interleave the destinations of the tile table (``lt``: token-tile group, column
+tile, destination, with about one wave of local runs at the end) and run it as
+one persistent launch: a fired per-destination launch gate yields there.  SM90
+groups of 2 and 4 at hidden 3072 and 4096 take ``il`` (no local tail) without that
+precedence (``plans.DEST_INTERLEAVE_DEFAULT_WITHOUT_PD``)
+(``plans.resolve_dest_interleave``, :func:`plans.plan_row`).  Only the order of
+the tile rows changes; ``describe()`` reports the session's mode
+(``dest_interleave``) and the prepared rows' plans.
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
@@ -696,6 +710,11 @@ class CakeQkvExchangeSession:
         self.xband_min_m, self.xband_min_m_source = resolve_xband_min_m(
             arch, self.world_size
         )
+        (
+            self.dest_interleave,
+            self.dest_interleave_pd,
+            self.dest_interleave_max_m,
+        ) = plans.resolve_dest_interleave(arch, self.world_size)
         if layout not in plans.LAYOUTS:
             raise ValueError(f"layout must be one of {plans.LAYOUTS}, got {layout!r}")
         if (
@@ -801,12 +820,13 @@ class CakeQkvExchangeSession:
             and self.xband_eligible
             and self.max_tokens >= self.xband_min_m
         )
-        # 128-column tile table (plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD): a 256-column session of a table cell runs
-        # its rows up to the cell's bound on the 128-column tile with the band policy's pair flag (no such row is a
-        # cross-destination-band row: the table has no pair-architecture cell).  It yields where this delivery
-        # lacks the 128-column producer of the session's build.
+        # 128-column tile table (plans.default_bn128_max_m: HOPPER_BN128_MAX_M_BY_ARCH_WORLD on SM90,
+        # BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD on the pair architectures): a 256-column session of a table cell runs
+        # its rows up to the cell's bound on the 128-column tile with the band policy's pair flag (on the pair
+        # architectures its pair rows only; a cross-destination-band row keeps its plan).  It yields where this
+        # delivery lacks the 128-column producer of the session's build.
         self.bn128_max_m, self.bn128_max_m_source = 0, "default"
-        bn128_cell = plans.hopper_bn128_max_m(self.arch, self.world_size, self.hidden)
+        bn128_cell = plans.default_bn128_max_m(self.arch, self.world_size, self.hidden)
         if bn128_cell and self.bn != plans.HOPPER_BN128_BN:
             if all(
                 loader.has_producer(
@@ -1120,10 +1140,15 @@ class CakeQkvExchangeSession:
             words_capacity_per_dest=self.words_cap,
             group_m_scale=self.group_m_scale,
             bn128_max_m=self.bn128_max_m,
+            dest_interleave=self.dest_interleave,
+            dest_interleave_pd=self.dest_interleave_pd,
+            dest_interleave_max_m=self.dest_interleave_max_m,
         )
         row_bn = (
             plans.HOPPER_BN128_BN
-            if self.bn128_max_m and geometry.rows <= self.bn128_max_m
+            if self.bn128_max_m
+            and geometry.rows <= self.bn128_max_m
+            and (plan.pair or self.arch not in plans.PAIR_ARCHES)
             else self.bn
         )
         expected_bn = plans.XBAND_BN if plan.xband else row_bn
@@ -1569,7 +1594,15 @@ class CakeQkvExchangeSession:
             "bn128_max_m": {
                 "value": self.bn128_max_m,
                 "source": self.bn128_max_m_source,
-                "default": plans.hopper_bn128_max_m(
+                "default": plans.default_bn128_max_m(
+                    self.arch, self.world_size, self.hidden
+                ),
+            },
+            "dest_interleave": {
+                "value": self.dest_interleave,
+                "per_dest_precedence": self.dest_interleave_pd,
+                "max_m": self.dest_interleave_max_m,
+                "band": plans.dest_interleave_band(
                     self.arch, self.world_size, self.hidden
                 ),
             },
