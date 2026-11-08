@@ -3009,17 +3009,20 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
 # route's time under both gate regimes, the same bits run to run; the split forward stays off there.
 FWD_A_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 WY_A_MAX_GROUP = 3
-# On an architecture of ``FWD_A_SERIAL_KEEP`` a host-built table without plan pins keeps a SERIAL forward table where
-# the register planner takes a split one and prices its cheapest serial table at most the architecture's factor above
-# it (the planner record's ``priced`` entries, :func:`fwd_serial_keep_pricing`); ``CHAIN_PLAN`` then deepens no forward
-# table there and :func:`fwd_a_route` serves the row.  A planner table that is serial already keeps every rule.  R200
+# On an architecture of ``FWD_A_SERIAL_KEEP`` (price factor, fill) a host-built table without plan pins keeps a SERIAL
+# forward table where the register planner takes a split one, prices its cheapest serial table at most the factor above
+# it (the planner record's ``priced`` entries, :func:`fwd_serial_keep_pricing`) and the serial table's CTAs (sequences x
+# HV) fill at least the fill fraction of the SMs; ``CHAIN_PLAN`` then deepens no forward table there and
+# :func:`fwd_a_route` serves the row.  A planner table that is serial already keeps every rule.  R200
 # (sm_107a, 212 SMs; 4 fresh processes, CUPTI, cold L2) against the split tables: the 3 sequences of 11000 / 12000 /
 # 9768 tokens with HV 48 (144 serial CTAs, ratio 1.06) run fwd 0.71-0.85, fwd+bwd 0.89-0.95, checkpoint 0.82-0.90 and
 # bwd 1.00 of the split table's time under both gate regimes, the same bits run to run; with HV 24 (72 CTAs, ratio
 # 1.51) the serial table is slower (fwd 1.25, fwd+bwd 1.08, checkpoint 1.08 under the bandwidth gate), with HV 12
-# (2.74) 21-34 % slower.  The crossover between 1.06 and 1.51 is not measured: 1.10 keeps the measured win.  On B200
-# the planner keeps the serial table of the HV 48 layout itself.
-FWD_A_SERIAL_KEEP: dict[str, float] = {"sm_107a": 1.10}
+# (2.74) 21-34 % slower.  The crossover between 1.06 and 1.51 is not measured: 1.10 keeps the measured win, and the
+# fill of 0.65 (138 CTAs on 212 SMs) keeps it off the layouts of fewer serial CTAs the price alone admits (4 sequences
+# of 4096 tokens with HV 24: 96 CTAs, ratio 1.08, whose split table the forward's value-half split prices), measured
+# nowhere.  On B200 the planner keeps the serial table of the HV 48 layout itself.
+FWD_A_SERIAL_KEEP: dict[str, tuple[float, float]] = {"sm_107a": (1.10, 0.65)}
 # fwd_ho_a's tape word per tape entry (the qn / kn tapes are wy_a's outputs)
 FWD_A_TAPE = {"h": 1, "v_new": 2, "w": 8}
 
@@ -3056,22 +3059,26 @@ def fwd_serial_keep_pricing(
     total_tokens: int | None = None,
 ) -> dict:
     """The forward table rule of :data:`FWD_A_SERIAL_KEEP` on a host layout whose planner forward table without plan
-    pins is ``plan``: ``{"select", "ratio", "serial", "limit"}``, ``serial`` the planner's cheapest serial table and
-    ``ratio`` its price over the price of ``plan`` (``select``: ``plan`` splits a sequence and ``ratio`` is at most the
-    architecture's ``limit``).  Host work only."""
+    pins is ``plan``: ``{"select", "ratio", "fill", "serial", "limit", "min_fill"}``, ``serial`` the planner's cheapest
+    serial table, ``ratio`` its price over the price of ``plan`` and ``fill`` its CTAs over the SMs (``select``: ``plan``
+    splits a sequence, ``ratio`` is at most the architecture's ``limit`` and ``fill`` at least its ``min_fill``).  Host
+    work only."""
     index = int(device_index)
     arch = cake_backend.device_arch(index)
     seq_lens = tuple(int(n) for n in seq_lens)
-    limit = FWD_A_SERIAL_KEEP.get(arch)
+    limit, min_fill = FWD_A_SERIAL_KEEP.get(arch, (None, None))
     rec: dict[str, Any] = {
         "select": False,
         "ratio": None,
+        "fill": None,
         "serial": None,
         "limit": limit,
+        "min_fill": min_fill,
     }
     chunks = tuple(-(-n // CHUNK) for n in seq_lens)
     if (
         limit is None
+        or min_fill is None
         or not chunks
         or plan.segment_len <= 0
         or max(chunks) <= plan.segment_len
@@ -3094,7 +3101,13 @@ def fwd_serial_keep_pricing(
         return rec
     cost, config = min(serial)
     ratio = cost / chosen[0]
-    rec.update(select=ratio <= limit, ratio=round(ratio, 4), serial=ScanPlan(config, 0))
+    fill = len(seq_lens) * int(num_v_heads) / _device_props(index)[0]
+    rec.update(
+        select=ratio <= limit and fill >= min_fill,
+        ratio=round(ratio, 4),
+        fill=round(fill, 4),
+        serial=ScanPlan(config, 0),
+    )
     return rec
 
 
