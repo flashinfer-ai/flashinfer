@@ -676,6 +676,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "batch_size"],
         ["parameter", "has_sinks"],
         ["parameter", "total_work_items"],
+        ["parameter", "num_query_tokens"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -809,7 +810,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_103a"],
         "identity": {
-            "sm_103a": "32c057dbbe84e98a6b6f5619eed73ff7561d671e13f1d3774f41ea330934817f",
+            "sm_103a": "723d365e77682461f22ae691dee3ad828a7a71656d4e47c9dbabc2edd5aa7cdd",
         },
     },
     "cake_dsv4_13091b5bf0612783f02d": {
@@ -1248,7 +1249,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "51dcf4f44217bf164c05ec0bfda6d81387be2283f2bb73ffb16568367ece16cc",
+            "sm_100a": "a7e68188ce894ea1ae2c0ba4babb168b040877227741c7da89d7689561757d2d",
         },
     },
     "cake_dsv4_9daa9c5ff43490ad80ac": {
@@ -1419,8 +1420,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_h64_source_exact_qlayout",
         "arches": ["sm_100a", "sm_103a"],
         "identity": {
-            "sm_100a": "34284d78f03b0284b881b9720674d1a4813c6b087a742acca08cc5f123e12364",
-            "sm_103a": "d993119b34840042a04139a493421b6bb1fad516a895b869c08da8710fe4053a",
+            "sm_100a": "13f4a547c0061816d07cdbe46b7ee77dfcad4f12a4ac9b6f9de44f32038530a4",
+            "sm_103a": "16676f60a97e85568291e8efbd7eec3750189512899b6b3721c8bd98eabf3dc1",
         },
     },
     "cake_dsv4_e880e7c12a67fe035a37": {
@@ -1470,7 +1471,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "fd4a13f32b30471c675e21d7ac69955b43369f67e74f2be3a4736350b5d8fcb2",
+            "sm_100a": "b00e7ecf066310de780d1784a65726bdc931ec8e237c9a47a0e3ea7a065ad199",
         },
     },
     "cake_dsv4_ff4aa022aa97fded6032": {
@@ -1482,7 +1483,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_103a"],
         "identity": {
-            "sm_103a": "85f6e251ee2272c1f34b4ec404e3e76aaa5e13fc25ba50cd303d5007808ac69d",
+            "sm_103a": "832dacc9ff00ef248b7be596da51588a6aca20c85fd17b4fdd25cbf7064f09b2",
         },
     },
     "cake_dsv4_ffa4216b35dae8d46543": {
