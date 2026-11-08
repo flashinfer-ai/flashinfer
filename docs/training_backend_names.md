@@ -69,7 +69,7 @@ Module names are under `flashinfer.`. "Planned" marks versions that do not exist
 | | nondet | single rank | `cake_dense_gemm_nondet_train` | `cake_dense_gemm_nondet_train_projection`, `cake_dense_gemm_nondet_train_router` | per entry, by rule 3 | `experimental.dense_projection_gemm` `cake_backend` |
 | DSA indexer | det | single rank | `cake_dsa_indexer_det_train` | `cake_dsa_indexer_det_train_topk`, `cake_dsa_indexer_det_train_topk_workspace_size` | none (no autograd: top-k selection) | `experimental.cake_dsa_indexer_det` (+ alias `experimental.cake_dsa_indexer`) / `dsa_indexer.dsa_indexer_det_topk(backend="cake")`, `dsa_indexer_det_topk_workspace_size`, aliases `dsa_indexer_topk*` |
 | | nondet | single rank | `cake_dsa_indexer_nondet_train` | `cake_dsa_indexer_nondet_train_topk`, `cake_dsa_indexer_nondet_train_topk_workspace_size` | none (no autograd: top-k selection) | new; no former name |
-| DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | | | planned |
+| DSA sparse attention | det | single rank | `cake_dsa_sparse_attention_det_train` | `cake_dsa_sparse_attention_det`, `cake_dsa_sparse_attention_det_varlen`, `cake_dsa_sparse_attention_det_nope`, `cake_dsa_sparse_attention_det_nope_varlen` | `CakeDSASparseAttentionDetFunction` (both rope entries), `CakeDSASparseAttentionDetNopeFunction`, `CakeDSASparseAttentionDetNopeVarlenFunction` | new |
 | | nondet | single rank | `cake_dsa_sparse_attention_nondet_train` | `cake_dsa_sparse_attention_nondet`, `cake_dsa_sparse_attention_nondet_varlen`, `cake_dsa_sparse_attention_nondet_nope`, `cake_dsa_sparse_attention_nondet_nope_varlen` | `CakeDSASparseAttentionNondetFunction` (both rope entries), `CakeDSASparseAttentionNondetNopeFunction`, `CakeDSASparseAttentionNondetNopeVarlenFunction` | `experimental.cake_dsa_train` / `dsa_sparse_attention.dsa_sparse_attention{,_varlen,_nope,_nope_varlen}` |
 | GQA HD256 | det | single rank | `cake_gqa_det_train` | `cake_gqa_det` | `CakeGQADetFunction` | new; no former name |
 | | nondet | single rank | `cake_gqa_nondet_train` | `cake_gqa_nondet` | `CakeGQANondetFunction` | `gqa_train` / `varlen_gqa_attention` |
@@ -94,7 +94,6 @@ GDN and conv1d use the same pattern with their own stem. For `nondet`, replace `
 - **GDN `nondet` stays.** Today it is fixed-order in practice; its contract does not promise run-to-run bits.
 - **mHC head becomes its own family.** It ships `det` and `nondet`. Like GDN `nondet`, the head's `nondet` is fixed-order (the same kernels as `det`); its contract does not promise run-to-run bits.
 - **Causal conv1d KCP stays inside the single-rank backend packages.** `cake_causal_conv1d_det_train` and `cake_causal_conv1d_nondet_train` each carry a `kcp` submodule behind the top-level `cake_causal_conv1d_<mode>_train_kcp` facades (rule 1 exception).
-- **The missing version keeps its reserved name:** DSA sparse attention `det`.
 
 ## Current names
 
