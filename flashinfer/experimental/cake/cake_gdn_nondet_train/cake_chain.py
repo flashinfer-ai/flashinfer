@@ -326,6 +326,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "fwd_summary": _FWD_SUMMARY_ARGS,
     "fwd_ho_vh2": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
+    "stitch_mt": _STITCH_ARGS,
     "piece_chain": _CHAIN_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
@@ -653,7 +654,9 @@ class ChunkMeta:
     the entry tables of the one-wave split of the adjoint walk over ``bwd_segments`` (:class:`AdjointSplit`), which
     the backward runs instead of a pre-scan (``None``: the other plans); ``fwd_split``: the tables of the one-wave split
     of the forward scan on the host plan's piece table (:class:`ForwardSplit`), which the forward of
-    :func:`fwd_split_route` runs instead of the pre-scan (``None``: the other plans)."""
+    :func:`fwd_split_route` runs instead of the pre-scan (``None``: the other plans); ``m_share``: both splits run on one
+    piece table and the plan takes M-share there (:func:`_m_share_planned`): the taped split forward keeps its segment
+    state for the backward's first wave."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -673,6 +676,8 @@ class ChunkMeta:
     bwd_split: AdjointSplit | None = None
     # the one-wave split of the forward scan on the host plan's piece table (:func:`forward_split_tables`)
     fwd_split: ForwardSplit | None = None
+    # M-share on this table (:data:`M_SHARE_ARCHS`)
+    m_share: bool = False
 
 
 @dataclass(frozen=True)
@@ -2050,6 +2055,17 @@ ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a", "sm_107a"
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
 ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
+# M-share (:func:`cake_plan.m_share`): on these architectures, a call whose forward runs the split forward and whose
+# backward runs this split on the same piece table, where the plan prices it, keeps the forward's segment state on its
+# tape (``"m_share"``: each middle piece's map ``[B | M]``, M as the forward applies it); wave 1 then walks the middle
+# pieces from zero for their start adjoint alone (``dhu_tc2_dvl32_modes``, mode ``SPLIT_OUT``) into the B half of that
+# state, and ``stitch_mt`` (the stitch's ``transpose_m`` build: ``x -> M^T x + B``, the adjoint of the forward's map)
+# composes the end adjoints.  The adjoint's own map (``dhu_tc2_dvl32_gm``) is not walked.  ``M_SHARE_ONE_LAUNCH``:
+# wave 1 as one launch of the walk form over the last pieces' and the middle pieces' entries (no fork), else the
+# middle pieces' walks take the summaries' place beside the last pieces' walks (the same kernels and bits).
+M_SHARE_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a"})
+M_SHARE_STAGES = ("dhu_tc2_dvl32_modes", "stitch_mt")
+M_SHARE_ONE_LAUNCH = False
 # the mode bits of an entry of the forms (``seg_mode``): seed the walk from ``dht`` (row of the segment, or of its
 # sequence with SPLIT_SEED_SEQ), write the dh / dv2 tapes, store the adjoint at the segment's start into the B half of
 # ``seg_state`` (the stitch's layout)
@@ -2257,7 +2273,10 @@ class AdjointSplit:
     ``[segment index, mode bits]`` of each launch of the ``dhu_tc2_dvl32`` forms (:func:`adjoint_split_tables`), and the
     stitch's ``seg_flag`` (``[segments, HV]``: 0 at each sequence's last piece, whose B half the stitch copies);
     ``one_stream``: wave 1 on the caller's stream, summaries first (:func:`adjoint_split_pricing`), instead of the
-    summaries on a side stream beside the last pieces' walks (the same kernels and bits)."""
+    summaries on a side stream beside the last pieces' walks (the same kernels and bits).  Under M-share
+    (:data:`M_SHARE_ARCHS`) wave 1 reads ``gonly`` (the summaries' segments, each walked from zero for its start adjoint
+    alone: mode ``SPLIT_OUT``) instead of ``summary``, or ``pass1`` (the walks' rows, then ``gonly``'s, one launch) with
+    :data:`M_SHARE_ONE_LAUNCH`."""
 
     walk: torch.Tensor
     summary: torch.Tensor
@@ -2267,6 +2286,8 @@ class AdjointSplit:
     num_summary: int
     num_front: int
     one_stream: bool = False
+    gonly: torch.Tensor | None = None
+    pass1: torch.Tensor | None = None
 
 
 def adjoint_split_lists(
@@ -2307,7 +2328,9 @@ def adjoint_split_tables(
     flags: list[int] = []
     for s0, s1 in zip(seq_seg_start[:-1], seq_seg_start[1:], strict=True):
         flags.extend([1] * ((s1 - s0 - 1) * int(num_v_heads)) + [0] * int(num_v_heads))
-    parts = [walk_i + walk_m, summary_i + summary_m, front_i + front_m, flags]
+    gonly_m = [SPLIT_OUT] * len(summary_i)
+    parts = [walk_i + walk_m, summary_i + summary_m, front_i + front_m, flags, summary_i + gonly_m,
+             walk_i + summary_i + walk_m + gonly_m]  # fmt: skip
     table = torch.tensor([x for part in parts for x in part], dtype=torch.int32)
     device = torch.device(device)
     table = (
@@ -2329,6 +2352,8 @@ def adjoint_split_tables(
         num_summary=len(summary_i),
         num_front=len(front_i),
         one_stream=bool(one_stream),
+        gonly=views[4].view(2, -1),
+        pass1=views[5].view(2, -1),
     )
 
 
@@ -3318,6 +3343,35 @@ def forward_split_length(
     return cake_plan.forward_split_length(arch, plan.pieces)
 
 
+def _m_share_planned(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bool:
+    """Whether a host-built ``meta`` takes M-share (:data:`M_SHARE_ARCHS`): it carries the split forward's tables and the
+    one-wave split of the adjoint walk on the same pieces (one length, the same segments, the forward's middle pieces
+    the backward's summaries), the device's architecture is one of :data:`M_SHARE_ARCHS` with the stitch composing the
+    end adjoints and the M-share stages delivered, and :func:`cake_plan.m_share` takes it on the device."""
+    split, split1, segs = meta.fwd_split, meta.bwd_split, meta.bwd_segments
+    if (
+        split is None
+        or split1 is None
+        or not split1.num_summary
+        or meta.seq_lens is None
+    ):
+        return False
+    if (
+        split.length != segs.segment_len
+        or split.num_segments != segs.num_segments
+        or split.num_middle != split1.num_summary
+    ):
+        return False
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    if arch not in M_SHARE_ARCHS or _adjoint_chain_stage(arch) != "stitch":
+        return False
+    if not all(_available(stage, arch) for stage in M_SHARE_STAGES):
+        return False
+    plan = cake_plan.host_plan(tuple(meta.seq_lens), int(num_v_heads), index)
+    return cake_plan.m_share(plan.chunks, int(num_v_heads), arch, plan.sm_count)
+
+
 def _host_forward_split(
     meta: ChunkMeta, num_v_heads: int, device_index: int, options: ChainOptions
 ) -> ForwardSplit | None:
@@ -3428,12 +3482,21 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     else:
         h0, use_init = final_state, 0
     hv = num_v_heads
-    seg_state = workspaces.take(
-        table,
-        "f_seg_state",
-        (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM),
-        f32,
-        device,
+    # under M-share (``meta.m_share``) a taped forward's segment state is an allocation of its own, kept on the tape
+    # (``"m_share"``): the backward's first wave reads the middle pieces' M halves the summary stores in it
+    m_share = tape and meta.m_share
+    seg_state = (
+        torch.empty(
+            (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), dtype=f32, device=device
+        )
+        if m_share
+        else workspaces.take(
+            table,
+            "f_seg_state",
+            (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM),
+            f32,
+            device,
+        )
     )
     seg_flag = workspaces.take(
         table, "f_seg_flag", (split.num_segments, hv), torch.int32, device
@@ -3563,6 +3626,8 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
         "w": w, "u": u, "v": v_in, "beta32": beta32, "meta": meta, "scale": float(scale),
         "output": o, "final_state": final_state if output_final_state else None, "initial_state": initial_state,
         "h": h, "v_new": v_new, "options": options, "mode": _TAPE_MODE, "forward": "fwd_split",
+        "m_share": seg_state if m_share else None,
+        "m_share_shape": tuple(seg_state.shape) if meta.m_share else None,
     }  # fmt: skip
 
 
@@ -4052,7 +4117,8 @@ def _replay(plan: _BackwardPlan, saved, do, grad_qkv):
 # --------------------------------------------------------------------------- #
 def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMeta, qn, kn, w, do, g_cs, dht32,
                         use_dht: int, dh, dv2, dh0, has_initial_state: bool, num_heads: int, num_v_heads: int,
-                        scale: float, table, workspaces: Workspaces, index: int, device, ex=None) -> None:  # fmt: skip
+                        scale: float, table, workspaces: Workspaces, index: int, device, ex=None,
+                        m_share=None) -> None:  # fmt: skip
     """The adjoint walk of a table's segments as the one-wave split (:class:`AdjointSplit`): wave 1, the last and
     one-piece walks (``dhu_tc2_dvl32_modes``, caller's stream) beside the middle pieces' summaries
     (``dhu_tc2_dvl32_gm``, side stream, joined back; both launches bound before the fork and fired back to back), or
@@ -4060,11 +4126,32 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     adjoints (the stitch with ``reverse``, or ``piece_chain``: each sequence's last piece ends at ``dht``, the piece
     before it at the B half its walk stored, every earlier one at ``M x + B`` of the piece after it); wave 2, the other
     pieces' walks from those end adjoints.  ``dh`` / ``dv2`` receive every chunk's tapes, ``dh0`` each sequence's
-    start adjoint (with ``has_initial_state``).  ``ex``: the backward's executor (:data:`_DIRECT` when ``None``)."""
+    start adjoint (with ``has_initial_state``).  ``ex``: the backward's executor (:data:`_DIRECT` when ``None``).
+    ``m_share``: the forward's segment state (M-share, :data:`M_SHARE_ARCHS`): wave 1 walks the middle pieces from
+    zero for their B halves alone (``dhu_tc2_dvl32_modes`` on ``gonly``; with :data:`M_SHARE_ONE_LAUNCH`, one launch
+    of ``pass1`` with the last pieces' walks) into it beside the M halves the forward's summary stored, and the
+    stitch reads those M halves transposed (``stitch_mt``: the forward applies M, the adjoint its transpose)."""
     ex = ex or _DIRECT
     hv = num_v_heads
-    seg_state = workspaces.take(table, "b_seg_state", (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), torch.float32,
-                                device)  # fmt: skip
+    chain = _adjoint_chain_stage(cake_backend.device_arch(index))
+    # M-share composes with the stitch only (piece_chain reads M as gm stores it)
+    shared = (
+        m_share is not None
+        and split1.num_summary > 0
+        and split1.gonly is not None
+        and chain == "stitch"
+    )
+    seg_state = (
+        m_share
+        if shared
+        else workspaces.take(
+            table,
+            "b_seg_state",
+            (segs.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM),
+            torch.float32,
+            device,
+        )  # fmt: skip
+    )
     store0 = 1 if has_initial_state else 0
     common = (meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
               hv)  # fmt: skip
@@ -4076,9 +4163,22 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     def walk(stage, entries, count, dht, use_final, store_initial):
         bound(stage, entries, count, dht, use_final, store_initial)()
 
-    if split1.num_summary:
-        summaries = bound(
-            "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
+    if shared and M_SHARE_ONE_LAUNCH:
+        walk(
+            "dhu_tc2_dvl32_modes",
+            split1.pass1,
+            split1.num_walk + split1.num_summary,
+            dht32,
+            use_dht,
+            store0,
+        )
+    elif split1.num_summary:
+        summaries = (
+            bound("dhu_tc2_dvl32_modes", split1.gonly, split1.num_summary, dht32, 0, 0)
+            if shared
+            else bound(
+                "dhu_tc2_dvl32_gm", split1.summary, split1.num_summary, dht32, 0, 0
+            )
         )
         walks = bound(
             "dhu_tc2_dvl32_modes", split1.walk, split1.num_walk, dht32, use_dht, store0
@@ -4107,12 +4207,12 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
         torch.float32,
         device,
     )
-    if _adjoint_chain_stage(cake_backend.device_arch(index)) == "piece_chain":
+    if chain == "piece_chain":
         ex.launch("piece_chain", meta.num_seqs, hv, CHAIN_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                   split1.seg_flag, hv, use_dht)  # fmt: skip
     else:
-        ex.launch("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
-                  split1.seg_flag, hv, use_dht, 1)  # fmt: skip
+        ex.launch("stitch_mt" if shared else "stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end,
+                  segs.seq_seg_start, split1.seg_flag, hv, use_dht, 1)  # fmt: skip
     walk("dhu_tc2_dvl32_modes", split1.front, split1.num_front, dh_end, 1, store0)
 
 
@@ -4249,7 +4349,8 @@ def _backward_chain(
     tc_stage = dhu_tc2_stage(arch)
     if split1 is not None:
         _adjoint_split_walk(split1, segs, meta, qn, kn, w, do, g_cs, dht32, use_dht, dh, dv2, dh0, has_initial_state,
-                            num_heads, num_v_heads, scale, table, workspaces, index, device, ex)  # fmt: skip
+                            num_heads, num_v_heads, scale, table, workspaces, index, device, ex,
+                            m_share=forward.get("m_share"))  # fmt: skip
     elif use_tc and groups is None:
         # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
         ex.launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
@@ -4707,6 +4808,10 @@ def _chunk_meta(
         id(cake_plan.ADJOINT_FORMS),
         FWD_SPLIT_ARCHS,
         tuple(sorted(cake_plan.FORWARD_SPLIT_MIN_PIECE.items())),
+        tuple(sorted(M_SHARE_ARCHS)),
+        id(cake_plan.M_SHARE_COSTS),
+        cake_plan.M_SHARE_MIN_SAVING,
+        M_SHARE_ONE_LAUNCH,
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -4747,6 +4852,8 @@ def _chunk_meta(
     fwd_split = _host_forward_split(meta, int(num_v_heads), int(index), options)
     if fwd_split is not None:
         meta = replace(meta, fwd_split=fwd_split)
+        if _m_share_planned(meta, int(num_v_heads), int(index)):
+            meta = replace(meta, m_share=True)
     if options.streams == 2:
         split_adjoint = _split_r_groups(
             cake_backend.device_arch(int(index)), group, options
@@ -4792,8 +4899,19 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
         else cake_plan.placeholder(fwd[name].shape, fwd[name].dtype, fwd[name].device)
         for name in cake_plan.STATE_NAMES
     )
+    # the M-share segment state (:data:`M_SHARE_ARCHS`) is the saved list's last entry, a placeholder without it:
+    # metadata-equal to the segment state where the call plans M-share but keeps no tape (a non-reentrant
+    # checkpoint's first pass saves what its recompute saves), else empty.  Whether the backward reads it follows
+    # the plan, as the kept state does: a non-reentrant checkpoint's backward runs on the first pass's ctx with the
+    # recompute's saved tensors
+    m_share = fwd.get("m_share")
+    ctx.m_share = fwd.get("m_share_shape") is not None
+    if m_share is None:
+        m_share = cake_plan.placeholder(
+            fwd.get("m_share_shape") or (0,), torch.float32, fwd["qn"].device
+        )
     ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
-                          fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
+                          fwd["beta32"], fwd["A"], initial_state, *state_tensors, m_share)  # fmt: skip
     ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
     ctx.grad_shapes = (g.shape, beta.shape)
     ctx.normalize_qk = bool(use_qk_l2norm_in_kernel)
@@ -4815,7 +4933,7 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
         # CakeGDNNondetPackedFunction's forward sets row_shape
         packed = getattr(ctx, "row_shape", None) is not None
         key = (id(meta), _stream_key(index), arch, pins, ctx.scale, ctx.normalize_qk, ctx.grad_shapes, ctx.dtypes,
-               fwd["v"].stride(), initial_state is not None, kept, packed)  # fmt: skip
+               fwd["v"].stride(), initial_state is not None, kept, packed, ctx.m_share)  # fmt: skip
         plan = _BWD_PLANS.get(key)
         if plan is None or plan.meta is not meta:
             ctx.plan_key = key
@@ -4848,7 +4966,19 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
 def _general_backward(ctx, saved, do, dht, grad_qkv):
     """The backward chain over the saved tape (:func:`_backward_chain`); records the plan of the forward's key when
     the forward made one (a call without a final-state gradient)."""
-    qn, kn, rstd_q, rstd_k, v_flat, g_cs, beta32, A, saved_state, *state_tensors = saved
+    (
+        qn,
+        kn,
+        rstd_q,
+        rstd_k,
+        v_flat,
+        g_cs,
+        beta32,
+        A,
+        saved_state,
+        *state_tensors,
+        m_share,
+    ) = saved
     g_shape, beta_shape = ctx.grad_shapes
     tape = {"arch": ctx.arch, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "v": v_flat, "g_cs": g_cs,
             "beta32": beta32, "A": A, "meta": ctx.meta, "scale": ctx.scale, "normalize_qk": ctx.normalize_qk,
@@ -4859,6 +4989,8 @@ def _general_backward(ctx, saved, do, dht, grad_qkv):
         for name, t in zip(cake_plan.STATE_NAMES, state_tensors, strict=True)
         if name in kept
     )
+    if ctx.m_share:
+        tape["m_share"] = m_share
     do = do.contiguous()
     key = ctx.plan_key
     recorder = None

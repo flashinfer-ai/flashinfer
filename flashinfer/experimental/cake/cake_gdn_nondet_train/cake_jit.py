@@ -69,7 +69,11 @@ pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA) and
 ``dhu_pre_dvl32_r64k1`` (the same pre-scan adding its FP32 ``dv_local`` tiles
 to ``dv2``, which then rounds once), ``dhu_tc2`` (the serial adjoint scan with
 ``dv_local`` fused, tcgen05, TMA ring fills) and ``dhu_tc2_dvl32`` (the same
-scan adding the FP32 ``dv_local`` accumulator to ``dv2``), ``dqkwg``,
+scan adding the FP32 ``dv_local`` accumulator to ``dv2``), the one-wave split
+of the adjoint walk (``dhu_tc2_dvl32_modes`` / ``dhu_tc2_dvl32_gm``, the
+composition of its end adjoints ``piece_chain``, and ``stitch_mt``: the
+stitch reading each map's M half transposed, which composes them on the split
+forward's maps under M-share), ``dqkwg``,
 ``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` / ``finalize_mlp``, ``tail_g2`` /
 ``tail_g2_bf16`` (``dqkwg``, the WY pullback and the finalize of a value-head
 group of two in one tcgen05 cluster kernel; each value head's ``dq`` / ``dk``
@@ -133,6 +137,7 @@ STAGES = (
     "dhu_tc2_dvl32",
     "dhu_tc2_dvl32_modes",
     "dhu_tc2_dvl32_gm",
+    "stitch_mt",
     "piece_chain",
     "dqkwg",
     "wy_bwd",
@@ -1536,6 +1541,33 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_train_f2b9d7db2234ed86559f",
         "stage": "dhu_tc2_dvl32_gm",
+    },
+    "stitch_mt": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "seg_state"],
+            ["buffer", "init_state"],
+            ["buffer", "state_out"],
+            ["buffer", "seq_seg_start"],
+            ["buffer", "seg_flag"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_init"],
+            ["parameter", "reverse"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_train_be470a9f111f3b3123de",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 131072,
+            "use_pdl": True,
+        },
+        "library": "cake_gdn_train_be470a9f111f3b3123de",
+        "stage": "stitch_mt",
     },
     "piece_chain": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
