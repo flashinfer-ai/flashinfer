@@ -1058,3 +1058,131 @@ def test_paged_candidates_small_partition():
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     _check_candidates(idx, sc, q, w, ctx, paged, cand, 8, 512)
+
+
+def _check_source(out, q, w, ctx, paged, bs, C):
+    """out: each row's top min(C, blocks) blocks by block score (the largest
+    score of the block's visible keys; the newest block first), ties to the
+    larger block, in any order, then -1."""
+    B, next_n = ctx.shape
+    for b in range(B):
+        n_max = int(ctx[b].max())
+        keys = paged.request_keys(b, n_max)
+        rows = slice(b * next_n, (b + 1) * next_n)
+        full = _scores(q.value[b], w[rows], keys).float()
+        for j in range(next_n):
+            r = b * next_n + j
+            n = int(ctx[b, j])
+            nb = (n + bs - 1) // bs
+            what = f"request {b} row {j}"
+            if nb == 0:
+                assert bool((out[r] == -1).all()), what
+                continue
+            padded = torch.full((nb * bs,), -torch.inf, device=out.device)
+            padded[:n] = full[j, :n]
+            score = padded.view(nb, bs).amax(1)
+            score[nb - 1] = torch.inf
+            ids = torch.arange(nb, device=out.device)
+            order = torch.argsort(ids, descending=True, stable=True)
+            order = order[torch.argsort(score[order], descending=True, stable=True)]
+            want = min(C, nb)
+            ref = torch.sort(order[:want]).values.int()
+            got = torch.sort(out[r, :want]).values
+            assert torch.equal(got, ref), what
+            assert bool((out[r, want:] == -1).all()), f"{what}: padding"
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+@pytest.mark.parametrize("heads,top_k", _HK)
+@pytest.mark.parametrize(
+    "next_n,lens,bs,C",
+    [
+        # DeepSeek-V4.1: 2048 blocks of 8 keys. Rows of at most C blocks (all
+        # published), more, and more than one selection CTA's blocks.
+        (1, [60000, 16384, 3000, 0, 5, 16385, 140000], 8, 2048),
+        (2, [60000, 900, 30000, 140000], 8, 2048),
+        (1, [5000, 40000, 20001], 16, 512),
+    ],
+)
+def test_paged_candidate_source(fp4, heads, top_k, next_n, lens, bs, C):
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(len(lens) * 31 + next_n + bs + heads)
+    B = len(lens)
+    paged = _Paged(fp4, B, max(lens), 64, gen, dev)
+    q, w, ctx = _decode_inputs(fp4, B, next_n, heads, lens, gen, dev)
+    out = torch.full((B * next_n, C), 7, dtype=torch.int32, device=dev)
+    idx, sc = _run_decode(
+        q, w, ctx, paged, top_k, candidate_out=out, candidate_block_size=bs
+    )
+    _check_decode(idx, sc, q, w, ctx, paged, top_k)
+    _check_source(out, q, w, ctx, paged, bs, C)
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+def test_paged_candidate_source_cuda_graph(fp4):
+    """One capture replays over new lengths and queries, block rows longer than
+    one selection CTA's included (their state persists across replays)."""
+    dev = torch.device("cuda")
+    B, next_n, max_len, C, bs, top_k = 4, 2, 150000, 2048, 8, 512
+    gen = torch.Generator(device=dev).manual_seed(41)
+    paged = _Paged(fp4, B, max_len, 64, gen, dev)
+    q, w, ctx = _decode_inputs(fp4, B, next_n, 32, [max_len] * B, gen, dev)
+    idx = torch.empty(B * next_n, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(B * next_n, top_k, dtype=torch.float32, device=dev)
+    out = torch.empty(B * next_n, C, dtype=torch.int32, device=dev)
+
+    def run():
+        _run_decode(q, w, ctx, paged, top_k, indices=idx, scores=sc, candidate_out=out)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lo, hi in (
+        (140000, max_len),
+        (1, 2000),
+        (1, max_len),
+        (140000, max_len),
+        (0, 1),
+    ):
+        q2 = _queries(fp4, (B, next_n, 32), gen, dev)
+        q.data.copy_(q2.data)
+        if fp4:
+            q.scale.copy_(q2.scale)
+        q.value = q2.value
+        Lb = torch.randint(
+            lo, hi + 1, (B, 1), generator=gen, device=dev, dtype=torch.int32
+        )
+        ctx.copy_((Lb - next_n + 1 + torch.arange(next_n, device=dev)).clamp_min(0))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_decode(idx, sc, q, w, ctx, paged, top_k)
+        _check_source(out, q, w, ctx, paged, bs, C)
+
+
+def test_paged_candidate_source_validation():
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(4)
+    paged = _Paged(False, 1, 1000, 64, gen, dev)
+    q, w, ctx = _decode_inputs(False, 1, 1, 32, [1000], gen, dev)
+    out = torch.empty(1, 2048, dtype=torch.int32, device=dev)
+    cand = torch.zeros(1, 2048, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _run_decode(q, w, ctx, paged, 512, candidate_blocks=cand, candidate_out=out)
+    for bad in (
+        torch.empty(1, 4097, dtype=torch.int32, device=dev),
+        torch.empty(1, 2048, dtype=torch.int64, device=dev),
+        torch.empty(2, 2048, dtype=torch.int32, device=dev),
+        torch.empty(1, 4096, dtype=torch.int32, device=dev)[:, ::2],
+    ):
+        with pytest.raises(ValueError, match="candidate_out"):
+            _run_decode(q, w, ctx, paged, 512, candidate_out=bad)
+    for bs in (4, 32):
+        with pytest.raises(ValueError, match="candidate_block_size"):
+            _run_decode(
+                q, w, ctx, paged, 512, candidate_out=out, candidate_block_size=bs
+            )

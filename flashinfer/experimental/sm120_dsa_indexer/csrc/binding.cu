@@ -583,13 +583,22 @@ void launch_scan(Kernel kernel, const ScanParams& p, const void* q, const void* 
 // cand_sorted [num_rows, C] and cand_vlen [num_rows] int32 are scratch; the
 // rows are at most C << cand_shift <= kRowSelKeys keys, so logits need only
 // that many columns and no long_ws.
+//
+// Source mode (cand_out [num_rows, C] int32, C <= 4096): each row also gets its
+// top C blocks of 1 << cand_shift (8 or 16) keys by block score, which the
+// scan writes (decode_scan.cuh), in no particular order, -1 padded.
+// blk_scores [>= num_rows, >= the bound's blocks] fp32 (row stride a multiple
+// of 4) and blk_len [num_rows] int32 are scratch, and blk_long_ws (when the
+// bound has more than kRowSelKeys blocks) the block rows' selection state,
+// like long_ws.
 void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
                TensorView block_table, int64_t page_rows, int64_t unit_rows, int64_t units_per_req,
                int64_t top_k, int64_t max_context_len, Optional<TensorView> q_sf,
                TensorView indices, Optional<TensorView> scores, TensorView logits,
                Optional<TensorView> long_ws, bool enable_pdl, Optional<TensorView> cand_blocks,
-               int64_t cand_shift, Optional<TensorView> cand_sorted,
-               Optional<TensorView> cand_vlen) {
+               int64_t cand_shift, Optional<TensorView> cand_sorted, Optional<TensorView> cand_vlen,
+               Optional<TensorView> cand_out, Optional<TensorView> blk_scores,
+               Optional<TensorView> blk_len, Optional<TensorView> blk_long_ws) {
   const bool fp4 = q_sf.has_value();
   const int64_t row_bytes = fp4 ? kHeadDim / 2 : kHeadDim;
   if (fp4) {
@@ -638,6 +647,8 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
                  block_table.size(0) >= num_units / units_per_req)
       << "block_table must have a row per request";
   const bool cand = cand_blocks.has_value();
+  const bool source = cand_out.has_value();
+  TVM_FFI_ICHECK(!(cand && source)) << "a row takes candidate blocks or publishes them, not both";
   int num_cands = 0;
   // The scan's rows: the keys, or in candidate mode the virtual rows.
   int64_t scan_len = max_context_len;
@@ -658,6 +669,27 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
                    cand_vlen.value().numel() >= num_rows)
         << "candidate scratch too small";
     scan_len = std::min<int64_t>(max_context_len, int64_t{num_cands} << cand_shift);
+  }
+  int64_t max_blocks = 0;
+  if (source) {
+    TVM_FFI_ICHECK(cand_shift == 3 || cand_shift == 4)
+        << "candidate_out takes blocks of 8 or 16 keys";
+    CHECK_INPUT_TYPE(cand_out.value(), dl_int32);
+    TVM_FFI_ICHECK(cand_out.value().ndim() == 2 && cand_out.value().size(0) == num_rows &&
+                   cand_out.value().size(1) >= 1 && cand_out.value().size(1) <= 4096 &&
+                   cand_out.value().IsContiguous())
+        << "candidate_out must be a contiguous [rows, C] int32 tensor, 1 <= C <= 4096";
+    max_blocks = (max_context_len + (int64_t{1} << cand_shift) - 1) >> cand_shift;
+    TVM_FFI_ICHECK(blk_scores.has_value() && blk_len.has_value() &&
+                   blk_scores.value().ndim() == 2 && blk_scores.value().size(0) >= num_rows &&
+                   blk_scores.value().size(1) >= max_blocks && blk_scores.value().stride(1) == 1 &&
+                   blk_scores.value().stride(0) % 4 == 0 && blk_len.value().numel() >= num_rows)
+        << "block scratch too small";
+    if (max_blocks > kRowSelKeys) {
+      TVM_FFI_ICHECK(blk_long_ws.has_value() &&
+                     blk_long_ws.value().numel() >= int64_t{num_rows} * kLongWords)
+          << "blk_long_ws must hold rows * " << kLongWords << " 32-bit words";
+    }
   }
   TVM_FFI_ICHECK(logits.ndim() == 2 && logits.size(0) >= num_rows && logits.stride(1) == 1 &&
                  logits.stride(0) % 4 == 0 && logits.size(1) >= scan_len)
@@ -714,6 +746,14 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
     p.kv_scales = static_cast<const uint8_t*>(kv.data_ptr()) + page_rows * row_bytes;
     p.page_stride = page_stride;
   }
+  if (source) {
+    p.blk = ptr<float>(blk_scores.value());
+    p.blk_stride = blk_scores.value().stride(0);
+    p.blk_len = ptr<int32_t>(blk_len.value());
+    // Block rows can be long only where key rows are (the kLong scan).
+    p.blk_long_ws = max_blocks > kRowSelKeys ? ptr<uint32_t>(blk_long_ws.value()) : nullptr;
+    p.blk_shift = static_cast<int>(cand_shift);
+  }
   // Logits of 4 MB up to a quarter of L2 stay there for the selection: their
   // write-back would take the DRAM-bound scan's bandwidth. Smaller calls keep
   // the plain kernels.
@@ -730,25 +770,32 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
     constexpr int H = decltype(heads_tag)::value;
     constexpr bool kF = decltype(fp4_tag)::value;
     constexpr int NN = decltype(unit_tag)::value;
-    auto go = [&](auto long_tag, auto keep_tag) {
+    auto go = [&](auto long_tag, auto keep_tag, auto blk_tag) {
       constexpr bool kL = decltype(long_tag)::value;
       constexpr bool kK = kL && decltype(keep_tag)::value;
-      using LS = ScanSmem<H, kF, NN, kL>;
+      constexpr bool kB = decltype(blk_tag)::value;
+      using LS = ScanSmem<H, kF, NN, kL, kB>;
       int st = kScanMaxStages;
       while (st > 2 && LS::bytes(st) > kSmemLimit) --st;
       p.k_stages = st;
       const int box_rows =
           cand ? 1 << cand_shift : static_cast<int>(std::min<int64_t>(page_rows, kBlockKV));
-      launch_scan<H, kF, NN>(logits_scan_kernel<H, kF, NN, kL, kK>, p, q.data_ptr(), w.data_ptr(),
-                             kv.data_ptr(), qsf, num_pages, page_stride, box_rows, S, enable_pdl,
-                             stream, LS::bytes(st));
+      launch_scan<H, kF, NN>(logits_scan_kernel<H, kF, NN, kL, kK, kB>, p, q.data_ptr(),
+                             w.data_ptr(), kv.data_ptr(), qsf, num_pages, page_stride, box_rows, S,
+                             enable_pdl, stream, LS::bytes(st));
+    };
+    auto go_blk = [&](auto long_tag, auto keep_tag) {
+      if (source)
+        go(long_tag, keep_tag, std::true_type{});
+      else
+        go(long_tag, keep_tag, std::false_type{});
     };
     if (!may_long)
-      go(std::false_type{}, std::false_type{});
+      go_blk(std::false_type{}, std::false_type{});
     else if (keep)
-      go(std::true_type{}, std::true_type{});
+      go_blk(std::true_type{}, std::true_type{});
     else
-      go(std::true_type{}, std::false_type{});
+      go_blk(std::true_type{}, std::false_type{});
   };
   using I32 = std::integral_constant<int, 32>;
   using I64 = std::integral_constant<int, 64>;
@@ -781,6 +828,22 @@ void RunDecode(TensorView q, TensorView kv, TensorView w, TensorView row_len,
   launch_ex(keep ? select_kernel<true> : select_kernel<false>, num_rows + (may_long ? S : 0),
             kSelThreads, 0, stream, enable_pdl, false, sp);
   check_launch("decode select");
+  if (source) {
+    // The block rows, ranked like key rows: their ids are block ids.
+    const bool blk_long = max_blocks > kRowSelKeys;
+    SelParams bs{};
+    bs.logits = ptr<float>(blk_scores.value());
+    bs.stride = blk_scores.value().stride(0);
+    bs.row_len = ptr<const int32_t>(blk_len.value());
+    bs.num_rows = num_rows;
+    bs.top_k = static_cast<int>(cand_out.value().size(1));
+    bs.indices = ptr<int32_t>(cand_out.value());
+    bs.scores = nullptr;
+    bs.long_ws = blk_long ? ptr<uint32_t>(blk_long_ws.value()) : nullptr;
+    launch_ex(select_kernel<false>, num_rows + (blk_long ? S : 0), kSelThreads, 0, stream,
+              enable_pdl, false, bs);
+    check_launch("decode block select");
+  }
 }
 
 int64_t DecodeLongWords() { return kLongWords; }

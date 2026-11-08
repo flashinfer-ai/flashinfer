@@ -73,6 +73,20 @@ and masking it:
 
 A row's work is thus bounded by its candidates, not by its context.
 
+The source layer publishes those lists (`candidate_out`). Its rows are scanned
+and selected as usual, for their own top-k. In addition:
+- The scan's epilogue writes each block's score: the largest score among its
+  visible keys, with the row's newest block and any block with a NaN score
+  pinned to `+inf`.
+  - A warp's 16 keys of a tile lie on the MMA fragment's 8 row groups, so a
+    block of 8 keys is three shuffles away and a block of 16 is the pair.
+  - Blocks of 8 or 16 keys are therefore supported.
+- The selection kernel then ranks these block rows like key rows, with
+  `top_k = C`, and its ids are block ids.
+- Block rows longer than one selection CTA (more than 16K blocks) get their
+  histogram from the scan, beside the long key rows'. They keep their own
+  long-row state.
+
 ## Performance
 
 Measured on an RTX PRO 6000 Blackwell Server Edition (188 SMs) with CUPTI
@@ -113,9 +127,11 @@ spot checks keep the same picture.
   long-row state is allocated and zeroed eagerly.
 - `max_seqlen_k`, when given, must bound every segment's keys. Rows longer
   than the bound are left unwritten.
-- Candidate rows are decode-only (the paged form). Rows whose candidates cover
-  all their blocks still take the per-block loads, so up to 16K keys they run
-  slower than the same rows without candidates.
+- Candidate rows and source rows are decode-only (the paged form).
+- Rows whose candidates cover all their blocks still take the per-block loads,
+  so up to 16K keys they run slower than the same rows without candidates.
+- A source row costs one launch more than a plain row: the block selection.
+  `candidate_out` takes blocks of 8 or 16 keys.
 - Tested on SM120 (188 and 170 SMs) and SM121 (GB10, 48 SMs). Routing
   thresholds are tuned for SM120's 128 MB L2. On GB10's 24 MB L2, two cases
   fall behind the DeepGEMM-logits pipelines:

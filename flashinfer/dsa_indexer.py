@@ -61,6 +61,7 @@ def dsa_indexer_det_topk(
     enable_pdl: Optional[bool] = None,
     candidate_blocks: Optional[torch.Tensor] = None,
     candidate_block_size: int = 8,
+    candidate_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Fused DSA indexer scoring and exact top-k selection (DeepSeek Sparse
     Attention indexer), the experimental FP8 / MXFP4 serving form on SM120:
@@ -178,7 +179,15 @@ def dsa_indexer_det_topk(
         launches, so a captured graph replays for any lists.
     candidate_block_size : int
         Keys a candidate block: a power of two from 8 to
-        ``min(k.shape[1], 128)``.
+        ``min(k.shape[1], 128)``; 8 or 16 with ``candidate_out``.
+    candidate_out : Optional[torch.Tensor]
+        The paged form only, not with ``candidate_blocks``: int32
+        ``[B * next_n, C]`` (``C <= 4096``) that also receives each row's top
+        ``min(C, blocks)`` blocks of ``candidate_block_size`` keys, in no
+        particular order, then ``-1`` (DeepSeek-V4.1's candidate source layer).
+        A block's score is the largest score of its visible keys; the row's
+        newest block, and a block with a NaN score, rank first.  Ties go to the
+        larger block id.  The row's own top-k is returned as without it.
 
     Returns
     -------
@@ -240,9 +249,12 @@ def dsa_indexer_det_topk(
             enable_pdl=enable_pdl,
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,
+            candidate_out=candidate_out,
         )
-    if candidate_blocks is not None:
-        raise ValueError("candidate_blocks needs the paged form of backend='sm120'")
+    if candidate_blocks is not None or candidate_out is not None:
+        raise ValueError(
+            "candidate_blocks and candidate_out need the paged form of backend='sm120'"
+        )
     if k_scale is None:
         raise ValueError("backend='sm120' requires k_scale")
     if cu_seqlens_q is None or cu_seqlens_k is None:
