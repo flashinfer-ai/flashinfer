@@ -6132,7 +6132,11 @@ K1_WGRAD_SK_ROWS = {
         for T in (16172, 16231, 16384)
         for dt in ("bf16", "f32")
     },
-    ("sm_103a", 152): {(5120, 1024, 16384, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t"},
+    ("sm_103a", 152): {
+        (5120, 1024, 16172, "bf16"): "dense_proj_gemm_sk_nn_n256_t",
+        (5120, 1024, 16231, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
+        (5120, 1024, 16384, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
+    },
 }
 K1_ORDERED_ROWS = {
     ("sm_107a", 212): {
@@ -13696,6 +13700,7 @@ K1_WGRAD_CHANGED_ROWS = {
         (5120, 32, "f32", 16384): ("det", None, None), (5120, 48, "bf16", 16231): ("det", None, None),
         (5120, 64, "f32", 16231): ("det", None, None), (5120, 64, "f32", 16384): ("det", None, None),
         (5120, 128, "f32", 16231): ("det", None, None), (5120, 128, "f32", 16384): ("det", None, None),
+        (5120, 1024, "bf16", 16172): ("sk", 256, None), (5120, 1024, "f32", 16231): ("sk", 256, None),
         (5120, 1024, "f32", 16384): ("sk", 256, None),
     },
     ("sm_107a", 212): {

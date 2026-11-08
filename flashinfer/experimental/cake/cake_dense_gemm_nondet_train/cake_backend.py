@@ -2003,7 +2003,11 @@ _SK_FLAG_WORDS = 512
 #: the six input kinds of :data:`K1_DSM_RANGES_BY_SM`'s check.  On a 152-SM ``sm_103a`` part (76 units) the FP32
 #: program at ``5120 -> 1024`` and 16384 tokens, measured the same way on one GB300 node: 6.0 to 6.7 % faster than the
 #: fastest non-Cake program and 3.3 to 4.2 % faster than this package's program of the row, the same bits on 20
-#: repeats and within the same check.
+#: repeats and within the same check.  The BF16 program at 16172 tokens and the FP32 program at 16231 tokens, on two
+#: GB300 nodes: this package's program of the row took 1.018 to 1.047 times their median time in eager launches and in
+#: CUDA graph replays, slower in at most 2 of 15 paired groups on one node and 1 of 7 on the other on every GPU, the
+#: same bits on 20 repeats and within the same check.  The other BF16 and FP32 token counts keep this package's program
+#: on ``sm_103a``: the stream-K program missed that group count there.
 # fmt: off
 K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
@@ -2011,7 +2015,10 @@ K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], s
         (5120, 1024, 16384, "bf16"): _SK_N256_T, (5120, 1024, 16172, "f32"): _SK_N256_F32_T,
         (5120, 1024, 16231, "f32"): _SK_N256_F32_T, (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
     },
-    ("sm_103a", 152): {(5120, 1024, 16384, "f32"): _SK_N256_F32_T},
+    ("sm_103a", 152): {
+        (5120, 1024, 16172, "bf16"): _SK_N256_T, (5120, 1024, 16231, "f32"): _SK_N256_F32_T,
+        (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
+    },
 }
 # fmt: on
 
