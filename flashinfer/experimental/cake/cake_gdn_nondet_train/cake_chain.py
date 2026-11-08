@@ -4577,7 +4577,8 @@ def _backward_chain(
     v, beta32 = forward["v"], forward["beta32"]
     num_heads, num_v_heads = qn.shape[-2], v.shape[-2]
     v_rows = _v_rows(v)
-    if v_rows is None:  # a tape whose v is not one the stages read in place: copied into fresh contiguous rows
+    # a tape whose v is not one the stages read in place: copied into fresh contiguous rows
+    if v_rows is None:
         ex.refuse("v is not read in place")
         v = _dense(v, torch.empty(v.shape, dtype=v.dtype, device=v.device))
         v_rows = num_v_heads

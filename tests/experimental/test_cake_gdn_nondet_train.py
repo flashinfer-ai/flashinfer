@@ -5740,9 +5740,7 @@ def test_deterministic_algorithms_run_the_a_and_split_routes(
     with _deterministic_algorithms(True), warnings.catch_warnings():
         warnings.simplefilter("error")
         stages = _record_launches(monkeypatch)
-        got = _run(
-            inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht
-        )
+        got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
         o = checkpoint(layer, *leaves.values(), use_reentrant=False)
         (o.float() * inputs["do"].float()).sum().backward()
         torch.cuda.synchronize()
