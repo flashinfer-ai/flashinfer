@@ -293,6 +293,21 @@ EDGE_ROWS = [
     pytest.param(4, 108, 772, 64, id="c4w772-q4-t108"),
     pytest.param(1, 108, 640, 64, id="c4w640-q1-t108"),
     pytest.param(5, 110, 640, 64, id="c4w640-q5-t110"),
+    # Just outside the one-token decode window: 175 and 209 rows, 160 and
+    # 256 rows, and the c128 layer (compressed pages of 2 rows) at 192 rows.
+    pytest.param(1, 175, 1152, 64, id="c4w1152-q1-t175"),
+    pytest.param(1, 209, 1152, 64, id="c4w1152-q1-t209"),
+    pytest.param(1, 160, 1152, 64, id="c4w1152-q1-t160"),
+    pytest.param(1, 256, 1152, 64, id="c4w1152-q1-t256"),
+    pytest.param(1, 192, 1152, 2, id="c128w1152-q1-t192"),
+]
+# Rows of the one-token decode window (``_KV4_BCL_DECODE_WINDOWS``: 64
+# heads, items 1152 wide, compressed pages of 64 rows, 176-208 rows), which
+# takes the TMEM-batch sibling on devices of 212 or 216 SMs only.
+DECODE_WINDOW_ROWS = [
+    pytest.param(1, 176, 1152, 64, id="c4w1152-q1-t176"),
+    pytest.param(1, 192, 1152, 64, id="c4w1152-q1-t192"),
+    pytest.param(1, 208, 1152, 64, id="c4w1152-q1-t208"),
 ]
 
 
@@ -432,6 +447,83 @@ def test_tmem_batch_program_is_deterministic(monkeypatch):
     torch.cuda.synchronize()
     # One launch per eager call and one captured; replays prepare nothing.
     assert launched == [BCL_VARIANT] * (REPEATS + 2)
+    for repeat in range(REPEATS):
+        case.query.zero_()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.reshape(first.shape), first), (
+            f"graph replay {repeat} differs from the eager call"
+        )
+
+
+def _decode_window_program() -> str:
+    """The program a one-token decode-window row runs on this device: the
+    TMEM-batch sibling on 212 or 216 SMs, the four-stage program elsewhere."""
+    sm_count = cake._device_sm_count(torch.device("cuda:0"))
+    if sm_count in cake._KV4_BCL_DECODE_SM_COUNTS:
+        return BCL_VARIANT
+    return KV4_VARIANT
+
+
+@pytest.mark.parametrize("lengths", ["full", "mixed"])
+@pytest.mark.parametrize("q_len,rows,width,page", DECODE_WINDOW_ROWS)
+def test_decode_window_rows_run_the_tmem_batch_program(
+    monkeypatch, q_len, rows, width, page, lengths
+):
+    """On 212 or 216 SMs the row runs the TMEM-batch sibling (elsewhere the
+    four-stage program), matches the reference, is bit-identical with the
+    masked columns' pages poisoned, equals the launch without PDL bit for bit
+    and equals the four-stage program's output bit for bit."""
+    _skip_unless_sm107()
+    _require_tmem_batch_program()
+    program = _decode_window_program()
+    case = _decode_case(q_len, rows, width, page, lengths=lengths)
+    req = case.requirement()
+    assert (req.route, req.num_splits) == (M64_ROUTE, 1)
+    workspace = _workspace(case)
+    launched = _record_launches(monkeypatch)
+    pdl = hardening._assert_poison_inert(case, workspace, enable_pdl=True)
+    plain = case.run(workspace=workspace, out=case.nan_out())
+    torch.cuda.synchronize()
+    assert launched == [program] * 3
+    assert torch.equal(plain, pdl), "the PDL launch differs from the plain one"
+    monkeypatch.setattr(cake, "_kv4_bcl_variant", lambda variant, **kwargs: variant)
+    four_stage = case.run(workspace=workspace, out=case.nan_out(), enable_pdl=True)
+    torch.cuda.synchronize()
+    assert launched == [program] * 3 + [KV4_VARIANT]
+    assert torch.equal(four_stage, pdl), (
+        "the TMEM-batch program differs from the four-stage program"
+    )
+
+
+def test_tmem_batch_decode_window_program_is_deterministic(monkeypatch):
+    """Eager calls and CUDA graph replays of a one-token decode-window row
+    (192 rows over items 1152 wide, masked columns of both kinds, PDL on) are
+    bitwise identical and run the device's decode-window program."""
+    _skip_unless_sm107()
+    _require_tmem_batch_program()
+    program = _decode_window_program()
+    case = _decode_case(1, 192, 1152, 64, lengths="mixed")
+    workspace = _workspace(case)
+    run = dict(workspace=workspace, float_scales=True, enable_pdl=True)
+    launched = _record_launches(monkeypatch)
+    first = case.run(out=case.nan_out(), **run)
+    torch.cuda.synchronize()
+    hardening._assert_valid(first, case)
+    for repeat in range(REPEATS):
+        again = case.run(out=case.nan_out(), **run)
+        torch.cuda.synchronize()
+        assert torch.equal(again, first), f"eager repeat {repeat} differs"
+
+    source = case.query.clone()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(out=out, **run)
+    torch.cuda.synchronize()
+    assert launched == [program] * (REPEATS + 2)
     for repeat in range(REPEATS):
         case.query.zero_()
         out.fill_(float("nan"))

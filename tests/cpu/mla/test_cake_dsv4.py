@@ -4530,12 +4530,22 @@ def _bf16_out_at(rows, num_heads, offset):
 
 
 def _run_fake_h64_decode_fp8(
-    monkeypatch, *, arch, width, tokens, workspace=None, out=None, max_q_len=1
+    monkeypatch,
+    *,
+    arch,
+    width,
+    tokens,
+    workspace=None,
+    out=None,
+    max_q_len=1,
+    sm_count=208,
+    page=64,
 ):
     """Drive run_cake_dsv4 on CPU tensors for a dense FP8/H64 decode call of
     ``tokens`` rows in requests of ``max_q_len`` rows (default one) over
-    ``width`` keys on ``arch`` (208 SMs); return the launched programs, their
-    bound arguments and the output."""
+    ``width`` keys on ``arch`` (``sm_count`` SMs, default 208), the
+    compressed cache on pages of ``page`` rows (default 64); return the
+    launched programs, their bound arguments and the output."""
     plans = {
         route: _PERSISTENT_PLAN
         for route in (
@@ -4555,7 +4565,7 @@ def _run_fake_h64_decode_fp8(
 
     monkeypatch.setattr(cake, "_variant_module", module)
     monkeypatch.setattr(cake, "_target_arch", lambda device: arch)
-    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 208)
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
     table, lens = _combined_metadata(tokens, width - 128)
     if workspace is None:
         workspace = _aligned_u8(
@@ -4564,7 +4574,7 @@ def _run_fake_h64_decode_fp8(
     result = cake.run_cake_dsv4(
         query=torch.zeros((tokens, 64, 512), dtype=torch.float8_e4m3fn),
         swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
-        compressed_kv_cache=torch.zeros((4, 1, 64, 512), dtype=torch.float8_e4m3fn),
+        compressed_kv_cache=torch.zeros((4, 1, page, 512), dtype=torch.float8_e4m3fn),
         workspace_buffer=workspace,
         out=out,
         bmm1_scale=0.5,
@@ -7129,3 +7139,214 @@ def test_row_tiled_mtp_decode_chunks_pick_their_program_per_launch(monkeypatch):
     grids = [(c["grid_x"], c["grid_y"], c["grid_z"]) for c in calls]
     assert grids == [(120, 1, 1), (80, 1, 1)]
     assert [c["total_work_items"] for c in calls] == [120, 80]
+
+
+# --------------------------------------------------------------------------- #
+# TMEM-batch sibling: SM107's one-token decode window (c4, items 1152 wide)    #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.cpu_only
+def test_bcl_decode_window_bounds():
+    """One decode window: 64 heads, one-token requests over items 1152 wide
+    with compressed pages of 64 rows (the c4 layer), 176-208 rows, at most one
+    row per SM, on devices of 212 or 216 SMs."""
+    assert cake._KV4_BCL_DECODE_WINDOWS == {(1, 1152, 64): (176, 208)}
+    assert cake._KV4_BCL_DECODE_SM_COUNTS == frozenset({212, 216})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("sm_count", [148, 208, 212, 216, 232])
+def test_four_stage_launches_take_the_bcl_sibling_in_its_decode_window(
+    monkeypatch, arch, sm_count
+):
+    """Where SM107 routes the TMEM-batch sibling to a program of its own, a
+    four-stage launch of a 64-head call of one-token requests over items 1152
+    wide with compressed pages of 64 rows takes it at 176-208 rows on 212 or
+    216 SMs.  The same launch on other SM counts, at 175 or 209 rows, with
+    compressed pages of 2 rows or of an unknown size, over other widths, of
+    two-token requests or of other head counts keeps the four-stage key, and
+    SM100 and SM103 keep it."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    own = arch == "sm_107a"
+    for num_heads in (32, 64, 128):
+        for max_q_len in (1, 2):
+            for sparse_topk in (1024, 1151, 1152, 1153):
+                for page in (None, 2, 64):
+                    for tokens in (144, 160, 175, 176, 177, 192, 207, 208, 209, 256):
+                        shape = dict(
+                            num_heads=num_heads,
+                            max_q_len=max_q_len,
+                            num_query_tokens=tokens,
+                            sparse_topk=sparse_topk,
+                        )
+                        takes = (
+                            own
+                            and num_heads == 64
+                            and max_q_len == 1
+                            and sparse_topk == 1152
+                            and page == 64
+                            and 176 <= tokens <= 208
+                            and tokens <= sm_count
+                            and sm_count in (212, 216)
+                        )
+                        variant = cake._kv4_bcl_variant(
+                            _KV4_SIBLING,
+                            arch=arch,
+                            device=_DEVICE,
+                            compressed_page_size=page,
+                            **shape,
+                        )
+                        expected = _BCL_SIBLING if takes else _KV4_SIBLING
+                        assert variant == expected, (shape, page)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count,ceiling", [(208, 416), (212, 424), (216, 432)])
+@pytest.mark.parametrize("page", [None, 2, 64])
+def test_bcl_mtp_window_does_not_read_the_page_size(
+    monkeypatch, sm_count, ceiling, page
+):
+    """The MTP window (2-4 query tokens) takes the same launches whatever the
+    compressed page size, as before the decode window."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: sm_count)
+    for max_q_len in (2, 4):
+        for sparse_topk, tokens, takes in (
+            (640, 107, False),
+            (640, 108, True),
+            (768, ceiling, True),
+            (768, ceiling + 1, False),
+            (769, 120, False),
+            (1152, 192, False),
+        ):
+            variant = cake._kv4_bcl_variant(
+                _KV4_SIBLING,
+                arch="sm_107a",
+                device=_DEVICE,
+                num_heads=64,
+                max_q_len=max_q_len,
+                num_query_tokens=tokens,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page,
+            )
+            expected = _BCL_SIBLING if takes else _KV4_SIBLING
+            assert variant == expected, (max_q_len, sparse_topk, tokens)
+
+
+@pytest.mark.cpu_only
+def test_bcl_decode_window_reads_the_sm_count_last(monkeypatch):
+    """A decode-window shape reads the device's SM count only once its rows
+    are in the window and SM107 routes the sibling to a program of its own;
+    shapes outside the window never read it."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    read = []
+
+    def sm_count(device):
+        read.append(device)
+        return _SM107_SM_COUNT
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", sm_count)
+    decode = dict(num_heads=64, max_q_len=1, sparse_topk=1152)
+    for tokens, page in ((175, 64), (209, 64), (192, 2), (192, None)):
+        variant = cake._kv4_bcl_variant(
+            _KV4_SIBLING,
+            arch="sm_107a",
+            device=_DEVICE,
+            num_query_tokens=tokens,
+            compressed_page_size=page,
+            **decode,
+        )
+        assert variant == _KV4_SIBLING, (tokens, page)
+    assert read == []
+    variant = cake._kv4_bcl_variant(
+        _KV4_SIBLING,
+        arch="sm_107a",
+        device=_DEVICE,
+        num_query_tokens=192,
+        compressed_page_size=64,
+        **decode,
+    )
+    assert variant == _BCL_SIBLING
+    assert read == [_DEVICE]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("page", [64, 2, None])
+def test_fp8_h64_m64_launch_takes_the_bcl_sibling_in_its_decode_window(
+    monkeypatch, page
+):
+    """On 216 SMs the multi-tile M64 launches of a 64-head call of one-token
+    requests over items 1152 wide run the TMEM-batch sibling at 176-208 rows
+    when the launch values carry compressed pages of 64 rows, over the
+    four-stage sibling's grid and partials; launch values with pages of 2 rows
+    or without a page size, and 175 or 209 rows, run the four-stage sibling."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM107_SM_COUNT)
+    page_values = {} if page is None else {"compressed_page_size": page}
+    for tokens in (175, 176, 192, 208, 209):
+        L = _RecordingLauncher(
+            "sm_107a",
+            Q=torch.empty(0),
+            num_query_tokens=tokens,
+            num_heads=64,
+            sparse_topk=1152,
+            max_q_len=1,
+            **page_values,
+        )
+        cake._dispatch_route(_M64_MULTI_TILE_ROUTE, L)
+        window = page == 64 and 176 <= tokens <= 208
+        program = _BCL_SIBLING if window else _KV4_SIBLING
+        launch = {"grid": (tokens, 1, 1), "total_work_items": tokens}
+        assert L.calls == [(program, {**launch, **L.partials(1)})], tokens
+
+
+@pytest.mark.cpu_only
+def test_run_cake_dsv4_launches_the_bcl_sibling_in_its_decode_window(monkeypatch):
+    """run_cake_dsv4 on SM107 with the TMEM-batch sibling routed to a program
+    of its own: dense FP8/H64 one-token decode calls over items 1152 wide on
+    the multi-tile M64 route launch it at 176-208 rows with compressed pages
+    of 64 rows on 212 and 216 SMs, and the four-stage sibling at 175 and 209
+    rows, with compressed pages of 2 rows and on 208 SMs, one CTA per row
+    either way."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    monkeypatch.setattr(jit, "VARIANTS", _bcl_variants())
+    for sm_count, page, tokens, program in (
+        (216, 64, 176, _BCL_SIBLING),
+        (216, 64, 192, _BCL_SIBLING),
+        (216, 64, 208, _BCL_SIBLING),
+        (212, 64, 176, _BCL_SIBLING),
+        (212, 64, 208, _BCL_SIBLING),
+        (216, 64, 175, _KV4_SIBLING),
+        (216, 64, 209, _KV4_SIBLING),
+        (212, 64, 209, _KV4_SIBLING),
+        (216, 2, 192, _KV4_SIBLING),
+        (212, 2, 192, _KV4_SIBLING),
+        (208, 64, 192, _KV4_SIBLING),
+        (208, 64, 208, _KV4_SIBLING),
+    ):
+        shape = (sm_count, page, tokens)
+        programs, calls, _ = _run_fake_h64_decode_fp8(
+            monkeypatch,
+            arch="sm_107a",
+            width=1152,
+            tokens=tokens,
+            sm_count=sm_count,
+            page=page,
+        )
+        (bound,) = calls
+        assert programs == [program], shape
+        assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (tokens, 1, 1)
+        assert bound["total_work_items"] == bound["num_query_tokens"] == tokens
+        assert bound["max_q_len"] == 1, shape
