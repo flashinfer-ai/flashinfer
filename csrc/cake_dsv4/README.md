@@ -18,7 +18,11 @@ route instead of the lane-gather one when each request holds one query row (at
 most 2 from 256 rows) or, on calls that read a 64-row-page compressed cache
 (compress ratio 4), at most 4 query rows (at most 8 from 256 rows).
 The other BF16 / FP8 programs launch without it, and the NVFP4 family rejects
-it. The TRTLLM-GEN RopeQuant epilogue is not supported.
+it. On SM107 the FP8 low-head prefill route's `_overlap` sibling, the same work
+with the P x V MMAs started on the low half of P and the output drained per V
+block, runs on launches of at most 64 query rows (scaled down with the SM count
+below 216 SMs); routing its `VARIANTS` key to the route's program retires it.
+The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (
@@ -68,7 +72,9 @@ launch. Bindings perform no device allocation.
   (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
   `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
   `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
-  stride, free row stride.
+  stride, a 16-byte aligned start and, with more than one row, a row stride that
+  is a multiple of 4 (the kernels load index rows 16 bytes at a time; the host
+  rejects other tables).
 * Padded rows: `num_query_tokens = T` is the metadata row count; `query` / `out`
   may carry more rows, rows `>= T` are neither read nor written.
 * Workspace (contiguous, 128-byte aligned): `[0, 1024)` reserved,

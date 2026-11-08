@@ -923,6 +923,56 @@ CASES = [
         ),
         id="prefill-flat-bf16-gqa16-kmaj-fused-q13",
     ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[97],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=83,
+        ),
+        id="prefill-paged-fp8q-q1-box",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[128],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=85,
+            use_workspace=False,
+        ),
+        id="prefill-paged-fp8q-q1-box-no-workspace",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[1],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=87,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-fp8q-q1-kv1-box-graph",
+    ),
 ]
 
 
@@ -956,7 +1006,7 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def _output_dtype(q: torch.Tensor) -> torch.dtype:
-    """Uniform FP8 Q/K/V decode returns BF16; every other route returns q's dtype."""
+    """Uniform FP8 Q/K/V calls (decode, prefill) return BF16; other routes q's dtype."""
     return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
@@ -1594,10 +1644,9 @@ def _assert_matches_reference(
 
 def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
     device = _current_device()
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     seqlen_q = 8
     batch = _two_split_batch(backend, device, seqlen_q)
@@ -1620,20 +1669,29 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
 
     calls = 200
     outputs = []
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+
+    def window():
+        outputs.clear()
         for call in range(calls):
             outputs.append(run(sets[call % 2]))
-        torch.cuda.synchronize()
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (a session can lose its device records;
+    # see tests.test_helpers.cake_profiler).  When every session lost them, the
+    # outputs and counters of the last window are still checked before the
+    # launch count is skipped.
+    lost = None
+    try:
+        kernels = cuda_kernel_names(window, exclude=())
+    except pytest.skip.Exception as skipped:
+        lost = skipped
     for call, actual in enumerate(outputs):
         _assert_matches_reference(actual, expected[call % 2])
     counter = _counter_storage(backend, device)
     assert counter.numel() == backend._num_sms(device) // 2
     assert int(counter.abs().sum()) == 0, "every merge reset its counter"
-    kernels = [
-        event.name
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
+    if lost is not None:
+        raise lost
     assert len(kernels) == calls, sorted(set(kernels))
     assert len(set(kernels)) == 1, sorted(set(kernels))
 
@@ -1935,10 +1993,9 @@ def test_union_decode_capture_with_an_unwarmed_carrier_raises(monkeypatch):
 
 def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     device = _current_device()
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
     sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
@@ -1952,28 +2009,36 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     torch.cuda.synchronize()
     calls = 40
     outputs = []
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+
+    def window():
+        outputs.clear()
         for call in range(calls):
             outputs.append(run(sets[call % 2]))
-        torch.cuda.synchronize()
+
+    # Every CUDA activity of the window, read between sentinel kernels that
+    # prove the session kept it whole (tests.test_helpers.cake_profiler).  When
+    # every session lost them, the outputs and carriers of the last window are
+    # still checked before the launch count is skipped.
+    lost = None
+    try:
+        kernels = cuda_kernel_names(window, exclude=())
+    except pytest.skip.Exception as skipped:
+        lost = skipped
     for call, actual in enumerate(outputs):
         _assert_bitwise(actual, first[call % 2])
         torch.testing.assert_close(
             actual[0], expected[call % 2][0], atol=0.01, rtol=0.01
         )
         _assert_lse_close(actual[1], expected[call % 2][1])
-    kernels = [
-        event.name
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    assert len(kernels) == calls, sorted(set(kernels))
-    assert len(set(kernels)) == 1, sorted(set(kernels))
     for inputs in sets:
         key = (backend._device_index(device), int(inputs["q"].shape[0]) // 8, 8)
         cu_q, zeros = backend._decode_union_carriers_cache[key]
         assert cu_q.tolist() == [8 * i for i in range(key[1] + 1)]
         assert int(zeros.abs().sum()) == 0 and zeros.numel() == key[1] + 1
+    if lost is not None:
+        raise lost
+    assert len(kernels) == calls, sorted(set(kernels))
+    assert len(set(kernels)) == 1, sorted(set(kernels))
 
 
 def test_union_decode_carriers_created_on_one_stream_serve_another():
@@ -2001,3 +2066,213 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
     for actual in (created, reused):
         torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
         _assert_lse_close(actual[1], expected[1])
+
+
+# Uniform FP8 prefill is served on measured shapes only (one request over 64 Q
+# heads and 4 KV heads, paged causal: one query token with a one-page table,
+# and on compute capability 10.3 also 146 query tokens with a two-page table);
+# the calls just outside them -- two requests, two or 147 query tokens, a
+# two-page table for one token, a three-page table for 146 tokens, GQA 8,
+# non-causal, an explicit ``q_offset`` (the derived value, passed), flat K/V --
+# raise as every FP8-Q prefill call did before: the same exception type and
+# the same text.
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"q_lens": [1, 1], "kv_lens": [97, 97]},
+        {"q_lens": [2], "kv_lens": [97]},
+        {"kv_lens": [200]},
+        {"num_kv_heads": 8},
+        {"causal": False},
+        {"q_offset": [96]},
+        {"kv_layout": "flat_varlen"},
+        {"q_lens": [146, 146], "kv_lens": [146, 146]},
+        {"q_lens": [147], "kv_lens": [147]},
+        {"q_lens": [146], "kv_lens": [300]},
+        {"q_lens": [146], "kv_lens": [146], "num_kv_heads": 8},
+    ],
+    ids=[
+        "batch2",
+        "seqlen-q2",
+        "page-width2",
+        "gqa8",
+        "noncausal",
+        "explicit-q-offset",
+        "flat",
+        "q146-batch2",
+        "seqlen-q147",
+        "q146-page-width3",
+        "q146-gqa8",
+    ],
+)
+def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[1],
+        kv_lens=[97],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=89,
+    )
+    inputs = _make_attention_inputs({**case, **change}, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ) as declined:
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
+    assert declined.type is NotImplementedError
+
+
+# The 146-token shape is served on compute capability 10.3 only; compute
+# capability 10.0 declines it with the same exception type and text.
+def test_uniform_fp8_prefill_q146_is_declined_on_sm100():
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(device) != (10, 0):
+        pytest.skip("compute capability 10.3 serves the 146-token shape")
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[146],
+        kv_lens=[146],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=149,
+    )
+    inputs = _make_attention_inputs(case, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ):
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
+
+
+# Inside the box the program converts the E4M3 Q to BF16 in its Q ingress (an
+# exact conversion) and otherwise runs as the BF16-Q program over the same FP8
+# cache (route prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any), so every
+# output equals, bit for bit, the call on ``q.to(torch.bfloat16)``.  Q is
+# scaled by 8 (exact in E4M3) so that the logits spread (standard deviation
+# about 0.9): the reference LSE of a zero Q then lies outside the LSE
+# tolerance, so the reference check sees Q as well.  The 146-token cases run
+# on compute capability 10.3, the only target that serves that shape.
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "use_workspace", "cuda_graph", "temperature_scale", "seed"),
+    [
+        (1, 97, True, False, 0.7, 103),
+        (1, 128, False, False, 1.0, 107),
+        (1, 1, True, True, 1.0, 109),
+        (1, 128, True, True, 0.7, 113),
+        (146, 146, True, False, 0.7, 127),
+        (146, 256, False, False, 1.0, 131),
+        (146, 146, True, True, 1.0, 137),
+        (146, 200, True, True, 0.7, 139),
+    ],
+    ids=[
+        "kv97-temperature",
+        "kv128-no-workspace",
+        "kv1-graph",
+        "kv128-graph-temperature",
+        "q146-kv146-temperature",
+        "q146-kv256-no-workspace",
+        "q146-kv146-graph",
+        "q146-kv200-graph-temperature",
+    ],
+)
+def test_uniform_fp8_prefill_box_is_the_bf16_q_call_bitwise(
+    q_len, kv_len, use_workspace, cuda_graph, temperature_scale, seed
+):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_attention,
+        msa_sparse_decode_attention,
+    )
+    from flashinfer.utils import get_compute_capability
+
+    if q_len != 1 and get_compute_capability(device) != (10, 3):
+        pytest.skip("the 146-token shape is served on compute capability 10.3")
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[q_len],
+        kv_lens=[kv_len],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        return_temperature_lse=temperature_scale != 1.0,
+        lse_temperature_scale=temperature_scale,
+    )
+    inputs = _make_attention_inputs(case, device)
+    inputs["q"].copy_((inputs["q"].float() * 8.0).to(inputs["q"].dtype))
+
+    def new_workspace() -> Any:
+        if not use_workspace:
+            return None
+        return MSASparseAttentionWorkspace(device=device)
+
+    def run(call_inputs: dict[str, Any], workspace: Any) -> tuple[torch.Tensor, ...]:
+        return _invoke_attention(
+            call_inputs,
+            workspace,
+            msa_sparse_attention,
+            msa_sparse_decode_attention,
+        )
+
+    if cuda_graph:
+        # A workspace that took part in a capture is not reused eagerly.
+        captured_workspace = new_workspace()
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run(inputs, captured_workspace)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run(inputs, captured_workspace)
+        # FP8 tensors have no in-place CUDA arithmetic: perturb in float, store back.
+        inputs["q"].copy_((inputs["q"].float() * 0.5 + 0.125).to(inputs["q"].dtype))
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        actual = tuple(t.clone() for t in captured)
+    else:
+        actual = tuple(t.clone() for t in run(inputs, new_workspace()))
+    upcast = run({**inputs, "q": inputs["q"].to(torch.bfloat16)}, new_workspace())
+    torch.cuda.synchronize()
+    assert actual[0].dtype == torch.bfloat16
+    _assert_bitwise(actual, upcast)
+
+    expected = _reference_attention(inputs)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.1, rtol=0.1)
+    _assert_lse_close(actual[1], expected[1])
+    if temperature_scale != 1.0:
+        _assert_lse_close(actual[2], expected[2])
+    # the reference check sees Q: a zero Q moves the reference LSE outside
+    # the LSE tolerance
+    zero_q = (inputs["q"].float() * 0.0).to(inputs["q"].dtype)
+    blind = _reference_attention({**inputs, "q": zero_q})
+    assert not torch.allclose(blind[1], expected[1], atol=0.05, rtol=0.01)

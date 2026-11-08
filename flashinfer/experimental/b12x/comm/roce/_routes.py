@@ -18,7 +18,6 @@ link always agree on which rail it carries.
 
 from __future__ import annotations
 
-import fcntl
 import ipaddress
 import itertools
 import socket
@@ -41,6 +40,9 @@ class Endpoint:
 
 def _netmask(ifname: str) -> Optional[str]:
     """IPv4 netmask of ``ifname`` (SIOCGIFNETMASK), or None when unavailable."""
+    # Linux-only ioctl; imported here so Windows can import the module.
+    import fcntl
+
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         try:
             raw = fcntl.ioctl(

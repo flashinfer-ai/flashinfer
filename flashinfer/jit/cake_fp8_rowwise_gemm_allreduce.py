@@ -29,8 +29,13 @@ for its exact architecture together with its thin tvm-ffi launcher.
 ``COMM_MODES`` / ``FROZEN`` / ``GEOMETRY`` / ``CAPACITY_VARIANTS`` record the
 carrier per world size, the trace-time choices frozen into the generated
 programs (never knobs) and the per-architecture geometry the backend sizes its
-workspace and launch with. The tables are filled by the exporter from the
-program bundle; the loader never hashes sources or interprets argument plans.
+workspace and launch with. ``LEVER_DISPATCH`` records, per architecture, the
+per-call choice among the programs of one route: a call whose shape meets a
+lever's condition runs the program of the route key extended by the lever's
+suffix (``call_program``); every such program computes the same result as the
+route's program and only schedules it differently. The tables are filled by the
+exporter from the program bundle; the loader never hashes sources or interprets
+argument plans.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from .core import (
     gen_jit_spec,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm90a_nvcc_flags,
 )
 
 # Filled mechanically from the program bundle.
@@ -76,6 +82,90 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_n",
             "pair_tiles",
             "K_tiles",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
             "C",
             "C_cap",
             "S_bytes",
@@ -174,8 +264,102 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
     },
+    "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 225376,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 225376,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
 }
 ROUTES: dict[str, dict[str, str]] = {
+    "sm_90a": {
+        "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws2_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+        "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws4_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+        "main_ws8_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws8_p2p_g4": "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa",
+        "main_ws8_p2p_g4_r6": "cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6",
+        "main_ws8_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+    },
     "sm_100a": {
         "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
         "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
@@ -190,11 +374,24 @@ ROUTES: dict[str, dict[str, str]] = {
 COMPILE_FLAGS: list[str] = []
 # Per architecture: the exchange carrier of each delivered world size.
 COMM_MODES: dict[str, dict[int, str]] = {
+    "sm_90a": {2: "p2p", 4: "p2p", 8: "p2p"},
     "sm_100a": {2: "p2p", 4: "p2p", 8: "nvls"},
     "sm_103a": {2: "p2p", 4: "p2p", 8: "nvls"},
 }
 # Frozen trace-time choices per architecture and carrier (documentation, never knobs).
 FROZEN: dict[str, dict[str, dict[str, Any]]] = {
+    "sm_90a": {
+        "p2p": {
+            "bc_release": "release",
+            "chunk_groups": 8,
+            "layout": "wg4",
+            "num_stages": 5,
+            "promote_k32_steps": 4,
+            "timeout_cycles_log2": 34,
+            "transport": "pull",
+            "wgmma_inflight_groups": 2,
+        },
+    },
     "sm_100a": {
         "nvls": {"g1_sched": "static", "num_stages": 4, "timeout_cycles_log2": 34},
         "p2p": {
@@ -218,6 +415,31 @@ FROZEN: dict[str, dict[str, dict[str, Any]]] = {
 }
 # Tile geometry, control-word layout and grid rule per architecture (mirrors the Cake export adapter).
 GEOMETRY: dict[str, dict[str, Any]] = {
+    "sm_90a": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "CHUNK_ROWS": 128,
+        "CLUSTER_DIMS": [1, 1, 1],
+        "OUT_BYTES": 2,
+        "TILE_BYTES": 32768,
+        "FLAG_WORD_BYTES_PER_CHUNK": 8,
+        "MAX_CTAS": 1024,
+        "CTL_EXTRA_WORDS": 2,
+        "CTL_STEAL_WORDS": False,
+        "CTL_SCHED_WORDS": False,
+        "S_ROWS_OWNED_ONLY_UNDER_PULL": True,
+        "GRID_RULE": "persistent_sm_count",
+        "TILE_ARG": "tiles",
+        "MAX_DYNAMIC_SMEM_BYTES": 232448,
+        "THREADS": {"p2p": 512, "nvls": 384},
+        "RASTER_SM_COUNT": 132,
+        "RASTER_L2_BYTES": 52428800,
+        "RASTER_GROUP_CHOICES": [1, 2, 4, 8, 16, 32],
+        "RASTER_MIN_GRID_N": 16,
+        "RASTER_MIN_K": 4096,
+        "RASTER_MIN_CHUNKS": 4,
+    },
     "sm_100a": {
         "BLOCK_M": 128,
         "BLOCK_N": 256,
@@ -261,25 +483,57 @@ GEOMETRY: dict[str, dict[str, Any]] = {
 }
 # Per architecture: ``[world_size, rows_capacity, suffix]`` rows naming the program variant a
 # prepared capacity of exactly ``rows_capacity`` rows selects (empty when every capacity shares one program).
-CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {"sm_100a": [], "sm_103a": []}
+CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {
+    "sm_90a": [[8, 4096, "_g4"]],
+    "sm_100a": [],
+    "sm_103a": [],
+}
+# Per architecture: the levers a call may switch on (empty when every route runs one program).
+# ``REDUCERS``: route suffix and the largest ``K_l`` per world size of the program with more
+# reducer warps (it also needs ``K_l * world_size <= N`` and, for a world size in
+# ``mn_limit``, ``M * N`` below that limit). ``LOCKSTEP``: route suffix, the
+# smallest raster group and the smallest tile count of the program that throttles its
+# producers to the grid's progress. Both suffixes apply in that order; an absent lever is
+# never selected.
+LEVER_DISPATCH: dict[str, dict[str, Any]] = {
+    "sm_90a": {
+        "REDUCERS": {
+            "suffix": "_r6",
+            "max_k_l": {2: 4096, 4: 1536, 8: 1536},
+            "mn_limit": {2: 1073741824},
+        },
+    },
+    "sm_100a": {},
+    "sm_103a": {},
+}
 # Exact-architecture compile flags (``flashinfer.jit.core``) and the capability -> architecture table.
 ARCH_FLAGS: dict[str, list[str]] = {
+    "sm_90a": sm90a_nvcc_flags,
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
 }
 CAPABILITY_ARCH: dict[tuple[int, int], str] = {
+    (9, 0): "sm_90a",
     (10, 0): "sm_100a",
     (10, 3): "sm_103a",
 }
 SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
 
 SOURCE_PACKAGE = "cake_fp8_rowwise_gemm_allreduce"
+# Family directories of the package: their programs and the headers they include.
+SOURCE_DIRECTORIES: tuple[str, ...] = ("hopper",)
 EXCHANGE_MODE = "X16"
 # One chunk is 128 rows on every architecture; the column tile is per architecture (``GEOMETRY[arch]["BLOCK_N"]``).
 BLOCK_M = 128
 BLOCK_K = 128
 OUT_BYTES = 2
 MAX_ROWS_TIMES_COLS = 1 << 30
+# The column multiple of the operand contract on every architecture (the
+# sm_90a tile is 128 wide, but only multiples of 256 are delivered).
+N_MULTIPLE = 256
+# Reducer/drainer vector indices are 32-bit: 16 * N plus the drainer's
+# 8 * 64 * MAX_CTAS stride overshoot must stay below 2**31.
+MAX_COLS = (1 << 27) - (1 << 15)
 GRID_RULE_CLUSTER_PAIRS = "persistent_cluster_pairs"
 GRID_RULE_SM_COUNT = "persistent_sm_count"
 
@@ -465,12 +719,18 @@ def ctl_words(c_cap: int, arch: str) -> int:
 
 
 def validate_shape(m: int, n: int, k_l: int, arch: str) -> tuple[int, int, int]:
-    """``M >= 1``, ``N % BLOCK_N == 0``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
+    """``M >= 1``, ``N % 256 == 0``, ``N <= MAX_COLS``, ``K_l % 128 == 0``, ``M * N <= 2**30``."""
 
     m, n, k_l = int(m), int(n), int(k_l)
     if m <= 0:
         raise ValueError(f"M must be positive, got {m}")
     grid_n(n, arch)
+    if n % N_MULTIPLE:
+        raise ValueError(f"N must be a positive multiple of {N_MULTIPLE}, got {n}")
+    if n > MAX_COLS:
+        raise ValueError(
+            f"N = {n} exceeds {MAX_COLS} (32-bit reducer/drainer vector index)"
+        )
     if k_l <= 0 or k_l % BLOCK_K:
         raise ValueError(f"K_l must be a positive multiple of {BLOCK_K}, got {k_l}")
     if m * n > MAX_ROWS_TIMES_COLS:
@@ -538,6 +798,120 @@ def raster_group_m(m: int, n: int, k_l: int, arch: str) -> int:
     return fits[0] if fits else min(candidates, key=live)
 
 
+def lever_suffixes(arch: str) -> tuple[str, ...]:
+    """Every lever suffix a call on ``arch`` can select, ``""`` (no lever) first."""
+
+    table = LEVER_DISPATCH.get(arch, {})
+    suffixes = [""]
+    for lever in ("REDUCERS", "LOCKSTEP"):
+        if lever in table:
+            suffix = str(table[lever]["suffix"])
+            suffixes += [item + suffix for item in suffixes]
+    return tuple(suffixes)
+
+
+def lever_variant(
+    world_size: int, m: int, n: int, k_l: int, arch: str, *, sm_count: int
+) -> str:
+    """The lever suffix of one call on ``arch`` (empty: the route's program).
+
+    Reducers: ``K_l`` at most the world size's bound, ``K_l * world_size <= N`` and
+    ``M * N`` below the world size's ``mn_limit`` (when it has one).
+    Lockstep: a raster group of at least ``min_raster_group``, at least ``min_tiles``
+    tiles and a grid below ``MAX_CTAS`` (the throttle counts in the last arrival word).
+    """
+
+    table = LEVER_DISPATCH.get(arch, {})
+    world_size, m, n, k_l = int(world_size), int(m), int(n), int(k_l)
+    suffix = ""
+    reducers = table.get("REDUCERS")
+    bound = None if reducers is None else reducers["max_k_l"].get(world_size)
+    limit = None if reducers is None else reducers.get("mn_limit", {}).get(world_size)
+    if (
+        bound is not None
+        and k_l <= int(bound)
+        and k_l * world_size <= n
+        and (limit is None or m * n < int(limit))
+    ):
+        suffix += str(reducers["suffix"])
+    lockstep = table.get("LOCKSTEP")
+    if (
+        lockstep is not None
+        and 0 < int(sm_count) < int(geometry(arch)["MAX_CTAS"])
+        and raster_group_m(m, n, k_l, arch) >= int(lockstep["min_raster_group"])
+        and tiles(m, n, arch) >= int(lockstep["min_tiles"])
+    ):
+        suffix += str(lockstep["suffix"])
+    return suffix
+
+
+def call_program(
+    world_size: int,
+    arch: str,
+    max_rows: int,
+    m: int,
+    n: int,
+    k_l: int,
+    *,
+    sm_count: int,
+) -> str:
+    """The program one call of ``(m, n, k_l)`` runs in a workspace of ``max_rows`` rows."""
+
+    key = route_key(world_size, arch, max_rows) + lever_variant(
+        world_size, m, n, k_l, arch, sm_count=sm_count
+    )
+    table = ROUTES.get(arch, {})
+    if key not in table:
+        raise ValueError(
+            f"no fused FP8 GEMM + all-reduce program is delivered for {key!r} on {arch} "
+            f"(world_size={int(world_size)}; delivered: {sorted(table)})"
+        )
+    return table[key]
+
+
+def dispatch_programs(
+    world_size: int,
+    arch: str,
+    max_rows: int,
+    n: int,
+    k_l: int | None = None,
+    *,
+    sm_count: int,
+) -> tuple[str, ...]:
+    """Every program a workspace of ``max_rows`` rows can dispatch, its main program first.
+
+    With ``k_l`` (a prepared launcher binds ``N`` and ``K_l``): the programs of the calls of
+    1 to ``chunk_capacity(max_rows)`` chunks, each at its first and its last row count (a
+    call's lever depends on ``M`` through its chunk count and the reducers' ``M * N``
+    limit, which a chunk's two ends bracket). Without ``k_l`` (the one-shot workspace
+    serves any ``K_l``): every program of the route's lever keys. On an architecture
+    without levers every call runs the main program, so no chunk is enumerated.
+    """
+
+    main = main_program(world_size, arch, max_rows)
+    if not LEVER_DISPATCH.get(arch):
+        return (main,)
+    base = route_key(world_size, arch, max_rows)
+    table = ROUTES.get(arch, {})
+    if k_l is None:
+        found = [table[base + s] for s in lever_suffixes(arch) if base + s in table]
+    else:
+        found = [
+            call_program(
+                world_size,
+                arch,
+                max_rows,
+                m,
+                n,
+                k_l,
+                sm_count=sm_count,
+            )
+            for chunks in range(1, chunk_capacity(max_rows) + 1)
+            for m in ((chunks - 1) * BLOCK_M + 1, chunks * BLOCK_M)
+        ]
+    return tuple(dict.fromkeys([main, *found]))
+
+
 def launch_grid(
     m: int, n: int, arch: str, *, max_clusters: int = 0, sm_count: int = 0
 ) -> tuple[int, int, int]:
@@ -576,11 +950,12 @@ def _source_dir() -> Path:
 
 def _source_path(relative: str) -> Path:
     parts = Path(relative).parts
-    if parts[:2] != ("csrc", SOURCE_PACKAGE) or len(parts) != 3:
+    nested = len(parts) == 4 and parts[2] in SOURCE_DIRECTORIES
+    if parts[:2] != ("csrc", SOURCE_PACKAGE) or not (len(parts) == 3 or nested):
         raise ValueError(
             f"exported source path is outside the fused FP8 GEMM + all-reduce package: {relative!r}"
         )
-    return _source_dir() / parts[2]
+    return _source_dir().joinpath(*parts[2:])
 
 
 @functools.cache
@@ -719,7 +1094,10 @@ __all__ = [
     "GEOMETRY",
     "GRID_RULE_CLUSTER_PAIRS",
     "GRID_RULE_SM_COUNT",
+    "LEVER_DISPATCH",
+    "MAX_COLS",
     "MAX_ROWS_TIMES_COLS",
+    "N_MULTIPLE",
     "OUT_BYTES",
     "PROGRAMS",
     "ROUTES",
@@ -727,6 +1105,7 @@ __all__ = [
     "SUPPORTED_WORLD_SIZES",
     "DeviceFacts",
     "block_n",
+    "call_program",
     "ceil128",
     "chunk_capacity",
     "chunk_count",
@@ -735,6 +1114,7 @@ __all__ = [
     "comm_mode",
     "ctl_words",
     "device_facts",
+    "dispatch_programs",
     "dynamic_smem_bytes",
     "flag_bytes",
     "flag_words",
@@ -743,6 +1123,8 @@ __all__ = [
     "launch_block",
     "launch_grid",
     "launcher_args",
+    "lever_suffixes",
+    "lever_variant",
     "load",
     "main_program",
     "program_variant",
