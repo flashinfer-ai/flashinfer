@@ -155,6 +155,7 @@ CONSTANTS: Dict[str, float] = dict(
     absorb=0.2,  # the fraction of the body's time during which refetched bytes stream without a stall
     step_floor=32.0,  # cycles per k-step no tile can beat
     fixup_floor=8000.0,  # cycles of the workspace split's fixup launch
+    fold_rate=10.0,  # bytes per cycle at which the in-cluster fold takes a partner CTA's fp32 partial tile through distributed shared memory, its barrier included
     raster_pow=0.05,  # the wrong raster: (tile-count imbalance) ** raster_pow
     raster_min=2.0,  # ... once the tile-count imbalance reaches this ratio
     overrun_pow=0.65,  # a swizzle group larger than its axis: (swizzle / tiles) ** overrun_pow
@@ -298,7 +299,9 @@ def estimate_cycles(
     pad_m = -(-ctas_m // cm) * cm
     pad_n = -(-n_tiles // cn) * cn
     clusters = pad_m * pad_n // (cm * cn) * items
-    size = cm * cn
+    # the in-cluster split record puts its `cluster_k` chunk CTAs in one cluster per tile: the cluster the hardware
+    # co-schedules is that many times the (M, N) cluster, and every CTA of it streams its own K slice
+    size = cm * cn * k.cluster_k
     capacity = cap.get(size) or max(1, sms // size)
     waves = -(-clusters // capacity)
     ksteps = max(1.0, (K / (chunks if (ws or k.cluster_k > 1) else 1)) / kk)
@@ -326,7 +329,7 @@ def estimate_cycles(
         max(mma_cycles, (a_bytes + b_bytes) / part.load_bytes_per_clk) + p["step_floor"]
     )
     body = waves * ksteps * step
-    active = ctas_m * n_tiles * items
+    active = ctas_m * n_tiles * items * k.cluster_k
     l2_total = (
         active
         * ksteps
@@ -335,6 +338,9 @@ def estimate_cycles(
     )
     body = max(body, l2_total)
     epi = waves * rows * tn * (4.0 if ws else out_bytes) / part.load_bytes_per_clk
+    if k.cluster_k > 1:
+        # the in-cluster fold: the owning CTA of every tile reads the other chunks' fp32 partial tiles from its partners
+        epi += waves * (k.cluster_k - 1) * rows * tn * 4.0 / p["fold_rate"]
     fix = (
         (M * N * (chunks * 4.0 + out_bytes)) / (part.hbm_bytes_per_clk * sms)
         + p["fixup_floor"]
