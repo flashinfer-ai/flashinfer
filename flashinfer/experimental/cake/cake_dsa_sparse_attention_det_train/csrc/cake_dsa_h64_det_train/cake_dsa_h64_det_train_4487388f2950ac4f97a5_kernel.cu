@@ -1253,8 +1253,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     roff_r = crow * dkr_stride + dkr_col0;
                 }
                 unsigned int vmask = __ballot_sync(0xFFFFFFFF, row >= 0);
-                int _find_first_set_0 = __ffs((int)vmask);
-                int first = _find_first_set_0 - 1 & 31;
+                unsigned int thr_w = 0;
+                unsigned int thr_l = 4294967295u;
+                if (row >= 0) {
+                    thr_l = thr;
+                }
+                unsigned int _warp_redux_0;
+                asm volatile("redux.sync.min.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_0) : "r"(thr_l));
+                thr_w = _warp_redux_0;
+                int _find_first_set_1 = __ffs((int)vmask);
+                int first = _find_first_set_1 - 1 & 31;
                 int roff_v = __shfl_sync(0xFFFFFFFF, roff, first);
                 int roff_rv = __shfl_sync(0xFFFFFFFF, roff_r, first);
                 if (row < 0) {
@@ -1314,144 +1322,145 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     float yr_0 = rk[0] * scale_c_0;
                     int nr_0 = __float2int_rn(yr_0);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_0 + rope_col)))), "r"(static_cast<int>(nr_0)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_1;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_1) : "f"(yr_0));
-                    rk[0] = _abs_1;
+                    float _abs_2;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_2) : "f"(yr_0));
+                    rk[0] = _abs_2;
                     int src_c_1 = rope_hi + 1;
                     int rr_1 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_1);
                     float scale_c_1 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_1);
                     float yr_1 = rk[1] * scale_c_1;
                     int nr_1 = __float2int_rn(yr_1);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_1 + rope_col)))), "r"(static_cast<int>(nr_1)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_2;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_2) : "f"(yr_1));
-                    rk[1] = _abs_2;
+                    float _abs_3;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_3) : "f"(yr_1));
+                    rk[1] = _abs_3;
                     int src_c_2 = rope_hi + 2;
                     int rr_2 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_2);
                     float scale_c_2 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_2);
                     float yr_2 = rk[2] * scale_c_2;
                     int nr_2 = __float2int_rn(yr_2);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_2 + rope_col)))), "r"(static_cast<int>(nr_2)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_3;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_3) : "f"(yr_2));
-                    rk[2] = _abs_3;
+                    float _abs_4;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_4) : "f"(yr_2));
+                    rk[2] = _abs_4;
                     int src_c_3 = rope_hi + 3;
                     int rr_3 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_3);
                     float scale_c_3 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_3);
                     float yr_3 = rk[3] * scale_c_3;
                     int nr_3 = __float2int_rn(yr_3);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_3 + rope_col)))), "r"(static_cast<int>(nr_3)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_4;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_4) : "f"(yr_3));
-                    rk[3] = _abs_4;
+                    float _abs_5;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_5) : "f"(yr_3));
+                    rk[3] = _abs_5;
                     int src_c_4 = rope_hi + 4;
                     int rr_4 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_4);
                     float scale_c_4 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_4);
                     float yr_4 = rk[4] * scale_c_4;
                     int nr_4 = __float2int_rn(yr_4);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_4 + rope_col)))), "r"(static_cast<int>(nr_4)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_5;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_5) : "f"(yr_4));
-                    rk[4] = _abs_5;
+                    float _abs_6;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_6) : "f"(yr_4));
+                    rk[4] = _abs_6;
                     int src_c_5 = rope_hi + 5;
                     int rr_5 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_5);
                     float scale_c_5 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_5);
                     float yr_5 = rk[5] * scale_c_5;
                     int nr_5 = __float2int_rn(yr_5);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_5 + rope_col)))), "r"(static_cast<int>(nr_5)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_6;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_6) : "f"(yr_5));
-                    rk[5] = _abs_6;
+                    float _abs_7;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_7) : "f"(yr_5));
+                    rk[5] = _abs_7;
                     int src_c_6 = rope_hi + 6;
                     int rr_6 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_6);
                     float scale_c_6 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_6);
                     float yr_6 = rk[6] * scale_c_6;
                     int nr_6 = __float2int_rn(yr_6);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_6 + rope_col)))), "r"(static_cast<int>(nr_6)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_7;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_7) : "f"(yr_6));
-                    rk[6] = _abs_7;
+                    float _abs_8;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_8) : "f"(yr_6));
+                    rk[6] = _abs_8;
                     int src_c_7 = rope_hi + 7;
                     int rr_7 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_7);
                     float scale_c_7 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_7);
                     float yr_7 = rk[7] * scale_c_7;
                     int nr_7 = __float2int_rn(yr_7);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_7 + rope_col)))), "r"(static_cast<int>(nr_7)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_8;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_8) : "f"(yr_7));
-                    rk[7] = _abs_8;
+                    float _abs_9;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_9) : "f"(yr_7));
+                    rk[7] = _abs_9;
                     int src_c_8 = rope_hi + 8;
                     int rr_8 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_8);
                     float scale_c_8 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_8);
                     float yr_8 = rk[8] * scale_c_8;
                     int nr_8 = __float2int_rn(yr_8);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_8 + rope_col)))), "r"(static_cast<int>(nr_8)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_9;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_9) : "f"(yr_8));
-                    rk[8] = _abs_9;
+                    float _abs_10;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_10) : "f"(yr_8));
+                    rk[8] = _abs_10;
                     int src_c_9 = rope_hi + 9;
                     int rr_9 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_9);
                     float scale_c_9 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_9);
                     float yr_9 = rk[9] * scale_c_9;
                     int nr_9 = __float2int_rn(yr_9);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_9 + rope_col)))), "r"(static_cast<int>(nr_9)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_10;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_10) : "f"(yr_9));
-                    rk[9] = _abs_10;
+                    float _abs_11;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_11) : "f"(yr_9));
+                    rk[9] = _abs_11;
                     int src_c_10 = rope_hi + 10;
                     int rr_10 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_10);
                     float scale_c_10 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_10);
                     float yr_10 = rk[10] * scale_c_10;
                     int nr_10 = __float2int_rn(yr_10);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_10 + rope_col)))), "r"(static_cast<int>(nr_10)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_11;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_11) : "f"(yr_10));
-                    rk[10] = _abs_11;
+                    float _abs_12;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_12) : "f"(yr_10));
+                    rk[10] = _abs_12;
                     int src_c_11 = rope_hi + 11;
                     int rr_11 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_11);
                     float scale_c_11 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_11);
                     float yr_11 = rk[11] * scale_c_11;
                     int nr_11 = __float2int_rn(yr_11);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_11 + rope_col)))), "r"(static_cast<int>(nr_11)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_12;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_12) : "f"(yr_11));
-                    rk[11] = _abs_12;
+                    float _abs_13;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_13) : "f"(yr_11));
+                    rk[11] = _abs_13;
                     int src_c_12 = rope_hi + 12;
                     int rr_12 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_12);
                     float scale_c_12 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_12);
                     float yr_12 = rk[12] * scale_c_12;
                     int nr_12 = __float2int_rn(yr_12);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_12 + rope_col)))), "r"(static_cast<int>(nr_12)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_13;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_13) : "f"(yr_12));
-                    rk[12] = _abs_13;
+                    float _abs_14;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_14) : "f"(yr_12));
+                    rk[12] = _abs_14;
                     int src_c_13 = rope_hi + 13;
                     int rr_13 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_13);
                     float scale_c_13 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_13);
                     float yr_13 = rk[13] * scale_c_13;
                     int nr_13 = __float2int_rn(yr_13);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_13 + rope_col)))), "r"(static_cast<int>(nr_13)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_14;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_14) : "f"(yr_13));
-                    rk[13] = _abs_14;
+                    float _abs_15;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_15) : "f"(yr_13));
+                    rk[13] = _abs_15;
                     int src_c_14 = rope_hi + 14;
                     int rr_14 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_14);
                     float scale_c_14 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_14);
                     float yr_14 = rk[14] * scale_c_14;
                     int nr_14 = __float2int_rn(yr_14);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_14 + rope_col)))), "r"(static_cast<int>(nr_14)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_15;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_15) : "f"(yr_14));
-                    rk[14] = _abs_15;
+                    float _abs_16;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_16) : "f"(yr_14));
+                    rk[14] = _abs_16;
                     int src_c_15 = rope_hi + 15;
                     int rr_15 = __shfl_sync(0xFFFFFFFF, roff_r, src_c_15);
                     float scale_c_15 = __shfl_sync(0xFFFFFFFF, s_rope, src_c_15);
                     float yr_15 = rk[15] * scale_c_15;
                     int nr_15 = __float2int_rn(yr_15);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkr_acc) + ((long long)(rr_15 + rope_col)))), "r"(static_cast<int>(nr_15)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_16;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_16) : "f"(yr_15));
-                    rk[15] = _abs_16;
+                    float _abs_17;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_17) : "f"(yr_15));
+                    rk[15] = _abs_17;
+                    float lm = 0.0f;
                     int rj_0 = __shfl_sync(0xFFFFFFFF, roff, 0);
                     float scale_j_0 = __shfl_sync(0xFFFFFFFF, s_lat, 0);
                     long long idx_j_0 = (long long)(rj_0 + lat_col);
@@ -1461,21 +1470,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_0 = __float2int_rn(y1_0);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_0))), "r"(static_cast<int>(n0_0)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_0 + 128ll))), "r"(static_cast<int>(n1_0)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_17;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_17) : "f"(y0_0));
                     float _abs_18;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_18) : "f"(y1_0));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_18) : "f"(y0_0));
+                    float _abs_19;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_19) : "f"(y1_0));
                     float m2_0;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_0) : "f"(_abs_17), "f"(_abs_18));
-                    float _max_19;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_19) : "f"(m2_0), "f"(((lane_0_1 < 16) ? rk[0] : 0.0f)));
-                    m2_0 = _max_19;
-                    unsigned int m_j_0;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_0) : "r"(__as_u32(m2_0)));
-                    if (lane_0_1 == 0) {
-                        unsigned int _max_20 = ((mx) > (m_j_0) ? (mx) : (m_j_0));
-                        mx = _max_20;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_0) : "f"(_abs_18), "f"(_abs_19));
+                    float _max_20;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_20) : "f"(m2_0), "f"(((lane_0_1 < 16) ? rk[0] : 0.0f)));
+                    m2_0 = _max_20;
+                    a0[0] = m2_0;
+                    float _max_21;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_21) : "f"(lm), "f"(m2_0));
+                    lm = _max_21;
                     int rj_1 = __shfl_sync(0xFFFFFFFF, roff, 1);
                     float scale_j_1 = __shfl_sync(0xFFFFFFFF, s_lat, 1);
                     long long idx_j_1 = (long long)(rj_1 + lat_col);
@@ -1485,21 +1492,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_1 = __float2int_rn(y1_1);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_1))), "r"(static_cast<int>(n0_1)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_1 + 128ll))), "r"(static_cast<int>(n1_1)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_21;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_21) : "f"(y0_1));
                     float _abs_22;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_22) : "f"(y1_1));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_22) : "f"(y0_1));
+                    float _abs_23;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_23) : "f"(y1_1));
                     float m2_1;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_1) : "f"(_abs_21), "f"(_abs_22));
-                    float _max_23;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_23) : "f"(m2_1), "f"(((lane_0_1 < 16) ? rk[1] : 0.0f)));
-                    m2_1 = _max_23;
-                    unsigned int m_j_1;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_1) : "r"(__as_u32(m2_1)));
-                    if (lane_0_1 == 1) {
-                        unsigned int _max_24 = ((mx) > (m_j_1) ? (mx) : (m_j_1));
-                        mx = _max_24;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_1) : "f"(_abs_22), "f"(_abs_23));
+                    float _max_24;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_24) : "f"(m2_1), "f"(((lane_0_1 < 16) ? rk[1] : 0.0f)));
+                    m2_1 = _max_24;
+                    a0[1] = m2_1;
+                    float _max_25;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_25) : "f"(lm), "f"(m2_1));
+                    lm = _max_25;
                     int rj_2 = __shfl_sync(0xFFFFFFFF, roff, 2);
                     float scale_j_2 = __shfl_sync(0xFFFFFFFF, s_lat, 2);
                     long long idx_j_2 = (long long)(rj_2 + lat_col);
@@ -1509,21 +1514,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_2 = __float2int_rn(y1_2);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_2))), "r"(static_cast<int>(n0_2)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_2 + 128ll))), "r"(static_cast<int>(n1_2)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_25;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_25) : "f"(y0_2));
                     float _abs_26;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_26) : "f"(y1_2));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_26) : "f"(y0_2));
+                    float _abs_27;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_27) : "f"(y1_2));
                     float m2_2;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_2) : "f"(_abs_25), "f"(_abs_26));
-                    float _max_27;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_27) : "f"(m2_2), "f"(((lane_0_1 < 16) ? rk[2] : 0.0f)));
-                    m2_2 = _max_27;
-                    unsigned int m_j_2;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_2) : "r"(__as_u32(m2_2)));
-                    if (lane_0_1 == 2) {
-                        unsigned int _max_28 = ((mx) > (m_j_2) ? (mx) : (m_j_2));
-                        mx = _max_28;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_2) : "f"(_abs_26), "f"(_abs_27));
+                    float _max_28;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_28) : "f"(m2_2), "f"(((lane_0_1 < 16) ? rk[2] : 0.0f)));
+                    m2_2 = _max_28;
+                    a0[2] = m2_2;
+                    float _max_29;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_29) : "f"(lm), "f"(m2_2));
+                    lm = _max_29;
                     int rj_3 = __shfl_sync(0xFFFFFFFF, roff, 3);
                     float scale_j_3 = __shfl_sync(0xFFFFFFFF, s_lat, 3);
                     long long idx_j_3 = (long long)(rj_3 + lat_col);
@@ -1533,21 +1536,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_3 = __float2int_rn(y1_3);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_3))), "r"(static_cast<int>(n0_3)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_3 + 128ll))), "r"(static_cast<int>(n1_3)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_29;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_29) : "f"(y0_3));
                     float _abs_30;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_30) : "f"(y1_3));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_30) : "f"(y0_3));
+                    float _abs_31;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_31) : "f"(y1_3));
                     float m2_3;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_3) : "f"(_abs_29), "f"(_abs_30));
-                    float _max_31;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_31) : "f"(m2_3), "f"(((lane_0_1 < 16) ? rk[3] : 0.0f)));
-                    m2_3 = _max_31;
-                    unsigned int m_j_3;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_3) : "r"(__as_u32(m2_3)));
-                    if (lane_0_1 == 3) {
-                        unsigned int _max_32 = ((mx) > (m_j_3) ? (mx) : (m_j_3));
-                        mx = _max_32;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_3) : "f"(_abs_30), "f"(_abs_31));
+                    float _max_32;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_32) : "f"(m2_3), "f"(((lane_0_1 < 16) ? rk[3] : 0.0f)));
+                    m2_3 = _max_32;
+                    a0[3] = m2_3;
+                    float _max_33;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_33) : "f"(lm), "f"(m2_3));
+                    lm = _max_33;
                     int rj_4 = __shfl_sync(0xFFFFFFFF, roff, 4);
                     float scale_j_4 = __shfl_sync(0xFFFFFFFF, s_lat, 4);
                     long long idx_j_4 = (long long)(rj_4 + lat_col);
@@ -1557,21 +1558,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_4 = __float2int_rn(y1_4);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_4))), "r"(static_cast<int>(n0_4)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_4 + 128ll))), "r"(static_cast<int>(n1_4)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_33;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_33) : "f"(y0_4));
                     float _abs_34;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_34) : "f"(y1_4));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_34) : "f"(y0_4));
+                    float _abs_35;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_35) : "f"(y1_4));
                     float m2_4;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_4) : "f"(_abs_33), "f"(_abs_34));
-                    float _max_35;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_35) : "f"(m2_4), "f"(((lane_0_1 < 16) ? rk[4] : 0.0f)));
-                    m2_4 = _max_35;
-                    unsigned int m_j_4;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_4) : "r"(__as_u32(m2_4)));
-                    if (lane_0_1 == 4) {
-                        unsigned int _max_36 = ((mx) > (m_j_4) ? (mx) : (m_j_4));
-                        mx = _max_36;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_4) : "f"(_abs_34), "f"(_abs_35));
+                    float _max_36;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_36) : "f"(m2_4), "f"(((lane_0_1 < 16) ? rk[4] : 0.0f)));
+                    m2_4 = _max_36;
+                    a0[4] = m2_4;
+                    float _max_37;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_37) : "f"(lm), "f"(m2_4));
+                    lm = _max_37;
                     int rj_5 = __shfl_sync(0xFFFFFFFF, roff, 5);
                     float scale_j_5 = __shfl_sync(0xFFFFFFFF, s_lat, 5);
                     long long idx_j_5 = (long long)(rj_5 + lat_col);
@@ -1581,21 +1580,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_5 = __float2int_rn(y1_5);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_5))), "r"(static_cast<int>(n0_5)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_5 + 128ll))), "r"(static_cast<int>(n1_5)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_37;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_37) : "f"(y0_5));
                     float _abs_38;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_38) : "f"(y1_5));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_38) : "f"(y0_5));
+                    float _abs_39;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_39) : "f"(y1_5));
                     float m2_5;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_5) : "f"(_abs_37), "f"(_abs_38));
-                    float _max_39;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_39) : "f"(m2_5), "f"(((lane_0_1 < 16) ? rk[5] : 0.0f)));
-                    m2_5 = _max_39;
-                    unsigned int m_j_5;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_5) : "r"(__as_u32(m2_5)));
-                    if (lane_0_1 == 5) {
-                        unsigned int _max_40 = ((mx) > (m_j_5) ? (mx) : (m_j_5));
-                        mx = _max_40;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_5) : "f"(_abs_38), "f"(_abs_39));
+                    float _max_40;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_40) : "f"(m2_5), "f"(((lane_0_1 < 16) ? rk[5] : 0.0f)));
+                    m2_5 = _max_40;
+                    a0[5] = m2_5;
+                    float _max_41;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_41) : "f"(lm), "f"(m2_5));
+                    lm = _max_41;
                     int rj_6 = __shfl_sync(0xFFFFFFFF, roff, 6);
                     float scale_j_6 = __shfl_sync(0xFFFFFFFF, s_lat, 6);
                     long long idx_j_6 = (long long)(rj_6 + lat_col);
@@ -1605,21 +1602,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_6 = __float2int_rn(y1_6);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_6))), "r"(static_cast<int>(n0_6)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_6 + 128ll))), "r"(static_cast<int>(n1_6)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_41;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_41) : "f"(y0_6));
                     float _abs_42;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_42) : "f"(y1_6));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_42) : "f"(y0_6));
+                    float _abs_43;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_43) : "f"(y1_6));
                     float m2_6;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_6) : "f"(_abs_41), "f"(_abs_42));
-                    float _max_43;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_43) : "f"(m2_6), "f"(((lane_0_1 < 16) ? rk[6] : 0.0f)));
-                    m2_6 = _max_43;
-                    unsigned int m_j_6;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_6) : "r"(__as_u32(m2_6)));
-                    if (lane_0_1 == 6) {
-                        unsigned int _max_44 = ((mx) > (m_j_6) ? (mx) : (m_j_6));
-                        mx = _max_44;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_6) : "f"(_abs_42), "f"(_abs_43));
+                    float _max_44;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_44) : "f"(m2_6), "f"(((lane_0_1 < 16) ? rk[6] : 0.0f)));
+                    m2_6 = _max_44;
+                    a0[6] = m2_6;
+                    float _max_45;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_45) : "f"(lm), "f"(m2_6));
+                    lm = _max_45;
                     int rj_7 = __shfl_sync(0xFFFFFFFF, roff, 7);
                     float scale_j_7 = __shfl_sync(0xFFFFFFFF, s_lat, 7);
                     long long idx_j_7 = (long long)(rj_7 + lat_col);
@@ -1629,21 +1624,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_7 = __float2int_rn(y1_7);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_7))), "r"(static_cast<int>(n0_7)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_7 + 128ll))), "r"(static_cast<int>(n1_7)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_45;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_45) : "f"(y0_7));
                     float _abs_46;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_46) : "f"(y1_7));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_46) : "f"(y0_7));
+                    float _abs_47;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_47) : "f"(y1_7));
                     float m2_7;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_7) : "f"(_abs_45), "f"(_abs_46));
-                    float _max_47;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_47) : "f"(m2_7), "f"(((lane_0_1 < 16) ? rk[7] : 0.0f)));
-                    m2_7 = _max_47;
-                    unsigned int m_j_7;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_7) : "r"(__as_u32(m2_7)));
-                    if (lane_0_1 == 7) {
-                        unsigned int _max_48 = ((mx) > (m_j_7) ? (mx) : (m_j_7));
-                        mx = _max_48;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_7) : "f"(_abs_46), "f"(_abs_47));
+                    float _max_48;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_48) : "f"(m2_7), "f"(((lane_0_1 < 16) ? rk[7] : 0.0f)));
+                    m2_7 = _max_48;
+                    a0[7] = m2_7;
+                    float _max_49;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_49) : "f"(lm), "f"(m2_7));
+                    lm = _max_49;
                     int rj_8 = __shfl_sync(0xFFFFFFFF, roff, 8);
                     float scale_j_8 = __shfl_sync(0xFFFFFFFF, s_lat, 8);
                     long long idx_j_8 = (long long)(rj_8 + lat_col);
@@ -1653,21 +1646,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_8 = __float2int_rn(y1_8);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_8))), "r"(static_cast<int>(n0_8)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_8 + 128ll))), "r"(static_cast<int>(n1_8)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_49;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_49) : "f"(y0_8));
                     float _abs_50;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_50) : "f"(y1_8));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_50) : "f"(y0_8));
+                    float _abs_51;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_51) : "f"(y1_8));
                     float m2_8;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_8) : "f"(_abs_49), "f"(_abs_50));
-                    float _max_51;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_51) : "f"(m2_8), "f"(((lane_0_1 < 16) ? rk[8] : 0.0f)));
-                    m2_8 = _max_51;
-                    unsigned int m_j_8;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_8) : "r"(__as_u32(m2_8)));
-                    if (lane_0_1 == 8) {
-                        unsigned int _max_52 = ((mx) > (m_j_8) ? (mx) : (m_j_8));
-                        mx = _max_52;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_8) : "f"(_abs_50), "f"(_abs_51));
+                    float _max_52;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_52) : "f"(m2_8), "f"(((lane_0_1 < 16) ? rk[8] : 0.0f)));
+                    m2_8 = _max_52;
+                    a0[8] = m2_8;
+                    float _max_53;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_53) : "f"(lm), "f"(m2_8));
+                    lm = _max_53;
                     int rj_9 = __shfl_sync(0xFFFFFFFF, roff, 9);
                     float scale_j_9 = __shfl_sync(0xFFFFFFFF, s_lat, 9);
                     long long idx_j_9 = (long long)(rj_9 + lat_col);
@@ -1677,21 +1668,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_9 = __float2int_rn(y1_9);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_9))), "r"(static_cast<int>(n0_9)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_9 + 128ll))), "r"(static_cast<int>(n1_9)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_53;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_53) : "f"(y0_9));
                     float _abs_54;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_54) : "f"(y1_9));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_54) : "f"(y0_9));
+                    float _abs_55;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_55) : "f"(y1_9));
                     float m2_9;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_9) : "f"(_abs_53), "f"(_abs_54));
-                    float _max_55;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_55) : "f"(m2_9), "f"(((lane_0_1 < 16) ? rk[9] : 0.0f)));
-                    m2_9 = _max_55;
-                    unsigned int m_j_9;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_9) : "r"(__as_u32(m2_9)));
-                    if (lane_0_1 == 9) {
-                        unsigned int _max_56 = ((mx) > (m_j_9) ? (mx) : (m_j_9));
-                        mx = _max_56;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_9) : "f"(_abs_54), "f"(_abs_55));
+                    float _max_56;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_56) : "f"(m2_9), "f"(((lane_0_1 < 16) ? rk[9] : 0.0f)));
+                    m2_9 = _max_56;
+                    a0[9] = m2_9;
+                    float _max_57;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_57) : "f"(lm), "f"(m2_9));
+                    lm = _max_57;
                     int rj_10 = __shfl_sync(0xFFFFFFFF, roff, 10);
                     float scale_j_10 = __shfl_sync(0xFFFFFFFF, s_lat, 10);
                     long long idx_j_10 = (long long)(rj_10 + lat_col);
@@ -1701,21 +1690,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_10 = __float2int_rn(y1_10);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_10))), "r"(static_cast<int>(n0_10)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_10 + 128ll))), "r"(static_cast<int>(n1_10)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_57;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_57) : "f"(y0_10));
                     float _abs_58;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_58) : "f"(y1_10));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_58) : "f"(y0_10));
+                    float _abs_59;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_59) : "f"(y1_10));
                     float m2_10;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_10) : "f"(_abs_57), "f"(_abs_58));
-                    float _max_59;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_59) : "f"(m2_10), "f"(((lane_0_1 < 16) ? rk[10] : 0.0f)));
-                    m2_10 = _max_59;
-                    unsigned int m_j_10;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_10) : "r"(__as_u32(m2_10)));
-                    if (lane_0_1 == 10) {
-                        unsigned int _max_60 = ((mx) > (m_j_10) ? (mx) : (m_j_10));
-                        mx = _max_60;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_10) : "f"(_abs_58), "f"(_abs_59));
+                    float _max_60;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_60) : "f"(m2_10), "f"(((lane_0_1 < 16) ? rk[10] : 0.0f)));
+                    m2_10 = _max_60;
+                    a0[10] = m2_10;
+                    float _max_61;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_61) : "f"(lm), "f"(m2_10));
+                    lm = _max_61;
                     int rj_11 = __shfl_sync(0xFFFFFFFF, roff, 11);
                     float scale_j_11 = __shfl_sync(0xFFFFFFFF, s_lat, 11);
                     long long idx_j_11 = (long long)(rj_11 + lat_col);
@@ -1725,21 +1712,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_11 = __float2int_rn(y1_11);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_11))), "r"(static_cast<int>(n0_11)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_11 + 128ll))), "r"(static_cast<int>(n1_11)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_61;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_61) : "f"(y0_11));
                     float _abs_62;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_62) : "f"(y1_11));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_62) : "f"(y0_11));
+                    float _abs_63;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_63) : "f"(y1_11));
                     float m2_11;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_11) : "f"(_abs_61), "f"(_abs_62));
-                    float _max_63;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_63) : "f"(m2_11), "f"(((lane_0_1 < 16) ? rk[11] : 0.0f)));
-                    m2_11 = _max_63;
-                    unsigned int m_j_11;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_11) : "r"(__as_u32(m2_11)));
-                    if (lane_0_1 == 11) {
-                        unsigned int _max_64 = ((mx) > (m_j_11) ? (mx) : (m_j_11));
-                        mx = _max_64;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_11) : "f"(_abs_62), "f"(_abs_63));
+                    float _max_64;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_64) : "f"(m2_11), "f"(((lane_0_1 < 16) ? rk[11] : 0.0f)));
+                    m2_11 = _max_64;
+                    a0[11] = m2_11;
+                    float _max_65;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_65) : "f"(lm), "f"(m2_11));
+                    lm = _max_65;
                     int rj_12 = __shfl_sync(0xFFFFFFFF, roff, 12);
                     float scale_j_12 = __shfl_sync(0xFFFFFFFF, s_lat, 12);
                     long long idx_j_12 = (long long)(rj_12 + lat_col);
@@ -1749,21 +1734,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_12 = __float2int_rn(y1_12);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_12))), "r"(static_cast<int>(n0_12)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_12 + 128ll))), "r"(static_cast<int>(n1_12)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_65;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_65) : "f"(y0_12));
                     float _abs_66;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_66) : "f"(y1_12));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_66) : "f"(y0_12));
+                    float _abs_67;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_67) : "f"(y1_12));
                     float m2_12;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_12) : "f"(_abs_65), "f"(_abs_66));
-                    float _max_67;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_67) : "f"(m2_12), "f"(((lane_0_1 < 16) ? rk[12] : 0.0f)));
-                    m2_12 = _max_67;
-                    unsigned int m_j_12;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_12) : "r"(__as_u32(m2_12)));
-                    if (lane_0_1 == 12) {
-                        unsigned int _max_68 = ((mx) > (m_j_12) ? (mx) : (m_j_12));
-                        mx = _max_68;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_12) : "f"(_abs_66), "f"(_abs_67));
+                    float _max_68;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_68) : "f"(m2_12), "f"(((lane_0_1 < 16) ? rk[12] : 0.0f)));
+                    m2_12 = _max_68;
+                    a0[12] = m2_12;
+                    float _max_69;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_69) : "f"(lm), "f"(m2_12));
+                    lm = _max_69;
                     int rj_13 = __shfl_sync(0xFFFFFFFF, roff, 13);
                     float scale_j_13 = __shfl_sync(0xFFFFFFFF, s_lat, 13);
                     long long idx_j_13 = (long long)(rj_13 + lat_col);
@@ -1773,21 +1756,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_13 = __float2int_rn(y1_13);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_13))), "r"(static_cast<int>(n0_13)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_13 + 128ll))), "r"(static_cast<int>(n1_13)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_69;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_69) : "f"(y0_13));
                     float _abs_70;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_70) : "f"(y1_13));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_70) : "f"(y0_13));
+                    float _abs_71;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_71) : "f"(y1_13));
                     float m2_13;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_13) : "f"(_abs_69), "f"(_abs_70));
-                    float _max_71;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_71) : "f"(m2_13), "f"(((lane_0_1 < 16) ? rk[13] : 0.0f)));
-                    m2_13 = _max_71;
-                    unsigned int m_j_13;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_13) : "r"(__as_u32(m2_13)));
-                    if (lane_0_1 == 13) {
-                        unsigned int _max_72 = ((mx) > (m_j_13) ? (mx) : (m_j_13));
-                        mx = _max_72;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_13) : "f"(_abs_70), "f"(_abs_71));
+                    float _max_72;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_72) : "f"(m2_13), "f"(((lane_0_1 < 16) ? rk[13] : 0.0f)));
+                    m2_13 = _max_72;
+                    a0[13] = m2_13;
+                    float _max_73;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_73) : "f"(lm), "f"(m2_13));
+                    lm = _max_73;
                     int rj_14 = __shfl_sync(0xFFFFFFFF, roff, 14);
                     float scale_j_14 = __shfl_sync(0xFFFFFFFF, s_lat, 14);
                     long long idx_j_14 = (long long)(rj_14 + lat_col);
@@ -1797,21 +1778,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_14 = __float2int_rn(y1_14);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_14))), "r"(static_cast<int>(n0_14)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_14 + 128ll))), "r"(static_cast<int>(n1_14)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_73;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_73) : "f"(y0_14));
                     float _abs_74;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_74) : "f"(y1_14));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_74) : "f"(y0_14));
+                    float _abs_75;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_75) : "f"(y1_14));
                     float m2_14;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_14) : "f"(_abs_73), "f"(_abs_74));
-                    float _max_75;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_75) : "f"(m2_14), "f"(((lane_0_1 < 16) ? rk[14] : 0.0f)));
-                    m2_14 = _max_75;
-                    unsigned int m_j_14;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_14) : "r"(__as_u32(m2_14)));
-                    if (lane_0_1 == 14) {
-                        unsigned int _max_76 = ((mx) > (m_j_14) ? (mx) : (m_j_14));
-                        mx = _max_76;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_14) : "f"(_abs_74), "f"(_abs_75));
+                    float _max_76;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_76) : "f"(m2_14), "f"(((lane_0_1 < 16) ? rk[14] : 0.0f)));
+                    m2_14 = _max_76;
+                    a0[14] = m2_14;
+                    float _max_77;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_77) : "f"(lm), "f"(m2_14));
+                    lm = _max_77;
                     int rj_15 = __shfl_sync(0xFFFFFFFF, roff, 15);
                     float scale_j_15 = __shfl_sync(0xFFFFFFFF, s_lat, 15);
                     long long idx_j_15 = (long long)(rj_15 + lat_col);
@@ -1821,21 +1800,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_15 = __float2int_rn(y1_15);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_15))), "r"(static_cast<int>(n0_15)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_15 + 128ll))), "r"(static_cast<int>(n1_15)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_77;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_77) : "f"(y0_15));
                     float _abs_78;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_78) : "f"(y1_15));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_78) : "f"(y0_15));
+                    float _abs_79;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_79) : "f"(y1_15));
                     float m2_15;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_15) : "f"(_abs_77), "f"(_abs_78));
-                    float _max_79;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_79) : "f"(m2_15), "f"(((lane_0_1 < 16) ? rk[15] : 0.0f)));
-                    m2_15 = _max_79;
-                    unsigned int m_j_15;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_15) : "r"(__as_u32(m2_15)));
-                    if (lane_0_1 == 15) {
-                        unsigned int _max_80 = ((mx) > (m_j_15) ? (mx) : (m_j_15));
-                        mx = _max_80;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_15) : "f"(_abs_78), "f"(_abs_79));
+                    float _max_80;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_80) : "f"(m2_15), "f"(((lane_0_1 < 16) ? rk[15] : 0.0f)));
+                    m2_15 = _max_80;
+                    a0[15] = m2_15;
+                    float _max_81;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_81) : "f"(lm), "f"(m2_15));
+                    lm = _max_81;
                     int rj_16 = __shfl_sync(0xFFFFFFFF, roff, 16);
                     float scale_j_16 = __shfl_sync(0xFFFFFFFF, s_lat, 16);
                     long long idx_j_16 = (long long)(rj_16 + lat_col);
@@ -1845,21 +1822,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_16 = __float2int_rn(y1_16);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_16))), "r"(static_cast<int>(n0_16)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_16 + 128ll))), "r"(static_cast<int>(n1_16)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_81;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_81) : "f"(y0_16));
                     float _abs_82;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_82) : "f"(y1_16));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_82) : "f"(y0_16));
+                    float _abs_83;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_83) : "f"(y1_16));
                     float m2_16;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_16) : "f"(_abs_81), "f"(_abs_82));
-                    float _max_83;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_83) : "f"(m2_16), "f"(((lane_0_1 < 16) ? 0.0f : rk[0])));
-                    m2_16 = _max_83;
-                    unsigned int m_j_16;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_16) : "r"(__as_u32(m2_16)));
-                    if (lane_0_1 == 16) {
-                        unsigned int _max_84 = ((mx) > (m_j_16) ? (mx) : (m_j_16));
-                        mx = _max_84;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_16) : "f"(_abs_82), "f"(_abs_83));
+                    float _max_84;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_84) : "f"(m2_16), "f"(((lane_0_1 < 16) ? 0.0f : rk[0])));
+                    m2_16 = _max_84;
+                    a0[16] = m2_16;
+                    float _max_85;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_85) : "f"(lm), "f"(m2_16));
+                    lm = _max_85;
                     int rj_17 = __shfl_sync(0xFFFFFFFF, roff, 17);
                     float scale_j_17 = __shfl_sync(0xFFFFFFFF, s_lat, 17);
                     long long idx_j_17 = (long long)(rj_17 + lat_col);
@@ -1869,21 +1844,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_17 = __float2int_rn(y1_17);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_17))), "r"(static_cast<int>(n0_17)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_17 + 128ll))), "r"(static_cast<int>(n1_17)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_85;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_85) : "f"(y0_17));
                     float _abs_86;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_86) : "f"(y1_17));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_86) : "f"(y0_17));
+                    float _abs_87;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_87) : "f"(y1_17));
                     float m2_17;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_17) : "f"(_abs_85), "f"(_abs_86));
-                    float _max_87;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_87) : "f"(m2_17), "f"(((lane_0_1 < 16) ? 0.0f : rk[1])));
-                    m2_17 = _max_87;
-                    unsigned int m_j_17;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_17) : "r"(__as_u32(m2_17)));
-                    if (lane_0_1 == 17) {
-                        unsigned int _max_88 = ((mx) > (m_j_17) ? (mx) : (m_j_17));
-                        mx = _max_88;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_17) : "f"(_abs_86), "f"(_abs_87));
+                    float _max_88;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_88) : "f"(m2_17), "f"(((lane_0_1 < 16) ? 0.0f : rk[1])));
+                    m2_17 = _max_88;
+                    a0[17] = m2_17;
+                    float _max_89;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_89) : "f"(lm), "f"(m2_17));
+                    lm = _max_89;
                     int rj_18 = __shfl_sync(0xFFFFFFFF, roff, 18);
                     float scale_j_18 = __shfl_sync(0xFFFFFFFF, s_lat, 18);
                     long long idx_j_18 = (long long)(rj_18 + lat_col);
@@ -1893,21 +1866,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_18 = __float2int_rn(y1_18);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_18))), "r"(static_cast<int>(n0_18)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_18 + 128ll))), "r"(static_cast<int>(n1_18)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_89;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_89) : "f"(y0_18));
                     float _abs_90;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_90) : "f"(y1_18));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_90) : "f"(y0_18));
+                    float _abs_91;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_91) : "f"(y1_18));
                     float m2_18;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_18) : "f"(_abs_89), "f"(_abs_90));
-                    float _max_91;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_91) : "f"(m2_18), "f"(((lane_0_1 < 16) ? 0.0f : rk[2])));
-                    m2_18 = _max_91;
-                    unsigned int m_j_18;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_18) : "r"(__as_u32(m2_18)));
-                    if (lane_0_1 == 18) {
-                        unsigned int _max_92 = ((mx) > (m_j_18) ? (mx) : (m_j_18));
-                        mx = _max_92;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_18) : "f"(_abs_90), "f"(_abs_91));
+                    float _max_92;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_92) : "f"(m2_18), "f"(((lane_0_1 < 16) ? 0.0f : rk[2])));
+                    m2_18 = _max_92;
+                    a0[18] = m2_18;
+                    float _max_93;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_93) : "f"(lm), "f"(m2_18));
+                    lm = _max_93;
                     int rj_19 = __shfl_sync(0xFFFFFFFF, roff, 19);
                     float scale_j_19 = __shfl_sync(0xFFFFFFFF, s_lat, 19);
                     long long idx_j_19 = (long long)(rj_19 + lat_col);
@@ -1917,21 +1888,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_19 = __float2int_rn(y1_19);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_19))), "r"(static_cast<int>(n0_19)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_19 + 128ll))), "r"(static_cast<int>(n1_19)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_93;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_93) : "f"(y0_19));
                     float _abs_94;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_94) : "f"(y1_19));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_94) : "f"(y0_19));
+                    float _abs_95;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_95) : "f"(y1_19));
                     float m2_19;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_19) : "f"(_abs_93), "f"(_abs_94));
-                    float _max_95;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_95) : "f"(m2_19), "f"(((lane_0_1 < 16) ? 0.0f : rk[3])));
-                    m2_19 = _max_95;
-                    unsigned int m_j_19;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_19) : "r"(__as_u32(m2_19)));
-                    if (lane_0_1 == 19) {
-                        unsigned int _max_96 = ((mx) > (m_j_19) ? (mx) : (m_j_19));
-                        mx = _max_96;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_19) : "f"(_abs_94), "f"(_abs_95));
+                    float _max_96;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_96) : "f"(m2_19), "f"(((lane_0_1 < 16) ? 0.0f : rk[3])));
+                    m2_19 = _max_96;
+                    a0[19] = m2_19;
+                    float _max_97;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_97) : "f"(lm), "f"(m2_19));
+                    lm = _max_97;
                     int rj_20 = __shfl_sync(0xFFFFFFFF, roff, 20);
                     float scale_j_20 = __shfl_sync(0xFFFFFFFF, s_lat, 20);
                     long long idx_j_20 = (long long)(rj_20 + lat_col);
@@ -1941,21 +1910,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_20 = __float2int_rn(y1_20);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_20))), "r"(static_cast<int>(n0_20)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_20 + 128ll))), "r"(static_cast<int>(n1_20)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_97;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_97) : "f"(y0_20));
                     float _abs_98;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_98) : "f"(y1_20));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_98) : "f"(y0_20));
+                    float _abs_99;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_99) : "f"(y1_20));
                     float m2_20;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_20) : "f"(_abs_97), "f"(_abs_98));
-                    float _max_99;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_99) : "f"(m2_20), "f"(((lane_0_1 < 16) ? 0.0f : rk[4])));
-                    m2_20 = _max_99;
-                    unsigned int m_j_20;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_20) : "r"(__as_u32(m2_20)));
-                    if (lane_0_1 == 20) {
-                        unsigned int _max_100 = ((mx) > (m_j_20) ? (mx) : (m_j_20));
-                        mx = _max_100;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_20) : "f"(_abs_98), "f"(_abs_99));
+                    float _max_100;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_100) : "f"(m2_20), "f"(((lane_0_1 < 16) ? 0.0f : rk[4])));
+                    m2_20 = _max_100;
+                    a0[20] = m2_20;
+                    float _max_101;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_101) : "f"(lm), "f"(m2_20));
+                    lm = _max_101;
                     int rj_21 = __shfl_sync(0xFFFFFFFF, roff, 21);
                     float scale_j_21 = __shfl_sync(0xFFFFFFFF, s_lat, 21);
                     long long idx_j_21 = (long long)(rj_21 + lat_col);
@@ -1965,21 +1932,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_21 = __float2int_rn(y1_21);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_21))), "r"(static_cast<int>(n0_21)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_21 + 128ll))), "r"(static_cast<int>(n1_21)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_101;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_101) : "f"(y0_21));
                     float _abs_102;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_102) : "f"(y1_21));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_102) : "f"(y0_21));
+                    float _abs_103;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_103) : "f"(y1_21));
                     float m2_21;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_21) : "f"(_abs_101), "f"(_abs_102));
-                    float _max_103;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_103) : "f"(m2_21), "f"(((lane_0_1 < 16) ? 0.0f : rk[5])));
-                    m2_21 = _max_103;
-                    unsigned int m_j_21;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_21) : "r"(__as_u32(m2_21)));
-                    if (lane_0_1 == 21) {
-                        unsigned int _max_104 = ((mx) > (m_j_21) ? (mx) : (m_j_21));
-                        mx = _max_104;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_21) : "f"(_abs_102), "f"(_abs_103));
+                    float _max_104;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_104) : "f"(m2_21), "f"(((lane_0_1 < 16) ? 0.0f : rk[5])));
+                    m2_21 = _max_104;
+                    a0[21] = m2_21;
+                    float _max_105;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_105) : "f"(lm), "f"(m2_21));
+                    lm = _max_105;
                     int rj_22 = __shfl_sync(0xFFFFFFFF, roff, 22);
                     float scale_j_22 = __shfl_sync(0xFFFFFFFF, s_lat, 22);
                     long long idx_j_22 = (long long)(rj_22 + lat_col);
@@ -1989,21 +1954,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_22 = __float2int_rn(y1_22);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_22))), "r"(static_cast<int>(n0_22)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_22 + 128ll))), "r"(static_cast<int>(n1_22)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_105;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_105) : "f"(y0_22));
                     float _abs_106;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_106) : "f"(y1_22));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_106) : "f"(y0_22));
+                    float _abs_107;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_107) : "f"(y1_22));
                     float m2_22;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_22) : "f"(_abs_105), "f"(_abs_106));
-                    float _max_107;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_107) : "f"(m2_22), "f"(((lane_0_1 < 16) ? 0.0f : rk[6])));
-                    m2_22 = _max_107;
-                    unsigned int m_j_22;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_22) : "r"(__as_u32(m2_22)));
-                    if (lane_0_1 == 22) {
-                        unsigned int _max_108 = ((mx) > (m_j_22) ? (mx) : (m_j_22));
-                        mx = _max_108;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_22) : "f"(_abs_106), "f"(_abs_107));
+                    float _max_108;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_108) : "f"(m2_22), "f"(((lane_0_1 < 16) ? 0.0f : rk[6])));
+                    m2_22 = _max_108;
+                    a0[22] = m2_22;
+                    float _max_109;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_109) : "f"(lm), "f"(m2_22));
+                    lm = _max_109;
                     int rj_23 = __shfl_sync(0xFFFFFFFF, roff, 23);
                     float scale_j_23 = __shfl_sync(0xFFFFFFFF, s_lat, 23);
                     long long idx_j_23 = (long long)(rj_23 + lat_col);
@@ -2013,21 +1976,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_23 = __float2int_rn(y1_23);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_23))), "r"(static_cast<int>(n0_23)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_23 + 128ll))), "r"(static_cast<int>(n1_23)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_109;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_109) : "f"(y0_23));
                     float _abs_110;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_110) : "f"(y1_23));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_110) : "f"(y0_23));
+                    float _abs_111;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_111) : "f"(y1_23));
                     float m2_23;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_23) : "f"(_abs_109), "f"(_abs_110));
-                    float _max_111;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_111) : "f"(m2_23), "f"(((lane_0_1 < 16) ? 0.0f : rk[7])));
-                    m2_23 = _max_111;
-                    unsigned int m_j_23;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_23) : "r"(__as_u32(m2_23)));
-                    if (lane_0_1 == 23) {
-                        unsigned int _max_112 = ((mx) > (m_j_23) ? (mx) : (m_j_23));
-                        mx = _max_112;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_23) : "f"(_abs_110), "f"(_abs_111));
+                    float _max_112;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_112) : "f"(m2_23), "f"(((lane_0_1 < 16) ? 0.0f : rk[7])));
+                    m2_23 = _max_112;
+                    a0[23] = m2_23;
+                    float _max_113;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_113) : "f"(lm), "f"(m2_23));
+                    lm = _max_113;
                     int rj_24 = __shfl_sync(0xFFFFFFFF, roff, 24);
                     float scale_j_24 = __shfl_sync(0xFFFFFFFF, s_lat, 24);
                     long long idx_j_24 = (long long)(rj_24 + lat_col);
@@ -2037,21 +1998,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_24 = __float2int_rn(y1_24);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_24))), "r"(static_cast<int>(n0_24)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_24 + 128ll))), "r"(static_cast<int>(n1_24)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_113;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_113) : "f"(y0_24));
                     float _abs_114;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_114) : "f"(y1_24));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_114) : "f"(y0_24));
+                    float _abs_115;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_115) : "f"(y1_24));
                     float m2_24;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_24) : "f"(_abs_113), "f"(_abs_114));
-                    float _max_115;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_115) : "f"(m2_24), "f"(((lane_0_1 < 16) ? 0.0f : rk[8])));
-                    m2_24 = _max_115;
-                    unsigned int m_j_24;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_24) : "r"(__as_u32(m2_24)));
-                    if (lane_0_1 == 24) {
-                        unsigned int _max_116 = ((mx) > (m_j_24) ? (mx) : (m_j_24));
-                        mx = _max_116;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_24) : "f"(_abs_114), "f"(_abs_115));
+                    float _max_116;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_116) : "f"(m2_24), "f"(((lane_0_1 < 16) ? 0.0f : rk[8])));
+                    m2_24 = _max_116;
+                    a0[24] = m2_24;
+                    float _max_117;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_117) : "f"(lm), "f"(m2_24));
+                    lm = _max_117;
                     int rj_25 = __shfl_sync(0xFFFFFFFF, roff, 25);
                     float scale_j_25 = __shfl_sync(0xFFFFFFFF, s_lat, 25);
                     long long idx_j_25 = (long long)(rj_25 + lat_col);
@@ -2061,21 +2020,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_25 = __float2int_rn(y1_25);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_25))), "r"(static_cast<int>(n0_25)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_25 + 128ll))), "r"(static_cast<int>(n1_25)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_117;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_117) : "f"(y0_25));
                     float _abs_118;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_118) : "f"(y1_25));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_118) : "f"(y0_25));
+                    float _abs_119;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_119) : "f"(y1_25));
                     float m2_25;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_25) : "f"(_abs_117), "f"(_abs_118));
-                    float _max_119;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_119) : "f"(m2_25), "f"(((lane_0_1 < 16) ? 0.0f : rk[9])));
-                    m2_25 = _max_119;
-                    unsigned int m_j_25;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_25) : "r"(__as_u32(m2_25)));
-                    if (lane_0_1 == 25) {
-                        unsigned int _max_120 = ((mx) > (m_j_25) ? (mx) : (m_j_25));
-                        mx = _max_120;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_25) : "f"(_abs_118), "f"(_abs_119));
+                    float _max_120;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_120) : "f"(m2_25), "f"(((lane_0_1 < 16) ? 0.0f : rk[9])));
+                    m2_25 = _max_120;
+                    a0[25] = m2_25;
+                    float _max_121;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_121) : "f"(lm), "f"(m2_25));
+                    lm = _max_121;
                     int rj_26 = __shfl_sync(0xFFFFFFFF, roff, 26);
                     float scale_j_26 = __shfl_sync(0xFFFFFFFF, s_lat, 26);
                     long long idx_j_26 = (long long)(rj_26 + lat_col);
@@ -2085,21 +2042,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_26 = __float2int_rn(y1_26);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_26))), "r"(static_cast<int>(n0_26)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_26 + 128ll))), "r"(static_cast<int>(n1_26)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_121;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_121) : "f"(y0_26));
                     float _abs_122;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_122) : "f"(y1_26));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_122) : "f"(y0_26));
+                    float _abs_123;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_123) : "f"(y1_26));
                     float m2_26;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_26) : "f"(_abs_121), "f"(_abs_122));
-                    float _max_123;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_123) : "f"(m2_26), "f"(((lane_0_1 < 16) ? 0.0f : rk[10])));
-                    m2_26 = _max_123;
-                    unsigned int m_j_26;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_26) : "r"(__as_u32(m2_26)));
-                    if (lane_0_1 == 26) {
-                        unsigned int _max_124 = ((mx) > (m_j_26) ? (mx) : (m_j_26));
-                        mx = _max_124;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_26) : "f"(_abs_122), "f"(_abs_123));
+                    float _max_124;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_124) : "f"(m2_26), "f"(((lane_0_1 < 16) ? 0.0f : rk[10])));
+                    m2_26 = _max_124;
+                    a0[26] = m2_26;
+                    float _max_125;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_125) : "f"(lm), "f"(m2_26));
+                    lm = _max_125;
                     int rj_27 = __shfl_sync(0xFFFFFFFF, roff, 27);
                     float scale_j_27 = __shfl_sync(0xFFFFFFFF, s_lat, 27);
                     long long idx_j_27 = (long long)(rj_27 + lat_col);
@@ -2109,21 +2064,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_27 = __float2int_rn(y1_27);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_27))), "r"(static_cast<int>(n0_27)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_27 + 128ll))), "r"(static_cast<int>(n1_27)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_125;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_125) : "f"(y0_27));
                     float _abs_126;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_126) : "f"(y1_27));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_126) : "f"(y0_27));
+                    float _abs_127;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_127) : "f"(y1_27));
                     float m2_27;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_27) : "f"(_abs_125), "f"(_abs_126));
-                    float _max_127;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_127) : "f"(m2_27), "f"(((lane_0_1 < 16) ? 0.0f : rk[11])));
-                    m2_27 = _max_127;
-                    unsigned int m_j_27;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_27) : "r"(__as_u32(m2_27)));
-                    if (lane_0_1 == 27) {
-                        unsigned int _max_128 = ((mx) > (m_j_27) ? (mx) : (m_j_27));
-                        mx = _max_128;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_27) : "f"(_abs_126), "f"(_abs_127));
+                    float _max_128;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_128) : "f"(m2_27), "f"(((lane_0_1 < 16) ? 0.0f : rk[11])));
+                    m2_27 = _max_128;
+                    a0[27] = m2_27;
+                    float _max_129;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_129) : "f"(lm), "f"(m2_27));
+                    lm = _max_129;
                     int rj_28 = __shfl_sync(0xFFFFFFFF, roff, 28);
                     float scale_j_28 = __shfl_sync(0xFFFFFFFF, s_lat, 28);
                     long long idx_j_28 = (long long)(rj_28 + lat_col);
@@ -2133,21 +2086,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_28 = __float2int_rn(y1_28);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_28))), "r"(static_cast<int>(n0_28)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_28 + 128ll))), "r"(static_cast<int>(n1_28)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_129;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_129) : "f"(y0_28));
                     float _abs_130;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_130) : "f"(y1_28));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_130) : "f"(y0_28));
+                    float _abs_131;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_131) : "f"(y1_28));
                     float m2_28;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_28) : "f"(_abs_129), "f"(_abs_130));
-                    float _max_131;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_131) : "f"(m2_28), "f"(((lane_0_1 < 16) ? 0.0f : rk[12])));
-                    m2_28 = _max_131;
-                    unsigned int m_j_28;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_28) : "r"(__as_u32(m2_28)));
-                    if (lane_0_1 == 28) {
-                        unsigned int _max_132 = ((mx) > (m_j_28) ? (mx) : (m_j_28));
-                        mx = _max_132;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_28) : "f"(_abs_130), "f"(_abs_131));
+                    float _max_132;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_132) : "f"(m2_28), "f"(((lane_0_1 < 16) ? 0.0f : rk[12])));
+                    m2_28 = _max_132;
+                    a0[28] = m2_28;
+                    float _max_133;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_133) : "f"(lm), "f"(m2_28));
+                    lm = _max_133;
                     int rj_29 = __shfl_sync(0xFFFFFFFF, roff, 29);
                     float scale_j_29 = __shfl_sync(0xFFFFFFFF, s_lat, 29);
                     long long idx_j_29 = (long long)(rj_29 + lat_col);
@@ -2157,21 +2108,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_29 = __float2int_rn(y1_29);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_29))), "r"(static_cast<int>(n0_29)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_29 + 128ll))), "r"(static_cast<int>(n1_29)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_133;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_133) : "f"(y0_29));
                     float _abs_134;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_134) : "f"(y1_29));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_134) : "f"(y0_29));
+                    float _abs_135;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_135) : "f"(y1_29));
                     float m2_29;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_29) : "f"(_abs_133), "f"(_abs_134));
-                    float _max_135;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_135) : "f"(m2_29), "f"(((lane_0_1 < 16) ? 0.0f : rk[13])));
-                    m2_29 = _max_135;
-                    unsigned int m_j_29;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_29) : "r"(__as_u32(m2_29)));
-                    if (lane_0_1 == 29) {
-                        unsigned int _max_136 = ((mx) > (m_j_29) ? (mx) : (m_j_29));
-                        mx = _max_136;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_29) : "f"(_abs_134), "f"(_abs_135));
+                    float _max_136;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_136) : "f"(m2_29), "f"(((lane_0_1 < 16) ? 0.0f : rk[13])));
+                    m2_29 = _max_136;
+                    a0[29] = m2_29;
+                    float _max_137;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_137) : "f"(lm), "f"(m2_29));
+                    lm = _max_137;
                     int rj_30 = __shfl_sync(0xFFFFFFFF, roff, 30);
                     float scale_j_30 = __shfl_sync(0xFFFFFFFF, s_lat, 30);
                     long long idx_j_30 = (long long)(rj_30 + lat_col);
@@ -2181,21 +2130,19 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_30 = __float2int_rn(y1_30);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_30))), "r"(static_cast<int>(n0_30)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_30 + 128ll))), "r"(static_cast<int>(n1_30)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_137;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_137) : "f"(y0_30));
                     float _abs_138;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_138) : "f"(y1_30));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_138) : "f"(y0_30));
+                    float _abs_139;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_139) : "f"(y1_30));
                     float m2_30;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_30) : "f"(_abs_137), "f"(_abs_138));
-                    float _max_139;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_139) : "f"(m2_30), "f"(((lane_0_1 < 16) ? 0.0f : rk[14])));
-                    m2_30 = _max_139;
-                    unsigned int m_j_30;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_30) : "r"(__as_u32(m2_30)));
-                    if (lane_0_1 == 30) {
-                        unsigned int _max_140 = ((mx) > (m_j_30) ? (mx) : (m_j_30));
-                        mx = _max_140;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_30) : "f"(_abs_138), "f"(_abs_139));
+                    float _max_140;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_140) : "f"(m2_30), "f"(((lane_0_1 < 16) ? 0.0f : rk[14])));
+                    m2_30 = _max_140;
+                    a0[30] = m2_30;
+                    float _max_141;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_141) : "f"(lm), "f"(m2_30));
+                    lm = _max_141;
                     int rj_31 = __shfl_sync(0xFFFFFFFF, roff, 31);
                     float scale_j_31 = __shfl_sync(0xFFFFFFFF, s_lat, 31);
                     long long idx_j_31 = (long long)(rj_31 + lat_col);
@@ -2205,20 +2152,214 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_31 = __float2int_rn(y1_31);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_31))), "r"(static_cast<int>(n0_31)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_31 + 128ll))), "r"(static_cast<int>(n1_31)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_141;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_141) : "f"(y0_31));
                     float _abs_142;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_142) : "f"(y1_31));
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_142) : "f"(y0_31));
+                    float _abs_143;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_143) : "f"(y1_31));
                     float m2_31;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_31) : "f"(_abs_141), "f"(_abs_142));
-                    float _max_143;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_143) : "f"(m2_31), "f"(((lane_0_1 < 16) ? 0.0f : rk[15])));
-                    m2_31 = _max_143;
-                    unsigned int m_j_31;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_31) : "r"(__as_u32(m2_31)));
-                    if (lane_0_1 == 31) {
-                        unsigned int _max_144 = ((mx) > (m_j_31) ? (mx) : (m_j_31));
-                        mx = _max_144;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_31) : "f"(_abs_142), "f"(_abs_143));
+                    float _max_144;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_144) : "f"(m2_31), "f"(((lane_0_1 < 16) ? 0.0f : rk[15])));
+                    m2_31 = _max_144;
+                    a0[31] = m2_31;
+                    float _max_145;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_145) : "f"(lm), "f"(m2_31));
+                    lm = _max_145;
+                    unsigned int _warp_redux_146;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_146) : "r"(__as_u32(lm)));
+                    if (_warp_redux_146 >= thr_w) {
+                        unsigned int m_j_0;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_0) : "r"(__as_u32(a0[0])));
+                        if (lane_0_1 == 0) {
+                            unsigned int _max_147 = ((mx) > (m_j_0) ? (mx) : (m_j_0));
+                            mx = _max_147;
+                        }
+                        unsigned int m_j_1;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_1) : "r"(__as_u32(a0[1])));
+                        if (lane_0_1 == 1) {
+                            unsigned int _max_148 = ((mx) > (m_j_1) ? (mx) : (m_j_1));
+                            mx = _max_148;
+                        }
+                        unsigned int m_j_2;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_2) : "r"(__as_u32(a0[2])));
+                        if (lane_0_1 == 2) {
+                            unsigned int _max_149 = ((mx) > (m_j_2) ? (mx) : (m_j_2));
+                            mx = _max_149;
+                        }
+                        unsigned int m_j_3;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_3) : "r"(__as_u32(a0[3])));
+                        if (lane_0_1 == 3) {
+                            unsigned int _max_150 = ((mx) > (m_j_3) ? (mx) : (m_j_3));
+                            mx = _max_150;
+                        }
+                        unsigned int m_j_4;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_4) : "r"(__as_u32(a0[4])));
+                        if (lane_0_1 == 4) {
+                            unsigned int _max_151 = ((mx) > (m_j_4) ? (mx) : (m_j_4));
+                            mx = _max_151;
+                        }
+                        unsigned int m_j_5;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_5) : "r"(__as_u32(a0[5])));
+                        if (lane_0_1 == 5) {
+                            unsigned int _max_152 = ((mx) > (m_j_5) ? (mx) : (m_j_5));
+                            mx = _max_152;
+                        }
+                        unsigned int m_j_6;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_6) : "r"(__as_u32(a0[6])));
+                        if (lane_0_1 == 6) {
+                            unsigned int _max_153 = ((mx) > (m_j_6) ? (mx) : (m_j_6));
+                            mx = _max_153;
+                        }
+                        unsigned int m_j_7;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_7) : "r"(__as_u32(a0[7])));
+                        if (lane_0_1 == 7) {
+                            unsigned int _max_154 = ((mx) > (m_j_7) ? (mx) : (m_j_7));
+                            mx = _max_154;
+                        }
+                        unsigned int m_j_8;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_8) : "r"(__as_u32(a0[8])));
+                        if (lane_0_1 == 8) {
+                            unsigned int _max_155 = ((mx) > (m_j_8) ? (mx) : (m_j_8));
+                            mx = _max_155;
+                        }
+                        unsigned int m_j_9;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_9) : "r"(__as_u32(a0[9])));
+                        if (lane_0_1 == 9) {
+                            unsigned int _max_156 = ((mx) > (m_j_9) ? (mx) : (m_j_9));
+                            mx = _max_156;
+                        }
+                        unsigned int m_j_10;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_10) : "r"(__as_u32(a0[10])));
+                        if (lane_0_1 == 10) {
+                            unsigned int _max_157 = ((mx) > (m_j_10) ? (mx) : (m_j_10));
+                            mx = _max_157;
+                        }
+                        unsigned int m_j_11;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_11) : "r"(__as_u32(a0[11])));
+                        if (lane_0_1 == 11) {
+                            unsigned int _max_158 = ((mx) > (m_j_11) ? (mx) : (m_j_11));
+                            mx = _max_158;
+                        }
+                        unsigned int m_j_12;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_12) : "r"(__as_u32(a0[12])));
+                        if (lane_0_1 == 12) {
+                            unsigned int _max_159 = ((mx) > (m_j_12) ? (mx) : (m_j_12));
+                            mx = _max_159;
+                        }
+                        unsigned int m_j_13;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_13) : "r"(__as_u32(a0[13])));
+                        if (lane_0_1 == 13) {
+                            unsigned int _max_160 = ((mx) > (m_j_13) ? (mx) : (m_j_13));
+                            mx = _max_160;
+                        }
+                        unsigned int m_j_14;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_14) : "r"(__as_u32(a0[14])));
+                        if (lane_0_1 == 14) {
+                            unsigned int _max_161 = ((mx) > (m_j_14) ? (mx) : (m_j_14));
+                            mx = _max_161;
+                        }
+                        unsigned int m_j_15;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_15) : "r"(__as_u32(a0[15])));
+                        if (lane_0_1 == 15) {
+                            unsigned int _max_162 = ((mx) > (m_j_15) ? (mx) : (m_j_15));
+                            mx = _max_162;
+                        }
+                        unsigned int m_j_16;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_16) : "r"(__as_u32(a0[16])));
+                        if (lane_0_1 == 16) {
+                            unsigned int _max_163 = ((mx) > (m_j_16) ? (mx) : (m_j_16));
+                            mx = _max_163;
+                        }
+                        unsigned int m_j_17;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_17) : "r"(__as_u32(a0[17])));
+                        if (lane_0_1 == 17) {
+                            unsigned int _max_164 = ((mx) > (m_j_17) ? (mx) : (m_j_17));
+                            mx = _max_164;
+                        }
+                        unsigned int m_j_18;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_18) : "r"(__as_u32(a0[18])));
+                        if (lane_0_1 == 18) {
+                            unsigned int _max_165 = ((mx) > (m_j_18) ? (mx) : (m_j_18));
+                            mx = _max_165;
+                        }
+                        unsigned int m_j_19;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_19) : "r"(__as_u32(a0[19])));
+                        if (lane_0_1 == 19) {
+                            unsigned int _max_166 = ((mx) > (m_j_19) ? (mx) : (m_j_19));
+                            mx = _max_166;
+                        }
+                        unsigned int m_j_20;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_20) : "r"(__as_u32(a0[20])));
+                        if (lane_0_1 == 20) {
+                            unsigned int _max_167 = ((mx) > (m_j_20) ? (mx) : (m_j_20));
+                            mx = _max_167;
+                        }
+                        unsigned int m_j_21;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_21) : "r"(__as_u32(a0[21])));
+                        if (lane_0_1 == 21) {
+                            unsigned int _max_168 = ((mx) > (m_j_21) ? (mx) : (m_j_21));
+                            mx = _max_168;
+                        }
+                        unsigned int m_j_22;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_22) : "r"(__as_u32(a0[22])));
+                        if (lane_0_1 == 22) {
+                            unsigned int _max_169 = ((mx) > (m_j_22) ? (mx) : (m_j_22));
+                            mx = _max_169;
+                        }
+                        unsigned int m_j_23;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_23) : "r"(__as_u32(a0[23])));
+                        if (lane_0_1 == 23) {
+                            unsigned int _max_170 = ((mx) > (m_j_23) ? (mx) : (m_j_23));
+                            mx = _max_170;
+                        }
+                        unsigned int m_j_24;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_24) : "r"(__as_u32(a0[24])));
+                        if (lane_0_1 == 24) {
+                            unsigned int _max_171 = ((mx) > (m_j_24) ? (mx) : (m_j_24));
+                            mx = _max_171;
+                        }
+                        unsigned int m_j_25;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_25) : "r"(__as_u32(a0[25])));
+                        if (lane_0_1 == 25) {
+                            unsigned int _max_172 = ((mx) > (m_j_25) ? (mx) : (m_j_25));
+                            mx = _max_172;
+                        }
+                        unsigned int m_j_26;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_26) : "r"(__as_u32(a0[26])));
+                        if (lane_0_1 == 26) {
+                            unsigned int _max_173 = ((mx) > (m_j_26) ? (mx) : (m_j_26));
+                            mx = _max_173;
+                        }
+                        unsigned int m_j_27;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_27) : "r"(__as_u32(a0[27])));
+                        if (lane_0_1 == 27) {
+                            unsigned int _max_174 = ((mx) > (m_j_27) ? (mx) : (m_j_27));
+                            mx = _max_174;
+                        }
+                        unsigned int m_j_28;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_28) : "r"(__as_u32(a0[28])));
+                        if (lane_0_1 == 28) {
+                            unsigned int _max_175 = ((mx) > (m_j_28) ? (mx) : (m_j_28));
+                            mx = _max_175;
+                        }
+                        unsigned int m_j_29;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_29) : "r"(__as_u32(a0[29])));
+                        if (lane_0_1 == 29) {
+                            unsigned int _max_176 = ((mx) > (m_j_29) ? (mx) : (m_j_29));
+                            mx = _max_176;
+                        }
+                        unsigned int m_j_30;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_30) : "r"(__as_u32(a0[30])));
+                        if (lane_0_1 == 30) {
+                            unsigned int _max_177 = ((mx) > (m_j_30) ? (mx) : (m_j_30));
+                            mx = _max_177;
+                        }
+                        unsigned int m_j_31;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_31) : "r"(__as_u32(a0[31])));
+                        if (lane_0_1 == 31) {
+                            unsigned int _max_178 = ((mx) > (m_j_31) ? (mx) : (m_j_31));
+                            mx = _max_178;
+                        }
                     }
                     mx = mx;
                 }
@@ -2244,6 +2385,7 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(dkv_b_drained_addr);
                 if (vmask != 0) {
+                    float lm_1 = 0.0f;
                     int rj_32 = __shfl_sync(0xFFFFFFFF, roff, 0);
                     float scale_j_32 = __shfl_sync(0xFFFFFFFF, s_lat, 0);
                     long long idx_j_32 = (long long)(rj_32 + lat_col);
@@ -2253,18 +2395,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_32 = __float2int_rn(y1_32);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_32 + 256ll))), "r"(static_cast<int>(n0_32)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_32 + 384ll))), "r"(static_cast<int>(n1_32)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_145;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_145) : "f"(y0_32));
-                    float _abs_146;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_146) : "f"(y1_32));
+                    float _abs_179;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_179) : "f"(y0_32));
+                    float _abs_180;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_180) : "f"(y1_32));
                     float m2_32;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_32) : "f"(_abs_145), "f"(_abs_146));
-                    unsigned int m_j_32;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_32) : "r"(__as_u32(m2_32)));
-                    if (lane_0_1 == 0) {
-                        unsigned int _max_147 = ((mx) > (m_j_32) ? (mx) : (m_j_32));
-                        mx = _max_147;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_32) : "f"(_abs_179), "f"(_abs_180));
+                    a0[0] = m2_32;
+                    float _max_181;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_181) : "f"(lm_1), "f"(m2_32));
+                    lm_1 = _max_181;
                     int rj_33 = __shfl_sync(0xFFFFFFFF, roff, 1);
                     float scale_j_33 = __shfl_sync(0xFFFFFFFF, s_lat, 1);
                     long long idx_j_33 = (long long)(rj_33 + lat_col);
@@ -2274,18 +2414,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_33 = __float2int_rn(y1_33);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_33 + 256ll))), "r"(static_cast<int>(n0_33)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_33 + 384ll))), "r"(static_cast<int>(n1_33)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_148;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_148) : "f"(y0_33));
-                    float _abs_149;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_149) : "f"(y1_33));
+                    float _abs_182;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_182) : "f"(y0_33));
+                    float _abs_183;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_183) : "f"(y1_33));
                     float m2_33;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_33) : "f"(_abs_148), "f"(_abs_149));
-                    unsigned int m_j_33;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_33) : "r"(__as_u32(m2_33)));
-                    if (lane_0_1 == 1) {
-                        unsigned int _max_150 = ((mx) > (m_j_33) ? (mx) : (m_j_33));
-                        mx = _max_150;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_33) : "f"(_abs_182), "f"(_abs_183));
+                    a0[1] = m2_33;
+                    float _max_184;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_184) : "f"(lm_1), "f"(m2_33));
+                    lm_1 = _max_184;
                     int rj_34 = __shfl_sync(0xFFFFFFFF, roff, 2);
                     float scale_j_34 = __shfl_sync(0xFFFFFFFF, s_lat, 2);
                     long long idx_j_34 = (long long)(rj_34 + lat_col);
@@ -2295,18 +2433,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_34 = __float2int_rn(y1_34);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_34 + 256ll))), "r"(static_cast<int>(n0_34)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_34 + 384ll))), "r"(static_cast<int>(n1_34)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_151;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_151) : "f"(y0_34));
-                    float _abs_152;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_152) : "f"(y1_34));
+                    float _abs_185;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_185) : "f"(y0_34));
+                    float _abs_186;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_186) : "f"(y1_34));
                     float m2_34;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_34) : "f"(_abs_151), "f"(_abs_152));
-                    unsigned int m_j_34;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_34) : "r"(__as_u32(m2_34)));
-                    if (lane_0_1 == 2) {
-                        unsigned int _max_153 = ((mx) > (m_j_34) ? (mx) : (m_j_34));
-                        mx = _max_153;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_34) : "f"(_abs_185), "f"(_abs_186));
+                    a0[2] = m2_34;
+                    float _max_187;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_187) : "f"(lm_1), "f"(m2_34));
+                    lm_1 = _max_187;
                     int rj_35 = __shfl_sync(0xFFFFFFFF, roff, 3);
                     float scale_j_35 = __shfl_sync(0xFFFFFFFF, s_lat, 3);
                     long long idx_j_35 = (long long)(rj_35 + lat_col);
@@ -2316,18 +2452,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_35 = __float2int_rn(y1_35);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_35 + 256ll))), "r"(static_cast<int>(n0_35)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_35 + 384ll))), "r"(static_cast<int>(n1_35)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_154;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_154) : "f"(y0_35));
-                    float _abs_155;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_155) : "f"(y1_35));
+                    float _abs_188;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_188) : "f"(y0_35));
+                    float _abs_189;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_189) : "f"(y1_35));
                     float m2_35;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_35) : "f"(_abs_154), "f"(_abs_155));
-                    unsigned int m_j_35;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_35) : "r"(__as_u32(m2_35)));
-                    if (lane_0_1 == 3) {
-                        unsigned int _max_156 = ((mx) > (m_j_35) ? (mx) : (m_j_35));
-                        mx = _max_156;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_35) : "f"(_abs_188), "f"(_abs_189));
+                    a0[3] = m2_35;
+                    float _max_190;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_190) : "f"(lm_1), "f"(m2_35));
+                    lm_1 = _max_190;
                     int rj_36 = __shfl_sync(0xFFFFFFFF, roff, 4);
                     float scale_j_36 = __shfl_sync(0xFFFFFFFF, s_lat, 4);
                     long long idx_j_36 = (long long)(rj_36 + lat_col);
@@ -2337,18 +2471,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_36 = __float2int_rn(y1_36);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_36 + 256ll))), "r"(static_cast<int>(n0_36)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_36 + 384ll))), "r"(static_cast<int>(n1_36)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_157;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_157) : "f"(y0_36));
-                    float _abs_158;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_158) : "f"(y1_36));
+                    float _abs_191;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_191) : "f"(y0_36));
+                    float _abs_192;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_192) : "f"(y1_36));
                     float m2_36;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_36) : "f"(_abs_157), "f"(_abs_158));
-                    unsigned int m_j_36;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_36) : "r"(__as_u32(m2_36)));
-                    if (lane_0_1 == 4) {
-                        unsigned int _max_159 = ((mx) > (m_j_36) ? (mx) : (m_j_36));
-                        mx = _max_159;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_36) : "f"(_abs_191), "f"(_abs_192));
+                    a0[4] = m2_36;
+                    float _max_193;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_193) : "f"(lm_1), "f"(m2_36));
+                    lm_1 = _max_193;
                     int rj_37 = __shfl_sync(0xFFFFFFFF, roff, 5);
                     float scale_j_37 = __shfl_sync(0xFFFFFFFF, s_lat, 5);
                     long long idx_j_37 = (long long)(rj_37 + lat_col);
@@ -2358,18 +2490,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_37 = __float2int_rn(y1_37);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_37 + 256ll))), "r"(static_cast<int>(n0_37)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_37 + 384ll))), "r"(static_cast<int>(n1_37)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_160;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_160) : "f"(y0_37));
-                    float _abs_161;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_161) : "f"(y1_37));
+                    float _abs_194;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_194) : "f"(y0_37));
+                    float _abs_195;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_195) : "f"(y1_37));
                     float m2_37;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_37) : "f"(_abs_160), "f"(_abs_161));
-                    unsigned int m_j_37;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_37) : "r"(__as_u32(m2_37)));
-                    if (lane_0_1 == 5) {
-                        unsigned int _max_162 = ((mx) > (m_j_37) ? (mx) : (m_j_37));
-                        mx = _max_162;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_37) : "f"(_abs_194), "f"(_abs_195));
+                    a0[5] = m2_37;
+                    float _max_196;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_196) : "f"(lm_1), "f"(m2_37));
+                    lm_1 = _max_196;
                     int rj_38 = __shfl_sync(0xFFFFFFFF, roff, 6);
                     float scale_j_38 = __shfl_sync(0xFFFFFFFF, s_lat, 6);
                     long long idx_j_38 = (long long)(rj_38 + lat_col);
@@ -2379,18 +2509,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_38 = __float2int_rn(y1_38);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_38 + 256ll))), "r"(static_cast<int>(n0_38)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_38 + 384ll))), "r"(static_cast<int>(n1_38)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_163;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_163) : "f"(y0_38));
-                    float _abs_164;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_164) : "f"(y1_38));
+                    float _abs_197;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_197) : "f"(y0_38));
+                    float _abs_198;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_198) : "f"(y1_38));
                     float m2_38;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_38) : "f"(_abs_163), "f"(_abs_164));
-                    unsigned int m_j_38;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_38) : "r"(__as_u32(m2_38)));
-                    if (lane_0_1 == 6) {
-                        unsigned int _max_165 = ((mx) > (m_j_38) ? (mx) : (m_j_38));
-                        mx = _max_165;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_38) : "f"(_abs_197), "f"(_abs_198));
+                    a0[6] = m2_38;
+                    float _max_199;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_199) : "f"(lm_1), "f"(m2_38));
+                    lm_1 = _max_199;
                     int rj_39 = __shfl_sync(0xFFFFFFFF, roff, 7);
                     float scale_j_39 = __shfl_sync(0xFFFFFFFF, s_lat, 7);
                     long long idx_j_39 = (long long)(rj_39 + lat_col);
@@ -2400,18 +2528,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_39 = __float2int_rn(y1_39);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_39 + 256ll))), "r"(static_cast<int>(n0_39)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_39 + 384ll))), "r"(static_cast<int>(n1_39)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_166;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_166) : "f"(y0_39));
-                    float _abs_167;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_167) : "f"(y1_39));
+                    float _abs_200;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_200) : "f"(y0_39));
+                    float _abs_201;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_201) : "f"(y1_39));
                     float m2_39;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_39) : "f"(_abs_166), "f"(_abs_167));
-                    unsigned int m_j_39;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_39) : "r"(__as_u32(m2_39)));
-                    if (lane_0_1 == 7) {
-                        unsigned int _max_168 = ((mx) > (m_j_39) ? (mx) : (m_j_39));
-                        mx = _max_168;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_39) : "f"(_abs_200), "f"(_abs_201));
+                    a0[7] = m2_39;
+                    float _max_202;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_202) : "f"(lm_1), "f"(m2_39));
+                    lm_1 = _max_202;
                     int rj_40 = __shfl_sync(0xFFFFFFFF, roff, 8);
                     float scale_j_40 = __shfl_sync(0xFFFFFFFF, s_lat, 8);
                     long long idx_j_40 = (long long)(rj_40 + lat_col);
@@ -2421,18 +2547,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_40 = __float2int_rn(y1_40);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_40 + 256ll))), "r"(static_cast<int>(n0_40)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_40 + 384ll))), "r"(static_cast<int>(n1_40)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_169;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_169) : "f"(y0_40));
-                    float _abs_170;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_170) : "f"(y1_40));
+                    float _abs_203;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_203) : "f"(y0_40));
+                    float _abs_204;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_204) : "f"(y1_40));
                     float m2_40;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_40) : "f"(_abs_169), "f"(_abs_170));
-                    unsigned int m_j_40;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_40) : "r"(__as_u32(m2_40)));
-                    if (lane_0_1 == 8) {
-                        unsigned int _max_171 = ((mx) > (m_j_40) ? (mx) : (m_j_40));
-                        mx = _max_171;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_40) : "f"(_abs_203), "f"(_abs_204));
+                    a0[8] = m2_40;
+                    float _max_205;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_205) : "f"(lm_1), "f"(m2_40));
+                    lm_1 = _max_205;
                     int rj_41 = __shfl_sync(0xFFFFFFFF, roff, 9);
                     float scale_j_41 = __shfl_sync(0xFFFFFFFF, s_lat, 9);
                     long long idx_j_41 = (long long)(rj_41 + lat_col);
@@ -2442,18 +2566,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_41 = __float2int_rn(y1_41);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_41 + 256ll))), "r"(static_cast<int>(n0_41)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_41 + 384ll))), "r"(static_cast<int>(n1_41)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_172;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_172) : "f"(y0_41));
-                    float _abs_173;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_173) : "f"(y1_41));
+                    float _abs_206;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_206) : "f"(y0_41));
+                    float _abs_207;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_207) : "f"(y1_41));
                     float m2_41;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_41) : "f"(_abs_172), "f"(_abs_173));
-                    unsigned int m_j_41;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_41) : "r"(__as_u32(m2_41)));
-                    if (lane_0_1 == 9) {
-                        unsigned int _max_174 = ((mx) > (m_j_41) ? (mx) : (m_j_41));
-                        mx = _max_174;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_41) : "f"(_abs_206), "f"(_abs_207));
+                    a0[9] = m2_41;
+                    float _max_208;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_208) : "f"(lm_1), "f"(m2_41));
+                    lm_1 = _max_208;
                     int rj_42 = __shfl_sync(0xFFFFFFFF, roff, 10);
                     float scale_j_42 = __shfl_sync(0xFFFFFFFF, s_lat, 10);
                     long long idx_j_42 = (long long)(rj_42 + lat_col);
@@ -2463,18 +2585,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_42 = __float2int_rn(y1_42);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_42 + 256ll))), "r"(static_cast<int>(n0_42)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_42 + 384ll))), "r"(static_cast<int>(n1_42)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_175;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_175) : "f"(y0_42));
-                    float _abs_176;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_176) : "f"(y1_42));
+                    float _abs_209;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_209) : "f"(y0_42));
+                    float _abs_210;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_210) : "f"(y1_42));
                     float m2_42;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_42) : "f"(_abs_175), "f"(_abs_176));
-                    unsigned int m_j_42;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_42) : "r"(__as_u32(m2_42)));
-                    if (lane_0_1 == 10) {
-                        unsigned int _max_177 = ((mx) > (m_j_42) ? (mx) : (m_j_42));
-                        mx = _max_177;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_42) : "f"(_abs_209), "f"(_abs_210));
+                    a0[10] = m2_42;
+                    float _max_211;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_211) : "f"(lm_1), "f"(m2_42));
+                    lm_1 = _max_211;
                     int rj_43 = __shfl_sync(0xFFFFFFFF, roff, 11);
                     float scale_j_43 = __shfl_sync(0xFFFFFFFF, s_lat, 11);
                     long long idx_j_43 = (long long)(rj_43 + lat_col);
@@ -2484,18 +2604,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_43 = __float2int_rn(y1_43);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_43 + 256ll))), "r"(static_cast<int>(n0_43)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_43 + 384ll))), "r"(static_cast<int>(n1_43)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_178;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_178) : "f"(y0_43));
-                    float _abs_179;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_179) : "f"(y1_43));
+                    float _abs_212;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_212) : "f"(y0_43));
+                    float _abs_213;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_213) : "f"(y1_43));
                     float m2_43;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_43) : "f"(_abs_178), "f"(_abs_179));
-                    unsigned int m_j_43;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_43) : "r"(__as_u32(m2_43)));
-                    if (lane_0_1 == 11) {
-                        unsigned int _max_180 = ((mx) > (m_j_43) ? (mx) : (m_j_43));
-                        mx = _max_180;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_43) : "f"(_abs_212), "f"(_abs_213));
+                    a0[11] = m2_43;
+                    float _max_214;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_214) : "f"(lm_1), "f"(m2_43));
+                    lm_1 = _max_214;
                     int rj_44 = __shfl_sync(0xFFFFFFFF, roff, 12);
                     float scale_j_44 = __shfl_sync(0xFFFFFFFF, s_lat, 12);
                     long long idx_j_44 = (long long)(rj_44 + lat_col);
@@ -2505,18 +2623,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_44 = __float2int_rn(y1_44);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_44 + 256ll))), "r"(static_cast<int>(n0_44)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_44 + 384ll))), "r"(static_cast<int>(n1_44)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_181;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_181) : "f"(y0_44));
-                    float _abs_182;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_182) : "f"(y1_44));
+                    float _abs_215;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_215) : "f"(y0_44));
+                    float _abs_216;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_216) : "f"(y1_44));
                     float m2_44;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_44) : "f"(_abs_181), "f"(_abs_182));
-                    unsigned int m_j_44;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_44) : "r"(__as_u32(m2_44)));
-                    if (lane_0_1 == 12) {
-                        unsigned int _max_183 = ((mx) > (m_j_44) ? (mx) : (m_j_44));
-                        mx = _max_183;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_44) : "f"(_abs_215), "f"(_abs_216));
+                    a0[12] = m2_44;
+                    float _max_217;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_217) : "f"(lm_1), "f"(m2_44));
+                    lm_1 = _max_217;
                     int rj_45 = __shfl_sync(0xFFFFFFFF, roff, 13);
                     float scale_j_45 = __shfl_sync(0xFFFFFFFF, s_lat, 13);
                     long long idx_j_45 = (long long)(rj_45 + lat_col);
@@ -2526,18 +2642,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_45 = __float2int_rn(y1_45);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_45 + 256ll))), "r"(static_cast<int>(n0_45)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_45 + 384ll))), "r"(static_cast<int>(n1_45)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_184;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_184) : "f"(y0_45));
-                    float _abs_185;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_185) : "f"(y1_45));
+                    float _abs_218;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_218) : "f"(y0_45));
+                    float _abs_219;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_219) : "f"(y1_45));
                     float m2_45;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_45) : "f"(_abs_184), "f"(_abs_185));
-                    unsigned int m_j_45;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_45) : "r"(__as_u32(m2_45)));
-                    if (lane_0_1 == 13) {
-                        unsigned int _max_186 = ((mx) > (m_j_45) ? (mx) : (m_j_45));
-                        mx = _max_186;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_45) : "f"(_abs_218), "f"(_abs_219));
+                    a0[13] = m2_45;
+                    float _max_220;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_220) : "f"(lm_1), "f"(m2_45));
+                    lm_1 = _max_220;
                     int rj_46 = __shfl_sync(0xFFFFFFFF, roff, 14);
                     float scale_j_46 = __shfl_sync(0xFFFFFFFF, s_lat, 14);
                     long long idx_j_46 = (long long)(rj_46 + lat_col);
@@ -2547,18 +2661,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_46 = __float2int_rn(y1_46);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_46 + 256ll))), "r"(static_cast<int>(n0_46)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_46 + 384ll))), "r"(static_cast<int>(n1_46)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_187;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_187) : "f"(y0_46));
-                    float _abs_188;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_188) : "f"(y1_46));
+                    float _abs_221;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_221) : "f"(y0_46));
+                    float _abs_222;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_222) : "f"(y1_46));
                     float m2_46;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_46) : "f"(_abs_187), "f"(_abs_188));
-                    unsigned int m_j_46;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_46) : "r"(__as_u32(m2_46)));
-                    if (lane_0_1 == 14) {
-                        unsigned int _max_189 = ((mx) > (m_j_46) ? (mx) : (m_j_46));
-                        mx = _max_189;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_46) : "f"(_abs_221), "f"(_abs_222));
+                    a0[14] = m2_46;
+                    float _max_223;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_223) : "f"(lm_1), "f"(m2_46));
+                    lm_1 = _max_223;
                     int rj_47 = __shfl_sync(0xFFFFFFFF, roff, 15);
                     float scale_j_47 = __shfl_sync(0xFFFFFFFF, s_lat, 15);
                     long long idx_j_47 = (long long)(rj_47 + lat_col);
@@ -2568,18 +2680,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_47 = __float2int_rn(y1_47);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_47 + 256ll))), "r"(static_cast<int>(n0_47)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_47 + 384ll))), "r"(static_cast<int>(n1_47)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_190;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_190) : "f"(y0_47));
-                    float _abs_191;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_191) : "f"(y1_47));
+                    float _abs_224;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_224) : "f"(y0_47));
+                    float _abs_225;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_225) : "f"(y1_47));
                     float m2_47;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_47) : "f"(_abs_190), "f"(_abs_191));
-                    unsigned int m_j_47;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_47) : "r"(__as_u32(m2_47)));
-                    if (lane_0_1 == 15) {
-                        unsigned int _max_192 = ((mx) > (m_j_47) ? (mx) : (m_j_47));
-                        mx = _max_192;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_47) : "f"(_abs_224), "f"(_abs_225));
+                    a0[15] = m2_47;
+                    float _max_226;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_226) : "f"(lm_1), "f"(m2_47));
+                    lm_1 = _max_226;
                     int rj_48 = __shfl_sync(0xFFFFFFFF, roff, 16);
                     float scale_j_48 = __shfl_sync(0xFFFFFFFF, s_lat, 16);
                     long long idx_j_48 = (long long)(rj_48 + lat_col);
@@ -2589,18 +2699,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_48 = __float2int_rn(y1_48);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_48 + 256ll))), "r"(static_cast<int>(n0_48)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_48 + 384ll))), "r"(static_cast<int>(n1_48)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_193;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_193) : "f"(y0_48));
-                    float _abs_194;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_194) : "f"(y1_48));
+                    float _abs_227;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_227) : "f"(y0_48));
+                    float _abs_228;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_228) : "f"(y1_48));
                     float m2_48;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_48) : "f"(_abs_193), "f"(_abs_194));
-                    unsigned int m_j_48;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_48) : "r"(__as_u32(m2_48)));
-                    if (lane_0_1 == 16) {
-                        unsigned int _max_195 = ((mx) > (m_j_48) ? (mx) : (m_j_48));
-                        mx = _max_195;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_48) : "f"(_abs_227), "f"(_abs_228));
+                    a0[16] = m2_48;
+                    float _max_229;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_229) : "f"(lm_1), "f"(m2_48));
+                    lm_1 = _max_229;
                     int rj_49 = __shfl_sync(0xFFFFFFFF, roff, 17);
                     float scale_j_49 = __shfl_sync(0xFFFFFFFF, s_lat, 17);
                     long long idx_j_49 = (long long)(rj_49 + lat_col);
@@ -2610,18 +2718,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_49 = __float2int_rn(y1_49);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_49 + 256ll))), "r"(static_cast<int>(n0_49)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_49 + 384ll))), "r"(static_cast<int>(n1_49)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_196;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_196) : "f"(y0_49));
-                    float _abs_197;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_197) : "f"(y1_49));
+                    float _abs_230;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_230) : "f"(y0_49));
+                    float _abs_231;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_231) : "f"(y1_49));
                     float m2_49;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_49) : "f"(_abs_196), "f"(_abs_197));
-                    unsigned int m_j_49;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_49) : "r"(__as_u32(m2_49)));
-                    if (lane_0_1 == 17) {
-                        unsigned int _max_198 = ((mx) > (m_j_49) ? (mx) : (m_j_49));
-                        mx = _max_198;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_49) : "f"(_abs_230), "f"(_abs_231));
+                    a0[17] = m2_49;
+                    float _max_232;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_232) : "f"(lm_1), "f"(m2_49));
+                    lm_1 = _max_232;
                     int rj_50 = __shfl_sync(0xFFFFFFFF, roff, 18);
                     float scale_j_50 = __shfl_sync(0xFFFFFFFF, s_lat, 18);
                     long long idx_j_50 = (long long)(rj_50 + lat_col);
@@ -2631,18 +2737,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_50 = __float2int_rn(y1_50);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_50 + 256ll))), "r"(static_cast<int>(n0_50)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_50 + 384ll))), "r"(static_cast<int>(n1_50)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_199;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_199) : "f"(y0_50));
-                    float _abs_200;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_200) : "f"(y1_50));
+                    float _abs_233;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_233) : "f"(y0_50));
+                    float _abs_234;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_234) : "f"(y1_50));
                     float m2_50;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_50) : "f"(_abs_199), "f"(_abs_200));
-                    unsigned int m_j_50;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_50) : "r"(__as_u32(m2_50)));
-                    if (lane_0_1 == 18) {
-                        unsigned int _max_201 = ((mx) > (m_j_50) ? (mx) : (m_j_50));
-                        mx = _max_201;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_50) : "f"(_abs_233), "f"(_abs_234));
+                    a0[18] = m2_50;
+                    float _max_235;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_235) : "f"(lm_1), "f"(m2_50));
+                    lm_1 = _max_235;
                     int rj_51 = __shfl_sync(0xFFFFFFFF, roff, 19);
                     float scale_j_51 = __shfl_sync(0xFFFFFFFF, s_lat, 19);
                     long long idx_j_51 = (long long)(rj_51 + lat_col);
@@ -2652,18 +2756,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_51 = __float2int_rn(y1_51);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_51 + 256ll))), "r"(static_cast<int>(n0_51)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_51 + 384ll))), "r"(static_cast<int>(n1_51)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_202;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_202) : "f"(y0_51));
-                    float _abs_203;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_203) : "f"(y1_51));
+                    float _abs_236;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_236) : "f"(y0_51));
+                    float _abs_237;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_237) : "f"(y1_51));
                     float m2_51;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_51) : "f"(_abs_202), "f"(_abs_203));
-                    unsigned int m_j_51;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_51) : "r"(__as_u32(m2_51)));
-                    if (lane_0_1 == 19) {
-                        unsigned int _max_204 = ((mx) > (m_j_51) ? (mx) : (m_j_51));
-                        mx = _max_204;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_51) : "f"(_abs_236), "f"(_abs_237));
+                    a0[19] = m2_51;
+                    float _max_238;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_238) : "f"(lm_1), "f"(m2_51));
+                    lm_1 = _max_238;
                     int rj_52 = __shfl_sync(0xFFFFFFFF, roff, 20);
                     float scale_j_52 = __shfl_sync(0xFFFFFFFF, s_lat, 20);
                     long long idx_j_52 = (long long)(rj_52 + lat_col);
@@ -2673,18 +2775,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_52 = __float2int_rn(y1_52);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_52 + 256ll))), "r"(static_cast<int>(n0_52)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_52 + 384ll))), "r"(static_cast<int>(n1_52)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_205;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_205) : "f"(y0_52));
-                    float _abs_206;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_206) : "f"(y1_52));
+                    float _abs_239;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_239) : "f"(y0_52));
+                    float _abs_240;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_240) : "f"(y1_52));
                     float m2_52;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_52) : "f"(_abs_205), "f"(_abs_206));
-                    unsigned int m_j_52;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_52) : "r"(__as_u32(m2_52)));
-                    if (lane_0_1 == 20) {
-                        unsigned int _max_207 = ((mx) > (m_j_52) ? (mx) : (m_j_52));
-                        mx = _max_207;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_52) : "f"(_abs_239), "f"(_abs_240));
+                    a0[20] = m2_52;
+                    float _max_241;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_241) : "f"(lm_1), "f"(m2_52));
+                    lm_1 = _max_241;
                     int rj_53 = __shfl_sync(0xFFFFFFFF, roff, 21);
                     float scale_j_53 = __shfl_sync(0xFFFFFFFF, s_lat, 21);
                     long long idx_j_53 = (long long)(rj_53 + lat_col);
@@ -2694,18 +2794,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_53 = __float2int_rn(y1_53);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_53 + 256ll))), "r"(static_cast<int>(n0_53)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_53 + 384ll))), "r"(static_cast<int>(n1_53)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_208;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_208) : "f"(y0_53));
-                    float _abs_209;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_209) : "f"(y1_53));
+                    float _abs_242;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_242) : "f"(y0_53));
+                    float _abs_243;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_243) : "f"(y1_53));
                     float m2_53;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_53) : "f"(_abs_208), "f"(_abs_209));
-                    unsigned int m_j_53;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_53) : "r"(__as_u32(m2_53)));
-                    if (lane_0_1 == 21) {
-                        unsigned int _max_210 = ((mx) > (m_j_53) ? (mx) : (m_j_53));
-                        mx = _max_210;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_53) : "f"(_abs_242), "f"(_abs_243));
+                    a0[21] = m2_53;
+                    float _max_244;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_244) : "f"(lm_1), "f"(m2_53));
+                    lm_1 = _max_244;
                     int rj_54 = __shfl_sync(0xFFFFFFFF, roff, 22);
                     float scale_j_54 = __shfl_sync(0xFFFFFFFF, s_lat, 22);
                     long long idx_j_54 = (long long)(rj_54 + lat_col);
@@ -2715,18 +2813,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_54 = __float2int_rn(y1_54);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_54 + 256ll))), "r"(static_cast<int>(n0_54)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_54 + 384ll))), "r"(static_cast<int>(n1_54)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_211;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_211) : "f"(y0_54));
-                    float _abs_212;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_212) : "f"(y1_54));
+                    float _abs_245;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_245) : "f"(y0_54));
+                    float _abs_246;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_246) : "f"(y1_54));
                     float m2_54;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_54) : "f"(_abs_211), "f"(_abs_212));
-                    unsigned int m_j_54;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_54) : "r"(__as_u32(m2_54)));
-                    if (lane_0_1 == 22) {
-                        unsigned int _max_213 = ((mx) > (m_j_54) ? (mx) : (m_j_54));
-                        mx = _max_213;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_54) : "f"(_abs_245), "f"(_abs_246));
+                    a0[22] = m2_54;
+                    float _max_247;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_247) : "f"(lm_1), "f"(m2_54));
+                    lm_1 = _max_247;
                     int rj_55 = __shfl_sync(0xFFFFFFFF, roff, 23);
                     float scale_j_55 = __shfl_sync(0xFFFFFFFF, s_lat, 23);
                     long long idx_j_55 = (long long)(rj_55 + lat_col);
@@ -2736,18 +2832,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_55 = __float2int_rn(y1_55);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_55 + 256ll))), "r"(static_cast<int>(n0_55)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_55 + 384ll))), "r"(static_cast<int>(n1_55)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_214;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_214) : "f"(y0_55));
-                    float _abs_215;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_215) : "f"(y1_55));
+                    float _abs_248;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_248) : "f"(y0_55));
+                    float _abs_249;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_249) : "f"(y1_55));
                     float m2_55;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_55) : "f"(_abs_214), "f"(_abs_215));
-                    unsigned int m_j_55;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_55) : "r"(__as_u32(m2_55)));
-                    if (lane_0_1 == 23) {
-                        unsigned int _max_216 = ((mx) > (m_j_55) ? (mx) : (m_j_55));
-                        mx = _max_216;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_55) : "f"(_abs_248), "f"(_abs_249));
+                    a0[23] = m2_55;
+                    float _max_250;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_250) : "f"(lm_1), "f"(m2_55));
+                    lm_1 = _max_250;
                     int rj_56 = __shfl_sync(0xFFFFFFFF, roff, 24);
                     float scale_j_56 = __shfl_sync(0xFFFFFFFF, s_lat, 24);
                     long long idx_j_56 = (long long)(rj_56 + lat_col);
@@ -2757,18 +2851,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_56 = __float2int_rn(y1_56);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_56 + 256ll))), "r"(static_cast<int>(n0_56)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_56 + 384ll))), "r"(static_cast<int>(n1_56)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_217;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_217) : "f"(y0_56));
-                    float _abs_218;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_218) : "f"(y1_56));
+                    float _abs_251;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_251) : "f"(y0_56));
+                    float _abs_252;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_252) : "f"(y1_56));
                     float m2_56;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_56) : "f"(_abs_217), "f"(_abs_218));
-                    unsigned int m_j_56;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_56) : "r"(__as_u32(m2_56)));
-                    if (lane_0_1 == 24) {
-                        unsigned int _max_219 = ((mx) > (m_j_56) ? (mx) : (m_j_56));
-                        mx = _max_219;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_56) : "f"(_abs_251), "f"(_abs_252));
+                    a0[24] = m2_56;
+                    float _max_253;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_253) : "f"(lm_1), "f"(m2_56));
+                    lm_1 = _max_253;
                     int rj_57 = __shfl_sync(0xFFFFFFFF, roff, 25);
                     float scale_j_57 = __shfl_sync(0xFFFFFFFF, s_lat, 25);
                     long long idx_j_57 = (long long)(rj_57 + lat_col);
@@ -2778,18 +2870,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_57 = __float2int_rn(y1_57);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_57 + 256ll))), "r"(static_cast<int>(n0_57)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_57 + 384ll))), "r"(static_cast<int>(n1_57)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_220;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_220) : "f"(y0_57));
-                    float _abs_221;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_221) : "f"(y1_57));
+                    float _abs_254;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_254) : "f"(y0_57));
+                    float _abs_255;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_255) : "f"(y1_57));
                     float m2_57;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_57) : "f"(_abs_220), "f"(_abs_221));
-                    unsigned int m_j_57;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_57) : "r"(__as_u32(m2_57)));
-                    if (lane_0_1 == 25) {
-                        unsigned int _max_222 = ((mx) > (m_j_57) ? (mx) : (m_j_57));
-                        mx = _max_222;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_57) : "f"(_abs_254), "f"(_abs_255));
+                    a0[25] = m2_57;
+                    float _max_256;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_256) : "f"(lm_1), "f"(m2_57));
+                    lm_1 = _max_256;
                     int rj_58 = __shfl_sync(0xFFFFFFFF, roff, 26);
                     float scale_j_58 = __shfl_sync(0xFFFFFFFF, s_lat, 26);
                     long long idx_j_58 = (long long)(rj_58 + lat_col);
@@ -2799,18 +2889,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_58 = __float2int_rn(y1_58);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_58 + 256ll))), "r"(static_cast<int>(n0_58)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_58 + 384ll))), "r"(static_cast<int>(n1_58)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_223;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_223) : "f"(y0_58));
-                    float _abs_224;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_224) : "f"(y1_58));
+                    float _abs_257;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_257) : "f"(y0_58));
+                    float _abs_258;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_258) : "f"(y1_58));
                     float m2_58;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_58) : "f"(_abs_223), "f"(_abs_224));
-                    unsigned int m_j_58;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_58) : "r"(__as_u32(m2_58)));
-                    if (lane_0_1 == 26) {
-                        unsigned int _max_225 = ((mx) > (m_j_58) ? (mx) : (m_j_58));
-                        mx = _max_225;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_58) : "f"(_abs_257), "f"(_abs_258));
+                    a0[26] = m2_58;
+                    float _max_259;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_259) : "f"(lm_1), "f"(m2_58));
+                    lm_1 = _max_259;
                     int rj_59 = __shfl_sync(0xFFFFFFFF, roff, 27);
                     float scale_j_59 = __shfl_sync(0xFFFFFFFF, s_lat, 27);
                     long long idx_j_59 = (long long)(rj_59 + lat_col);
@@ -2820,18 +2908,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_59 = __float2int_rn(y1_59);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_59 + 256ll))), "r"(static_cast<int>(n0_59)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_59 + 384ll))), "r"(static_cast<int>(n1_59)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_226;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_226) : "f"(y0_59));
-                    float _abs_227;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_227) : "f"(y1_59));
+                    float _abs_260;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_260) : "f"(y0_59));
+                    float _abs_261;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_261) : "f"(y1_59));
                     float m2_59;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_59) : "f"(_abs_226), "f"(_abs_227));
-                    unsigned int m_j_59;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_59) : "r"(__as_u32(m2_59)));
-                    if (lane_0_1 == 27) {
-                        unsigned int _max_228 = ((mx) > (m_j_59) ? (mx) : (m_j_59));
-                        mx = _max_228;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_59) : "f"(_abs_260), "f"(_abs_261));
+                    a0[27] = m2_59;
+                    float _max_262;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_262) : "f"(lm_1), "f"(m2_59));
+                    lm_1 = _max_262;
                     int rj_60 = __shfl_sync(0xFFFFFFFF, roff, 28);
                     float scale_j_60 = __shfl_sync(0xFFFFFFFF, s_lat, 28);
                     long long idx_j_60 = (long long)(rj_60 + lat_col);
@@ -2841,18 +2927,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_60 = __float2int_rn(y1_60);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_60 + 256ll))), "r"(static_cast<int>(n0_60)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_60 + 384ll))), "r"(static_cast<int>(n1_60)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_229;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_229) : "f"(y0_60));
-                    float _abs_230;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_230) : "f"(y1_60));
+                    float _abs_263;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_263) : "f"(y0_60));
+                    float _abs_264;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_264) : "f"(y1_60));
                     float m2_60;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_60) : "f"(_abs_229), "f"(_abs_230));
-                    unsigned int m_j_60;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_60) : "r"(__as_u32(m2_60)));
-                    if (lane_0_1 == 28) {
-                        unsigned int _max_231 = ((mx) > (m_j_60) ? (mx) : (m_j_60));
-                        mx = _max_231;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_60) : "f"(_abs_263), "f"(_abs_264));
+                    a0[28] = m2_60;
+                    float _max_265;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_265) : "f"(lm_1), "f"(m2_60));
+                    lm_1 = _max_265;
                     int rj_61 = __shfl_sync(0xFFFFFFFF, roff, 29);
                     float scale_j_61 = __shfl_sync(0xFFFFFFFF, s_lat, 29);
                     long long idx_j_61 = (long long)(rj_61 + lat_col);
@@ -2862,18 +2946,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_61 = __float2int_rn(y1_61);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_61 + 256ll))), "r"(static_cast<int>(n0_61)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_61 + 384ll))), "r"(static_cast<int>(n1_61)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_232;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_232) : "f"(y0_61));
-                    float _abs_233;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_233) : "f"(y1_61));
+                    float _abs_266;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_266) : "f"(y0_61));
+                    float _abs_267;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_267) : "f"(y1_61));
                     float m2_61;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_61) : "f"(_abs_232), "f"(_abs_233));
-                    unsigned int m_j_61;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_61) : "r"(__as_u32(m2_61)));
-                    if (lane_0_1 == 29) {
-                        unsigned int _max_234 = ((mx) > (m_j_61) ? (mx) : (m_j_61));
-                        mx = _max_234;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_61) : "f"(_abs_266), "f"(_abs_267));
+                    a0[29] = m2_61;
+                    float _max_268;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_268) : "f"(lm_1), "f"(m2_61));
+                    lm_1 = _max_268;
                     int rj_62 = __shfl_sync(0xFFFFFFFF, roff, 30);
                     float scale_j_62 = __shfl_sync(0xFFFFFFFF, s_lat, 30);
                     long long idx_j_62 = (long long)(rj_62 + lat_col);
@@ -2883,18 +2965,16 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_62 = __float2int_rn(y1_62);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_62 + 256ll))), "r"(static_cast<int>(n0_62)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_62 + 384ll))), "r"(static_cast<int>(n1_62)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_235;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_235) : "f"(y0_62));
-                    float _abs_236;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_236) : "f"(y1_62));
+                    float _abs_269;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_269) : "f"(y0_62));
+                    float _abs_270;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_270) : "f"(y1_62));
                     float m2_62;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_62) : "f"(_abs_235), "f"(_abs_236));
-                    unsigned int m_j_62;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_62) : "r"(__as_u32(m2_62)));
-                    if (lane_0_1 == 30) {
-                        unsigned int _max_237 = ((mx) > (m_j_62) ? (mx) : (m_j_62));
-                        mx = _max_237;
-                    }
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_62) : "f"(_abs_269), "f"(_abs_270));
+                    a0[30] = m2_62;
+                    float _max_271;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_271) : "f"(lm_1), "f"(m2_62));
+                    lm_1 = _max_271;
                     int rj_63 = __shfl_sync(0xFFFFFFFF, roff, 31);
                     float scale_j_63 = __shfl_sync(0xFFFFFFFF, s_lat, 31);
                     long long idx_j_63 = (long long)(rj_63 + lat_col);
@@ -2904,17 +2984,211 @@ kernel_cake_dsa_h64_det_train_4487388f2950ac4f97a5(const __grid_constant__ CUten
                     int n1_63 = __float2int_rn(y1_63);
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_63 + 256ll))), "r"(static_cast<int>(n0_63)), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_j_63 + 384ll))), "r"(static_cast<int>(n1_63)), "l"(0x14F0000000000000ULL) : "memory");
-                    float _abs_238;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_238) : "f"(y0_63));
-                    float _abs_239;
-                    asm("abs.f32 %0, %1;" : "=f"(_abs_239) : "f"(y1_63));
+                    float _abs_272;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_272) : "f"(y0_63));
+                    float _abs_273;
+                    asm("abs.f32 %0, %1;" : "=f"(_abs_273) : "f"(y1_63));
                     float m2_63;
-                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_63) : "f"(_abs_238), "f"(_abs_239));
-                    unsigned int m_j_63;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_63) : "r"(__as_u32(m2_63)));
-                    if (lane_0_1 == 31) {
-                        unsigned int _max_240 = ((mx) > (m_j_63) ? (mx) : (m_j_63));
-                        mx = _max_240;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_63) : "f"(_abs_272), "f"(_abs_273));
+                    a0[31] = m2_63;
+                    float _max_274;
+                    asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_274) : "f"(lm_1), "f"(m2_63));
+                    lm_1 = _max_274;
+                    unsigned int _warp_redux_275;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_275) : "r"(__as_u32(lm_1)));
+                    if (_warp_redux_275 >= thr_w) {
+                        unsigned int m_j_32;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_32) : "r"(__as_u32(a0[0])));
+                        if (lane_0_1 == 0) {
+                            unsigned int _max_276 = ((mx) > (m_j_32) ? (mx) : (m_j_32));
+                            mx = _max_276;
+                        }
+                        unsigned int m_j_33;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_33) : "r"(__as_u32(a0[1])));
+                        if (lane_0_1 == 1) {
+                            unsigned int _max_277 = ((mx) > (m_j_33) ? (mx) : (m_j_33));
+                            mx = _max_277;
+                        }
+                        unsigned int m_j_34;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_34) : "r"(__as_u32(a0[2])));
+                        if (lane_0_1 == 2) {
+                            unsigned int _max_278 = ((mx) > (m_j_34) ? (mx) : (m_j_34));
+                            mx = _max_278;
+                        }
+                        unsigned int m_j_35;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_35) : "r"(__as_u32(a0[3])));
+                        if (lane_0_1 == 3) {
+                            unsigned int _max_279 = ((mx) > (m_j_35) ? (mx) : (m_j_35));
+                            mx = _max_279;
+                        }
+                        unsigned int m_j_36;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_36) : "r"(__as_u32(a0[4])));
+                        if (lane_0_1 == 4) {
+                            unsigned int _max_280 = ((mx) > (m_j_36) ? (mx) : (m_j_36));
+                            mx = _max_280;
+                        }
+                        unsigned int m_j_37;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_37) : "r"(__as_u32(a0[5])));
+                        if (lane_0_1 == 5) {
+                            unsigned int _max_281 = ((mx) > (m_j_37) ? (mx) : (m_j_37));
+                            mx = _max_281;
+                        }
+                        unsigned int m_j_38;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_38) : "r"(__as_u32(a0[6])));
+                        if (lane_0_1 == 6) {
+                            unsigned int _max_282 = ((mx) > (m_j_38) ? (mx) : (m_j_38));
+                            mx = _max_282;
+                        }
+                        unsigned int m_j_39;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_39) : "r"(__as_u32(a0[7])));
+                        if (lane_0_1 == 7) {
+                            unsigned int _max_283 = ((mx) > (m_j_39) ? (mx) : (m_j_39));
+                            mx = _max_283;
+                        }
+                        unsigned int m_j_40;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_40) : "r"(__as_u32(a0[8])));
+                        if (lane_0_1 == 8) {
+                            unsigned int _max_284 = ((mx) > (m_j_40) ? (mx) : (m_j_40));
+                            mx = _max_284;
+                        }
+                        unsigned int m_j_41;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_41) : "r"(__as_u32(a0[9])));
+                        if (lane_0_1 == 9) {
+                            unsigned int _max_285 = ((mx) > (m_j_41) ? (mx) : (m_j_41));
+                            mx = _max_285;
+                        }
+                        unsigned int m_j_42;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_42) : "r"(__as_u32(a0[10])));
+                        if (lane_0_1 == 10) {
+                            unsigned int _max_286 = ((mx) > (m_j_42) ? (mx) : (m_j_42));
+                            mx = _max_286;
+                        }
+                        unsigned int m_j_43;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_43) : "r"(__as_u32(a0[11])));
+                        if (lane_0_1 == 11) {
+                            unsigned int _max_287 = ((mx) > (m_j_43) ? (mx) : (m_j_43));
+                            mx = _max_287;
+                        }
+                        unsigned int m_j_44;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_44) : "r"(__as_u32(a0[12])));
+                        if (lane_0_1 == 12) {
+                            unsigned int _max_288 = ((mx) > (m_j_44) ? (mx) : (m_j_44));
+                            mx = _max_288;
+                        }
+                        unsigned int m_j_45;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_45) : "r"(__as_u32(a0[13])));
+                        if (lane_0_1 == 13) {
+                            unsigned int _max_289 = ((mx) > (m_j_45) ? (mx) : (m_j_45));
+                            mx = _max_289;
+                        }
+                        unsigned int m_j_46;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_46) : "r"(__as_u32(a0[14])));
+                        if (lane_0_1 == 14) {
+                            unsigned int _max_290 = ((mx) > (m_j_46) ? (mx) : (m_j_46));
+                            mx = _max_290;
+                        }
+                        unsigned int m_j_47;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_47) : "r"(__as_u32(a0[15])));
+                        if (lane_0_1 == 15) {
+                            unsigned int _max_291 = ((mx) > (m_j_47) ? (mx) : (m_j_47));
+                            mx = _max_291;
+                        }
+                        unsigned int m_j_48;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_48) : "r"(__as_u32(a0[16])));
+                        if (lane_0_1 == 16) {
+                            unsigned int _max_292 = ((mx) > (m_j_48) ? (mx) : (m_j_48));
+                            mx = _max_292;
+                        }
+                        unsigned int m_j_49;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_49) : "r"(__as_u32(a0[17])));
+                        if (lane_0_1 == 17) {
+                            unsigned int _max_293 = ((mx) > (m_j_49) ? (mx) : (m_j_49));
+                            mx = _max_293;
+                        }
+                        unsigned int m_j_50;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_50) : "r"(__as_u32(a0[18])));
+                        if (lane_0_1 == 18) {
+                            unsigned int _max_294 = ((mx) > (m_j_50) ? (mx) : (m_j_50));
+                            mx = _max_294;
+                        }
+                        unsigned int m_j_51;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_51) : "r"(__as_u32(a0[19])));
+                        if (lane_0_1 == 19) {
+                            unsigned int _max_295 = ((mx) > (m_j_51) ? (mx) : (m_j_51));
+                            mx = _max_295;
+                        }
+                        unsigned int m_j_52;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_52) : "r"(__as_u32(a0[20])));
+                        if (lane_0_1 == 20) {
+                            unsigned int _max_296 = ((mx) > (m_j_52) ? (mx) : (m_j_52));
+                            mx = _max_296;
+                        }
+                        unsigned int m_j_53;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_53) : "r"(__as_u32(a0[21])));
+                        if (lane_0_1 == 21) {
+                            unsigned int _max_297 = ((mx) > (m_j_53) ? (mx) : (m_j_53));
+                            mx = _max_297;
+                        }
+                        unsigned int m_j_54;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_54) : "r"(__as_u32(a0[22])));
+                        if (lane_0_1 == 22) {
+                            unsigned int _max_298 = ((mx) > (m_j_54) ? (mx) : (m_j_54));
+                            mx = _max_298;
+                        }
+                        unsigned int m_j_55;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_55) : "r"(__as_u32(a0[23])));
+                        if (lane_0_1 == 23) {
+                            unsigned int _max_299 = ((mx) > (m_j_55) ? (mx) : (m_j_55));
+                            mx = _max_299;
+                        }
+                        unsigned int m_j_56;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_56) : "r"(__as_u32(a0[24])));
+                        if (lane_0_1 == 24) {
+                            unsigned int _max_300 = ((mx) > (m_j_56) ? (mx) : (m_j_56));
+                            mx = _max_300;
+                        }
+                        unsigned int m_j_57;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_57) : "r"(__as_u32(a0[25])));
+                        if (lane_0_1 == 25) {
+                            unsigned int _max_301 = ((mx) > (m_j_57) ? (mx) : (m_j_57));
+                            mx = _max_301;
+                        }
+                        unsigned int m_j_58;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_58) : "r"(__as_u32(a0[26])));
+                        if (lane_0_1 == 26) {
+                            unsigned int _max_302 = ((mx) > (m_j_58) ? (mx) : (m_j_58));
+                            mx = _max_302;
+                        }
+                        unsigned int m_j_59;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_59) : "r"(__as_u32(a0[27])));
+                        if (lane_0_1 == 27) {
+                            unsigned int _max_303 = ((mx) > (m_j_59) ? (mx) : (m_j_59));
+                            mx = _max_303;
+                        }
+                        unsigned int m_j_60;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_60) : "r"(__as_u32(a0[28])));
+                        if (lane_0_1 == 28) {
+                            unsigned int _max_304 = ((mx) > (m_j_60) ? (mx) : (m_j_60));
+                            mx = _max_304;
+                        }
+                        unsigned int m_j_61;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_61) : "r"(__as_u32(a0[29])));
+                        if (lane_0_1 == 29) {
+                            unsigned int _max_305 = ((mx) > (m_j_61) ? (mx) : (m_j_61));
+                            mx = _max_305;
+                        }
+                        unsigned int m_j_62;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_62) : "r"(__as_u32(a0[30])));
+                        if (lane_0_1 == 30) {
+                            unsigned int _max_306 = ((mx) > (m_j_62) ? (mx) : (m_j_62));
+                            mx = _max_306;
+                        }
+                        unsigned int m_j_63;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_j_63) : "r"(__as_u32(a0[31])));
+                        if (lane_0_1 == 31) {
+                            unsigned int _max_307 = ((mx) > (m_j_63) ? (mx) : (m_j_63));
+                            mx = _max_307;
+                        }
                     }
                     mx = mx;
                 }

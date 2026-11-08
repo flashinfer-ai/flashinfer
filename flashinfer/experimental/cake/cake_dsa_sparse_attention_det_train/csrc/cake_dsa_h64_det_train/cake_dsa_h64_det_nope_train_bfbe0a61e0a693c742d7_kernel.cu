@@ -332,11 +332,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
 
     // ---- Role: gather ----
     if (warp <= 3) {
-#if __CUDA_ARCH__ == 1070
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
-#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
-#endif
         { // gather_main
             int ntok = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
             int tord = 0;
@@ -1170,11 +1166,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
     }
     // ---- Role: reduce ----
     if (warp >= 8 && warp <= 15) {
-#if __CUDA_ARCH__ == 1070
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
-#else
         asm volatile("setmaxnreg.inc.sync.aligned.u32 112;");
-#endif
         { // reduce_main
             int ntok_2 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
             int tord_2 = 0;
@@ -1222,8 +1214,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         roff = row * dkv_stride;
                     }
                     unsigned int vmask = __ballot_sync(0xFFFFFFFF, row >= 0);
-                    int _find_first_set_0 = __ffs((int)vmask);
-                    int roff_v = __shfl_sync(0xFFFFFFFF, roff, _find_first_set_0 - 1 & 31);
+                    unsigned int thr_w = 0;
+                    unsigned int thr_l = 4294967295u;
+                    if (row >= 0) {
+                        thr_l = thr;
+                    }
+                    unsigned int _warp_redux_0;
+                    asm volatile("redux.sync.min.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_0) : "r"(thr_l));
+                    thr_w = _warp_redux_0;
+                    int _find_first_set_1 = __ffs((int)vmask);
+                    int roff_v = __shfl_sync(0xFFFFFFFF, roff, _find_first_set_1 - 1 & 31);
                     if (row < 0) {
                         roff = roff_v;
                     }
@@ -1262,6 +1262,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                     mbarrier_arrive(dkv_a_drained_addr);
                     unsigned int mx = 0;
                     if (vmask != 0) {
+                        float lm = 0.0f;
                         int rc_0 = __shfl_sync(0xFFFFFFFF, roff, 0);
                         float scale_c_0 = __shfl_sync(0xFFFFFFFF, s_dkv, 0);
                         long long idx_c_0 = (long long)(rc_0 + lat_col);
@@ -1271,18 +1272,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_0 = __float2int_rn(y1_0);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_0))), "r"(static_cast<int>(n0_0)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_0 + 128ll))), "r"(static_cast<int>(n1_0)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_1;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1) : "f"(y0_0));
-                        float _abs_2;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_2) : "f"(y1_0));
-                        float m2_0;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_0) : "f"(_abs_1), "f"(_abs_2));
-                        unsigned int m_c_0;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_0) : "r"(__as_u32(m2_0)));
-                        if (lane_0_1 == 0) {
-                            unsigned int _max_3 = ((mx) > (m_c_0) ? (mx) : (m_c_0));
-                            mx = _max_3;
-                        }
+                        float _abs_3;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_3) : "f"(y0_0));
+                        float _abs_4;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_4) : "f"(y1_0));
+                        float _max_2;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(_abs_3), "f"(_abs_4));
+                        a0[0] = _max_2;
+                        float _max_5;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_5) : "f"(lm), "f"(a0[0]));
+                        lm = _max_5;
                         int rc_1 = __shfl_sync(0xFFFFFFFF, roff, 1);
                         float scale_c_1 = __shfl_sync(0xFFFFFFFF, s_dkv, 1);
                         long long idx_c_1 = (long long)(rc_1 + lat_col);
@@ -1292,18 +1291,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_1 = __float2int_rn(y1_1);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_1))), "r"(static_cast<int>(n0_1)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_1 + 128ll))), "r"(static_cast<int>(n1_1)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_4;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_4) : "f"(y0_1));
-                        float _abs_5;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_5) : "f"(y1_1));
-                        float m2_1;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_1) : "f"(_abs_4), "f"(_abs_5));
-                        unsigned int m_c_1;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_1) : "r"(__as_u32(m2_1)));
-                        if (lane_0_1 == 1) {
-                            unsigned int _max_6 = ((mx) > (m_c_1) ? (mx) : (m_c_1));
-                            mx = _max_6;
-                        }
+                        float _abs_7;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_7) : "f"(y0_1));
+                        float _abs_8;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_8) : "f"(y1_1));
+                        float _max_6;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_6) : "f"(_abs_7), "f"(_abs_8));
+                        a0[1] = _max_6;
+                        float _max_9;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_9) : "f"(lm), "f"(a0[1]));
+                        lm = _max_9;
                         int rc_2 = __shfl_sync(0xFFFFFFFF, roff, 2);
                         float scale_c_2 = __shfl_sync(0xFFFFFFFF, s_dkv, 2);
                         long long idx_c_2 = (long long)(rc_2 + lat_col);
@@ -1313,18 +1310,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_2 = __float2int_rn(y1_2);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_2))), "r"(static_cast<int>(n0_2)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_2 + 128ll))), "r"(static_cast<int>(n1_2)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_7;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_7) : "f"(y0_2));
-                        float _abs_8;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_8) : "f"(y1_2));
-                        float m2_2;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_2) : "f"(_abs_7), "f"(_abs_8));
-                        unsigned int m_c_2;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_2) : "r"(__as_u32(m2_2)));
-                        if (lane_0_1 == 2) {
-                            unsigned int _max_9 = ((mx) > (m_c_2) ? (mx) : (m_c_2));
-                            mx = _max_9;
-                        }
+                        float _abs_11;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_11) : "f"(y0_2));
+                        float _abs_12;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_12) : "f"(y1_2));
+                        float _max_10;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_10) : "f"(_abs_11), "f"(_abs_12));
+                        a0[2] = _max_10;
+                        float _max_13;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_13) : "f"(lm), "f"(a0[2]));
+                        lm = _max_13;
                         int rc_3 = __shfl_sync(0xFFFFFFFF, roff, 3);
                         float scale_c_3 = __shfl_sync(0xFFFFFFFF, s_dkv, 3);
                         long long idx_c_3 = (long long)(rc_3 + lat_col);
@@ -1334,18 +1329,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_3 = __float2int_rn(y1_3);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_3))), "r"(static_cast<int>(n0_3)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_3 + 128ll))), "r"(static_cast<int>(n1_3)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_10;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_10) : "f"(y0_3));
-                        float _abs_11;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_11) : "f"(y1_3));
-                        float m2_3;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_3) : "f"(_abs_10), "f"(_abs_11));
-                        unsigned int m_c_3;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_3) : "r"(__as_u32(m2_3)));
-                        if (lane_0_1 == 3) {
-                            unsigned int _max_12 = ((mx) > (m_c_3) ? (mx) : (m_c_3));
-                            mx = _max_12;
-                        }
+                        float _abs_15;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_15) : "f"(y0_3));
+                        float _abs_16;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_16) : "f"(y1_3));
+                        float _max_14;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_14) : "f"(_abs_15), "f"(_abs_16));
+                        a0[3] = _max_14;
+                        float _max_17;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_17) : "f"(lm), "f"(a0[3]));
+                        lm = _max_17;
                         int rc_4 = __shfl_sync(0xFFFFFFFF, roff, 4);
                         float scale_c_4 = __shfl_sync(0xFFFFFFFF, s_dkv, 4);
                         long long idx_c_4 = (long long)(rc_4 + lat_col);
@@ -1355,18 +1348,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_4 = __float2int_rn(y1_4);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_4))), "r"(static_cast<int>(n0_4)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_4 + 128ll))), "r"(static_cast<int>(n1_4)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_13;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_13) : "f"(y0_4));
-                        float _abs_14;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_14) : "f"(y1_4));
-                        float m2_4;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_4) : "f"(_abs_13), "f"(_abs_14));
-                        unsigned int m_c_4;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_4) : "r"(__as_u32(m2_4)));
-                        if (lane_0_1 == 4) {
-                            unsigned int _max_15 = ((mx) > (m_c_4) ? (mx) : (m_c_4));
-                            mx = _max_15;
-                        }
+                        float _abs_19;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_19) : "f"(y0_4));
+                        float _abs_20;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_20) : "f"(y1_4));
+                        float _max_18;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_18) : "f"(_abs_19), "f"(_abs_20));
+                        a0[4] = _max_18;
+                        float _max_21;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_21) : "f"(lm), "f"(a0[4]));
+                        lm = _max_21;
                         int rc_5 = __shfl_sync(0xFFFFFFFF, roff, 5);
                         float scale_c_5 = __shfl_sync(0xFFFFFFFF, s_dkv, 5);
                         long long idx_c_5 = (long long)(rc_5 + lat_col);
@@ -1376,18 +1367,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_5 = __float2int_rn(y1_5);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_5))), "r"(static_cast<int>(n0_5)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_5 + 128ll))), "r"(static_cast<int>(n1_5)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_16;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_16) : "f"(y0_5));
-                        float _abs_17;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_17) : "f"(y1_5));
-                        float m2_5;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_5) : "f"(_abs_16), "f"(_abs_17));
-                        unsigned int m_c_5;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_5) : "r"(__as_u32(m2_5)));
-                        if (lane_0_1 == 5) {
-                            unsigned int _max_18 = ((mx) > (m_c_5) ? (mx) : (m_c_5));
-                            mx = _max_18;
-                        }
+                        float _abs_23;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_23) : "f"(y0_5));
+                        float _abs_24;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_24) : "f"(y1_5));
+                        float _max_22;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_22) : "f"(_abs_23), "f"(_abs_24));
+                        a0[5] = _max_22;
+                        float _max_25;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_25) : "f"(lm), "f"(a0[5]));
+                        lm = _max_25;
                         int rc_6 = __shfl_sync(0xFFFFFFFF, roff, 6);
                         float scale_c_6 = __shfl_sync(0xFFFFFFFF, s_dkv, 6);
                         long long idx_c_6 = (long long)(rc_6 + lat_col);
@@ -1397,18 +1386,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_6 = __float2int_rn(y1_6);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_6))), "r"(static_cast<int>(n0_6)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_6 + 128ll))), "r"(static_cast<int>(n1_6)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_19;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_19) : "f"(y0_6));
-                        float _abs_20;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_20) : "f"(y1_6));
-                        float m2_6;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_6) : "f"(_abs_19), "f"(_abs_20));
-                        unsigned int m_c_6;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_6) : "r"(__as_u32(m2_6)));
-                        if (lane_0_1 == 6) {
-                            unsigned int _max_21 = ((mx) > (m_c_6) ? (mx) : (m_c_6));
-                            mx = _max_21;
-                        }
+                        float _abs_27;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_27) : "f"(y0_6));
+                        float _abs_28;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_28) : "f"(y1_6));
+                        float _max_26;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_26) : "f"(_abs_27), "f"(_abs_28));
+                        a0[6] = _max_26;
+                        float _max_29;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_29) : "f"(lm), "f"(a0[6]));
+                        lm = _max_29;
                         int rc_7 = __shfl_sync(0xFFFFFFFF, roff, 7);
                         float scale_c_7 = __shfl_sync(0xFFFFFFFF, s_dkv, 7);
                         long long idx_c_7 = (long long)(rc_7 + lat_col);
@@ -1418,18 +1405,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_7 = __float2int_rn(y1_7);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_7))), "r"(static_cast<int>(n0_7)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_7 + 128ll))), "r"(static_cast<int>(n1_7)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_22;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_22) : "f"(y0_7));
-                        float _abs_23;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_23) : "f"(y1_7));
-                        float m2_7;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_7) : "f"(_abs_22), "f"(_abs_23));
-                        unsigned int m_c_7;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_7) : "r"(__as_u32(m2_7)));
-                        if (lane_0_1 == 7) {
-                            unsigned int _max_24 = ((mx) > (m_c_7) ? (mx) : (m_c_7));
-                            mx = _max_24;
-                        }
+                        float _abs_31;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_31) : "f"(y0_7));
+                        float _abs_32;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_32) : "f"(y1_7));
+                        float _max_30;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_30) : "f"(_abs_31), "f"(_abs_32));
+                        a0[7] = _max_30;
+                        float _max_33;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_33) : "f"(lm), "f"(a0[7]));
+                        lm = _max_33;
                         int rc_8 = __shfl_sync(0xFFFFFFFF, roff, 8);
                         float scale_c_8 = __shfl_sync(0xFFFFFFFF, s_dkv, 8);
                         long long idx_c_8 = (long long)(rc_8 + lat_col);
@@ -1439,18 +1424,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_8 = __float2int_rn(y1_8);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_8))), "r"(static_cast<int>(n0_8)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_8 + 128ll))), "r"(static_cast<int>(n1_8)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_25;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_25) : "f"(y0_8));
-                        float _abs_26;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_26) : "f"(y1_8));
-                        float m2_8;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_8) : "f"(_abs_25), "f"(_abs_26));
-                        unsigned int m_c_8;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_8) : "r"(__as_u32(m2_8)));
-                        if (lane_0_1 == 8) {
-                            unsigned int _max_27 = ((mx) > (m_c_8) ? (mx) : (m_c_8));
-                            mx = _max_27;
-                        }
+                        float _abs_35;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_35) : "f"(y0_8));
+                        float _abs_36;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_36) : "f"(y1_8));
+                        float _max_34;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_34) : "f"(_abs_35), "f"(_abs_36));
+                        a0[8] = _max_34;
+                        float _max_37;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_37) : "f"(lm), "f"(a0[8]));
+                        lm = _max_37;
                         int rc_9 = __shfl_sync(0xFFFFFFFF, roff, 9);
                         float scale_c_9 = __shfl_sync(0xFFFFFFFF, s_dkv, 9);
                         long long idx_c_9 = (long long)(rc_9 + lat_col);
@@ -1460,18 +1443,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_9 = __float2int_rn(y1_9);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_9))), "r"(static_cast<int>(n0_9)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_9 + 128ll))), "r"(static_cast<int>(n1_9)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_28;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_28) : "f"(y0_9));
-                        float _abs_29;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_29) : "f"(y1_9));
-                        float m2_9;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_9) : "f"(_abs_28), "f"(_abs_29));
-                        unsigned int m_c_9;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_9) : "r"(__as_u32(m2_9)));
-                        if (lane_0_1 == 9) {
-                            unsigned int _max_30 = ((mx) > (m_c_9) ? (mx) : (m_c_9));
-                            mx = _max_30;
-                        }
+                        float _abs_39;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_39) : "f"(y0_9));
+                        float _abs_40;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_40) : "f"(y1_9));
+                        float _max_38;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_38) : "f"(_abs_39), "f"(_abs_40));
+                        a0[9] = _max_38;
+                        float _max_41;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_41) : "f"(lm), "f"(a0[9]));
+                        lm = _max_41;
                         int rc_10 = __shfl_sync(0xFFFFFFFF, roff, 10);
                         float scale_c_10 = __shfl_sync(0xFFFFFFFF, s_dkv, 10);
                         long long idx_c_10 = (long long)(rc_10 + lat_col);
@@ -1481,18 +1462,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_10 = __float2int_rn(y1_10);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_10))), "r"(static_cast<int>(n0_10)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_10 + 128ll))), "r"(static_cast<int>(n1_10)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_31;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_31) : "f"(y0_10));
-                        float _abs_32;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_32) : "f"(y1_10));
-                        float m2_10;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_10) : "f"(_abs_31), "f"(_abs_32));
-                        unsigned int m_c_10;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_10) : "r"(__as_u32(m2_10)));
-                        if (lane_0_1 == 10) {
-                            unsigned int _max_33 = ((mx) > (m_c_10) ? (mx) : (m_c_10));
-                            mx = _max_33;
-                        }
+                        float _abs_43;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_43) : "f"(y0_10));
+                        float _abs_44;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_44) : "f"(y1_10));
+                        float _max_42;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_42) : "f"(_abs_43), "f"(_abs_44));
+                        a0[10] = _max_42;
+                        float _max_45;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_45) : "f"(lm), "f"(a0[10]));
+                        lm = _max_45;
                         int rc_11 = __shfl_sync(0xFFFFFFFF, roff, 11);
                         float scale_c_11 = __shfl_sync(0xFFFFFFFF, s_dkv, 11);
                         long long idx_c_11 = (long long)(rc_11 + lat_col);
@@ -1502,18 +1481,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_11 = __float2int_rn(y1_11);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_11))), "r"(static_cast<int>(n0_11)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_11 + 128ll))), "r"(static_cast<int>(n1_11)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_34;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_34) : "f"(y0_11));
-                        float _abs_35;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_35) : "f"(y1_11));
-                        float m2_11;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_11) : "f"(_abs_34), "f"(_abs_35));
-                        unsigned int m_c_11;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_11) : "r"(__as_u32(m2_11)));
-                        if (lane_0_1 == 11) {
-                            unsigned int _max_36 = ((mx) > (m_c_11) ? (mx) : (m_c_11));
-                            mx = _max_36;
-                        }
+                        float _abs_47;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_47) : "f"(y0_11));
+                        float _abs_48;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_48) : "f"(y1_11));
+                        float _max_46;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_46) : "f"(_abs_47), "f"(_abs_48));
+                        a0[11] = _max_46;
+                        float _max_49;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_49) : "f"(lm), "f"(a0[11]));
+                        lm = _max_49;
                         int rc_12 = __shfl_sync(0xFFFFFFFF, roff, 12);
                         float scale_c_12 = __shfl_sync(0xFFFFFFFF, s_dkv, 12);
                         long long idx_c_12 = (long long)(rc_12 + lat_col);
@@ -1523,18 +1500,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_12 = __float2int_rn(y1_12);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_12))), "r"(static_cast<int>(n0_12)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_12 + 128ll))), "r"(static_cast<int>(n1_12)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_37;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_37) : "f"(y0_12));
-                        float _abs_38;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_38) : "f"(y1_12));
-                        float m2_12;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_12) : "f"(_abs_37), "f"(_abs_38));
-                        unsigned int m_c_12;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_12) : "r"(__as_u32(m2_12)));
-                        if (lane_0_1 == 12) {
-                            unsigned int _max_39 = ((mx) > (m_c_12) ? (mx) : (m_c_12));
-                            mx = _max_39;
-                        }
+                        float _abs_51;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_51) : "f"(y0_12));
+                        float _abs_52;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_52) : "f"(y1_12));
+                        float _max_50;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_50) : "f"(_abs_51), "f"(_abs_52));
+                        a0[12] = _max_50;
+                        float _max_53;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_53) : "f"(lm), "f"(a0[12]));
+                        lm = _max_53;
                         int rc_13 = __shfl_sync(0xFFFFFFFF, roff, 13);
                         float scale_c_13 = __shfl_sync(0xFFFFFFFF, s_dkv, 13);
                         long long idx_c_13 = (long long)(rc_13 + lat_col);
@@ -1544,18 +1519,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_13 = __float2int_rn(y1_13);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_13))), "r"(static_cast<int>(n0_13)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_13 + 128ll))), "r"(static_cast<int>(n1_13)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_40;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_40) : "f"(y0_13));
-                        float _abs_41;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_41) : "f"(y1_13));
-                        float m2_13;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_13) : "f"(_abs_40), "f"(_abs_41));
-                        unsigned int m_c_13;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_13) : "r"(__as_u32(m2_13)));
-                        if (lane_0_1 == 13) {
-                            unsigned int _max_42 = ((mx) > (m_c_13) ? (mx) : (m_c_13));
-                            mx = _max_42;
-                        }
+                        float _abs_55;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_55) : "f"(y0_13));
+                        float _abs_56;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_56) : "f"(y1_13));
+                        float _max_54;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_54) : "f"(_abs_55), "f"(_abs_56));
+                        a0[13] = _max_54;
+                        float _max_57;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_57) : "f"(lm), "f"(a0[13]));
+                        lm = _max_57;
                         int rc_14 = __shfl_sync(0xFFFFFFFF, roff, 14);
                         float scale_c_14 = __shfl_sync(0xFFFFFFFF, s_dkv, 14);
                         long long idx_c_14 = (long long)(rc_14 + lat_col);
@@ -1565,18 +1538,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_14 = __float2int_rn(y1_14);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_14))), "r"(static_cast<int>(n0_14)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_14 + 128ll))), "r"(static_cast<int>(n1_14)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_43;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_43) : "f"(y0_14));
-                        float _abs_44;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_44) : "f"(y1_14));
-                        float m2_14;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_14) : "f"(_abs_43), "f"(_abs_44));
-                        unsigned int m_c_14;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_14) : "r"(__as_u32(m2_14)));
-                        if (lane_0_1 == 14) {
-                            unsigned int _max_45 = ((mx) > (m_c_14) ? (mx) : (m_c_14));
-                            mx = _max_45;
-                        }
+                        float _abs_59;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_59) : "f"(y0_14));
+                        float _abs_60;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_60) : "f"(y1_14));
+                        float _max_58;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_58) : "f"(_abs_59), "f"(_abs_60));
+                        a0[14] = _max_58;
+                        float _max_61;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_61) : "f"(lm), "f"(a0[14]));
+                        lm = _max_61;
                         int rc_15 = __shfl_sync(0xFFFFFFFF, roff, 15);
                         float scale_c_15 = __shfl_sync(0xFFFFFFFF, s_dkv, 15);
                         long long idx_c_15 = (long long)(rc_15 + lat_col);
@@ -1586,18 +1557,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_15 = __float2int_rn(y1_15);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_15))), "r"(static_cast<int>(n0_15)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_15 + 128ll))), "r"(static_cast<int>(n1_15)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_46;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_46) : "f"(y0_15));
-                        float _abs_47;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_47) : "f"(y1_15));
-                        float m2_15;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_15) : "f"(_abs_46), "f"(_abs_47));
-                        unsigned int m_c_15;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_15) : "r"(__as_u32(m2_15)));
-                        if (lane_0_1 == 15) {
-                            unsigned int _max_48 = ((mx) > (m_c_15) ? (mx) : (m_c_15));
-                            mx = _max_48;
-                        }
+                        float _abs_63;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_63) : "f"(y0_15));
+                        float _abs_64;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_64) : "f"(y1_15));
+                        float _max_62;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_62) : "f"(_abs_63), "f"(_abs_64));
+                        a0[15] = _max_62;
+                        float _max_65;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_65) : "f"(lm), "f"(a0[15]));
+                        lm = _max_65;
                         int rc_16 = __shfl_sync(0xFFFFFFFF, roff, 16);
                         float scale_c_16 = __shfl_sync(0xFFFFFFFF, s_dkv, 16);
                         long long idx_c_16 = (long long)(rc_16 + lat_col);
@@ -1607,18 +1576,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_16 = __float2int_rn(y1_16);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_16))), "r"(static_cast<int>(n0_16)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_16 + 128ll))), "r"(static_cast<int>(n1_16)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_49;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_49) : "f"(y0_16));
-                        float _abs_50;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_50) : "f"(y1_16));
-                        float m2_16;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_16) : "f"(_abs_49), "f"(_abs_50));
-                        unsigned int m_c_16;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_16) : "r"(__as_u32(m2_16)));
-                        if (lane_0_1 == 16) {
-                            unsigned int _max_51 = ((mx) > (m_c_16) ? (mx) : (m_c_16));
-                            mx = _max_51;
-                        }
+                        float _abs_67;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_67) : "f"(y0_16));
+                        float _abs_68;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_68) : "f"(y1_16));
+                        float _max_66;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_66) : "f"(_abs_67), "f"(_abs_68));
+                        a0[16] = _max_66;
+                        float _max_69;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_69) : "f"(lm), "f"(a0[16]));
+                        lm = _max_69;
                         int rc_17 = __shfl_sync(0xFFFFFFFF, roff, 17);
                         float scale_c_17 = __shfl_sync(0xFFFFFFFF, s_dkv, 17);
                         long long idx_c_17 = (long long)(rc_17 + lat_col);
@@ -1628,18 +1595,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_17 = __float2int_rn(y1_17);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_17))), "r"(static_cast<int>(n0_17)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_17 + 128ll))), "r"(static_cast<int>(n1_17)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_52;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_52) : "f"(y0_17));
-                        float _abs_53;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_53) : "f"(y1_17));
-                        float m2_17;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_17) : "f"(_abs_52), "f"(_abs_53));
-                        unsigned int m_c_17;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_17) : "r"(__as_u32(m2_17)));
-                        if (lane_0_1 == 17) {
-                            unsigned int _max_54 = ((mx) > (m_c_17) ? (mx) : (m_c_17));
-                            mx = _max_54;
-                        }
+                        float _abs_71;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_71) : "f"(y0_17));
+                        float _abs_72;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_72) : "f"(y1_17));
+                        float _max_70;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_70) : "f"(_abs_71), "f"(_abs_72));
+                        a0[17] = _max_70;
+                        float _max_73;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_73) : "f"(lm), "f"(a0[17]));
+                        lm = _max_73;
                         int rc_18 = __shfl_sync(0xFFFFFFFF, roff, 18);
                         float scale_c_18 = __shfl_sync(0xFFFFFFFF, s_dkv, 18);
                         long long idx_c_18 = (long long)(rc_18 + lat_col);
@@ -1649,18 +1614,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_18 = __float2int_rn(y1_18);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_18))), "r"(static_cast<int>(n0_18)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_18 + 128ll))), "r"(static_cast<int>(n1_18)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_55;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_55) : "f"(y0_18));
-                        float _abs_56;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_56) : "f"(y1_18));
-                        float m2_18;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_18) : "f"(_abs_55), "f"(_abs_56));
-                        unsigned int m_c_18;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_18) : "r"(__as_u32(m2_18)));
-                        if (lane_0_1 == 18) {
-                            unsigned int _max_57 = ((mx) > (m_c_18) ? (mx) : (m_c_18));
-                            mx = _max_57;
-                        }
+                        float _abs_75;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_75) : "f"(y0_18));
+                        float _abs_76;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_76) : "f"(y1_18));
+                        float _max_74;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_74) : "f"(_abs_75), "f"(_abs_76));
+                        a0[18] = _max_74;
+                        float _max_77;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_77) : "f"(lm), "f"(a0[18]));
+                        lm = _max_77;
                         int rc_19 = __shfl_sync(0xFFFFFFFF, roff, 19);
                         float scale_c_19 = __shfl_sync(0xFFFFFFFF, s_dkv, 19);
                         long long idx_c_19 = (long long)(rc_19 + lat_col);
@@ -1670,18 +1633,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_19 = __float2int_rn(y1_19);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_19))), "r"(static_cast<int>(n0_19)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_19 + 128ll))), "r"(static_cast<int>(n1_19)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_58;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_58) : "f"(y0_19));
-                        float _abs_59;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_59) : "f"(y1_19));
-                        float m2_19;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_19) : "f"(_abs_58), "f"(_abs_59));
-                        unsigned int m_c_19;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_19) : "r"(__as_u32(m2_19)));
-                        if (lane_0_1 == 19) {
-                            unsigned int _max_60 = ((mx) > (m_c_19) ? (mx) : (m_c_19));
-                            mx = _max_60;
-                        }
+                        float _abs_79;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_79) : "f"(y0_19));
+                        float _abs_80;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_80) : "f"(y1_19));
+                        float _max_78;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_78) : "f"(_abs_79), "f"(_abs_80));
+                        a0[19] = _max_78;
+                        float _max_81;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_81) : "f"(lm), "f"(a0[19]));
+                        lm = _max_81;
                         int rc_20 = __shfl_sync(0xFFFFFFFF, roff, 20);
                         float scale_c_20 = __shfl_sync(0xFFFFFFFF, s_dkv, 20);
                         long long idx_c_20 = (long long)(rc_20 + lat_col);
@@ -1691,18 +1652,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_20 = __float2int_rn(y1_20);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_20))), "r"(static_cast<int>(n0_20)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_20 + 128ll))), "r"(static_cast<int>(n1_20)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_61;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_61) : "f"(y0_20));
-                        float _abs_62;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_62) : "f"(y1_20));
-                        float m2_20;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_20) : "f"(_abs_61), "f"(_abs_62));
-                        unsigned int m_c_20;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_20) : "r"(__as_u32(m2_20)));
-                        if (lane_0_1 == 20) {
-                            unsigned int _max_63 = ((mx) > (m_c_20) ? (mx) : (m_c_20));
-                            mx = _max_63;
-                        }
+                        float _abs_83;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_83) : "f"(y0_20));
+                        float _abs_84;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_84) : "f"(y1_20));
+                        float _max_82;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_82) : "f"(_abs_83), "f"(_abs_84));
+                        a0[20] = _max_82;
+                        float _max_85;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_85) : "f"(lm), "f"(a0[20]));
+                        lm = _max_85;
                         int rc_21 = __shfl_sync(0xFFFFFFFF, roff, 21);
                         float scale_c_21 = __shfl_sync(0xFFFFFFFF, s_dkv, 21);
                         long long idx_c_21 = (long long)(rc_21 + lat_col);
@@ -1712,18 +1671,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_21 = __float2int_rn(y1_21);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_21))), "r"(static_cast<int>(n0_21)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_21 + 128ll))), "r"(static_cast<int>(n1_21)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_64;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_64) : "f"(y0_21));
-                        float _abs_65;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_65) : "f"(y1_21));
-                        float m2_21;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_21) : "f"(_abs_64), "f"(_abs_65));
-                        unsigned int m_c_21;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_21) : "r"(__as_u32(m2_21)));
-                        if (lane_0_1 == 21) {
-                            unsigned int _max_66 = ((mx) > (m_c_21) ? (mx) : (m_c_21));
-                            mx = _max_66;
-                        }
+                        float _abs_87;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_87) : "f"(y0_21));
+                        float _abs_88;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_88) : "f"(y1_21));
+                        float _max_86;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_86) : "f"(_abs_87), "f"(_abs_88));
+                        a0[21] = _max_86;
+                        float _max_89;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_89) : "f"(lm), "f"(a0[21]));
+                        lm = _max_89;
                         int rc_22 = __shfl_sync(0xFFFFFFFF, roff, 22);
                         float scale_c_22 = __shfl_sync(0xFFFFFFFF, s_dkv, 22);
                         long long idx_c_22 = (long long)(rc_22 + lat_col);
@@ -1733,18 +1690,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_22 = __float2int_rn(y1_22);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_22))), "r"(static_cast<int>(n0_22)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_22 + 128ll))), "r"(static_cast<int>(n1_22)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_67;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_67) : "f"(y0_22));
-                        float _abs_68;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_68) : "f"(y1_22));
-                        float m2_22;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_22) : "f"(_abs_67), "f"(_abs_68));
-                        unsigned int m_c_22;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_22) : "r"(__as_u32(m2_22)));
-                        if (lane_0_1 == 22) {
-                            unsigned int _max_69 = ((mx) > (m_c_22) ? (mx) : (m_c_22));
-                            mx = _max_69;
-                        }
+                        float _abs_91;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_91) : "f"(y0_22));
+                        float _abs_92;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_92) : "f"(y1_22));
+                        float _max_90;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_90) : "f"(_abs_91), "f"(_abs_92));
+                        a0[22] = _max_90;
+                        float _max_93;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_93) : "f"(lm), "f"(a0[22]));
+                        lm = _max_93;
                         int rc_23 = __shfl_sync(0xFFFFFFFF, roff, 23);
                         float scale_c_23 = __shfl_sync(0xFFFFFFFF, s_dkv, 23);
                         long long idx_c_23 = (long long)(rc_23 + lat_col);
@@ -1754,18 +1709,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_23 = __float2int_rn(y1_23);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_23))), "r"(static_cast<int>(n0_23)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_23 + 128ll))), "r"(static_cast<int>(n1_23)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_70;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_70) : "f"(y0_23));
-                        float _abs_71;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_71) : "f"(y1_23));
-                        float m2_23;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_23) : "f"(_abs_70), "f"(_abs_71));
-                        unsigned int m_c_23;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_23) : "r"(__as_u32(m2_23)));
-                        if (lane_0_1 == 23) {
-                            unsigned int _max_72 = ((mx) > (m_c_23) ? (mx) : (m_c_23));
-                            mx = _max_72;
-                        }
+                        float _abs_95;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_95) : "f"(y0_23));
+                        float _abs_96;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_96) : "f"(y1_23));
+                        float _max_94;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_94) : "f"(_abs_95), "f"(_abs_96));
+                        a0[23] = _max_94;
+                        float _max_97;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_97) : "f"(lm), "f"(a0[23]));
+                        lm = _max_97;
                         int rc_24 = __shfl_sync(0xFFFFFFFF, roff, 24);
                         float scale_c_24 = __shfl_sync(0xFFFFFFFF, s_dkv, 24);
                         long long idx_c_24 = (long long)(rc_24 + lat_col);
@@ -1775,18 +1728,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_24 = __float2int_rn(y1_24);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_24))), "r"(static_cast<int>(n0_24)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_24 + 128ll))), "r"(static_cast<int>(n1_24)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_73;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_73) : "f"(y0_24));
-                        float _abs_74;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_74) : "f"(y1_24));
-                        float m2_24;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_24) : "f"(_abs_73), "f"(_abs_74));
-                        unsigned int m_c_24;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_24) : "r"(__as_u32(m2_24)));
-                        if (lane_0_1 == 24) {
-                            unsigned int _max_75 = ((mx) > (m_c_24) ? (mx) : (m_c_24));
-                            mx = _max_75;
-                        }
+                        float _abs_99;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_99) : "f"(y0_24));
+                        float _abs_100;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_100) : "f"(y1_24));
+                        float _max_98;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_98) : "f"(_abs_99), "f"(_abs_100));
+                        a0[24] = _max_98;
+                        float _max_101;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_101) : "f"(lm), "f"(a0[24]));
+                        lm = _max_101;
                         int rc_25 = __shfl_sync(0xFFFFFFFF, roff, 25);
                         float scale_c_25 = __shfl_sync(0xFFFFFFFF, s_dkv, 25);
                         long long idx_c_25 = (long long)(rc_25 + lat_col);
@@ -1796,18 +1747,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_25 = __float2int_rn(y1_25);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_25))), "r"(static_cast<int>(n0_25)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_25 + 128ll))), "r"(static_cast<int>(n1_25)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_76;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_76) : "f"(y0_25));
-                        float _abs_77;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_77) : "f"(y1_25));
-                        float m2_25;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_25) : "f"(_abs_76), "f"(_abs_77));
-                        unsigned int m_c_25;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_25) : "r"(__as_u32(m2_25)));
-                        if (lane_0_1 == 25) {
-                            unsigned int _max_78 = ((mx) > (m_c_25) ? (mx) : (m_c_25));
-                            mx = _max_78;
-                        }
+                        float _abs_103;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_103) : "f"(y0_25));
+                        float _abs_104;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_104) : "f"(y1_25));
+                        float _max_102;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_102) : "f"(_abs_103), "f"(_abs_104));
+                        a0[25] = _max_102;
+                        float _max_105;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_105) : "f"(lm), "f"(a0[25]));
+                        lm = _max_105;
                         int rc_26 = __shfl_sync(0xFFFFFFFF, roff, 26);
                         float scale_c_26 = __shfl_sync(0xFFFFFFFF, s_dkv, 26);
                         long long idx_c_26 = (long long)(rc_26 + lat_col);
@@ -1817,18 +1766,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_26 = __float2int_rn(y1_26);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_26))), "r"(static_cast<int>(n0_26)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_26 + 128ll))), "r"(static_cast<int>(n1_26)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_79;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_79) : "f"(y0_26));
-                        float _abs_80;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_80) : "f"(y1_26));
-                        float m2_26;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_26) : "f"(_abs_79), "f"(_abs_80));
-                        unsigned int m_c_26;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_26) : "r"(__as_u32(m2_26)));
-                        if (lane_0_1 == 26) {
-                            unsigned int _max_81 = ((mx) > (m_c_26) ? (mx) : (m_c_26));
-                            mx = _max_81;
-                        }
+                        float _abs_107;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_107) : "f"(y0_26));
+                        float _abs_108;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_108) : "f"(y1_26));
+                        float _max_106;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_106) : "f"(_abs_107), "f"(_abs_108));
+                        a0[26] = _max_106;
+                        float _max_109;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_109) : "f"(lm), "f"(a0[26]));
+                        lm = _max_109;
                         int rc_27 = __shfl_sync(0xFFFFFFFF, roff, 27);
                         float scale_c_27 = __shfl_sync(0xFFFFFFFF, s_dkv, 27);
                         long long idx_c_27 = (long long)(rc_27 + lat_col);
@@ -1838,18 +1785,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_27 = __float2int_rn(y1_27);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_27))), "r"(static_cast<int>(n0_27)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_27 + 128ll))), "r"(static_cast<int>(n1_27)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_82;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_82) : "f"(y0_27));
-                        float _abs_83;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_83) : "f"(y1_27));
-                        float m2_27;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_27) : "f"(_abs_82), "f"(_abs_83));
-                        unsigned int m_c_27;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_27) : "r"(__as_u32(m2_27)));
-                        if (lane_0_1 == 27) {
-                            unsigned int _max_84 = ((mx) > (m_c_27) ? (mx) : (m_c_27));
-                            mx = _max_84;
-                        }
+                        float _abs_111;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_111) : "f"(y0_27));
+                        float _abs_112;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_112) : "f"(y1_27));
+                        float _max_110;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_110) : "f"(_abs_111), "f"(_abs_112));
+                        a0[27] = _max_110;
+                        float _max_113;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_113) : "f"(lm), "f"(a0[27]));
+                        lm = _max_113;
                         int rc_28 = __shfl_sync(0xFFFFFFFF, roff, 28);
                         float scale_c_28 = __shfl_sync(0xFFFFFFFF, s_dkv, 28);
                         long long idx_c_28 = (long long)(rc_28 + lat_col);
@@ -1859,18 +1804,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_28 = __float2int_rn(y1_28);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_28))), "r"(static_cast<int>(n0_28)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_28 + 128ll))), "r"(static_cast<int>(n1_28)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_85;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_85) : "f"(y0_28));
-                        float _abs_86;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_86) : "f"(y1_28));
-                        float m2_28;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_28) : "f"(_abs_85), "f"(_abs_86));
-                        unsigned int m_c_28;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_28) : "r"(__as_u32(m2_28)));
-                        if (lane_0_1 == 28) {
-                            unsigned int _max_87 = ((mx) > (m_c_28) ? (mx) : (m_c_28));
-                            mx = _max_87;
-                        }
+                        float _abs_115;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_115) : "f"(y0_28));
+                        float _abs_116;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_116) : "f"(y1_28));
+                        float _max_114;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_114) : "f"(_abs_115), "f"(_abs_116));
+                        a0[28] = _max_114;
+                        float _max_117;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_117) : "f"(lm), "f"(a0[28]));
+                        lm = _max_117;
                         int rc_29 = __shfl_sync(0xFFFFFFFF, roff, 29);
                         float scale_c_29 = __shfl_sync(0xFFFFFFFF, s_dkv, 29);
                         long long idx_c_29 = (long long)(rc_29 + lat_col);
@@ -1880,18 +1823,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_29 = __float2int_rn(y1_29);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_29))), "r"(static_cast<int>(n0_29)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_29 + 128ll))), "r"(static_cast<int>(n1_29)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_88;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_88) : "f"(y0_29));
-                        float _abs_89;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_89) : "f"(y1_29));
-                        float m2_29;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_29) : "f"(_abs_88), "f"(_abs_89));
-                        unsigned int m_c_29;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_29) : "r"(__as_u32(m2_29)));
-                        if (lane_0_1 == 29) {
-                            unsigned int _max_90 = ((mx) > (m_c_29) ? (mx) : (m_c_29));
-                            mx = _max_90;
-                        }
+                        float _abs_119;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_119) : "f"(y0_29));
+                        float _abs_120;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_120) : "f"(y1_29));
+                        float _max_118;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_118) : "f"(_abs_119), "f"(_abs_120));
+                        a0[29] = _max_118;
+                        float _max_121;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_121) : "f"(lm), "f"(a0[29]));
+                        lm = _max_121;
                         int rc_30 = __shfl_sync(0xFFFFFFFF, roff, 30);
                         float scale_c_30 = __shfl_sync(0xFFFFFFFF, s_dkv, 30);
                         long long idx_c_30 = (long long)(rc_30 + lat_col);
@@ -1901,18 +1842,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_30 = __float2int_rn(y1_30);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_30))), "r"(static_cast<int>(n0_30)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_30 + 128ll))), "r"(static_cast<int>(n1_30)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_91;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_91) : "f"(y0_30));
-                        float _abs_92;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_92) : "f"(y1_30));
-                        float m2_30;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_30) : "f"(_abs_91), "f"(_abs_92));
-                        unsigned int m_c_30;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_30) : "r"(__as_u32(m2_30)));
-                        if (lane_0_1 == 30) {
-                            unsigned int _max_93 = ((mx) > (m_c_30) ? (mx) : (m_c_30));
-                            mx = _max_93;
-                        }
+                        float _abs_123;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_123) : "f"(y0_30));
+                        float _abs_124;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_124) : "f"(y1_30));
+                        float _max_122;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_122) : "f"(_abs_123), "f"(_abs_124));
+                        a0[30] = _max_122;
+                        float _max_125;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_125) : "f"(lm), "f"(a0[30]));
+                        lm = _max_125;
                         int rc_31 = __shfl_sync(0xFFFFFFFF, roff, 31);
                         float scale_c_31 = __shfl_sync(0xFFFFFFFF, s_dkv, 31);
                         long long idx_c_31 = (long long)(rc_31 + lat_col);
@@ -1922,17 +1861,211 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_31 = __float2int_rn(y1_31);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_31))), "r"(static_cast<int>(n0_31)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_31 + 128ll))), "r"(static_cast<int>(n1_31)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_94;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_94) : "f"(y0_31));
-                        float _abs_95;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_95) : "f"(y1_31));
-                        float m2_31;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_31) : "f"(_abs_94), "f"(_abs_95));
-                        unsigned int m_c_31;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_31) : "r"(__as_u32(m2_31)));
-                        if (lane_0_1 == 31) {
-                            unsigned int _max_96 = ((mx) > (m_c_31) ? (mx) : (m_c_31));
-                            mx = _max_96;
+                        float _abs_127;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_127) : "f"(y0_31));
+                        float _abs_128;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_128) : "f"(y1_31));
+                        float _max_126;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_126) : "f"(_abs_127), "f"(_abs_128));
+                        a0[31] = _max_126;
+                        float _max_129;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_129) : "f"(lm), "f"(a0[31]));
+                        lm = _max_129;
+                        unsigned int _warp_redux_130;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_130) : "r"(__as_u32(lm)));
+                        if (_warp_redux_130 >= thr_w) {
+                            unsigned int m_c_0;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_0) : "r"(__as_u32(a0[0])));
+                            if (lane_0_1 == 0) {
+                                unsigned int _max_131 = ((mx) > (m_c_0) ? (mx) : (m_c_0));
+                                mx = _max_131;
+                            }
+                            unsigned int m_c_1;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_1) : "r"(__as_u32(a0[1])));
+                            if (lane_0_1 == 1) {
+                                unsigned int _max_132 = ((mx) > (m_c_1) ? (mx) : (m_c_1));
+                                mx = _max_132;
+                            }
+                            unsigned int m_c_2;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_2) : "r"(__as_u32(a0[2])));
+                            if (lane_0_1 == 2) {
+                                unsigned int _max_133 = ((mx) > (m_c_2) ? (mx) : (m_c_2));
+                                mx = _max_133;
+                            }
+                            unsigned int m_c_3;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_3) : "r"(__as_u32(a0[3])));
+                            if (lane_0_1 == 3) {
+                                unsigned int _max_134 = ((mx) > (m_c_3) ? (mx) : (m_c_3));
+                                mx = _max_134;
+                            }
+                            unsigned int m_c_4;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_4) : "r"(__as_u32(a0[4])));
+                            if (lane_0_1 == 4) {
+                                unsigned int _max_135 = ((mx) > (m_c_4) ? (mx) : (m_c_4));
+                                mx = _max_135;
+                            }
+                            unsigned int m_c_5;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_5) : "r"(__as_u32(a0[5])));
+                            if (lane_0_1 == 5) {
+                                unsigned int _max_136 = ((mx) > (m_c_5) ? (mx) : (m_c_5));
+                                mx = _max_136;
+                            }
+                            unsigned int m_c_6;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_6) : "r"(__as_u32(a0[6])));
+                            if (lane_0_1 == 6) {
+                                unsigned int _max_137 = ((mx) > (m_c_6) ? (mx) : (m_c_6));
+                                mx = _max_137;
+                            }
+                            unsigned int m_c_7;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_7) : "r"(__as_u32(a0[7])));
+                            if (lane_0_1 == 7) {
+                                unsigned int _max_138 = ((mx) > (m_c_7) ? (mx) : (m_c_7));
+                                mx = _max_138;
+                            }
+                            unsigned int m_c_8;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_8) : "r"(__as_u32(a0[8])));
+                            if (lane_0_1 == 8) {
+                                unsigned int _max_139 = ((mx) > (m_c_8) ? (mx) : (m_c_8));
+                                mx = _max_139;
+                            }
+                            unsigned int m_c_9;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_9) : "r"(__as_u32(a0[9])));
+                            if (lane_0_1 == 9) {
+                                unsigned int _max_140 = ((mx) > (m_c_9) ? (mx) : (m_c_9));
+                                mx = _max_140;
+                            }
+                            unsigned int m_c_10;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_10) : "r"(__as_u32(a0[10])));
+                            if (lane_0_1 == 10) {
+                                unsigned int _max_141 = ((mx) > (m_c_10) ? (mx) : (m_c_10));
+                                mx = _max_141;
+                            }
+                            unsigned int m_c_11;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_11) : "r"(__as_u32(a0[11])));
+                            if (lane_0_1 == 11) {
+                                unsigned int _max_142 = ((mx) > (m_c_11) ? (mx) : (m_c_11));
+                                mx = _max_142;
+                            }
+                            unsigned int m_c_12;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_12) : "r"(__as_u32(a0[12])));
+                            if (lane_0_1 == 12) {
+                                unsigned int _max_143 = ((mx) > (m_c_12) ? (mx) : (m_c_12));
+                                mx = _max_143;
+                            }
+                            unsigned int m_c_13;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_13) : "r"(__as_u32(a0[13])));
+                            if (lane_0_1 == 13) {
+                                unsigned int _max_144 = ((mx) > (m_c_13) ? (mx) : (m_c_13));
+                                mx = _max_144;
+                            }
+                            unsigned int m_c_14;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_14) : "r"(__as_u32(a0[14])));
+                            if (lane_0_1 == 14) {
+                                unsigned int _max_145 = ((mx) > (m_c_14) ? (mx) : (m_c_14));
+                                mx = _max_145;
+                            }
+                            unsigned int m_c_15;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_15) : "r"(__as_u32(a0[15])));
+                            if (lane_0_1 == 15) {
+                                unsigned int _max_146 = ((mx) > (m_c_15) ? (mx) : (m_c_15));
+                                mx = _max_146;
+                            }
+                            unsigned int m_c_16;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_16) : "r"(__as_u32(a0[16])));
+                            if (lane_0_1 == 16) {
+                                unsigned int _max_147 = ((mx) > (m_c_16) ? (mx) : (m_c_16));
+                                mx = _max_147;
+                            }
+                            unsigned int m_c_17;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_17) : "r"(__as_u32(a0[17])));
+                            if (lane_0_1 == 17) {
+                                unsigned int _max_148 = ((mx) > (m_c_17) ? (mx) : (m_c_17));
+                                mx = _max_148;
+                            }
+                            unsigned int m_c_18;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_18) : "r"(__as_u32(a0[18])));
+                            if (lane_0_1 == 18) {
+                                unsigned int _max_149 = ((mx) > (m_c_18) ? (mx) : (m_c_18));
+                                mx = _max_149;
+                            }
+                            unsigned int m_c_19;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_19) : "r"(__as_u32(a0[19])));
+                            if (lane_0_1 == 19) {
+                                unsigned int _max_150 = ((mx) > (m_c_19) ? (mx) : (m_c_19));
+                                mx = _max_150;
+                            }
+                            unsigned int m_c_20;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_20) : "r"(__as_u32(a0[20])));
+                            if (lane_0_1 == 20) {
+                                unsigned int _max_151 = ((mx) > (m_c_20) ? (mx) : (m_c_20));
+                                mx = _max_151;
+                            }
+                            unsigned int m_c_21;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_21) : "r"(__as_u32(a0[21])));
+                            if (lane_0_1 == 21) {
+                                unsigned int _max_152 = ((mx) > (m_c_21) ? (mx) : (m_c_21));
+                                mx = _max_152;
+                            }
+                            unsigned int m_c_22;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_22) : "r"(__as_u32(a0[22])));
+                            if (lane_0_1 == 22) {
+                                unsigned int _max_153 = ((mx) > (m_c_22) ? (mx) : (m_c_22));
+                                mx = _max_153;
+                            }
+                            unsigned int m_c_23;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_23) : "r"(__as_u32(a0[23])));
+                            if (lane_0_1 == 23) {
+                                unsigned int _max_154 = ((mx) > (m_c_23) ? (mx) : (m_c_23));
+                                mx = _max_154;
+                            }
+                            unsigned int m_c_24;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_24) : "r"(__as_u32(a0[24])));
+                            if (lane_0_1 == 24) {
+                                unsigned int _max_155 = ((mx) > (m_c_24) ? (mx) : (m_c_24));
+                                mx = _max_155;
+                            }
+                            unsigned int m_c_25;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_25) : "r"(__as_u32(a0[25])));
+                            if (lane_0_1 == 25) {
+                                unsigned int _max_156 = ((mx) > (m_c_25) ? (mx) : (m_c_25));
+                                mx = _max_156;
+                            }
+                            unsigned int m_c_26;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_26) : "r"(__as_u32(a0[26])));
+                            if (lane_0_1 == 26) {
+                                unsigned int _max_157 = ((mx) > (m_c_26) ? (mx) : (m_c_26));
+                                mx = _max_157;
+                            }
+                            unsigned int m_c_27;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_27) : "r"(__as_u32(a0[27])));
+                            if (lane_0_1 == 27) {
+                                unsigned int _max_158 = ((mx) > (m_c_27) ? (mx) : (m_c_27));
+                                mx = _max_158;
+                            }
+                            unsigned int m_c_28;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_28) : "r"(__as_u32(a0[28])));
+                            if (lane_0_1 == 28) {
+                                unsigned int _max_159 = ((mx) > (m_c_28) ? (mx) : (m_c_28));
+                                mx = _max_159;
+                            }
+                            unsigned int m_c_29;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_29) : "r"(__as_u32(a0[29])));
+                            if (lane_0_1 == 29) {
+                                unsigned int _max_160 = ((mx) > (m_c_29) ? (mx) : (m_c_29));
+                                mx = _max_160;
+                            }
+                            unsigned int m_c_30;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_30) : "r"(__as_u32(a0[30])));
+                            if (lane_0_1 == 30) {
+                                unsigned int _max_161 = ((mx) > (m_c_30) ? (mx) : (m_c_30));
+                                mx = _max_161;
+                            }
+                            unsigned int m_c_31;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_31) : "r"(__as_u32(a0[31])));
+                            if (lane_0_1 == 31) {
+                                unsigned int _max_162 = ((mx) > (m_c_31) ? (mx) : (m_c_31));
+                                mx = _max_162;
+                            }
                         }
                         mx = mx;
                     }
@@ -1957,6 +2090,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dkv_b_drained_addr);
                     if (vmask != 0) {
+                        float lm_1 = 0.0f;
                         int rc_32 = __shfl_sync(0xFFFFFFFF, roff, 0);
                         float scale_c_32 = __shfl_sync(0xFFFFFFFF, s_dkv, 0);
                         long long idx_c_32 = (long long)(rc_32 + lat_col);
@@ -1966,18 +2100,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_32 = __float2int_rn(y1_32);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_32 + 256ll))), "r"(static_cast<int>(n0_32)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_32 + 384ll))), "r"(static_cast<int>(n1_32)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_97;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_97) : "f"(y0_32));
-                        float _abs_98;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_98) : "f"(y1_32));
-                        float m2_32;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_32) : "f"(_abs_97), "f"(_abs_98));
-                        unsigned int m_c_32;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_32) : "r"(__as_u32(m2_32)));
-                        if (lane_0_1 == 0) {
-                            unsigned int _max_99 = ((mx) > (m_c_32) ? (mx) : (m_c_32));
-                            mx = _max_99;
-                        }
+                        float _abs_164;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_164) : "f"(y0_32));
+                        float _abs_165;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_165) : "f"(y1_32));
+                        float _max_163;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_163) : "f"(_abs_164), "f"(_abs_165));
+                        a0[0] = _max_163;
+                        float _max_166;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_166) : "f"(lm_1), "f"(a0[0]));
+                        lm_1 = _max_166;
                         int rc_33 = __shfl_sync(0xFFFFFFFF, roff, 1);
                         float scale_c_33 = __shfl_sync(0xFFFFFFFF, s_dkv, 1);
                         long long idx_c_33 = (long long)(rc_33 + lat_col);
@@ -1987,18 +2119,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_33 = __float2int_rn(y1_33);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_33 + 256ll))), "r"(static_cast<int>(n0_33)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_33 + 384ll))), "r"(static_cast<int>(n1_33)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_100;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_100) : "f"(y0_33));
-                        float _abs_101;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_101) : "f"(y1_33));
-                        float m2_33;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_33) : "f"(_abs_100), "f"(_abs_101));
-                        unsigned int m_c_33;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_33) : "r"(__as_u32(m2_33)));
-                        if (lane_0_1 == 1) {
-                            unsigned int _max_102 = ((mx) > (m_c_33) ? (mx) : (m_c_33));
-                            mx = _max_102;
-                        }
+                        float _abs_168;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_168) : "f"(y0_33));
+                        float _abs_169;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_169) : "f"(y1_33));
+                        float _max_167;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_167) : "f"(_abs_168), "f"(_abs_169));
+                        a0[1] = _max_167;
+                        float _max_170;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_170) : "f"(lm_1), "f"(a0[1]));
+                        lm_1 = _max_170;
                         int rc_34 = __shfl_sync(0xFFFFFFFF, roff, 2);
                         float scale_c_34 = __shfl_sync(0xFFFFFFFF, s_dkv, 2);
                         long long idx_c_34 = (long long)(rc_34 + lat_col);
@@ -2008,18 +2138,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_34 = __float2int_rn(y1_34);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_34 + 256ll))), "r"(static_cast<int>(n0_34)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_34 + 384ll))), "r"(static_cast<int>(n1_34)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_103;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_103) : "f"(y0_34));
-                        float _abs_104;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_104) : "f"(y1_34));
-                        float m2_34;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_34) : "f"(_abs_103), "f"(_abs_104));
-                        unsigned int m_c_34;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_34) : "r"(__as_u32(m2_34)));
-                        if (lane_0_1 == 2) {
-                            unsigned int _max_105 = ((mx) > (m_c_34) ? (mx) : (m_c_34));
-                            mx = _max_105;
-                        }
+                        float _abs_172;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_172) : "f"(y0_34));
+                        float _abs_173;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_173) : "f"(y1_34));
+                        float _max_171;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_171) : "f"(_abs_172), "f"(_abs_173));
+                        a0[2] = _max_171;
+                        float _max_174;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_174) : "f"(lm_1), "f"(a0[2]));
+                        lm_1 = _max_174;
                         int rc_35 = __shfl_sync(0xFFFFFFFF, roff, 3);
                         float scale_c_35 = __shfl_sync(0xFFFFFFFF, s_dkv, 3);
                         long long idx_c_35 = (long long)(rc_35 + lat_col);
@@ -2029,18 +2157,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_35 = __float2int_rn(y1_35);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_35 + 256ll))), "r"(static_cast<int>(n0_35)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_35 + 384ll))), "r"(static_cast<int>(n1_35)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_106;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_106) : "f"(y0_35));
-                        float _abs_107;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_107) : "f"(y1_35));
-                        float m2_35;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_35) : "f"(_abs_106), "f"(_abs_107));
-                        unsigned int m_c_35;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_35) : "r"(__as_u32(m2_35)));
-                        if (lane_0_1 == 3) {
-                            unsigned int _max_108 = ((mx) > (m_c_35) ? (mx) : (m_c_35));
-                            mx = _max_108;
-                        }
+                        float _abs_176;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_176) : "f"(y0_35));
+                        float _abs_177;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_177) : "f"(y1_35));
+                        float _max_175;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_175) : "f"(_abs_176), "f"(_abs_177));
+                        a0[3] = _max_175;
+                        float _max_178;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_178) : "f"(lm_1), "f"(a0[3]));
+                        lm_1 = _max_178;
                         int rc_36 = __shfl_sync(0xFFFFFFFF, roff, 4);
                         float scale_c_36 = __shfl_sync(0xFFFFFFFF, s_dkv, 4);
                         long long idx_c_36 = (long long)(rc_36 + lat_col);
@@ -2050,18 +2176,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_36 = __float2int_rn(y1_36);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_36 + 256ll))), "r"(static_cast<int>(n0_36)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_36 + 384ll))), "r"(static_cast<int>(n1_36)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_109;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_109) : "f"(y0_36));
-                        float _abs_110;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_110) : "f"(y1_36));
-                        float m2_36;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_36) : "f"(_abs_109), "f"(_abs_110));
-                        unsigned int m_c_36;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_36) : "r"(__as_u32(m2_36)));
-                        if (lane_0_1 == 4) {
-                            unsigned int _max_111 = ((mx) > (m_c_36) ? (mx) : (m_c_36));
-                            mx = _max_111;
-                        }
+                        float _abs_180;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_180) : "f"(y0_36));
+                        float _abs_181;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_181) : "f"(y1_36));
+                        float _max_179;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_179) : "f"(_abs_180), "f"(_abs_181));
+                        a0[4] = _max_179;
+                        float _max_182;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_182) : "f"(lm_1), "f"(a0[4]));
+                        lm_1 = _max_182;
                         int rc_37 = __shfl_sync(0xFFFFFFFF, roff, 5);
                         float scale_c_37 = __shfl_sync(0xFFFFFFFF, s_dkv, 5);
                         long long idx_c_37 = (long long)(rc_37 + lat_col);
@@ -2071,18 +2195,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_37 = __float2int_rn(y1_37);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_37 + 256ll))), "r"(static_cast<int>(n0_37)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_37 + 384ll))), "r"(static_cast<int>(n1_37)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_112;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_112) : "f"(y0_37));
-                        float _abs_113;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_113) : "f"(y1_37));
-                        float m2_37;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_37) : "f"(_abs_112), "f"(_abs_113));
-                        unsigned int m_c_37;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_37) : "r"(__as_u32(m2_37)));
-                        if (lane_0_1 == 5) {
-                            unsigned int _max_114 = ((mx) > (m_c_37) ? (mx) : (m_c_37));
-                            mx = _max_114;
-                        }
+                        float _abs_184;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_184) : "f"(y0_37));
+                        float _abs_185;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_185) : "f"(y1_37));
+                        float _max_183;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_183) : "f"(_abs_184), "f"(_abs_185));
+                        a0[5] = _max_183;
+                        float _max_186;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_186) : "f"(lm_1), "f"(a0[5]));
+                        lm_1 = _max_186;
                         int rc_38 = __shfl_sync(0xFFFFFFFF, roff, 6);
                         float scale_c_38 = __shfl_sync(0xFFFFFFFF, s_dkv, 6);
                         long long idx_c_38 = (long long)(rc_38 + lat_col);
@@ -2092,18 +2214,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_38 = __float2int_rn(y1_38);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_38 + 256ll))), "r"(static_cast<int>(n0_38)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_38 + 384ll))), "r"(static_cast<int>(n1_38)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_115;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_115) : "f"(y0_38));
-                        float _abs_116;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_116) : "f"(y1_38));
-                        float m2_38;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_38) : "f"(_abs_115), "f"(_abs_116));
-                        unsigned int m_c_38;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_38) : "r"(__as_u32(m2_38)));
-                        if (lane_0_1 == 6) {
-                            unsigned int _max_117 = ((mx) > (m_c_38) ? (mx) : (m_c_38));
-                            mx = _max_117;
-                        }
+                        float _abs_188;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_188) : "f"(y0_38));
+                        float _abs_189;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_189) : "f"(y1_38));
+                        float _max_187;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_187) : "f"(_abs_188), "f"(_abs_189));
+                        a0[6] = _max_187;
+                        float _max_190;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_190) : "f"(lm_1), "f"(a0[6]));
+                        lm_1 = _max_190;
                         int rc_39 = __shfl_sync(0xFFFFFFFF, roff, 7);
                         float scale_c_39 = __shfl_sync(0xFFFFFFFF, s_dkv, 7);
                         long long idx_c_39 = (long long)(rc_39 + lat_col);
@@ -2113,18 +2233,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_39 = __float2int_rn(y1_39);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_39 + 256ll))), "r"(static_cast<int>(n0_39)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_39 + 384ll))), "r"(static_cast<int>(n1_39)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_118;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_118) : "f"(y0_39));
-                        float _abs_119;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_119) : "f"(y1_39));
-                        float m2_39;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_39) : "f"(_abs_118), "f"(_abs_119));
-                        unsigned int m_c_39;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_39) : "r"(__as_u32(m2_39)));
-                        if (lane_0_1 == 7) {
-                            unsigned int _max_120 = ((mx) > (m_c_39) ? (mx) : (m_c_39));
-                            mx = _max_120;
-                        }
+                        float _abs_192;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_192) : "f"(y0_39));
+                        float _abs_193;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_193) : "f"(y1_39));
+                        float _max_191;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_191) : "f"(_abs_192), "f"(_abs_193));
+                        a0[7] = _max_191;
+                        float _max_194;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_194) : "f"(lm_1), "f"(a0[7]));
+                        lm_1 = _max_194;
                         int rc_40 = __shfl_sync(0xFFFFFFFF, roff, 8);
                         float scale_c_40 = __shfl_sync(0xFFFFFFFF, s_dkv, 8);
                         long long idx_c_40 = (long long)(rc_40 + lat_col);
@@ -2134,18 +2252,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_40 = __float2int_rn(y1_40);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_40 + 256ll))), "r"(static_cast<int>(n0_40)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_40 + 384ll))), "r"(static_cast<int>(n1_40)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_121;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_121) : "f"(y0_40));
-                        float _abs_122;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_122) : "f"(y1_40));
-                        float m2_40;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_40) : "f"(_abs_121), "f"(_abs_122));
-                        unsigned int m_c_40;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_40) : "r"(__as_u32(m2_40)));
-                        if (lane_0_1 == 8) {
-                            unsigned int _max_123 = ((mx) > (m_c_40) ? (mx) : (m_c_40));
-                            mx = _max_123;
-                        }
+                        float _abs_196;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_196) : "f"(y0_40));
+                        float _abs_197;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_197) : "f"(y1_40));
+                        float _max_195;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_195) : "f"(_abs_196), "f"(_abs_197));
+                        a0[8] = _max_195;
+                        float _max_198;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_198) : "f"(lm_1), "f"(a0[8]));
+                        lm_1 = _max_198;
                         int rc_41 = __shfl_sync(0xFFFFFFFF, roff, 9);
                         float scale_c_41 = __shfl_sync(0xFFFFFFFF, s_dkv, 9);
                         long long idx_c_41 = (long long)(rc_41 + lat_col);
@@ -2155,18 +2271,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_41 = __float2int_rn(y1_41);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_41 + 256ll))), "r"(static_cast<int>(n0_41)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_41 + 384ll))), "r"(static_cast<int>(n1_41)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_124;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_124) : "f"(y0_41));
-                        float _abs_125;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_125) : "f"(y1_41));
-                        float m2_41;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_41) : "f"(_abs_124), "f"(_abs_125));
-                        unsigned int m_c_41;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_41) : "r"(__as_u32(m2_41)));
-                        if (lane_0_1 == 9) {
-                            unsigned int _max_126 = ((mx) > (m_c_41) ? (mx) : (m_c_41));
-                            mx = _max_126;
-                        }
+                        float _abs_200;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_200) : "f"(y0_41));
+                        float _abs_201;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_201) : "f"(y1_41));
+                        float _max_199;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_199) : "f"(_abs_200), "f"(_abs_201));
+                        a0[9] = _max_199;
+                        float _max_202;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_202) : "f"(lm_1), "f"(a0[9]));
+                        lm_1 = _max_202;
                         int rc_42 = __shfl_sync(0xFFFFFFFF, roff, 10);
                         float scale_c_42 = __shfl_sync(0xFFFFFFFF, s_dkv, 10);
                         long long idx_c_42 = (long long)(rc_42 + lat_col);
@@ -2176,18 +2290,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_42 = __float2int_rn(y1_42);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_42 + 256ll))), "r"(static_cast<int>(n0_42)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_42 + 384ll))), "r"(static_cast<int>(n1_42)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_127;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_127) : "f"(y0_42));
-                        float _abs_128;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_128) : "f"(y1_42));
-                        float m2_42;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_42) : "f"(_abs_127), "f"(_abs_128));
-                        unsigned int m_c_42;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_42) : "r"(__as_u32(m2_42)));
-                        if (lane_0_1 == 10) {
-                            unsigned int _max_129 = ((mx) > (m_c_42) ? (mx) : (m_c_42));
-                            mx = _max_129;
-                        }
+                        float _abs_204;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_204) : "f"(y0_42));
+                        float _abs_205;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_205) : "f"(y1_42));
+                        float _max_203;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_203) : "f"(_abs_204), "f"(_abs_205));
+                        a0[10] = _max_203;
+                        float _max_206;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_206) : "f"(lm_1), "f"(a0[10]));
+                        lm_1 = _max_206;
                         int rc_43 = __shfl_sync(0xFFFFFFFF, roff, 11);
                         float scale_c_43 = __shfl_sync(0xFFFFFFFF, s_dkv, 11);
                         long long idx_c_43 = (long long)(rc_43 + lat_col);
@@ -2197,18 +2309,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_43 = __float2int_rn(y1_43);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_43 + 256ll))), "r"(static_cast<int>(n0_43)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_43 + 384ll))), "r"(static_cast<int>(n1_43)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_130;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_130) : "f"(y0_43));
-                        float _abs_131;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_131) : "f"(y1_43));
-                        float m2_43;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_43) : "f"(_abs_130), "f"(_abs_131));
-                        unsigned int m_c_43;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_43) : "r"(__as_u32(m2_43)));
-                        if (lane_0_1 == 11) {
-                            unsigned int _max_132 = ((mx) > (m_c_43) ? (mx) : (m_c_43));
-                            mx = _max_132;
-                        }
+                        float _abs_208;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_208) : "f"(y0_43));
+                        float _abs_209;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_209) : "f"(y1_43));
+                        float _max_207;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_207) : "f"(_abs_208), "f"(_abs_209));
+                        a0[11] = _max_207;
+                        float _max_210;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_210) : "f"(lm_1), "f"(a0[11]));
+                        lm_1 = _max_210;
                         int rc_44 = __shfl_sync(0xFFFFFFFF, roff, 12);
                         float scale_c_44 = __shfl_sync(0xFFFFFFFF, s_dkv, 12);
                         long long idx_c_44 = (long long)(rc_44 + lat_col);
@@ -2218,18 +2328,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_44 = __float2int_rn(y1_44);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_44 + 256ll))), "r"(static_cast<int>(n0_44)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_44 + 384ll))), "r"(static_cast<int>(n1_44)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_133;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_133) : "f"(y0_44));
-                        float _abs_134;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_134) : "f"(y1_44));
-                        float m2_44;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_44) : "f"(_abs_133), "f"(_abs_134));
-                        unsigned int m_c_44;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_44) : "r"(__as_u32(m2_44)));
-                        if (lane_0_1 == 12) {
-                            unsigned int _max_135 = ((mx) > (m_c_44) ? (mx) : (m_c_44));
-                            mx = _max_135;
-                        }
+                        float _abs_212;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_212) : "f"(y0_44));
+                        float _abs_213;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_213) : "f"(y1_44));
+                        float _max_211;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_211) : "f"(_abs_212), "f"(_abs_213));
+                        a0[12] = _max_211;
+                        float _max_214;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_214) : "f"(lm_1), "f"(a0[12]));
+                        lm_1 = _max_214;
                         int rc_45 = __shfl_sync(0xFFFFFFFF, roff, 13);
                         float scale_c_45 = __shfl_sync(0xFFFFFFFF, s_dkv, 13);
                         long long idx_c_45 = (long long)(rc_45 + lat_col);
@@ -2239,18 +2347,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_45 = __float2int_rn(y1_45);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_45 + 256ll))), "r"(static_cast<int>(n0_45)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_45 + 384ll))), "r"(static_cast<int>(n1_45)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_136;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_136) : "f"(y0_45));
-                        float _abs_137;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_137) : "f"(y1_45));
-                        float m2_45;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_45) : "f"(_abs_136), "f"(_abs_137));
-                        unsigned int m_c_45;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_45) : "r"(__as_u32(m2_45)));
-                        if (lane_0_1 == 13) {
-                            unsigned int _max_138 = ((mx) > (m_c_45) ? (mx) : (m_c_45));
-                            mx = _max_138;
-                        }
+                        float _abs_216;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_216) : "f"(y0_45));
+                        float _abs_217;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_217) : "f"(y1_45));
+                        float _max_215;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_215) : "f"(_abs_216), "f"(_abs_217));
+                        a0[13] = _max_215;
+                        float _max_218;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_218) : "f"(lm_1), "f"(a0[13]));
+                        lm_1 = _max_218;
                         int rc_46 = __shfl_sync(0xFFFFFFFF, roff, 14);
                         float scale_c_46 = __shfl_sync(0xFFFFFFFF, s_dkv, 14);
                         long long idx_c_46 = (long long)(rc_46 + lat_col);
@@ -2260,18 +2366,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_46 = __float2int_rn(y1_46);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_46 + 256ll))), "r"(static_cast<int>(n0_46)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_46 + 384ll))), "r"(static_cast<int>(n1_46)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_139;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_139) : "f"(y0_46));
-                        float _abs_140;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_140) : "f"(y1_46));
-                        float m2_46;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_46) : "f"(_abs_139), "f"(_abs_140));
-                        unsigned int m_c_46;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_46) : "r"(__as_u32(m2_46)));
-                        if (lane_0_1 == 14) {
-                            unsigned int _max_141 = ((mx) > (m_c_46) ? (mx) : (m_c_46));
-                            mx = _max_141;
-                        }
+                        float _abs_220;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_220) : "f"(y0_46));
+                        float _abs_221;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_221) : "f"(y1_46));
+                        float _max_219;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_219) : "f"(_abs_220), "f"(_abs_221));
+                        a0[14] = _max_219;
+                        float _max_222;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_222) : "f"(lm_1), "f"(a0[14]));
+                        lm_1 = _max_222;
                         int rc_47 = __shfl_sync(0xFFFFFFFF, roff, 15);
                         float scale_c_47 = __shfl_sync(0xFFFFFFFF, s_dkv, 15);
                         long long idx_c_47 = (long long)(rc_47 + lat_col);
@@ -2281,18 +2385,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_47 = __float2int_rn(y1_47);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_47 + 256ll))), "r"(static_cast<int>(n0_47)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_47 + 384ll))), "r"(static_cast<int>(n1_47)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_142;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_142) : "f"(y0_47));
-                        float _abs_143;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_143) : "f"(y1_47));
-                        float m2_47;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_47) : "f"(_abs_142), "f"(_abs_143));
-                        unsigned int m_c_47;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_47) : "r"(__as_u32(m2_47)));
-                        if (lane_0_1 == 15) {
-                            unsigned int _max_144 = ((mx) > (m_c_47) ? (mx) : (m_c_47));
-                            mx = _max_144;
-                        }
+                        float _abs_224;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_224) : "f"(y0_47));
+                        float _abs_225;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_225) : "f"(y1_47));
+                        float _max_223;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_223) : "f"(_abs_224), "f"(_abs_225));
+                        a0[15] = _max_223;
+                        float _max_226;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_226) : "f"(lm_1), "f"(a0[15]));
+                        lm_1 = _max_226;
                         int rc_48 = __shfl_sync(0xFFFFFFFF, roff, 16);
                         float scale_c_48 = __shfl_sync(0xFFFFFFFF, s_dkv, 16);
                         long long idx_c_48 = (long long)(rc_48 + lat_col);
@@ -2302,18 +2404,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_48 = __float2int_rn(y1_48);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_48 + 256ll))), "r"(static_cast<int>(n0_48)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_48 + 384ll))), "r"(static_cast<int>(n1_48)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_145;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_145) : "f"(y0_48));
-                        float _abs_146;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_146) : "f"(y1_48));
-                        float m2_48;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_48) : "f"(_abs_145), "f"(_abs_146));
-                        unsigned int m_c_48;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_48) : "r"(__as_u32(m2_48)));
-                        if (lane_0_1 == 16) {
-                            unsigned int _max_147 = ((mx) > (m_c_48) ? (mx) : (m_c_48));
-                            mx = _max_147;
-                        }
+                        float _abs_228;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_228) : "f"(y0_48));
+                        float _abs_229;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_229) : "f"(y1_48));
+                        float _max_227;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_227) : "f"(_abs_228), "f"(_abs_229));
+                        a0[16] = _max_227;
+                        float _max_230;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_230) : "f"(lm_1), "f"(a0[16]));
+                        lm_1 = _max_230;
                         int rc_49 = __shfl_sync(0xFFFFFFFF, roff, 17);
                         float scale_c_49 = __shfl_sync(0xFFFFFFFF, s_dkv, 17);
                         long long idx_c_49 = (long long)(rc_49 + lat_col);
@@ -2323,18 +2423,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_49 = __float2int_rn(y1_49);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_49 + 256ll))), "r"(static_cast<int>(n0_49)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_49 + 384ll))), "r"(static_cast<int>(n1_49)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_148;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_148) : "f"(y0_49));
-                        float _abs_149;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_149) : "f"(y1_49));
-                        float m2_49;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_49) : "f"(_abs_148), "f"(_abs_149));
-                        unsigned int m_c_49;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_49) : "r"(__as_u32(m2_49)));
-                        if (lane_0_1 == 17) {
-                            unsigned int _max_150 = ((mx) > (m_c_49) ? (mx) : (m_c_49));
-                            mx = _max_150;
-                        }
+                        float _abs_232;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_232) : "f"(y0_49));
+                        float _abs_233;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_233) : "f"(y1_49));
+                        float _max_231;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_231) : "f"(_abs_232), "f"(_abs_233));
+                        a0[17] = _max_231;
+                        float _max_234;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_234) : "f"(lm_1), "f"(a0[17]));
+                        lm_1 = _max_234;
                         int rc_50 = __shfl_sync(0xFFFFFFFF, roff, 18);
                         float scale_c_50 = __shfl_sync(0xFFFFFFFF, s_dkv, 18);
                         long long idx_c_50 = (long long)(rc_50 + lat_col);
@@ -2344,18 +2442,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_50 = __float2int_rn(y1_50);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_50 + 256ll))), "r"(static_cast<int>(n0_50)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_50 + 384ll))), "r"(static_cast<int>(n1_50)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_151;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_151) : "f"(y0_50));
-                        float _abs_152;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_152) : "f"(y1_50));
-                        float m2_50;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_50) : "f"(_abs_151), "f"(_abs_152));
-                        unsigned int m_c_50;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_50) : "r"(__as_u32(m2_50)));
-                        if (lane_0_1 == 18) {
-                            unsigned int _max_153 = ((mx) > (m_c_50) ? (mx) : (m_c_50));
-                            mx = _max_153;
-                        }
+                        float _abs_236;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_236) : "f"(y0_50));
+                        float _abs_237;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_237) : "f"(y1_50));
+                        float _max_235;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_235) : "f"(_abs_236), "f"(_abs_237));
+                        a0[18] = _max_235;
+                        float _max_238;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_238) : "f"(lm_1), "f"(a0[18]));
+                        lm_1 = _max_238;
                         int rc_51 = __shfl_sync(0xFFFFFFFF, roff, 19);
                         float scale_c_51 = __shfl_sync(0xFFFFFFFF, s_dkv, 19);
                         long long idx_c_51 = (long long)(rc_51 + lat_col);
@@ -2365,18 +2461,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_51 = __float2int_rn(y1_51);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_51 + 256ll))), "r"(static_cast<int>(n0_51)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_51 + 384ll))), "r"(static_cast<int>(n1_51)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_154;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_154) : "f"(y0_51));
-                        float _abs_155;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_155) : "f"(y1_51));
-                        float m2_51;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_51) : "f"(_abs_154), "f"(_abs_155));
-                        unsigned int m_c_51;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_51) : "r"(__as_u32(m2_51)));
-                        if (lane_0_1 == 19) {
-                            unsigned int _max_156 = ((mx) > (m_c_51) ? (mx) : (m_c_51));
-                            mx = _max_156;
-                        }
+                        float _abs_240;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_240) : "f"(y0_51));
+                        float _abs_241;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_241) : "f"(y1_51));
+                        float _max_239;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_239) : "f"(_abs_240), "f"(_abs_241));
+                        a0[19] = _max_239;
+                        float _max_242;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_242) : "f"(lm_1), "f"(a0[19]));
+                        lm_1 = _max_242;
                         int rc_52 = __shfl_sync(0xFFFFFFFF, roff, 20);
                         float scale_c_52 = __shfl_sync(0xFFFFFFFF, s_dkv, 20);
                         long long idx_c_52 = (long long)(rc_52 + lat_col);
@@ -2386,18 +2480,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_52 = __float2int_rn(y1_52);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_52 + 256ll))), "r"(static_cast<int>(n0_52)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_52 + 384ll))), "r"(static_cast<int>(n1_52)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_157;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_157) : "f"(y0_52));
-                        float _abs_158;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_158) : "f"(y1_52));
-                        float m2_52;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_52) : "f"(_abs_157), "f"(_abs_158));
-                        unsigned int m_c_52;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_52) : "r"(__as_u32(m2_52)));
-                        if (lane_0_1 == 20) {
-                            unsigned int _max_159 = ((mx) > (m_c_52) ? (mx) : (m_c_52));
-                            mx = _max_159;
-                        }
+                        float _abs_244;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_244) : "f"(y0_52));
+                        float _abs_245;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_245) : "f"(y1_52));
+                        float _max_243;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_243) : "f"(_abs_244), "f"(_abs_245));
+                        a0[20] = _max_243;
+                        float _max_246;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_246) : "f"(lm_1), "f"(a0[20]));
+                        lm_1 = _max_246;
                         int rc_53 = __shfl_sync(0xFFFFFFFF, roff, 21);
                         float scale_c_53 = __shfl_sync(0xFFFFFFFF, s_dkv, 21);
                         long long idx_c_53 = (long long)(rc_53 + lat_col);
@@ -2407,18 +2499,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_53 = __float2int_rn(y1_53);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_53 + 256ll))), "r"(static_cast<int>(n0_53)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_53 + 384ll))), "r"(static_cast<int>(n1_53)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_160;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_160) : "f"(y0_53));
-                        float _abs_161;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_161) : "f"(y1_53));
-                        float m2_53;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_53) : "f"(_abs_160), "f"(_abs_161));
-                        unsigned int m_c_53;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_53) : "r"(__as_u32(m2_53)));
-                        if (lane_0_1 == 21) {
-                            unsigned int _max_162 = ((mx) > (m_c_53) ? (mx) : (m_c_53));
-                            mx = _max_162;
-                        }
+                        float _abs_248;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_248) : "f"(y0_53));
+                        float _abs_249;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_249) : "f"(y1_53));
+                        float _max_247;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_247) : "f"(_abs_248), "f"(_abs_249));
+                        a0[21] = _max_247;
+                        float _max_250;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_250) : "f"(lm_1), "f"(a0[21]));
+                        lm_1 = _max_250;
                         int rc_54 = __shfl_sync(0xFFFFFFFF, roff, 22);
                         float scale_c_54 = __shfl_sync(0xFFFFFFFF, s_dkv, 22);
                         long long idx_c_54 = (long long)(rc_54 + lat_col);
@@ -2428,18 +2518,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_54 = __float2int_rn(y1_54);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_54 + 256ll))), "r"(static_cast<int>(n0_54)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_54 + 384ll))), "r"(static_cast<int>(n1_54)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_163;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_163) : "f"(y0_54));
-                        float _abs_164;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_164) : "f"(y1_54));
-                        float m2_54;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_54) : "f"(_abs_163), "f"(_abs_164));
-                        unsigned int m_c_54;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_54) : "r"(__as_u32(m2_54)));
-                        if (lane_0_1 == 22) {
-                            unsigned int _max_165 = ((mx) > (m_c_54) ? (mx) : (m_c_54));
-                            mx = _max_165;
-                        }
+                        float _abs_252;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_252) : "f"(y0_54));
+                        float _abs_253;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_253) : "f"(y1_54));
+                        float _max_251;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_251) : "f"(_abs_252), "f"(_abs_253));
+                        a0[22] = _max_251;
+                        float _max_254;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_254) : "f"(lm_1), "f"(a0[22]));
+                        lm_1 = _max_254;
                         int rc_55 = __shfl_sync(0xFFFFFFFF, roff, 23);
                         float scale_c_55 = __shfl_sync(0xFFFFFFFF, s_dkv, 23);
                         long long idx_c_55 = (long long)(rc_55 + lat_col);
@@ -2449,18 +2537,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_55 = __float2int_rn(y1_55);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_55 + 256ll))), "r"(static_cast<int>(n0_55)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_55 + 384ll))), "r"(static_cast<int>(n1_55)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_166;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_166) : "f"(y0_55));
-                        float _abs_167;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_167) : "f"(y1_55));
-                        float m2_55;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_55) : "f"(_abs_166), "f"(_abs_167));
-                        unsigned int m_c_55;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_55) : "r"(__as_u32(m2_55)));
-                        if (lane_0_1 == 23) {
-                            unsigned int _max_168 = ((mx) > (m_c_55) ? (mx) : (m_c_55));
-                            mx = _max_168;
-                        }
+                        float _abs_256;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_256) : "f"(y0_55));
+                        float _abs_257;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_257) : "f"(y1_55));
+                        float _max_255;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_255) : "f"(_abs_256), "f"(_abs_257));
+                        a0[23] = _max_255;
+                        float _max_258;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_258) : "f"(lm_1), "f"(a0[23]));
+                        lm_1 = _max_258;
                         int rc_56 = __shfl_sync(0xFFFFFFFF, roff, 24);
                         float scale_c_56 = __shfl_sync(0xFFFFFFFF, s_dkv, 24);
                         long long idx_c_56 = (long long)(rc_56 + lat_col);
@@ -2470,18 +2556,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_56 = __float2int_rn(y1_56);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_56 + 256ll))), "r"(static_cast<int>(n0_56)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_56 + 384ll))), "r"(static_cast<int>(n1_56)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_169;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_169) : "f"(y0_56));
-                        float _abs_170;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_170) : "f"(y1_56));
-                        float m2_56;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_56) : "f"(_abs_169), "f"(_abs_170));
-                        unsigned int m_c_56;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_56) : "r"(__as_u32(m2_56)));
-                        if (lane_0_1 == 24) {
-                            unsigned int _max_171 = ((mx) > (m_c_56) ? (mx) : (m_c_56));
-                            mx = _max_171;
-                        }
+                        float _abs_260;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_260) : "f"(y0_56));
+                        float _abs_261;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_261) : "f"(y1_56));
+                        float _max_259;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_259) : "f"(_abs_260), "f"(_abs_261));
+                        a0[24] = _max_259;
+                        float _max_262;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_262) : "f"(lm_1), "f"(a0[24]));
+                        lm_1 = _max_262;
                         int rc_57 = __shfl_sync(0xFFFFFFFF, roff, 25);
                         float scale_c_57 = __shfl_sync(0xFFFFFFFF, s_dkv, 25);
                         long long idx_c_57 = (long long)(rc_57 + lat_col);
@@ -2491,18 +2575,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_57 = __float2int_rn(y1_57);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_57 + 256ll))), "r"(static_cast<int>(n0_57)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_57 + 384ll))), "r"(static_cast<int>(n1_57)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_172;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_172) : "f"(y0_57));
-                        float _abs_173;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_173) : "f"(y1_57));
-                        float m2_57;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_57) : "f"(_abs_172), "f"(_abs_173));
-                        unsigned int m_c_57;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_57) : "r"(__as_u32(m2_57)));
-                        if (lane_0_1 == 25) {
-                            unsigned int _max_174 = ((mx) > (m_c_57) ? (mx) : (m_c_57));
-                            mx = _max_174;
-                        }
+                        float _abs_264;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_264) : "f"(y0_57));
+                        float _abs_265;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_265) : "f"(y1_57));
+                        float _max_263;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_263) : "f"(_abs_264), "f"(_abs_265));
+                        a0[25] = _max_263;
+                        float _max_266;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_266) : "f"(lm_1), "f"(a0[25]));
+                        lm_1 = _max_266;
                         int rc_58 = __shfl_sync(0xFFFFFFFF, roff, 26);
                         float scale_c_58 = __shfl_sync(0xFFFFFFFF, s_dkv, 26);
                         long long idx_c_58 = (long long)(rc_58 + lat_col);
@@ -2512,18 +2594,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_58 = __float2int_rn(y1_58);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_58 + 256ll))), "r"(static_cast<int>(n0_58)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_58 + 384ll))), "r"(static_cast<int>(n1_58)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_175;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_175) : "f"(y0_58));
-                        float _abs_176;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_176) : "f"(y1_58));
-                        float m2_58;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_58) : "f"(_abs_175), "f"(_abs_176));
-                        unsigned int m_c_58;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_58) : "r"(__as_u32(m2_58)));
-                        if (lane_0_1 == 26) {
-                            unsigned int _max_177 = ((mx) > (m_c_58) ? (mx) : (m_c_58));
-                            mx = _max_177;
-                        }
+                        float _abs_268;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_268) : "f"(y0_58));
+                        float _abs_269;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_269) : "f"(y1_58));
+                        float _max_267;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_267) : "f"(_abs_268), "f"(_abs_269));
+                        a0[26] = _max_267;
+                        float _max_270;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_270) : "f"(lm_1), "f"(a0[26]));
+                        lm_1 = _max_270;
                         int rc_59 = __shfl_sync(0xFFFFFFFF, roff, 27);
                         float scale_c_59 = __shfl_sync(0xFFFFFFFF, s_dkv, 27);
                         long long idx_c_59 = (long long)(rc_59 + lat_col);
@@ -2533,18 +2613,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_59 = __float2int_rn(y1_59);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_59 + 256ll))), "r"(static_cast<int>(n0_59)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_59 + 384ll))), "r"(static_cast<int>(n1_59)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_178;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_178) : "f"(y0_59));
-                        float _abs_179;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_179) : "f"(y1_59));
-                        float m2_59;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_59) : "f"(_abs_178), "f"(_abs_179));
-                        unsigned int m_c_59;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_59) : "r"(__as_u32(m2_59)));
-                        if (lane_0_1 == 27) {
-                            unsigned int _max_180 = ((mx) > (m_c_59) ? (mx) : (m_c_59));
-                            mx = _max_180;
-                        }
+                        float _abs_272;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_272) : "f"(y0_59));
+                        float _abs_273;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_273) : "f"(y1_59));
+                        float _max_271;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_271) : "f"(_abs_272), "f"(_abs_273));
+                        a0[27] = _max_271;
+                        float _max_274;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_274) : "f"(lm_1), "f"(a0[27]));
+                        lm_1 = _max_274;
                         int rc_60 = __shfl_sync(0xFFFFFFFF, roff, 28);
                         float scale_c_60 = __shfl_sync(0xFFFFFFFF, s_dkv, 28);
                         long long idx_c_60 = (long long)(rc_60 + lat_col);
@@ -2554,18 +2632,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_60 = __float2int_rn(y1_60);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_60 + 256ll))), "r"(static_cast<int>(n0_60)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_60 + 384ll))), "r"(static_cast<int>(n1_60)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_181;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_181) : "f"(y0_60));
-                        float _abs_182;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_182) : "f"(y1_60));
-                        float m2_60;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_60) : "f"(_abs_181), "f"(_abs_182));
-                        unsigned int m_c_60;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_60) : "r"(__as_u32(m2_60)));
-                        if (lane_0_1 == 28) {
-                            unsigned int _max_183 = ((mx) > (m_c_60) ? (mx) : (m_c_60));
-                            mx = _max_183;
-                        }
+                        float _abs_276;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_276) : "f"(y0_60));
+                        float _abs_277;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_277) : "f"(y1_60));
+                        float _max_275;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_275) : "f"(_abs_276), "f"(_abs_277));
+                        a0[28] = _max_275;
+                        float _max_278;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_278) : "f"(lm_1), "f"(a0[28]));
+                        lm_1 = _max_278;
                         int rc_61 = __shfl_sync(0xFFFFFFFF, roff, 29);
                         float scale_c_61 = __shfl_sync(0xFFFFFFFF, s_dkv, 29);
                         long long idx_c_61 = (long long)(rc_61 + lat_col);
@@ -2575,18 +2651,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_61 = __float2int_rn(y1_61);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_61 + 256ll))), "r"(static_cast<int>(n0_61)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_61 + 384ll))), "r"(static_cast<int>(n1_61)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_184;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_184) : "f"(y0_61));
-                        float _abs_185;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_185) : "f"(y1_61));
-                        float m2_61;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_61) : "f"(_abs_184), "f"(_abs_185));
-                        unsigned int m_c_61;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_61) : "r"(__as_u32(m2_61)));
-                        if (lane_0_1 == 29) {
-                            unsigned int _max_186 = ((mx) > (m_c_61) ? (mx) : (m_c_61));
-                            mx = _max_186;
-                        }
+                        float _abs_280;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_280) : "f"(y0_61));
+                        float _abs_281;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_281) : "f"(y1_61));
+                        float _max_279;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_279) : "f"(_abs_280), "f"(_abs_281));
+                        a0[29] = _max_279;
+                        float _max_282;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_282) : "f"(lm_1), "f"(a0[29]));
+                        lm_1 = _max_282;
                         int rc_62 = __shfl_sync(0xFFFFFFFF, roff, 30);
                         float scale_c_62 = __shfl_sync(0xFFFFFFFF, s_dkv, 30);
                         long long idx_c_62 = (long long)(rc_62 + lat_col);
@@ -2596,18 +2670,16 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_62 = __float2int_rn(y1_62);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_62 + 256ll))), "r"(static_cast<int>(n0_62)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_62 + 384ll))), "r"(static_cast<int>(n1_62)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_187;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_187) : "f"(y0_62));
-                        float _abs_188;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_188) : "f"(y1_62));
-                        float m2_62;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_62) : "f"(_abs_187), "f"(_abs_188));
-                        unsigned int m_c_62;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_62) : "r"(__as_u32(m2_62)));
-                        if (lane_0_1 == 30) {
-                            unsigned int _max_189 = ((mx) > (m_c_62) ? (mx) : (m_c_62));
-                            mx = _max_189;
-                        }
+                        float _abs_284;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_284) : "f"(y0_62));
+                        float _abs_285;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_285) : "f"(y1_62));
+                        float _max_283;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_283) : "f"(_abs_284), "f"(_abs_285));
+                        a0[30] = _max_283;
+                        float _max_286;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_286) : "f"(lm_1), "f"(a0[30]));
+                        lm_1 = _max_286;
                         int rc_63 = __shfl_sync(0xFFFFFFFF, roff, 31);
                         float scale_c_63 = __shfl_sync(0xFFFFFFFF, s_dkv, 31);
                         long long idx_c_63 = (long long)(rc_63 + lat_col);
@@ -2617,17 +2689,211 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         int n1_63 = __float2int_rn(y1_63);
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_63 + 256ll))), "r"(static_cast<int>(n0_63)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile("red.relaxed.gpu.global.add.L2::cache_hint.s32 [%0], %1, %2;" :: "l"((reinterpret_cast<int*>(dkv_acc) + (idx_c_63 + 384ll))), "r"(static_cast<int>(n1_63)), "l"(0x14F0000000000000ULL) : "memory");
-                        float _abs_190;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_190) : "f"(y0_63));
-                        float _abs_191;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_191) : "f"(y1_63));
-                        float m2_63;
-                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(m2_63) : "f"(_abs_190), "f"(_abs_191));
-                        unsigned int m_c_63;
-                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_63) : "r"(__as_u32(m2_63)));
-                        if (lane_0_1 == 31) {
-                            unsigned int _max_192 = ((mx) > (m_c_63) ? (mx) : (m_c_63));
-                            mx = _max_192;
+                        float _abs_288;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_288) : "f"(y0_63));
+                        float _abs_289;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_289) : "f"(y1_63));
+                        float _max_287;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_287) : "f"(_abs_288), "f"(_abs_289));
+                        a0[31] = _max_287;
+                        float _max_290;
+                        asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_290) : "f"(lm_1), "f"(a0[31]));
+                        lm_1 = _max_290;
+                        unsigned int _warp_redux_291;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_291) : "r"(__as_u32(lm_1)));
+                        if (_warp_redux_291 >= thr_w) {
+                            unsigned int m_c_32;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_32) : "r"(__as_u32(a0[0])));
+                            if (lane_0_1 == 0) {
+                                unsigned int _max_292 = ((mx) > (m_c_32) ? (mx) : (m_c_32));
+                                mx = _max_292;
+                            }
+                            unsigned int m_c_33;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_33) : "r"(__as_u32(a0[1])));
+                            if (lane_0_1 == 1) {
+                                unsigned int _max_293 = ((mx) > (m_c_33) ? (mx) : (m_c_33));
+                                mx = _max_293;
+                            }
+                            unsigned int m_c_34;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_34) : "r"(__as_u32(a0[2])));
+                            if (lane_0_1 == 2) {
+                                unsigned int _max_294 = ((mx) > (m_c_34) ? (mx) : (m_c_34));
+                                mx = _max_294;
+                            }
+                            unsigned int m_c_35;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_35) : "r"(__as_u32(a0[3])));
+                            if (lane_0_1 == 3) {
+                                unsigned int _max_295 = ((mx) > (m_c_35) ? (mx) : (m_c_35));
+                                mx = _max_295;
+                            }
+                            unsigned int m_c_36;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_36) : "r"(__as_u32(a0[4])));
+                            if (lane_0_1 == 4) {
+                                unsigned int _max_296 = ((mx) > (m_c_36) ? (mx) : (m_c_36));
+                                mx = _max_296;
+                            }
+                            unsigned int m_c_37;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_37) : "r"(__as_u32(a0[5])));
+                            if (lane_0_1 == 5) {
+                                unsigned int _max_297 = ((mx) > (m_c_37) ? (mx) : (m_c_37));
+                                mx = _max_297;
+                            }
+                            unsigned int m_c_38;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_38) : "r"(__as_u32(a0[6])));
+                            if (lane_0_1 == 6) {
+                                unsigned int _max_298 = ((mx) > (m_c_38) ? (mx) : (m_c_38));
+                                mx = _max_298;
+                            }
+                            unsigned int m_c_39;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_39) : "r"(__as_u32(a0[7])));
+                            if (lane_0_1 == 7) {
+                                unsigned int _max_299 = ((mx) > (m_c_39) ? (mx) : (m_c_39));
+                                mx = _max_299;
+                            }
+                            unsigned int m_c_40;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_40) : "r"(__as_u32(a0[8])));
+                            if (lane_0_1 == 8) {
+                                unsigned int _max_300 = ((mx) > (m_c_40) ? (mx) : (m_c_40));
+                                mx = _max_300;
+                            }
+                            unsigned int m_c_41;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_41) : "r"(__as_u32(a0[9])));
+                            if (lane_0_1 == 9) {
+                                unsigned int _max_301 = ((mx) > (m_c_41) ? (mx) : (m_c_41));
+                                mx = _max_301;
+                            }
+                            unsigned int m_c_42;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_42) : "r"(__as_u32(a0[10])));
+                            if (lane_0_1 == 10) {
+                                unsigned int _max_302 = ((mx) > (m_c_42) ? (mx) : (m_c_42));
+                                mx = _max_302;
+                            }
+                            unsigned int m_c_43;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_43) : "r"(__as_u32(a0[11])));
+                            if (lane_0_1 == 11) {
+                                unsigned int _max_303 = ((mx) > (m_c_43) ? (mx) : (m_c_43));
+                                mx = _max_303;
+                            }
+                            unsigned int m_c_44;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_44) : "r"(__as_u32(a0[12])));
+                            if (lane_0_1 == 12) {
+                                unsigned int _max_304 = ((mx) > (m_c_44) ? (mx) : (m_c_44));
+                                mx = _max_304;
+                            }
+                            unsigned int m_c_45;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_45) : "r"(__as_u32(a0[13])));
+                            if (lane_0_1 == 13) {
+                                unsigned int _max_305 = ((mx) > (m_c_45) ? (mx) : (m_c_45));
+                                mx = _max_305;
+                            }
+                            unsigned int m_c_46;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_46) : "r"(__as_u32(a0[14])));
+                            if (lane_0_1 == 14) {
+                                unsigned int _max_306 = ((mx) > (m_c_46) ? (mx) : (m_c_46));
+                                mx = _max_306;
+                            }
+                            unsigned int m_c_47;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_47) : "r"(__as_u32(a0[15])));
+                            if (lane_0_1 == 15) {
+                                unsigned int _max_307 = ((mx) > (m_c_47) ? (mx) : (m_c_47));
+                                mx = _max_307;
+                            }
+                            unsigned int m_c_48;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_48) : "r"(__as_u32(a0[16])));
+                            if (lane_0_1 == 16) {
+                                unsigned int _max_308 = ((mx) > (m_c_48) ? (mx) : (m_c_48));
+                                mx = _max_308;
+                            }
+                            unsigned int m_c_49;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_49) : "r"(__as_u32(a0[17])));
+                            if (lane_0_1 == 17) {
+                                unsigned int _max_309 = ((mx) > (m_c_49) ? (mx) : (m_c_49));
+                                mx = _max_309;
+                            }
+                            unsigned int m_c_50;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_50) : "r"(__as_u32(a0[18])));
+                            if (lane_0_1 == 18) {
+                                unsigned int _max_310 = ((mx) > (m_c_50) ? (mx) : (m_c_50));
+                                mx = _max_310;
+                            }
+                            unsigned int m_c_51;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_51) : "r"(__as_u32(a0[19])));
+                            if (lane_0_1 == 19) {
+                                unsigned int _max_311 = ((mx) > (m_c_51) ? (mx) : (m_c_51));
+                                mx = _max_311;
+                            }
+                            unsigned int m_c_52;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_52) : "r"(__as_u32(a0[20])));
+                            if (lane_0_1 == 20) {
+                                unsigned int _max_312 = ((mx) > (m_c_52) ? (mx) : (m_c_52));
+                                mx = _max_312;
+                            }
+                            unsigned int m_c_53;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_53) : "r"(__as_u32(a0[21])));
+                            if (lane_0_1 == 21) {
+                                unsigned int _max_313 = ((mx) > (m_c_53) ? (mx) : (m_c_53));
+                                mx = _max_313;
+                            }
+                            unsigned int m_c_54;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_54) : "r"(__as_u32(a0[22])));
+                            if (lane_0_1 == 22) {
+                                unsigned int _max_314 = ((mx) > (m_c_54) ? (mx) : (m_c_54));
+                                mx = _max_314;
+                            }
+                            unsigned int m_c_55;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_55) : "r"(__as_u32(a0[23])));
+                            if (lane_0_1 == 23) {
+                                unsigned int _max_315 = ((mx) > (m_c_55) ? (mx) : (m_c_55));
+                                mx = _max_315;
+                            }
+                            unsigned int m_c_56;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_56) : "r"(__as_u32(a0[24])));
+                            if (lane_0_1 == 24) {
+                                unsigned int _max_316 = ((mx) > (m_c_56) ? (mx) : (m_c_56));
+                                mx = _max_316;
+                            }
+                            unsigned int m_c_57;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_57) : "r"(__as_u32(a0[25])));
+                            if (lane_0_1 == 25) {
+                                unsigned int _max_317 = ((mx) > (m_c_57) ? (mx) : (m_c_57));
+                                mx = _max_317;
+                            }
+                            unsigned int m_c_58;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_58) : "r"(__as_u32(a0[26])));
+                            if (lane_0_1 == 26) {
+                                unsigned int _max_318 = ((mx) > (m_c_58) ? (mx) : (m_c_58));
+                                mx = _max_318;
+                            }
+                            unsigned int m_c_59;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_59) : "r"(__as_u32(a0[27])));
+                            if (lane_0_1 == 27) {
+                                unsigned int _max_319 = ((mx) > (m_c_59) ? (mx) : (m_c_59));
+                                mx = _max_319;
+                            }
+                            unsigned int m_c_60;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_60) : "r"(__as_u32(a0[28])));
+                            if (lane_0_1 == 28) {
+                                unsigned int _max_320 = ((mx) > (m_c_60) ? (mx) : (m_c_60));
+                                mx = _max_320;
+                            }
+                            unsigned int m_c_61;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_61) : "r"(__as_u32(a0[29])));
+                            if (lane_0_1 == 29) {
+                                unsigned int _max_321 = ((mx) > (m_c_61) ? (mx) : (m_c_61));
+                                mx = _max_321;
+                            }
+                            unsigned int m_c_62;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_62) : "r"(__as_u32(a0[30])));
+                            if (lane_0_1 == 30) {
+                                unsigned int _max_322 = ((mx) > (m_c_62) ? (mx) : (m_c_62));
+                                mx = _max_322;
+                            }
+                            unsigned int m_c_63;
+                            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(m_c_63) : "r"(__as_u32(a0[31])));
+                            if (lane_0_1 == 31) {
+                                unsigned int _max_323 = ((mx) > (m_c_63) ? (mx) : (m_c_63));
+                                mx = _max_323;
+                            }
                         }
                         mx = mx;
                     }
@@ -2645,1124 +2911,6 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
             }
         }
     }
-#if __CUDA_ARCH__ == 1070
-    // ---- Role: mma ----
-    if (warp == 16) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-        { // mma_main
-            int ntok_3 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_3 = 0;
-            #pragma unroll 1
-            for (int tk_3 = 0; tk_3 < ntok_3; tk_3++) {
-                int tok_2 = blockIdx.x + tk_3 * gridDim.x;
-                int bslot_3 = tk_3 % 2;
-                int _stage_blocks_ready_3 = (int)((unsigned int)tk_3 % 2);
-                int _parity_blocks_ready_3 = (int)((unsigned int)tk_3 / 2 % 2);
-                mbarrier_wait(blocks_ready_addr + (_stage_blocks_ready_3) * 8, _parity_blocks_ready_3);
-                int blocks_3 = blocks_word[bslot_3];
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(blocks_free_addr + ((int)((unsigned int)tk_3 % 2)) * 8);
-                int _parity_qdo_full = (int)((unsigned int)tk_3 % 2);
-                mbarrier_wait(qdo_full_addr, _parity_qdo_full);
-                if (elect_sync()) {
-                    #pragma unroll 1
-                    for (int i = 0; i < blocks_3; i++) {
-                        if (i == 0) {
-                            int _parity_k_full = (int)((unsigned int)(tord_3 + i) % 2);
-                            mbarrier_wait(k_full_addr, _parity_k_full);
-                            if (tord_3 > 0) {
-                                int _parity_s_free = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
-                                mbarrier_wait(s_free_addr, _parity_s_free);
-                            }
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_0 = ((q_k_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_1 = ((k_k_addr) >> 4) & 0x7FFF;
-                            asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68158608;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_tmem), "r"(0) : "memory");
-                            tcgen05_commit(s_full_addr);
-                        }
-                        if (i == 0) {
-                            int _parity_do_full = (int)((unsigned int)tk_3 % 2);
-                            mbarrier_wait(do_full_addr, _parity_do_full);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                        }
-                        int _parity_dp_free = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
-                        mbarrier_wait(dp_free_addr, _parity_dp_free);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_2 = ((do_k_addr) >> 4) & 0x7FFF;
-                        int _smem_desc_lo_3 = ((v_k_addr) >> 4) & 0x7FFF;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68158608;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem + (1048576))), "r"(0) : "memory");
-                        tcgen05_commit(dp_full_addr);
-                        int _parity_p_full = (int)((unsigned int)(tord_3 + i) % 2);
-                        mbarrier_wait(p_full_addr, _parity_p_full);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (tord_3 + i > 0) {
-                            int _parity_dkv_b_drained = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
-                            mbarrier_wait(dkv_b_drained_addr, _parity_dkv_b_drained);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                        }
-                        int _mma_a_lo_0 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
-                        int _mma_b_lo_0 = (((p_k_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem + (64))), "r"(0) : "memory");
-                        int _smem_desc_lo_4 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_mma_b_lo_0), "r"((tmem_tmem + (128))), "r"(0) : "memory");
-                        int _parity_ds_full = (int)((unsigned int)(tord_3 + i) % 2);
-                        mbarrier_wait(ds_full_addr, _parity_ds_full);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (i == 0) {
-                            int _parity_dq_drained = (int)((unsigned int)tk_3 % 2) ^ 1;
-                            mbarrier_wait(dq_drained_addr, _parity_dq_drained);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                        }
-                        int _mma_a_lo_1 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
-                        int _mma_b_lo_1 = (((ds_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135365776;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem + (192))), "r"(((i == 0) ? 0 : 1)) : "memory");
-                        int _smem_desc_lo_5 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135365776;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_5), "r"(_mma_b_lo_1), "r"((tmem_tmem + (256))), "r"(((i == 0) ? 0 : 1)) : "memory");
-                        int _smem_desc_lo_6 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135365776;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_6), "r"(_mma_b_lo_1), "r"((tmem_tmem + (320))), "r"(((i == 0) ? 0 : 1)) : "memory");
-                        int _smem_desc_lo_7 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135365776;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_7), "r"(_mma_b_lo_1), "r"((tmem_tmem + (384))), "r"(((i == 0) ? 0 : 1)) : "memory");
-                        tcgen05_commit(k_free_addr);
-                        int _mma_a_lo_2 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
-                        int _mma_b_lo_2 = (((ds_k_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_tmem + (64))), "r"(1) : "memory");
-                        int _smem_desc_lo_8 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_mma_b_lo_2), "r"((tmem_tmem + (128))), "r"(1) : "memory");
-                        tcgen05_commit(dkv_a_full_addr);
-                        int _parity_dkv_a_drained = (int)((unsigned int)(tord_3 + i) % 2);
-                        mbarrier_wait(dkv_a_drained_addr, _parity_dkv_a_drained);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _smem_desc_lo_9 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_9), "r"(_mma_b_lo_0), "r"((tmem_tmem + (64))), "r"(0) : "memory");
-                        int _smem_desc_lo_10 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_mma_b_lo_0), "r"((tmem_tmem + (128))), "r"(0) : "memory");
-                        tcgen05_commit(p_free_addr);
-                        int _smem_desc_lo_11 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_11), "r"(_mma_b_lo_2), "r"((tmem_tmem + (64))), "r"(1) : "memory");
-                        int _smem_desc_lo_12 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135300240;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_12), "r"(_mma_b_lo_2), "r"((tmem_tmem + (128))), "r"(1) : "memory");
-                        tcgen05_commit(dkv_b_full_addr);
-                        tcgen05_commit(ds_free_addr);
-                        if (blocks_3 > i + 1) {
-                            int _parity_k_full_1 = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
-                            mbarrier_wait(k_full_addr, _parity_k_full_1);
-                            int _parity_s_free_1 = (int)((unsigned int)(tord_3 + i) % 2);
-                            mbarrier_wait(s_free_addr, _parity_s_free_1);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _smem_desc_lo_13 = ((q_k_addr) >> 4) & 0x7FFF;
-                            int _smem_desc_lo_14 = ((k_k_addr) >> 4) & 0x7FFF;
-                            asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68158608;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 506;\n\t"
-                    "add.u32 blo, blo, 506;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_13), "r"(_smem_desc_lo_14), "r"(tmem_tmem), "r"(0) : "memory");
-                            tcgen05_commit(s_full_addr);
-                        }
-                    }
-                    tcgen05_commit(dq_done_addr);
-                }
-                tord_3 += blocks_3;
-            }
-        }
-    }
-    // ---- Role: load ----
-    if (warp == 17) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-        { // load_main
-            int ntok_4 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_4 = 0;
-            #pragma unroll 1
-            for (int tk_4 = 0; tk_4 < ntok_4; tk_4++) {
-                int tok_3 = blockIdx.x + tk_4 * gridDim.x;
-                int token_1 = token_base + token_step * tok_3;
-                int lane_0_2 = lane;
-                int _parity_dq_done_1 = (int)((unsigned int)tk_4 % 2) ^ 1;
-                mbarrier_wait(dq_done_addr, _parity_dq_done_1);
-                if (elect_sync()) {
-                    tma_4d_gmem2smem(q_k_addr, (&q_latent), 0, 0, 0, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 8192, (&q_latent), 0, 0, 1, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 16384, (&q_latent), 0, 0, 2, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 24576, (&q_latent), 0, 0, 3, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 32768, (&q_latent), 0, 0, 4, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 40960, (&q_latent), 0, 0, 5, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 49152, (&q_latent), 0, 0, 6, token_1, qdo_full_addr);
-                    tma_4d_gmem2smem(q_k_addr + 57344, (&q_latent), 0, 0, 7, token_1, qdo_full_addr);
-                    mbarrier_arrive_expect_tx(qdo_full_addr, 65536);
-                }
-                int _parity_do_free = (int)((unsigned int)tk_4 % 2) ^ 1;
-                mbarrier_wait(do_free_addr, _parity_do_free);
-                if (elect_sync()) {
-                    tma_4d_gmem2smem(do_k_addr, (&dout), 0, 0, 0, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 8192, (&dout), 0, 0, 1, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 16384, (&dout), 0, 0, 2, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 24576, (&dout), 0, 0, 3, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 32768, (&dout), 0, 0, 4, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 40960, (&dout), 0, 0, 5, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 49152, (&dout), 0, 0, 6, token_1, do_full_addr);
-                    tma_4d_gmem2smem(do_k_addr + 57344, (&dout), 0, 0, 7, token_1, do_full_addr);
-                    mbarrier_arrive_expect_tx(do_full_addr, 65536);
-                }
-                stats[lane_0_2] = lse[token_1 * 64 + lane_0_2] * 1.442695f;
-                stats[32 + lane_0_2] = lse[token_1 * 64 + 32 + lane_0_2] * 1.442695f;
-                stats[64 + lane_0_2] = delta[token_1 * 64 + lane_0_2];
-                stats[96 + lane_0_2] = delta[token_1 * 64 + 32 + lane_0_2];
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(stats_full_addr);
-            }
-        }
-    }
-    // ---- Role: metadata ----
-    if (warp == 18) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-        { // metadata_main
-            int ntok_5 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_5 = 0;
-            #pragma unroll 1
-            for (int tk_5 = 0; tk_5 < ntok_5; tk_5++) {
-                int tok_4 = blockIdx.x + tk_5 * gridDim.x;
-                int token_2 = token_base + token_step * tok_4;
-                int lane_0_3 = lane;
-                int active = topk;
-                if (has_topk_length != 0) {
-                    int _max_1 = ((topk_length[token_2]) > (0) ? (topk_length[token_2]) : (0));
-                    int _min_0 = ((_max_1) < (topk) ? (_max_1) : (topk));
-                    active = _min_0;
-                }
-                long long row_base = (long long)indices_offset + (long long)token_2 * (long long)idx_stride;
-                int aligned4 = (int)(((idx_stride | indices_offset) & 3) == 0);
-                int last_valid = -1;
-                for (int blk = (active + 127) / 128 - 1; blk >= 0; blk--) {
-                    int pos = blk * 128 + lane_0_3 * 4;
-                    int best = -1;
-                    if (pos < active) {
-                        if (aligned4 != 0) {
-                            int _vec_load_0[4];
-                            {
-                                const int4* _ivptr_2 = reinterpret_cast<const int4*>(indices + (row_base + (long long)pos) + 0);
-                                int4 _ivld_2;
-                                _ivld_2 = *_ivptr_2;
-                                _vec_load_0[0 + 0] = _ivld_2.x;
-                                _vec_load_0[0 + 1] = _ivld_2.y;
-                                _vec_load_0[0 + 2] = _ivld_2.z;
-                                _vec_load_0[0 + 3] = _ivld_2.w;
-                            }
-                            if (_vec_load_0[0] >= 0 && _vec_load_0[0] < num_kv && active > pos) {
-                                int m = 1;
-                                int r = _vec_load_0[0];
-                                if (dkv_has_map != 0) {
-                                    r = dkv_dst_map[(long long)_vec_load_0[0]];
-#else
     // ---- Warpgroup: 4 ----
     if (warp >= 16 && warp <= 19) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
@@ -3792,17 +2940,15 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 if (tord_3 > 0) {
                                     int _parity_s_free = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
                                     mbarrier_wait(s_free_addr, _parity_s_free);
-#endif
                                 }
-#if __CUDA_ARCH__ == 1070
-                                m = (int)(redo_mark[(long long)r] == 1);
-                                if (m != 0) {
-                                    best = pos;
-                                }
-#else
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                                int _smem_desc_lo_0 = ((q_k_addr) >> 4) & 0x7FFF;
+                                int _smem_desc_lo_1 = ((k_k_addr) >> 4) & 0x7FFF;
+#else
                                 int _smem_desc_lo_0 = ((q_k_addr) >> 4) & 0x3FFF;
                                 int _smem_desc_lo_1 = ((k_k_addr) >> 4) & 0x3FFF;
+#endif
                                 asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -3978,43 +3124,22 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "}\n"
                         :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_tmem), "r"(0) : "memory");
                                 tcgen05_commit(s_full_addr);
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            if (_vec_load_0[1] >= 0 && _vec_load_0[1] < num_kv && active > pos + 1) {
-                                int m_1 = 1;
-                                int r_1 = _vec_load_0[1];
-                                if (dkv_has_map != 0) {
-                                    r_1 = dkv_dst_map[(long long)_vec_load_0[1]];
-                                }
-                                m_1 = (int)(redo_mark[(long long)r_1] == 1);
-                                if (m_1 != 0) {
-                                    best = pos + 1;
-                                }
-#else
                             if (i == 0) {
                                 int _parity_do_full = (int)((unsigned int)tk_3 % 2);
                                 mbarrier_wait(do_full_addr, _parity_do_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            if (_vec_load_0[2] >= 0 && _vec_load_0[2] < num_kv && active > pos + 2) {
-                                int m_2 = 1;
-                                int r_2 = _vec_load_0[2];
-                                if (dkv_has_map != 0) {
-                                    r_2 = dkv_dst_map[(long long)_vec_load_0[2]];
-                                }
-                                m_2 = (int)(redo_mark[(long long)r_2] == 1);
-                                if (m_2 != 0) {
-                                    best = pos + 2;
-                                }
-#else
                             int _parity_dp_free = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
                             mbarrier_wait(dp_free_addr, _parity_dp_free);
                             asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_2 = ((do_k_addr) >> 4) & 0x7FFF;
+                            int _smem_desc_lo_3 = ((v_k_addr) >> 4) & 0x7FFF;
+#else
                             int _smem_desc_lo_2 = ((do_k_addr) >> 4) & 0x3FFF;
                             int _smem_desc_lo_3 = ((v_k_addr) >> 4) & 0x3FFF;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4197,22 +3322,14 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 int _parity_dkv_b_drained = (int)((unsigned int)(tord_3 + i) % 2) ^ 1;
                                 mbarrier_wait(dkv_b_drained_addr, _parity_dkv_b_drained);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-#endif
                             }
 #if __CUDA_ARCH__ == 1070
-                            if (_vec_load_0[3] >= 0 && _vec_load_0[3] < num_kv && active > pos + 3) {
-                                int m_3 = 1;
-                                int r_3 = _vec_load_0[3];
-                                if (dkv_has_map != 0) {
-                                    r_3 = dkv_dst_map[(long long)_vec_load_0[3]];
-                                }
-                                m_3 = (int)(redo_mark[(long long)r_3] == 1);
-                                if (m_3 != 0) {
-                                    best = pos + 3;
-                                }
+                            int _mma_a_lo_0 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
+                            int _mma_b_lo_0 = (((p_k_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
                             int _mma_a_lo_0 = ((((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (0) * 1024;
                             int _mma_b_lo_0 = (((p_k_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4247,7 +3364,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem + (64))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_4 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
+#else
                             int _smem_desc_lo_4 = ((((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (1) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4289,18 +3410,14 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 int _parity_dq_drained = (int)((unsigned int)tk_3 % 2) ^ 1;
                                 mbarrier_wait(dq_drained_addr, _parity_dq_drained);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-#endif
                             }
 #if __CUDA_ARCH__ == 1070
-                        } else {
-                            if (active > pos) {
-                                int sv_1_0 = indices[row_base + (long long)pos];
-                                if (sv_1_0 >= 0 && sv_1_0 < num_kv) {
-                                    int m_4 = 1;
-                                    int r_4 = sv_1_0;
+                            int _mma_a_lo_1 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
+                            int _mma_b_lo_1 = (((ds_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
                             int _mma_a_lo_1 = ((((k_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (0) * 1024;
                             int _mma_b_lo_1 = (((ds_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4335,7 +3452,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem + (192))), "r"(((i == 0) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_5 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
+#else
                             int _smem_desc_lo_5 = ((((k_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (1) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4370,7 +3491,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_smem_desc_lo_5), "r"(_mma_b_lo_1), "r"((tmem_tmem + (256))), "r"(((i == 0) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_6 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
+#else
                             int _smem_desc_lo_6 = ((((k_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (2) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4405,7 +3530,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_smem_desc_lo_6), "r"(_mma_b_lo_1), "r"((tmem_tmem + (320))), "r"(((i == 0) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_7 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
+#else
                             int _smem_desc_lo_7 = ((((k_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (3) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4441,8 +3570,13 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "}\n"
                         :: "r"(_smem_desc_lo_7), "r"(_mma_b_lo_1), "r"((tmem_tmem + (384))), "r"(((i == 0) ? 0 : 1)) : "memory");
                             tcgen05_commit(k_free_addr);
+#if __CUDA_ARCH__ == 1070
+                            int _mma_a_lo_2 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
+                            int _mma_b_lo_2 = (((ds_k_addr) >> 4) & 0x7FFF) | 0x2000000;
+#else
                             int _mma_a_lo_2 = ((((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (0) * 1024;
                             int _mma_b_lo_2 = (((ds_k_addr) >> 4) & 0x3FFF) | 0x2000000;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4477,7 +3611,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_tmem + (64))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_8 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (1) * 1024;
+#else
                             int _smem_desc_lo_8 = ((((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (1) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4516,7 +3654,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                             int _parity_dkv_a_drained = (int)((unsigned int)(tord_3 + i) % 2);
                             mbarrier_wait(dkv_a_drained_addr, _parity_dkv_a_drained);
                             asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_9 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
+#else
                             int _smem_desc_lo_9 = ((((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (2) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4551,7 +3693,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_smem_desc_lo_9), "r"(_mma_b_lo_0), "r"((tmem_tmem + (64))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_10 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
+#else
                             int _smem_desc_lo_10 = ((((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (3) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4587,7 +3733,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "}\n"
                         :: "r"(_smem_desc_lo_10), "r"(_mma_b_lo_0), "r"((tmem_tmem + (128))), "r"(0) : "memory");
                             tcgen05_commit(p_free_addr);
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_11 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
+#else
                             int _smem_desc_lo_11 = ((((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (2) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4622,7 +3772,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                         "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                         "}\n"
                         :: "r"(_smem_desc_lo_11), "r"(_mma_b_lo_2), "r"((tmem_tmem + (64))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                            int _smem_desc_lo_12 = ((((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (3) * 1024;
+#else
                             int _smem_desc_lo_12 = ((((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (3) * 1024;
+#endif
                             asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4665,8 +3819,13 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 int _parity_s_free_1 = (int)((unsigned int)(tord_3 + i) % 2);
                                 mbarrier_wait(s_free_addr, _parity_s_free_1);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                                int _smem_desc_lo_13 = ((q_k_addr) >> 4) & 0x7FFF;
+                                int _smem_desc_lo_14 = ((k_k_addr) >> 4) & 0x7FFF;
+#else
                                 int _smem_desc_lo_13 = ((q_k_addr) >> 4) & 0x3FFF;
                                 int _smem_desc_lo_14 = ((k_k_addr) >> 4) & 0x3FFF;
+#endif
                                 asm volatile(
                         "{\n\t"
                         ".reg .pred p0, p1;\n\t"
@@ -4930,111 +4089,45 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 if (_vec_load_0[0] >= 0 && _vec_load_0[0] < num_kv && active > pos) {
                                     int m = 1;
                                     int r = _vec_load_0[0];
-#endif
                                     if (dkv_has_map != 0) {
-#if __CUDA_ARCH__ == 1070
-                                        r_4 = dkv_dst_map[(long long)sv_1_0];
-#else
                                         r = dkv_dst_map[(long long)_vec_load_0[0]];
-#endif
                                     }
-#if __CUDA_ARCH__ == 1070
-                                    m_4 = (int)(redo_mark[(long long)r_4] == 1);
-                                    if (m_4 != 0) {
-#else
                                     m = (int)(redo_mark[(long long)r] == 1);
                                     if (m != 0) {
-#endif
                                         best = pos;
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                            }
-                            if (active > pos + 1) {
-                                int sv_1_1 = indices[row_base + (long long)(pos + 1)];
-                                if (sv_1_1 >= 0 && sv_1_1 < num_kv) {
-                                    int m_5 = 1;
-                                    int r_5 = sv_1_1;
-#else
                                 if (_vec_load_0[1] >= 0 && _vec_load_0[1] < num_kv && active > pos + 1) {
                                     int m_1 = 1;
                                     int r_1 = _vec_load_0[1];
-#endif
                                     if (dkv_has_map != 0) {
-#if __CUDA_ARCH__ == 1070
-                                        r_5 = dkv_dst_map[(long long)sv_1_1];
-#else
                                         r_1 = dkv_dst_map[(long long)_vec_load_0[1]];
-#endif
                                     }
-#if __CUDA_ARCH__ == 1070
-                                    m_5 = (int)(redo_mark[(long long)r_5] == 1);
-                                    if (m_5 != 0) {
-#else
                                     m_1 = (int)(redo_mark[(long long)r_1] == 1);
                                     if (m_1 != 0) {
-#endif
                                         best = pos + 1;
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                            }
-                            if (active > pos + 2) {
-                                int sv_1_2 = indices[row_base + (long long)(pos + 2)];
-                                if (sv_1_2 >= 0 && sv_1_2 < num_kv) {
-                                    int m_6 = 1;
-                                    int r_6 = sv_1_2;
-#else
                                 if (_vec_load_0[2] >= 0 && _vec_load_0[2] < num_kv && active > pos + 2) {
                                     int m_2 = 1;
                                     int r_2 = _vec_load_0[2];
-#endif
                                     if (dkv_has_map != 0) {
-#if __CUDA_ARCH__ == 1070
-                                        r_6 = dkv_dst_map[(long long)sv_1_2];
-#else
                                         r_2 = dkv_dst_map[(long long)_vec_load_0[2]];
-#endif
                                     }
-#if __CUDA_ARCH__ == 1070
-                                    m_6 = (int)(redo_mark[(long long)r_6] == 1);
-                                    if (m_6 != 0) {
-#else
                                     m_2 = (int)(redo_mark[(long long)r_2] == 1);
                                     if (m_2 != 0) {
-#endif
                                         best = pos + 2;
                                     }
                                 }
-#if __CUDA_ARCH__ == 1070
-                            }
-                            if (active > pos + 3) {
-                                int sv_1_3 = indices[row_base + (long long)(pos + 3)];
-                                if (sv_1_3 >= 0 && sv_1_3 < num_kv) {
-                                    int m_7 = 1;
-                                    int r_7 = sv_1_3;
-#else
                                 if (_vec_load_0[3] >= 0 && _vec_load_0[3] < num_kv && active > pos + 3) {
                                     int m_3 = 1;
                                     int r_3 = _vec_load_0[3];
-#endif
                                     if (dkv_has_map != 0) {
-#if __CUDA_ARCH__ == 1070
-                                        r_7 = dkv_dst_map[(long long)sv_1_3];
-#else
                                         r_3 = dkv_dst_map[(long long)_vec_load_0[3]];
-#endif
                                     }
-#if __CUDA_ARCH__ == 1070
-                                    m_7 = (int)(redo_mark[(long long)r_7] == 1);
-                                    if (m_7 != 0) {
-#else
                                     m_3 = (int)(redo_mark[(long long)r_3] == 1);
                                     if (m_3 != 0) {
-#endif
                                         best = pos + 3;
-#if __CUDA_ARCH__ == 1070
-#else
                                     }
                                 }
                             } else {
@@ -5092,138 +4185,17 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                         if (m_7 != 0) {
                                             best = pos + 3;
                                         }
-#endif
                                     }
                                 }
                             }
                         }
-#if __CUDA_ARCH__ == 1070
-                    }
-                    int _warp_redux_3;
-                    asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_3) : "r"(best));
-                    best = _warp_redux_3;
-                    if (best >= 0) {
-                        last_valid = best;
-                        break;
-                    }
-                }
-                int blocks_4 = (((last_valid + 64) / 64) > (1) ? ((last_valid + 64) / 64) : (1));
-                int bfree_slot = tk_5 % 2;
-                int _stage_blocks_free = (int)((unsigned int)tk_5 % 2);
-                int _parity_blocks_free = (int)((unsigned int)tk_5 / 2 % 2) ^ 1;
-                mbarrier_wait(blocks_free_addr + (_stage_blocks_free) * 8, _parity_blocks_free);
-                if (lane_0_3 == 0) {
-                    blocks_word[bfree_slot] = blocks_4;
-                    mbarrier_arrive(blocks_ready_addr + ((int)((unsigned int)tk_5 % 2)) * 8);
-                }
-                if (lane_0_3 < 8) {
-                    #pragma unroll 1
-                    for (int i_1 = 0; i_1 < blocks_4; i_1++) {
-                        int n = blocks_4 - 1 - i_1;
-                        int slot_2 = tord_5 % 2;
-                        unsigned int mask = 0;
-                        int position = n * 64 + lane_0_3 * 8;
-                        int values[8];
-                        int whole_tile = (int)(active >= n * 64 + 64 && ((idx_stride | indices_offset) & 7) == 0);
-                        if (whole_tile != 0) {
-                            int _vec_load_1[8];
-                            {
-                                uint32_t _iv_4_0;
-                                uint32_t _iv_4_1;
-                                uint32_t _iv_4_2;
-                                uint32_t _iv_4_3;
-                                uint32_t _iv_4_4;
-                                uint32_t _iv_4_5;
-                                uint32_t _iv_4_6;
-                                uint32_t _iv_4_7;
-                                asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                    : "=r"(_iv_4_0), "=r"(_iv_4_1), "=r"(_iv_4_2), "=r"(_iv_4_3), "=r"(_iv_4_4), "=r"(_iv_4_5), "=r"(_iv_4_6), "=r"(_iv_4_7) : "l"((const void*)(indices + (row_base + (long long)position) + (0))) : "memory");
-                                _vec_load_1[0 + 0] = (int32_t)_iv_4_0;
-                                _vec_load_1[0 + 1] = (int32_t)_iv_4_1;
-                                _vec_load_1[0 + 2] = (int32_t)_iv_4_2;
-                                _vec_load_1[0 + 3] = (int32_t)_iv_4_3;
-                                _vec_load_1[0 + 4] = (int32_t)_iv_4_4;
-                                _vec_load_1[0 + 5] = (int32_t)_iv_4_5;
-                                _vec_load_1[0 + 6] = (int32_t)_iv_4_6;
-                                _vec_load_1[0 + 7] = (int32_t)_iv_4_7;
-                            }
-                            values[0] = _vec_load_1[0];
-                            values[1] = _vec_load_1[1];
-                            values[2] = _vec_load_1[2];
-                            values[3] = _vec_load_1[3];
-                            values[4] = _vec_load_1[4];
-                            values[5] = _vec_load_1[5];
-                            values[6] = _vec_load_1[6];
-                            values[7] = _vec_load_1[7];
-                        } else {
-                            int clamped_1_0 = ((position) < (topk - 1) ? (position) : (topk - 1));
-                            int value_2_0 = indices[row_base + (long long)clamped_1_0];
-                            if (active <= position) {
-                                value_2_0 = -1;
-                            }
-                            values[0] = value_2_0;
-                            int clamped_1_1 = ((position + 1) < (topk - 1) ? (position + 1) : (topk - 1));
-                            int value_2_1 = indices[row_base + (long long)clamped_1_1];
-                            if (active <= position + 1) {
-                                value_2_1 = -1;
-                            }
-                            values[1] = value_2_1;
-                            int clamped_1_2 = ((position + 2) < (topk - 1) ? (position + 2) : (topk - 1));
-                            int value_2_2 = indices[row_base + (long long)clamped_1_2];
-                            if (active <= position + 2) {
-                                value_2_2 = -1;
-                            }
-                            values[2] = value_2_2;
-                            int clamped_1_3 = ((position + 3) < (topk - 1) ? (position + 3) : (topk - 1));
-                            int value_2_3 = indices[row_base + (long long)clamped_1_3];
-                            if (active <= position + 3) {
-                                value_2_3 = -1;
-                            }
-                            values[3] = value_2_3;
-                            int clamped_1_4 = ((position + 4) < (topk - 1) ? (position + 4) : (topk - 1));
-                            int value_2_4 = indices[row_base + (long long)clamped_1_4];
-                            if (active <= position + 4) {
-                                value_2_4 = -1;
-                            }
-                            values[4] = value_2_4;
-                            int clamped_1_5 = ((position + 5) < (topk - 1) ? (position + 5) : (topk - 1));
-                            int value_2_5 = indices[row_base + (long long)clamped_1_5];
-                            if (active <= position + 5) {
-                                value_2_5 = -1;
-                            }
-                            values[5] = value_2_5;
-                            int clamped_1_6 = ((position + 6) < (topk - 1) ? (position + 6) : (topk - 1));
-                            int value_2_6 = indices[row_base + (long long)clamped_1_6];
-                            if (active <= position + 6) {
-                                value_2_6 = -1;
-                            }
-                            values[6] = value_2_6;
-                            int clamped_1_7 = ((position + 7) < (topk - 1) ? (position + 7) : (topk - 1));
-                            int value_2_7 = indices[row_base + (long long)clamped_1_7];
-                            if (active <= position + 7) {
-                                value_2_7 = -1;
-                            }
-                            values[7] = value_2_7;
-#else
                         int _warp_redux_3;
                         asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_3) : "r"(best));
                         best = _warp_redux_3;
                         if (best >= 0) {
                             last_valid = best;
                             break;
-#endif
                         }
-#if __CUDA_ARCH__ == 1070
-                        int _stage_idx_free = (int)((unsigned int)tord_5 % 2);
-                        int _parity_idx_free = (int)((unsigned int)tord_5 / 2 % 2) ^ 1;
-                        mbarrier_wait(idx_free_addr + (_stage_idx_free) * 8, _parity_idx_free);
-                        int ok_7_0 = (int)(values[0] >= 0 && values[0] < num_kv);
-                        if (ok_7_0 != 0) {
-                            int m_8 = 1;
-                            int r_8 = values[0];
-                            if (dkv_has_map != 0) {
-                                r_8 = dkv_dst_map[(long long)values[0]];
-#else
                     }
                     int blocks_4 = (((last_valid + 64) / 64) > (1) ? ((last_valid + 64) / 64) : (1));
                     int bfree_slot = tk_5 % 2;
@@ -5322,25 +4294,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                     value_2_7 = -1;
                                 }
                                 values[7] = value_2_7;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_8 = (int)(redo_mark[(long long)r_8] == 1);
-                            ok_7_0 = m_8;
-                        }
-                        if (ok_7_0 != 0) {
-                            mask = mask | 1;
-                        } else {
-                            values[0] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8] = values[0];
-                        int ok_7_1 = (int)(values[1] >= 0 && values[1] < num_kv);
-                        if (ok_7_1 != 0) {
-                            int m_9 = 1;
-                            int r_9 = values[1];
-                            if (dkv_has_map != 0) {
-                                r_9 = dkv_dst_map[(long long)values[1]];
-#else
                             int _stage_idx_free = (int)((unsigned int)tord_5 % 2);
                             int _parity_idx_free = (int)((unsigned int)tord_5 / 2 % 2) ^ 1;
                             mbarrier_wait(idx_free_addr + (_stage_idx_free) * 8, _parity_idx_free);
@@ -5353,48 +4307,12 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 }
                                 m_8 = (int)(redo_mark[(long long)r_8] == 1);
                                 ok_7_0 = m_8;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_9 = (int)(redo_mark[(long long)r_9] == 1);
-                            ok_7_1 = m_9;
-                        }
-                        if (ok_7_1 != 0) {
-                            mask = mask | 2;
-                        } else {
-                            values[1] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 1] = values[1];
-                        int ok_7_2 = (int)(values[2] >= 0 && values[2] < num_kv);
-                        if (ok_7_2 != 0) {
-                            int m_10 = 1;
-                            int r_10 = values[2];
-                            if (dkv_has_map != 0) {
-                                r_10 = dkv_dst_map[(long long)values[2]];
-#else
                             if (ok_7_0 != 0) {
                                 mask = mask | 1;
                             } else {
                                 values[0] = -1;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_10 = (int)(redo_mark[(long long)r_10] == 1);
-                            ok_7_2 = m_10;
-                        }
-                        if (ok_7_2 != 0) {
-                            mask = mask | 4;
-                        } else {
-                            values[2] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 2] = values[2];
-                        int ok_7_3 = (int)(values[3] >= 0 && values[3] < num_kv);
-                        if (ok_7_3 != 0) {
-                            int m_11 = 1;
-                            int r_11 = values[3];
-                            if (dkv_has_map != 0) {
-                                r_11 = dkv_dst_map[(long long)values[3]];
-#else
                             tile_idx[slot_2 * 80 + lane_0_3 * 8] = values[0];
                             int ok_7_1 = (int)(values[1] >= 0 && values[1] < num_kv);
                             if (ok_7_1 != 0) {
@@ -5405,48 +4323,12 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 }
                                 m_9 = (int)(redo_mark[(long long)r_9] == 1);
                                 ok_7_1 = m_9;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_11 = (int)(redo_mark[(long long)r_11] == 1);
-                            ok_7_3 = m_11;
-                        }
-                        if (ok_7_3 != 0) {
-                            mask = mask | 8;
-                        } else {
-                            values[3] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 3] = values[3];
-                        int ok_7_4 = (int)(values[4] >= 0 && values[4] < num_kv);
-                        if (ok_7_4 != 0) {
-                            int m_12 = 1;
-                            int r_12 = values[4];
-                            if (dkv_has_map != 0) {
-                                r_12 = dkv_dst_map[(long long)values[4]];
-#else
                             if (ok_7_1 != 0) {
                                 mask = mask | 2;
                             } else {
                                 values[1] = -1;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_12 = (int)(redo_mark[(long long)r_12] == 1);
-                            ok_7_4 = m_12;
-                        }
-                        if (ok_7_4 != 0) {
-                            mask = mask | 16;
-                        } else {
-                            values[4] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 4] = values[4];
-                        int ok_7_5 = (int)(values[5] >= 0 && values[5] < num_kv);
-                        if (ok_7_5 != 0) {
-                            int m_13 = 1;
-                            int r_13 = values[5];
-                            if (dkv_has_map != 0) {
-                                r_13 = dkv_dst_map[(long long)values[5]];
-#else
                             tile_idx[slot_2 * 80 + lane_0_3 * 8 + 1] = values[1];
                             int ok_7_2 = (int)(values[2] >= 0 && values[2] < num_kv);
                             if (ok_7_2 != 0) {
@@ -5457,48 +4339,12 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 }
                                 m_10 = (int)(redo_mark[(long long)r_10] == 1);
                                 ok_7_2 = m_10;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_13 = (int)(redo_mark[(long long)r_13] == 1);
-                            ok_7_5 = m_13;
-                        }
-                        if (ok_7_5 != 0) {
-                            mask = mask | 32;
-                        } else {
-                            values[5] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 5] = values[5];
-                        int ok_7_6 = (int)(values[6] >= 0 && values[6] < num_kv);
-                        if (ok_7_6 != 0) {
-                            int m_14 = 1;
-                            int r_14 = values[6];
-                            if (dkv_has_map != 0) {
-                                r_14 = dkv_dst_map[(long long)values[6]];
-#else
                             if (ok_7_2 != 0) {
                                 mask = mask | 4;
                             } else {
                                 values[2] = -1;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_14 = (int)(redo_mark[(long long)r_14] == 1);
-                            ok_7_6 = m_14;
-                        }
-                        if (ok_7_6 != 0) {
-                            mask = mask | 64;
-                        } else {
-                            values[6] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 6] = values[6];
-                        int ok_7_7 = (int)(values[7] >= 0 && values[7] < num_kv);
-                        if (ok_7_7 != 0) {
-                            int m_15 = 1;
-                            int r_15 = values[7];
-                            if (dkv_has_map != 0) {
-                                r_15 = dkv_dst_map[(long long)values[7]];
-#else
                             tile_idx[slot_2 * 80 + lane_0_3 * 8 + 2] = values[2];
                             int ok_7_3 = (int)(values[3] >= 0 && values[3] < num_kv);
                             if (ok_7_3 != 0) {
@@ -5509,12 +4355,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                                 }
                                 m_11 = (int)(redo_mark[(long long)r_11] == 1);
                                 ok_7_3 = m_11;
-#endif
                             }
-#if __CUDA_ARCH__ == 1070
-                            m_15 = (int)(redo_mark[(long long)r_15] == 1);
-                            ok_7_7 = m_15;
-#else
                             if (ok_7_3 != 0) {
                                 mask = mask | 8;
                             } else {
@@ -5588,36 +4429,10 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                             validity8[slot_2 * 320 + 256 + lane_0_3] = mask;
                             mbarrier_arrive(idx_full_addr + ((int)((unsigned int)tord_5 % 2)) * 8);
                             tord_5 += 1;
-#endif
                         }
-#if __CUDA_ARCH__ == 1070
-                        if (ok_7_7 != 0) {
-                            mask = mask | 128;
-                        } else {
-                            values[7] = -1;
-                        }
-                        tile_idx[slot_2 * 80 + lane_0_3 * 8 + 7] = values[7];
-                        validity8[slot_2 * 320 + 256 + lane_0_3] = mask;
-                        mbarrier_arrive(idx_full_addr + ((int)((unsigned int)tord_5 % 2)) * 8);
-                        tord_5 += 1;
-#else
-#endif
                     }
                 }
             }
-#if __CUDA_ARCH__ == 1070
-        }
-    }
-    // ---- Role: spare ----
-    if (warp == 19) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
-        { // spare_main
-            int ntok_6 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
-            int tord_6 = 0;
-            #pragma unroll 1
-            for (int tk_6 = 0; tk_6 < ntok_6; tk_6++) {
-                int tok_5 = blockIdx.x + tk_6 * gridDim.x;
-#else
         // ---- Role: spare ----
         } else if (warp == 19) {
             { // spare_main
@@ -5627,7 +4442,6 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
                 for (int tk_6 = 0; tk_6 < ntok_6; tk_6++) {
                     int tok_5 = blockIdx.x + tk_6 * gridDim.x;
                 }
-#endif
             }
         }
     }
