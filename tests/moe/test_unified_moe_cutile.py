@@ -1775,13 +1775,27 @@ def test_cutile_nvfp4_persistent_grid_matches_one_cta_per_block(
     runner.check_support()
     runner.build()
     inputs = runner.pack_inputs(activations, weights)
+    launches = []
+    launch = fp4.ct.launch
+
+    def record(stream, grid, kernel, args):
+        name = getattr(getattr(kernel, "_pyfunc", None), "__name__", "")
+        if name in ("_grouped_gemm_w4a16", "_grouped_gemm_w4a4"):
+            launches.append((tuple(grid), args[-1]))
+        return launch(stream, grid, kernel, args)
+
     # The persistent grid runs first, so that rows it skipped cannot be left
     # over in the workspace by the one-CTA-per-block run.
     with monkeypatch.context() as patch:
         patch.setattr(fp4, "_PERSISTENT_MIN_ASSIGNMENTS", 1)
         patch.setattr(fp4, "_PERSISTENT_MAX_K", 1 << 30)
         patch.setattr(fp4, "_persistent_grid_m", lambda *_args: 1)
+        patch.setattr(fp4.ct, "launch", record)
         actual = runner.forward(inputs, tactic=tactic).clone()
+    # The changed grouped GEMMs took the persistent grid with their loop compiled in.
+    assert launches, "no _grouped_gemm_w4a16 / _grouped_gemm_w4a4 launch was recorded"
+    for grid, persistent in launches:
+        assert grid[0] == 1 and persistent is True, launches
     expected = runner.forward(inputs, tactic=tactic).clone()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
