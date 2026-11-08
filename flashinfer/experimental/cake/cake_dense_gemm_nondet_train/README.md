@@ -126,18 +126,18 @@ On some rows this module runs the deterministic package's fixed-order programs:
 
 *Table: the numerical, architecture and parallelism matrix of this module.*
 
-| output (default arguments, the shipped tables) | run to run | why |
-|---|---|---|
-| K1 forward `out` | repeats bit for bit | the deterministic programs: whole tiles, or two K ranges added in a fixed order (the one-wave program of `K1_FORWARD_PROGRAM_RULES_BY_SM`: the same bits) |
-| K1 input gradient `out` | repeats bit for bit | the deterministic programs (the rows of `K1_DGRAD_RULES_BY_SM`: another of them, the same bits; the input-gradient program of `K1_DGRAD_PROGRAM_RULES_BY_SM` and the nvjet program of `K1_DGRAD_NVJET_RULES_BY_SM`: the same bits) |
-| K1 weight gradient `out`, `d_out` or `d_in` at most 1024 | repeats bit for bit | at most two partials per element (two splits), or a fixed order (the cluster program's rank order, chains added in order, the mirror order of four splits, the stream-K program's unit order, the deterministic programs), or whole tiles (one split) |
-| K1 weight gradient `out`, both sides above 1024 | repeats bit for bit | the deterministic programs, and the two-split and one-split rows of the tables |
-| K2 forward `out` (router logits) | repeats bit for bit | the SIMT program (rank-ordered) or the deterministic program |
-| K2 input gradient `out` | repeats bit for bit | the SIMT program or the deterministic program (one split) |
-| K2 weight gradient `out` | repeats bit for bit | the SIMT program, the K-order program (partials added in K order), a `"waves"` partition of at most two partials per element, or the deterministic program at the split count of the router tables (partials added in a fixed order) |
-| any output with a caller's `splits >= 3` (K1 in the arrival order, K2 weight gradient) | may vary in the last bits | the partials are added in the order they finish; PyTorch's deterministic-algorithms alert fires before such a launch |
+| output (default arguments, the shipped tables) | run to run | why | error against FP64 (relative L2 / worst element) |
+|---|---|---|---|
+| K1 forward `out` | repeats bit for bit | the deterministic programs: whole tiles, or two K ranges added in a fixed order (the one-wave program of `K1_FORWARD_PROGRAM_RULES_BY_SM`: the same bits) | 1.000 / 1.000 |
+| K1 input gradient `out` | repeats bit for bit | the deterministic programs (the rows of `K1_DGRAD_RULES_BY_SM`: another of them, the same bits; the input-gradient program of `K1_DGRAD_PROGRAM_RULES_BY_SM` and the nvjet program of `K1_DGRAD_NVJET_RULES_BY_SM`: the same bits) | 1.000 / 1.000 |
+| K1 weight gradient `out`, `d_out` or `d_in` at most 1024 | repeats bit for bit | at most two partials per element (two splits), or a fixed order (the cluster program's rank order, chains added in order, the mirror order of four splits, the stream-K program's unit order, the deterministic programs), or whole tiles (one split) | 1.000 / 1.087 |
+| K1 weight gradient `out`, both sides above 1024 | repeats bit for bit | the deterministic programs, and the two-split and one-split rows of the tables | 1.000 / 1.000 |
+| K2 forward `out` (router logits) | repeats bit for bit | the SIMT program (rank-ordered) or the deterministic program | 1.000 / 1.000 |
+| K2 input gradient `out` | repeats bit for bit | the SIMT program or the deterministic program (one split) | 1.000 / 1.000 |
+| K2 weight gradient `out` | repeats bit for bit | the SIMT program, the K-order program (partials added in K order), a `"waves"` partition of at most two partials per element, or the deterministic program at the split count of the router tables (partials added in a fixed order) | 1.012 / 1.095 |
+| any output with a caller's `splits >= 3` (K1 in the arrival order, K2 weight gradient) | may vary in the last bits | the partials are added in the order they finish; PyTorch's deterministic-algorithms alert fires before such a launch | not measured (no shipped row) |
 
-*Table: whether each output repeats bit for bit across runs, and why.  The table states the shipped tables with default arguments; a row moves to a program whose bits vary only under the speed rule of [Acceptance rules](#acceptance-rules), and its launch raises the alert above.*
+*Table: whether each output repeats bit for bit across runs, why, and its error against FP64.  The table states the shipped tables with default arguments; a row moves to a program whose bits vary only under the speed rule of [Acceptance rules](#acceptance-rules), and its launch raises the alert above.  The error column is the largest error against FP64 over every benchmark row of the output (and the rows at 16384 tokens), the six input kinds of the accuracy rule and five runs, on a B200, a GB200, a GB300 and an R200 part, as a multiple of the median error of the reference implementation (FlashInfer commit `2e989556`) in the same run: relative L2 error, then the largest element error.  The accuracy rule allows 1.1.*
 
 ## Acceptance rules
 
@@ -274,7 +274,8 @@ only at 16172 to 16384 tokens (`K1_SPLIT_RULES_BY_SM_TOKENS`), and the 212-SM ch
 token-range table also at its ranges.*
 
 **Accuracy and repeatability changes.**  Every shipped row repeats bit for bit.  Every shipped row meets the accuracy
-rule above (the six input kinds against the reference implementation, FlashInfer commit `2e989556`).  The changes:
+rule above (the six input kinds against the reference implementation, FlashInfer commit `2e989556`; measured at every
+benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of the run-to-run table).  The changes:
 
 - K1 weight gradient: the `sm_107a` CTA-pair rows of three or four splits (their partials added in the order they
   finish; on 212-SM parts they missed mirrored cancellation, 5.8 to 8.7 times the reference's error) run two splits
@@ -1336,7 +1337,7 @@ not accepted can still be a shipped verdict.
 
 ## Tested versions
 
-The benchmark of this package (every row, eager and CUDA graph, at FlashInfer commit `fdd17bae`) ran on these GPUs:
+The benchmark of this package (every row, eager and CUDA graph, with the tables of this version) ran on these GPUs:
 
 | GPU | architecture | SMs | driver (CUDA driver API) |
 |---|---|---|---|
