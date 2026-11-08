@@ -4900,9 +4900,11 @@ def _function_forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_
     )
     # the M-share segment state (:data:`M_SHARE_ARCHS`) is the saved list's last entry, a placeholder without it:
     # metadata-equal to the segment state where the call plans M-share but keeps no tape (a non-reentrant
-    # checkpoint's first pass saves what its recompute saves), else empty
+    # checkpoint's first pass saves what its recompute saves), else empty.  Whether the backward reads it follows
+    # the plan, as the kept state does: a non-reentrant checkpoint's backward runs on the first pass's ctx with the
+    # recompute's saved tensors
     m_share = fwd.get("m_share")
-    ctx.m_share = m_share is not None
+    ctx.m_share = fwd.get("m_share_shape") is not None
     if m_share is None:
         m_share = cake_plan.placeholder(
             fwd.get("m_share_shape") or (0,), torch.float32, fwd["qn"].device
