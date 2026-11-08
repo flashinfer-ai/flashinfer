@@ -1526,6 +1526,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "scale"],
             ["buffer", "seg_index"],
             ["buffer", "seg_mode"],
+            ["parameter", "warmup_thresh_log2"],
+            ["buffer", "seg_flag"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
