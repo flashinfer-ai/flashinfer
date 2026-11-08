@@ -2038,6 +2038,14 @@ ADJOINT_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a", "sm_107a"
 ADJOINT_SPLIT_STAGES = ("dhu_tc2_dvl32_modes", "dhu_tc2_dvl32_gm")
 # the stages that compose the end adjoints, in preference order
 ADJOINT_CHAIN_STAGES = ("stitch", "piece_chain")
+# The one-wave route of the split (:func:`_adjoint_split_walk`): on an architecture of ONE_WAVE_SPLIT_ARCHS whose
+# composer is the stitch, a table whose pieces all fit one wave beside one another (pieces x HV <= SMs) runs the
+# summaries, the stitch and ONE walk of every piece from the stitched end adjoints on the caller's stream (the stitch
+# writes the end adjoint of each sequence's last piece too: its ``dht`` row, or zeros).  The two-stream route walks
+# the last pieces beside the summaries instead, which the walk of the other pieces then waits for; where every piece
+# fits one wave that overlap buys no device time (the summaries take at least as long), while the fork, the stream
+# switches and the join hold the device idle on the host.  The same kernels and bits as the two-stream route.
+ONE_WAVE_SPLIT_ARCHS: frozenset[str] = frozenset({"sm_100a", "sm_103a", "sm_107a"})
 # the mode bits of an entry of the forms (``seg_mode``): seed the walk from ``dht`` (row of the segment, or of its
 # sequence with SPLIT_SEED_SEQ), write the dh / dv2 tapes, store the adjoint at the segment's start into the B half of
 # ``seg_state`` (the stitch's layout), bound a summary (``dhu_tc2_dvl32_gm``) by the warm-up and write its seg_flag
@@ -2245,7 +2253,9 @@ class AdjointSplit:
     ``[segment index, mode bits]`` of each launch of the ``dhu_tc2_dvl32`` forms (:func:`adjoint_split_tables`; the
     summaries write the stitch's ``seg_flag``); ``one_stream``: every launch on the caller's stream, summaries first
     (:func:`adjoint_split_pricing`), instead of the summaries, the composition and the other pieces' walks on a side
-    stream beside the last pieces' walks (the same kernels and bits)."""
+    stream beside the last pieces' walks (the same kernels and bits); ``one_wave``: the one-wave route of
+    ONE_WAVE_SPLIT_ARCHS, ``every`` (every piece from its stitched end adjoint, tapes) after the summaries and the
+    stitch, all on the caller's stream."""
 
     walk: torch.Tensor
     summary: torch.Tensor
@@ -2254,6 +2264,9 @@ class AdjointSplit:
     num_summary: int
     num_front: int
     one_stream: bool = False
+    every: torch.Tensor | None = None
+    num_every: int = 0
+    one_wave: bool = False
 
 
 def adjoint_split_lists(
@@ -2276,15 +2289,23 @@ def adjoint_split_lists(
 
 
 def adjoint_split_tables(
-    seq_seg_start, num_v_heads: int, device, one_stream: bool = False
+    seq_seg_start,
+    num_v_heads: int,
+    device,
+    one_stream: bool = False,
+    one_wave: bool = False,
 ) -> AdjointSplit:
     """:class:`AdjointSplit` of a segment table (:func:`adjoint_split_lists`), copied to ``device`` in one transfer;
-    ``one_stream`` as given."""
+    ``one_stream`` as given; with ``one_wave`` also ``every``, each segment seeded from its own end adjoint with
+    tapes."""
     seq_seg_start = [int(x) for x in seq_seg_start]
     walk_i, walk_m, summary_i, summary_m, front_i, front_m = adjoint_split_lists(
         seq_seg_start
     )
     parts = [walk_i + walk_m, summary_i + summary_m, front_i + front_m]
+    every_i = list(range(seq_seg_start[-1])) if one_wave else []
+    if one_wave:
+        parts.append(every_i + [SPLIT_SEED | SPLIT_TAPE] * len(every_i))
     table = torch.tensor([x for part in parts for x in part], dtype=torch.int32)
     device = torch.device(device)
     table = (
@@ -2305,6 +2326,9 @@ def adjoint_split_tables(
         num_summary=len(summary_i),
         num_front=len(front_i),
         one_stream=bool(one_stream),
+        every=views[3].view(2, -1) if one_wave else None,
+        num_every=len(every_i),
+        one_wave=bool(one_wave),
     )
 
 
@@ -2316,10 +2340,12 @@ def _host_adjoint_split(
     device_index: int,
     lpt: bool,
     one_stream: bool = False,
+    wave_sms: int = 0,
 ) -> AdjointSplit:
     """:func:`adjoint_split_tables` of the adjoint segments :func:`build_chunk_meta` builds for ``seq_lens`` (the
     sequences in :func:`lpt_sequence_order` with ``lpt``) at ``segment_len``, wave 1 on one stream with
-    ``one_stream``."""
+    ``one_stream``; the one-wave route where ``wave_sms`` (the SM count, 0 without the route) holds every piece of
+    every value head."""
     order = lpt_sequence_order(seq_lens) if lpt else None
     seq_seg_start = [0]
     for seq in order if order is not None else range(len(seq_lens)):
@@ -2327,8 +2353,13 @@ def _host_adjoint_split(
         seq_seg_start.append(
             seq_seg_start[-1] + len(segment_bounds(n, int(segment_len))) - 1
         )
+    one_wave = 0 < seq_seg_start[-1] * int(num_v_heads) <= int(wave_sms)
     return adjoint_split_tables(
-        seq_seg_start, num_v_heads, torch.device("cuda", device_index), one_stream
+        seq_seg_start,
+        num_v_heads,
+        torch.device("cuda", device_index),
+        one_stream,
+        one_wave,
     )
 
 
@@ -3648,7 +3679,8 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     ``seg_flag``), the composition of the pieces' end adjoints (the stitch with ``reverse``, or ``piece_chain``: each
     sequence's last piece ends at ``dht``, every earlier one at ``M x + B`` of the piece after it, or ``B`` where that
     piece's flag is 0) and the other pieces' walks from those end adjoints; every launch bound before the fork, or with
-    ``one_stream`` all of them on the caller's stream, summaries first.  ``dh`` / ``dv2`` receive every chunk's tapes,
+    ``one_stream`` all of them on the caller's stream, summaries first; with ``one_wave`` the summaries, the stitch and
+    one walk of every piece from its end adjoint on the caller's stream.  ``dh`` / ``dv2`` receive every chunk's tapes,
     ``dh0`` each sequence's start adjoint (with ``has_initial_state``).  ``ex``: the backward's executor
     (:data:`_DIRECT` when ``None``)."""
     ex = ex or _DIRECT
@@ -3689,6 +3721,15 @@ def _adjoint_split_walk(split1: AdjointSplit, segs: SegmentTable, meta: ChunkMet
     else:
         compose = ex.bind("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                           seg_flag, hv, use_dht, 1)  # fmt: skip
+    if split1.one_wave:
+        # the one-wave route (ONE_WAVE_SPLIT_ARCHS): the summaries, the stitch (every end adjoint, the last pieces'
+        # from dht) and one walk of every piece, all on the caller's stream
+        summaries()
+        compose()
+        bound(
+            "dhu_tc2_dvl32_modes", split1.every, split1.num_every, dh_end, 1, store0
+        )()
+        return
     fronts = bound(
         "dhu_tc2_dvl32_modes", split1.front, split1.num_front, dh_end, 1, store0
     )
@@ -4299,6 +4340,7 @@ def _chunk_meta(
         options.tail,
         SPLIT_R_FORM,
         tuple(sorted(ADJOINT_SPLIT_ARCHS)),
+        tuple(sorted(ONE_WAVE_SPLIT_ARCHS)),
         id(cake_plan.ADJOINT_FORMS),
     )
     if options.host_cache:
@@ -4321,10 +4363,15 @@ def _chunk_meta(
     )
     if split_len is not None and int(plans[1].segment_len) == split_len:
         # wave 1 on one stream where the pricing says so or where the caller keeps every launch on its stream
+        arch = cake_backend.device_arch(int(index))
         one_stream = options.streams == 1 or bool(
-            _adjoint_split_priced(
-                seq_lens, num_v_heads, index, cake_backend.device_arch(int(index))
-            )["one_stream"]
+            _adjoint_split_priced(seq_lens, num_v_heads, index, arch)["one_stream"]
+        )
+        # the one-wave route needs the stitch, which writes the last pieces' end adjoints too
+        wave_sms = (
+            _device_props(int(index))[0]
+            if arch in ONE_WAVE_SPLIT_ARCHS and _adjoint_chain_stage(arch) == "stitch"
+            else 0
         )
         meta = replace(
             meta,
@@ -4335,6 +4382,7 @@ def _chunk_meta(
                 int(index),
                 options.lpt,
                 one_stream,
+                wave_sms,
             ),
         )
     if options.streams == 2:

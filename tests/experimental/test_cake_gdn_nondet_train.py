@@ -4314,6 +4314,8 @@ def _split_device(monkeypatch, device, *, split: bool, chain: str | None = None)
     monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_COSTS", {arch: costs})
     monkeypatch.setattr(cake_chain, "ADJOINT_SPLIT_DEVICE_COSTS", {})
     monkeypatch.setattr(cake_plan, "ADJOINT_FORMS", types.MappingProxyType({}))
+    # the two-stream route (its 10 pieces x 4 value heads would fit the 40 SMs in one wave)
+    monkeypatch.setattr(cake_chain, "ONE_WAVE_SPLIT_ARCHS", frozenset())
     return arch
 
 
@@ -4438,6 +4440,73 @@ def test_adjoint_split_one_stream_gives_the_two_stream_bits(
             ), stages
     assert gm_streams[True] == {main} and main not in gm_streams[False], gm_streams
     _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
+
+
+def test_adjoint_split_one_wave_tables() -> None:
+    # the one-wave route's table: every segment, seeded from its own end adjoint with tapes, after the other parts
+    seed, tape = cake_chain.SPLIT_SEED, cake_chain.SPLIT_TAPE
+    split = cake_chain.adjoint_split_tables([0, 1, 4, 6], 4, "cpu", one_wave=True)
+    assert split.one_wave and split.num_every == 6
+    assert split.every.tolist() == [list(range(6)), [seed | tape] * 6]
+    assert (split.num_walk, split.num_summary, split.num_front) == (3, 3, 3)
+    plain = cake_chain.adjoint_split_tables([0, 1, 4, 6], 4, "cpu")
+    assert not plain.one_wave and plain.every is None and plain.num_every == 0
+
+
+@pytest.mark.parametrize(
+    "lpt, states",
+    [(True, True), (False, False)],
+    ids=["lpt-h0-dht", "caller-order-no-states"],
+)
+def test_adjoint_split_one_wave_gives_the_two_stream_bits(
+    lpt, states, device, monkeypatch
+) -> None:
+    # every piece of the split layout fits the small device in one wave (10 pieces x 4 value heads = 40 SMs): with
+    # the one-wave route the summaries, the stitch and one walk of every piece run on the caller's stream, and the
+    # gradients are the two-stream route's bits (the last pieces start from the stitch's copy of dht, or zeros)
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    index = cake_chain._device_index(device)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7031)
+    gen = torch.Generator().manual_seed(7032)
+    h0 = dht = None
+    if states:
+        h0 = (
+            0.1
+            * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+        ).to(device)
+        dht = torch.randn(
+            len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen
+        ).to(device)
+    names = OUTPUT_NAMES + (("final_state", "dh0") if states else ())
+    main = torch.cuda.current_stream(device).cuda_stream
+    runs = {}
+    for one_wave in (False, True):
+        with monkeypatch.context() as m:
+            arch = _split_device(m, device, split=True)
+            if cake_chain._adjoint_chain_stage(arch) != "stitch":
+                pytest.skip(f"the one-wave route needs the stitch on {arch}")
+            if one_wave:
+                m.setattr(cake_chain, "ONE_WAVE_SPLIT_ARCHS", frozenset({arch}))
+            options = cake_chain.make_options(lpt=lpt)
+            cu = torch.tensor(_cu(seq_lens), dtype=torch.int64)
+            meta = cake_chain._chunk_meta(cu.to(device), cu, 1, sum(seq_lens), index, heads[1], options,
+                                          heads[1] // heads[0])  # fmt: skip
+            split = meta.bwd_split
+            assert split is not None and split.one_wave is one_wave, split
+            assert split.num_every == (10 if one_wave else 0), split
+            launches = _record_streams(m)
+            got = [_run(inputs, seq_lens, initial_state=h0, output_final_state=states, dht=dht, lpt=lpt)
+                   for _ in range(2)]  # fmt: skip
+            stages = [stage for stage, _ in launches]
+            assert stages.count("dhu_tc2_dvl32_gm") == 2, stages
+            assert stages.count("dhu_tc2_dvl32_modes") == (2 if one_wave else 4), stages
+            split_streams = {
+                stream for stage, stream in launches if stage in _SPLIT_STAGES
+            }
+            assert (split_streams == {main}) is one_wave, split_streams
+            _assert_same_bits(got[1], got[0], names)
+            runs[one_wave] = got[0]
+    _assert_same_bits(runs[True], runs[False], names)
 
 
 def _record_gm_flags(monkeypatch) -> list[tuple[torch.Tensor, torch.Tensor]]:
