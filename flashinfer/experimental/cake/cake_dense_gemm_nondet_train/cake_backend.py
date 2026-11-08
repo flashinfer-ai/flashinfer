@@ -38,7 +38,7 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish (in the tables only the four-split rows of
   :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts and of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on 148-SM
-  and 152-SM sm_100a parts; else a caller's explicit ``splits``).  The one-split rows
+  and 152-SM sm_100a and 152-SM sm_103a parts; else a caller's explicit ``splits``).  The one-split rows
   store whole tiles, and the rows of :data:`K1_WGRAD_DET_RULES_BY_SM` run
   another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
@@ -83,8 +83,8 @@ package's plan of one of its programs (the same kernel parameters and bits).
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
 of CTA pairs at three or more splits in the arrival order, a K2 stream-K partition that gives an element more than two
 partials; in the shipped tables only the four-split rows of :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts
-and of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on 148-SM and 152-SM sm_100a parts, a caller's explicit split count and
-the K2 ``"waves"`` windows on a part without a router table of its SM count -- raises
+and of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on 148-SM and 152-SM sm_100a and 152-SM sm_103a parts, a caller's
+explicit split count and the K2 ``"waves"`` windows on a part without a router table of its SM count -- raises
 PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
 and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
 launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
@@ -1021,11 +1021,12 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: ``5120 -> 64`` and ``5120 -> 128`` stay: there the reference sums the reduction in one chain, and ``5120 -> 128`` on
 #: three CTAs met the check on all six kinds at 16231 and 16384 tokens (0.36 to 0.40 times the reference's error).
 #:
-#: On 148-SM and 152-SM ``sm_100a`` parts ``4096 -> 48`` and ``4096 -> 64`` run two CTAs of 32-wide tiles from 16172 to
-#: 16384 tokens.  At an even number of 64-token K blocks (16231 and 16384 tokens) they sum the same two halves as the
-#: reference (its error exactly, on all six kinds) and were the fastest program that met the check: 0.98 to 0.99 times
-#: the time of two CTAs of 64-wide tiles on a B200 part and 0.94 times on a GB200 part.  At an odd block count every
-#: two-way split missed the check; those token counts run the program of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`.
+#: On 148-SM and 152-SM ``sm_100a`` parts and 152-SM ``sm_103a`` parts ``4096 -> 48`` and ``4096 -> 64`` run two CTAs of
+#: 32-wide tiles from 16172 to 16384 tokens.  At an even number of 64-token K blocks (16231 and 16384 tokens) they sum
+#: the same two halves as the reference (its error exactly, on all six kinds) and were the fastest program that met the
+#: check: 0.98 to 0.99 times the time of two CTAs of 64-wide tiles on a B200 part and 0.94 times on a GB200 and a GB300
+#: part.  At an odd block count every two-way split missed the check; those token counts run the program of
+#: :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`.
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1060,8 +1061,14 @@ K1_DSM_RANGES_BY_SM: dict[
     },
     ("sm_103a", 152): {
         ("sm_103a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
-        ("sm_103a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
-        ("sm_103a", 1, 4096, 64, "f32"): ((1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 32768, (64, 2))),
+        ("sm_103a", 1, 4096, 48, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
+        ("sm_103a", 1, 4096, 64, "f32"): (
+            (1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 16171, (64, 2)),
+            (16172, 16384, (32, 2)), (16385, 32768, (64, 2)),
+        ),
         ("sm_103a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
         ("sm_103a", 1, 5120, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (12288, 16383, (32, 2)), (16385, 32768, (32, 2))),
         ("sm_103a", 1, 5120, 48, "f32"): ((2048, 4095, (64, 2)),),
@@ -1081,12 +1088,13 @@ K1_DSM_RANGES_BY_SM: dict[
 #: cluster program sum; at an odd one a unit runs on into the next tile, so 31 of the 32 tiles sum three shorter
 #: partials.  There every two-way split (two CTAs of 32-wide or 64-wide tiles, two splits of the CTA-pair program)
 #: missed the check of :data:`K1_DSM_RANGES_BY_SM`: its worst relative error was 1.16 times the reference's median at
-#: 16130, 16172, 16300 and 16320 tokens on a B200 part (at 16172 tokens also on a GB200 part).  Four splits of the
-#: 64-wide CTA-pair program met the check on all six kinds there (0.60 to 0.82 times the reference's error), and so
-#: did the deterministic program.  Each row runs the faster of the two at 16172 tokens: ``4096 -> 48`` the
-#: deterministic program (1.2 % faster than four splits on a B200 part, 2.3 % on a GB200 part), ``4096 -> 64`` four
-#: splits in the arrival order (4.7 % and 0.3 % faster than the deterministic program).  Their partials add in the
-#: order the splits finish, so the bits can vary run to run (:func:`_alert_order_varying`).
+#: 16130, 16172, 16300 and 16320 tokens on a B200 part (at 16172 tokens also on a GB200 and a GB300 part).  Four
+#: splits of the 64-wide CTA-pair program met the check on all six kinds there (0.60 to 0.82 times the reference's
+#: error), and so did the deterministic program.  Each row runs the faster of the two at 16172 tokens: ``4096 -> 48``
+#: the deterministic program (1.2 % faster than four splits on a B200 part, 2.3 % on a GB200 part, 2.6 % on a GB300
+#: part), ``4096 -> 64`` four splits in the arrival order (4.7 %, 0.3 % and 1.5 % faster than the deterministic
+#: program).  Their partials add in the order the splits finish, so the bits can vary run to run
+#: (:func:`_alert_order_varying`).
 # fmt: off
 K1_DSM_ODD_BLOCK_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1099,6 +1107,10 @@ K1_DSM_ODD_BLOCK_RANGES_BY_SM: dict[
     ("sm_100a", 152): {
         ("sm_100a", 1, 4096, 48, "f32"): ((16172, 16384, None),),
         ("sm_100a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 48, "f32"): ((16172, 16384, None),),
+        ("sm_103a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
     },
 }
 # fmt: on

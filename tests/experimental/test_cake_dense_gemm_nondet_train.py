@@ -1695,8 +1695,14 @@ K1_DSM_RANGES = {
     },
     ("sm_103a", 152): {
         (4096, 32): ((1024, 32768, (32, 2)),),
-        (4096, 48): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
-        (4096, 64): ((1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 32768, (64, 2))),
+        (4096, 48): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
+        (4096, 64): (
+            (1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 16171, (64, 2)),
+            (16172, 16384, (32, 2)), (16385, 32768, (64, 2)),
+        ),
         (4096, 128): ((1024, 12288, (64, 2)),),
         (5120, 32): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (12288, 16383, (32, 2)), (16385, 32768, (32, 2))),
         (5120, 48): ((2048, 4095, (64, 2)),),
@@ -1705,12 +1711,12 @@ K1_DSM_RANGES = {
     },
 }
 #: The token counts at which the rows of each part were measured (two 148-SM B200 parts, two 152-SM GB200 parts, two
-#: 152-SM GB300 parts; on sm_100a also 16172 and 16231 tokens, where ``4096 -> 48`` and ``4096 -> 64`` were measured
-#: for the parity ranges of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on one B200 and one GB200 part).
+#: 152-SM GB300 parts; also 16172 and 16231 tokens, where ``4096 -> 48`` and ``4096 -> 64`` were measured for the
+#: parity ranges of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on one B200, one GB200 and one GB300 part).
 K1_DSM_MEASURED_TOKENS = {
     ("sm_100a", 148): (1024, 2048, 4096, 6144, 8192, 12288, 16172, 16231, 16384, 24576, 32768),
     ("sm_100a", 152): (1024, 2048, 3072, 4096, 6144, 8192, 12288, 16172, 16231, 16384, 24576, 32768),
-    ("sm_103a", 152): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_103a", 152): (1024, 2048, 4096, 6144, 8192, 12288, 16172, 16231, 16384, 24576, 32768),
 }
 # fmt: on
 
@@ -1887,6 +1893,7 @@ def test_k1_dsm_ranges(monkeypatch):
 K1_DSM_ODD_BLOCK_RANGES = {
     ("sm_100a", 148): {(4096, 48): ((16172, 16384, None),), (4096, 64): ((16172, 16384, (64, 4, 1, "arrival")),)},
     ("sm_100a", 152): {(4096, 48): ((16172, 16384, None),), (4096, 64): ((16172, 16384, (64, 4, 1, "arrival")),)},
+    ("sm_103a", 152): {(4096, 48): ((16172, 16384, None),), (4096, 64): ((16172, 16384, (64, 4, 1, "arrival")),)},
 }
 # fmt: on
 
@@ -1934,9 +1941,9 @@ def _assert_k1_odd_block_range(arch, sms, M, N, lo, hi, program):
 
 
 def test_k1_dsm_odd_block_ranges(monkeypatch):
-    """On 148-SM and 152-SM sm_100a parts the FP32 rows ``4096 -> 48`` and ``4096 -> 64`` run the program of their
-    range in :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (:func:`k1_dsm_odd_block_plan`) at every token count of the range
-    that spans an odd number of 64-token K blocks: ``4096 -> 48`` the deterministic program, ``4096 -> 64`` four
+    """On 148-SM and 152-SM sm_100a parts and 152-SM sm_103a parts the FP32 rows ``4096 -> 48`` and ``4096 -> 64`` run
+    the program of their range in :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (:func:`k1_dsm_odd_block_plan`) at every token
+    count of the range that spans an odd number of 64-token K blocks: ``4096 -> 48`` the deterministic program, ``4096 -> 64`` four
     splits of 64-wide tiles in the arrival order (a plan that is not reproducible).  At an even block count they run
     two CTAs of 32-wide tiles, the cluster range that holds the range.  At no token count of a range with an odd block
     count does the planner give a two-way split (every two-way split missed the accuracy check there).  BF16 out, a
@@ -13679,8 +13686,10 @@ K1_WGRAD_CHANGED_ROWS = {
     },
     ("sm_103a", 152): {
         (4096, 32, "f32", 16231): ("dsm", 32, 2),
-        (4096, 48, "f32", 16231): ("dsm", 64, 2), (4096, 48, "f32", 16384): ("dsm", 64, 2),
-        (4096, 64, "f32", 16231): ("dsm", 64, 2), (4096, 64, "f32", 16384): ("dsm", 64, 2),
+        (4096, 48, "f32", 16172): ("det", None, None),
+        (4096, 48, "f32", 16231): ("dsm", 32, 2), (4096, 48, "f32", 16384): ("dsm", 32, 2),
+        (4096, 64, "f32", 16172): ("odd", 64, 4),
+        (4096, 64, "f32", 16231): ("dsm", 32, 2), (4096, 64, "f32", 16384): ("dsm", 32, 2),
         (5120, 32, "f32", 16384): ("det", None, None), (5120, 48, "bf16", 16231): ("det", None, None),
         (5120, 64, "f32", 16231): ("det", None, None), (5120, 64, "f32", 16384): ("det", None, None),
         (5120, 128, "f32", 16231): ("det", None, None), (5120, 128, "f32", 16384): ("det", None, None),
@@ -13758,8 +13767,8 @@ K1_ROUTE_PARTS = (
 
 #: The bench's weight-gradient rows that may plan an order-varying program, ``(arch, sm_count, d_in, d_out, dtype,
 #: T)``: the four-split arrival-order ranges of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a thin FP32 rows) and
-#: of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (148-SM and 152-SM sm_100a ``4096 -> 64`` FP32 at 16172 tokens, an odd
-#: number of K blocks): the fastest programs that met all six input kinds of the accuracy check there.
+#: of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (148-SM and 152-SM sm_100a and 152-SM sm_103a ``4096 -> 64`` FP32 at 16172
+#: tokens, an odd number of K blocks): the fastest programs that met all six input kinds of the accuracy check there.
 K1_ORDER_VARYING_ROWS = {
     ("sm_107a", 212, 4096, d_out, "f32", T)
     for d_out, tokens in (
@@ -13768,7 +13777,10 @@ K1_ORDER_VARYING_ROWS = {
         (64, (16231, 16384)),
     )
     for T in tokens
-} | {("sm_100a", sms, 4096, 64, "f32", 16172) for sms in (148, 152)}
+} | {
+    (arch, sms, 4096, 64, "f32", 16172)
+    for arch, sms in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152))
+}
 
 
 def test_k1_no_order_varying_plan_on_bench_rows():
