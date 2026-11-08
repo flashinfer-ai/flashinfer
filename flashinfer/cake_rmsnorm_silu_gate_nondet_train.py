@@ -70,7 +70,8 @@ streams.  The kernels are those of the standalone package
   900 rows on sm_100a, sm_103a and sm_107a with an FP32 one) runs one
   thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same arithmetic,
   which adds the weight-gradient partials of each column in a fixed order in
-  FP64, rounds once and uses no workspace.
+  FP64, rounds that sum to FP32 (then to BF16 for a BF16 weight gradient) and
+  uses no workspace.
 
 Mode and dispatch rules:
 
@@ -414,8 +415,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
         tensor).  Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
         Add the gradient to ``grad_weight``'s current value before the
-        rounding (exactly; needs ``grad_weight``).  A call with no rows leaves
-        the accumulator as it is.
+        rounding (exactly on the static and the claimed backward; in FP64
+        before the rounding in the small-row bands; needs ``grad_weight``).
+        A call with no rows leaves the accumulator as it is.
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
         it.  A call of few rows runs the one-cluster backward, which uses

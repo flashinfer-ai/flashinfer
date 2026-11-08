@@ -34,8 +34,9 @@ every row's arithmetic fixed, so ``y`` is the same bits on every call) and
 ``bwd_bf16`` / ``bwd_f32`` (the backward: ``dx``, ``dz`` and the weight
 gradient in one kernel; ``dx``, ``dz`` and the FP32 partial of each chunk of
 rows are the deterministic backward's arithmetic, and the partials are summed
-exactly, as integers, into a BF16 or FP32 weight gradient rounded once, so
-every output is the same bits at any grid and in any order of the CTAs).
+exactly, as integers, into a weight gradient rounded to FP32 from the FP64
+value of the exact sum, then to BF16 for a BF16 one, so every output is the
+same bits at any grid and in any order of the CTAs).
 ``ROUTES[arch][role]`` names the one module a role runs on an architecture;
 a module may be delivered for more architectures than route it (every
 forward module is delivered for every architecture, so a new forward cut is a

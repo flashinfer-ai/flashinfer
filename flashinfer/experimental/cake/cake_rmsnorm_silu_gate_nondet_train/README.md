@@ -24,14 +24,19 @@ within the deterministic FP64 sum's error of a rounding boundary.
 
 | output | how it is computed | run to run | error against an FP64 reference |
 | --- | --- | --- | --- |
-| `y` | `rstd` with `rsqrt.approx`, the sigmoid with `ex2.approx` and `rcp.approx`, FP32 products, one rounding to BF16 | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dx` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dz` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp; at most 1.1 times the deterministic package's |
-| `dw` (BF16 or FP32) | the deterministic backward's FP32 chunk partials, summed exactly in 64-bit integer windows (in the small-row bands: on chip in the deterministic pair's order in FP64), one rounding | bit for bit | within the deterministic budget `abs(dw64) * 2^-7 + sum(abs(terms)) * 2^-20`; at most 1.1 times the deterministic package's; in every band a column with an infinite or NaN term has the FP64 reference's class (`+inf`, `-inf` or `NaN`), also when the row count is not a multiple of the row block |
+| `y` | `rstd` with `rsqrt.approx`, the sigmoid with `ex2.approx` and `rcp.approx`, FP32 products, one rounding to BF16 | bit for bit | within one BF16 ulp plus 1/64 BF16 ulp of the tensor's largest magnitude; at most 1.1 times the deterministic package's |
+| `dx` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp plus 1/64 BF16 ulp of the tensor's largest magnitude (cancellation); at most 1.1 times the deterministic package's |
+| `dz` | the deterministic backward's row arithmetic (its bits) | bit for bit | within one BF16 ulp plus 1/64 BF16 ulp of the tensor's largest magnitude; at most 1.1 times the deterministic package's |
+| `dw` (BF16 or FP32) | the deterministic backward's FP32 chunk partials, summed exactly in 64-bit integer windows (in the small-row bands: on chip in the deterministic pair's order in FP64), rounded to FP32 from the FP64 value of that sum, then to BF16 for a BF16 `dw` | bit for bit | within the deterministic budget `abs(dw64) * 2^-7 + sum(abs(terms)) * 2^-20`; at most 1.1 times the deterministic package's; in every band a column with an infinite or NaN term has the FP64 reference's class (`+inf`, `-inf` or `NaN`), also when the row count is not a multiple of the row block |
 
 "At most 1.1 times the deterministic package's" holds for both error measures
 the tests compute on the same inputs: the relative L2 error and the largest
-absolute error relative to the largest reference value.
+absolute error relative to the largest reference value.  The tests also check
+every output against the explicit eager operation (FP32 arithmetic, one final
+cast to BF16, PyTorch autograd for the gradients) with the deterministic
+suite's bounds: `y`, `dx` and `dz` within one BF16 ulp of the eager output plus
+1/64 BF16 ulp of the FP64 reference's largest magnitude, `dw` within
+`abs(dw_eager) * 2^-7 + sum(abs(terms)) * 2^-20`.
 
 Measured errors against an FP64 reference computed from the BF16 inputs, on
 normal inputs at three training shapes `[T, H, 128]`: `x`, `z` and `dy`
@@ -93,6 +98,13 @@ The mode is part of every name: no entry point takes a `deterministic`
 keyword (passing one is a `TypeError`), and no call runs the deterministic
 package.  This package exports the same names.
 
+A call with no rows (`T * H == 0`) checks the last dimension (128), `weight`,
+the given outputs and, in the backward, `grad_weight` and the refusal of an
+FP32 workspace, then returns without a launch; it does not check the dtype,
+device or layout of `x`, `z` and the upstream gradient or the size of a
+`torch.uint8` workspace (the deterministic package checks a call with no
+rows the same way).
+
 ## Programs and routes
 
 `cake_jit.py` routes each call by its row count `rows = T * H` and the
@@ -107,11 +119,11 @@ the same inputs on the same device.
 
 | role | program | runs |
 | --- | --- | --- |
-| `fwd_short` | persistent forward, 16 lanes a row, one CTA per 16-row block | its forward bands |
-| `fwd` | forward, 64 threads, 8 lanes a row | the call role; no forward band names it |
-| `fwd_mid` | persistent forward, at most 6 CTAs per SM, each at most 2 blocks of 16 rows | its forward bands |
-| `fwd_long` | persistent forward, at most 3 CTAs per SM, each at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
-| `fwd_xlong` | the long forward, also prefetching the next block with one bulk prefetch | its forward bands |
+| `fwd_short` | forward, 256 threads, 16 lanes a row, one CTA per 16-row block (not persistent) | its forward bands |
+| `fwd` | forward, 64 threads, 8 lanes a row, one CTA per 8-row block | the call role; no forward band routes it (the support query needs every role routed; the stall tests time the short forward against it) |
+| `fwd_mid` | whole waves of 6 CTAs per SM (as many waves as the rows need), each CTA at most 2 blocks of 16 rows | its forward bands |
+| `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
+| `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
 | `bwd_bf16_t512`, `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the deterministic backward's chunk partials summed on chip in its reduction order, no workspace | the rows of its bands (at most 512) |
 | `bwd_bf16_t1024`, `bwd_f32_t1024` | exact tiny backward of 8 teams | the rows of its bands (at most 1024) |
 | `bwd_bf16`, `bwd_f32` | static backward: CTA `b` runs chunks `b`, `b + grid`, ... | past the bands, while the chunks fit 8 CTAs per SM (up to 64 rows per SM) |
@@ -142,6 +154,17 @@ deterministic backward's chunks: `blocks_per_chunk = max(1, ceil(blocks /
 The claimed backward lets a CTA slowed by a kernel on another stream take
 fewer chunks; the bits do not depend on which CTA runs a chunk.
 
+## Saved state
+
+The autograd function (`cake_rmsnorm_silu_gate_nondet`) saves `x`, `z` and
+`weight` by reference through `save_for_backward`, and `eps` as a Python
+float.  It saves no `rstd` and no other intermediate, so beyond its inputs it
+keeps 0 bytes, and a non-reentrant checkpointed forward keeps nothing but its
+output (FlashInfer issue #7039).  The saved tensors are the caller's own: `x`
+and `z` hold `T * H * 128` BF16 values (`T * H * 256` bytes each) and
+`weight` 128 BF16 values (256 bytes).  A backward's workspace (below) is not
+saved state: no tensor of it is kept by the autograd node.
+
 ## Workspace
 
 The static and the claimed backward need a workspace, also with
@@ -166,12 +189,17 @@ backward.  The deterministic package's FP32 workspace is refused with a
 `ValueError` that names both workspaces.
 
 Calls without a workspace use one per device, stream and backward program
-that takes one, kept for the process.  Each device also keeps a reserve for CUDA Graph
+that takes one (29192 bytes each; on each stream at most one per backward
+program: the static and the claimed backward of each weight-gradient dtype),
+kept for the process.  Eager
+calls without a workspace also keep a reserve per device for CUDA Graph
 captures: 64 zero-filled workspaces in one allocation (29440 bytes each with
 256-byte alignment, about 1.8 MiB), refilled outside any capture, at most 1024
 per device.  A captured call without a workspace takes one from the reserve
-for its capture and capture stream and keeps it, so a replay launches no fill
-kernel; with none ready, the graph zero-fills a workspace of its own.
+and keeps it, so a replay launches no fill kernel: one for its capture and
+capture stream when cuda-python is installed (it gives the capture ids),
+otherwise one per captured call.  With none ready, the graph zero-fills a
+workspace of its own.
 
 ## Layout of this package
 
@@ -188,14 +216,17 @@ kernel; with none ready, the graph zero-fills a workspace of its own.
 * `csrc/` -- generated translation units (kernel and tvm-ffi binding per
   program) and `cake_ffi_checks.h`.
 
-The package imports only itself, `torch` and `tvm_ffi`; its only `flashinfer`
+The package imports only itself, `torch` and `tvm_ffi`, and, when installed,
+cuda-python's `cuda.bindings.runtime` for CUDA Graph capture ids (without it,
+each captured call takes its own reserve workspace); its only `flashinfer`
 import is the JIT fallback of `cake_build.py`.
 
 ## Tests
 
 * `tests/norm/test_cake_rmsnorm_silu_gate_nondet_train.py` -- the package
-  alone: FP64 budgets, run-to-run bits on every path, workspaces, CUDA
-  Graphs, routing and grids, `torch.use_deterministic_algorithms`.
+  alone: FP64 budgets, the explicit eager operation, run-to-run bits on every
+  path, workspaces, CUDA Graphs, routing and grids,
+  `torch.use_deterministic_algorithms`.
 * `tests/norm/test_cake_rmsnorm_silu_gate_nondet_train_api.py` -- the public
   module and the comparison with the deterministic package (each output's
   FP64 error at most 1.1 times the deterministic package's; `dx` and `dz` its

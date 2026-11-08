@@ -62,8 +62,10 @@ package's public forward and backward only.  This module checks:
   non-deterministic backward refuses an FP32 workspace (the deterministic
   package's) naming both modes' workspaces, also in a call with no rows with
   the error of a call with rows, and the deterministic backward refuses the
-  ``torch.uint8`` workspace of this package; on the backend suite's accuracy
-  matrix and paths (accumulation, ``compute_grad_weight=False``, a reset
+  ``torch.uint8`` workspace of this package with its own FP32 workspace
+  requirement; on the backend suite's accuracy matrix (weight-gradient terms
+  that cancel per column included) and paths (accumulation,
+  ``compute_grad_weight=False``, a reset
   workspace with nonzero bytes reused across shapes, two streams, a side
   stream, CUDA Graph replays, autograd and non-reentrant checkpointing) every
   output repeats bit for bit (an accumulated ``dw`` from the same starting
@@ -75,10 +77,11 @@ package's public forward and backward only.  This module checks:
   ``module_for_rows``' module: the small-row backwards (one cluster each, in
   the rows of their ``BACKWARD_BANDS`` bands), the static backward (at most 8
   chunks of rows per SM) and the claimed backward (more chunks); gate inputs at and past the packed
-  gate's range and infinite upstream gradients give the FP64 reference's
+  gate's range (around FP32 ``expf``'s overflow too), in the forward and the
+  backward, and infinite upstream gradients give the FP64 reference's
   ``NaN``, ``+inf`` and ``-inf`` positions and finite elements within the
-  error budget (with infinite upstream gradients, ``dx`` and ``dz`` have the
-  deterministic package's ``NaN`` positions and bits elsewhere); one-head inputs of several layouts one row past the start of
+  error budget (``dx`` and ``dz`` have the deterministic package's ``NaN``
+  positions and bits elsewhere); one-head inputs of several layouts one row past the start of
   each module that warms rows in L2 give the same bits for every layout,
   passing the packed-rows test exactly when their rows follow one another;
   and weight gradients in the subnormal range (identical rows whose FP32 terms
@@ -97,6 +100,7 @@ import ast
 import inspect
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -147,13 +151,15 @@ BACKEND_DIR = Path(backend.__file__).parent
 # The bound of an output's errors against the FP64 reference, as a multiple of
 # the deterministic package's errors on the same inputs.
 DET_ERROR_RATIO = 1.1
-# Words of the non-deterministic backward's refusal of an FP32 workspace (the
-# deterministic package's): both modes' workspace dtypes and factories.
-REFUSAL_WORDS = (
-    "FP32",
-    "uint8",
-    "cake_rmsnorm_silu_gate_det_train_backward_workspace",
-    "cake_rmsnorm_silu_gate_nondet_train_backward_workspace",
+# The non-deterministic backward's refusal of an FP32 workspace (the
+# deterministic package's), naming both modes' workspace dtypes and factories
+# (the backend suite asserts the same text).
+REFUSAL = (
+    "workspace is FP32, a workspace of the deterministic mode "
+    "(flashinfer.cake_rmsnorm_silu_gate_det_train."
+    "cake_rmsnorm_silu_gate_det_train_backward_workspace); the "
+    "non-deterministic backward needs its own zero-filled uint8 workspace "
+    f"({backend.__name__}.cake_rmsnorm_silu_gate_nondet_train_backward_workspace)"
 )
 
 nd_forward = cake_rmsnorm_silu_gate_nondet_train_forward
@@ -317,10 +323,9 @@ def assert_det_bits_beside_nans(what, got, det) -> None:
 
 
 def _assert_refusal(error: BaseException) -> None:
-    """The refusal of an FP32 workspace names both modes' workspaces."""
-    message = str(error)
-    for word in REFUSAL_WORDS:
-        assert word in message, (word, message)
+    """The refusal of an FP32 workspace is :data:`REFUSAL`, naming both
+    modes' workspaces."""
+    assert str(error) == REFUSAL, str(error)
 
 
 # --------------------------------------------------------------------------- the surface (no device)
@@ -807,7 +812,13 @@ def test_nondet_entry_points_run_this_package(
             dy, x, z, w, EPS, workspace=fp32_workspace
         )
     _assert_refusal(info.value)
-    with pytest.raises(ValueError):
+    # the deterministic backward's requirement names its own dtype (FP32)
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"workspace must be a contiguous FP32 tensor on {x.device} with at least "
+        ),
+    ):
         det_backward(dy, x, z, w, EPS, workspace=nd_workspace(T * H, x.device))
     assert launched == []
 
@@ -1418,10 +1429,15 @@ def test_forward_around_its_bands_within_the_deterministic_error(
 
 
 # Gate inputs at and past the edges of the packed gate's range: below -41,
-# subnormal and zero, infinite and NaN, beside saturated and ordinary ones.
+# around FP32 expf's overflow (|z| from 87.5 to 89), subnormal and zero,
+# infinite and NaN, beside saturated and ordinary ones.
 GATE_EDGE_VALUES = [
     -1e4,
     -100.0,
+    -89.0,
+    -88.5,
+    -88.0,
+    -87.5,
     -42.0,
     -41.0,
     -40.0,
@@ -1432,6 +1448,9 @@ GATE_EDGE_VALUES = [
     1e-39,
     1e-30,
     40.0,
+    87.5,
+    88.0,
+    89.0,
     100.0,
     1e4,
     float("inf"),
@@ -1481,6 +1500,24 @@ GATE_EDGE_CASES = [
 ]
 
 
+def _gate_edge_inputs(tokens: int, heads: int):
+    """``(x, z, w, dy)`` of ``suite.make`` with gate inputs from
+    ``GATE_EDGE_VALUES`` in a quarter of the elements of two of every three
+    rows (so the packed gate's range check fails for some threads of a row and
+    holds for others) and ordinary ones in the rest."""
+    x, z, w, dy = suite.make(tokens, heads, seed=23)
+    g = torch.Generator(device=z.device).manual_seed(24)
+    values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
+    pick = torch.randint(
+        0, len(GATE_EDGE_VALUES), z.shape, device=z.device, generator=g
+    )
+    edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
+    rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
+    edge &= rows % 3 != 0
+    z.copy_(torch.where(edge, values[pick], z))
+    return x, z, w, dy
+
+
 @requires_device
 @pytest.mark.parametrize("tokens,heads", GATE_EDGE_CASES)
 def test_forward_gate_edges_keep_the_fp64_classes(
@@ -1495,16 +1532,7 @@ def test_forward_gate_edges_keep_the_fp64_classes(
     package's."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
-    x, z, w, dy = suite.make(tokens, heads, seed=23)
-    g = torch.Generator(device=z.device).manual_seed(24)
-    values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
-    pick = torch.randint(
-        0, len(GATE_EDGE_VALUES), z.shape, device=z.device, generator=g
-    )
-    edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
-    rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
-    edge &= rows % 3 != 0
-    z.copy_(torch.where(edge, values[pick], z))
+    x, z, w, dy = _gate_edge_inputs(tokens, heads)
     launched = _spy_launches(monkeypatch)
     y = nd_forward(x, z, w, EPS)
     assert_same_bits("y", nd_forward(x, z, w, EPS), y)
@@ -1515,6 +1543,65 @@ def test_forward_gate_edges_keep_the_fp64_classes(
     assert_error_within_det(
         "finite y", y, det_forward(x, z, w, EPS), y64, mask=torch.isfinite(y64)
     )
+
+
+# Backward inputs with the forward's gate edges (``_gate_edge_inputs``): 48,
+# 240 and 1008 rows (the first small-row band, and the second one or, where
+# that band ends below 1008 rows, the static backward) and 6192 and 49488 rows
+# (the static or the claimed backward, by the SM count).
+GATE_EDGE_BACKWARD_CASES = [
+    pytest.param(1, 48, id="1x48"),
+    pytest.param(5, 48, id="5x48"),
+    pytest.param(21, 48, id="21x48"),
+    pytest.param(129, 48, id="129x48"),
+    pytest.param(1031, 48, id="1031x48"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads", GATE_EDGE_BACKWARD_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_gate_edges_keep_the_fp64_classes(
+    tokens, heads, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the forward's gate edges (``_gate_edge_inputs``) the backward
+    launches ``module_for_rows``' module, every output repeats bit for bit,
+    ``dx`` and ``dz`` have the deterministic package's ``NaN`` positions and
+    its bits elsewhere, ``dx``, ``dz`` and ``dw`` have the FP64 reference's
+    ``NaN``, ``+inf`` and ``-inf`` positions, their finite elements lie
+    within the error budget of the deterministic package's, and the
+    workspace is zero after every call."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    x, z, w, dy = _gate_edge_inputs(tokens, heads)
+    rows = tokens * heads
+    _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    dets = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    got = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+    assert not bool(ws.any()), "the workspace is not zero"
+    again = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+    assert not bool(ws.any()), "the workspace is not zero"
+    name = loader.module_for_rows(arch, role, rows, sms)
+    assert launched == [name] * 2, launched
+    assert got[2].dtype == dw_dtype
+    for what, g, a in zip(("dx", "dz", "dw"), got, again, strict=True):
+        assert_same_bits(what, a, g)
+    assert_det_bits_beside_nans("dx", got[0], dets[0])
+    assert_det_bits_beside_nans("dz", got[1], dets[1])
+    for what, g, det, ref in zip(
+        ("dx", "dz", "dw"), got, dets, (dx64, dz64, dw64), strict=True
+    ):
+        assert_same_classes(what, g, ref)
+        assert_error_within_det(f"finite {what}", g, det, ref, mask=torch.isfinite(ref))
 
 
 def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
@@ -1580,10 +1667,18 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     assert launched == [name] * (suite.REPEATS + 2), launched
 
 
-# The backward's small-row bands of the most bands an architecture routes
-# (``_backward_tiers``: ``band0`` ... ``band3``), then its static and claimed
-# backward.
-BACKWARD_TIERS = ["band0", "band1", "band2", "band3", "static", "claimed"]
+# The most small-row bands any architecture routes for a backward role
+# (``loader.BACKWARD_BANDS``), so no tier below is a band no architecture has.
+BACKWARD_BAND_COUNT = max(
+    len(bands) for roles in loader.BACKWARD_BANDS.values() for bands in roles.values()
+)
+# The backward's small-row bands (``_backward_tiers``: ``band0`` ... up to
+# ``BACKWARD_BAND_COUNT``), then its static and claimed backward.
+BACKWARD_TIERS = [
+    *(f"band{i}" for i in range(BACKWARD_BAND_COUNT)),
+    "static",
+    "claimed",
+]
 # The edges of the backward's programs on this device (``_backward_tiers``):
 # (tier, edge).  ``chunks`` is the claimed backward's last rows of one-block
 # chunks (``rows_per_block * chunk_limit``), ``chunks+1`` its first rows of
@@ -1591,7 +1686,7 @@ BACKWARD_TIERS = ["band0", "band1", "band2", "band3", "static", "claimed"]
 BACKWARD_TIER_EDGES = [
     *(
         pytest.param(f"band{i}", edge, id=f"band{i}-{edge}")
-        for i in range(4)
+        for i in range(BACKWARD_BAND_COUNT)
         for edge in ("first", "last")
     ),
     pytest.param("static", "first", id="static-first"),

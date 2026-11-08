@@ -20,15 +20,22 @@ non-deterministic family
 ``RMSNorm(x) * w * SiLU(z)``.
 
 ``y``, ``dx`` and ``dz`` must lie within one BF16 ulp of an independent FP64
-reference, and the weight gradient within the deterministic suite's budget,
-``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| * 2^-20``.  Every output (``y``,
+reference (plus an absolute floor of 1/64 ulp of the tensor's largest
+magnitude), and the weight gradient within the deterministic suite's budget,
+``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| * 2^-20``; each output is also
+checked against the explicit eager operation (FP32 arithmetic, one final cast
+to BF16, PyTorch autograd for the gradients) with the deterministic suite's
+bounds: ``y``, ``dx`` and ``dz`` within one BF16 ulp of the eager output plus
+the floor of the FP64 reference's largest magnitude, ``dw`` within
+``|dw_eager| * 2^-7 + sum|terms| * 2^-20``.  Every output (``y``,
 ``dx``, ``dz`` and ``dw``, BF16 and FP32 weight gradients, accumulated or not)
 must be the same bits on every launch and on every path: streams, CUDA Graph
 replays, autograd, ``compute_grad_weight``, grids smaller than the chunks (the
 static and the claimed backward at 1, 3 and 7 CTAs), a workspace reused across
 shapes.  The matrix covers dynamic token and head counts (``H = 48`` and small
 or irregular row counts), ``[T, H, 128]`` strided and flattened layouts,
-near-zero variance, saturated gates, FP32 and BF16 weight gradients,
+near-zero variance, saturated gates, weight-gradient terms that cancel per
+column, FP32 and BF16 weight gradients,
 accumulation, ``compute_grad_weight=False``, the small-row backwards (one
 cluster each, in the rows of their ``BACKWARD_BANDS`` bands: no workspace made
 or touched, a caller workspace checked and left as it is, the first row count
@@ -117,7 +124,7 @@ SHAPES = [
     (33, 1),
 ]
 LAYOUTS = ["flat", "projection", "head_major", "misaligned"]
-EDGE_DATA = ["near_zero", "saturated"]
+EDGE_DATA = ["near_zero", "saturated", "dw_cancel"]
 EPSILONS = [1e-5, 1e-3]
 ISSUE_TOKENS = [30193, 32737, 32388]
 FP32_SHAPES = [(7, 48), (1031, 48), (32737, 48)]
@@ -208,6 +215,25 @@ def fp64_reference(dy, x, z, w, eps):
     return y, dx, dz, dw
 
 
+def eager(x, z, w, eps):
+    """The issue's reference operation in FP32, one final cast (the
+    deterministic suite's)."""
+    xf, zf, wf = x.float(), z.float(), w.float()
+    rstd = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
+    return (((xf * rstd) * wf) * torch.nn.functional.silu(zf)).to(x.dtype)
+
+
+def eager_grads(dy, x, z, w, eps):
+    """``(y, dx, dz, dw)`` of :func:`eager` and its PyTorch autograd backward
+    for ``dy`` (BF16 inputs, BF16 gradients)."""
+    xr = x.detach().clone().requires_grad_(True)
+    zr = z.detach().clone().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    y = eager(xr, zr, wr, eps)
+    y.backward(dy)
+    return y.detach(), xr.grad, zr.grad, wr.grad
+
+
 def magnitudes(dy, x, z, eps):
     """``sum |a * n|`` per column: the scale of the weight gradient's rounding."""
     terms = (dy.double() * torch.nn.functional.silu(z.double())) * (
@@ -272,6 +298,16 @@ def make(T, H, *, layout="contiguous", data="normal", seed=0, device="cuda"):
         xv = x.view(T, H, D)
         xv[flat % 3 == 0] = 0
         xv[flat % 3 == 1] = 2.0**-60
+    elif data == "dw_cancel":
+        # Rows in pairs with the same x and z and opposite dy (but for a small
+        # perturbation): each column's weight-gradient terms cancel to a small
+        # remainder of their magnitudes.
+        xv, zv, gv = x.reshape(-1, D), z.reshape(-1, D), dy.reshape(-1, D)
+        pairs = xv.shape[0] // 2
+        xv[1 : 2 * pairs : 2] = xv[0 : 2 * pairs : 2]
+        zv[1 : 2 * pairs : 2] = zv[0 : 2 * pairs : 2]
+        small = (2.0**-6 * torch.randn(pairs, D, device=device, generator=g)).bfloat16()
+        gv[1 : 2 * pairs : 2] = -gv[0 : 2 * pairs : 2] + small
     elif data == "saturated":
         values = torch.tensor(
             [-1e4, -100.0, -90.0, -30.0, -10.0, 10.0, 30.0, 90.0, 100.0, 1e4],
@@ -287,8 +323,23 @@ def make(T, H, *, layout="contiguous", data="normal", seed=0, device="cuda"):
     return x, z, w, dy
 
 
+def check_eager(y, dx, dz, dw, x, z, w, dy, eps):
+    """``y``, ``dx``, ``dz`` and ``dw`` against the explicit eager operation
+    (:func:`eager_grads`) with the deterministic suite's bounds: one BF16 ulp
+    of the eager output plus 1/64 ulp of the FP64 reference's largest
+    magnitude, and for ``dw`` ``|dw_eager| * 2^-7 + sum|terms| * 2^-20``."""
+    y64, dx64, dz64, _ = fp64_reference(dy, x, z, w, eps)
+    mag = magnitudes(dy, x, z, eps)
+    ye, dxe, dze, dwe = eager_grads(dy, x, z, w, eps)
+    assert_bf16_close(y, ye, what="y vs eager", scale=y64.abs().max().item())
+    assert_bf16_close(dz, dze, what="dz vs eager", scale=dz64.abs().max().item())
+    assert_bf16_close(dx, dxe, what="dx vs eager", scale=dx64.abs().max().item())
+    assert_dw_within(dw, dwe, mag, what="dw vs eager")
+
+
 def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS):
-    """``repeats`` forward and backward launches against the FP64 reference,
+    """``repeats`` forward and backward launches against the FP64 reference
+    and the eager operation (:func:`check_eager`, the first launch),
     every output the same bits on every launch, the weight gradient also when
     accumulated into a nonzero buffer; returns ``(y, dx, dz, dw)`` of the first
     launch."""
@@ -320,6 +371,7 @@ def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS):
             assert_bf16_close(dx, dx64, what="dx vs FP64")
             assert_dw_within(dw, dw64, mag, what="dw vs FP64")
             assert_dw_within(main, 0.25 + dw64, mag, what="accumulated dw vs FP64")
+            check_eager(y, dx, dz, dw, x, z, w, dy, eps)
         for what, got, want in zip(
             ("y", "dx", "dz", "dw", "accumulated dw"),
             (y, dx, dz, dw, main),
@@ -2138,7 +2190,8 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
     ``warn_only``) with every warning an error, a CUDA Graph captures the
     forward and the backward (caller workspace and none, BF16 and FP32 weight
     gradients) without an alert; its replays return the bits of eager calls,
-    the workspace zero after each."""
+    which lie within the FP64 reference's budgets, the workspace zero after
+    each."""
     T, H = 300, 48
     x, z, w, dy = make(T, H, seed=75)
     ws = workspace_for(T * H, x.device)
@@ -2159,6 +2212,13 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     want = [t.clone() for t in (y, dx, dz, dw, main)]
+    y64, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, EPS)
+    mag = magnitudes(dy, x, z, EPS)
+    assert_bf16_close(want[0], y64, what="y vs FP64")
+    assert_bf16_close(want[1], dx64, what="dx vs FP64")
+    assert_bf16_close(want[2], dz64, what="dz vs FP64")
+    assert_dw_within(want[3], dw64, mag, what="dw vs FP64")
+    assert_dw_within(want[4], dw64, mag, what="FP32 dw vs FP64")
     torch.use_deterministic_algorithms(True, warn_only=warn_only)
     with warnings.catch_warnings():
         warnings.simplefilter("error")

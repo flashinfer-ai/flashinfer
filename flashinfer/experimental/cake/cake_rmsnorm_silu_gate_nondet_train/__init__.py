@@ -84,30 +84,43 @@ Host design (the input layout rules are the deterministic package's):
   :func:`cake_rmsnorm_silu_gate_nondet_train_reset_workspace` after anything
   else wrote into it (a launch that did not complete, another use of the
   buffer); the kernel never needs a reset between its own calls.
-- Retained state (FlashInfer issue #7039): the autograd function saves only
-  ``x``, ``z`` and ``weight`` through ``save_for_backward``, so a non-reentrant
-  checkpointed forward keeps nothing but its output.  A backward without a
-  caller workspace that runs a module taking one (every module but the
-  small-row backwards; ``compute_grad_weight=False`` included: it runs the
-  BF16 weight gradient's modules) uses the
-  zero-filled workspace of its (device,
-  stream, backward module), allocated on first use and kept in
-  ``_STREAM_WORKSPACES`` for later calls: 29192 bytes each, at most one per
-  backward module (two per weight-gradient dtype: the static and the claimed
-  backward) for every stream that ran such a backward.  Such eager calls also
-  keep a reserve of 64 zero-filled workspaces per device (one allocation of
-  about 1.8 MiB, filled outside any capture), from which a call during CUDA
-  Graph capture takes the workspace of its capture and capture stream for
-  good, so a replay launches no fill kernel (see ``_RESERVES``; with none
-  ready, the graph zero-fills one of its own).
+- Saved state (FlashInfer issue #7039): the autograd function saves only
+  ``x``, ``z`` and ``weight``, by reference, through ``save_for_backward``
+  (``T * H * 256`` bytes each for ``x`` and ``z``, 256 bytes for ``weight``,
+  all the caller's tensors) and ``eps`` as a Python float; no ``rstd`` or
+  other intermediate, so a non-reentrant checkpointed forward keeps nothing
+  but its output.  No workspace is saved state.
+- Workspaces the package keeps: a backward without a caller workspace that
+  runs a module taking one (every module but the small-row backwards;
+  ``compute_grad_weight=False`` included: it runs the BF16 weight gradient's
+  modules) uses the zero-filled workspace of its (device, stream, backward
+  module), allocated on first use and kept in ``_STREAM_WORKSPACES`` for later
+  calls: 29192 bytes each, at most one per backward module (two per
+  weight-gradient dtype: the static and the claimed backward) for every stream
+  that ran such a backward.  Such eager calls also keep a reserve of 64
+  zero-filled workspaces per device (29440 bytes each in one allocation of
+  about 1.8 MiB, filled outside any capture, at most 1024 per device), from
+  which a call during CUDA Graph capture takes a workspace for good, so a
+  replay launches no fill kernel: one per capture and capture stream when
+  cuda-python (an optional import) gives the capture ids, else one per
+  captured call (see ``_RESERVES``; with none ready, the graph zero-fills one
+  of its own).
+- A call with no rows checks the last dimension, ``weight``, the given
+  outputs and, in the backward, ``grad_weight`` and the refusal of an FP32
+  workspace, then returns without a launch (the deterministic package's
+  order).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count, the forward's by the bands of rows per SM of
-  ``cake_jit.FORWARD_BANDS``): the forward launches one 64-thread CTA per
-  block of 8 rows; the short forward (up to 12 rows per SM on sm_100a and
-  sm_103a, 59 on sm_107a) one 256-thread CTA per block of 16 rows; and the
-  persistent forwards a grid whose CTA ``b`` walks the blocks ``b``, ``b +
-  grid``, ..., loading each next block while it computes the current one, in
-  the fewest whole waves that give no CTA more than a few blocks: the mid
+  ``cake_jit.FORWARD_BANDS``): a call runs the short, the mid, the long or
+  the extra-long forward.  The plain forward (the call role ``fwd``: one
+  64-thread CTA per block of 8 rows) is routed by no band; it stays in
+  ``ROUTES`` because the support query needs every role routed, and the
+  stall tests time the short forward against it.  The short forward (up to
+  12 rows per SM on sm_100a and sm_103a, 59 on sm_107a) launches one
+  256-thread CTA per block of 16 rows; the other forwards a grid whose CTA
+  ``b`` walks the blocks ``b``, ``b + grid``, ..., loading each next block
+  while it computes the current one, in the fewest whole waves that give no
+  CTA more than a few blocks (past one wave the CTAs are not persistent): the mid
   forward (6 CTAs per SM, at most 2 blocks of 16 rows each, thread 0 warming
   the CTA's next block and the first block of the CTA one wave later in L2
   where x and z hold their rows packed: head stride 128 and token stride ``H

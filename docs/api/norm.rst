@@ -221,19 +221,20 @@ Training SiLU-gated RMSNorm (Cake)
 backward for training on SM100, SM103 and SM107: rows of 128 (``[T, H, 128]``
 or ``[T * H, 128]``) normalized per head with FP32 statistics and gate, BF16
 inputs, outputs and gradients, a weight shared by every token and head whose
-gradient is summed in a fixed order (repeated calls return the same bits), and
-an autograd wrapper that saves only its inputs.  The forward runs one of several
-fixed-order modules chosen from the row count and the SM count (a short forward
-up to 12 rows per SM, 59 on SM107; past that, in bands of rows per SM,
-persistent forwards whose CTAs each walk a few row blocks); each module returns
-the same bits on every call.  Beside a kernel on another stream that holds ``k`` of the ``N``
-SMs, a persistent forward takes at most ``N / (N - k)`` times its time alone,
-plus one CTA's share of the row blocks, plus 0.02, and the short forward ends
-no later than the plain forward (within 2 % or 1.5 microseconds).
-On SM100 and SM103 with fewer than 64 SMs and on SM107 with fewer than 205, as
-on a small MIG instance, the short forward's grid at the end of its band (12
-rows per SM, 59 on SM107) has more CTAs than the SMs beside 16 held ones take
-in one wave, and this bound of the short forward is not shown there.
+gradient is summed so that repeated calls return the same bits, and an
+autograd wrapper that saves only its inputs.  The deterministic forward runs
+one of several fixed-order modules chosen from the row count and the SM count
+(a short forward up to 12 rows per SM, 59 on SM107; the plain forward up to
+975 rows per SM, 799 on SM107; from 976 rows per SM, 800 on SM107,
+persistent forwards whose CTAs each walk a few row blocks); every module
+returns the same bits.  Beside a kernel on another stream that holds ``k`` of
+the ``N`` SMs, a persistent forward takes at most ``N / (N - k)`` times its
+time alone, plus one CTA's share of the row blocks, plus 0.02, and the short
+forward ends no later than the plain forward (within 2 % or 1.5
+microseconds).  On SM107 with fewer than 205 SMs, as on a small MIG instance,
+the short forward's grid at 59 rows per SM is more than one wave, and this
+bound of the short forward is not shown there.  The non-deterministic
+package's forward bands are in its section below.
 
 .. rubric:: Mode and dispatch rules
 
@@ -336,8 +337,8 @@ From v0.7.4rc1 a former entry ran the deterministic package by default
     CakeRMSNormSiLUGateDetFunction
     is_cake_rmsnorm_silu_gate_det_train_supported
 
-Training SiLU-gated RMSNorm, non-deterministic weight gradient (Cake)
----------------------------------------------------------------------
+Training SiLU-gated RMSNorm, non-deterministic package (Cake)
+-------------------------------------------------------------
 
 The non-deterministic package (``nondet`` names; see the mode and dispatch
 rules above). Its entry points run only the standalone non-deterministic
@@ -353,9 +354,12 @@ inputs, and within the deterministic package's absolute bounds.
 * The forward uses approximate FP32 intrinsics (``rsqrt.approx`` for
   ``rstd``; ``ex2.approx`` and ``rcp.approx`` for the sigmoid).  It runs one
   of several modules chosen by bands of rows per SM: a short forward up to 12
-  rows per SM on SM100 and SM103 (59 on SM107); past that a persistent forward
-  whose CTAs each walk at most 2 row blocks (mid), a long forward, or an
-  extra-long forward that also prefetches its next block.  The bands: on
+  rows per SM on SM100 and SM103 (59 on SM107), one CTA per 16-row block;
+  past that the mid forward (whole waves of 6 CTAs per SM, each CTA at most 2
+  blocks of 16 rows), the long forward (whole waves of 3 CTAs per SM, each
+  CTA at most 6 blocks of 32 rows) or the extra-long forward (the long
+  forward's grid, also prefetching its next block); the plain forward (one
+  64-thread CTA per 8-row block) is in no band.  The bands: on
   SM100 mid up to 140 rows per SM, long up to 400, extra-long up to 1000, mid
   past it; on SM103 mid up to 250, extra-long up to 550, mid past it; on SM107
   mid up to 200, extra-long up to 520, mid past it.  Each module's arithmetic
@@ -363,10 +367,19 @@ inputs, and within the deterministic package's absolute bounds.
   short forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4,
   8; the others: 16-term chains of 8 lanes folded by 1, 2, 4), so ``y``'s bits
   can differ between bands, and ``y`` repeats bit for bit for the same inputs
-  on the same device.
+  on the same device.  Beside a kernel on another stream that holds ``k`` of
+  the ``N`` SMs, the mid, long and extra-long forwards take at most ``N / (N
+  - k)`` times their time alone, plus one CTA's share of the row blocks, plus
+  0.02, and the short forward ends no later than this package's plain forward
+  (within 2 % or 1.5 microseconds).  On SM100 and SM103 with fewer than 64
+  SMs and on SM107 with fewer than 205, as on a small MIG instance, the short
+  forward's grid at the end of its band has more CTAs than the SMs beside 16
+  held ones take in one wave, and this bound of the short forward is not
+  shown there.
 * The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
   backward's row arithmetic.  The weight gradient sums the deterministic
-  backward's chunk partials exactly in 64-bit integer windows and rounds once,
+  backward's chunk partials exactly in 64-bit integer windows and rounds that
+  sum to FP32 from its FP64 value (then to BF16 for a BF16 weight gradient),
   so it does not depend on the grid or on the order in which CTAs finish.  Up
   to 64 rows per SM every chunk has its own CTA; past that the CTAs claim runs
   of chunks at run time, so a CTA slowed by a kernel on another stream takes
@@ -380,9 +393,11 @@ inputs, and within the deterministic package's absolute bounds.
   concurrently running stream.  A buffer that anything else wrote into is
   zeroed with ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.  Calls
   without a workspace use one per stream and backward module that takes one,
-  kept for the
-  process, and each device keeps a reserve of zero-filled workspaces for CUDA
-  Graph captures (about 1.8 MiB per 64 workspaces, at most 1024).
+  kept for the process, and such eager calls also keep a reserve of
+  zero-filled workspaces per device for CUDA Graph captures (about 1.8 MiB per
+  64 workspaces, at most 1024).  The autograd wrapper saves ``x``, ``z`` and
+  ``weight`` by reference and ``eps``, no intermediate; no workspace is saved
+  state.
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_nondet_train
 
