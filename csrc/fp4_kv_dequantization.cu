@@ -34,9 +34,7 @@ __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f, 
                                               4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
                                               -2.0f, -3.0f, -4.0f, -6.0f};
 
-// Exact fp32 E2M1 value from a nibble, with no constant-memory table and no exp2f.
-// Produces the same values as E2M1_LUT bit-for-bit: e in {1,2,3} -> 2^(e-1)*(1 + 0.5*m);
-// e==0 -> 0.5*m. The shift is only evaluated on the e!=0 branch (e in {1,2,3} -> shift 0..2).
+// Arithmetic E2M1 decode, bit-identical to E2M1_LUT, avoiding serialized constant-memory reads.
 __device__ __forceinline__ float e2m1_to_f32(uint32_t n) {
   const uint32_t e = (n >> 1) & 0x3u;
   const uint32_t m = n & 0x1u;
@@ -46,9 +44,7 @@ __device__ __forceinline__ float e2m1_to_f32(uint32_t n) {
   return (n & 0x8u) ? -mag : mag;
 }
 
-// Decode the 16 nibbles of one NVFP4 block (two packed words) into `res`, applying the
-// scale in the SAME fp32 order the original kernel used, (e2m1 * block_scale) * global_scale,
-// and rounding once — so the output is byte-for-byte identical to the previous kernel.
+// Keep the fp32 order (e2m1 * block_scale) * global_scale: the bit-exact tests pin it.
 template <typename OutType>
 __device__ __forceinline__ void decode_block(uint32_t w0, uint32_t w1, float block_scale,
                                              float global_scale, OutType* res) {
@@ -70,14 +66,7 @@ __device__ __forceinline__ void decode_block(uint32_t w0, uint32_t w1, float blo
   }
 }
 
-// Blockwise dequant: one thread per 16-element NVFP4 block, grid-strided over all M*(K/16)
-// blocks. This replaces the row-per-block mapping (grid(M), shared-memory scale staging),
-// which is memory-latency bound and reaches only ~20% of peak bandwidth; the blockwise
-// mapping reaches ~65% (~3x faster) with byte-identical output.
-//
-// ALIGNED selects a fast path with a 128-bit uint2 load + two 128-bit float4 stores, used
-// only when the caller's pointers are suitably aligned. Otherwise (e.g. a contiguous tensor
-// with a nonzero storage offset) the safe path uses byte loads and scalar stores.
+// One thread per NVFP4 block for wide memory ops; !ALIGNED uses byte loads for offset views.
 template <typename OutType, bool ALIGNED>
 __global__ void nvfp4_dequant_blockwise_kernel(const uint8_t* __restrict__ fp4_data,
                                                const uint8_t* __restrict__ block_scales,
@@ -116,18 +105,7 @@ __global__ void nvfp4_dequant_blockwise_kernel(const uint8_t* __restrict__ fp4_d
   }
 }
 
-// Paged dequant, blockwise: one thread per 16-element NVFP4 block, grid-strided over all
-// batch*seq*head*(head_dim/16) blocks. Each thread does the page lookup once, a uint2 load
-// (8 packed bytes = 16 nibbles), reads its one FP8 scale, dequantizes in fp32 with the same
-// multiply order as before — (e2m1 * block_scale) * global_scale, so output is byte-identical
-// — and writes 16 outputs as two float4 stores. Invalid rows (token >= seq_len, or an
-// out-of-range page) are skipped without writing, exactly as before. This replaces the
-// one-block-per-(batch,token,head) mapping with scalar 1-byte loads, which is memory-latency
-// bound; the blockwise mapping with wide transactions is ~2.7x faster on large caches.
-//
-// ALIGNED selects the 128-bit uint2 load + float4 stores; the safe path (byte loads, scalar
-// stores) handles callers passing views with a nonzero storage offset or non-multiple-of-16
-// strides (which the API allows: it only requires the last dim to be contiguous).
+// Paged variant; invalid rows are left unwritten. !ALIGNED: the API allows any outer strides.
 template <typename OutType, typename IdType, bool ALIGNED>
 __global__ void nvfp4_paged_dequant_blockwise_kernel(
     const uint8_t* __restrict__ paged_cache, const uint8_t* __restrict__ paged_scales,

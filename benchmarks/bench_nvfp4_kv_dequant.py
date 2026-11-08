@@ -7,28 +7,17 @@ Reports effective DRAM bandwidth (GB/s) on large, bandwidth-bound shapes for bot
     python benchmarks/bench_nvfp4_kv_dequant.py
 """
 
+import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 NVFP4_BLOCK_SIZE = 16
 
 
-def _time_ms(fn, warmup=10, iters=50):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(iters):
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record()
-        fn()
-        e.record()
-        torch.cuda.synchronize()
-        times.append(s.elapsed_time(e))
-    times.sort()
-    return times[len(times) // 2]
+def _time_ms(fn):
+    return np.median(bench_gpu_time(fn, cold_l2_cache=True, enable_cupti=True))
 
 
 def bench_dense():

@@ -119,9 +119,10 @@ def test_nvfp4_kv_dequant(shape, dtype):
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
-# Large, bandwidth-bound shapes that exercise the blockwise dequant kernel's
-# grid-stride loop (well past the launch-overhead regime of the small shapes above).
-LARGE_SHAPES = [(16384, 512), (4096, 2048)]
+# Large, bandwidth-bound shapes. One pass of the capped grid (3456 x 256 threads) covers
+# 884,736 NVFP4 blocks, so (32768, 512) -- 1,048,576 blocks -- makes the grid-stride loop
+# iterate; the other two finish in a single pass.
+LARGE_SHAPES = [(16384, 512), (4096, 2048), (32768, 512)]
 
 # Non-power-of-two global scales. These matter: with a power-of-two scale (e.g. 0.5) the
 # products stay exactly representable, which would hide a multiplication-order change. The
@@ -317,10 +318,14 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
-    """Paged dequant: bit-exact at non-power-of-two scales, with non-contiguous cache
-    inputs AND an output view with a nonzero storage offset -- i.e. exercising the
-    byte-safe fallback on both the load and the store side."""
+@pytest.mark.parametrize("aligned", [True, False])
+def test_nvfp4_kv_dequantize_paged_bitexact(kv_layout, dtype, aligned):
+    """Paged dequant is bit-exact at non-power-of-two scales on both kernel paths.
+
+    aligned=True: contiguous cache and an offset-0 output, so the vectorized fast path runs.
+    aligned=False: non-contiguous cache views and an output with a nonzero storage offset,
+    so the byte-safe fallback runs on both the load and the store side.
+    """
     cc = get_compute_capability()
     if cc < 80:
         pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
@@ -354,10 +359,13 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
         return x if kv_layout == "NHD" else x.permute(0, 2, 1, 3).contiguous()
 
     # non-contiguous last-dim views -> misaligned base / non-multiple strides -> fallback
-    k_cache = make_non_contiguous_last_dim_view(to_layout(k_cache_nhd))
-    v_cache = make_non_contiguous_last_dim_view(to_layout(v_cache_nhd))
-    k_scales = make_non_contiguous_last_dim_view(to_layout(k_scales_nhd))
-    v_scales = make_non_contiguous_last_dim_view(to_layout(v_scales_nhd))
+    make_view = (lambda x: x) if aligned else make_non_contiguous_last_dim_view
+    k_cache = make_view(to_layout(k_cache_nhd))
+    v_cache = make_view(to_layout(v_cache_nhd))
+    k_scales = make_view(to_layout(k_scales_nhd))
+    v_scales = make_view(to_layout(v_scales_nhd))
+    if aligned:
+        assert k_cache.data_ptr() % 8 == 0 and v_cache.data_ptr() % 8 == 0
 
     block_tables = torch.tensor(
         [[2, 5, 1], [6, 3, 0]], dtype=torch.int32, device="cuda"
@@ -367,12 +375,15 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
     k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
     v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device="cuda")
 
-    # output views with a nonzero (odd-element) storage offset -> unaligned base -> fallback
+    # unaligned: an odd-element storage offset makes the output base unaligned -> fallback
     def offset_output(hd):
+        offset = 0 if aligned else 1
         numel = batch_size * max_seq_len * num_kv_heads * hd
-        buf = torch.full((numel + 1,), 123.0, dtype=dtype, device="cuda")
-        view = buf[1:].view(batch_size, max_seq_len, num_kv_heads, hd)
-        assert view.is_contiguous() and view.storage_offset() == 1
+        buf = torch.full((numel + offset,), 123.0, dtype=dtype, device="cuda")
+        view = buf[offset:].view(batch_size, max_seq_len, num_kv_heads, hd)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        if aligned:
+            assert view.data_ptr() % 16 == 0
         return view
 
     output_k, output_v = offset_output(k_head_dim), offset_output(v_head_dim)
