@@ -1516,7 +1516,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 37
+        len(key) == 38
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1578,7 +1578,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 37 and key[22] == "evict_last"
+    assert len(key) == 38 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1672,7 +1672,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 37 and key[23] == 2 and key[24] == 0
+    assert len(key) == 38 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1691,8 +1691,9 @@ def test_round15_pd_sh_knobs():
             False,
             0,
             "",
+            0,
         )
-    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off), the round-2 shapes tranche's sk_first / lw flags, the whole-tile tile resolve flag mg and the paced output-store step count sw and the CTA form token ("" = the default form)
+    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off), the round-2 shapes tranche's sk_first / lw flags, the whole-tile tile resolve flag mg and the paced output-store step count sw, the CTA form token ("" = the default form) and the serpentine K walk kser (0 = off)
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1796,7 +1797,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 37 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 38 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1939,7 +1940,7 @@ def test_round19_sk_slab_knob():
     # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
     # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
     key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 37 and key[25] is True and key[26] == 2 and key[27] is False
+    assert len(key) == 38 and key[25] is True and key[26] == 2 and key[27] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_nn_n256_m256_sks_sb2"
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
@@ -2010,7 +2011,7 @@ def test_round19_cta1_knob():
     # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
     # policies / probes and the batched raster knob
     key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 37 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert len(key) == 38 and key[27] is True and key[26] == 0 and key[5] == 7
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n128_c1"
     assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
     assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
@@ -3239,7 +3240,7 @@ def test_round27_stt_knob(T):
         sk_sync=True,
         stt=True,
     )
-    assert len(on) == 37 and on[30] is True and on[25] is True and on[29] is False
+    assert len(on) == 38 and on[30] is True and on[25] is True and on[29] is False
     assert instance_symbol(on) == "dense_proj_det_gemm_nn_n192_bz64_hee_t_sks_stt"
     off = instance_key(
         a_mn=True,
@@ -3250,13 +3251,13 @@ def test_round27_stt_knob(T):
         hints=("evict_first", "evict_first"),
         sk_sync=True,
     )
-    assert len(off) == 37 and off[30] is False and off[:30] == on[:30]
+    assert len(off) == 38 and off[30] is False and off[:30] == on[:30]
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_nn_n192_bz64_hee_t_sks"
     )  # the round-18 symbol, byte-identical
     plain = instance_key(a_mn=True, b_mn=True, out_t=True, stt=True)
     assert (
-        len(plain) == 37
+        len(plain) == 38
         and plain[30] is True
         and plain[5] == off[5] == on[5]
         or plain[30] is True
@@ -3264,7 +3265,7 @@ def test_round27_stt_knob(T):
     assert instance_symbol(plain) == "dense_proj_det_gemm_nn_n256_t_stt"
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[30] is False
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -3727,10 +3728,10 @@ def test_round33_pro_knob(T):
     # pair programs only (the single-CTA form refuses it); every other field is unchanged: the OFF form's key is the round-27 key plus a
     # trailing 0 and its symbol is the round-27 symbol
     on = instance_key(a_mn=False, b_mn=True, pro=7)
-    assert len(on) == 37 and on[31] == 7 and on[30] is False and on[27] is False
+    assert len(on) == 38 and on[31] == 7 and on[30] is False and on[27] is False
     assert instance_symbol(on) == "dense_proj_det_gemm_kn_n256_pro7"
     off = instance_key(a_mn=False, b_mn=True)
-    assert len(off) == 37 and off[31] == 0 and off[:31] == on[:31]
+    assert len(off) == 38 and off[31] == 0 and off[:31] == on[:31]
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_kn_n256"
     )  # the round-2 symbol, byte-identical
@@ -3778,7 +3779,7 @@ def test_round33_pro_knob(T):
     )
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[31] == 0
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -3861,10 +3862,10 @@ def test_round21_cgrp_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(key) == 37 and key[28] is True and key[27] is False
+    assert len(key) == 38 and key[28] is True and key[27] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 37 and off[:28] == key[:28] and off[28] is False
+    assert len(off) == 38 and off[:28] == key[:28] and off[28] is False
     assert instance_symbol(off) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
     assert (
         instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
@@ -4030,26 +4031,26 @@ def test_round24_ovr_knob(T, monkeypatch):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, htail=True, cgrp=True, ovr=True
     )
-    assert len(key) == 37 and key[29] is True and key[28] is True and key[16] is False
+    assert len(key) == 38 and key[29] is True and key[28] is True and key[16] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
     solo = instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True)
-    assert len(solo) == 37 and solo[29] is True and solo[28] is False
+    assert len(solo) == 38 and solo[29] is True and solo[28] is False
     assert instance_symbol(solo) == "dense_proj_det_gemm_kk_n256_m256_ht_or"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 37 and off[29] is False and off[16] is True
+    assert len(off) == 38 and off[29] is False and off[16] is True
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
     )  # the round-21 symbol, byte-identical
     cg = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(cg) == 37 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
+    assert len(cg) == 38 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
     assert (
         instance_symbol(cg) == "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg"
     )  # test_round21_cgrp_knob's symbol, now on a 30-field key
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[29] is False
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -4282,7 +4283,7 @@ def test_instance_key_rejects_bad_configurations():
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
     # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
     # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 37 and key[11:] == (
+    assert len(key) == 38 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -4309,6 +4310,7 @@ def test_instance_key_rejects_bad_configurations():
         False,  # mg (35 fields: the whole-tile tile resolve)
         0,  # sw (36 fields: the paced output stores)
         "",  # form (37 fields: the eight-warp CTA form)
+        0,  # kser (38 fields: the serpentine K walk)
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
@@ -8031,7 +8033,7 @@ def test_round2_knobs_name_their_programs():
     key = cake_backend.instance_key(
         **nn, cta_rows=256, sk_exact=True, sk_first=True, pro=7
     )
-    assert len(key) == 37 and key[32] is True and key[33] is False and key[34] is False
+    assert len(key) == 38 and key[32] is True and key[33] is False and key[34] is False
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7"
@@ -8510,7 +8512,7 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
     # the key: field 35, the symbol token after ``_lw``; the forms the program excludes are refused with it
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1, pd=2, pro=15)
     key = cake_backend.instance_key(**kn, mg=True)
-    assert len(key) == 37 and key[34] is True and key[33] is False
+    assert len(key) == 38 and key[34] is True and key[33] is False
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_pro15"
@@ -8635,7 +8637,7 @@ def test_sw_rules_plan_the_paced_store_programs(T):
     # the key: field 36, the symbol token after ``_mg``; the knob is a step count on the bf16 TMA-store pd-2 drain
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1, pd=2, pro=15)
     key = cake_backend.instance_key(**kn, mg=True, sw=25)
-    assert len(key) == 37 and key[35] == 25 and key[34] is True
+    assert len(key) == 38 and key[35] == 25 and key[34] is True
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_sw25_pro15"
@@ -8885,7 +8887,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     # the key: field 37, the symbol token after ``_pro<n>``; every field the form cannot carry is refused with it
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1)
     key = cake_backend.instance_key(**kn, form="w8r")
-    assert len(key) == 37 and key[36] == "w8r" and key[35] == 0 and key[34] is False
+    assert len(key) == 38 and key[36] == "w8r" and key[35] == 0 and key[34] is False
     assert cake_backend.instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma1_w8r"
     assert (
         cake_backend.instance_symbol(cake_backend.instance_key(**kn, form="w8rs"))
@@ -9023,7 +9025,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 # forward at T 16172 / 16384, the 17408 -> 5120 forward and the 5120 -> 17408 input gradient at T 16172, the
 # 4096 -> 12288 input gradient at T 16231 (each its row's program) and the 12288 -> 4096 forward at T 16172
 # (GB_T_EXACT_T_PROGRAMS), and on sm_103a: the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and
-# 17408 -> 5120 forwards and the 5120 -> 17408 and 4096 -> 12288 input gradients at T 16172 (each its row's program).
+# 17408 -> 5120 forwards and the 5120 -> 17408 and 4096 -> 12288 input gradients at T 16172 (each its row's program;
+# the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at T 16172 with the serpentine K walk on the
+# 152-SM part: GB_T_EXACT_KSER_ROWS).
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -9094,7 +9098,7 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 4096, 12288): (
-        (16172, 16231, 16384),
+        (16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_100a", True, 4096, 12288): (
@@ -9102,7 +9106,7 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", True, 4096, 12288): (
-        (16172, 16231, 16384),
+        (16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
     ),
 }
@@ -9188,6 +9192,7 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
         # the batched MLA T-exact keys are test_round15_store_hint_knob's
         and not key[5]
         and key[8] is not None
+        and "kser" not in ROW_RULES[key]
     )
     assert exact == [key for key in GB_T_EXACT_KEYS if key[0] == arch]
     registered = _registered(arch)
@@ -9314,6 +9319,205 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
         key,
         plain.template,
     )
+
+
+# The GB T-exact serpentine-K rules: (arch, B MN-major, N, K) -> (the T of the exact keys, the program on the 76-pair parts, the
+# program without ``kser``).  Each key names the T 16231 key's program of the row with ``kser`` 76; the wave guard keeps it on
+# the 152-SM parts only (76 CTA pairs), every other part plans the program without it.
+GB_T_EXACT_KSER_ROWS = {
+    ("sm_103a", False, 4096, 12288): (
+        (16172,),
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_ks76_pro7",
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
+    ),
+    ("sm_103a", True, 4096, 12288): (
+        (16172,),
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7",
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
+    ),
+}
+GB_T_EXACT_KSER_KEYS = sorted(
+    (arch, False, b_mn, False, False, False, N, K, T)
+    for (arch, b_mn, N, K), (Ts, _template, _plain) in GB_T_EXACT_KSER_ROWS.items()
+    for T in Ts
+)
+
+
+def test_kser_instance_key_symbol_and_refusals():
+    """``kser`` is instance-key field 38 (symbol ``_ks<P>`` between ``_sw<n>`` and ``_pro<n>``); 0 renders the key and symbol of
+    the program without it; the single-CTA form, the exact / tail-first / synchronised splits, the transposed staging, the
+    whole-tile tile resolve, a batch raster, the eight-warp form and a negative count are refused; the symbol decodes back."""
+    tall = dict(
+        a_mn=False, b_mn=True, cta_rows=256, ovr=True, htail=True, cgrp=True, pro=7
+    )
+    on, off = instance_key(**tall, kser=76), instance_key(**tall)
+    assert len(on) == 38 and on[37] == 76 and off[37] == 0 and on[:37] == off[:37]
+    assert instance_symbol(on) == "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7"
+    assert instance_symbol(off) == "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7"
+    assert cake_backend._template_knobs(instance_symbol(on))["kser"] == 76
+    assert cake_backend._template_knobs(instance_symbol(off))["kser"] == 0
+    for bad in (
+        dict(a_mn=False, b_mn=True, kser=-1),
+        dict(a_mn=False, b_mn=True, cta1=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_exact=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_exact=True, sk_first=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_sync=True, kser=76),
+        dict(a_mn=True, b_mn=True, out_t=True, stt=True, kser=76),
+        dict(a_mn=False, b_mn=True, mg=True, pro=4, kser=76),
+        dict(a_mn=False, b_mn=True, batch_group=8, kser=76),
+    ):
+        with pytest.raises(ValueError, match="kser"):
+            instance_key(**bad)
+
+
+@pytest.mark.parametrize("arch", ["sm_103a"])
+def test_gb_t_exact_kser_rules_plan_their_programs(arch, monkeypatch):
+    """The GB T-exact serpentine-K rules (sm_103a: the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at
+    T 16172) plan their ``_ks76`` program on the 152-SM part and the program without ``kser`` on the 148- and 160-SM parts
+    (the wave guard); on every part the plan is the plan of the key's rule without ``kser`` but for the program (whole K per
+    output tile, the same K partitions, raster group and grid), and T +- 1 plan the row's plan without the key."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(
+        key for key in ROW_RULES if key[0] == arch and "kser" in ROW_RULES[key]
+    )
+    assert keys == [key for key in GB_T_EXACT_KSER_KEYS if key[0] == arch]
+    registered = _registered(arch)
+    for key in keys:
+        _arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+        _Ts, template, plain_template = GB_T_EXACT_KSER_ROWS[(arch, b_mn, N, K)]
+        assert template in registered and plain_template in registered, key
+        rule = dict(ROW_RULES[key])
+        assert rule.pop("kser") == 76
+        for sm_count in (148, 152, 160):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"], v["B"], v["out"], **kw
+            )
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert _whole_k(plan), (key, sm_count)
+            if sm_count == 152:
+                assert (plan.template, plan.kser) == (template, 76), (
+                    key,
+                    sm_count,
+                    plan.template,
+                )
+            else:
+                assert (plan.template, plan.kser) == (plain_template, 0), (
+                    key,
+                    sm_count,
+                    plan.template,
+                )
+            with monkeypatch.context() as m:
+                m.setitem(ROW_RULES, key, rule)
+                v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
+                without, *_ = cake_dense_gemm_det_train_projection_plan(
+                    v["A"], v["B"], v["out"], **kw
+                )
+            assert without.template == plain_template and without.kser == 0, (
+                key,
+                sm_count,
+            )
+            assert (
+                plan.group_m,
+                plan.grid,
+                plan.k_blocks,
+                plan.num_full,
+                plan.sk_units,
+                plan.htail_plan,
+            ) == (
+                without.group_m,
+                without.grid,
+                without.k_blocks,
+                without.num_full,
+                without.sk_units,
+                without.htail_plan,
+            ), (key, sm_count)
+            for t in (T - 1, T + 1):
+                v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                near, *_ = cake_dense_gemm_det_train_projection_plan(
+                    v["A"], v["B"], v["out"], **kw
+                )
+                with monkeypatch.context() as m:
+                    m.delitem(ROW_RULES, key)
+                    v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                    far, *_ = cake_dense_gemm_det_train_projection_plan(
+                        v["A"], v["B"], v["out"], **kw
+                    )
+                assert near.kser == 0 and _plan_signature(near) == _plan_signature(
+                    far
+                ), (key, t)
+
+
+@pytest.mark.parametrize(
+    "key",
+    GB_T_EXACT_KSER_KEYS,
+    ids=lambda key: f"{key[0]}-{'kn' if key[2] else 'kk'}-{key[6]}x{key[7]}-T{key[8]}",
+)
+def test_gb_t_exact_kser_rows_match_fp64_and_repeat_bitwise(key, monkeypatch):
+    """Each GB T-exact serpentine-K row of the device's architecture runs its program at its T against the FP64 reference of
+    the exact BF16 operands (the package tolerance), bitwise equal over repeated launches and a second prepare; on the 152-SM
+    part the program is the ``_ks76`` one and its bits differ from the program without ``kser`` (another FP32 summation
+    order), elsewhere the program is the one without ``kser``.  A key of another architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    A = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    if b_mn:
+        B = (torch.randn(K, N, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
+    else:
+        B = (
+            (torch.randn(N, K, device=device, generator=g) * K**-0.5)
+            .to(torch.bfloat16)
+            .t()
+        )
+    _Ts, template, plain_template = GB_T_EXACT_KSER_ROWS[(arch, b_mn, N, K)]
+    pairs = torch.cuda.get_device_properties(device).multi_processor_count // 2
+    want = template if pairs == 76 else plain_template
+    _require_program(want)
+    out = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
+    assert prepared.template == want, prepared.template
+    assert _whole_k(prepared.plan)
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(A.double(), B.double()))
+    first = out.clone()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), first.view(torch.int16)), key
+    again_out = torch.full_like(out, float("nan"))
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    again = cake_dense_gemm_det_train_projection_prepare(A, B, again_out)
+    again.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(again_out.view(torch.int16), first.view(torch.int16)), key
+    if pairs != 76:
+        return
+    rule = dict(ROW_RULES[key])
+    rule.pop("kser")
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        m.setitem(ROW_RULES, key, rule)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_prepare(A, B, plain_out)
+    assert plain.template == plain_template, plain.template
+    plain.launch()
+    torch.cuda.synchronize()
+    _check(plain_out, torch.matmul(A.double(), B.double()))
+    assert not torch.equal(plain_out.view(torch.int16), first.view(torch.int16)), key
 
 
 # The GB T-exact weight-gradient rules (round 2; round 7: the sm_100a 5120 -> 17408 weight gradient with the sm_103a

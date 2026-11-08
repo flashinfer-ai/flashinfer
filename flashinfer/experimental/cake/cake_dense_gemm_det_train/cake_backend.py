@@ -642,6 +642,7 @@ def instance_key(
     mg: bool = False,
     sw: int = 0,
     form: str = "",
+    kser: int = 0,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -733,7 +734,14 @@ def instance_key(
     raster form (``sk_exact`` / ``sk_first`` / ``sk_sync`` / ``sk_slab`` / ``htail`` / ``cgrp`` / ``batch_group`` /
     ``stt`` / ``ovl`` / ``ovr`` / ``park``) and any pair-program knob off its plain value (``pd`` / ``pro`` / ``lw`` /
     ``mg`` / ``sw`` / a non-default stage count / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` / ``store_ef`` /
-    ``quad_store`` / ``f32_v8``); the OFF form renders byte-identical.
+    ``quad_store`` / ``f32_v8``); the OFF form renders byte-identical.  ``kser`` (field 38 = LAST, symbol ``_ks<P>``
+    directly after ``_sw<n>`` and before ``_pro<n>``; 0 = off) is the serpentine K walk of the pair programs: the load
+    warp walks the K blocks of a whole-K item (every K block of its tile in one item) whose item index lies in an odd
+    block of P items descending, so a wave of P pairs starts on the K end the previous wave left in L2; the MMA warp is
+    unchanged.  The direction is a pure function of the item and P: run-to-run deterministic, another FP32 summation
+    order than ``kser`` 0.  A pair count >= 0 on the plain item walk: no ``cta1``, ``sk_exact`` / ``sk_first`` /
+    ``sk_sync`` / ``stt``, ``mg``, ``batch_group`` or ``form``; every other field is unchanged and the OFF form renders
+    byte-identical.
     [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
@@ -1104,6 +1112,20 @@ def instance_key(
             f"cgrp={cgrp}, batch_group={batch_group}, stt={stt}, ovl={ovl}, ovr={ovr}, park={park}, pf={pf}, "
             f"sh={sh}, store_hint={store_hint!r}, store_ef={store_ef}, quad_store={quad_store}, f32_v8={f32_v8}"
         )
+    kser = int(kser)
+    if kser < 0 or (
+        kser
+        and (
+            cta1 or sk_exact or sk_first or sk_sync or stt or mg or batch_group or form
+        )
+    ):
+        # the serpentine K walk is written for the pair programs' plain item walk (the kernel's refusal)
+        raise ValueError(
+            f"kser (serpentine K walk) is a pair count >= 0 and needs the cluster pair on the plain item walk (no cta1, "
+            f"sk_exact, sk_first, sk_sync, stt, mg, batch_group or form); got kser={kser}, cta1={cta1}, "
+            f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, stt={stt}, mg={mg}, "
+            f"batch_group={batch_group}, form={form!r}"
+        )
     return (
         a_mn,
         b_mn,
@@ -1142,6 +1164,7 @@ def instance_key(
         mg,
         sw,
         form,
+        kser,
     )
 
 
@@ -1162,7 +1185,8 @@ def instance_symbol(key: tuple) -> str:
     the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it);
     the round-2 shapes tranche adds ``_skf`` directly after ``_skx`` (``sk_first``) and ``_lw`` between ``_or`` and
     ``_pro`` (``lw``); ``_mg`` directly after ``_lw`` for the whole-tile tile resolve (``mg``); ``_sw<n>`` directly
-    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
+    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_ks<P>`` directly after ``_sw<n>`` for the
+    serpentine K walk (``kser``, absent when 0); ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
     ``_pro<n>`` and before the diag tokens for the eight-warp CTA form (``form``, absent when "")).
     [Cake ``instance_symbol``]"""
     (
@@ -1203,6 +1227,7 @@ def instance_symbol(key: tuple) -> str:
         mg,
         sw,
         form,
+        kser,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -1256,6 +1281,7 @@ def instance_symbol(key: tuple) -> str:
         + ("_lw" if lw else "")
         + ("_mg" if mg else "")
         + (f"_sw{sw}" if sw else "")
+        + (f"_ks{kser}" if kser else "")
         + (f"_pro{pro}" if pro else "")
         + (f"_{form}" if form else "")
         + "".join(f"_{d}" for d in diag)
@@ -1911,10 +1937,14 @@ ROW_RULES: dict[tuple, dict] = {
     #      of the row's plan without it (bitwise equal to that plan), measured on GB300 against that plan on two nodes ----
     ('sm_103a', False, False, False, False, False, 6144, 16384, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
     ('sm_103a', False, False, False, False, False, 6144, 16384, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
-    ('sm_103a', False, False, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at T 16172 also walk K serpentine over blocks
+    # of 76 items (``kser`` 76, the CTA pairs of the 152-SM part; the wave guard drops it on the parts with another
+    # pair count), measured on GB300 against the best library GEMM on two nodes
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8, "kser": 76},
     ('sm_103a', False, False, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
     ('sm_103a', False, True, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
-    ('sm_103a', False, True, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    # the serpentine K walk over blocks of 76 items (``kser`` 76: see the 12288 -> 4096 forward at T 16172)
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
     ('sm_103a', True, True, False, False, False, 5120, 16172, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_103a', True, True, False, False, False, 17408, 16172, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
 }
@@ -2481,6 +2511,10 @@ class CakeDenseGemmDetProjectionPlan:
     # TMA-store tiles only; a program knob that adds the raster's four fast divisors to the launch (``_k1_values``) and
     # changes no plan arithmetic
     form: str = ""
+    # the serpentine K walk (instance_key field 38, ``_ks<P>``): the load warp walks the K blocks of a whole-K item in
+    # an odd block of P items descending (P = ``sm_pairs``: the wave guard keeps the rule's value on devices with P
+    # pairs only) - a program knob, no launch argument, no plan arithmetic (0 = off)
+    kser: int = 0
     # FlashInfer-only: the rule's exact-wave BLOCK_N (224) yielded to the default tile because the device's CTA pairs do
     # not fit its tiles in whole waves and the default tile needs fewer waves (``exact_waves``)
     wave_fallback: bool = False
@@ -2829,6 +2863,7 @@ def cake_dense_gemm_det_train_projection_plan(
     mg: Optional[bool] = None,
     sw: Optional[int] = None,
     form: Optional[str] = None,
+    kser: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -2889,7 +2924,14 @@ def cake_dense_gemm_det_train_projection_plan(
     ``store_ef`` / ``quad_store`` / ``f32_v8``) are cleared before the key: the eight-warp programs carry none of them.
     A caller-forced ``form`` is admitted or refused by ``instance_key`` and refused on a plan with stream-K units.  It
     changes no plan arithmetic; the launch adds the raster's four fast divisors (``fd_tiles_l`` / ``fd_tiles_g`` /
-    ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.
+    ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.  ``kser`` (``_ks<P>``) is the
+    row's serpentine K walk - taken from the rule (the sm_103a T-exact rules of the 12288 -> 4096 forward and the
+    4096 -> 12288 input gradient at T 16172 carry ``kser`` 76) and dropped where the planned program cannot carry it
+    (the single-CTA form, an exact, tail-first or synchronised split, the transposed staging, the whole-tile tile
+    resolve, a batch raster, the eight-warp form) or where the device's CTA pairs are not P (74 pairs of a 148-SM part,
+    80 of a 160-SM part: the reversed blocks would not be the device's waves); a caller-forced ``kser`` is admitted or
+    refused by ``instance_key``.  It changes neither a launch argument nor the plan arithmetic; the output bits are
+    those of another FP32 summation order than the row's program without it, fixed run to run.
     [Cake K1 kernel host L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -2968,6 +3010,7 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=mg,
         sw=sw,
         form=form,
+        kser=kser,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -3092,6 +3135,7 @@ def cake_dense_gemm_det_train_projection_plan(
                 "lw",
                 "mg",
                 "sw",
+                "kser",
             )
         }
     if cta1 is None:
@@ -3222,6 +3266,12 @@ def cake_dense_gemm_det_train_projection_plan(
         # the measured ``_sw<n>`` programs are pair programs: a caller-forced single-CTA form keeps the row's
         # single-CTA program without it (a caller-forced ``sw`` is admitted or refused by ``instance_key``)
         sw = 0
+    rule_kser = kser is None
+    if kser is None:
+        # the serpentine K walk of the row's rule (the ``_ks<P>`` programs); the wave guard before ``instance_key``
+        # drops it from a plan that cannot carry it or from a device with another pair count
+        kser = rule.get("kser", 0)
+    kser = int(kser)
     rule_form = form is None
     if form is None:
         # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` / ``_w8`` programs): the whole-tile
@@ -3545,6 +3595,27 @@ def cake_dense_gemm_det_train_projection_plan(
             f"cake_dense_gemm_det_train_projection: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
             f"tiles under 2**21 cluster tiles (got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
         )
+    # The wave guard of ``kser``: the ``_ks<P>`` programs reverse the K walk of the whole-K items in every odd block of
+    # P items, measured with P = the 76 CTA pairs of the 152-SM parts.  A rule's ``kser`` yields where the planned
+    # program cannot carry it (the single-CTA form, an exact / tail-first / synchronised split, the transposed staging,
+    # the whole-tile tile resolve, a batch raster, the eight-warp form) or where the device's pairs are not P; a
+    # caller-forced ``kser`` is admitted or refused by ``instance_key``.
+    if (
+        kser
+        and rule_kser
+        and (
+            cta1
+            or exact_plan is not None
+            or sk_first
+            or sync_plan is not None
+            or stt
+            or mg
+            or batch_group
+            or form
+            or units != kser
+        )
+    ):
+        kser = 0
     key = instance_key(
         a_mn=a_mn,
         b_mn=b_mn,
@@ -3584,6 +3655,7 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=mg,
         sw=sw,
         form=form,
+        kser=kser,
     )
     plan = CakeDenseGemmDetProjectionPlan(
         L=L,
@@ -3639,6 +3711,7 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=bool(key[34]),
         sw=int(key[35]),
         form=str(key[36]),
+        kser=int(key[37]),
         wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan, arch)
@@ -3804,6 +3877,7 @@ _CTA1_CLEARED = (
     "pro",
     "sk_first",
     "lw",
+    "kser",
 )
 # The caller knobs the eight-warp CTA form yields to (``cake_dense_gemm_det_train_projection_plan``): a value a caller forces for any
 # of them shapes the pipeline, tile, epilogue, tail or raster the form cannot carry, so the row's ten-warp program runs
@@ -3837,6 +3911,7 @@ _W8_FIXED = (
     "lw",
     "mg",
     "sw",
+    "kser",
     "sk_max_units",
     "sk_parts",
 )
@@ -3906,6 +3981,7 @@ def _template_knobs(
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
     row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
     ``_lw`` = the load-warp prelude form, ``_mg`` = the whole-tile tile resolve, ``_sw<n>`` = the paced output stores,
+    ``_ks<P>`` = the serpentine K walk,
     ``_w8r`` / ``_w8rs`` / ``_w8`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
@@ -3944,6 +4020,7 @@ def _template_knobs(
         mg=False,
         sw=0,
         form="",
+        kser=0,
     )
     for token in tokens[1:]:
         if token in ("f32", "t"):
@@ -4008,6 +4085,8 @@ def _template_knobs(
             knobs["mg"] = True
         elif m := re.fullmatch(r"sw(\d+)", token):
             knobs["sw"] = int(m[1])
+        elif m := re.fullmatch(r"ks(\d+)", token):
+            knobs["kser"] = int(m[1])
         elif m := re.fullmatch(r"pro(\d+)", token):
             knobs["pro"] = int(m[1])
         elif token in W8_FORMS:
