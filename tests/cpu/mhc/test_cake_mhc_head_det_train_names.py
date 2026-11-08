@@ -80,26 +80,80 @@ _LW64 = ("sm_100a", "sm_103a")
 RECORDS = {
     "cake_mhc_det_train_head_fwd": ("head_fwd", ("sm_107a",), 256, 8, 0),
     **{
-        f"cake_mhc_det_train_head_fwd__lw64_t128_h{h}": ("head_fwd", ("sm_103a",), 128, 4, h)
+        f"cake_mhc_det_train_head_fwd__lw64_t128_h{h}": (
+            "head_fwd",
+            ("sm_103a",),
+            128,
+            4,
+            h,
+        )
         for h in (4096, 5120, 7168)
     },
     **{
-        f"cake_mhc_det_train_head_fwd__lw64_t256_h{h}": ("head_fwd", ("sm_100a",), 256, 4, h)
+        f"cake_mhc_det_train_head_fwd__lw64_t256_h{h}": (
+            "head_fwd",
+            ("sm_100a",),
+            256,
+            4,
+            h,
+        )
         for h in (4096, 5120, 7168)
     },
-    "cake_mhc_det_train_head_fwd__lw256_t128_h4096": ("head_fwd", ("sm_107a",), 128, 16, 4096),
+    "cake_mhc_det_train_head_fwd__lw256_t128_h4096": (
+        "head_fwd",
+        ("sm_107a",),
+        128,
+        16,
+        4096,
+    ),
     "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
-    "cake_mhc_det_train_head_bwd__lw64_t480_h4096": ("head_bwd", ("sm_100a",), 480, 4, 4096),
+    "cake_mhc_det_train_head_bwd__lw64_t480_h4096": (
+        "head_bwd",
+        ("sm_100a",),
+        480,
+        4,
+        4096,
+    ),
     **{
-        f"cake_mhc_det_train_head_bwd__lw64_t512_h{h}": ("head_bwd", ("sm_103a",), 512, 4, h)
+        f"cake_mhc_det_train_head_bwd__lw64_t512_h{h}": (
+            "head_bwd",
+            ("sm_103a",),
+            512,
+            4,
+            h,
+        )
         for h in (4096, 5120, 7168)
     },
-    "cake_mhc_det_train_head_bwd__lw64_t256_h5120": ("head_bwd", ("sm_100a",), 256, 4, 5120),
-    "cake_mhc_det_train_head_bwd__lw64_t256_h7168": ("head_bwd", ("sm_100a",), 256, 4, 7168),
-    "cake_mhc_det_train_head_bwd__lw256_t128_h4096": ("head_bwd", ("sm_107a",), 128, 16, 4096),
+    "cake_mhc_det_train_head_bwd__lw64_t256_h5120": (
+        "head_bwd",
+        ("sm_100a",),
+        256,
+        4,
+        5120,
+    ),
+    "cake_mhc_det_train_head_bwd__lw64_t256_h7168": (
+        "head_bwd",
+        ("sm_100a",),
+        256,
+        4,
+        7168,
+    ),
+    "cake_mhc_det_train_head_bwd__lw256_t128_h4096": (
+        "head_bwd",
+        ("sm_107a",),
+        128,
+        16,
+        4096,
+    ),
     "cake_mhc_det_train_head_bwd__acc": ("head_bwd_acc", ("sm_107a",), 256, 16, 0),
     **{
-        f"cake_mhc_det_train_head_bwd__acc_lw64_t768_h{h}": ("head_bwd_acc", _LW64, 768, 4, h)
+        f"cake_mhc_det_train_head_bwd__acc_lw64_t768_h{h}": (
+            "head_bwd_acc",
+            _LW64,
+            768,
+            4,
+            h,
+        )
         for h in (4096, 5120, 7168)
     },
     "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": (
@@ -271,7 +325,8 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
         "sm_103a": (4096, 5120, 7168),
         "sm_107a": (4096,),
     }
-    assert loader.ROUTES == {
+    routes, small_routes = loader.ROUTES, loader.SMALL_ROUTES
+    assert routes == {
         arch: {
             role: {
                 hidden: built(arch, role, hidden)
@@ -282,7 +337,7 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
         for arch in loader.ARCHES
     }
     small = "cake_mhc_det_train_head_bwd"
-    assert loader.SMALL_ROUTES == {
+    assert small_routes == {
         "sm_100a": {"head_bwd": small},
         "sm_103a": {"head_bwd": small},
         "sm_107a": {

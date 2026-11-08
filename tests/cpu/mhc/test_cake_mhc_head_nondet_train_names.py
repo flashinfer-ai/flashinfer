@@ -282,10 +282,10 @@ def test_the_registry_is_the_det_head_registry_renamed() -> None:
     the same programs, launched on the same architectures, under this package's own library names."""
     ours = importlib.import_module(f"{BACKEND}.cake_jit")
     det = importlib.import_module(f"{DET_BACKEND}.cake_jit")
-    modules, routes = ours.MODULES, ours.ROUTES
+    modules, routes, small_routes = ours.MODULES, ours.ROUTES, ours.SMALL_ROUTES
     assert modules == _renamed(det.MODULES)
     assert routes == _renamed(det.ROUTES)
-    assert ours.SMALL_ROUTES == _renamed(det.SMALL_ROUTES)
+    assert small_routes == _renamed(det.SMALL_ROUTES)
     assert all(record["library"].startswith(STEM) for record in modules.values()), (
         modules
     )
