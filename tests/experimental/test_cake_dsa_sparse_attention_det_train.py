@@ -1411,6 +1411,119 @@ def test_key_passes_give_the_bits_of_one_launch(monkeypatch, dkv, redo):
                 assert _same_bits(a, b)
 
 
+# The poisoned-scratch cases: (program, dK/dV form, key-range passes).  "fresh": the runner's own dK/dV outputs
+# (BF16 for RoPE, the FP32 ``dkv`` that is its own accumulator for NoPE); "fp32": the natural-layout FP32 RoPE
+# outputs (``dkv_fp32=True``); "acc": added into a caller ``dkv_acc``; "acc_map": the same through a
+# ``dkv_dst_map`` that maps two keys to every destination row.
+POISON_CASES = [
+    pytest.param("rope", form, passes, id=f"rope-{form}-P{passes}")
+    for form in ("fresh", "fp32", "acc", "acc_map")
+    for passes in (1, 2)
+] + [
+    pytest.param("nope", form, 1, id=f"nope-{form}")
+    for form in ("fresh", "acc", "acc_map")
+]
+# Every tensor of a runner the backward may use as scratch or write: the outputs (the bound terms and key norms live
+# in dQ, the redo lists and delta in a fresh dK/dV output) and the forward's outputs.
+POISON_TENSORS = (
+    "out",
+    "lse",
+    "o_lo",
+    "dq_latent",
+    "dq_rope",
+    "dkv_latent",
+    "dk_rope",
+    "dkv_latent_fp32",
+    "dk_rope_fp32",
+    "dkv",
+)
+
+
+def _poison(t: torch.Tensor, pattern: str, gen: torch.Generator) -> None:
+    """Overwrite every byte of ``t`` (contiguous): ``zero``, ``ff`` (NaN bits for FP32 / BF16, -1 for the
+    integers) or ``rand`` (random bytes)."""
+    raw = t.view(-1).view(torch.uint8)
+    if pattern == "zero":
+        raw.zero_()
+    elif pattern == "ff":
+        raw.fill_(0xFF)
+    else:
+        noise = torch.randint(
+            0, 256, raw.shape, dtype=torch.uint8, device=raw.device, generator=gen
+        )
+        raw.copy_(noise)
+
+
+@pytest.mark.parametrize("redo", [False, True], ids=["no_redo", "redo"])
+@pytest.mark.parametrize("program, form, passes", POISON_CASES)
+def test_backward_reads_no_stale_scratch(monkeypatch, program, form, passes, redo):
+    """Every byte of a runner's workspace (the global words, the int32 accumulator, the overflow counters, grid
+    words, pair counts, redo lists, key norms, bound terms, ``delta`` and the key-range-pass scratch) and of its
+    outputs (where the plan keeps scratch in dead output storage) is overwritten with zeros, with ``0xFF`` (NaN bits)
+    and with random bytes before ``forward()`` + ``backward()``: dQ, dK/dV (or the accumulated rows), the forward's
+    outputs and the flagged-row and non-finite counts are the same bits under the three, with most rows recomputed
+    by the redo too (``GRID_SHIFT = 24``).  No stage reads a byte the backward did not write first."""
+    nope = program == "nope"
+    _require_program(
+        backward=True, program=cake_jit.NOPE_PROGRAM if nope else cake_jit.PROGRAM
+    )
+    if passes > 1:
+        _require_key_passes()
+    inp = make_inputs([384], [4096], seed=SEED + 34, topk=512)
+    S, width = inp.total_k, D_LATENT if nope else D_QK
+    if redo:
+        monkeypatch.setattr(cake_backend, "GRID_SHIFT", 24)
+        monkeypatch.setattr(cake_backend, "MIN_BUMP", 25)
+    dst_map, rows = None, S
+    if form == "acc_map":
+        rows = S // 2
+        dst_map = (
+            torch.arange(S, device="cuda", dtype=torch.int32) % rows
+        ).contiguous()
+    gen = torch.Generator(device="cuda").manual_seed(SEED)
+    prev = torch.randn(rows, width, device="cuda", generator=gen)
+
+    def run(pattern):
+        acc = None if form == "fresh" else prev.clone()
+        if nope:
+            runner = cake_backend.prepare_dsa_nope_train(
+                inp.q_latent, inp.kv_latent, inp.idx_global, topk_length=inp.topk_length,
+                dout=inp.dout, dkv_acc=acc, dkv_dst_map=dst_map,
+            )  # fmt: skip
+        else:
+            runner = cake_backend.prepare_dsa_train(
+                *_rope_args(inp), topk_length=inp.topk_length, dout=inp.dout,
+                dkv_acc=acc, dkv_dst_map=dst_map, key_passes=passes,
+                dkv_fp32=form == "fp32",
+            )  # fmt: skip
+            assert runner.key_passes == passes
+        # the workspace length vector (filled at prepare time) is not in use: the caller passes the lengths
+        assert runner.has_topk_length
+        gen = torch.Generator(device="cuda").manual_seed(SEED + 1)
+        _poison(runner.workspace, pattern, gen)
+        for name in POISON_TENSORS:
+            if runner.tensors.get(name) is not None:
+                _poison(runner.tensors[name], pattern, gen)
+        out, lse, _ = runner.forward()
+        grads = [g.clone() for g in runner.backward() if g is not None]
+        words = _globals(runner)
+        results = [out.clone(), lse.clone(), *grads]
+        if acc is not None:
+            results.append(acc)
+        flagged = words[cake_backend.REDO_WORD], words[cake_backend.NONFINITE_WORD]
+        return results, flagged
+
+    clean, clean_words = run("zero")
+    assert clean_words[1] == 0
+    if redo:
+        assert clean_words[0] > 0
+    for pattern in ("ff", "rand"):
+        got, words = run(pattern)
+        assert words == clean_words, (pattern, words, clean_words)
+        for i, (a, b) in enumerate(zip(got, clean, strict=True)):
+            assert _same_bits(a, b), (pattern, i)
+
+
 def _inside(x: torch.Tensor, y: torch.Tensor) -> bool:
     """Whether the bytes of ``x`` lie inside the bytes of ``y``."""
     lo, hi = y.data_ptr(), y.data_ptr() + y.numel() * y.element_size()
