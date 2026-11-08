@@ -1288,6 +1288,14 @@ def test_launch_values_are_the_program_args() -> None:
     previous = kcp.set_backend("fake", Recording())
     try:
         _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True, save_mode="full")
+        # the full set keeps qn / kn, so its backward launches no qk_apply: the test knob runs the qk_apply form
+        _saved_pass(
+            ctx,
+            ops,
+            use_qk_l2norm_in_kernel=True,
+            save_mode="full",
+            test_knobs={"full_qk": "apply"},
+        )
         _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True)
     finally:
         kcp.set_backend("fake", previous)
