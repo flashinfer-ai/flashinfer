@@ -2990,7 +2990,9 @@ def fwd_a_route(
 ) -> bool:
     """Whether a forward on ``meta`` runs ``wy_a`` and ``fwd_ho_a`` (see :data:`FWD_A_ARCHS`): q and k 16-byte aligned
     (wy_a's tensor maps), the rest as there."""
-    if arch not in FWD_A_ARCHS or not _fwd_a_inputs(meta, q, k, v, beta, normalize_qk, options):
+    if arch not in FWD_A_ARCHS or not _fwd_a_inputs(
+        meta, q, k, v, beta, normalize_qk, options
+    ):
         return False
     segs = meta.fwd_segments
     if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
@@ -2998,7 +3000,9 @@ def fwd_a_route(
     return _available("wy_a", arch) and _available("fwd_ho_a", arch)
 
 
-def _fwd_a_inputs(meta: ChunkMeta, q, k, v, beta, normalize_qk: bool, options: ChainOptions) -> bool:
+def _fwd_a_inputs(
+    meta: ChunkMeta, q, k, v, beta, normalize_qk: bool, options: ChainOptions
+) -> bool:
     """The input conditions of the forwards on wy_a's A (:func:`fwd_a_route`, :func:`fwd_split_route`): normalized
     q / k, FP32 beta, no ``prep`` pin, a host-built table, value-head groups of at most :data:`WY_A_MAX_GROUP`, q and k
     16-byte aligned."""
@@ -3213,7 +3217,13 @@ FWD_SPLIT_MIN_PIECE: dict[str, int] = {"sm_100a": 16, "sm_103a": 16}
 # fwd_fused's tape word per tape entry
 FWD_FUSED_TAPE = {"h": 1, "v_new": 2}
 # fwd_summary's output layout into the stitch's [B | M] FP32 [K][V + K] block: b_head, b_row, m_head, m_row, m_col
-_SUMMARY_LAYOUT = (HEAD_DIM * 2 * HEAD_DIM, 2 * HEAD_DIM, HEAD_DIM * 2 * HEAD_DIM, 2 * HEAD_DIM, HEAD_DIM)
+_SUMMARY_LAYOUT = (
+    HEAD_DIM * 2 * HEAD_DIM,
+    2 * HEAD_DIM,
+    HEAD_DIM * 2 * HEAD_DIM,
+    2 * HEAD_DIM,
+    HEAD_DIM,
+)
 
 
 @dataclass(frozen=True)
@@ -3291,7 +3301,9 @@ def forward_split_tables(
                         num_rest=len(lists[6]), length=int(length), one_stream=bool(one_stream))  # fmt: skip
 
 
-def forward_split_length(meta: ChunkMeta, arch: str, num_v_heads: int, device_index: int) -> int | None:
+def forward_split_length(
+    meta: ChunkMeta, arch: str, num_v_heads: int, device_index: int
+) -> int | None:
     """The piece length of the split forward of a host-built ``meta`` on ``arch``: the host plan's
     (:func:`cake_plan.pieces`) where ``meta``'s forward segment table splits a sequence and the length reaches the
     architecture's :data:`FWD_SPLIT_MIN_PIECE`, else ``None``."""
@@ -3300,7 +3312,9 @@ def forward_split_length(meta: ChunkMeta, arch: str, num_v_heads: int, device_in
         return None
     if not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs):
         return None
-    length = cake_plan.host_plan(tuple(meta.seq_lens), int(num_v_heads), int(device_index)).pieces.length
+    length = cake_plan.host_plan(
+        tuple(meta.seq_lens), int(num_v_heads), int(device_index)
+    ).pieces.length
     if length <= 0 or length < FWD_SPLIT_MIN_PIECE.get(arch, 1 << 30):
         return None
     return length
@@ -3315,7 +3329,9 @@ def _host_forward_split(
     if options.scan_config is not None or options.segment_chunks is not None:
         return None
     one_stream = options.streams == 1
-    length = forward_split_length(meta, cake_backend.device_arch(int(device_index)), num_v_heads, device_index)
+    length = forward_split_length(
+        meta, cake_backend.device_arch(int(device_index)), num_v_heads, device_index
+    )
     if length is None:
         return None
     chunks = cake_plan.chunk_counts(meta.seq_lens)
@@ -3333,7 +3349,10 @@ def fwd_split_route(
         return False
     if not _fwd_a_inputs(meta, q, k, v, beta, normalize_qk, options):
         return False
-    return all(_available(stage, arch) for stage in ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch"))
+    return all(
+        _available(stage, arch)
+        for stage in ("wy_a", "wy_tc2", "fwd_fused", "fwd_summary", "stitch")
+    )
 
 
 def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output_final_state, normalize_qk, options,
@@ -3364,12 +3383,16 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     # v_new off the tape stand as placeholders (fwd_fused stores neither)
     kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
     on_tape = [name in kept for name in cake_plan.STATE_NAMES]
-    views = _carve(device, pieces + [s for s, on in zip(state, on_tape, strict=True) if on])
+    views = _carve(
+        device, pieces + [s for s, on in zip(state, on_tape, strict=True) if on]
+    )
     qn, kn, rstd_q, rstd_k, g_cs, A = views[:6]
     v_dense = views[6] if copy_v else None
     kept_views = iter(views[len(pieces) :])
     named: dict[str, torch.Tensor] = {}
-    for name, (shape, dtype), on in zip(cake_plan.STATE_NAMES, state, on_tape, strict=True):
+    for name, (shape, dtype), on in zip(
+        cake_plan.STATE_NAMES, state, on_tape, strict=True
+    ):
         if on:
             named[name] = next(kept_views)
         elif name in ("w", "u"):
@@ -3382,12 +3405,22 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     table = workspaces.table(index)
     word = sum(FWD_FUSED_TAPE[name] for name in kept if name in FWD_FUSED_TAPE)
     rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
-    h_t = h if "h" in kept else workspaces.take(table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device)
+    h_t = (
+        h
+        if "h" in kept
+        else workspaces.take(
+            table, "fa_h_off", (1, 1, HEAD_DIM, HEAD_DIM), bf16, device
+        )
+    )
     v_new_t = v_new if "v_new" in kept else rows
     if output_final_state:
-        final_state = torch.empty((meta.num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM), dtype=f32, device=device)
+        final_state = torch.empty(
+            (meta.num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM), dtype=f32, device=device
+        )
     else:
-        final_state = workspaces.take(table, "f_zero_state", (0, num_v_heads, HEAD_DIM, HEAD_DIM), f32, device)
+        final_state = workspaces.take(
+            table, "f_zero_state", (0, num_v_heads, HEAD_DIM, HEAD_DIM), f32, device
+        )
     initial_rows = _table_rows(initial_state, meta)
     if initial_rows is not None:
         h0 = initial_rows.contiguous()
@@ -3397,9 +3430,19 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
     else:
         h0, use_init = final_state, 0
     hv = num_v_heads
-    seg_state = workspaces.take(table, "f_seg_state", (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM), f32, device)
-    seg_flag = workspaces.take(table, "f_seg_flag", (split.num_segments, hv), torch.int32, device)
-    seg_start = workspaces.take(table, "f_seg_start", (split.num_segments, hv, HEAD_DIM, HEAD_DIM), f32, device)
+    seg_state = workspaces.take(
+        table,
+        "f_seg_state",
+        (split.num_segments, hv, HEAD_DIM, 2 * HEAD_DIM),
+        f32,
+        device,
+    )
+    seg_flag = workspaces.take(
+        table, "f_seg_flag", (split.num_segments, hv), torch.int32, device
+    )
+    seg_start = workspaces.take(
+        table, "f_seg_start", (split.num_segments, hv, HEAD_DIM, HEAD_DIM), f32, device
+    )
     sm_count = _device_props(index)[0]
     v_in = v_dense if copy_v else v
 
@@ -3410,23 +3453,88 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
                          split_out)  # fmt: skip
 
     front = [
-        _prepared("wy_a", min(sm_count, meta.num_chunks * num_heads), 1, 1, k, k, q, g32, beta32, A.view(torch.uint32),
-                  rstd_k, rstd_q, g_cs, qn.view(torch.uint32), kn.view(torch.uint32), meta.chunk_start,
-                  meta.chunk_len, meta.num_chunks, num_heads, hv),  # fmt: skip
-        _prepared("wy_tc2", meta.num_chunks, hv, 1, kn, v_in, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
-                  num_heads, hv, 1, v_rows),  # fmt: skip
+        _prepared(
+            "wy_a",
+            min(sm_count, meta.num_chunks * num_heads),
+            1,
+            1,
+            k,
+            k,
+            q,
+            g32,
+            beta32,
+            A.view(torch.uint32),
+            rstd_k,
+            rstd_q,
+            g_cs,
+            qn.view(torch.uint32),
+            kn.view(torch.uint32),
+            meta.chunk_start,
+            meta.chunk_len,
+            meta.num_chunks,
+            num_heads,
+            hv,
+        ),  # fmt: skip
+        _prepared(
+            "wy_tc2",
+            meta.num_chunks,
+            hv,
+            1,
+            kn,
+            v_in,
+            g_cs,
+            beta32,
+            A,
+            w,
+            u,
+            meta.chunk_start,
+            meta.chunk_len,
+            num_heads,
+            hv,
+            1,
+            v_rows,
+        ),  # fmt: skip
     ]
-    wave1 = fused(split.first, split.num_first, split.first_end, 0, 1, 1) if split.num_first else None
+    wave1 = (
+        fused(split.first, split.num_first, split.first_end, 0, 1, 1)
+        if split.num_first
+        else None
+    )
     summary = (
-        _prepared("fwd_summary", split.num_middle * hv, 1, 1, kn, w, u, g_cs, seg_state, seg_state, seg_flag,
-                  meta.chunk_start, meta.chunk_len, split.seg_chunk_start, split.middle, split.slot, num_heads, hv,
-                  *_SUMMARY_LAYOUT)  # fmt: skip
+        _prepared(
+            "fwd_summary",
+            split.num_middle * hv,
+            1,
+            1,
+            kn,
+            w,
+            u,
+            g_cs,
+            seg_state,
+            seg_state,
+            seg_flag,
+            meta.chunk_start,
+            meta.chunk_len,
+            split.seg_chunk_start,
+            split.middle,
+            split.slot,
+            num_heads,
+            hv,
+            *_SUMMARY_LAYOUT,
+        )  # fmt: skip
         if split.num_middle
         else None
     )
     stitch = _prepared("stitch", meta.num_seqs, hv, STITCH_VSPLIT, seg_state, h0, seg_start, split.seq_seg_start,
                        seg_flag, hv, use_init, 0)  # fmt: skip
-    wave2 = fused(split.rest, split.num_rest, meta.seq_chunk_start, 1, 1 if output_final_state else 0, 0)
+    wave2 = fused(
+        split.rest,
+        split.num_rest,
+        meta.seq_chunk_start,
+        1,
+        1 if output_final_state else 0,
+        0,
+    )
     if copy_v:
         _dense(v, v_dense)
     for launch in front:
