@@ -43,10 +43,11 @@ order: at the same topology repeated calls give bitwise the same results; ``out`
 same accuracy budget).  No launch is unordered, so no entry raises an alert or a warning under
 ``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``), and no entry runs the deterministic
 package.  A workspace or a saved set of the deterministic package raises ``ValueError`` naming the mode; a saved set
-is read by the backward of this package only.  These bitwise statements hold for the default saved set
-(``saved_rows="auto"`` / ``"none"``).  ``saved_rows="intra"`` / ``"wy"`` keeps the forward's internal rows so that
-the backward skips its intra program (and WY program): the gradients are then held to the light path's FP64 error
-budget, not bitwise.
+is read by the backward of this package only.  These bitwise statements hold for the light saved set
+(``saved_rows="none"``, and ``"auto"`` / ``"tape"`` wherever the checkpoint hand-off does not engage) and for the
+hand-off's tape set (``saved_rows="tape"``).  ``saved_rows="intra"`` / ``"wy"``, and ``"auto"`` where the hand-off
+engages (it keeps the ``"wy"`` rows there), keep the forward's internal rows so that the backward skips its intra
+program (and WY program): the gradients are then held to the light path's FP64 error budget, not bitwise.
 
 Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and ``lower_bound``) and the in-kernel q / k
 L2 norm (``use_qk_l2norm_in_kernel=True``) run in either combination: the compute entries forward the keywords, and

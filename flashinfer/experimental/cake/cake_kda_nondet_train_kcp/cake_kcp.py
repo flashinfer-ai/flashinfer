@@ -485,7 +485,7 @@ TRANSFER_WALKS = (
     "bf16x3_hw64",
     "tf32_hilo",
     "bf16x3",
-)  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
+)  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)
 KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg, carry plane] -- the optional members travel as flags}; version 1 also held the token-row Aqk / Akk
 # Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (

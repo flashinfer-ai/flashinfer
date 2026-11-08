@@ -1851,8 +1851,8 @@ def test_rank_check_two_ranks(case: str) -> None:
             text = log.read_text(errors="replace") if log.exists() else ""
             try:
                 result = json.loads(js.read_text()) if js.exists() else None
-            except json.JSONDecodeError:  # a rank aborted mid-write (files of an older writer)
-                result = None
+            except json.JSONDecodeError:
+                result = None  # a rank aborted mid-write (files of an older writer)
             ranks.append(
                 {
                     "exitcode": p.exitcode,

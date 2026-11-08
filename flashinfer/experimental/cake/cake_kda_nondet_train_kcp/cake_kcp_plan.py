@@ -2639,7 +2639,7 @@ KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
 # lies between 522784 and 1045568: every row it admits (H8 at CP2, H16 and H64 at CP2 and CP4) gains 1.060-1.081 in
 # runs within both limits (the activated gate's H16 CP4 row: 1.059, one run, drift 2.5 %), and it refuses H4 at CP4
 # (0.958-0.978), H8 at CP4 and H4 at CP2.  The H64 step at 16384 tokens per rank (1048576) is admitted.
-KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY: dict[tuple[str, int, str], int] = {
+KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY: dict[tuple[object, ...], int] = {
     ("sm_100a", 152, "13.4"): 786432,  # GB200
 }
 # the tape set, in saved-set order: the h tape BF16 [NC_pad, H, 128, 128], v_new and w BF16 [R, H, 128], the internal
@@ -2670,8 +2670,8 @@ KCP_SAVED_ROWS_BYTES = {"intra": 256, "wy": 768}
 KCP_SAVED_ROWS_MODES = ("auto", "none", "intra", "wy", "tape")
 KCP_SAVED_ROWS_DEFAULT = "auto"
 # the form "auto" keeps where the checkpoint hand-off engages (the same admission as the tape set): the wy rows
-# beside the light set (and the carry plane).  GB300 CP4 H64, 16384 tokens per rank: checkpointed step 0.13-0.26 ms
-# (1.6-2.8 %) faster than the tape set and 528 MiB less per layer and rank (+792 vs +1320 MiB over the light set);
+# beside the light set (and the carry plane).  GB300 CP4 H64, 16384 tokens per rank: checkpointed step 0.21-0.33 ms
+# (2.4-4.3 %) faster than the tape set and 528 MiB less per layer and rank (+792 vs +1320 MiB over the light set);
 # the backward still replays the K1 tape
 KCP_HANDOFF_AUTO_ROWS = "wy"
 

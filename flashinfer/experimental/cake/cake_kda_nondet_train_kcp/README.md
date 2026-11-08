@@ -743,7 +743,7 @@ recompute issues no collective), and its gradients are held to the light
 path's FP64 error budget, not bitwise those of `"off"`.  `saved_rows="auto"`
 (the default) keeps the `"wy"` rows form (`cake_kcp_plan.KCP_HANDOFF_AUTO_ROWS`)
 where the hand-off engages: on GB300 at CP4, H 64, 16384 tokens per rank it
-is 0.13-0.26 ms faster per checkpointed layer than the tape set and keeps
+is 0.21-0.33 ms faster per checkpointed layer than the tape set and keeps
 528 MiB less per layer and rank (768 instead of 1280 B per internal
 token-head).  `saved_rows="tape"` keeps the tape set.
 
