@@ -1358,9 +1358,7 @@ def test_key_passes_give_the_bits_of_one_launch(monkeypatch, dkv, redo):
         assert runner.key_passes == passes
         stages = [k[0] if isinstance(k, tuple) else k for k in runner.backward_order]
         main = [
-            k
-            for k, s in zip(runner.backward_order, stages, strict=True)
-            if "main" in s
+            k for k, s in zip(runner.backward_order, stages, strict=True) if "main" in s
         ]
         if passes == 1:
             assert main == ["bwd_main"]
