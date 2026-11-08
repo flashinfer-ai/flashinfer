@@ -4173,21 +4173,18 @@ def test_bwd_piece_table_rule() -> None:
 
 def test_adjoint_split_entry_lists() -> None:
     # three sequences: one piece, three pieces, two pieces (segments [0, 1), [1, 4), [4, 6))
-    seed, seq, tape, out = (cake_chain.SPLIT_SEED, cake_chain.SPLIT_SEED_SEQ, cake_chain.SPLIT_TAPE,
-                            cake_chain.SPLIT_OUT)  # fmt: skip
+    seed, seq, tape, warm = (cake_chain.SPLIT_SEED, cake_chain.SPLIT_SEED_SEQ, cake_chain.SPLIT_TAPE,
+                             cake_chain.SPLIT_WARM)  # fmt: skip
     walk_i, walk_m, summary_i, summary_m, front_i, front_m = (
         cake_chain.adjoint_split_lists([0, 1, 4, 6])
     )
-    assert walk_i == [0, 3, 5]
-    assert walk_m == [
-        seed | seq | tape,
-        seed | seq | tape | out,
-        seed | seq | tape | out,
-    ]
-    assert summary_i == [2] and summary_m == [0]
+    # the last pieces from dht, no start adjoint stored (the summaries carry it)
+    assert walk_i == [0, 3, 5] and walk_m == [seed | seq | tape] * 3
+    # a summary of every piece but each sequence's first, last pieces included, under the warm-up bound
+    assert summary_i == [2, 3, 5] and summary_m == [warm] * 3
     assert front_i == [1, 2, 4] and front_m == [seed | tape] * 3
-    # every segment's tapes are written once: by a first-wave walk or a second-wave walk
-    assert sorted(walk_i[:1] + [3, 5] + front_i) == list(range(6))
+    # every segment's tapes are written once: by a last-piece walk or another piece's walk
+    assert sorted(walk_i + front_i) == list(range(6))
 
 
 @pytest.mark.parametrize("row", sorted(PIECE_ROWS))
@@ -4370,7 +4367,7 @@ def test_adjoint_split_matches_the_fp64_recurrence_and_the_serial_walk(
                     meta.bwd_split.num_walk,
                     meta.bwd_split.num_summary,
                     meta.bwd_split.num_front,
-                ) == (3, 5, 7)
+                ) == (3, 7, 7)
             else:
                 assert meta.bwd_split is None and meta.bwd_segments.num_segments == len(
                     seq_lens
@@ -4441,6 +4438,54 @@ def test_adjoint_split_one_stream_gives_the_two_stream_bits(
             ), stages
     assert gm_streams[True] == {main} and main not in gm_streams[False], gm_streams
     _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
+
+
+def _record_gm_flags(monkeypatch) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """(seg_index, seg_flag) of every ``dhu_tc2_dvl32_gm`` launch from here on (its last argument and the fourth from
+    last in the record's order)."""
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, grid, values, **kwargs):
+        if stage == "dhu_tc2_dvl32_gm":
+            seen.append((values[-4], values[-1]))
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return seen
+
+
+@pytest.mark.parametrize("gate_scale", [1.0, 0.002], ids=["strong", "weak"])
+def test_adjoint_split_warm_bound(gate_scale, device, monkeypatch) -> None:
+    # the summaries' warm-up bound (SPLIT_WARM, the threshold of warmup_log2): under strong gates every summary stops
+    # early (seg_flag 0) and the gradients stay within the budgets of the unbounded split (warmup_log2 -1e30, every
+    # flag 1) and of the FP64 recurrence; under weak gates (about e^-0.06 per chunk) no piece is cut, so the bound
+    # changes no bit; run to run the same bits either way
+    seq_lens, heads = SPLIT_LAYOUT, SPLIT_HEADS
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=7021)
+    inputs["g"] = (inputs["g"] * (gate_scale / 0.5)).contiguous()
+    runs, flags = {}, {}
+    for bounded in (True, False):
+        with monkeypatch.context() as m:
+            _split_device(m, device, split=True)
+            seen = _record_gm_flags(m)
+            pins = {} if bounded else {"warmup_log2": -1.0e30}
+            got = [_run(inputs, seq_lens, **pins) for _ in range(2)]
+            assert seen, "the split ran no summary"
+            rows, flag = seen[-1]
+            flags[bounded] = flag[rows.long()].cpu()
+        _assert_same_bits(got[1], got[0], OUTPUT_NAMES)
+        runs[bounded] = got[0]
+    assert bool((flags[False] == 1).all()), flags[False]
+    if gate_scale >= 1.0:
+        assert bool((flags[True] == 0).all()), flags[True]
+        _assert_within_budget(runs[True], runs[False], OUTPUT_NAMES)
+        _assert_close_to_reference(
+            runs[True], _reference(inputs, seq_lens), OUTPUT_NAMES
+        )
+    else:
+        assert bool((flags[True] == 1).all()), flags[True]
+        _assert_same_bits(runs[True], runs[False], OUTPUT_NAMES)
 
 
 def test_adjoint_forms_keep_gb200_h1_hv3_off_the_split(monkeypatch) -> None:
