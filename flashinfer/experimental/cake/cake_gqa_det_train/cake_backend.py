@@ -327,6 +327,8 @@ def cake_gqa_det_train_workspace_bytes(
         raise ValueError(
             "row_map=True needs total_k and num_heads_kv (the window gradients are [T_k, H_kv, 256])"
         )
+    # The host boundaries come both or neither, at every size.
+    host = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)
     need = cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
     if total_k is not None and num_heads_kv is not None and total_q and total_k:
         plan = cake_jit.chunk_plan(
@@ -337,12 +339,10 @@ def cake_gqa_det_train_workspace_bytes(
             num_segments=int(num_segments),
             max_seqlen_k=max_seqlen_k,
             budget_bytes=int(budget_bytes),
-            seqlens=_host_seqlens(
-                cu_seqlens_q_host,
-                cu_seqlens_k_host,
-                int(total_q),
-                int(total_k),
-                int(num_segments),
+            seqlens=None
+            if host is None
+            else cake_jit.host_seqlens(
+                *host, int(total_q), int(total_k), int(num_segments)
             ),
         )
         need += plan["ws_tiles"] * cake_jit.DS_TILE_BYTES
@@ -680,6 +680,9 @@ def cake_gqa_det_train_backward(
         raise ValueError(f"max_seqlen_k must be >= 0, got {max_seqlen_k}")
     total_q, total_k = dims["total_q"], dims["total_k"]
     heads_q, heads_kv = dims["num_heads_q"], dims["num_heads_kv"]
+    seqlens = _host_seqlens(
+        cu_seqlens_q_host, cu_seqlens_k_host, total_q, total_k, dims["num_segments"]
+    )
     device = q.device
     _check_out("out", out, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
     _check_out("dout", dout, (total_q, heads_q, HEAD_DIM), torch.bfloat16, device)
@@ -742,9 +745,6 @@ def cake_gqa_det_train_backward(
     scale = _scale(softmax_scale)
     rows = cake_jit.rows_pad(total_q, segments)
     group = heads_q // heads_kv
-    seqlens = _host_seqlens(
-        cu_seqlens_q_host, cu_seqlens_k_host, total_q, total_k, segments
-    )
     plan = cake_jit.chunk_plan(
         total_q=total_q,
         total_k=total_k,
@@ -789,7 +789,9 @@ def cake_gqa_det_train_backward(
                             device_index,
                         )
                         if seqlens is not None:
-                            _check_ranges(tables[0], cu_seqlens_k, plan, segments)
+                            _check_ranges(
+                                tables[0], cu_seqlens_k, plan, segments, total_q
+                            )
                         planned = side.record_event()
                     if fold is not None:
                         _fold_index(row_map, *fold)
@@ -812,7 +814,7 @@ def cake_gqa_det_train_backward(
                     cu_seqlens_q, cu_seqlens_k, plan["key_blocks"], total_q
                 )
                 if seqlens is not None:
-                    _check_ranges(tables[0], cu_seqlens_k, plan, segments)
+                    _check_ranges(tables[0], cu_seqlens_k, plan, segments, total_q)
             tile_base, pair_base, pair_order = tables
             # Per call, from the caching allocator on the current stream: the dS^T chunk and (row-map form) the FP32 window
             # gradients, which the main kernel stores in full (zero rows included) before the fold reads them.
@@ -940,6 +942,7 @@ def _check_ranges(
     cu_seqlens_k: torch.Tensor,
     plan: Mapping[str, Any],
     segments: int,
+    total_q: int,
 ) -> None:
     """Queue a device-side assert, on the current stream, that a host-boundary plan covers the device boundaries:
     every device segment's keys within the plan's ``key_blocks`` and every key-block range holding at most
@@ -947,9 +950,10 @@ def _check_ranges(
     block ``n``).  The kernels read the device boundaries; host boundaries within both bounds give the device
     boundaries' gradients (only the chunks, and with them the dQ rounding, may differ).  Past them the main kernel
     would leave key blocks out or write beyond its chunk: the assert fires first, and the process's CUDA context is
-    unusable after it (PyTorch reports it at the next synchronization)."""
+    unusable after it (PyTorch reports it at the next synchronization).  The counts come from :func:`_range_marks`,
+    exact past 2^31 tiles: a range past ``tile_stride`` fails the check instead of wrapping into it."""
     ranges = plan["ranges"]
-    marks = tile_base[::segments]
+    marks = _range_marks(tile_base, segments, total_q, plan["key_blocks"])
     edges = torch.stack([marks[n0] for n0, _ in ranges] + [marks[ranges[-1][1]]])
     # ``amax``, not ``max``: its result is never filled under ``torch.use_deterministic_algorithms(True)``.
     fits = torch.diff(edges).amax() <= plan["tile_stride"]
@@ -960,6 +964,20 @@ def _check_ranges(
         fits & keys,
         "cake_gqa_det_train: cu_seqlens_q_host / cu_seqlens_k_host disagree with the device boundaries",
     )
+
+
+def _range_marks(
+    tile_base: torch.Tensor, segments: int, total_q: int, key_blocks: int
+) -> torch.Tensor:
+    """The tile count before each key block ``n <= key_blocks`` (``tile_base[n * B]``), exact.  ``tile_base`` is int32
+    and wraps modulo 2^32 past 2^31 tiles (both table builders).  One key block holds at most
+    :func:`.cake_jit.tiles_per_key_block` tiles (below 2^32), so when ``key_blocks + 1`` such blocks can reach 2^31
+    the marks are rebuilt in int64 from their differences modulo 2^32; below that they are the int32 entries."""
+    marks = tile_base[::segments]
+    if (key_blocks + 1) * cake_jit.tiles_per_key_block(total_q, segments) < 1 << 31:
+        return marks
+    counts = torch.diff(marks.to(torch.int64)).remainder_(1 << 32)
+    return torch.cat([counts.new_zeros(1), counts.cumsum(0)])
 
 
 def _plan_tables(
@@ -1124,7 +1142,7 @@ class CakeGQADetFunction(torch.autograd.Function):
         dkv_acc: Optional[CakeGQADetDkvAccSource],
         max_seqlen_k: Optional[int],
         workspace: Optional[CakeGQADetWorkspace],
-        host_boundaries: Optional[tuple[list[int], list[int]]],
+        host_boundaries: Optional[tuple[list[int], list[int]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out, lse = cake_gqa_det_train_forward(
             q,
@@ -1167,11 +1185,13 @@ class CakeGQADetFunction(torch.autograd.Function):
             kwargs["cu_seqlens_q_host"], kwargs["cu_seqlens_k_host"] = (
                 ctx.host_boundaries
             )
+        # One gradient per forward argument: nine or ten (``host_boundaries`` may be left out).
+        rest = (None,) * (len(ctx.needs_input_grad) - 3)
         if ctx.dkv_acc is None:
             dq, dk, dv = cake_gqa_det_train_backward(
                 q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
             )
-            return dq, dk, dv, None, None, None, None, None, None, None
+            return (dq, dk, dv, *rest)
         dk_t, dv_t, row_map = _resolve_dkv_acc(ctx.dkv_acc)
         if row_map is None:
             kwargs.update(dk=dk_t, dv=dv_t, dkv_dtype=torch.float32)
@@ -1180,7 +1200,7 @@ class CakeGQADetFunction(torch.autograd.Function):
         dq = cake_gqa_det_train_backward(
             q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
         )[0]
-        return dq, None, None, None, None, None, None, None, None, None
+        return (dq, None, None, *rest)
 
 
 def cake_gqa_det(

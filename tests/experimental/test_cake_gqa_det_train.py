@@ -1533,6 +1533,140 @@ def test_host_boundaries_that_disagree_past_the_plan_stop_the_call(device) -> No
         )
 
 
+def _child_check_ranges(tile_base, plan, total_q) -> subprocess.CompletedProcess:
+    """A child process (a device-side assert ends its CUDA context) queuing :func:`cake_backend._check_ranges` of one
+    segment on the int32 tile table ``tile_base`` (wrapped as int32 stores it) and a 100-key device segment; it prints
+    ``checked`` after the synchronization."""
+    code = (
+        "import importlib, sys\n"
+        f"sys.path[:0] = {sys.path!r}\n"
+        "import torch\n"
+        f"b = importlib.import_module({cake_backend.__name__!r})\n"
+        "d = torch.device('cuda:0')\n"
+        f"tb = torch.tensor({list(tile_base)!r}, dtype=torch.int32, device=d)\n"
+        "ck = torch.tensor([0, 100], dtype=torch.int32, device=d)\n"
+        f"b._check_ranges(tb, ck, {dict(plan)!r}, 1, {total_q!r})\n"
+        "torch.cuda.synchronize()\n"
+        "print('checked', flush=True)\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+
+
+def test_a_range_past_two_to_the_31_tiles_fails_the_range_check(device) -> None:
+    """The device tile table is an int32 prefix sum, which wraps past 2^31 tiles: a range of 2^31 + 64 tiles reads
+    as a negative int32 difference, below any ``tile_stride``.  With ``T_q`` large enough for the wrap, the check
+    rebuilds the counts in int64: that range fires the assert, and a wrapped table whose ranges fit passes (each in
+    a child process)."""
+    total_q = 2**31 - 1
+    per_block = cake_jit.tiles_per_key_block(total_q, 1)  # 2^25
+    marks = [n * per_block for n in range(65)]  # 64 key blocks, the last mark 2^31
+    table = [(m + 2**31) % 2**32 - 2**31 for m in marks]
+    assert marks[-1] >= 2**31 and table[-1] < 0
+    fit = {
+        "ranges": [(0, 32), (32, 64)],
+        "tile_stride": 32 * per_block,
+        "key_blocks": 64,
+    }
+    over = {"ranges": [(0, 64)], "tile_stride": 10, "key_blocks": 64}
+    assert table[-1] - table[0] <= over["tile_stride"]  # an int32 difference would pass
+    result = _child_check_ranges(table, fit, total_q)
+    assert result.returncode == 0 and result.stdout.split() == ["checked"], (
+        result.stderr[-2000:]
+    )
+    result = _child_check_ranges(table, over, total_q)
+    assert result.returncode != 0 and "checked" not in result.stdout, result.stdout
+    assert "device-side assert" in result.stderr or "disagree" in result.stderr, (
+        result.stderr[-2000:]
+    )
+
+
+def test_the_tile_tables_wrap_and_the_range_marks_rebuild_them(
+    device, monkeypatch
+) -> None:
+    """Past 2^31 tiles of one head pair, both tile-table builders (the PyTorch plan and the ``bwd_plan`` kernel, here
+    allowed up to its capacity ``PLAN_MAX_PAIRS``) wrap modulo 2^32 (no saturation), and
+    :func:`cake_backend._range_marks` gives the exact counts of :func:`.cake_jit.exact_tiles` before every key
+    block."""
+    monkeypatch.setattr(cake_jit, "PLAN_KERNEL_PAIRS", cake_jit.PLAN_MAX_PAIRS)
+    for q_lens, k_lens, kernel in (
+        ((6_000_000, 0), (6_000_000, 0), False),  # past PLAN_MAX_PAIRS: the PyTorch ops
+        ((2_000_000,), (10_000_000,), True),  # one bwd_plan launch
+    ):
+        segments, total_q, total_k = len(q_lens), sum(q_lens), sum(k_lens)
+        key_blocks = cake_jit.key_blocks(total_k, max(k_lens))
+        counts = cake_jit.exact_tiles(q_lens, k_lens, key_blocks)
+        want = [0, *itertools.accumulate(counts)]
+        assert want[-1] >= 2**31, want[-1]
+        cq = torch.tensor(_cu(q_lens), dtype=torch.int32, device=device)
+        ck = torch.tensor(_cu(k_lens), dtype=torch.int32, device=device)
+        builders = {"torch": cake_backend._tile_plan(cq, ck, key_blocks, total_q)}
+        if kernel:
+            assert cake_jit.pair_bound(total_q, segments) <= cake_jit.PLAN_MAX_PAIRS
+            dims = {
+                "total_q": total_q,
+                "total_k": total_k,
+                "num_heads_q": 24,
+                "num_heads_kv": 4,
+                "num_segments": segments,
+            }
+            builders["bwd_plan"] = cake_backend._plan_tables(
+                cq, ck, key_blocks, total_q, dims, device.index
+            )
+        for name, tables in builders.items():
+            marks = cake_backend._range_marks(tables[0], segments, total_q, key_blocks)
+            assert marks.dtype == torch.int64, name
+            assert marks.tolist() == want, (q_lens, k_lens, name)
+
+
+def test_host_boundaries_come_together_at_every_size(device) -> None:
+    """One host boundary vector without the other is refused by the workspace estimator at every size and by the
+    backward also when the call has no query or no key (it returns early there); the empty backward still checks the
+    host boundaries against the operands."""
+    for args in ((0, 24, 1), (377, 24, 2)):
+        with pytest.raises(ValueError, match="together"):
+            cake_backend.cake_gqa_det_train_workspace_bytes(
+                *args, cu_seqlens_q_host=[0, 0]
+            )
+    for q_lens, k_lens in (((0,), (8,)), ((8,), (0,))):
+        x = _inputs(q_lens, k_lens, 24, 4, device)
+        out, lse = cake_backend.cake_gqa_det_train_forward(
+            x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE
+        )
+        args = (x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"])
+        with pytest.raises(ValueError, match="together"):
+            cake_backend.cake_gqa_det_train_backward(
+                *args, cu_seqlens_q_host=x["cq"]
+            )
+        with pytest.raises(ValueError, match="boundaries from 0"):
+            cake_backend.cake_gqa_det_train_backward(
+                *args, cu_seqlens_q_host=[0, 1], cu_seqlens_k_host=x["ck"]
+            )
+        dq, dk, dv = cake_backend.cake_gqa_det_train_backward(
+            *args, cu_seqlens_q_host=x["cq"], cu_seqlens_k_host=x["ck"]
+        )
+        torch.cuda.synchronize()
+        assert not dq.any() and not dk.any() and not dv.any()
+
+
+def test_nine_argument_apply_calls_keep_working(device) -> None:
+    """``CakeGQADetFunction.apply`` without the host boundaries (its nine arguments before they were added) gives
+    the bits of the call with ``None`` for them."""
+    x = _inputs((257, 129), (513, 129), 24, 4, device)
+    grads = []
+    for extra in ((), (None,)):
+        leaves = [x[n].clone().requires_grad_() for n in ("q", "k", "v")]
+        out, _ = cake_backend.CakeGQADetFunction.apply(
+            *leaves, x["cu_q"], x["cu_k"], SCALE, None, None, None, *extra
+        )
+        out.backward(x["dout"])
+        grads.append([out.detach()] + [t.grad for t in leaves])
+    torch.cuda.synchronize()
+    for got, want in zip(grads[0], grads[1], strict=True):
+        assert torch.equal(got, want)
+
+
 @pytest.mark.parametrize("host", (False, True), ids=("device_bounds", "host_bounds"))
 @pytest.mark.parametrize("budget", (None, 1), ids=("default", "minimum"))
 @pytest.mark.parametrize("form", DKV_FORMS)
