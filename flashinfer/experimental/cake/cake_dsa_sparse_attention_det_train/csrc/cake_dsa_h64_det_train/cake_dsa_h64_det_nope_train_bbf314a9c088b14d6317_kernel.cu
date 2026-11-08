@@ -124,9 +124,19 @@ kernel_cake_dsa_h64_det_nope_train_bbf314a9c088b14d6317(int* __restrict__ indice
         }
         long long row_base = (long long)indices_offset + (long long)token * (long long)idx_stride;
         int aligned4 = (int)(((idx_stride | indices_offset) & 3) == 0);
+        int blocks = (active + 127) / 128;
+        int rot = 0;
+        if (blocks > 0) {
+            rot = token % blocks;
+        }
         #pragma unroll 1
         for (int blk = 0; blk < (active + 127) / 128; blk++) {
             int pos = blk * 128 + lane_1 * 4;
+            int rblk = blk + rot;
+            if (rblk >= blocks) {
+                rblk = rblk - blocks;
+            }
+            pos = rblk * 128 + lane_1 * 4;
             int keys[4];
             if (aligned4 != 0 && pos + 4 <= active) {
                 {
