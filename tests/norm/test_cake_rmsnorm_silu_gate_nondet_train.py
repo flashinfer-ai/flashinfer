@@ -2416,9 +2416,7 @@ PIPE_FORWARD_GRIDS = [
 
 
 @pytest.mark.parametrize(("rows", "sm_count", "ctas"), PIPE_FORWARD_GRIDS)
-def test_pipelined_forward_grid_is_a_block_a_cta_then_whole_waves(
-    rows, sm_count, ctas
-):
+def test_pipelined_forward_grid_is_a_block_a_cta_then_whole_waves(rows, sm_count, ctas):
     # every pipelined forward module (the deterministic package's grid rule)
     records = []
     for arch in ("sm_100a", "sm_103a", "sm_107a"):

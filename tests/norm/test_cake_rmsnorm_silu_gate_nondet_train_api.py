@@ -2037,9 +2037,7 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     if not varies:
         assert_same_bits("accumulated dw", acc[1], acc[0])
     for acc_dw in acc if varies else acc[:1]:
-        assert_error_within_det(
-            "accumulated dw", acc_dw, acc_d, 0.25 + dw64, mag=mag
-        )
+        assert_error_within_det("accumulated dw", acc_dw, acc_d, 0.25 + dw64, mag=mag)
         suite.assert_dw_within(acc_dw, 0.25 + dw64, mag, what="accumulated dw vs FP64")
     assert launched == [name] * (suite.REPEATS + 2), launched
 
@@ -2659,9 +2657,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
             assert heads and all(v == D for v in heads), (layout, strides)
             assert _packed(strides) == packed, (layout, strides)
     for what, got, det, ref in zip(names, want, dets, refs, strict=True):
-        assert_error_within_det(
-            what, got, det, ref, mag=mag if role != "fwd" else None
-        )
+        assert_error_within_det(what, got, det, ref, mag=mag if role != "fwd" else None)
     if role != "fwd":
         suite.assert_dw_within(
             want[2], dets[2], mag, what="dw vs the deterministic package"
