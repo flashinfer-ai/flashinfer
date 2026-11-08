@@ -127,20 +127,14 @@ def test_fixed_tile_mixed_batch_and_prefix_tail(tile, cache):
     _assert_bit_equal(run(prefix=256), (out[256:], lse[256:]))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="flashinfer-ai/flashinfer#6907: the FMA-contracted online-softmax "
-    "rescale changes the last bits of a prefix tail whose packed start is not "
-    "a multiple of the tile",
-)
 @pytest.mark.parametrize("tile", [16, 64, 128])
 @pytest.mark.parametrize("cache", ["paged", "ragged"])
 def test_fixed_tile_misaligned_prefix_tail(tile, cache):
     """Prefix 250 starts the tail at packed row 500, off every tile boundary.
 
-    A fixed tile alone does not make this tail bit-exact: rows land in tiles that
-    run a different number of rescale steps. Remove the xfail once the rescale
-    fix lands (flashinfer-ai/flashinfer#6908 or #7191).
+    The FA2 online-softmax rescale preserves an unchanged running maximum
+    exactly, so both output and LSE must match the full request even when the
+    tail starts off a tile boundary.
     """
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("bf16 regression requires SM80 or newer")

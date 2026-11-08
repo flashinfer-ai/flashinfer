@@ -3853,10 +3853,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
             A query tail after a prefix (chunked prefill, a prefix-cache hit) keeps the
-            full request's bits only when the prefix length times
-            ``num_qo_heads // num_kv_heads`` is a multiple of the tile; otherwise the
-            last bits of the output and LSE can differ
-            (flashinfer-ai/flashinfer#6907).
+            full request's output and LSE bits wherever its tile boundaries fall; this
+            holds for the default fp32 score accumulation, not
+            ``use_fp16_qk_reduction=True``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -6159,10 +6158,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
             A query tail after a prefix (chunked prefill, a prefix-cache hit) keeps the
-            full request's bits only when the prefix length times
-            ``num_qo_heads // num_kv_heads`` is a multiple of the tile; otherwise the
-            last bits of the output and LSE can differ
-            (flashinfer-ai/flashinfer#6907).
+            full request's output and LSE bits wherever its tile boundaries fall; this
+            holds for the default fp32 score accumulation, not
+            ``use_fp16_qk_reduction=True``.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
