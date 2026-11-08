@@ -65,6 +65,7 @@ Every shipped training module after the renames. Each module has a backend packa
 |  | `flashinfer.cake_dsa_indexer_nondet_train` | nondet | single rank | #9113 |
 | DSA sparse attention | `flashinfer.cake_dsa_sparse_attention_nondet_train` | nondet | single rank | #8942 |
 | GQA HD256 | `flashinfer.cake_gqa_nondet_train` | nondet | single rank | #8939 |
+|  | `flashinfer.cake_gqa_det_train` | det | single rank | #9121 |
 
 ## Calls that took `deterministic=`
 
@@ -185,7 +186,7 @@ For vendoring builds that copy a backend directory.
 | `flashinfer.cake_rmsnorm_silu_gate_train.CakeRMSNormSiLUGateFunction.apply(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.CakeRMSNormSiLUGateNondetFunction` | #8922 |
 | `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_{forward, backward, backward_workspace, backward_workspace_bytes}` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8922 |
 | `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_{forward, backward, backward_workspace, backward_workspace_bytes}(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_{forward, backward, backward_workspace, backward_workspace_bytes}` | #8922 |
-| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_reset_workspace` (default) | 0.7.4rc1 | removed, no replacement (the det workspace needs no reset) | #8922 |
+| `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_reset_workspace` (default) | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_reset_workspace` | #8922 |
 | `flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.cake_rmsnorm_silu_gate_nondet_train_reset_workspace` | #8922 |
 | `flashinfer.cake_rmsnorm_silu_gate_train.is_cake_rmsnorm_silu_gate_train_supported` (default) | 0.7.3, 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_det_train.is_cake_rmsnorm_silu_gate_det_train_supported` | #8922 |
 | `flashinfer.cake_rmsnorm_silu_gate_train.is_cake_rmsnorm_silu_gate_train_supported(..., deterministic=False)` | 0.7.4rc1 | `flashinfer.cake_rmsnorm_silu_gate_nondet_train.is_cake_rmsnorm_silu_gate_nondet_train_supported` | #8922 |
@@ -557,4 +558,3 @@ On main, #8924 already removed the module `flashinfer.grouped_mm.cake`, the name
 ## Reserved names
 
 - `flashinfer.cake_dsa_sparse_attention_det_train`: DSA sparse attention `det`, not implemented.
-- `flashinfer.cake_gqa_det_train` (`cake_gqa_det`, `CakeGQADetFunction`): GQA HD256 `det`, not implemented.

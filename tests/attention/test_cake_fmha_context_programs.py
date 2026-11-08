@@ -827,12 +827,14 @@ def _bf16_flag_form_box(target, causal, pack, batch, heads, q_len, kv_len):
     boxes = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOXES.get(target, {})
     return any(
         (box_batch is None or batch <= box_batch)
+        and (box_min_q is None or q_len >= box_min_q)
+        and (box_q is None or q_len <= box_q)
         and (box_keys is None or kv_len <= box_keys)
         and (box_area is None or q_len * kv_len <= box_area)
         and (box_work is None or batch * heads * q_len * kv_len <= box_work)
-        for box_batch, box_keys, box_area, box_work in boxes.get(causal, {}).get(
-            pack, ()
-        )
+        for box_batch, box_min_q, box_q, box_keys, box_area, box_work in boxes.get(
+            causal, {}
+        ).get(pack, ())
     )
 
 
@@ -938,15 +940,21 @@ def test_cake_fmha_context_bf16_flag_forms_take_the_runtime_program_of_their_for
 _BF16_FLAG_BOUND_ROWS = [
     (True, 2, 6144, 6144, 32, 4, True, True),
     (True, 16, 512, 5120, 64, 4, True, True),
-    (True, 16, 512, 6144, 64, 4, False, True),
+    (True, 16, 512, 6144, 64, 4, True, True),
+    (True, 64, 256, 6144, 64, 4, False, True),
+    (True, 32, 1024, 6144, 64, 4, False, True),
     (True, 8, 2048, 5120, 32, 8, True, True),
-    (True, 8, 2048, 6144, 32, 8, False, True),
+    (True, 8, 2048, 6144, 32, 8, True, True),
     (True, 1, 8192, 8192, 32, 4, True, True),
     (True, 1, 8192, 8192, 64, 8, True, True),
     (True, 1, 2048, 8192, 32, 4, True, True),
     (True, 2, 8192, 8192, 32, 4, False, True),
     (True, 1, 8192, 8192, 128, 16, False, True),
-    (True, 1, 8192, 8192, 64, 4, False, True),
+    (True, 1, 8192, 8192, 64, 4, True, True),
+    (True, 16, 512, 8192, 32, 4, True, True),
+    (True, 32, 512, 8192, 32, 4, False, True),
+    (True, 4, 1024, 8192, 32, 4, False, True),
+    (True, 16, 128, 8192, 40, 8, True, True),
     (True, 16, 512, 8192, 64, 4, False, True),
     (True, 1, 12288, 12288, 32, 4, False, False),
     (True, 1, 16384, 16384, 32, 4, False, False),
@@ -1050,10 +1058,11 @@ def test_cake_fmha_context_bf16_flag_form_boxes_lie_past_the_bounds() -> None:
                         assert (pack, None) in tables[target], (target, form, pack)
                 bound = cake_api._CONTEXT_BF16_RUNTIME_FLAG_BOUNDS[target][causal][pack]
                 for box in boxes:
-                    assert len(box) == 4, box
+                    assert len(box) == 6, box
+                    # (keys, query x keys, work) of the box against the bound's
                     assert any(
                         limit is not None and (size is None or size > limit)
-                        for size, limit in zip(box[1:], bound, strict=True)
+                        for size, limit in zip(box[3:], bound, strict=True)
                     ), (target, causal, pack, box)
 
 

@@ -923,8 +923,9 @@ MODULES: dict[str, dict[str, Any]] = {
     # Route ``fwd``: this package's copy of the det forward program
     # ``cake_causal_conv1d_det_train_8665d0756b8240ecb4d0`` (built with ``fast=True, sched="dynamic",
     # chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is bitwise the det
-    # program's); selected from C = 256 on sm_107a.  ``work`` holds the int32 token-chunk counters (two per
-    # channel tile), zero before the first launch and left zero by every launch.
+    # program's); selected from C = 256 and S = 65536 on sm_107a, and its channel band's copy from C = 2048 at every
+    # S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero before the first
+    # launch and left zero by every launch.
     "cake_causal_conv1d_train_8665d0756b8240ecb4d0": {
         "arches": [
             "sm_107a",
@@ -985,7 +986,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 256,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -994,9 +998,10 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # Route ``fwd_dt``: this package's copy of the det forward program
     # ``cake_causal_conv1d_det_train_176ebb3e14f7ad9c94dc`` (built with ``dtype_flags=True, fast=True,
-    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y``
-    # is bitwise the det program's); selected from C = 512 on sm_107a.  ``work`` holds the int32 token-chunk
-    # counters (two per channel tile), zero before the first launch and left zero by every launch.
+    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is
+    # bitwise the det program's); selected from C = 512 and S = 65536 on sm_107a, and its channel band's copy from C
+    # = 2048 at every S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero
+    # before the first launch and left zero by every launch.
     "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc": {
         "arches": [
             "sm_107a",
@@ -1059,7 +1064,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "channels": {
                 "sm_107a": 512,
             },
-            "kind": "channels_at_least",
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
         },
         "workspace_rule": {
             "kind": "tile_counters",
@@ -1067,10 +1075,11 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # Route ``fwd_bias``: this package's copy of the det forward program
-    # ``cake_causal_conv1d_det_train_d829c95e1d610bc14b23`` (built with ``bias=True, dtype_flags=True,
-    # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix,
-    # so ``y`` is bitwise the det program's); selected from C = 1024 on sm_107a.  ``work`` holds the int32
-    # token-chunk counters (two per channel tile), zero before the first launch and left zero by every launch.
+    # ``cake_causal_conv1d_det_train_d829c95e1d610bc14b23`` (built with ``bias=True, dtype_flags=True, fast=True,
+    # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is
+    # bitwise the det program's); selected from C = 1024 and S = 65536 on sm_107a, and its channel band's copy from
+    # C = 2048 at every S (round 35).  ``work`` holds the int32 token-chunk counters (two per channel tile), zero
+    # before the first launch and left zero by every launch.
     "cake_causal_conv1d_train_d829c95e1d610bc14b23": {
         "arches": [
             "sm_107a",
@@ -1134,6 +1143,233 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "channels": {
                 "sm_107a": 1024,
+            },
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 65536,
+            },
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with fast, sched dynamic, chunk_stages 2, pair_math, c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_d00a2892aa363564c673": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_d00a2892aa363564c673",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_d00a2892aa363564c673",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_d00a2892aa363564c673",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math, c_band
+    # 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_6211cda590057b12f1a2": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_6211cda590057b12f1a2",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "tile_counters",
+            "words_per_tile": 2,
+        },
+    },
+    # This package's copy of the det forward channel-band program (round 35): the forward
+    # with bias, dtype_flags, fast, sched dynamic, chunk_stages 2, pair_math,
+    # c_band 2048
+    # (4 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_train_77af6383ff00b1cd047c": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "b"],
+            ["buffer", "work"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["parameter", "flags"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 4,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33920,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_77af6383ff00b1cd047c",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "b": "b",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "flags": "flags",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 2048,
             },
             "kind": "channels_at_least",
         },
@@ -2620,14 +2856,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "fwd": [
             "cake_causal_conv1d_train_f5497330bfd286211643",
             "cake_causal_conv1d_train_8665d0756b8240ecb4d0",
+            "cake_causal_conv1d_train_d00a2892aa363564c673",
         ],
         "fwd_bias": [
             "cake_causal_conv1d_train_08880ca12e4064bc8cdb",
             "cake_causal_conv1d_train_d829c95e1d610bc14b23",
+            "cake_causal_conv1d_train_77af6383ff00b1cd047c",
         ],
         "fwd_dt": [
             "cake_causal_conv1d_train_9c1e7ee9f37e3102660e",
             "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc",
+            "cake_causal_conv1d_train_6211cda590057b12f1a2",
         ],
     },
 }
