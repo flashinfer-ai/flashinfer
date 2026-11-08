@@ -1922,7 +1922,9 @@ def routes_every_call(arch: str) -> bool:
     own module (:func:`module_for_rows` falls back to it past the bands)."""
 
     routes = ROUTES.get(arch, {})
-    tables = [("fwd", FORWARD_BANDS.get(arch, ()))]
+    tables: list[tuple[str, tuple[tuple[object, str], ...]]] = [
+        ("fwd", FORWARD_BANDS.get(arch, ()))
+    ]
     tables.append(("fwd", STRIDED_FORWARD_BANDS.get(arch, ())))
     for role in ROLES:
         if role != "fwd":
@@ -1970,14 +1972,14 @@ def module_for_rows(
             if last is None or int(rows) <= int(last) * int(sm_count):
                 return route_module(arch, band)
         return route_module(arch, role)
-    for last, band in BACKWARD_BANDS.get(arch, {}).get(role, ()):
+    for bound, band in BACKWARD_BANDS.get(arch, {}).get(role, ()):
         name = route_module(arch, band)
-        if last is None:
+        if bound is None:
             return name
-        if isinstance(last, tuple):
-            if int(rows) <= int(last[1]):
+        if isinstance(bound, tuple):
+            if int(rows) <= int(bound[1]):
                 return name
-        elif int(rows) <= last * int(sm_count):
+        elif int(rows) <= bound * int(sm_count):
             return name
     return route_module(arch, role)
 
