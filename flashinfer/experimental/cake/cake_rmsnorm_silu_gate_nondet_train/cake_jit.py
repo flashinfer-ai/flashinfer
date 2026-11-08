@@ -1717,7 +1717,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 20736,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
