@@ -6176,6 +6176,7 @@ LOCAL_RECORD_CASES = [
     (64, "sm_103a", 152),
     (64, "sm_107a", 216),
     (4, "sm_100a", 148),
+    (12, "sm_103a", 152),
 ]
 
 
@@ -6190,7 +6191,8 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     every logical name of every
     record it launches -- the plan's records on the forward path without a saved set and on the replay path, the
     direct WY record where the plan fuses the WY representation into a recurrence the KCP does not run, and the
-    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
+    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids (``kcp_dav`` only where the plan dispatches its dav stage,
+    H 12 here: :func:`cake_kcp_plan.kcp_dav_needed`); the two backward modes launch the same records on the same
     grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
     bytes count it) while every other program reads the context's tables."""
     part = _small_partition(2)
@@ -6330,7 +6332,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
         expect("bwd_prep", b),
         expect("fwd_intra", b),
         expect("wy", b),
-        "kcp_dav",
+        *(["kcp_dav"] if kp.kcp_dav_needed(plan) else []),
         expect("dqkg", b),
         expect("glm_intra", b),
         # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a: glm_intra;
@@ -6378,7 +6380,9 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
         fwd[1][3]["chunk_bos"] is ctx.tables["chunk_bos"]
     )  # the WY program reads the context's tables
     assert fwd[2][2] == (plan.NC_pad * H, 1, 1)
-    assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
+    assert kp.kcp_dav_needed(plan) == (H == 12)
+    if kp.kcp_dav_needed(plan):
+        assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
     for kind, record, grid, _values in fwd + bwd:
         if kind == "backend":
             stage = cake_jit.MODULES[record]["stage"]
@@ -6778,6 +6782,90 @@ def test_gpu_fused_forward_output_is_bitwise_and_one_launch_fewer(
     for b0, b1 in ((s0, s1), (r0, r1)):
         assert b0["sequence"] == b1["sequence"] and "kcp_fwdh_o" not in b1["sequence"]
         assert b0["n_launches"] == b1["n_launches"]
+
+
+# the kcp_dav knob rows: one rank, H 4 / 16 / 64 (the fused gradient stores every dAqk row: "auto" skips kcp_dav) and
+# H 12 (the plan dispatches its dav stage: both values launch it)
+KCP_DAV_ROWS = [((300, 724, 476), 4), ((300, 724, 476), 12), ((3000,), 16), ((300, 724, 476), 64)]
+KCP_DAV_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in KCP_DAV_ROWS]
+
+
+@pytest.mark.parametrize("lengths,H", KCP_DAV_ROWS, ids=KCP_DAV_IDS)
+def test_gpu_kcp_dav_always_is_bitwise_auto(device, monkeypatch, lengths, H) -> None:
+    """The private test knob ``kcp_dav="always"`` (``kcp_dav`` on every backward of the replay layout) against the
+    shipped ``"auto"`` (only where ``cake_kcp_plan.kcp_dav_needed``, H 9-15), one rank: ``out``, the saved set and
+    every gradient of a saved-mode and a replay-mode backward and of a checkpointed autograd call are bitwise equal
+    (the adjoint walks form ``dv1`` themselves and the fused gradient stores every ``dAqk`` row where "auto" skips
+    it); ``LAST_CALL["bwd"]["kcp_dav"]`` records the launch, the stage is counted either way.  The checkpointed
+    call's backward binds the recompute's kept intra rows (``intra_rows="ckpt"``), and every K2 adjoint walk it
+    launches reads ``aqk_int`` from them (the carrier form) or from the arena rows they were copied into."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    needed = 9 <= H <= 15
+    # the K2 walks' aqk_int and the rows a backward binds (carrier) or copies into its arena (copy)
+    k2: list = []
+    rows_at: list = []
+    real_walk = cake_kcp_jit._walk
+    real_bind = cake_kcp._bind_intra_rows
+    real_copy = cake_kcp._copy_intra_rows
+
+    def walk(name, a, call, device_index):
+        # the K2 adjoint walks (the fused forward walk reads aqk_int too, in the forwards)
+        if name.startswith("kcp_dhu") and "aqk_int" in cake_kcp_jit._WALK_OPERANDS[name]:
+            k2.append((name, call.local_values["aqk_int"].data_ptr()))
+        return real_walk(name, a, call, device_index)
+
+    def bind(call, rows):
+        rows_at.append(("carrier", rows[0].data_ptr()))
+        return real_bind(call, rows)
+
+    def copy(call, rows):
+        real_copy(call, rows)
+        rows_at.append(("copy", call.scratch["views"].aqk_int.data_ptr()))
+
+    monkeypatch.setattr(cake_kcp_jit, "_walk", walk)
+    monkeypatch.setattr(cake_kcp, "_bind_intra_rows", bind)
+    monkeypatch.setattr(cake_kcp, "_copy_intra_rows", copy)
+    res: dict = {}
+    for mode in ("auto", "always"):
+        knobs = {"_kcp_test_knobs": {"kcp_dav": mode}}
+        ws = cake_kcp.CakeKDADetKcpWorkspace()
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
+            *args, ctx, workspace=ws, **knobs
+        )
+        assert cake_kcp.LAST_CALL["fwd"]["kcp_dav"] is None
+        g_saved = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=saved, workspace=ws, **knobs
+        )
+        rec_s = dict(cake_kcp.LAST_CALL["bwd"])
+        g_replay = cake_kcp.cake_kda_det_train_kcp_backward(
+            *args, ctx, ops["dout"], saved=None, workspace=ws, **knobs
+        )
+        rec_r = dict(cake_kcp.LAST_CALL["bwd"])
+        k2.clear()
+        rows_at.clear()
+        ck, (_rec_o, _rec_f, rec_b) = _ckpt_pass(ctx, ops, **knobs)
+        torch.cuda.synchronize(device)
+        want = "launched" if (needed or mode == "always") else "skipped"
+        for rec in (rec_s, rec_r, rec_b):
+            assert rec["kcp_dav"] == want, (mode, rec["kcp_dav"])
+            assert rec["sequence"].count("dav") == 1, mode
+        # the checkpointed backward bound the recompute's rows; every K2 adjoint walk reads aqk_int from them
+        assert rec_b["intra_rows"] == "bound", rec_b["intra_rows"]
+        form = rec_b["intra_rows_form"]
+        assert form in ("carrier", "copy") and rows_at and rows_at[-1][0] == form
+        assert k2, mode
+        assert all(p == rows_at[-1][1] for _n, p in k2), (form, k2, rows_at)
+        res[mode] = (
+            (out, *saved.tensors(), *g_saved, *g_replay, *[ck[n] for n in sorted(ck)]),
+            (rec_s, rec_r, rec_b),
+        )
+    for a, b in zip(res["auto"][0], res["always"][0], strict=True):
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert torch.equal(_bits(a), _bits(b))
+    for ra, rb in zip(res["auto"][1], res["always"][1], strict=True):
+        assert ra["sequence"] == rb["sequence"] and ra["n_launches"] == rb["n_launches"]
 
 
 def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:

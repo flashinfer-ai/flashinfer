@@ -219,6 +219,20 @@ launches, bitwise; ``cake_kda_det_train_kcp_saved_bytes`` counts the plane.
 the replay mode (checkpoint recompute) and ``P = 1`` ranks are the same under
 both values.
 
+Output backward: the adjoint walks' records are their forms' ``fuse_dv1``
+builds, which form ``dv1 = Aqk^T dO`` in FP32 inside the step from the
+internal ``Aqk`` rows (``aqk_int``), so ``kcp_dav``'s ``dv1`` has no reader.
+The backward launches ``kcp_dav`` only where its ``dAqk`` has one: where the
+existing backend's plan dispatches its ``dav`` stage on the replay path
+(:func:`cake_kcp_plan.kcp_dav_needed`; the serial route below 16 heads,
+H 9-15), whose fused gradient stores no ``dAqk``.  Everywhere else that fused
+gradient stores every ``dAqk`` row GLM intra reads, and the ``dav`` stage
+launches nothing (counted in the call's launches and ``sequence`` like the
+gate epilogue a plan fuses away).  ``LAST_CALL["bwd"]["kcp_dav"]`` records
+``"launched"`` or ``"skipped"``; the private test knob ``kcp_dav``
+(``"auto"`` shipped, ``"always"``: launch it on every backward of the replay
+layout, the coverage record) changes no output or gradient bit.
+
 The metadata (partition, context, head ownership, chain tables, split sizes,
 segment plan, compact-buffer addressing, byte queries) is
 :mod:`.cake_kcp_plan`; this module reads tensor contents nowhere, dispatches
@@ -518,6 +532,12 @@ WALK_FORM_DEFAULT = "auto"
 # the form never changes a bit.
 WALK_STREAMS = ("auto", "one", "two")
 WALK_STREAMS_DEFAULT = "auto"
+# The backward's kcp_dav launch: "auto" (shipped) = only where cake_kcp_plan.kcp_dav_needed (the existing backend's plan
+# dispatches its dav stage: its fused gradient stores no dAqk); "always" = on every backward of the replay layout,
+# _kcp_test_knobs only (the coverage record: kcp_dav's outputs have no reader where "auto" skips it, so every output
+# and gradient bit is the same).
+KCP_DAV_MODES = ("auto", "always")
+KCP_DAV_DEFAULT = "auto"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
@@ -533,6 +553,7 @@ P2_KNOBS = {  # knob -> admitted values
     "fwd_o_fuse": FWD_O_FUSES,
     "intra_rows": INTRA_ROWS,
     "rows_probe": ROWS_PROBES,
+    "kcp_dav": KCP_DAV_MODES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
@@ -1197,8 +1218,14 @@ class KernelBackend(Backend):
             if name == "dav":
                 # kcp_dav only where its dAqk has a reader: the plan dispatches its dav stage, so its fused gradient
                 # stores no dAqk (cake_kcp_plan.kcp_dav_needed); the adjoint walks form dv1 themselves.  Elsewhere
-                # nothing launches (counted like a stage the plan fuses away)
-                if not cake_kcp_plan.kcp_dav_needed(p):
+                # nothing launches (counted like a stage the plan fuses away; the knob kcp_dav="always" launches it
+                # anyway on the replay layout: its outputs have no reader there; the lean layout serves no plan that
+                # dispatches dav)
+                launch = cake_kcp_plan.kcp_dav_needed(p) or (
+                    call.opts.kcp_dav == "always" and not _lean_passes(local)
+                )
+                call.scratch["kcp_dav"] = "launched" if launch else "skipped"
+                if not launch:
                     return
                 if hasattr(views, "dAqk_sink"):
                     # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
@@ -4513,7 +4540,9 @@ class CakeKDADetKcpOptions:
     trimmed host path of the eager call -- the same launches in the same order, bitwise; ``0`` = the previous host path;
     ``_kcp_test_knobs`` only), ``saved_carry`` (``1`` shipped: the forward of a ``P > 1`` rank keeps its carry plane in
     the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
-    remaining launches, bitwise; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
+    remaining launches, bitwise; ``_kcp_test_knobs`` only), ``kcp_dav`` (``"auto"`` shipped: the backward launches
+    ``kcp_dav`` only where :func:`cake_kcp_plan.kcp_dav_needed`; ``"always"`` = on every backward of the replay
+    layout, the same bits; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
     ``_kcp_test_knobs``)."""
 
     save_transfer: bool | None = (
@@ -4544,6 +4573,7 @@ class CakeKDADetKcpOptions:
     fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
     intra_rows: str = INTRA_ROWS_DEFAULT  # shipped "ckpt" = a checkpoint recompute keeps its intra rows for its backward; "always" / "never" via _kcp_test_knobs only
     rows_probe: int = 0  # 1 = a backward that binds kept intra rows also launches its intra program and records the bitwise comparison (host sync); _kcp_test_knobs only
+    kcp_dav: str = KCP_DAV_DEFAULT  # the backward's kcp_dav: "auto" (shipped) only where cake_kcp_plan.kcp_dav_needed; "always" on every backward of the replay layout (the same bits), via _kcp_test_knobs only
 
     def check(self) -> CakeKDADetKcpOptions:
         if self.exchange not in EXCHANGES:
@@ -5114,6 +5144,9 @@ def _record(kind: str, call: CakeKDADetKcpCall) -> None:
         "rows_probe": call.scratch.get(
             "rows_probe"
         ),  # the rows_probe test knob's bitwise comparison (backward), None otherwise
+        # a backward's kcp_dav: "launched" / "skipped" (cake_kcp_plan.kcp_dav_needed or the knob kcp_dav="always");
+        # None on a forward or a backward without a local stage
+        "kcp_dav": call.scratch.get("kcp_dav"),
         "graph": call.opts.graph,
         "graph_event": "eager",
         "graph_key": None,
