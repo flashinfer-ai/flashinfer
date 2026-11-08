@@ -141,10 +141,13 @@ def fused_bf16_stage(
     if prepared is not None and prepared.signature == signature:
         import cuda.bindings.driver as cuda
 
-        prepared.compiled(
-            *prepared.arguments,
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
-        )
+        with torch.cuda.device(hidden_states.device):
+            prepared.compiled(
+                *prepared.arguments,
+                cuda.CUstream(
+                    torch.cuda.current_stream(hidden_states.device).cuda_stream
+                ),
+            )
         return True
     if not all(t.ndim == 2 for t in tensors):
         return False
@@ -199,30 +202,33 @@ def fused_bf16_stage(
         topk_ids.shape[1],
         tuple((item[4], item[3], item[2]) for item in signature),
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = _STAGERS.get(key)
-    import cutlass.torch as cutlass_torch
-
-    arguments = tuple(
-        cutlass_torch.from_dlpack(
-            t, assumed_align=16 if i in (0, 3) else 1
-        ).mark_layout_dynamic(leading_dim=1)
-        for i, t in enumerate(tensors)
-    )
-    if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "fused BF16 staging compilation cannot run during CUDA graph "
-                "capture; warm up staging before capture"
-            )
-        compiled = cute.compile(
-            _kernel_class()(hidden_states.shape[1], topk_ids.shape[1]),
-            *arguments,
-            stream,
+    with torch.cuda.device(hidden_states.device):
+        stream = cuda.CUstream(
+            torch.cuda.current_stream(hidden_states.device).cuda_stream
         )
-        _STAGERS[key] = compiled
-    # Publish a single immutable object and retain this call's local arguments.
-    # Other host threads cannot replace its binding before the launch.
-    _PREPARED.stager = _PreparedStager(signature, compiled, arguments)
-    compiled(*arguments, stream)
+        compiled = _STAGERS.get(key)
+        import cutlass.torch as cutlass_torch
+
+        arguments = tuple(
+            cutlass_torch.from_dlpack(
+                t, assumed_align=16 if i in (0, 3) else 1
+            ).mark_layout_dynamic(leading_dim=1)
+            for i, t in enumerate(tensors)
+        )
+        if compiled is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "fused BF16 staging compilation cannot run during CUDA graph "
+                    "capture; warm up staging before capture"
+                )
+            compiled = cute.compile(
+                _kernel_class()(hidden_states.shape[1], topk_ids.shape[1]),
+                *arguments,
+                stream,
+            )
+            _STAGERS[key] = compiled
+        # Publish a single immutable object and retain this call's local arguments.
+        # Other host threads cannot replace its binding before the launch.
+        _PREPARED.stager = _PreparedStager(signature, compiled, arguments)
+        compiled(*arguments, stream)
     return True

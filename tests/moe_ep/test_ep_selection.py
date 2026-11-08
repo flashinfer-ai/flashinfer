@@ -15,6 +15,7 @@ from flashinfer.moe_ep.core.selection import (
     plain,
     record_key,
 )
+from flashinfer.moe_ep.core.tuning_measurement import CaptureUnsupported
 from flashinfer.moe_ep.core.tuning_state import AutoTuningState, prepared_for_serving
 from flashinfer.moe_ep.modes.auto_layer import MoEEpAutoWorkspace
 from flashinfer.moe_ep.modes.selection import SplitProtocol
@@ -129,6 +130,40 @@ def test_full_path_tactics_and_partial_cache_reuse(monkeypatch):
         c.measured.clear()
         tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
         assert len(c.measured) == 5
+
+
+@pytest.mark.parametrize("failure", [CaptureUnsupported, RuntimeError])
+def test_cached_split_tactic_capture_failure_retries_other_tactics(
+    monkeypatch, failure
+):
+    tuner, c, plan = AutoTuner.get(), LocalCollective(), SplitTrial()
+    protocol = SplitProtocol(
+        plan, SimpleNamespace(hidden_states=torch.empty(1)), c, {"capacity": 32}, {}
+    )
+    with autotune_v2(persistent_cache=False):
+        tuner.clear_cache()
+        tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+        c.measured.clear()
+        attempted = []
+        measure = c.measure
+
+        def measure_with_failure(*args, **kwargs):
+            attempted.append(plan.selected)
+            if plan.selected == (0, 11):
+                raise failure("cached tactic failed")
+            return measure(*args, **kwargs)
+
+        monkeypatch.setattr(c, "measure", measure_with_failure)
+        if failure is RuntimeError:
+            with pytest.raises(RuntimeError, match="cached tactic failed"):
+                tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+            assert attempted == [(0, 11)]
+        else:
+            result = tuner.choose_with_protocol(BACKEND_NAMESPACE, protocol)
+            assert attempted == [(0, 11), (0, 10), (2, 20)]
+            assert result["selection"] == [2, 20]
+            records = tuner.get_protocol_records(BACKEND_NAMESPACE).values()
+            assert sorted(r["selection"] for r in records) == [[0, 10], [2, 20]]
 
 
 def test_disabled_and_skipped_do_not_measure():
@@ -392,11 +427,25 @@ def test_split_intersects_tactics_and_backend_eligibility_across_ranks(
     assert c.measured == measured
 
 
-def test_outer_selects_full_plan_and_replays_without_measurement():
+@pytest.mark.parametrize("split_capture_failure", [False, True])
+def test_outer_selects_full_plan_and_replays_without_measurement(split_capture_failure):
     from flashinfer.moe_ep import FleetParams, MoEEpTensors
     from flashinfer.moe_ep.core.selection import NAMESPACE
     from flashinfer.moe_ep.modes.auto_layer import _OuterProtocol
     from flashinfer.moe_ep.modes.mega_layer import MoEEpMegaLayer
+
+    from flashinfer.moe_ep.modes.selection import SplitPlan
+
+    split_trials = []
+
+    class UncapturableSplit(SplitTrial, SplitPlan):
+        def __init__(self):
+            super().__init__()
+            self.destroy = Mock()
+            split_trials.append(self)
+
+        def forward(self, tensors):
+            raise CaptureUnsupported("split capture failed")
 
     class Plan:
         def __init__(self, index):
@@ -438,20 +487,26 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
     def prepare(index, *, selected=None, fallback=False, force_tune=False):
         calls.append((index, selected))
         force_flags.append(force_tune)
-        return Plan(index)
+        return (
+            UncapturableSplit() if split_capture_failure and index == 1 else Plan(index)
+        )
 
     protocol._new_plan = prepare
+    chosen = 0 if split_capture_failure else 1
+    measured = [0] if split_capture_failure else [0, 1]
     with autotune_v2(persistent_cache=False):
         tuner.clear_cache()
         result = tuner.choose_with_protocol(NAMESPACE, protocol)
-        assert result["candidate"] == 1
-        assert c.measured == [0, 1]
+        assert result["candidate"] == chosen
+        assert c.measured == measured
         c.measured.clear()
         calls.clear()
         result = tuner.choose_with_protocol(NAMESPACE, protocol)
-        assert result["candidate"] == 1
+        assert result["candidate"] == chosen
         assert not c.measured
-        assert calls == [(1, {"kernel_variant": "inference", "knobs": {"tile": 1}})]
+        assert calls == [
+            (chosen, {"kernel_variant": "inference", "knobs": {"tile": chosen}})
+        ]
         key, record = next(iter(tuner.get_protocol_records(NAMESPACE).items()))
         # The workspace bound stays fixed, but each live workload needs its
         # own search. Neither workload may suppress the other's tuning.
@@ -459,7 +514,7 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
             tensors.hidden_states[:1], tensors.topk_ids[:1], tensors.topk_weights[:1]
         )
         tuner.choose_with_protocol(NAMESPACE, protocol)
-        assert c.measured == [0, 1]
+        assert c.measured == measured
         assert len(tuner.get_protocol_records(NAMESPACE)) == 2
         c.measured.clear()
         protocol.tensors = tensors
@@ -467,12 +522,23 @@ def test_outer_selects_full_plan_and_replays_without_measurement():
         record["selected"] = {"wrong": True}
         tuner.publish_protocol_record(NAMESPACE, key, record, persist=False)
         tuner.choose_with_protocol(NAMESPACE, protocol)
-        assert c.measured == [0, 1]
+        assert c.measured == measured
         c.measured.clear()
         force_flags.clear()
         tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=True)
-        assert c.measured == [0, 1]
+        assert c.measured == measured
         assert force_flags == [True, True, False]
+        if split_capture_failure:
+            assert "No split tactic completed" in layer.rejected_candidates[1]
+            assert not layer._failed_plans
+            for trial in split_trials:
+                trial.destroy.assert_called_once()
+            saved = layer._prototypes.pop(0)
+            with pytest.raises(
+                RuntimeError, match="No EP candidate completed measurement"
+            ):
+                tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=True)
+            layer._prototypes[0] = saved
         c.measure = Mock(side_effect=RuntimeError("launch failure"))
         with pytest.raises(RuntimeError, match="launch failure"):
             tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=True)

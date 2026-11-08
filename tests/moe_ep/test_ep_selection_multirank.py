@@ -119,6 +119,7 @@ def assert_output(output, t, weights):
         (0, None),
         (1, None),
         (None, "graph"),
+        (None, "capture_failure"),
         (None, "cupti"),
         (1, "nccl"),
         (None, "transports"),
@@ -132,6 +133,10 @@ def test_search_replay_and_captured_lifetime(
     policy,
 ):
     bootstrap = rubin_bootstrap
+    if policy == "nccl" and not all(
+        Collective(bootstrap).gather(moe_ep.have_nccl_ep())
+    ):
+        pytest.skip("requires NCCL-EP on every rank")
     monkeypatch.setattr(problem, "INTERMEDIATE", 384)
     if policy in ("nccl", "transports"):
         monkeypatch.setattr(problem, "HIDDEN", 4096)
@@ -150,11 +155,24 @@ def test_search_replay_and_captured_lifetime(
             else (*config.candidates, split)
         )
         config = dataclasses.replace(config, candidates=candidates)
+    if policy == "capture_failure":
+        from flashinfer.moe_ep.modes.selection import SplitPlan
+
+        forward = SplitPlan.forward
+
+        def reject_capture(plan, tensors):
+            output = forward(plan, tensors)
+            # Reject on one rank after recording the complete collective call.
+            if torch.cuda.is_current_stream_capturing() and bootstrap.rank == 0:
+                raise RuntimeError("split capture rejected")
+            return output
+
+        monkeypatch.setattr(SplitPlan, "forward", reject_capture)
     options = dict(
         cache_root=str(tmp_path / "managed"),
         measurement_policy=(
             MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True)
-            if policy == "graph"
+            if policy in ("graph", "capture_failure")
             else MeasurementPolicy(execution_mode="cuda_graph", _timer="cupti")
             if policy == "cupti"
             else None
@@ -186,6 +204,9 @@ def test_search_replay_and_captured_lifetime(
             layer.warmup(t)
             assert_output(layer(t), t, global_weights)
         chosen = layer.get_selected_plan()
+        if policy == "capture_failure":
+            assert chosen["candidate"] == 0
+            assert "No split tactic completed" in layer.rejected_candidates[1]
         if policy == "cupti":
             assert not tuner._cupti_disabled
         if forced is not None:
@@ -222,7 +243,7 @@ def test_search_replay_and_captured_lifetime(
         assert not measured
         if bootstrap.rank == 0:
             assert tuner.get_protocol_records(NAMESPACE)
-            if forced != 0:
+            if forced != 0 and policy != "capture_failure":
                 assert tuner.get_protocol_records(BACKEND_NAMESPACE)
         # A capacity change uses independent storage and a different record.
         with autotune_v2(mode="replay", **options):

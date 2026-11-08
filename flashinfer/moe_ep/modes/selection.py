@@ -432,7 +432,12 @@ class SplitProtocol:
                 if cached is not None:
                     winners.append(cached)
                 continue
-            trials = [tuples(cached["selection"])[1]] if cached else tactics
+            cached_tactic = tuples(cached["selection"])[1] if cached else None
+            trials = (
+                [cached_tactic] + [t for t in tactics if t != cached_tactic]
+                if cached
+                else tactics
+            )
             passing = []
             for tactic in trials:
                 selection = (choice["runner"], tactic)
@@ -454,6 +459,10 @@ class SplitProtocol:
                         "contract": plain(contract),
                     }
                 )
+                # A usable cached winner avoids a new sweep. If capture fails,
+                # the remaining agreed tactics still need to be tried.
+                if cached and tactic == cached_tactic:
+                    break
             if not passing:
                 continue
             winner = min(passing, key=lambda v: v["p50_us"])
@@ -464,7 +473,7 @@ class SplitProtocol:
             c.prepare(lambda: plan.prepare(selection))
             return TuningResult({"selection": plain(selection)})
         if not winners:
-            raise RuntimeError("No split tactic completed full-EP measurement")
+            raise CaptureUnsupported("No split tactic completed full-EP measurement")
         winner = min(winners, key=lambda v: v["p50_us"])
         c.prepare(lambda: plan.prepare(winner["selection"]))
         return TuningResult(

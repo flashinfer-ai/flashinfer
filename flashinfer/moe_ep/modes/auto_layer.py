@@ -771,7 +771,7 @@ class _OuterProtocol:
                                     ),
                                     force_tune=context.force_tune,
                                 )
-                            except NoEligibleCandidate as exc:
+                            except (NoEligibleCandidate, CaptureUnsupported) as exc:
                                 layer.rejected_candidates[index] = str(exc)
                                 continue
                             selected = result["selection"]
