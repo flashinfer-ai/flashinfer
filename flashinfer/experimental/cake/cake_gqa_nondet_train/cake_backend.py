@@ -328,7 +328,8 @@ def cake_gqa_nondet_train_workspace_bytes(
     ``cu_seqlens_q_host`` / ``cu_seqlens_k_host``, else a bound) and with ``row_map`` plus the two FP32 window
     gradients ``[T_k, H_kv, 256]``; the call allocates those two from PyTorch's caching allocator and frees them when
     it returns."""
-    host = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)  # both or neither, at every size
+    # The host boundaries come both or neither, at every size.
+    host = _host_lists(cu_seqlens_q_host, cu_seqlens_k_host)
     need = cake_jit.scratch_bytes(int(total_q), int(num_heads_q), int(num_segments))
     if total_q and total_k and num_heads_kv:
         plan = cake_jit.chunk_plan(
