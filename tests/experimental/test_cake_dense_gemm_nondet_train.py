@@ -1670,8 +1670,11 @@ def test_k1_152_sm_one_split_ranges_bind_the_one_split_program(monkeypatch):
 K1_DSM_RANGES = {
     ("sm_100a", 148): {
         (4096, 32): ((1024, 32768, (32, 2)),),
-        (4096, 48): ((1024, 4095, (32, 2)), (4096, 16384, (64, 2)), (32768, 32768, (64, 2))),
-        (4096, 64): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
+        (4096, 48): ((1024, 4095, (32, 2)), (4096, 16171, (64, 2)), (16172, 16384, (32, 2)), (32768, 32768, (64, 2))),
+        (4096, 64): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
         (4096, 128): ((1024, 12288, (64, 2)),),
         (5120, 32): ((1024, 32768, (32, 2)),),
         (5120, 48): ((1024, 32768, (64, 2)),),
@@ -1680,8 +1683,8 @@ K1_DSM_RANGES = {
     },
     ("sm_100a", 152): {
         (4096, 32): ((1024, 2048, (32, 2)), (6144, 32768, (32, 2))),
-        (4096, 48): ((1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16384, 32768, (64, 2))),
-        (4096, 64): ((1024, 32768, (64, 2)),),
+        (4096, 48): ((1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2))),
+        (4096, 64): ((1024, 16171, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2))),
         (4096, 128): ((4096, 6144, (64, 2)), (6145, 8192, (128, 2))),
         (5120, 32): ((1024, 32768, (32, 2)),),
         (5120, 48): ((1024, 24576, (64, 2)),),
@@ -1700,10 +1703,11 @@ K1_DSM_RANGES = {
     },
 }
 #: The token counts at which the rows of each part were measured (two 148-SM B200 parts, two 152-SM GB200 parts, two
-#: 152-SM GB300 parts).
+#: 152-SM GB300 parts; on sm_100a also 16172 and 16231 tokens, where ``4096 -> 48`` and ``4096 -> 64`` were measured
+#: for the parity ranges of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on one B200 and one GB200 part).
 K1_DSM_MEASURED_TOKENS = {
-    ("sm_100a", 148): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
-    ("sm_100a", 152): (1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    ("sm_100a", 148): (1024, 2048, 4096, 6144, 8192, 12288, 16172, 16231, 16384, 24576, 32768),
+    ("sm_100a", 152): (1024, 2048, 3072, 4096, 6144, 8192, 12288, 16172, 16231, 16384, 24576, 32768),
     ("sm_103a", 152): (1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
 }
 # fmt: on
@@ -1748,7 +1752,9 @@ def test_k1_dsm_ranges(monkeypatch):
     (where the next range starts), and every range names a program this checkout registers for the part's
     architecture, with its cluster size baked into the module.  One token below or above a row's ranges, BF16 out,
     every other row and every other part (SM count or architecture) keep the plan they take without the part's table
-    (another part's table where it has one); every row's plan changes inside each of its ranges."""
+    (another part's table where it has one); every row's plan changes inside each of its ranges.  The odd block counts
+    of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, which the planner reads inside a cluster range, are taken out of the
+    plan comparison (``test_k1_dsm_odd_block_ranges`` holds them)."""
     table = cake_backend.K1_DSM_RANGES_BY_SM
     assert table == {
         part: {(part[0], 1, M, N, "f32"): want for (M, N), want in rows.items()}
@@ -1841,6 +1847,7 @@ def test_k1_dsm_ranges(monkeypatch):
             for (arch, sms, f32), plan in _k1_wgrad_plans(M, N, T, parts).items()
         }
 
+    monkeypatch.setattr(cake_backend, "K1_DSM_ODD_BLOCK_RANGES_BY_SM", {})
     with_table = plans()
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
     without = plans()
@@ -1869,6 +1876,114 @@ def test_k1_dsm_ranges(monkeypatch):
         for (M, N), ranges in rows.items()
         for i in range(len(ranges))
     )
+
+
+#: The ranges of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, ``(arch, sm_count) -> {(d_in, d_out): ((min_tokens,
+#: max_tokens, program), ...)}`` (FP32 out; ``program`` ``None`` for the deterministic program, else ``(block_n,
+#: splits, chains, order)`` of the CTA-pair program).
+# fmt: off
+K1_DSM_ODD_BLOCK_RANGES = {
+    ("sm_100a", 148): {(4096, 48): ((16172, 16384, None),), (4096, 64): ((16172, 16384, (64, 4, 1, "arrival")),)},
+    ("sm_100a", 152): {(4096, 48): ((16172, 16384, None),), (4096, 64): ((16172, 16384, (64, 4, 1, "arrival")),)},
+}
+# fmt: on
+
+
+def _assert_k1_odd_block_range(arch, sms, M, N, lo, hi, program):
+    """One range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`: it lies inside one cluster range of the row, of two CTAs
+    of 32-wide tiles, and names a registered three-or-more-split program (or the deterministic program).  At every
+    token count from ``lo`` to ``hi`` the planner's FP32 launch is that program at an odd number of 64-token K
+    blocks -- never a two-way split -- and the cluster program at an even one; one token outside the range, BF16 out
+    and another SM count get no program from the table."""
+    ((cluster,),) = [
+        [v for a, b, v in K1_DSM_RANGES[(arch, sms)][(M, N)] if a <= lo <= hi <= b]
+    ]
+    assert cluster == (32, 2), (arch, sms, M, N)
+    if program is not None:
+        block_n, splits, chains, order = program
+        assert order in cake_backend.K1_SPLIT_ORDERS and splits > 2
+        template = cake_backend.atomic_k1_template(block_n, True, chains, order)
+        assert template in cake_jit.KERNELS[arch], template
+    G = torch.empty(hi + 1, N, dtype=torch.bfloat16)
+    X = torch.empty(hi + 1, M, dtype=torch.bfloat16)
+    out = torch.empty(N, M, dtype=torch.float32)
+    for T in range(lo - 1, hi + 2):
+        where = (arch, sms, M, N, T)
+        kw = dict(arch=arch, L=1, M=M, N=N, K=T, out_f32=True, sm_count=sms)
+        held = -(-T // 64) % 2 == 1 and lo <= T <= hi
+        got = cake_backend.k1_dsm_odd_block_plan(**kw)
+        assert got == ((program or ()) if held else None), where
+        for other in (dict(kw, out_f32=False), dict(kw, sm_count=sms + 1)):
+            assert cake_backend.k1_dsm_odd_block_plan(**other) is None, where
+        if not lo <= T <= hi:
+            continue
+        plan = cake_backend.plan_atomic_gemm(
+            X[:T].t(), G[:T], out, transposed_out=True, arch=arch, sm_count=sms
+        )[0]
+        if not held:
+            assert plan is not None and plan.dsm, where
+            assert (plan.block_n, plan.splits) == (32, 2), where
+        elif program is None:
+            assert plan is None, where
+        else:
+            assert not plan.dsm and not plan.reproducible and plan.splits > 2, where
+            got = (plan.block_n, plan.splits, plan.chains, plan.split_order)
+            assert got == program, where
+
+
+def test_k1_dsm_odd_block_ranges(monkeypatch):
+    """On 148-SM and 152-SM sm_100a parts the FP32 rows ``4096 -> 48`` and ``4096 -> 64`` run the program of their
+    range in :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (:func:`k1_dsm_odd_block_plan`) at every token count of the range
+    that spans an odd number of 64-token K blocks: ``4096 -> 48`` the deterministic program, ``4096 -> 64`` four
+    splits of 64-wide tiles in the arrival order (a plan that is not reproducible).  At an even block count they run
+    two CTAs of 32-wide tiles, the cluster range that holds the range.  At no token count of a range with an odd block
+    count does the planner give a two-way split (every two-way split missed the accuracy check there).  BF16 out, a
+    token count outside the ranges, the other rows and the other parts keep the plan they take without the table, and
+    without the cluster ranges the table does not apply."""
+    table = cake_backend.K1_DSM_ODD_BLOCK_RANGES_BY_SM
+    assert table == {
+        part: {(part[0], 1, M, N, "f32"): want for (M, N), want in rows.items()}
+        for part, rows in K1_DSM_ODD_BLOCK_RANGES.items()
+    }
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        _register_k1(monkeypatch, arch)
+    for (arch, sms), rows in K1_DSM_ODD_BLOCK_RANGES.items():
+        for (M, N), ranges in rows.items():
+            for lo, hi, program in ranges:
+                _assert_k1_odd_block_range(arch, sms, M, N, lo, hi, program)
+    parts = [("sm_100a", s) for s in (147, 148, 150, 152, 153)]
+    parts += [("sm_103a", 148), ("sm_103a", 152), ("sm_107a", 212)]
+    Ts = (16171, 16172, 16173, 16192, 16193, 16231, 16256, 16257, 16300, 16320)
+    Ts += (16321, 16384, 16385)
+    shapes = ((4096, 32), (4096, 48), (4096, 64), (4096, 128), (5120, 48), (5120, 64))
+
+    def plans():
+        return {
+            (arch, sms, M, N, T, f32): plan
+            for M, N in shapes
+            for T in Ts
+            for (arch, sms, f32), plan in _k1_wgrad_plans(M, N, T, parts).items()
+        }
+
+    with_table = plans()
+    monkeypatch.setattr(cake_backend, "K1_DSM_ODD_BLOCK_RANGES_BY_SM", {})
+    without = plans()
+    changed = set()
+    for (arch, sms, M, N, T, f32), plan in with_table.items():
+        own = K1_DSM_ODD_BLOCK_RANGES.get((arch, sms), {}).get((M, N), ())
+        held = [v for lo, hi, v in own if lo <= T <= hi and -(-T // 64) % 2 == 1]
+        if f32 and held:
+            assert plan != without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T)
+            changed.add((arch, sms, M, N))
+        else:
+            assert plan == without[(arch, sms, M, N, T, f32)], (arch, sms, M, N, T, f32)
+    rows = K1_DSM_ODD_BLOCK_RANGES
+    assert changed == {(*part, M, N) for part in rows for M, N in rows[part]}
+    # without the cluster ranges the odd-block table does not apply
+    monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
+    neither = plans()
+    monkeypatch.setattr(cake_backend, "K1_DSM_ODD_BLOCK_RANGES_BY_SM", table)
+    assert plans() == neither
 
 
 @pytest.mark.parametrize(
@@ -10884,9 +10999,17 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
         )
         kw = dict(arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=sm_count)
         dsm = cake_backend.k1_dsm_plan(**kw)
-        # a token count of a K1_ORDERED_RANGES_BY_SM range runs that range's program in place of the verdict
-        ordered = None if dsm else cake_backend.k1_ordered_plan(**kw)
-        want = dsm or (tuple(ordered[:2]) if ordered else cake_backend.k1_plan(**kw))
+        odd = cake_backend.k1_dsm_odd_block_plan(**kw) if dsm else None
+        if odd is not None:
+            # an odd number of K blocks in a range of K1_DSM_ODD_BLOCK_RANGES_BY_SM runs that table's program
+            dsm, ordered = None, odd or None
+            want = tuple(odd[:2]) if odd else None
+        else:
+            # a token count of a K1_ORDERED_RANGES_BY_SM range runs that range's program in place of the verdict
+            ordered = None if dsm else cake_backend.k1_ordered_plan(**kw)
+            want = dsm or (
+                tuple(ordered[:2]) if ordered else cake_backend.k1_plan(**kw)
+            )
         if want is None:
             assert not isinstance(
                 prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch
@@ -13419,13 +13542,17 @@ def test_k1_wgrad_det_rules_by_sm():
 
 
 #: Weight-gradient rows whose route changed, per part, at the bench token counts: ``(d_in, d_out, dtype, T) ->
-#: (kind, block_n, splits)`` -- ``"dsm"`` the cluster program, ``"pair"`` the CTA-pair program, ``"det"`` the
-#: deterministic program (``"det"``, ``None``, ``None``).
+#: (kind, block_n, splits)`` -- ``"dsm"`` the cluster program, ``"pair"`` the CTA-pair program, ``"ordered"`` /
+#: ``"odd"`` the CTA-pair program of a range of :data:`K1_ORDERED_RANGES_BY_SM` /
+#: :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, ``"sk"`` the stream-K program, ``"det"`` the deterministic program
+#: (``"det"``, ``None``, ``None``).
 # fmt: off
 K1_WGRAD_CHANGED_ROWS = {
     ("sm_100a", 148): {
-        (4096, 48, "f32", 16231): ("dsm", 64, 2), (4096, 48, "f32", 16384): ("dsm", 64, 2),
-        (4096, 64, "f32", 16231): ("dsm", 64, 2), (4096, 64, "f32", 16384): ("dsm", 64, 2),
+        (4096, 48, "f32", 16172): ("det", None, None),
+        (4096, 48, "f32", 16231): ("dsm", 32, 2), (4096, 48, "f32", 16384): ("dsm", 32, 2),
+        (4096, 64, "f32", 16172): ("odd", 64, 4),
+        (4096, 64, "f32", 16231): ("dsm", 32, 2), (4096, 64, "f32", 16384): ("dsm", 32, 2),
         (4096, 1024, "bf16", 16172): ("pair", 256, 1), (4096, 1024, "bf16", 16231): ("pair", 256, 1),
         (4096, 1024, "bf16", 16384): ("pair", 256, 1),
         (5120, 1024, "bf16", 16172): ("sk", 256, None), (5120, 1024, "bf16", 16231): ("sk", 256, None),
@@ -13433,8 +13560,10 @@ K1_WGRAD_CHANGED_ROWS = {
         (5120, 1024, "f32", 16231): ("sk", 256, None), (5120, 1024, "f32", 16384): ("sk", 256, None),
     },
     ("sm_100a", 152): {
-        (4096, 48, "f32", 16384): ("dsm", 64, 2),
-        (4096, 64, "f32", 16231): ("dsm", 64, 2), (4096, 64, "f32", 16384): ("dsm", 64, 2),
+        (4096, 48, "f32", 16172): ("det", None, None),
+        (4096, 48, "f32", 16231): ("dsm", 32, 2), (4096, 48, "f32", 16384): ("dsm", 32, 2),
+        (4096, 64, "f32", 16172): ("odd", 64, 4),
+        (4096, 64, "f32", 16231): ("dsm", 32, 2), (4096, 64, "f32", 16384): ("dsm", 32, 2),
     },
     ("sm_103a", 152): {
         (4096, 32, "f32", 16231): ("dsm", 32, 2),
@@ -13459,10 +13588,21 @@ K1_WGRAD_CHANGED_ROWS = {
 # fmt: on
 
 
+def _k1_fixed_program(arch, sms, d_in, d_out, T, f32, L=1):
+    """``(block_n, splits, chains, order)`` of the CTA-pair program a row runs from a range of
+    :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (inside a cluster range, at an odd number of K blocks) or of
+    :data:`K1_ORDERED_RANGES_BY_SM`, else ``None``."""
+    kw = dict(arch=arch, L=L, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms)
+    if cake_backend.k1_dsm_plan(**kw) is not None:
+        return cake_backend.k1_dsm_odd_block_plan(**kw) or None
+    return cake_backend.k1_ordered_plan(**kw)
+
+
 def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
     """``(kind, block_n, splits)`` of the planner's weight-gradient route of a row: the stream-K table first
-    (``"sk"``), then the cluster tables (``"dsm"``), the ranges of :data:`K1_ORDERED_RANGES_BY_SM` (``"ordered"``)
-    and the split tables (``"pair"`` / ``"det"``)."""
+    (``"sk"``), then the cluster tables (``"dsm"``; at an odd number of K blocks in a range of
+    :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` that table's program, ``"odd"`` or ``"det"``), the ranges of
+    :data:`K1_ORDERED_RANGES_BY_SM` (``"ordered"``) and the split tables (``"pair"`` / ``"det"``)."""
     sk = cake_backend.K1_WGRAD_SK_RULES_BY_SM.get((arch, sms), {})
     template = sk.get((d_in, d_out, T, "f32" if f32 else "bf16"))
     if template is not None:
@@ -13470,6 +13610,9 @@ def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
     kw = dict(arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms)
     dsm = cake_backend.k1_dsm_plan(**kw)
     if dsm is not None:
+        odd = cake_backend.k1_dsm_odd_block_plan(**kw)
+        if odd is not None:
+            return ("odd", *odd[:2]) if odd else ("det", None, None)
         return ("dsm", *dsm)
     ordered = cake_backend.k1_ordered_plan(**kw)
     if ordered is not None:
@@ -13480,8 +13623,9 @@ def _k1_wgrad_route(arch, sms, d_in, d_out, T, f32):
 
 def test_k1_wgrad_changed_rows_take_their_route():
     """The weight-gradient rows whose route changed (:data:`K1_WGRAD_CHANGED_ROWS`) take it on their part: the
-    stream-K program, two CTAs of the cluster program, the CTA-pair program in a fixed split order or at two splits (or
-    one), or the deterministic program."""
+    stream-K program, two CTAs of the cluster program, the CTA-pair program of a range of
+    :data:`K1_ORDERED_RANGES_BY_SM` or :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` or at two splits (or one), or the
+    deterministic program."""
     for (arch, sms), rows in K1_WGRAD_CHANGED_ROWS.items():
         for (d_in, d_out, dt, T), want in rows.items():
             got = _k1_wgrad_route(arch, sms, d_in, d_out, T, dt == "f32")
@@ -13501,8 +13645,9 @@ K1_ROUTE_PARTS = (
 
 
 #: The bench's weight-gradient rows that may plan an order-varying program, ``(arch, sm_count, d_in, d_out, dtype,
-#: T)``: the four-split arrival-order ranges of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a thin FP32 rows, the
-#: fastest program that met all six input kinds of the accuracy check there).
+#: T)``: the four-split arrival-order ranges of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a thin FP32 rows) and
+#: of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (148-SM and 152-SM sm_100a ``4096 -> 64`` FP32 at 16172 tokens, an odd
+#: number of K blocks): the fastest programs that met all six input kinds of the accuracy check there.
 K1_ORDER_VARYING_ROWS = {
     ("sm_107a", 212, 4096, d_out, "f32", T)
     for d_out, tokens in (
@@ -13511,7 +13656,7 @@ K1_ORDER_VARYING_ROWS = {
         (64, (16231, 16384)),
     )
     for T in tokens
-}
+} | {("sm_100a", sms, 4096, 64, "f32", 16172) for sms in (148, 152)}
 
 
 def test_k1_no_order_varying_plan_on_bench_rows():
@@ -13519,7 +13664,8 @@ def test_k1_no_order_varying_plan_on_bench_rows():
     and FP32 out, its token counts) plans the CTA-pair program at three or more splits in the arrival order (partials
     added in the order they finish) but the rows of :data:`K1_ORDER_VARYING_ROWS`: the planner gives the stream-K
     program, the cluster program, a fixed split order, one or two splits, or the deterministic program.  The tables
-    hold no other such range.  The router
+    (:data:`K1_ORDERED_RANGES_BY_SM`, :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` at its odd block counts) hold no other
+    such range.  The router
     weight gradient of the bench's ``router`` class plans no stream-K partition with more than two partials per
     element: its row runs the SIMT program, the deterministic program (at the split count of its ``"det_s<n>"``
     window or the deterministic package's), or a partition of at most two partials."""
@@ -13553,15 +13699,14 @@ def test_k1_no_order_varying_plan_on_bench_rows():
                     spec["out_dtype"] == "f32",
                 )
                 assert route[0] != "pair" or route[2] <= 2, (arch, sms, spec, route)
-                if route[0] == "ordered" and route[2] > 2:
-                    order = cake_backend.k1_ordered_plan(
-                        arch=arch,
-                        L=1,
-                        M=spec["K"],
-                        N=spec["N"],
-                        K=spec["T"],
-                        out_f32=spec["out_dtype"] == "f32",
-                        sm_count=sms,
+                if route[0] in ("ordered", "odd") and route[2] > 2:
+                    order = _k1_fixed_program(
+                        arch,
+                        sms,
+                        spec["K"],
+                        spec["N"],
+                        spec["T"],
+                        spec["out_dtype"] == "f32",
                     )[3]
                     row = (
                         arch,
@@ -13579,6 +13724,12 @@ def test_k1_no_order_varying_plan_on_bench_rows():
             for lo, hi, (_, splits, _, order) in ranges:
                 if order == "arrival" and splits > 2:
                     for T in (lo, hi):
+                        assert (arch, sms, d_in, d_out, dt, T) in K1_ORDER_VARYING_ROWS
+    for (arch, sms), rows_ in cake_backend.K1_DSM_ODD_BLOCK_RANGES_BY_SM.items():
+        for (_, _, d_in, d_out, dt), ranges in rows_.items():
+            for lo, hi, program in ranges:
+                if program is not None and program[3] == "arrival" and program[1] > 2:
+                    for T in (t for t in (lo, hi) if -(-t // 64) % 2 == 1):
                         assert (arch, sms, d_in, d_out, dt, T) in K1_ORDER_VARYING_ROWS
     # nor at any token count of a table on its part: the tables carry no CTA-pair verdict of three or more splits
     for choice in cake_backend.K1_SPLIT_RULES.values():
@@ -13875,7 +14026,7 @@ def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
     """On a part of :data:`K1_WGRAD_CHANGED_ROWS`: the weight gradient of every changed row takes its route (the
     stream-K program of :data:`K1_WGRAD_SK_RULES_BY_SM` with no cached plan, or its :data:`_K1_ATOMIC_CACHE` entry:
     the cluster program, the CTA-pair program at one or two splits or in the split order of its range of
-    :data:`K1_ORDERED_RANGES_BY_SM`, or the deterministic program -- then the deterministic package's weight gradient
+    :data:`K1_ORDERED_RANGES_BY_SM` or :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`, or the deterministic program -- then the deterministic package's weight gradient
     bit for bit; a row of :data:`K1_WGRAD_DET_RULES_BY_SM` the bits of the deterministic package's prepared launch of
     the table's program), meets the deterministic package's budget against FP64 and repeats bit for bit over
     ``RERUNS`` calls into NaN-poisoned outputs -- a four-split arrival-order range meets the budget on each of those
@@ -13938,12 +14089,11 @@ def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
         if kind != "det":
             plan = entry.plan
             assert plan is not None, what
-            ordered = cake_backend.k1_ordered_plan(
-                arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms
-            )
+            ordered = _k1_fixed_program(arch, sms, d_in, d_out, T, f32)
             if ordered is not None:
                 assert (plan.chains, plan.split_order) == tuple(ordered[2:]), what
-            # only a range of K1_ORDERED_RANGES_BY_SM adds three or more splits in the arrival order
+            # only a range of K1_ORDERED_RANGES_BY_SM or K1_DSM_ODD_BLOCK_RANGES_BY_SM adds three or more splits in
+            # the arrival order
             varying = ordered is not None and not plan.reproducible
             assert plan.reproducible or varying, what
             assert (plan.dsm, plan.block_n, plan.splits) == (

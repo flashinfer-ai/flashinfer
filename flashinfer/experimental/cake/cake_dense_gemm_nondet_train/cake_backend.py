@@ -37,11 +37,13 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish (in the tables only the four-split rows of
-  :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts; else a caller's explicit ``splits``).  The one-split rows
+  :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts and of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on 148-SM
+  and 152-SM sm_100a parts; else a caller's explicit ``splits``).  The one-split rows
   store whole tiles, and the rows of :data:`K1_WGRAD_DET_RULES_BY_SM` run
   another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
-  ``sm_100a`` and 152-SM ``sm_103a`` parts, in that table's token ranges), before every other K1 table: a cluster
+  ``sm_100a`` and 152-SM ``sm_103a`` parts, in that table's token ranges, but the odd numbers of K blocks of
+  :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`), before every other K1 table: a cluster
   program (:func:`k1_dsm_plan`) whose ``S`` CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's
   distributed shared memory -- each CTA sends the column quads another rank owns to that rank, adds the ``S``
   partials of its own quads in cluster-rank order and stores them once (no workspace, no ticket; the same bits on
@@ -78,8 +80,9 @@ program: both add each output element's whole K in one ascending FP32 chain, wit
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
 of CTA pairs at three or more splits in the arrival order, a K2 stream-K partition that gives an element more than two
-partials; in the shipped tables only the four-split rows of :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts, a
-caller's explicit split count and the K2 ``"waves"`` windows on a part without a router table of its SM count -- raises
+partials; in the shipped tables only the four-split rows of :data:`K1_ORDERED_RANGES_BY_SM` on 212-SM sm_107a parts
+and of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` on 148-SM and 152-SM sm_100a parts, a caller's explicit split count and
+the K2 ``"waves"`` windows on a part without a router table of its SM count -- raises
 PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
 and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
 launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
@@ -276,7 +279,7 @@ ROUTES: dict[str, str] = {
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; the rows of the tables repeat bit for
     # bit (two splits, the cluster program, one split, a fixed split order) but the four-split arrival-order rows of
-    # K1_ORDERED_RANGES_BY_SM, the others run the deterministic program
+    # K1_ORDERED_RANGES_BY_SM and K1_DSM_ODD_BLOCK_RANGES_BY_SM, the others run the deterministic program
     "k2_kk": "atomic",  # router forward: the cluster SIMT program in its token windows; an explicit split count <= 2
     "k2_kn": "atomic",  # router input gradient: the SIMT program in its token windows, else one split
     "k2_nn_t": "atomic",  # router weight gradient: the SIMT program in its token windows, else the deterministic
@@ -984,7 +987,7 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: than that routing (median of the runs at most 1.013 times, no run slower than the slowest run of the routing
 #: against itself).  A row's ranges run from a passing measured token count to a passing measured token count and
 #: hold no measured token count that failed; every other token count, part and row keeps the routing of the other
-#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16383 tokens,
+#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16171 tokens,
 #: ``4096 -> 128`` below 4096 and above 8192 tokens, ``5120 -> 64`` from 2049 to 4095 and above 24576 tokens,
 #: ``5120 -> 48`` above 24576 tokens, ``5120 -> 128`` above 6144 tokens, every row below 1024 and above 32768 tokens).
 #: On 152-SM ``sm_103a`` parts (two GB300 parts) and 148-SM ``sm_100a`` parts (two B200 parts) the same rows run it in
@@ -1015,6 +1018,12 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: deterministic program (:data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The 148-SM ``sm_100a`` ranges of three CTAs of
 #: ``5120 -> 64`` and ``5120 -> 128`` stay: there the reference sums the reduction in one chain, and ``5120 -> 128`` on
 #: three CTAs met the check on all six kinds at 16231 and 16384 tokens (0.36 to 0.40 times the reference's error).
+#:
+#: On 148-SM and 152-SM ``sm_100a`` parts ``4096 -> 48`` and ``4096 -> 64`` run two CTAs of 32-wide tiles from 16172 to
+#: 16384 tokens.  At an even number of 64-token K blocks (16231 and 16384 tokens) they sum the same two halves as the
+#: reference (its error exactly, on all six kinds) and were the fastest program that met the check: 0.98 to 0.99 times
+#: the time of two CTAs of 64-wide tiles on a B200 part and 0.94 times on a GB200 part.  At an odd block count every
+#: two-way split missed the check; those token counts run the program of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`.
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1022,8 +1031,13 @@ K1_DSM_RANGES_BY_SM: dict[
 ] = {
     ("sm_100a", 148): {
         ("sm_100a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 4095, (32, 2)), (4096, 16384, (64, 2)), (32768, 32768, (64, 2))),
-        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 32768, (64, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 16171, (64, 2)), (16172, 16384, (32, 2)), (32768, 32768, (64, 2)),
+        ),
+        ("sm_100a", 1, 4096, 64, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
         ("sm_100a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
         ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 32768, (64, 2)),),
@@ -1032,8 +1046,10 @@ K1_DSM_RANGES_BY_SM: dict[
     },
     ("sm_100a", 152): {
         ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16384, 32768, (64, 2))),
-        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 2)),),
+        ("sm_100a", 1, 4096, 48, "f32"): (
+            (1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2)),
+        ),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 16171, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2))),
         ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 2))),
         ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
@@ -1049,6 +1065,38 @@ K1_DSM_RANGES_BY_SM: dict[
         ("sm_103a", 1, 5120, 48, "f32"): ((2048, 4095, (64, 2)),),
         ("sm_103a", 1, 5120, 64, "f32"): ((1024, 4095, (64, 2)), (6144, 12287, (64, 2))),
         ("sm_103a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)),),
+    },
+}
+# fmt: on
+#: The programs that rows of :data:`K1_DSM_RANGES_BY_SM` run in place of their cluster program at a token count that
+#: spans an odd number of 64-element K blocks (``ceil(K / 64)`` odd) inside a range of this table, on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, program), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`; ``program`` ``None`` for the deterministic program, or ``(block_n, splits, chains, order)``
+#: of this package's CTA-pair program as in :data:`K1_ORDERED_RANGES_BY_SM`).  An even block count, a token count
+#: outside the ranges and a token count outside the row's cluster ranges keep the routing of the other tables.  The
+#: deterministic program of these rows cuts the token reduction of the tiles, taken in order, into units of
+#: ``ceil(blocks / 2)`` K blocks.  At an even block count a tile's two units are the halves that two CTAs of the
+#: cluster program sum; at an odd one a unit runs on into the next tile, so 31 of the 32 tiles sum three shorter
+#: partials.  There every two-way split (two CTAs of 32-wide or 64-wide tiles, two splits of the CTA-pair program)
+#: missed the check of :data:`K1_DSM_RANGES_BY_SM`: its worst relative error was 1.16 times the reference's median at
+#: 16130, 16172, 16300 and 16320 tokens on a B200 part (at 16172 tokens also on a GB200 part).  Four splits of the
+#: 64-wide CTA-pair program met the check on all six kinds there (0.60 to 0.82 times the reference's error), and so
+#: did the deterministic program.  Each row runs the faster of the two at 16172 tokens: ``4096 -> 48`` the
+#: deterministic program (1.2 % faster than four splits on a B200 part, 2.3 % on a GB200 part), ``4096 -> 64`` four
+#: splits in the arrival order (4.7 % and 0.3 % faster than the deterministic program).  Their partials add in the
+#: order the splits finish, so the bits can vary run to run (:func:`_alert_order_varying`).
+# fmt: off
+K1_DSM_ODD_BLOCK_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[tuple[int, int, int, str]]], ...]],
+] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 48, "f32"): ((16172, 16384, None),),
+        ("sm_100a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
+    },
+    ("sm_100a", 152): {
+        ("sm_100a", 1, 4096, 48, "f32"): ((16172, 16384, None),),
+        ("sm_100a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4, 1, "arrival")),),
     },
 }
 # fmt: on
@@ -1150,6 +1198,39 @@ def k1_dsm_plan(
     for lo, hi, (block_n, splits) in K1_DSM_RANGES_BY_SM.get(part, {}).get(key, ()):
         if lo <= int(K) <= hi:
             return (int(block_n), int(splits)) if k1_splits_fit(splits, K) else None
+    return None
+
+
+def k1_dsm_odd_block_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Optional[tuple]:
+    """The program a row runs in place of its cluster program (:func:`k1_dsm_plan`) at a ``K`` of an odd number of
+    64-element K blocks on a device of exactly ``sm_count`` SMs (its range in :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`):
+    ``()`` for the deterministic program, else ``(block_n, splits, chains, order)`` of this package's CTA-pair program.
+    ``None`` at an even block count, outside those ranges, or at a ``K`` too short for the splits or chains
+    (:func:`k1_splits_fit`, :func:`k1_chains_fit`).  :func:`plan_atomic_gemm` asks it only where the row has a
+    cluster range.  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
+    if _ceil_div(int(K), K1_BLOCK_K) % 2 == 0:
+        return None
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    for lo, hi, program in K1_DSM_ODD_BLOCK_RANGES_BY_SM.get(
+        (arch, int(sm_count)), {}
+    ).get(key, ()):
+        if lo <= int(K) <= hi:
+            if program is None:
+                return ()
+            block_n, splits, chains, order = program
+            fits = k1_splits_fit(splits, K) and k1_chains_fit(chains, K)
+            return (
+                (int(block_n), int(splits), int(chains), str(order)) if fits else None
+            )
     return None
 
 
@@ -2117,9 +2198,10 @@ def plan_atomic_gemm(
     that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
     registry allow it.  The planner's choice is first :func:`k1_dsm_plan`'s cluster program where the row has a
     range of :data:`K1_DSM_RANGES_BY_SM` (a plan with ``dsm``; ``None`` when this checkout does not register its
-    template for ``arch``), then :func:`k1_ordered_plan`'s program where the row has a range of
-    :data:`K1_ORDERED_RANGES_BY_SM`, then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s accumulation chains
-    where it has them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names
+    template for ``arch``; at an odd number of K blocks in a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` that
+    table's program instead, :func:`k1_dsm_odd_block_plan`), then :func:`k1_ordered_plan`'s program where the row
+    has a range of :data:`K1_ORDERED_RANGES_BY_SM`, then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s
+    accumulation chains where it has them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names
     more, at one split, in the arrival order, and never the cluster program.
     Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an explicit choice the
     program cannot run."""
@@ -2176,7 +2258,14 @@ def plan_atomic_gemm(
         dsm = k1_dsm_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
+        odd = None
         if dsm is not None:
+            odd = k1_dsm_odd_block_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
+            if odd == ():
+                return (*none, "the planner keeps the row on the deterministic program")
+        if dsm is not None and odd is None:
             bn, p = dsm
             template = dsm_k1_template(bn, p)
             if template not in cake_jit.KERNELS.get(arch, {}):
@@ -2197,7 +2286,7 @@ def plan_atomic_gemm(
                 dsm=True,
             )
             return plan, a_launch, b_launch, O3, ""
-        ordered = k1_ordered_plan(
+        ordered = odd or k1_ordered_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
         if ordered is not None:
