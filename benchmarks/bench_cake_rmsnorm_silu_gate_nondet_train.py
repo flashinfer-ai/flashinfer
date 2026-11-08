@@ -18,7 +18,9 @@ Benchmark of the Cake SiLU-gated RMSNorm training kernels
 package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
 approximate FP32 intrinsics, and one backward kernel whose CTAs add the
 weight-gradient partials exactly as 64-bit integer windows, the last CTA
-rounding the sum once) against the deterministic package
+rounding the sum once, or, for a BF16 weight gradient in its row-claims bands,
+add FP32 runs of rows to FP64 accumulators with atomics) against the
+deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
 fixed-order weight-gradient reduction), each called through its own public
 entry points.
@@ -39,15 +41,18 @@ forward up to 140 rows per SM on SM100, 120 on SM103 and 65 on SM107 and past
 that a persistent forward (the mid, long or extra-long one) by bands of rows
 per SM (``cake_jit.FORWARD_BANDS``).
 Its backward runs one cluster of 16 CTAs up to 512 rows (with a BF16 or an
-FP32 weight gradient or ``compute_grad_weight=False``), else one kernel of at
-most 8 CTAs per SM over
-chunks of rows, by bands of rows (``cake_jit.BACKWARD_BANDS``): on SM100 and
-SM103 the static backward up to 49488 rows, a second static backward that
-warms the next block with one bulk prefetch up to 245760 rows and the claimed
-backward past that; on SM107 the static backward while every chunk has a CTA,
-a second static backward up to 98352 rows and the claimed backward past that.
-At ``--heads 48`` the default token counts reach every
-one of these kernels that a 148-SM B200 routes (2048 tokens: the extra-long
+FP32 weight gradient or ``compute_grad_weight=False``), else one kernel by
+bands of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient
+(the one timed here) runs a row-claims backward (256-thread CTAs of 16-row
+blocks, 4 per SM) up to 800 rows per SM on SM100 and 700 on SM103, the
+row-claims mid backward (5 CTAs per SM) up to 1329 rows per SM on SM100 and
+1294 on SM103, and past that the claimed backward (at most 8 CTAs per SM over
+chunks of rows); on SM107 the static backward up to 24 rows per SM, the
+row-claims backward up to 68 and the claimed backward past that.  An FP32
+weight gradient runs the static backward up to 256 rows per SM on SM100 and
+SM103 (64 on SM107) and the claimed backward past that.  At ``--heads 48``
+the default token counts reach every forward kernel of packed rows and every
+BF16 backward kernel that a 148-SM B200 routes (2048 tokens: the extra-long
 forward).
 
 Timing uses CUPTI kernel activity with a cold L2
@@ -67,7 +72,9 @@ results against the deterministic ones: ``y``, ``dx`` and ``dz`` bitwise (the
 non-deterministic forward's approximate intrinsics need not give the
 deterministic ``y`` bits), ``dw`` as the largest distance in BF16 units in the
 last place, and the number of distinct ``dw`` bit patterns over ``--repeats``
-backward calls (1 for both modes: every output repeats bit for bit).
+backward calls (1 for the deterministic package; 1 for the non-deterministic
+package too, except in its row-claims bands, where the BF16 ``dw``'s last bits
+may vary from run to run, so the count may exceed 1).
 
 Example::
 
@@ -111,9 +118,9 @@ API = {
 MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones
-# (at 48 heads on B200: 1, 5 and 7 tokens reach the small-row backward; 16,
-# 129 and 1031 the static backward; 2048 and 4097 the second static backward;
-# 30000 to 33000 the claimed backward).
+# (at 48 heads on a 148-SM B200, BF16 weight gradient: 1, 5 and 7 tokens reach
+# the small-row backward; 16, 129, 1031 and 2048 the row-claims backward; 4097
+# the row-claims mid backward; 30000 to 33000 the claimed backward).
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 

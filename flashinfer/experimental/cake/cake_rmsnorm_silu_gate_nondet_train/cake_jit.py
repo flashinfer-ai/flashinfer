@@ -52,8 +52,7 @@ forward, the forward and the mid, long and extra-long forwards, each where
 the architecture's bands name it); the backward by ``BACKWARD_BANDS``,
 bands of rows or of rows per SM: its small-row role (``BAND_ROLES``: the
 exact tiny backward ``_t512``, up to a count of rows), its call role (the static backward, where an architecture
-routes one for the role), on sm_107a its long role (the static backward over
-fewer window copies), for a BF16 weight gradient its row-claims roles
+routes one for the role), for a BF16 weight gradient its row-claims roles
 (``_rc``, ``_rc_mid``) and its mid role (the claimed backward).
 The forward's programs: the tiny forward (16 threads to a row, one 8-row
 block per 128-thread CTA, the gate before the sum of squares, packed rows
@@ -71,7 +70,7 @@ forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the ot
 between the programs, and so between the bands of one architecture, while
 each program gives the same bits for the same inputs on the same device.
 
-The backward's call role and its long role are static backwards (CTA ``b``
+The backward's call role is the static backward (CTA ``b``
 runs the chunks ``b``, ``b + grid``, ... and claims nothing); its mid role is
 the claimed backward (the CTAs claim runs of chunks from the workspace's
 claim counter at run time, so a CTA slowed beside another kernel takes
@@ -80,8 +79,8 @@ static backward with no prefetch, and the claimed backward warming the
 CTA's next block in L2, thread 0 with one bulk prefetch per tensor where
 ``dy``, ``x`` and ``z`` hold packed rows (head stride 128 and token stride
 ``H * 128``; other layouts: a prefetch per thread).  On sm_107a: the static
-backwards add their windows to 4 (the call role) or 2 (the long role) copies
-with an occupancy word per copy (``sparse``), and the claimed backward warms
+backward adds its windows to 4 copies with an occupancy word per copy
+(``sparse``) and runs one wave at most, and the claimed backward warms
 the block two ahead.  The row-claims backwards of a BF16 weight gradient
 (256 threads, 16-row blocks, the CTAs past one wave claiming blocks from the
 claim counter) add each thread's FP32 run of rows to 4 FP64 accumulator
@@ -1170,91 +1169,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw_win": 4480,
         },
     },
-    # The long static backward into a FP32 weight gradient on sm_107a: the
-    # sparse static schedule over 2 window copies, the weight gradient rounded
-    # once to FP32; BACKWARD_BANDS gives it its rows, at most 256 rows per SM
-    # (4 row blocks a CTA) (build {"bulk": 0, "chunks_per_step": 0,
-    # "min_blocks": 8, "out": "f32", "prefetch_ahead": 0, "schedule": "static",
-    # "slots": 3, "sparse": 1}).
-    "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "x"],
-            ["buffer", "z"],
-            ["buffer", "w"],
-            ["buffer", "dx"],
-            ["buffer", "dz"],
-            ["buffer", "dw_win"],
-            ["buffer", "dw_spec"],
-            ["buffer", "dw_done"],
-            ["buffer", "dw"],
-            ["parameter", "rows"],
-            ["parameter", "heads"],
-            ["parameter", "dy_tok"],
-            ["parameter", "dy_head"],
-            ["parameter", "x_tok"],
-            ["parameter", "x_head"],
-            ["parameter", "z_tok"],
-            ["parameter", "z_head"],
-            ["parameter", "eps"],
-            ["parameter", "accumulate"],
-            ["parameter", "weight_grad"],
-            ["parameter", "blocks_per_chunk"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunk_limit": 8192,
-            "ctas_per_sm": 8,
-            "kind": "chunks",
-            "rows_per_block": 8,
-        },
-        "kernel": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 15616,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
-        "logical": {
-            "accumulate": "accumulate",
-            "blocks_per_chunk": "blocks_per_chunk",
-            "dw": "dw",
-            "dw_done": "dw_done",
-            "dw_spec": "dw_spec",
-            "dw_win": "dw_win",
-            "dx": "dx",
-            "dy": "dy",
-            "dy_head": "dy_head",
-            "dy_tok": "dy_tok",
-            "dz": "dz",
-            "eps": "eps",
-            "heads": "heads",
-            "rows": "rows",
-            "w": "w",
-            "weight_grad": "weight_grad",
-            "x": "x",
-            "x_head": "x_head",
-            "x_tok": "x_tok",
-            "z": "z",
-            "z_head": "z_head",
-            "z_tok": "z_tok",
-        },
-        "role": "bwd_f32_long",
-        "workspace": {
-            "dw_done": 2,
-            "dw_spec": 128,
-            "dw_win": 2688,
-        },
-    },
     # The claimed backward into a FP32 weight gradient on sm_100a and sm_103a:
     # the static backward's rows and sums, its CTAs claiming runs of chunks
     # from the claim counter, thread 0 warming the CTA's next block in L2 with
@@ -1546,7 +1460,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_rc": "cake_rmsnorm_silu_gate_train_615c6fae07a6a89f3a45",
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
-        "bwd_f32_long": "cake_rmsnorm_silu_gate_train_de4ac875a4e07bb547fd",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
@@ -1623,7 +1536,7 @@ STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
 # and ``None`` (the last band) always.  The cuts are this table only (host
 # plan: a new cut needs no new program); they are the measured fastest
 # program at each row count (CUPTI, cold L2) under two rules.  A static
-# backward (the call role, and on sm_107a the long role) runs at most 4 row
+# backward (the call role) runs at most 4 row
 # blocks a CTA of its one-wave grid (256 rows per SM): its CTA ``b`` runs
 # the chunks ``b``, ``b + grid``, ... whatever other kernels hold, so beside a
 # kernel that holds some SMs its call ends about one CTA's chunks late, within
@@ -1667,13 +1580,12 @@ BACKWARD_BANDS: dict[
         "bwd_bf16": (
             ((ROWS, 512), "bwd_bf16_t512"),
             (24, "bwd_bf16"),
-            (115, "bwd_bf16_rc"),
+            (68, "bwd_bf16_rc"),
             (None, "bwd_bf16_mid"),
         ),
         "bwd_f32": (
             ((ROWS, 512), "bwd_f32_t512"),
             (64, "bwd_f32"),
-            (115, "bwd_f32_long"),
             (None, "bwd_f32_mid"),
         ),
     },
@@ -1690,8 +1602,7 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 # roles (``fwd_tiny``, ``fwd_short``, ``fwd_mid``, ``fwd_long``,
 # ``fwd_xlong``) in the rows of their ``FORWARD_BANDS`` bands; a backward
 # role (its own module, the static backward, where an architecture routes
-# one), its small-row roles (``BAND_ROLES``), on sm_107a its long role
-# (``<role>_long``, the static backward over 2 window copies), for a BF16
+# one), its small-row roles (``BAND_ROLES``), for a BF16
 # weight gradient its row-claims roles (``<role>_rc``, ``<role>_rc_mid``) and
 # its mid role (``<role>_mid``, the claimed backward) in the rows of their
 # ``BACKWARD_BANDS`` bands, which cover every row count.
@@ -1745,6 +1656,27 @@ def route_module(arch: str, role: str) -> str:
             f"exported architectures: {ARCHES}"
         )
     return name
+
+
+def routes_every_call(arch: str) -> bool:
+    """Whether ``arch`` routes a module for every call of every role: every
+    band of the forward's ``FORWARD_BANDS`` and ``STRIDED_FORWARD_BANDS`` and
+    of each backward role's ``BACKWARD_BANDS`` names a role ``ROUTES[arch]``
+    routes, and a role whose bands do not end with a ``None`` band routes its
+    own module (:func:`module_for_rows` falls back to it past the bands)."""
+
+    routes = ROUTES.get(arch, {})
+    tables = [("fwd", FORWARD_BANDS.get(arch, ()))]
+    tables.append(("fwd", STRIDED_FORWARD_BANDS.get(arch, ())))
+    for role in ROLES:
+        if role != "fwd":
+            tables.append((role, BACKWARD_BANDS.get(arch, {}).get(role, ())))
+    for role, bands in tables:
+        if any(band not in routes for _, band in bands):
+            return False
+        if all(last is not None for last, _ in bands) and role not in routes:
+            return False
+    return True
 
 
 def backward_chunks(name: str, rows: int) -> tuple[int, int]:

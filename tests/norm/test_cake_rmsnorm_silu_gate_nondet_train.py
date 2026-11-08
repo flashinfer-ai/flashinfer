@@ -27,14 +27,19 @@ checked against the explicit eager operation (FP32 arithmetic, one final cast
 to BF16, PyTorch autograd for the gradients) with the deterministic suite's
 bounds: ``y``, ``dx`` and ``dz`` within one BF16 ulp of the eager output plus
 the floor of the FP64 reference's largest magnitude, ``dw`` within
-``|dw_eager| * 2^-7 + sum|terms| * 2^-20``.  Every output (``y``,
-``dx``, ``dz`` and ``dw``, BF16 and FP32 weight gradients, accumulated or not)
-must be the same bits on every launch and on every path: streams, CUDA Graph
-replays, autograd, ``compute_grad_weight``, grids smaller than the chunks (the
-static, the second static and the claimed backward at 1, 3 and 7 CTAs), a
-workspace reused across shapes.  The matrix covers dynamic token and head
+``|dw_eager| * 2^-7 + sum|terms| * 2^-20``.  ``y``, ``dx``, ``dz`` and an
+FP32 weight gradient (accumulated or not) must be the same bits on every
+launch and on every path: streams, CUDA Graph replays, autograd,
+``compute_grad_weight``, grids smaller than the work (the static, the claimed
+and the row-claims backwards at 1, 3 and 7 CTAs), a workspace reused across
+shapes; so must a BF16 weight gradient in every band of ``BACKWARD_BANDS``
+but the row-claims backwards' (``_rc`` and ``_rc_mid``, :func:`_dw_varies`),
+whose CTAs claim row blocks at run time and add FP32 runs of rows with FP64
+atomics, so that their BF16 weight gradient may vary in its last bits from run
+to run: there every launch's BF16 weight gradient, alone and accumulated, lies
+within the budgets above instead.  The matrix covers dynamic token and head
 counts (``H = 48`` and small or irregular row counts), ``[T, H, 128]`` strided
-and flattened layouts (also in the bands of the second static and the claimed
+and flattened layouts (also in the bands of the claimed and the row-claims mid
 backward, whose sm_100a and sm_103a programs warm packed rows with a bulk
 prefetch and other layouts with a prefetch per thread),
 near-zero variance, saturated gates, weight-gradient terms that cancel per
@@ -50,14 +55,22 @@ workspace: one workspace per capture and capture stream, zero-filled outside
 the graph, no fill kernel in it; two such graphs replayed at the same time on
 two streams; the fill inside the graph past the graph-workspace limit), the
 autograd wrapper (non-reentrant checkpointing included), the state a
-checkpointed step keeps (FlashInfer issue #7039), the registry's routes, chunks
-and grids, and the mode policy: the mode is in the name, so no entry point
-takes a ``deterministic`` keyword (passing one, of any value, is a
-``TypeError`` before any launch), every entry point runs without an alert or a
-warning under ``torch.use_deterministic_algorithms(True)`` (strict and
-``warn_only``, CUDA Graph capture included) and returns the bits it returns
-with the setting off, and the deterministic package's FP32 workspace is refused
-naming both modes' workspaces.
+checkpointed step keeps (FlashInfer issue #7039), the registry's routes (a
+module for every call, which the support query requires; none of the programs
+the package no longer ships), bands, chunks and grids (the first and the last
+rows of every band of ``BACKWARD_BANDS`` run the band's program), and the mode
+policy: the mode is in the name, so no entry point takes a ``deterministic``
+keyword (passing one, of any value, is a ``TypeError`` before any launch); under
+``torch.use_deterministic_algorithms(True)`` a backward that computes the
+weight gradient on a row-claims backward raises PyTorch's alert immediately
+before its launch (a ``RuntimeError``; with ``warn_only=True`` a
+``UserWarning``, after which it runs; a CUDA Graph warns when it is captured
+and not when it is replayed), and every other call (the other bands,
+``compute_grad_weight=False``, no rows, the forward, the workspace entry
+points, the reset and the support query) runs without an alert or a warning
+(strict and ``warn_only``, CUDA Graph capture included) and returns the bits
+it returns with the setting off; the deterministic package's FP32 workspace is
+refused naming both modes' workspaces.
 
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
@@ -70,6 +83,7 @@ top level are ``test_cake_rmsnorm_silu_gate_nondet_train_api.py``'s.
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 from pathlib import Path
 
@@ -100,32 +114,45 @@ BF16_RTOL = 2.0**-7
 DW_MAG_TOL = 2.0**-20
 REPEATS = 10
 DET = "flashinfer.cake_rmsnorm_silu_gate_det_train"
+# PyTorch's alert of a backward under its deterministic algorithms.
+ALERT = "does not have a deterministic implementation"
 # The workspace of a backward module by its slots, ``(buffer, byte offset,
 # elements)``: the u64 windows of the exact weight-gradient sum (slots x 7
 # windows x 128 columns; on the sparse programs of sm_107a the last slot holds
 # the occupancy words), the FP32 class words (128) and the u32 arrival ticket
 # and claim counter, each buffer 16-byte aligned; and its bytes.
 WORKSPACE_LAYOUTS = {
-    3: (("dw_win", 0, 3 * 7 * 128), ("dw_spec", 21504, 128), ("dw_done", 22016, 2)),
     4: (("dw_win", 0, 4 * 7 * 128), ("dw_spec", 28672, 128), ("dw_done", 29184, 2)),
     5: (("dw_win", 0, 5 * 7 * 128), ("dw_spec", 35840, 128), ("dw_done", 36352, 2)),
 }
-MODULE_WORKSPACE_BYTES = {3: 22024, 4: 29192, 5: 36360}
-# The slots of each backward module with a workspace, by architecture and role:
-# 4 for the static, the second static (``_long``) and the claimed (``_mid``)
-# backward on sm_100a and sm_103a; 5, 3 and 4 on sm_107a.
+MODULE_WORKSPACE_BYTES = {4: 29192, 5: 36360}
+# The slots of each static and claimed backward module, by architecture and
+# role: on sm_100a and sm_103a 4 for the static backward of an FP32 weight
+# gradient and the claimed (``_mid``) backwards; on sm_107a 5 for the static
+# backwards and 4 for the claimed backwards.
 BACKWARD_SLOTS = {
-    arch: {
-        f"bwd_{out}{tier}": slots
-        for out in ("bf16", "f32")
-        for tier, slots in zip(("", "_long", "_mid"), by_tier, strict=True)
-    }
-    for arch, by_tier in (
-        ("sm_100a", (4, 4, 4)),
-        ("sm_103a", (4, 4, 4)),
-        ("sm_107a", (5, 3, 4)),
-    )
+    "sm_100a": {"bwd_f32": 4, "bwd_bf16_mid": 4, "bwd_f32_mid": 4},
+    "sm_103a": {"bwd_f32": 4, "bwd_bf16_mid": 4, "bwd_f32_mid": 4},
+    "sm_107a": {"bwd_bf16": 5, "bwd_f32": 5, "bwd_bf16_mid": 4, "bwd_f32_mid": 4},
 }
+# The torch dtype of each workspace buffer's view.
+WORKSPACE_DTYPES = {
+    "dw_win": torch.uint64,
+    "dw_sums": torch.float64,
+    "dw_spec": torch.float32,
+    "dw_done": torch.uint32,
+}
+# The row-claims backwards of a BF16 weight gradient (the base and the mid
+# backward whose CTAs claim 16-row blocks at run time) and their grid rules:
+# at most 4 (``_rc``) and 5 (``_rc_mid``) CTAs per SM; and their workspace: 512
+# FP64 column sums (4 slots of 128 columns) and the u32 arrival ticket and
+# claim counter, 4104 bytes.
+ROW_CLAIMS_GRID_RULES = {
+    "bwd_bf16_rc": {"ctas_per_sm": 4, "kind": "row_claims", "rows_per_cta": 16},
+    "bwd_bf16_rc_mid": {"ctas_per_sm": 5, "kind": "row_claims", "rows_per_cta": 16},
+}
+ROW_CLAIMS_LAYOUT = (("dw_sums", 0, 4 * D), ("dw_done", 4096, 2))
+ROW_CLAIMS_WORKSPACE_BYTES = 4104
 # The bytes of the backward workspace of each architecture, the largest of its
 # backward modules' (one zero-filled workspace serves them all, each module
 # laying its buffers over the first bytes): 29192 on sm_100a and sm_103a, 36360
@@ -236,7 +263,7 @@ def _backward_module(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> str:
     """The backward module ``module_for_rows`` runs for ``rows`` rows and a
     ``dw_dtype`` weight gradient on this device: the program of the role's
     first ``BACKWARD_BANDS`` band that holds the rows (a small-row backward,
-    the static, the second static or the claimed backward)."""
+    a static, a row-claims or the claimed backward)."""
     return _module("bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16", rows)
 
 
@@ -247,41 +274,111 @@ def _chunks(rows: int) -> int:
     return -(-blocks // max(1, -(-blocks // 8192)))
 
 
+def _band_end(last, sm_count: int) -> int | None:
+    """The most rows of a ``BACKWARD_BANDS`` band whose ``last`` is ``last``
+    on ``sm_count`` SMs: ``n`` for ``(ROWS, n)`` (a count of rows), the most
+    rows with ``rows <= last * sm_count`` for a number (rows per SM), ``None``
+    for the last band, which has no end."""
+    if last is None:
+        return None
+    if isinstance(last, tuple):
+        assert len(last) == 2 and last[0] == loader.ROWS, last
+        return int(last[1])
+    return math.floor(last * sm_count)
+
+
 def _backward_bands(
     arch: str, role: str, sm_count: int
 ) -> list[tuple[str, int, int | None]]:
     """``(band role, first rows, last rows or None)`` of each
-    ``BACKWARD_BANDS`` band of the backward ``role`` on ``arch`` with
-    ``sm_count`` SMs, in order: a ``ONE_WAVE`` band ends at the most rows whose
-    chunks each have a CTA of 8 per SM (64 rows per SM: chunks of one 8-row
-    block), the last band has no end."""
+    ``BACKWARD_BANDS`` band of the backward ``role`` (``bwd_bf16`` or
+    ``bwd_f32``) on ``arch`` with ``sm_count`` SMs that runs at least one row
+    count, in order: a band runs the rows past the ends of the bands before it
+    up to its own end (:func:`_band_end`); the last band has no end."""
     bands = []
-    first = 1
-    for last, band in BACKWARD_BANDS[arch][role]:
-        end = last
-        if last == ONE_WAVE:
-            end = 64 * sm_count
-            assert _chunks(end) <= 8 * sm_count < _chunks(end + 1), sm_count
-        bands.append((band, first, end))
-        if end is not None:
-            first = end + 1
+    covered = 0
+    for last, band in loader.BACKWARD_BANDS[arch][role]:
+        end = _band_end(last, sm_count)
+        if end is None or end > covered:
+            bands.append((band, covered + 1, end))
+        if end is None:
+            break
+        covered = max(covered, end)
     return bands
 
 
-def _band_tokens(band: str, heads: int = 48) -> int:
-    """The fewest tokens of ``heads`` heads whose rows lie in the
-    ``BACKWARD_BANDS`` band of the backward role ``band`` (``bwd_bf16_long``,
-    for one) on this device."""
+def _device_bands(role: str) -> list[tuple[str, int, int | None]]:
+    """:func:`_backward_bands` of the backward ``role`` on this device."""
     device_index = torch.cuda.current_device()
-    arch = loader.device_arch(device_index)
+    return _backward_bands(
+        loader.device_arch(device_index), role, loader.device_sm_count(device_index)
+    )
+
+
+def _device_band(band: str) -> tuple[int, int | None] | None:
+    """``(first rows, last rows or None)`` of the ``BACKWARD_BANDS`` band of
+    the backward role ``band`` (``bwd_bf16_rc``, for one) on this device
+    (:func:`_device_bands`); ``None`` where this device routes no such band."""
     role = "bwd_f32" if band.startswith("bwd_f32") else "bwd_bf16"
-    sm_count = loader.device_sm_count(device_index)
-    for name, first, last in _backward_bands(arch, role, sm_count):
+    for name, first, last in _device_bands(role):
         if name == band:
-            tokens = -(-first // heads)
-            assert last is None or tokens * heads <= last, (arch, band, heads)
-            return tokens
-    raise AssertionError(f"{arch} has no {band} band")
+            return first, last
+    return None
+
+
+def _band_tokens(band: str, heads: int = 48) -> int | None:
+    """The fewest tokens of ``heads`` heads whose rows lie in the
+    ``BACKWARD_BANDS`` band of the backward role ``band`` (``bwd_bf16_rc``,
+    for one) on this device; ``None`` where this device routes no such band
+    or no such count of rows lies in it."""
+    found = _device_band(band)
+    if found is None:
+        return None
+    first, last = found
+    tokens = -(-first // heads)
+    return tokens if last is None or tokens * heads <= last else None
+
+
+def _band_shape(band: str) -> tuple[int, int] | None:
+    """``(T, H)`` of the fewest rows in the ``BACKWARD_BANDS`` band of the
+    backward role ``band`` on this device as tokens of 48 heads, else (a
+    band narrower than that) the band's first rows as tokens of one head;
+    ``None`` where this device routes no such band."""
+    tokens = _band_tokens(band)
+    if tokens is not None:
+        return tokens, 48
+    tokens = _band_tokens(band, heads=1)
+    return None if tokens is None else (tokens, 1)
+
+
+def _varies(name: str) -> bool:
+    """Whether the BF16 weight gradient of backward module ``name`` may vary
+    in its last bits from run to run: a row-claims backward's (``_rc`` and
+    ``_rc_mid``), whose CTAs claim 16-row blocks at run time and add the FP32
+    runs of their rows with FP64 atomics.  Every other backward repeats its
+    bits: the small-row backwards sum on chip in a fixed order, the static and
+    the claimed backwards add their partials exactly, as integers."""
+    return loader.MODULES[name]["grid_rule"]["kind"] == "row_claims"
+
+
+def _dw_varies(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> bool:
+    """Whether the ``dw_dtype`` weight gradient of ``rows`` rows on this
+    device may vary in its last bits from run to run (:func:`_varies` of the
+    module ``module_for_rows`` runs; never for an FP32 weight gradient)."""
+    return _varies(_backward_module(rows, dw_dtype))
+
+
+def _expected_layout(arch: str, role: str) -> tuple:
+    """The workspace layout ``(buffer, byte offset, elements)`` of the
+    backward module that ``role`` routes on ``arch``: ``ROW_CLAIMS_LAYOUT``
+    for a row-claims backward, the layout of its slots (``BACKWARD_SLOTS``,
+    ``WORKSPACE_LAYOUTS``) for a static or a claimed backward, none for a
+    small-row backward (one cluster)."""
+    if role in ROW_CLAIMS_GRID_RULES:
+        return ROW_CLAIMS_LAYOUT
+    if role in BACKWARD_SLOTS[arch]:
+        return WORKSPACE_LAYOUTS[BACKWARD_SLOTS[arch][role]]
+    return ()
 
 
 def fp64_reference(dy, x, z, w, eps):
@@ -351,6 +448,17 @@ def assert_dw_within(dw, want, mag, *, what):
         f"{what}: {int(bad.sum())} of {bad.numel()} columns beyond the budget; "
         f"worst excess {(err - bound).max().item():.3e}"
     )
+
+
+def assert_dw_repeats(dw, first, want, mag, *, varies, what):
+    """A weight gradient ``dw`` of a call that ran before as ``first``: the
+    same bits where its band repeats them; where it may vary in its last bits
+    (``varies``: a row-claims band, :func:`_varies`) within the budget of the
+    reference ``want`` (:func:`assert_dw_within`) instead."""
+    if varies:
+        assert_dw_within(dw, want, mag, what=what)
+    else:
+        assert torch.equal(dw, first), f"{what}: not the bits of the first call"
 
 
 def make(T, H, *, layout="contiguous", data="normal", seed=0, device="cuda"):
@@ -426,11 +534,19 @@ def check_eager(y, dx, dz, dw, x, z, w, dy, eps):
 def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS):
     """``repeats`` forward and backward launches against the FP64 reference
     and the eager operation (:func:`check_eager`, the first launch),
-    every output the same bits on every launch, the weight gradient also when
-    accumulated into a nonzero buffer; returns ``(y, dx, dz, dw)`` of the first
+    ``y``, ``dx`` and ``dz`` the same bits on every launch, and so the weight
+    gradient, also when accumulated into a nonzero buffer, where its band
+    repeats it (:func:`_dw_varies`); in a row-claims band every launch's
+    weight gradient, alone and accumulated, lies within the FP64 budget and
+    the eager operation's instead; returns ``(y, dx, dz, dw)`` of the first
     launch."""
     y64, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, eps)
     mag = magnitudes(dy, x, z, eps)
+    varies = _dw_varies(x.numel() // D, dw_dtype)
+    dw_eager = eager_grads(dy, x, z, w, eps)[3] if varies else None
+    repeated = (
+        ("y", "dx", "dz") if varies else ("y", "dx", "dz", "dw", "accumulated dw")
+    )
 
     def out(fill=None):
         if fill is not None:
@@ -458,13 +574,20 @@ def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS):
             assert_dw_within(dw, dw64, mag, what="dw vs FP64")
             assert_dw_within(main, 0.25 + dw64, mag, what="accumulated dw vs FP64")
             check_eager(y, dx, dz, dw, x, z, w, dy, eps)
+        elif varies:
+            assert_dw_within(dw, dw64, mag, what=f"dw vs FP64, launch {i}")
+            assert_dw_within(dw, dw_eager, mag, what=f"dw vs eager, launch {i}")
+            assert_dw_within(
+                main, 0.25 + dw64, mag, what=f"accumulated dw vs FP64, launch {i}"
+            )
         for what, got, want in zip(
             ("y", "dx", "dz", "dw", "accumulated dw"),
             (y, dx, dz, dw, main),
             first,
             strict=True,
         ):
-            assert torch.equal(got, want), f"{what}: launch {i} vs the first launch"
+            if what in repeated:
+                assert torch.equal(got, want), f"{what}: launch {i} vs the first launch"
     return first[:4]
 
 
@@ -480,46 +603,63 @@ def test_layouts(layout):
     check_all(x, z, w, dy, EPS)
 
 
-# Inputs in the bands of the second static (``_long``) and the claimed
-# (``_mid``) backward: (T, H, layout, tier).  On sm_100a and sm_103a those
-# programs warm a block's rows in L2 with one bulk prefetch per tensor only
-# where dy, x and z share one packed row stride (head stride 128, token stride
-# H * 128); the other layouts here (``z`` and ``dy`` the gate columns of wider
-# projections, ``x`` and ``z`` head-major, one token of many heads, whose
-# token stride is passed as 0) fall back to a prefetch per thread.  65984 rows
-# lie in the ``_long`` band (49489 to 245760 rows; on sm_107a past 64 rows per
-# SM up to 98352), 262208 rows in the ``_mid`` band; packed rows of the same
-# counts too.
+# Inputs in the bands of the backwards past the small-row and the static bands
+# (band, layout), at the fewest tokens of 64 heads in the band on this device
+# (``_bulk_band_shape``; ``one_token``: one token of as many heads as the
+# band's first rows).  On sm_100a and sm_103a the claimed backwards (``_mid``)
+# and the row-claims mid backward (``bwd_bf16_rc_mid``) warm a block's rows in
+# L2 with one bulk prefetch per tensor only where dy, x and z share one packed
+# row stride (head stride 128, token stride H * 128); the other layouts here
+# (``z`` and ``dy`` the gate columns of wider projections, ``x`` and ``z``
+# head-major) fall back to a prefetch per thread.
+# One token of many heads (its token stride passed as 0) and contiguous tokens
+# are packed rows.  The row-claims backward (``bwd_bf16_rc``) warms no rows
+# and runs the same checks.
+BULK_BANDS = ("bwd_bf16_rc", "bwd_bf16_rc_mid", "bwd_bf16_mid", "bwd_f32_mid")
 BULK_BAND_CASES = [
-    pytest.param(1031, 64, "projection", "_long", id="1031x64-projection"),
-    pytest.param(1031, 64, "head_major", "_long", id="1031x64-head_major"),
-    pytest.param(1, 65984, "contiguous", "_long", id="1x65984"),
-    pytest.param(1031, 64, "contiguous", "_long", id="1031x64"),
-    pytest.param(4097, 64, "projection", "_mid", id="4097x64-projection"),
-    pytest.param(4097, 64, "head_major", "_mid", id="4097x64-head_major"),
-    pytest.param(1, 262208, "contiguous", "_mid", id="1x262208"),
-    pytest.param(4097, 64, "contiguous", "_mid", id="4097x64"),
+    pytest.param(band, layout, id=f"{band}-{layout}")
+    for band in BULK_BANDS
+    for layout in ("projection", "head_major", "one_token", "contiguous")
 ]
 
 
-@pytest.mark.parametrize("T,H,layout,tier", BULK_BAND_CASES)
-@pytest.mark.parametrize(
-    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
-)
-def test_layouts_in_the_long_and_claimed_backward_bands(
-    T, H, layout, tier, dw_dtype, launches
-):
-    """``BULK_BAND_CASES``: the second static or the claimed backward of this
-    device runs the rows (``module_for_rows``), within the FP64 budgets and
-    the eager operation's, every output the same bits on every launch
-    (``check_all``), and ``dx``, ``dz`` and ``dw`` the bits of the same rows
-    packed as ``[T * H, 1, 128]`` (which the bulk prefetch warms on sm_100a and
-    sm_103a; sm_107a's programs take no bulk prefetch and run the same
-    checks)."""
+def _bulk_band_shape(band: str, layout: str) -> tuple[int, int, str] | None:
+    """``(T, H, make's layout)`` of the ``BULK_BAND_CASES`` case ``(band,
+    layout)`` on this device: the fewest tokens (at least 2) of 64 heads whose
+    rows lie in the ``BACKWARD_BANDS`` band of the backward role ``band``, or
+    for ``one_token`` one contiguous token of the band's first rows of heads;
+    ``None`` where this device routes no such band or no such shape lies in
+    it."""
+    found = _device_band(band)
+    if found is None:
+        return None
+    first, last = found
+    if layout == "one_token":
+        return 1, first, "contiguous"
+    tokens = max(2, -(-first // 64))
+    if last is not None and tokens * 64 > last:
+        return None
+    return tokens, 64, layout
+
+
+@pytest.mark.parametrize("band,layout", BULK_BAND_CASES)
+def test_layouts_in_the_row_claims_and_claimed_backward_bands(band, layout, launches):
+    """``BULK_BAND_CASES``: the band's program runs the rows
+    (``module_for_rows``), within the FP64 budgets and the eager operation's,
+    ``y``, ``dx`` and ``dz`` (and ``dw`` where the band repeats it) the same
+    bits on every launch (``check_all``), and ``dx`` and ``dz`` the bits of the
+    same rows packed as ``[T * H, 1, 128]`` (which the bulk prefetch warms on
+    sm_100a and sm_103a; sm_107a's programs take no bulk prefetch and run the
+    same checks), so is ``dw`` where the band repeats it, else within the FP64
+    budget."""
+    shape = _bulk_band_shape(band, layout)
+    if shape is None:
+        pytest.skip(f"this device routes no {band} band with a {layout} input")
+    T, H, layout = shape
     rows = T * H
-    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    dw_dtype = torch.float32 if band.startswith("bwd_f32") else torch.bfloat16
     name = _backward_module(rows, dw_dtype)
-    assert name == _routes()[role + tier], (rows, name)
+    assert name == _routes()[band], (rows, name)
     x, z, w, dy = make(T, H, layout=layout, seed=90)
     _, dx, dz, dw = check_all(x, z, w, dy, EPS, dw_dtype=dw_dtype)
     fwd = _forward_module(rows, _packed(T, H, layout))
@@ -529,8 +669,12 @@ def test_layouts_in_the_long_and_claimed_backward_bands(
         gw = torch.empty(D, dtype=dw_dtype, device=x.device)
     packed = [t.contiguous().view(rows, 1, D) for t in (dy, x, z)]
     again = backward(*packed, w, EPS, grad_weight=gw)
-    for what, a, b in zip(("dx", "dz", "dw"), again, (dx, dz, dw), strict=True):
+    for what, a, b in zip(("dx", "dz"), again, (dx, dz), strict=True):
         assert torch.equal(a.reshape(-1, D), b.reshape(-1, D)), (what, layout)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    assert_dw_repeats(
+        again[2], dw, dw64, mag, varies=_varies(name), what=f"packed dw ({layout})"
+    )
 
 
 @pytest.mark.parametrize("data", EDGE_DATA)
@@ -558,8 +702,16 @@ def test_fp32_weight_gradient(T, H):
 
 
 def test_weight_gradient_accumulation():
+    """Two backwards accumulating into one FP32 or BF16 ``grad_weight``: every
+    repeat within the budget of two roundings, and the same bits on every
+    repeat but for a BF16 accumulator in a row-claims band
+    (:func:`_dw_varies`); autograd's ``.grad`` over two microbatches the sums
+    of the functional backward's gradients (``dw`` where its band repeats it;
+    in a row-claims band within the budget of two BF16 weight gradients, as
+    everywhere)."""
     x, z, w, dy = make(1031, 48, seed=6)
     x2, z2, _, dy2 = make(1031, 48, seed=7)
+    varies = _dw_varies(1031 * 48)
     dw64 = fp64_reference(dy, x, z, w, EPS)[3]
     dw64b = fp64_reference(dy2, x2, z2, w, EPS)[3]
     mag = magnitudes(dy, x, z, EPS) + magnitudes(dy2, x2, z2, EPS)
@@ -574,11 +726,13 @@ def test_weight_gradient_accumulation():
             for args in ((dy, x, z), (dy2, x2, z2)):
                 backward(*args, w, EPS, grad_weight=main, accumulate_grad_weight=True)
             results.append(main)
-        assert ((main.double() - want).abs() <= bound).all(), dtype
+        for main in results:
+            assert ((main.double() - want).abs() <= bound).all(), dtype
         if dtype == torch.float32:
             assert torch.allclose(main.double(), want, rtol=1e-5, atol=1e-3)
-        for other in results[1:]:
-            assert torch.equal(other, results[0]), dtype
+        if dtype == torch.float32 or not varies:
+            for other in results[1:]:
+                assert torch.equal(other, results[0]), dtype
     # autograd accumulation into .grad over two microbatches: the sums of the
     # functional backward's gradients
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
@@ -587,7 +741,8 @@ def test_weight_gradient_accumulation():
     dx1, dz1, dw1 = backward(dy, x, z, w, EPS)
     assert torch.equal(xa.grad, dx1 + dx1)
     assert torch.equal(za.grad, dz1 + dz1)
-    assert torch.equal(wa.grad, dw1 + dw1)
+    if not varies:
+        assert torch.equal(wa.grad, dw1 + dw1)
     # Two BF16 weight gradients within budget, summed in BF16 by autograd.
     mag1 = magnitudes(dy, x, z, EPS)
     err = (wa.grad.double() - 2 * dw64).abs()
@@ -609,8 +764,8 @@ def test_compute_grad_weight_false_touches_no_weight_state(monkeypatch):
     assert torch.equal(main, torch.full_like(main, 3.0))
     assert not bool(ws.any())
     # without a workspace: the launch still takes the arrival ticket (and the
-    # claimed backward claims its chunks), on the stream's workspace of the
-    # BF16 module, left zero
+    # claimed and the row-claims backwards claim their chunks or blocks), on
+    # the stream's workspace of the BF16 bands' module (its buffers, left zero)
     monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
     dx, dz, dw = backward(dy, x, z, w, EPS, compute_grad_weight=False)
     assert dw is None
@@ -623,7 +778,9 @@ def test_compute_grad_weight_false_touches_no_weight_state(monkeypatch):
     )
     assert list(pkg._STREAM_WORKSPACES) == [key]
     views = pkg._STREAM_WORKSPACES[key]
-    assert sorted(views) == ["dw_done", "dw_spec", "dw_win"]
+    arch = loader.device_arch(torch.cuda.current_device())
+    layout = _expected_layout(arch, loader.MODULES[key[2]]["role"])
+    assert layout and sorted(views) == sorted(b for b, _, _ in layout), key
     # (through bytes: uint64 tensors take few operations)
     assert not any(bool(view.view(torch.uint8).any()) for view in views.values())
     # autograd with a weight that needs no gradient
@@ -633,73 +790,77 @@ def test_compute_grad_weight_false_touches_no_weight_state(monkeypatch):
     assert w.grad is None
 
 
-@pytest.mark.parametrize("ctas", [1, 3, 7])
-@pytest.mark.parametrize(
-    "tier",
-    ["bwd_bf16", "bwd_bf16_long", "bwd_bf16_mid"],
-    ids=["static", "long", "claimed"],
+# The band roles of the backwards that run on a workspace: the static
+# backwards (the call roles), the row-claims backwards of a BF16 weight
+# gradient and the claimed backwards.
+GRID_BANDS = (
+    "bwd_bf16",
+    "bwd_f32",
+    "bwd_bf16_rc",
+    "bwd_bf16_rc_mid",
+    "bwd_bf16_mid",
+    "bwd_f32_mid",
 )
-def test_backward_at_grids_smaller_than_the_chunks(tier, ctas, launches, monkeypatch):
-    """The host's grid forced to ``ctas`` CTAs for ``T * 48`` rows of the
-    static backward (``T = 129``: 774 chunks of one 8-row block, in its band
-    on every architecture while it has 97 SMs or more), and of the second
-    static and the claimed backward (the fewest tokens of 48 heads in their
-    ``BACKWARD_BANDS`` bands on this device), so every CTA runs many chunks:
-    every output (``dx``, ``dz``, BF16 and FP32 ``dw``, alone and accumulated)
-    the bits of the host's grid; ``compute_grad_weight=False`` leaves
-    ``grad_weight`` as it is; the workspace is zero after every launch."""
-    T = 129 if tier == "bwd_bf16" else _band_tokens(tier)
-    rows = T * 48
-    role = loader.MODULES[_backward_module(rows)]["role"]
-    if role != tier:
-        pytest.skip(f"{rows} rows run {role} on this device's SMs, not {tier}")
-    x, z, w, dy = make(T, 48, seed=12)
+
+
+@pytest.mark.parametrize("ctas", [1, 3, 7])
+@pytest.mark.parametrize("band", GRID_BANDS)
+def test_backward_at_grids_smaller_than_the_chunks(band, ctas, launches, monkeypatch):
+    """The host's grid forced to ``ctas`` CTAs for the fewest rows of the
+    ``BACKWARD_BANDS`` band of ``band`` on this device (:func:`_band_shape`;
+    skipped where this device routes no such band), so every CTA runs many
+    chunks or row blocks: ``dx`` and ``dz`` the bits of the host's grid; the
+    weight gradient of the band's dtype, alone and accumulated, within the
+    FP64 budget, and the bits of the host's grid where the band repeats them
+    (:func:`assert_dw_repeats`); ``compute_grad_weight=False`` (the BF16 bands'
+    module) leaves ``grad_weight`` as it is; the workspace is zero after every
+    launch."""
+    shape = _band_shape(band)
+    if shape is None:
+        pytest.skip(f"this device routes no {band} band")
+    T, H = shape
+    rows = T * H
+    dtype = torch.float32 if band.startswith("bwd_f32") else torch.bfloat16
+    name = _backward_module(rows, dtype)
+    assert name == _routes()[band], (rows, name)
+    varies = _varies(name)
+    x, z, w, dy = make(T, H, seed=12)
     dw64 = fp64_reference(dy, x, z, w, EPS)[3]
     mag = magnitudes(dy, x, z, EPS)
-    want = {}
-    for dtype in (torch.bfloat16, torch.float32):
-        dw = torch.empty(D, dtype=dtype, device="cuda")
-        dx_d, dz_d, _ = backward(dy, x, z, w, EPS, grad_weight=dw)
-        main = torch.full((D,), 0.25, dtype=dtype, device="cuda")
-        backward(dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True)
-        want[dtype] = dw, main
+    dw_d = torch.empty(D, dtype=dtype, device="cuda")
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS, grad_weight=dw_d)
+    main_d = torch.full((D,), 0.25, dtype=dtype, device="cuda")
+    backward(dy, x, z, w, EPS, grad_weight=main_d, accumulate_grad_weight=True)
     ws = workspace_for(rows, x.device)
     monkeypatch.setattr(pkg, "backward_ctas", lambda name, rows, sm_count: ctas)
     launches.clear()
-    for dtype in (torch.bfloat16, torch.float32):
-        what = f"{dtype} at {ctas} CTAs"
-        dw = torch.empty(D, dtype=dtype, device="cuda")
-        dx, dz, _ = backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
-        assert torch.equal(dw, want[dtype][0]), f"dw {what}"
-        assert_dw_within(dw, dw64, mag, what=f"dw {what}")
-        assert not bool(ws.any()), what
-        main = torch.full((D,), 0.25, dtype=dtype, device="cuda")
-        backward(
-            dy,
-            x,
-            z,
-            w,
-            EPS,
-            grad_weight=main,
-            accumulate_grad_weight=True,
-            workspace=ws,
-        )
-        assert torch.equal(main, want[dtype][1]), f"accumulated dw {what}"
-        assert_dw_within(main, 0.25 + dw64, mag, what=f"accumulated dw {what}")
-        assert not bool(ws.any()), what
-        main = torch.full((D,), 3.0, dtype=dtype, device="cuda")
-        dx, dz, dw = backward(
-            dy, x, z, w, EPS, grad_weight=main, compute_grad_weight=False, workspace=ws
-        )
-        assert dw is None
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
-        assert torch.equal(main, torch.full_like(main, 3.0)), what
-        assert not bool(ws.any()), what
-    # a call with compute_grad_weight=False runs the BF16 module whatever the
-    # dtype of grad_weight (it writes no weight gradient)
-    bf16, f32 = _backward_module(rows), _backward_module(rows, torch.float32)
-    assert launches == [bf16, bf16, bf16, f32, f32, bf16], launches
+    what = f"{band} at {ctas} CTAs"
+    dw = torch.empty(D, dtype=dtype, device="cuda")
+    dx, dz, _ = backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
+    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
+    assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"dw {what}")
+    assert_dw_within(dw, dw64, mag, what=f"dw {what}")
+    assert not bool(ws.any()), what
+    main = torch.full((D,), 0.25, dtype=dtype, device="cuda")
+    backward(
+        dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True, workspace=ws
+    )
+    assert_dw_repeats(
+        main, main_d, 0.25 + dw64, mag, varies=varies, what=f"accumulated dw {what}"
+    )
+    assert_dw_within(main, 0.25 + dw64, mag, what=f"accumulated dw {what}")
+    assert not bool(ws.any()), what
+    main = torch.full((D,), 3.0, dtype=dtype, device="cuda")
+    dx, dz, dw = backward(
+        dy, x, z, w, EPS, grad_weight=main, compute_grad_weight=False, workspace=ws
+    )
+    assert dw is None
+    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
+    assert torch.equal(main, torch.full_like(main, 3.0)), what
+    assert not bool(ws.any()), what
+    # a call with compute_grad_weight=False runs the BF16 bands' module
+    # whatever the dtype of grad_weight (it writes no weight gradient)
+    assert launches == [name, name, _backward_module(rows)], launches
 
 
 @pytest.mark.parametrize("shape", [(0, 48, D), (5, 0, D), (0, D)])
@@ -726,14 +887,15 @@ def test_empty_work_keeps_the_accumulator(shape, launches):
 def test_workspace_reused_across_shapes_without_reset():
     """One zero-filled byte workspace of the architecture's
     ``WORKSPACE_BYTES`` (the largest of its backward modules' workspaces, each
-    module's layout of its slots over the first bytes) serves every backward
-    module and row count: each backward on it is within the FP64 budgets, the
-    bits of the same call on the stream's own workspace, and leaves it zero.
-    The shapes run every backward program of the architecture (on sm_100a and
-    sm_103a 49488 rows the static backward and 65552 the second static
-    backward; on sm_107a 6192 rows the static backward, 49488 and 65552 the
-    second static backward; 1449264 rows the claimed backward), a small-row
-    backward between them."""
+    module's layout over the first bytes: a static or a claimed backward's by
+    its slots, a row-claims backward's ``ROW_CLAIMS_LAYOUT``) serves every
+    backward module and row count: each backward on it is within the FP64
+    budgets, ``dx`` and ``dz`` the bits of the same call on the stream's own
+    workspace, so is the weight gradient where its band repeats it
+    (:func:`assert_dw_repeats`), and leaves it zero.  The shapes run every
+    ``BACKWARD_BANDS`` band of both weight-gradient dtypes on this device
+    (the fewest rows of each band no listed shape runs, :func:`_band_shape`),
+    the small-row backwards among them."""
     device = torch.device("cuda")
     ws = workspace_for(1, device)
     assert ws.dtype == torch.uint8 and ws.is_contiguous() and not bool(ws.any())
@@ -746,17 +908,19 @@ def test_workspace_reused_across_shapes_without_reset():
     for role, name in loader.ROUTES[arch].items():
         if not role.startswith("bwd"):
             continue
+        layout = _expected_layout(arch, role)
+        assert loader.workspace_layout(name) == layout, role
+        module_bytes = loader.workspace_bytes(name)
         if role in loader.BAND_ROLES:
-            assert loader.workspace_layout(name) == (), role
-            assert loader.workspace_bytes(name) == 0, role
+            assert layout == () and module_bytes == 0, role
+        elif role in ROW_CLAIMS_GRID_RULES:
+            assert module_bytes == ROW_CLAIMS_WORKSPACE_BYTES, role
         else:
             slots = BACKWARD_SLOTS[arch][role]
-            assert loader.workspace_layout(name) == WORKSPACE_LAYOUTS[slots], role
-            module_bytes = loader.workspace_bytes(name)
             assert module_bytes == MODULE_WORKSPACE_BYTES[slots], role
-            largest = max(largest, module_bytes)
+        largest = max(largest, module_bytes)
     assert largest == nbytes, (arch, largest, nbytes)
-    cases = (
+    cases = [
         (1031, 48, torch.bfloat16, False),
         (7, 48, torch.float32, False),
         (4097, 16, torch.bfloat16, False),
@@ -764,11 +928,22 @@ def test_workspace_reused_across_shapes_without_reset():
         (30193, 48, torch.bfloat16, False),
         (33, 7, torch.float32, True),
         (129, 48, torch.float32, False),
-    )
+    ]
+    bands = {
+        band for role in ("bwd_bf16", "bwd_f32") for band, _, _ in _device_bands(role)
+    }
+    listed = {
+        loader.MODULES[_backward_module(T * H, dtype)]["role"]
+        for T, H, dtype, _ in cases
+    }
+    for band in sorted(bands - listed):
+        T, H = _band_shape(band)
+        dtype = torch.float32 if band.startswith("bwd_f32") else torch.bfloat16
+        cases.append((T, H, dtype, False))
     ran = set()
     for i, (T, H, dtype, accumulate) in enumerate(cases):
-        role = loader.MODULES[_backward_module(T * H, dtype)]["role"]
-        ran.add(role.removeprefix("bwd_bf16").removeprefix("bwd_f32"))
+        name = _backward_module(T * H, dtype)
+        ran.add(loader.MODULES[name]["role"])
         x, z, w, dy = make(T, H, seed=20 + i)
         start = 0.5 if accumulate else 0.0
         gw = (
@@ -793,17 +968,25 @@ def test_workspace_reused_across_shapes_without_reset():
         assert_bf16_close(dz, dz64, what=f"dz T={T} H={H}")
         assert dw.dtype == dtype
         want = dw64 + start
-        assert_dw_within(
-            dw, want, magnitudes(dy, x, z, EPS), what=f"dw T={T} H={H} {dtype}"
-        )
-        # the same call on the stream's workspace: the same bits
+        mag = magnitudes(dy, x, z, EPS)
+        assert_dw_within(dw, want, mag, what=f"dw T={T} H={H} {dtype}")
+        # the same call on the stream's workspace: the same bits (the weight
+        # gradient within the budget where its band may vary it)
         gw2 = None if gw is None else torch.full_like(gw, start)
         again = backward(
             dy, x, z, w, EPS, grad_weight=gw2, accumulate_grad_weight=accumulate
         )
-        for a, b in zip(again, (dx, dz, dw), strict=True):
+        for a, b in zip(again[:2], (dx, dz), strict=True):
             assert torch.equal(a, b), (T, H, dtype)
-    assert {"", "_long", "_mid"} <= ran, (arch, ran)
+        assert_dw_repeats(
+            again[2],
+            dw,
+            want,
+            mag,
+            varies=_varies(name),
+            what=f"dw on the stream's workspace T={T} H={H} {dtype}",
+        )
+    assert ran == bands, (arch, ran, bands)
 
 
 def _unfit_workspaces(nbytes: int) -> list[torch.Tensor]:
@@ -839,7 +1022,8 @@ def test_reset_workspace_clears_nonzero_scratch():
     backward) is zeroed by ``reset_workspace``; backward launches at two
     different shapes and weight-gradient dtypes then run on it in sequence,
     within the FP64 budget and the bits of the same calls on a fresh
-    workspace, and leave it zero."""
+    workspace (the weight gradient within the budget instead where its band
+    may vary it, :func:`assert_dw_repeats`), and leave it zero."""
     device = torch.device("cuda")
     ws = workspace_for(1, device)
     g = torch.Generator(device="cuda").manual_seed(60)
@@ -849,8 +1033,15 @@ def test_reset_workspace_clears_nonzero_scratch():
     # a stale arrival ticket and a stale claim count, no byte of them zero, in
     # the layout of each backward module of the architecture
     arch = loader.device_arch(torch.cuda.current_device())
-    for slots in sorted(set(BACKWARD_SLOTS[arch].values())):
-        offset = dict((b, o) for b, o, _ in WORKSPACE_LAYOUTS[slots])["dw_done"]
+    offsets = {
+        offset
+        for role in loader.ROUTES[arch]
+        if role.startswith("bwd")
+        for buffer, offset, _ in _expected_layout(arch, role)
+        if buffer == "dw_done"
+    }
+    assert offsets, arch
+    for offset in sorted(offsets):
         ws[offset : offset + 8].view(torch.int32).fill_(0x03030303)
     assert bool(ws.ne(0).all())
     reset_workspace(ws)
@@ -872,15 +1063,22 @@ def test_reset_workspace_clears_nonzero_scratch():
         assert_bf16_close(dx, dx64, what=f"dx T={T} H={H}")
         assert_bf16_close(dz, dz64, what=f"dz T={T} H={H}")
         assert dw.dtype == dtype
-        assert_dw_within(
-            dw, dw64, magnitudes(dy, x, z, EPS), what=f"dw T={T} H={H} {dtype}"
-        )
+        mag = magnitudes(dy, x, z, EPS)
+        assert_dw_within(dw, dw64, mag, what=f"dw T={T} H={H} {dtype}")
         gw2 = None if gw is None else torch.empty_like(gw)
         fresh = backward(
             dy, x, z, w, EPS, grad_weight=gw2, workspace=workspace_for(1, device)
         )
-        for a, b in zip(fresh, (dx, dz, dw), strict=True):
+        for a, b in zip(fresh[:2], (dx, dz), strict=True):
             assert torch.equal(a, b), (T, H)
+        assert_dw_repeats(
+            fresh[2],
+            dw,
+            dw64,
+            mag,
+            varies=_dw_varies(T * H, dtype),
+            what=f"dw on a fresh workspace T={T} H={H} {dtype}",
+        )
         torch.cuda.synchronize()
         assert not bool(ws.any()), (T, H)
 
@@ -950,10 +1148,11 @@ def test_two_streams_with_their_own_workspaces():
     for i in range(2):
         dx_d, dz_d, dw_d = refs[i]
         dw64, mag = references[i]
+        varies = _dw_varies(cases[i][0].numel() // D)
         assert_dw_within(dw_d, dw64, mag, what=f"stream {i} dw")
         for dx, dz, dw in outputs[i]:
             assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), i
-            assert torch.equal(dw, dw_d), i
+            assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"stream {i} dw")
         assert not bool(workspaces[i].any()), i
 
 
@@ -979,9 +1178,10 @@ def test_side_stream_and_no_host_sync():
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     assert torch.equal(y, want_y)
+    varies = _dw_varies(x.numel() // D)
     for dx, dz, dw in (got, fresh):
         assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
-        assert torch.equal(dw, dw_d)
+        assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what="side stream dw")
     assert not bool(ws.any())
 
 
@@ -1016,6 +1216,7 @@ def test_cuda_graph_capture_and_replay():
     total = torch.zeros(D, dtype=torch.float64, device="cuda")
     total_mag = torch.zeros(D, dtype=torch.float64, device="cuda")
     main_e = torch.zeros(D, dtype=torch.float32, device="cuda")
+    varies = _dw_varies(T * H)
     for k in range(3):
         xn, zn, _, dyn = make(T, H, seed=40 + k)
         xs.copy_(xn)
@@ -1024,13 +1225,15 @@ def test_cuda_graph_capture_and_replay():
         graph.replay()
         torch.cuda.synchronize()
         # the replay against eager launches on the same inputs: the same bits
+        # (the BF16 weight gradient within the budget where its band may vary
+        # it)
         assert torch.equal(y, forward(xn, zn, w, EPS)), k
         dx_e, dz_e, dw_e = backward(dyn, xn, zn, w, EPS)
         assert torch.equal(dx, dx_e) and torch.equal(dz, dz_e), k
-        assert torch.equal(dw, dw_e), k
+        dw64, mag = fp64_reference(dyn, xn, zn, w, EPS)[3], magnitudes(dyn, xn, zn, EPS)
+        assert_dw_repeats(dw, dw_e, dw64, mag, varies=varies, what=f"replay {k} dw")
         backward(dyn, xn, zn, w, EPS, grad_weight=main_e, accumulate_grad_weight=True)
         assert torch.equal(main, main_e), k
-        dw64, mag = fp64_reference(dyn, xn, zn, w, EPS)[3], magnitudes(dyn, xn, zn, EPS)
         assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
         assert not bool(ws.any()), k
         total += dw64
@@ -1106,13 +1309,14 @@ def test_capture_without_workspace_takes_a_reserve_workspace(reserve):
     taken = [ws for ws in ready if all(ws is not r for r in reserve["ready"])]
     assert len(taken) == 1 and len(reserve["ready"]) == len(ready) - 1
     ws = taken[0]
+    varies = _dw_varies(T * H)
     for k in range(3):
         backward(dy, x, z, w, EPS)  # an eager call between replays
         graph.replay()
         torch.cuda.synchronize()
         for dx, dz, dw in outs:
             assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
-            assert torch.equal(dw, dw_d), k
+            assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"replay {k}")
             assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
         assert not bool(ws.any()), k
         err = (main.double() - (k + 1) * dw64).abs()
@@ -1154,10 +1358,11 @@ def test_graphs_without_workspace_replay_together_on_two_streams(reserve):
     for i in range(2):
         dx_d, dz_d, dw_d = refs[i]
         dw64, mag = budgets[i]
+        varies = _dw_varies(cases[i][0].numel() // D)
         assert_dw_within(dw_d, dw64, mag, what=f"graph {i} dw")
         for dx, dz, dw in results[i]:
             assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), i
-            assert torch.equal(dw, dw_d), i
+            assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"graph {i} dw")
         assert not bool(taken[i].any()), i
 
 
@@ -1177,12 +1382,13 @@ def test_captured_calls_without_capture_ids_take_one_workspace_each(
         outs = [backward(dy, x, z, w, EPS) for _ in range(3)]
     taken = [ws for ws in ready if all(ws is not r for r in reserve["ready"])]
     assert len(taken) == 3
+    varies = _dw_varies(129 * 48)
     for k in range(2):
         graph.replay()
         torch.cuda.synchronize()
         for dx, dz, dw in outs:
             assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
-            assert torch.equal(dw, dw_d), k
+            assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"replay {k}")
             assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
         assert not any(bool(ws.any()) for ws in taken), k
 
@@ -1204,11 +1410,12 @@ def test_capture_with_no_ready_workspace_fills_in_the_graph(monkeypatch):
         dx, dz, dw = backward(dy, x, z, w, EPS)
     types = _graph_node_types(graph)
     assert types in (["MEMSET", "KERNEL"], ["KERNEL", "KERNEL"]), types
+    varies = _dw_varies(129 * 48)
     for k in range(3):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
-        assert torch.equal(dw, dw_d), k
+        assert_dw_repeats(dw, dw_d, dw64, mag, varies=varies, what=f"replay {k}")
         assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
 
 
@@ -1219,12 +1426,13 @@ def test_autograd_matches_functional_and_checkpoint(launches):
     dx_d, dz_d, dw_d = backward(dy, x, z, w, EPS)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
     assert_dw_within(dw_d, dw64, mag, what="dw vs FP64")
+    varies = _dw_varies(x.numel() // D)
 
     def check(y, xg, zg, wg, what):
         assert torch.equal(y, y_ref), what
         assert torch.equal(xg, dx_d) and torch.equal(zg, dz_d), what
         assert wg.dtype == torch.bfloat16, what
-        assert torch.equal(wg, dw_d), what
+        assert_dw_repeats(wg, dw_d, dw64, mag, varies=varies, what=what)
 
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     y = gated_rmsnorm(xa, za, wa, EPS)
@@ -1275,8 +1483,10 @@ def test_nondeterministic_mode_launches_this_package(launches):
     assert launches == [fwd, bf16, f32], launches
     for name in launches:
         assert name.startswith("cake_rmsnorm_silu_gate_train_"), name
-    assert loader.MODULES[bf16]["role"] in BACKWARD_TIER_ROLES["bwd_bf16"]
-    assert loader.MODULES[f32]["role"] in BACKWARD_TIER_ROLES["bwd_f32"]
+    arch = loader.device_arch(torch.cuda.current_device())
+    for name, role in ((bf16, "bwd_bf16"), (f32, "bwd_f32")):
+        bands = {band for _, band in loader.BACKWARD_BANDS[arch][role]}
+        assert loader.MODULES[name]["role"] in bands, (name, role)
     # A mode keyword is a TypeError before any launch.
     launches.clear()
     with pytest.raises(TypeError, match="deterministic"):
@@ -1319,19 +1529,42 @@ def test_empty_and_errors():
         )
 
 
+# Programs this package no longer ships: no record, ``build.json`` library or
+# source file names them.  The second static backwards of sm_100a and sm_103a
+# (9e8bf507c9563bb24193, 348592b55aa04975cc33) and of sm_107a (3 slots:
+# f5a44b8ba8bccb590488 of a BF16, de4ac875a4e07bb547fd of an FP32 weight
+# gradient), and the static backward of a BF16 weight gradient on sm_100a and
+# sm_103a (7e9f1c0cadbc18c390d2).
+REMOVED_PROGRAMS = tuple(
+    f"cake_rmsnorm_silu_gate_train_{digest}"
+    for digest in (
+        "9e8bf507c9563bb24193",
+        "348592b55aa04975cc33",
+        "7e9f1c0cadbc18c390d2",
+        "f5a44b8ba8bccb590488",
+        "de4ac875a4e07bb547fd",
+    )
+)
+
+
 def test_registry_records_reference_the_build_manifest():
-    """Every role ships one module per architecture (a band role at most one;
-    the static, the second static and the claimed backward of each
-    weight-gradient dtype on every architecture);
-    every module record names its ``build.json`` library (schema
-    ``cake-build/1``), whose entries carry the package's kernel and binding
-    sources and the precise-arithmetic flags; the static, the second static
+    """Every architecture routes the forward, the roles of its forward bands
+    and the roles of its ``BACKWARD_BANDS`` bands, and nothing else, one module
+    a role (the call role ``bwd_bf16`` on sm_107a only: no band of a BF16
+    weight gradient runs a static backward on sm_100a and sm_103a); every
+    module record names its ``build.json`` library (schema ``cake-build/1``),
+    whose entries carry the package's kernel and binding sources and the
+    precise-arithmetic flags; no record, library or source file names a
+    program the package no longer ships (``REMOVED_PROGRAMS``).  The static
     and the claimed backward records cut their rows into chunks by one grid
-    rule with no cut of their own (``BACKWARD_BANDS`` routes them), launch as
-    the static backward of their architecture, ship on the architectures that
+    rule (``CHUNK_GRID_RULE``), launch as the static backward of an FP32
+    weight gradient of their architecture, ship on the architectures that
     route them and carry the workspace buffers of their slots
-    (``BACKWARD_SLOTS``); the small-row backward records launch one cluster
-    and take no workspace."""
+    (``BACKWARD_SLOTS``); the row-claims backward records claim 16-row blocks
+    by their grid rule (``ROW_CLAIMS_GRID_RULES``), launch 256-thread CTAs,
+    take the FP64 column sums and the two words (``ROW_CLAIMS_LAYOUT``) and no
+    chunks, and ship on the architectures that route them; the small-row
+    backward records launch one cluster and take no workspace."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert (
@@ -1340,20 +1573,32 @@ def test_registry_records_reference_the_build_manifest():
     )
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
-    backward_tiers = {role for roles in BACKWARD_TIER_ROLES.values() for role in roles}
     for arch in loader.ARCHES:
         routed = set(loader.ROUTES[arch])
-        tiers = FORWARD_ROLES + tuple(sorted(backward_tiers))
-        assert (
-            set(loader.ROLES) <= routed <= set(loader.ROLES + tiers + loader.BAND_ROLES)
-        )
-        assert backward_tiers <= routed, arch
+        forward_bands = {
+            band
+            for table in (loader.FORWARD_BANDS, loader.STRIDED_FORWARD_BANDS)
+            for _, band in table[arch]
+        }
+        assert forward_bands <= set(FORWARD_ROLES), (arch, forward_bands)
+        assert set(loader.BACKWARD_BANDS[arch]) == {"bwd_bf16", "bwd_f32"}, arch
+        backward_bands = {
+            band for bands in loader.BACKWARD_BANDS[arch].values() for _, band in bands
+        }
+        assert routed == {"fwd"} | forward_bands | backward_bands, arch
+        assert "bwd_f32" in routed, arch
+        assert ("bwd_bf16" in routed) == (arch == "sm_107a"), arch
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             assert record["role"] == role and arch in record["arches"], (arch, role)
             assert loader.library_name(name, arch) in libraries, (arch, role, name)
     routed = {name for by_role in loader.ROUTES.values() for name in by_role.values()}
     assert set(loader.MODULES) == routed
+    sources = [path.name for path in (package / "csrc").iterdir()]
+    for program in REMOVED_PROGRAMS:
+        assert program not in loader.MODULES, program
+        assert not [lib for lib in libraries if lib.startswith(program)], program
+        assert not [s for s in sources if s.startswith(program)], program
     for name, record in loader.MODULES.items():
         assert name.startswith("cake_rmsnorm_silu_gate_train_"), name
         assert record["library"] == record["kernel"] == name
@@ -1374,12 +1619,25 @@ def test_registry_records_reference_the_build_manifest():
             assert clustered
             assert record["launch"]["cluster"] == (record["grid_rule"]["cluster"], 1, 1)
             assert {"dw", "weight_grad"} <= set(plan), name
-            assert not {"dw_win", "dw_spec", "dw_done"} & set(plan), name
+            assert not {"dw_win", "dw_sums", "dw_spec", "dw_done"} & set(plan), name
             assert record.get("workspace") is None
             assert loader.workspace_bytes(name) == 0
+        elif record["grid_rule"]["kind"] == "row_claims":
+            role = record["role"]
+            assert role in ROW_CLAIMS_GRID_RULES, name
+            assert record["grid_rule"] == ROW_CLAIMS_GRID_RULES[role], name
+            assert record["launch"]["block"] == (256, 1, 1)
+            assert {"dw_sums", "dw_done", "dw", "weight_grad"} <= set(plan), name
+            assert not {"dw_win", "dw_spec", "blocks_per_chunk"} & set(plan), name
+            routed_on = [a for a in loader.ARCHES if loader.ROUTES[a].get(role) == name]
+            assert record["arches"] == routed_on, (name, record["arches"])
+            assert record["workspace"] == {"dw_done": 2, "dw_sums": 4 * D}, name
+            assert loader.workspace_layout(name) == ROW_CLAIMS_LAYOUT, name
+            assert loader.workspace_bytes(name) == ROW_CLAIMS_WORKSPACE_BYTES, name
+            for arch in record["arches"]:
+                assert loader.workspace_bytes(name) <= WORKSPACE_BYTES[arch], name
         else:
             role = record["role"]
-            assert role in backward_tiers, name
             assert record["grid_rule"] == CHUNK_GRID_RULE, name
             assert record["launch"]["block"] == (128, 1, 1)
             assert {
@@ -1390,9 +1648,9 @@ def test_registry_records_reference_the_build_manifest():
                 "weight_grad",
                 "blocks_per_chunk",
             } <= set(plan), name
+            assert "dw_sums" not in plan, name
             routed_on = [a for a in loader.ARCHES if loader.ROUTES[a].get(role) == name]
             assert record["arches"] == routed_on, (name, record["arches"])
-            call_role = role.removesuffix("_long").removesuffix("_mid")
             for arch in record["arches"]:
                 slots = BACKWARD_SLOTS[arch][role]
                 assert record["workspace"] == {
@@ -1403,7 +1661,7 @@ def test_registry_records_reference_the_build_manifest():
                 assert loader.workspace_layout(name) == WORKSPACE_LAYOUTS[slots]
                 assert loader.workspace_bytes(name) == MODULE_WORKSPACE_BYTES[slots]
                 assert loader.workspace_bytes(name) <= WORKSPACE_BYTES[arch], name
-                static = loader.MODULES[loader.ROUTES[arch][call_role]]
+                static = loader.MODULES[loader.ROUTES[arch]["bwd_f32"]]
                 assert record["launch"] == static["launch"], (name, arch)
         for arch in record["arches"]:
             entry = libraries[loader.library_name(name, arch)]
@@ -1414,12 +1672,9 @@ def test_registry_records_reference_the_build_manifest():
                 assert (package / source).is_file(), (name, source)
 
 
-# (rows, SMs, blocks per chunk, chunks, CTAs) of the static, the second static
-# and the claimed backward: 8-row blocks, at most 8192 chunks of the fewest
-# consecutive blocks each (the deterministic backward's chunks), at most 8
-# CTAs per SM.  Among them the ends of the bands of every architecture: 49488
-# and 245760 rows on sm_100a and sm_103a, one wave of CTAs (64 rows per SM)
-# and 98352 rows on sm_107a.
+# (rows, SMs, blocks per chunk, chunks, CTAs) of the static and the claimed
+# backwards: 8-row blocks, at most 8192 chunks of the fewest consecutive
+# blocks each (the deterministic backward's chunks), at most 8 CTAs per SM.
 BACKWARD_GRIDS = [
     (1, 148, 1, 1, 1),
     (48, 148, 1, 6, 6),
@@ -1448,29 +1703,81 @@ BACKWARD_GRIDS = [
     ("rows", "sm_count", "per_chunk", "chunks", "ctas"), BACKWARD_GRIDS
 )
 def test_backward_cta_rule(rows, sm_count, per_chunk, chunks, ctas):
-    """The static, the second static and the claimed backward:
-    ``blocks_per_chunk = max(1, ceil(blocks / 8192))`` blocks a chunk,
-    ``ceil(blocks / blocks_per_chunk)`` chunks, ``min(chunks, 8 * SMs)`` CTAs
-    (each running chunks ``b``, ``b + grid``, ... in the static backwards;
-    claiming runs of chunks in the claimed one), so a smaller grid still
-    covers every row; each runs the rows of its ``BACKWARD_BANDS`` band
-    (``_tier_module``)."""
+    """The static and the claimed backwards (every routed module whose grid
+    rule is ``chunks``): ``blocks_per_chunk = max(1, ceil(blocks / 8192))``
+    blocks a chunk, ``ceil(blocks / blocks_per_chunk)`` chunks, ``min(chunks,
+    8 * SMs)`` CTAs (each running chunks ``b``, ``b + grid``, ... in the static
+    backwards; claiming runs of chunks in the claimed ones), so a smaller grid
+    still covers every row; each backward role runs the module of the
+    ``BACKWARD_BANDS`` band that holds the rows (:func:`_band_module`)."""
     assert _chunks(rows) == chunks, rows
     for arch in loader.ARCHES:
+        chunked = {
+            name
+            for name in loader.ROUTES[arch].values()
+            if loader.MODULES[name]["grid_rule"]["kind"] == "chunks"
+        }
+        assert chunked, arch
+        for name in sorted(chunked):
+            record = loader.MODULES[name]
+            assert loader.backward_chunks(name, rows) == (per_chunk, chunks)
+            got = loader.backward_ctas(name, rows, sm_count)
+            assert got == ctas == min(chunks, 8 * sm_count), (name, rows)
+            grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=got)
+            assert grid == (ctas, 1, 1)
         for role in ("bwd_bf16", "bwd_f32"):
-            for tier in BACKWARD_TIER_ROLES[role]:
-                name = loader.ROUTES[arch][tier]
-                record = loader.MODULES[name]
-                assert loader.backward_chunks(name, rows) == (per_chunk, chunks)
-                got = loader.backward_ctas(name, rows, sm_count)
-                assert got == ctas == min(chunks, 8 * sm_count), (name, rows)
-                grid = loader.launch_grid(
-                    record, rows=rows, sm_count=sm_count, ctas=got
-                )
-                assert grid == (ctas, 1, 1)
-            want = _tier_module(arch, role, rows, sm_count)
+            want = _band_module(arch, role, rows, sm_count)
             got = loader.module_for_rows(arch, role, rows, sm_count)
             assert got == want, (arch, role, rows)
+
+
+# (rows, SMs, 16-row blocks, CTAs at 4 CTAs per SM, CTAs at 5 CTAs per SM) of
+# the row-claims backwards.
+ROW_CLAIMS_GRIDS = [
+    (1, 148, 1, 1, 1),
+    (16, 148, 1, 1, 1),
+    (17, 148, 2, 2, 2),
+    (11 * 48, 148, 33, 33, 33),
+    (16 * 592, 148, 592, 592, 592),  # a block a CTA of one wave of 4 per SM
+    (16 * 592 + 1, 148, 593, 592, 593),
+    (16 * 740, 148, 740, 592, 740),  # a block a CTA of one wave of 5 per SM
+    (16 * 740 + 1, 148, 741, 592, 740),
+    (1031 * 48, 148, 3093, 592, 740),
+    (4097 * 48, 152, 12291, 608, 760),
+    (300 * 48, 212, 900, 848, 900),
+    (2**31 - 1, 216, 2**27, 864, 1080),
+]
+
+
+@pytest.mark.parametrize(
+    ("rows", "sm_count", "blocks", "ctas4", "ctas5"), ROW_CLAIMS_GRIDS
+)
+def test_row_claims_backward_cta_rule(rows, sm_count, blocks, ctas4, ctas5):
+    """The row-claims backwards (every routed module whose grid rule is
+    ``row_claims``): ``min(ceil(rows / 16), ctas_per_sm * SMs)`` CTAs, at most
+    one CTA a 16-row block (past one wave the CTAs claim the blocks from the
+    claim counter at run time), a grid of that many CTAs, and no chunks."""
+    assert -(-rows // 16) == blocks, rows
+    found = set()
+    for arch in loader.ARCHES:
+        for role, name in loader.ROUTES[arch].items():
+            record = loader.MODULES[name]
+            rule = record["grid_rule"]
+            if rule["kind"] != "row_claims":
+                continue
+            found.add(role)
+            assert rule == ROW_CLAIMS_GRID_RULES[role], (arch, role)
+            want = {4: ctas4, 5: ctas5}[rule["ctas_per_sm"]]
+            got = loader.backward_ctas(name, rows, sm_count)
+            assert got == want == min(blocks, rule["ctas_per_sm"] * sm_count), (
+                name,
+                rows,
+            )
+            grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=got)
+            assert grid == (want, 1, 1)
+            with pytest.raises(ValueError, match="chunks"):
+                loader.backward_chunks(name, rows)
+    assert found == set(ROW_CLAIMS_GRID_RULES), found
 
 
 # The forward bands of each architecture for packed rows: (last rows per SM,
@@ -1522,50 +1829,13 @@ STRIDED_FORWARD_BANDS = {
     ),
 }
 FORWARD_ROLES = ("fwd_tiny", "fwd_short", "fwd_mid", "fwd_long", "fwd_xlong")
-# The backward programs of each call role past its small-row bands, routed on
-# every architecture: the static backward (the call role), the second static
-# backward (``_long``) and the claimed backward (``_mid``); and their one grid
-# rule (no cut of their own: ``BACKWARD_BANDS`` gives each its rows).
-BACKWARD_TIER_ROLES = {
-    role: (role, f"{role}_long", f"{role}_mid") for role in ("bwd_bf16", "bwd_f32")
-}
+# The one grid rule of the static and the claimed backwards (no cut of their
+# own: ``BACKWARD_BANDS`` gives each its rows).
 CHUNK_GRID_RULE = {
     "chunk_limit": 8192,
     "ctas_per_sm": 8,
     "kind": "chunks",
     "rows_per_block": 8,
-}
-
-
-# The band end of a backward program that runs while every chunk has a CTA of
-# its grid (``chunks <= ctas_per_sm * sm_count``).
-ONE_WAVE = "one_wave"
-# The backward bands of each architecture and backward role: (last, role) in
-# order, a call of ``rows`` rows running the first band's role whose ``last``
-# holds: ``rows <= last`` for a row count, ``ONE_WAVE`` while every chunk has a
-# CTA (64 rows per SM), ``None`` (the last band) always.  The small-row band's
-# module is one cluster of 16 CTAs of the exact tiny backward whatever the rows
-# (its 4-team program up to its max_rows; past it the static backward, which
-# starts beside a kernel resident on every SM where an 8-team, 1024-thread
-# program does not); then the static backward, the second static backward and
-# the claimed backward: on sm_100a and sm_103a up to 49488 and 245760 rows and
-# past them, on sm_107a while every chunk has a CTA, up to 98352 rows and past
-# them.
-BACKWARD_BANDS = {
-    arch: {
-        role: (
-            (512, f"{role}_t512"),
-            (static_last, role),
-            (long_last, f"{role}_long"),
-            (None, f"{role}_mid"),
-        )
-        for role in ("bwd_bf16", "bwd_f32")
-    }
-    for arch, static_last, long_last in (
-        ("sm_100a", 49488, 245760),
-        ("sm_103a", 49488, 245760),
-        ("sm_107a", ONE_WAVE, 98352),
-    )
 }
 
 
@@ -1584,27 +1854,29 @@ def _tiny_end(arch, sm_count):
     return last * sm_count
 
 
+def _band_module(arch, role, rows, sm_count):
+    """The module of the backward ``role`` (``bwd_bf16`` or ``bwd_f32``) for
+    ``rows`` rows on ``arch`` with ``sm_count`` SMs: the routed module of the
+    band of :func:`_backward_bands` whose first and last rows hold ``rows``
+    (the last band has no end)."""
+    for band, first, last in _backward_bands(arch, role, sm_count):
+        if first <= rows and (last is None or rows <= last):
+            return loader.ROUTES[arch][band]
+    raise AssertionError(f"no {role} band of {arch} holds {rows} rows")
+
+
 def _tier_module(arch, role, rows, sm_count, packed=True):
-    """The module of ``role`` for ``rows`` rows by ``FORWARD_BANDS`` (by
-    ``STRIDED_FORWARD_BANDS`` where the rows are not ``packed``) and
-    ``BACKWARD_BANDS``: the forward's module of the first forward band whose
-    rows per SM hold ``rows``; the backward's of the first backward band whose
-    ``last`` holds (``rows <= last``; for ``ONE_WAVE`` at most 8 chunks per SM,
-    ``_chunks``; ``None``), else the role's module."""
+    """The module of ``role`` for ``rows`` rows: the forward's by
+    ``FORWARD_BANDS`` (by ``STRIDED_FORWARD_BANDS`` where the rows are not
+    ``packed``), the module of the first forward band whose rows per SM hold
+    ``rows``; a backward role's by :func:`_band_module`."""
     if role == "fwd":
         table = FORWARD_BANDS if packed else STRIDED_FORWARD_BANDS
         for last, band in table[arch]:
             if last is None or rows <= last * sm_count:
                 return loader.ROUTES[arch][band]
-    for last, band in BACKWARD_BANDS[arch].get(role, ()):
-        if last is None:
-            return loader.ROUTES[arch][band]
-        if last == ONE_WAVE:
-            if _chunks(rows) <= 8 * sm_count:
-                return loader.ROUTES[arch][band]
-        elif rows <= last:
-            return loader.ROUTES[arch][band]
-    return loader.route_module(arch, role)
+        return loader.route_module(arch, role)
+    return _band_module(arch, role, rows, sm_count)
 
 
 @pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
@@ -1614,17 +1886,28 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
     not packed) with ``rows <= last * sm_count`` (rows per SM; the tiny, short,
     mid, long and extra-long forwards and the forward, each where the
     architecture's bands name it), a backward role's module of the first
-    ``BACKWARD_BANDS`` band whose ``last`` holds: the small-row module up to
-    its band's end (at most its module's ``max_rows``), then the static, the
-    second static and the claimed backward (on sm_107a the static backward
-    while every chunk has a CTA, ``ONE_WAVE``).  No grid rule carries rows per
-    SM or a chunks-per-SM cut: the bands are host plan only."""
+    ``BACKWARD_BANDS`` band whose ``last`` holds (:func:`_band_module`).  The
+    backward bands of each architecture and role: the small-row bands (a
+    ``BAND_ROLES`` role each, whose module is one cluster), each ending at a
+    count of rows ``(ROWS, n)`` with ``n`` at most its module's ``max_rows``,
+    and the bands of rows per SM, each running a static, a row-claims (a BF16
+    weight gradient only) or a claimed backward by its grid rule, the ends of
+    each kind in increasing order; last the claimed backward (``<role>_mid``)
+    with no end.  No grid rule carries rows per SM or a chunks-per-SM cut:
+    the bands are host plan only."""
     assert loader.FORWARD_BANDS == FORWARD_BANDS
     assert loader.STRIDED_FORWARD_BANDS == STRIDED_FORWARD_BANDS
-    assert loader.BAND_ROLES == ("bwd_bf16_t512", "bwd_f32_t512")
-    assert loader.ONE_WAVE == ONE_WAVE
-    assert loader.BACKWARD_BANDS == BACKWARD_BANDS
-    assert not hasattr(loader, "_claims")
+    clustered = {
+        loader.MODULES[name]["role"]
+        for routes in loader.ROUTES.values()
+        for name in routes.values()
+        if loader.MODULES[name]["grid_rule"]["kind"] == "cluster"
+    }
+    assert set(loader.BAND_ROLES) == clustered, (loader.BAND_ROLES, clustered)
+    assert loader.ROWS == "rows"
+    for gone in ("ONE_WAVE", "MAX_ROWS", "_claims"):
+        assert not hasattr(loader, gone), gone
+    assert set(loader.BACKWARD_BANDS) == set(loader.ARCHES)
     for arch in loader.ARCHES:
         forward = {"fwd"}
         for table, first in (
@@ -1643,27 +1926,36 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
                 assert record["grid_rule"]["kind"] == (kind or "persistent_row_blocks")
         routed = {role for role in loader.ROUTES[arch] if role.startswith("fwd")}
         assert routed == forward, arch
-        for role, bands in BACKWARD_BANDS[arch].items():
-            # the small-row bands, then the static, the second static and the
-            # claimed backward, the last band with no end
-            small = bands[: -len(BACKWARD_TIER_ROLES[role])]
-            tiers = bands[len(small) :]
-            assert [band for _, band in tiers] == list(BACKWARD_TIER_ROLES[role])
-            assert tiers[-1][0] is None, (arch, role)
-            ends = [end for _, _, end in _backward_bands(arch, role, sm_count)]
-            assert ends[:-1] == sorted(set(ends[:-1])), (arch, role, ends)
-            for last, band in small:
-                assert band in loader.BAND_ROLES, (arch, role, band)
-                assert band.startswith(role + "_"), (arch, role, band)
-                name = loader.ROUTES[arch][band]
-                record = loader.MODULES[name]
-                assert record["role"] == band
-                assert record["grid_rule"]["kind"] == "cluster"
-                assert last <= int(record["grid_rule"]["max_rows"]), (arch, band)
-            for _, band in tiers:
+        assert set(loader.BACKWARD_BANDS[arch]) == {"bwd_bf16", "bwd_f32"}, arch
+        for role, bands in loader.BACKWARD_BANDS[arch].items():
+            # the small-row bands (counts of rows) and the bands of rows per SM,
+            # each kind's ends increasing; the last the claimed backward with no
+            # end
+            assert bands[-1] == (None, f"{role}_mid"), (arch, role, bands[-1])
+            counts, per_sm = [], []
+            for last, band in bands:
+                assert band == role or band.startswith(role + "_"), (arch, band)
                 record = loader.MODULES[loader.ROUTES[arch][band]]
                 assert record["role"] == band
-                assert record["grid_rule"] == CHUNK_GRID_RULE, (arch, band)
+                rule = record["grid_rule"]
+                if band in loader.BAND_ROLES:
+                    assert rule["kind"] == "cluster", (arch, band)
+                    assert isinstance(last, tuple) and len(last) == 2, (arch, band)
+                    assert last[0] == loader.ROWS, (arch, band, last)
+                    assert last[1] <= int(rule["max_rows"]), (arch, band, last)
+                    counts.append(last[1])
+                    continue
+                if last is not None:
+                    assert type(last) in (int, float), (arch, band, last)
+                    per_sm.append(last)
+                if band in ROW_CLAIMS_GRID_RULES:
+                    assert rule == ROW_CLAIMS_GRID_RULES[band], (arch, band)
+                else:
+                    assert rule == CHUNK_GRID_RULE, (arch, band)
+            assert counts == sorted(set(counts)), (arch, role, counts)
+            assert per_sm == sorted(set(per_sm)), (arch, role, per_sm)
+            ends = [end for _, _, end in _backward_bands(arch, role, sm_count)]
+            assert ends[:-1] == sorted(set(ends[:-1])), (arch, role, ends)
         for name in loader.ROUTES[arch].values():
             rule = loader.MODULES[name]["grid_rule"]
             assert not {"min_rows_per_sm", "max_rows_per_sm"} & set(rule), name
@@ -1671,7 +1963,7 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
         edges = {1, 48, 255, 256, 257, 8 * 8192, 8 * 8192 + 1, 2**31 - 1}
-        for role in BACKWARD_BANDS[arch]:
+        for role in loader.BACKWARD_BANDS[arch]:
             for _, _, end in _backward_bands(arch, role, sm_count)[:-1]:
                 edges |= {end - 1, end, end + 1}
         for table in (FORWARD_BANDS, STRIDED_FORWARD_BANDS):
@@ -1731,42 +2023,6 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         got = loader.module_for_rows("sm_103a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
     assert "fwd_long" not in routes
-    # the backward on every architecture: the small-row backwards in their
-    # bands whatever the SMs (the 4-team exact tiny backward up to 512 rows);
-    # on sm_100a and sm_103a the static backward from the next row up to 49488
-    # rows, the second static backward up to 245760 rows and the claimed
-    # backward past it, whatever the SMs; on sm_107a the static backward from
-    # 513 rows up to 64 rows per SM (8 chunks of one 8-row block per SM, every
-    # chunk a CTA), the second static backward up to 98352 rows and the claimed
-    # backward past it
-    for rows, role, band in (
-        (1, "bwd_bf16", "bwd_bf16_t512"),
-        (192, "bwd_bf16", "bwd_bf16_t512"),
-        (193, "bwd_bf16", "bwd_bf16_t512"),
-        (256, "bwd_bf16", "bwd_bf16_t512"),
-        (512, "bwd_bf16", "bwd_bf16_t512"),
-        (513, "bwd_bf16", "bwd_bf16"),
-        (1024, "bwd_f32", "bwd_f32"),
-        (1, "bwd_f32", "bwd_f32_t512"),
-        (512, "bwd_f32", "bwd_f32_t512"),
-    ):
-        got = loader.module_for_rows("sm_100a", role, rows, sm_count)
-        assert got == loader.ROUTES["sm_100a"][band], (role, rows)
-    for arch in loader.ARCHES:
-        if arch == "sm_107a":
-            ends = ((512, "_t512"), (64 * sm_count, ""), (98352, "_long"))
-        else:
-            ends = ((512, "_t512"), (49488, ""), (245760, "_long"))
-        for role in ("bwd_bf16", "bwd_f32"):
-            cases = [(1, "_t512"), (8 * 8192, "_long"), (8 * 8192 + 1, "_long")]
-            for (end, tier), (_, after) in zip(
-                ends, ends[1:] + ((None, "_mid"),), strict=True
-            ):
-                cases += [(end, tier), (end + 1, after)]
-            cases += [(2**31 - 1, "_mid")]
-            for rows, tier in cases:
-                got = loader.module_for_rows(arch, role, rows, sm_count)
-                assert got == loader.ROUTES[arch][role + tier], (arch, role, rows)
     # the forward on sm_107a: packed rows the tiny forward up to 65 rows per
     # SM, other layouts the short forward up to 59 and the mid forward up to
     # 65; then the mid forward up to 200, the extra-long forward up to 520,
@@ -1790,6 +2046,129 @@ def test_forward_and_backward_modules_run_in_their_bands(sm_count):
         got = loader.module_for_rows("sm_107a", "fwd", rows, sm_count, packed=False)
         assert got == routes[strided], (rows, strided)
     assert "fwd_long" not in routes
+
+
+def _check_backward_bands(arch: str, sm_count: int) -> None:
+    """Every ``BACKWARD_BANDS`` band of ``arch`` runs rows on ``sm_count`` SMs
+    (:func:`_backward_bands`), and ``module_for_rows`` runs its routed module
+    at its first and at its last rows (the last band, which has no end, at
+    ``INT32_MAX`` rows); neighbouring bands run different modules, and the
+    row after a band's end runs the next band's module, so the bands cover
+    every row count without a gap; a band of a count of rows, ``(ROWS, n)``,
+    ends at most at its cluster module's ``max_rows``."""
+    for role in ("bwd_bf16", "bwd_f32"):
+        table = loader.BACKWARD_BANDS[arch][role]
+        bands = _backward_bands(arch, role, sm_count)
+        assert [band for band, _, _ in bands] == [band for _, band in table], (
+            arch,
+            role,
+            sm_count,
+            bands,
+        )
+        assert bands[0][1] == 1 and bands[-1][2] is None, (arch, role, bands)
+        for i, (band, first, last) in enumerate(bands):
+            name = loader.ROUTES[arch][band]
+            assert loader.MODULES[name]["role"] == band, (arch, band)
+            for rows in (first, loader.INT32_MAX if last is None else last):
+                got = loader.module_for_rows(arch, role, rows, sm_count)
+                assert got == name, (arch, role, band, rows)
+            if last is None:
+                continue
+            after = loader.ROUTES[arch][bands[i + 1][0]]
+            assert after != name, (arch, role, band, bands[i + 1][0])
+            got = loader.module_for_rows(arch, role, last + 1, sm_count)
+            assert got == after, (arch, role, band, last + 1)
+        for last, band in table:
+            if isinstance(last, tuple):
+                rule = loader.MODULES[loader.ROUTES[arch][band]]["grid_rule"]
+                assert rule["kind"] == "cluster", (arch, band)
+                assert last[1] <= int(rule["max_rows"]), (arch, band, last)
+
+
+@pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
+def test_backward_bands_run_their_modules_from_their_first_to_their_last_rows(
+    sm_count,
+):
+    """``BACKWARD_BANDS`` of every architecture on ``sm_count`` SMs
+    (:func:`_check_backward_bands`); the call role ``bwd_bf16`` has no module
+    on sm_100a and sm_103a (``route_module`` raises ``ValueError``): there the
+    bands of a BF16 weight gradient cover every row count without it."""
+    for arch in loader.ARCHES:
+        _check_backward_bands(arch, sm_count)
+    for arch in ("sm_100a", "sm_103a"):
+        assert "bwd_bf16" not in loader.ROUTES[arch], arch
+        with pytest.raises(ValueError, match="no exported"):
+            loader.route_module(arch, "bwd_bf16")
+
+
+def test_backward_bands_run_their_modules_on_this_device(launches):
+    """``BACKWARD_BANDS`` on this device's architecture and SM count
+    (:func:`_check_backward_bands`, :func:`_device_bands`), and a backward of
+    the first and of the last rows of every band (``T`` tokens of one head;
+    the last band at its first rows) launches the band's module, ``dx``,
+    ``dz`` and the weight gradient of the band's dtype within the FP64
+    budgets."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    sm_count = loader.device_sm_count(device_index)
+    _check_backward_bands(arch, sm_count)
+    for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
+        assert _device_bands(role) == _backward_bands(arch, role, sm_count)
+        for band, first, last in _device_bands(role):
+            name = loader.ROUTES[arch][band]
+            for rows in sorted({first} | ({last} if last is not None else set())):
+                x, z, w, dy = make(rows, 1, seed=91)
+                launches.clear()
+                gw = torch.empty(D, dtype=dtype, device="cuda")
+                dx, dz, dw = backward(dy, x, z, w, EPS, grad_weight=gw)
+                assert launches == [name], (band, rows, launches)
+                what = f"{band} at {rows} rows"
+                _, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, EPS)
+                assert_bf16_close(dx, dx64, what=f"dx {what}")
+                assert_bf16_close(dz, dz64, what=f"dz {what}")
+                mag = magnitudes(dy, x, z, EPS)
+                assert_dw_within(dw, dw64, mag, what=f"dw {what}")
+
+
+def test_support_query_needs_a_route_for_every_call(monkeypatch):
+    """``routes_every_call``: every exported architecture routes a module for
+    every call (the role of every band of its ``FORWARD_BANDS``,
+    ``STRIDED_FORWARD_BANDS`` and ``BACKWARD_BANDS``; a role whose bands end
+    without a ``None`` band, its own module), so the support query is true on
+    this device; an architecture that routes no module for one band's role,
+    or whose bands of a role without a module of its own end, or that is not
+    exported, does not."""
+    assert pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda"))
+    assert not loader.routes_every_call("sm_90a")
+    routes = loader.ROUTES
+    for arch in loader.ARCHES:
+        assert loader.routes_every_call(arch), arch
+        band_roles = {
+            band
+            for table in (loader.FORWARD_BANDS, loader.STRIDED_FORWARD_BANDS)
+            for _, band in table[arch]
+        }
+        band_roles |= {
+            band for bands in loader.BACKWARD_BANDS[arch].values() for _, band in bands
+        }
+        for role in sorted(band_roles):
+            fewer = {a: dict(by_role) for a, by_role in routes.items()}
+            del fewer[arch][role]
+            monkeypatch.setattr(loader, "ROUTES", fewer)
+            assert not loader.routes_every_call(arch), (arch, role)
+            monkeypatch.setattr(loader, "ROUTES", routes)
+    # the bands of a BF16 weight gradient without their last (``None``) band:
+    # sm_100a routes no module of the call role past them, sm_107a its static
+    # backward
+    bands = {a: dict(by_role) for a, by_role in loader.BACKWARD_BANDS.items()}
+    for arch in loader.ARCHES:
+        bands[arch]["bwd_bf16"] = bands[arch]["bwd_bf16"][:-1]
+    monkeypatch.setattr(loader, "BACKWARD_BANDS", bands)
+    for arch in loader.ARCHES:
+        own = "bwd_bf16" in loader.ROUTES[arch]
+        assert loader.routes_every_call(arch) == own, arch
+    assert not loader.routes_every_call("sm_100a")
+    assert loader.routes_every_call("sm_107a")
 
 
 # (rows, SMs, CTAs) of the long forward: 32-row blocks, the fewest whole waves
@@ -2127,8 +2506,8 @@ def test_tiny_forward_gives_the_short_forwards_bits(T, H, launches):
     assert torch.equal(y_short, y_tiny)
 
 
-# (rows, SMs) of the small-row backwards: one cluster of 16 CTAs whatever the
-# rows and the SMs, up to each program's ``max_rows``.
+# (rows, SMs) of the small-row backwards: one cluster whatever the rows and the
+# SMs, up to each program's ``max_rows``.
 SHORT_BACKWARD_GRIDS = [
     (1, 148),
     (48, 148),  # T 1, H 48
@@ -2139,44 +2518,55 @@ SHORT_BACKWARD_GRIDS = [
     (1024, 160),
     (1024, 212),
 ]
-# role -> (threads a CTA, max_rows, dynamic shared memory bytes or None to take
-# the record's) of the small-row backwards.
+# role -> (threads a CTA, max_rows, CTAs of the cluster) of the exact tiny
+# backwards (4 teams of the deterministic backward's 128-thread CTA a CTA),
+# shipped and routed on every architecture; any other small-row backward is
+# checked by its record.
 SMALL_ROW_BACKWARDS = {
-    "bwd_bf16_t512": (512, 512, None),
-    "bwd_f32_t512": (512, 512, None),
+    "bwd_bf16_t512": (512, 512, 16),
+    "bwd_f32_t512": (512, 512, 16),
 }
 
 
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
 def test_small_row_backwards_are_one_cluster(rows, sm_count):
-    """Every small-row backward: one cluster of 16 CTAs whatever the rows and
-    the SMs, up to its ``max_rows``, no workspace and no chunks; no
-    architecture routes a short backward (``bwd_bf16_short`` or
-    ``bwd_f32_short``)."""
-    for role, (threads, most, smem) in SMALL_ROW_BACKWARDS.items():
+    """Every small-row backward (each module a ``BAND_ROLES`` role routes):
+    one cluster of its grid rule's ``cluster`` CTAs whatever the rows and the
+    SMs, up to its rule's ``max_rows``, no workspace and no chunks; the exact
+    tiny backwards as ``SMALL_ROW_BACKWARDS`` gives them."""
+    small = {
+        name
+        for routes in loader.ROUTES.values()
+        for role, name in routes.items()
+        if role in loader.BAND_ROLES
+    }
+    for role, (threads, most, ctas) in SMALL_ROW_BACKWARDS.items():
         name = loader.ROUTES["sm_100a"][role]
         for arch in ("sm_100a", "sm_103a", "sm_107a"):
             assert loader.ROUTES[arch][role] == name
-            assert "bwd_f32_short" not in loader.ROUTES[arch]
-            assert "bwd_bf16_short" not in loader.ROUTES[arch]
         record = loader.MODULES[name]
         assert record["role"] == role
         assert record["grid_rule"] == {
-            "cluster": 16,
+            "cluster": ctas,
             "kind": "cluster",
             "max_rows": most,
         }
         assert record["launch"]["block"] == (threads, 1, 1)
-        assert record["launch"]["cluster"] == (16, 1, 1)
-        if smem is not None:
-            assert record["launch"]["dynamic_smem_bytes"] == smem
         assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
-        if rows > most:
+        assert name in small, name
+    for name in sorted(small):
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        assert rule["kind"] == "cluster", name
+        assert set(rule) == {"cluster", "kind", "max_rows"}, name
+        cluster = int(rule["cluster"])
+        assert record["launch"]["cluster"] == (cluster, 1, 1), name
+        assert loader.workspace_bytes(name) == 0, name
+        if rows > int(rule["max_rows"]):
             continue
-        assert loader.backward_ctas(name, rows, sm_count) == 16
-        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=16)
-        assert grid == (16, 1, 1)
-        assert loader.workspace_bytes(name) == 0
+        assert loader.backward_ctas(name, rows, sm_count) == cluster
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=cluster)
+        assert grid == (cluster, 1, 1)
         with pytest.raises(ValueError, match="chunks"):
             loader.backward_chunks(name, rows)
 
@@ -2291,19 +2681,25 @@ def test_short_backward_accumulates_and_skips_the_weight_gradient():
 
 
 def test_calls_without_workspace_share_one_buffer_per_stream():
+    """Calls without a workspace keep one per (device, stream, backward
+    module): the module's buffers (``_expected_layout``) as views of their
+    dtypes (``WORKSPACE_DTYPES``), zero after the calls."""
     # 1043 rows: past every small-row backward band, a backward with a workspace
     x, z, w, dy = make(149, 7)
     for _ in range(2):
         backward(dy, x, z, w, 1e-6)
     torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    arch = loader.device_arch(device)
     stream = torch.cuda.current_stream().cuda_stream
-    held = [v for k, v in pkg._STREAM_WORKSPACES.items() if k[1] == stream]
-    assert held, "a call without a workspace keeps one per stream"
-    for views in held:
-        assert sorted(views) == ["dw_done", "dw_spec", "dw_win"]
-        assert views["dw_win"].dtype == torch.uint64
-        assert views["dw_spec"].dtype == torch.float32
-        assert views["dw_done"].dtype == torch.uint32
+    held = {k: v for k, v in pkg._STREAM_WORKSPACES.items() if k[1] == stream}
+    assert (device, stream, _backward_module(149 * 7)) in held, list(held)
+    for key, views in held.items():
+        layout = _expected_layout(arch, loader.MODULES[key[2]]["role"])
+        assert sorted(views) == sorted(b for b, _, _ in layout), key
+        for buffer, _, elements in layout:
+            assert views[buffer].dtype == WORKSPACE_DTYPES[buffer], (key, buffer)
+            assert views[buffer].numel() == elements, (key, buffer)
         for view in views.values():
             assert not bool(view.view(torch.uint8).any())
     side = torch.cuda.Stream()
@@ -2440,21 +2836,30 @@ def _forward_rows() -> dict[str, tuple[int, bool]]:
 
 @pytest.mark.parametrize("warn_only", [False, True], ids=["strict", "warn_only"])
 def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launches):
-    """Every output repeats bit for bit, so under
-    ``torch.use_deterministic_algorithms(True)`` (strict and ``warn_only``)
-    with every warning an error, every entry point runs without an alert and
-    returns the bits it returns with the setting off, launching the same
-    modules: the forward on every forward module this device routes; the
-    short, the static, the second static and the claimed backward (BF16 and
-    FP32 weight gradients, accumulation, ``compute_grad_weight=False``, no
-    rows; the latter two at the fewest tokens of 48 heads in their bands); the
-    workspace entry points, the reset and the support query; the autograd
-    backward, also of a node built before the setting was enabled, and
-    non-reentrant checkpointing."""
+    """Every launch but a row-claims backward's weight gradient repeats bit for
+    bit, so under ``torch.use_deterministic_algorithms(True)`` (strict and
+    ``warn_only``) with every warning an error, those calls run without an
+    alert and return the bits they return with the setting off, launching the
+    same modules: the forward on every forward module this device routes; at
+    the fewest rows of every ``BACKWARD_BANDS`` band of this device
+    (:func:`_band_shape`) an FP32 weight gradient (accumulation included),
+    ``compute_grad_weight=False`` (the BF16 bands' module, a row-claims
+    backward included) and the autograd backward of a weight that needs no
+    gradient, and where the band repeats a BF16 weight gradient
+    (:func:`_dw_varies`) the BF16 weight gradient (caller workspace and none)
+    and the autograd backward with it, also of a node built before the
+    setting was enabled, and non-reentrant checkpointing; no rows; the
+    workspace entry points, the reset and the support query.  Every band's
+    module of this device is among the launches."""
     forward_rows = _forward_rows()
     assert len(forward_rows) >= 3, forward_rows
-    tokens = (5, 129, 300, _band_tokens("bwd_bf16_long"), _band_tokens("bwd_bf16_mid"))
-    cases = [make(T, 48, seed=69 + i) for i, T in enumerate(tokens)]
+    bands = [
+        band for role in ("bwd_bf16", "bwd_f32") for band, _, _ in _device_bands(role)
+    ]
+    shapes = list(dict.fromkeys(_band_shape(band) for band in bands))
+    cases = [make(T, H, seed=69 + i) for i, (T, H) in enumerate(shapes)]
+    repeats = [not _dw_varies(T * H) for T, H in shapes]
+    assert any(repeats), shapes
     empty = torch.empty(0, 48, D, dtype=torch.bfloat16, device="cuda")
     inputs = [
         make(rows, 1, layout="contiguous" if packed else "projection", seed=72)
@@ -2471,15 +2876,17 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
 
     def run(nodes):
         out = [forward(x, z, w, EPS) for x, z, w, _ in inputs]
-        for x, z, w, dy in cases:
-            out += backward(dy, x, z, w, EPS)
+        for (x, z, w, dy), bf16 in zip(cases, repeats, strict=True):
+            if bf16:
+                out += backward(dy, x, z, w, EPS)
             out += backward(dy, x, z, w, EPS, grad_weight=torch.empty(D, device="cuda"))
             main = torch.full((D,), 0.25, dtype=torch.float32, device="cuda")
             out += backward(
                 dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True
             )
             out += backward(dy, x, z, w, EPS, compute_grad_weight=False)[:2]
-            out += backward(dy, x, z, w, EPS, workspace=ws)
+            if bf16:
+                out += backward(dy, x, z, w, EPS, workspace=ws)
         out += backward(empty, empty, empty, cases[0][2], EPS)
         nbytes = WORKSPACE_BYTES[loader.device_arch(empty.device.index)]
         assert workspace_bytes(1, empty.device) == nbytes
@@ -2487,15 +2894,16 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
         reset_workspace(ws)
         assert pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(empty.device)
         for (x, z, w, dy), node in zip(cases, nodes, strict=True):
-            y, grads = node
-            y.backward(dy)
-            out += [y, *(t.grad for t in grads)]
-            ts = leaves(x, z, w)
-            yc = torch.utils.checkpoint.checkpoint(
-                gated_rmsnorm, *ts, EPS, use_reentrant=False
-            )
-            yc.backward(dy)
-            out += [yc, *(t.grad for t in ts)]
+            if node is not None:
+                y, grads = node
+                y.backward(dy)
+                out += [y, *(t.grad for t in grads)]
+                ts = leaves(x, z, w)
+                yc = torch.utils.checkpoint.checkpoint(
+                    gated_rmsnorm, *ts, EPS, use_reentrant=False
+                )
+                yc.backward(dy)
+                out += [yc, *(t.grad for t in ts)]
             ts = leaves(x, z, w, weight_grad=False)
             gated_rmsnorm(*ts, EPS).backward(dy)
             out += [ts[0].grad, ts[1].grad]
@@ -2504,9 +2912,9 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
 
     def nodes():
         built = []
-        for x, z, w, _ in cases:
-            grads = leaves(x, z, w)
-            built.append((gated_rmsnorm(*grads, EPS), grads))
+        for (x, z, w, _), bf16 in zip(cases, repeats, strict=True):
+            grads = leaves(x, z, w) if bf16 else None
+            built.append((gated_rmsnorm(*grads, EPS), grads) if bf16 else None)
         return built
 
     want = run(nodes())
@@ -2525,15 +2933,13 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
     assert launches == want_launches, launches
     modules = set(launches)
     assert set(forward_rows) <= modules, forward_rows
-    for x, *_ in cases:
-        rows = x.numel() // D
+    for T, H in shapes:
         assert {
-            _backward_module(rows),
-            _backward_module(rows, torch.float32),
-        } <= modules
+            _backward_module(T * H),
+            _backward_module(T * H, torch.float32),
+        } <= modules, (T, H)
     roles = {loader.MODULES[name]["role"] for name in modules}
-    for tiers in BACKWARD_TIER_ROLES.values():
-        assert set(tiers) <= roles, roles
+    assert set(bands) <= roles, (bands, roles)
     assert not bool(ws.any())
 
 
@@ -2542,10 +2948,14 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
     """Under ``torch.use_deterministic_algorithms(True)`` (strict and
     ``warn_only``) with every warning an error, a CUDA Graph captures the
     forward and the backward (caller workspace and none, BF16 and FP32 weight
-    gradients) without an alert; its replays return the bits of eager calls,
-    which lie within the FP64 reference's budgets, the workspace zero after
-    each."""
-    T, H = 300, 48
+    gradients) without an alert at the fewest rows of the claimed backward's
+    band (:func:`_band_shape`), whose BF16 weight gradient repeats its bits;
+    its replays return the bits of eager calls, which lie within the FP64
+    reference's budgets, the workspace zero after each."""
+    shape = _band_shape("bwd_bf16_mid")
+    assert shape is not None
+    T, H = shape
+    assert not _dw_varies(T * H), (T, H)
     x, z, w, dy = make(T, H, seed=75)
     ws = workspace_for(T * H, x.device)
     y = torch.empty_like(x)
@@ -2585,6 +2995,232 @@ def test_graph_capture_under_deterministic_algorithms(warn_only):
             torch.cuda.synchronize()
             for i, (a, b) in enumerate(zip((y, dx, dz, dw, main), want, strict=True)):
                 assert torch.equal(a, b), (k, i)
+            assert not bool(ws.any()), k
+
+
+# The bands whose backward of a weight gradient alerts under PyTorch's
+# deterministic algorithms (the row-claims backwards), and the rows of each
+# band a test runs: its first and its last.
+ALERT_BAND_CASES = [
+    pytest.param(band, edge, id=f"{band}-{edge}")
+    for band in ("bwd_bf16_rc", "bwd_bf16_rc_mid")
+    for edge in ("first", "last")
+]
+
+
+@pytest.mark.parametrize("band,edge", ALERT_BAND_CASES)
+def test_backward_alerts_under_deterministic_algorithms(band, edge, launches):
+    """Under ``torch.use_deterministic_algorithms(True)`` the paths that launch
+    a row-claims backward's order-varying weight-gradient sum (the first and
+    the last rows of the row-claims band ``band`` on this device, as tokens of
+    one head; skipped where this device routes no such band) -- the backward
+    with ``compute_grad_weight=True`` (also accumulating) and the autograd
+    backward when ``weight`` needs a gradient, also for a node built before
+    the mode was enabled -- raise PyTorch's alert immediately before the
+    launch, which never runs; under ``warn_only=True`` they warn and run the
+    non-deterministic backward (never a fallback): ``dx`` and ``dz`` the bits
+    of the call with the mode off, ``dw`` within the FP64 budget.  The
+    forward, the workspace entry points, the reset, the support query, the
+    backward without the weight gradient (on the same row-claims module) and
+    with an FP32 one, and the autograd backward of a weight that needs no
+    gradient run without a warning."""
+    found = _device_band(band)
+    if found is None:
+        pytest.skip(f"this device routes no {band} band")
+    first, last = found
+    assert last is not None, (band, found)
+    rows = first if edge == "first" else last
+    name = _backward_module(rows)
+    assert name == _routes()[band] and _varies(name), (rows, name)
+    x, z, w, dy = make(rows, 1, seed=65)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    ws = workspace_for(1, x.device)
+
+    def leaves(weight_grad=True):
+        return (
+            x.clone().requires_grad_(True),
+            z.clone().requires_grad_(True),
+            w.clone().requires_grad_(weight_grad),
+        )
+
+    node = gated_rmsnorm(*leaves(), EPS)  # built with the mode off
+    torch.use_deterministic_algorithms(True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        forward(x, z, w, EPS)
+        assert workspace_bytes(1, x.device) == workspace_for(1, x.device).numel()
+        reset_workspace(ws)
+        assert pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(x.device)
+        dx, dz, dw = backward(dy, x, z, w, EPS, compute_grad_weight=False)
+        assert dw is None
+        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+        f32 = torch.empty(D, dtype=torch.float32, device="cuda")
+        backward(dy, x, z, w, EPS, grad_weight=f32, workspace=ws)
+        xa, za, wa = leaves(weight_grad=False)
+        gated_rmsnorm(xa, za, wa, EPS).backward(dy)
+        assert xa.grad is not None and wa.grad is None
+    launches.clear()
+    with pytest.raises(RuntimeError, match=ALERT):
+        backward(dy, x, z, w, EPS)
+    main = torch.full((D,), 0.25, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match=ALERT):
+        backward(
+            dy,
+            x,
+            z,
+            w,
+            EPS,
+            grad_weight=main,
+            accumulate_grad_weight=True,
+            workspace=ws,
+        )
+    with pytest.raises(RuntimeError, match=ALERT):
+        node.backward(dy)
+    assert launches == []
+    torch.cuda.synchronize()
+    assert torch.equal(main, torch.full_like(main, 0.25))
+    assert not bool(ws.any())
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning, match=ALERT):
+        dx, dz, dw = backward(dy, x, z, w, EPS)
+    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+    assert_dw_within(dw, dw64, mag, what="warn_only dw")
+    xa, za, wa = leaves()
+    y = gated_rmsnorm(xa, za, wa, EPS)
+    with pytest.warns(UserWarning, match=ALERT):
+        y.backward(dy)
+    assert torch.equal(xa.grad, dx_d) and torch.equal(za.grad, dz_d)
+    assert_dw_within(wa.grad, dw64, mag, what="warn_only autograd dw")
+    fwd = _forward_module(rows)
+    assert launches == [name, fwd, name], launches
+
+
+def _alert(entry: str, deterministic_entry: str, *, warn_only: bool) -> str:
+    """The exact text of the alert of ``entry`` of this package."""
+    q = f"{pkg.__name__}.{entry}"
+    d = f"{DET}.{deterministic_entry}"
+    if warn_only:
+        return (
+            f"{q} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; the "
+            f"non-deterministic kernels run. {d} is the deterministic one."
+        )
+    return (
+        f"{q} does not have a deterministic implementation, but you set "
+        f"'torch.use_deterministic_algorithms(True)'. You can call {d} instead, "
+        "or use the 'warn_only=True' option, if that's acceptable for your "
+        "application."
+    )
+
+
+def test_alert_texts_name_the_entry_point_and_the_deterministic_one(launches):
+    """At the fewest rows of the row-claims band (:func:`_band_shape`), the
+    alert of the functional backward names it and the deterministic
+    backward; the autograd backward's names the autograd backward and the
+    deterministic autograd function (strict: ``RuntimeError`` before the
+    launch; ``warn_only``: one ``UserWarning`` a call, then the launch)."""
+    shape = _band_shape("bwd_bf16_rc")
+    assert shape is not None
+    T, H = shape
+    assert _dw_varies(T * H), (T, H)
+    x, z, w, dy = make(T, H, seed=66)
+
+    def node():
+        torch.use_deterministic_algorithms(False)
+        return gated_rmsnorm(
+            x.clone().requires_grad_(True),
+            z.clone().requires_grad_(True),
+            w.clone().requires_grad_(True),
+            EPS,
+        )
+
+    functional = (
+        "cake_rmsnorm_silu_gate_nondet_train_backward",
+        "cake_rmsnorm_silu_gate_det_train_backward",
+    )
+    autograd = (
+        "CakeRMSNormSiLUGateNondetFunction.backward",
+        "CakeRMSNormSiLUGateDetFunction",
+    )
+    torch.use_deterministic_algorithms(True)
+    launches.clear()
+    with pytest.raises(RuntimeError) as info:
+        backward(dy, x, z, w, EPS)
+    assert str(info.value) == _alert(*functional, warn_only=False)
+    y = node()
+    torch.use_deterministic_algorithms(True)
+    launches.clear()
+    with pytest.raises(RuntimeError) as info:
+        y.backward(dy)
+    assert _alert(*autograd, warn_only=False) in str(info.value), str(info.value)
+    assert launches == []
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning) as record:
+        backward(dy, x, z, w, EPS)
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [_alert(*functional, warn_only=True)], got
+    y = node()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning) as record:
+        y.backward(dy)
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [_alert(*autograd, warn_only=True)], got
+    bwd = _routes()["bwd_bf16_rc"]
+    assert launches == [bwd, _forward_module(T * H), bwd], launches
+
+
+def test_graph_capture_alerts_at_capture_and_replays_without_a_check():
+    """Under ``torch.use_deterministic_algorithms(True, warn_only=True)``
+    capturing a backward that computes the weight gradient at the fewest rows
+    of the row-claims band (:func:`_band_shape`) warns once (the check runs on
+    the host, at capture); the replays run the non-deterministic kernel
+    without a warning, ``dx`` and ``dz`` the bits of the eager call and within
+    the FP64 budget, ``dw`` within the budget, the workspace zero after
+    each."""
+    shape = _band_shape("bwd_bf16_rc")
+    assert shape is not None
+    T, H = shape
+    assert _dw_varies(T * H), (T, H)
+    x, z, w, dy = make(T, H, seed=72)
+    ws = workspace_for(T * H, x.device)
+    dx, dz = torch.empty_like(x), torch.empty_like(x)
+    dw = torch.empty(D, dtype=torch.bfloat16, device="cuda")
+
+    def step():
+        backward(dy, x, z, w, EPS, grad_x=dx, grad_z=dz, grad_weight=dw, workspace=ws)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()  # loads the module before the capture
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    dx_e, dz_e = dx.clone(), dz.clone()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    graph = torch.cuda.CUDAGraph()
+    with pytest.warns(UserWarning) as record, torch.cuda.graph(graph):
+        step()
+    got = [str(r.message) for r in record if ALERT in str(r.message)]
+    assert got == [
+        _alert(
+            "cake_rmsnorm_silu_gate_nondet_train_backward",
+            "cake_rmsnorm_silu_gate_det_train_backward",
+            warn_only=True,
+        )
+    ], got
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    _, dx64, dz64, _ = fp64_reference(dy, x, z, w, EPS)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for k in range(3):
+            dw.fill_(7.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
+            assert_bf16_close(dx, dx64, what=f"replay {k} dx")
+            assert_bf16_close(dz, dz64, what=f"replay {k} dz")
+            assert torch.equal(dx, dx_e) and torch.equal(dz, dz_e), k
             assert not bool(ws.any()), k
 
 

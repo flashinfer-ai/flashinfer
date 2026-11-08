@@ -53,9 +53,7 @@ one thread-block cluster of 16 CTAs, its ``dx`` and ``dz`` the same
 arithmetic, that sums the weight gradient on chip in a fixed order and rounds
 it once, the same bits on every call.  The exact tiny backward (4 teams of
 the deterministic backward's 128-thread CTA a CTA) adds the deterministic
-backward's chunk partials in its reduction order in FP64; the cluster
-backward of a BF16 weight gradient (256-thread CTAs) has each CTA finish 8
-columns from every CTA's FP32 partials in rank order in FP64.  Where a
+backward's chunk partials in its reduction order in FP64.  Where a
 row-claims backward saves at least 3 % of a checkpointed training step, a
 BF16 weight gradient runs it instead (256-thread CTAs of 16-row blocks, the
 CTAs past one wave claiming blocks from the workspace's claim counter): ``dx``
@@ -119,8 +117,8 @@ Host design (the input layout rules are the deterministic package's):
   modules) uses the zero-filled workspace of its (device, stream, backward
   module), allocated on first use and kept in ``_STREAM_WORKSPACES`` for later
   calls: 29192 bytes each on sm_100a and sm_103a and 36360 on sm_107a, at
-  most one per backward module that takes one (the static, the long static
-  ``_long``, the row-claims ``_rc`` and ``_rc_mid`` and the claimed ``_mid``
+  most one per backward module that takes one (the static, the row-claims
+  ``_rc`` and ``_rc_mid`` and the claimed ``_mid``
   backwards an architecture routes) for every stream that ran such a
   backward.  Such eager calls also keep a reserve of
   64 zero-filled workspaces per device (in one allocation, 29440 bytes each,
@@ -182,9 +180,8 @@ Host design (the input layout rules are the deterministic package's):
   backward module of a role by the rows (``T * H``), the first band that
   holds (small-row bands by a count of rows, the others by rows per SM): the
   small-row backwards, then a static backward up to at most 4 row blocks a
-  CTA (256 rows per SM; on sm_107a over 4 window copies plus occupancy words
-  while every chunk has a CTA, then for an FP32 weight gradient over 2
-  copies, ``_long``), for a BF16
+  CTA (256 rows per SM; on sm_107a over 4 window copies plus occupancy words,
+  one wave at most), for a BF16
   weight gradient the row-claims backwards where they save at least 3 % of a
   checkpointed training step, and the claimed backward (``_mid``) past them;
   on sm_100a and sm_103a the claimed backward and ``_rc_mid`` warm the CTA's
@@ -313,7 +310,8 @@ def _device_arch(device: torch.device) -> str:
 
 
 def is_cake_rmsnorm_silu_gate_nondet_train_supported(device: torch.device) -> bool:
-    """Whether ``device`` is a CUDA device with every route of this package.
+    """Whether ``device`` is a CUDA device whose architecture routes a module
+    for every call of this package (``cake_jit.routes_every_call``).
 
     A capability probe that launches nothing; it does not depend on
     ``torch.use_deterministic_algorithms``.
@@ -323,7 +321,7 @@ def is_cake_rmsnorm_silu_gate_nondet_train_supported(device: torch.device) -> bo
     if device.type != "cuda":
         return False
     arch = _arch_of_index(_device_index(device))
-    return arch is not None and set(ROLES) <= set(ROUTES.get(arch, {}))
+    return arch is not None and _loader.routes_every_call(arch)
 
 
 def _rows_shape(shape: torch.Size) -> tuple[int, int]:

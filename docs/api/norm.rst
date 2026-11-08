@@ -253,11 +253,17 @@ package's forward bands are in its section below.
    its architecture constants are the backend package's objects.
 2. No entry point takes a ``deterministic`` keyword: passing one is a
    ``TypeError``.  A call of one package never runs the other package.
-3. Under ``torch.use_deterministic_algorithms(True)`` no call of either
-   package alerts: every deterministic launch sums in a fixed order, and every
-   output of the non-deterministic package repeats bit for bit (its
-   weight-gradient sum is exact, so the order of its additions does not change
-   the bits).
+3. Under ``torch.use_deterministic_algorithms(True)`` no call of the
+   deterministic package alerts: every deterministic launch sums in a fixed
+   order.  A non-deterministic backward call that computes a BF16 weight
+   gradient in its row-claims bands (see its section below) raises PyTorch's
+   alert immediately before that launch, whose weight-gradient sum adds in an
+   order that depends on scheduling (``RuntimeError``; with ``warn_only=True``
+   a ``UserWarning``, then the non-deterministic kernel runs).  No other call of
+   the non-deterministic package alerts: its other launches repeat their bits
+   (their weight-gradient sum is exact, or in a fixed order, so the order of
+   the additions does not change the bits).  The check runs on the host: a
+   CUDA Graph checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
    and run the backward of their own package.  A backward workspace holds the
@@ -343,9 +349,13 @@ Training SiLU-gated RMSNorm, non-deterministic package (Cake)
 The non-deterministic package (``nondet`` names; see the mode and dispatch
 rules above). Its entry points run only the standalone non-deterministic
 kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``).
-Every output (``y``, ``dx``, ``dz`` and ``dw``) repeats bit for bit from run to
-run.  ``y`` is not the deterministic package's bits; ``dx`` and ``dz`` are, and
-``dw`` is except where the exact sum lies within the deterministic FP64 sum's
+``y``, ``dx``, ``dz`` and an FP32 weight gradient repeat bit for bit from run
+to run everywhere.  A BF16 weight gradient repeats bit for bit too, except in
+the row-claims bands (below: SM100 513 rows to 1329 rows per SM, SM103 513
+rows to 1294 rows per SM, SM107 above 24 to 68 rows per SM), where its last
+bits may vary from run to run.  ``y`` is not the deterministic package's bits;
+``dx`` and ``dz`` are in every band, and outside the row-claims bands ``dw`` is
+too, except where the exact sum lies within the deterministic FP64 sum's
 error of a rounding boundary.  The FP64 error of
 each output (relative L2 and the largest error relative to the largest
 reference value) is at most 1.1 times the deterministic package's on the same
@@ -381,28 +391,49 @@ inputs, and within the deterministic package's absolute bounds.
   more CTAs than the SMs beside 16 held ones take in one wave, and this bound
   of the short forward is not shown there.
 * The backward is one kernel.  ``dx`` and ``dz`` use the deterministic
-  backward's row arithmetic.  The weight gradient sums the deterministic
-  backward's chunk partials exactly in 64-bit integer windows and rounds that
+  backward's row arithmetic in every band.  Up to 512 rows, with a BF16 or an
+  FP32 weight gradient or with ``compute_grad_weight=False``, the backward is
+  one thread-block cluster of 16 CTAs that sums the weight gradient on chip
+  in a fixed order and takes no workspace.  Past that the rows (``T * H``)
+  and the SM count pick the kernel by bands of rows per SM.  The chunked
+  backwards launch at most 8 CTAs per SM; they sum the deterministic
+  backward's chunk partials exactly in 64-bit integer windows and round that
   sum to FP32 from its FP64 value (then to BF16 for a BF16 weight gradient),
-  so it does not depend on the grid or on the order in which CTAs finish.  Up
-  to 512 rows, with a BF16 or an FP32 weight gradient or with
-  ``compute_grad_weight=False``, the backward is one thread-block cluster of
-  16 CTAs that sums on chip and takes no workspace.  Past that it launches at
-  most 8 CTAs per SM, chosen by the rows (``T * H``); each gives the same bits
-  at any grid.  On SM100 and SM103 a static backward (CTA ``b`` runs the
-  chunks ``b``, ``b + grid``, ...) runs up to 49488 rows, a second static
-  backward up to 245760 rows and, past that, a claimed backward, whose CTAs
-  claim runs of chunks at run time, so a CTA slowed by a kernel on another
-  stream takes fewer; the last two warm each CTA's next block in L2 with one
-  bulk prefetch per tensor where ``dy``, ``x`` and ``z`` hold packed rows.  On
-  SM107 the static backward runs while every chunk has its own CTA (up to 64
-  rows per SM), with 4 copies of the weight-gradient windows plus occupancy
-  words, then the same with 2 copies up to 98352 rows, then the claimed
-  backward.
+  so the weight gradient does not depend on the grid or on the order in which
+  CTAs finish.  A static backward (CTA ``b`` runs the chunks ``b``, ``b +
+  grid``, ...) runs an FP32 weight gradient up to 256 rows per SM on SM100 and
+  SM103 and up to 64 on SM107, and a BF16 weight gradient up to 24 rows per SM
+  on SM107; on SM107 it keeps 4 copies of the weight-gradient windows plus
+  occupancy words.  Past the static and the row-claims bands a claimed
+  backward runs, whose CTAs claim runs of chunks at run time, so a CTA slowed
+  by a kernel on another stream takes fewer; on SM100 and SM103 it warms each
+  CTA's next block in L2 with one bulk prefetch per tensor where ``dy``,
+  ``x`` and ``z`` hold packed rows, on SM107 the block two ahead.
+* A BF16 weight gradient runs a row-claims backward where it saves at least
+  3 % of a checkpointed training step: on SM100 from 513 rows up to 1329 rows
+  per SM (the row-claims backward up to 800 rows per SM, the row-claims mid
+  backward past it), on SM103 from 513 rows up to 1294 rows per SM (the
+  row-claims backward up to 700 rows per SM, the row-claims mid backward past
+  it), on SM107 above 24 up to 68 rows per SM (the row-claims backward).
+  Its 256-thread CTAs take 16-row blocks (4 CTAs per SM, 5 for the
+  row-claims mid backward; past one wave they claim blocks from the
+  workspace's claim counter) and add each thread's FP32 run of rows to
+  FP64 accumulators with atomics (the row-claims mid backward: FP32 two-sum
+  pairs, added once as FP64), so the order of the sum, and the last bits of
+  the BF16 weight gradient, depend on scheduling, within the family's error
+  budget.  As currently measured (CUPTI, cold L2) these bands save about
+  3.2 % to 16.3 % of a checkpointed step (2 x forward + backward with a BF16
+  weight gradient) on SM100, about 4.0 % (an estimate) to 18.4 %
+  (provisional) on SM103 and about 3.3 % to 5.5 % on SM107.  Under
+  ``torch.use_deterministic_algorithms(True)`` a call that computes the
+  weight gradient there raises PyTorch's alert (rule 3); no other call
+  alerts.
 * The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
   is a zero-filled ``torch.uint8`` tensor of 29192 bytes on SM100 and SM103
-  and 36360 bytes on SM107, whatever the token count, that serves every
-  backward kernel of its architecture and is zero after every call: zero it
+  and 36360 bytes on SM107, whatever the token count (the largest layout of
+  the architecture's backward kernels; a row-claims backward lays its FP64
+  accumulators and two counter words in the first 4104 bytes), that serves
+  every backward kernel of its architecture and is zero after every call: zero it
   once and reuse it, one per
   concurrently running stream.  A buffer that anything else wrote into is
   zeroed with ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``.  Calls

@@ -38,69 +38,82 @@ extra-long forward up to 550 and the mid forward past it; on SM107 the mid
 forward up to 200, the extra-long forward up to 520 and the mid forward past
 it.
 
-The backward cuts the rows into blocks of 8 rows and the blocks into
-``C = ceil(blocks / B)`` chunks of ``B = max(1, ceil(blocks / 8192))``
-consecutive blocks, and launches ``G = min(C, 8 * SMs)`` CTAs of 128 threads,
-at most one wave (8 CTAs per SM).  Its programs run in the rows of their
-``BACKWARD_BANDS`` bands.  Past the small-row band, on SM100 and SM103 the
-static backward runs up to 49488 rows, the second static backward (the same
-schedule, each CTA warming its next block in L2) up to 245760 rows and the
-claimed backward past it; on SM107 the static backward runs while
-``C <= 8 * SMs`` (every chunk its own CTA), the second static backward up to
-98352 rows and the claimed backward past it.  A static backward's CTA ``b``
-runs the chunks ``b``, ``b + G``, ...  The claimed backward's CTAs claim runs
-of consecutive chunks from the workspace's claim counter, in halving rounds
+The backward runs the program of its architecture's ``BACKWARD_BANDS`` band
+of the weight gradient's dtype (a call without a weight gradient takes the
+BF16 bands).  A small-row backward, up to a count of rows, is one cluster of
+16 CTAs, scheduled together on the SMs of one GPC, whose CTAs each wait for
+the other CTAs' FP32 partials of their columns and finish them in a fixed
+order, with no workspace.  The chunked backwards cut the rows into blocks of
+8 rows and the blocks into ``C = ceil(blocks / B)`` chunks of
+``B = max(1, ceil(blocks / 8192))`` consecutive blocks, and launch
+``G = min(C, 8 * SMs)`` CTAs of 128 threads, at most one wave (8 CTAs per
+SM).  A static backward (the call role) runs the rows up to a few row blocks
+a CTA of that grid; its CTA ``b`` runs the chunks ``b``, ``b + G``, ...  The
+claimed backward's CTAs claim runs of consecutive chunks from the workspace's
+claim counter, in halving rounds
 and then single chunks, each CTA its next run as the last block of its
 current run starts, so a CTA that starts late takes fewer chunks (one that
-becomes resident after every run was claimed takes none).  Each CTA adds the
-FP32 weight-gradient partials of its chunks exactly into 64-bit integer
-windows of the workspace and takes a ticket on the arrival word; whichever CTA
-arrives last rounds the exact sum once into ``dw``, and no CTA waits for
-another.  In the rows of its small-row band the weight gradient
-comes from a small-row backward: one cluster of 16 CTAs, scheduled together
-on the SMs of one GPC, whose CTAs each wait for the other CTAs' FP32 partials
-of their columns and finish them, with no workspace.  Beside a
-long-resident one-thread kernel on another stream each call must keep its
-speed: per token count, the median of seven event-timed calls with the side
-kernel resident is at most ``MAX_RATIO`` times the median of seven calls alone,
-or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
-pairs, so host launch gaps and clock drift hit both arms alike.
+becomes resident after every run was claimed takes none).  Each CTA of a
+chunked backward adds the FP32 weight-gradient partials of its chunks exactly
+into 64-bit integer windows of the workspace and takes a ticket on the
+arrival word; whichever CTA arrives last rounds the exact sum once into
+``dw``, and no CTA waits for another.  The row-claims backwards of a BF16
+weight gradient cut the rows into blocks of 16 rows and launch
+``G = min(blocks, ctas_per_sm * SMs)`` CTAs of 256 threads; past one wave the
+CTAs claim the blocks from the workspace's claim counter, so a CTA that
+starts late takes fewer blocks; each CTA adds its FP32 runs of rows (the
+row-claims mid backward: as FP32 two-sum pairs) to FP64 accumulators of the
+workspace with atomics and takes a ticket, and the CTA that arrives last
+rounds the sum into ``dw``.  Beside a long-resident
+one-thread kernel on another stream each call must keep its speed: per token
+count, the median of seven event-timed calls with the side kernel resident is
+at most ``MAX_RATIO`` times the median of seven calls alone, or at most
+``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in pairs, so
+host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the static, the second static and the claimed backward needs 15616
-bytes of dynamic shared memory (the launch record's ``dynamic_smem_bytes``:
-the two halves of the 8 x 128 FP32 fold buffer, 8192 bytes, the 7 64-bit
-windows of each of the 128 columns, 7168 bytes, and the run cell, the arrival
-flag and the 8-entry claim table, 160 bytes, 15520 bytes rounded up), so a
-side kernel holding every SM
-with a small carveout can delay its start until the side kernel exits (no test
-here asserts that delay; documented in
-:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The documented remedy
-is checked here: with the side kernel's preferred carveout set to the maximum
-shared memory, the backward (BF16 and FP32 weight gradients) and the forward
-start beside it and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far
-below the side kernel's ``ALL_SM_SPIN_MS`` lifetime; so do the small-row
-backwards of a BF16 and an FP32 weight gradient at 1 and 5 tokens (48 and 240
-rows, the band of each role), which on SM100 and SM103 also start beside it
-with the default and the maximum-L1 carveout, and the static backward that
-takes the rows past the band, at its first whole tokens
-(``SHORT_BACKWARD_PROBES``).  On SM107 they
-do not start beside the side kernel with such a small carveout until that
-kernel exits (observed on R200 for the small-row backwards): there each must
-end at most ``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the
-static backward of its role at the same rows).
+CTA of the chunked backwards needs 15616 bytes of dynamic shared memory (the
+launch record's ``dynamic_smem_bytes``: the two halves of the 8 x 128 FP32
+fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128 columns,
+7168 bytes, and the run cell, the arrival flag and the 8-entry claim table,
+160 bytes, 15520 bytes rounded up) and each CTA of the row-claims backwards
+20736 bytes, so a side kernel holding every SM with a small carveout can
+delay its start until the side kernel exits (no test here asserts that delay;
+documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The
+documented remedy is checked here: with the side kernel's preferred carveout
+set to the maximum shared memory, the backward (BF16 and FP32 weight
+gradients) and the forward start beside it and cost at most
+``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
+``ALL_SM_SPIN_MS`` lifetime; so do the small-row backwards of a BF16 and an
+FP32 weight gradient at 1 and 5 tokens (48 and 240 rows, where a small-row
+band of the role holds them), which on SM100 and SM103 also start beside it
+with the default and the maximum-L1 carveout, and the backward that takes the
+rows past the role's small-row bands, at its first whole tokens
+(``SHORT_BACKWARD_PROBES``).  On SM107 they do not start beside the side
+kernel with such a small carveout until that kernel exits (observed on R200
+for the small-row backwards): there each must end at most
+``MAX_ALL_SM_EXTRA_MS`` after the backward it replaces (the module of the
+role's first band past its small-row bands, at the same rows).
 
 The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 #7548, item 1): busy / alone is at most the proportional ``N / (N - k)``, plus
-the share in the call of one row block of each CTA of the one-wave grid, plus
-``PROPORTIONAL_SLACK``.  The token counts give each CTA of that grid
-(``8 * N`` CTAs) 16, 32 and 160 row blocks: ``T = 3157``, ``6314`` and
-``31573`` on a 148-SM B200 (151536, 303072 and 1515504 rows, in chunks of 3, 5
-and 24 blocks), whose rows have more chunks than the grid has CTAs.  The
-backward of their ``BACKWARD_BANDS`` band runs them under the same bound: on
-SM100 and SM103 the second static backward the first (up to 245760 rows) and
-the claimed backward the others, on SM107 the claimed backward all three
-(past 98352 rows).  The persistent forwards beside the same side kernels:
+the share in the call of one row block of each CTA of the module's grid (its
+CTAs, ``backward_ctas``, over its row blocks), plus ``PROPORTIONAL_SLACK``.
+The token counts give each CTA of a module's one-wave grid (``ctas_per_sm *
+N`` CTAs; blocks of 8 rows of a chunked backward, of 16 rows of a row-claims
+backward) 16, 32 and 160 row blocks, in the first band of a BF16 weight
+gradient whose module ``BACKWARD_BANDS`` routes at those rows (on a 148-SM
+B200 the row-claims mid backward at 16 and the claimed backward at 32 and
+160); their rows have more chunks or blocks than the grid has CTAs.  The same
+bound holds at the edges of the bands, every size derived from
+``BACKWARD_BANDS`` and the device's SM count: in each static multi-chunk
+band (a static backward's band that holds rows with more chunks than its
+grid has CTAs) of either weight-gradient dtype, at its first such whole
+tokens and at the most tokens whose rows give each CTA the band end's whole
+row blocks a CTA (the band's last whole tokens where that is not past the
+first; a weight-gradient dtype with no such band skips); in each row-claims
+band, at its first and its last whole tokens.  The persistent forwards
+beside the same side kernels:
 busy / alone is at most ``N / (N - k)``, plus the share of one CTA's blocks
 in the call (a
 CTA whose slot the side kernel holds walks all of its blocks once it starts),
@@ -139,28 +152,33 @@ sample of that measurement, else it is taken again, at most
 measurement that counts (to the last one when none does).  The small-row
 backwards (``SHORT_BACKWARD_PROBES``, BF16 and FP32 weight gradients) keep
 their speed beside the one-thread kernel and, beside the short forward's side
-kernels, end no later than the backward they replace (the role's module, the
-static backward, at the same rows) by the short forward's bound and
-measurement rule: there a measurement
+kernels, end no later than the backward they replace (the module of the
+role's first band past its small-row bands, at the same rows) by the short
+forward's bound and measurement rule: there a measurement
 counts only when the short backward's and the replaced backward's alone
 medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest alone
 sample of that measurement.
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
-the call started.  In every test ``y``, ``dx``, ``dz`` and ``dw`` are bitwise
-those of the first call alone of the same entry point and module (a chunk's
-partial does not depend on the grid or on the CTA that claimed it, and the sum
-of the partials is exact), every ``dw`` also lies within the backend suite's
-budget of an FP64 reference, the small-row backward's ``dx`` and ``dz`` are
-bitwise those of the backward it replaces, and the workspace is zero after
-every call.
+the call started.  In every test ``y``, ``dx`` and ``dz`` are bitwise those of
+the first call alone of the same entry point and module, and so is ``dw`` of
+every module but a row-claims backward (a chunk's partial does not depend on
+the grid or on the CTA that claimed it, the sum of the partials is exact, and
+a small-row backward sums in a fixed order); every ``dw`` lies within the
+backend suite's budget of an FP64 reference (the row-claims backwards' ``dw``
+is checked against that budget only: its FP32 runs and the order of its FP64
+additions follow the blocks each CTA claimed), the small-row backward's
+``dx`` and ``dz`` are bitwise those of the backward it replaces, and the
+workspace is zero after every call.  PyTorch's deterministic algorithms are
+off in every test (a row-claims backward raises PyTorch's alert under them).
 """
 
 from __future__ import annotations
 
 import ctypes
 import functools
+import math
 import statistics
 
 import pytest
@@ -198,6 +216,18 @@ pytestmark = pytest.mark.skipif(
     or not pkg.is_cake_rmsnorm_silu_gate_nondet_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
+
+
+@pytest.fixture(autouse=True)
+def nondeterministic_allowed():
+    """PyTorch's deterministic algorithms off in every test: a backward that
+    runs a row-claims module raises PyTorch's alert under them, and these
+    tests time the calls."""
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    yield
+    torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 def _inputs(tokens: int, layout: str = "packed"):
@@ -284,13 +314,17 @@ def test_keeps_its_speed_beside_a_resident_kernel(stage: str, tokens: int) -> No
         f"STALL stage={stage} tokens={tokens} heads={H} alone_ms={alone_ms:.4f} "
         f"busy_ms={busy_ms:.4f} ratio={busy_ms / alone_ms:.3f} extra_ms={busy_ms - alone_ms:.4f}"
     )
-    _check_outputs(
-        stage,
-        tokens,
-        alone,
-        busy,
-        None if stage == "forward" else _dw_reference(dy, x, z),
-    )
+    if stage == "forward":
+        _check_outputs(stage, tokens, alone, busy)
+    else:
+        _check_outputs(
+            stage,
+            tokens,
+            alone,
+            busy,
+            _dw_reference(dy, x, z),
+            module=_backward_module(tokens * H),
+        )
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     assert _keeps_its_speed(alone_ms, busy_ms), (
         f"{stage} tokens={tokens}: {busy_ms:.4f} ms beside a resident kernel vs "
@@ -313,8 +347,8 @@ MAX_ALL_SM_EXTRA_MS = 1.0
 CARVEOUT_MAX_SHARED = 100
 # Item 1: (CTAs, threads) of side kernels that hold some SMs, the issue's
 # 1 x 128, 16 x 640 and 32 x 640, beside the backward at the token counts that
-# give each CTA of its one-wave grid (``ctas_per_sm`` CTAs per SM, the CTAs per
-# SM its launch bounds hold at once) this many row blocks.
+# give each CTA of the one-wave grid of the module that runs them
+# (``ctas_per_sm`` CTAs per SM) this many of its row blocks.
 PROPORTIONAL_SIDES = ((1, 128), (16, 640), (32, 640))
 PROPORTIONAL_BLOCKS_PER_CTA = (16, 32, 160)
 PROPORTIONAL_RUNS = 7
@@ -605,11 +639,48 @@ def _dw_reference(dy, x, z):
     return terms.sum(0), terms.abs().sum(0)
 
 
-def _check_outputs(stage: str, tokens: int, alone, busy, dw_reference=None) -> None:
-    """``y`` (forward) or ``dx``, ``dz`` and ``dw`` (backward) of every call
-    of one entry point and module bitwise those of its first call alone; every
-    backward ``dw`` also within the backend suite's budget of
-    ``dw_reference``."""
+def _device() -> tuple[str, int]:
+    """``(arch, SMs)`` of the current CUDA device."""
+    device_index = torch.cuda.current_device()
+    return (
+        loader.device_arch(device_index),
+        torch.cuda.get_device_properties(device_index).multi_processor_count,
+    )
+
+
+def _backward_role(dw_dtype: torch.dtype) -> str:
+    """The backward role of a ``dw_dtype`` weight gradient."""
+    return "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+
+
+def _backward_module(rows: int, dw_dtype: torch.dtype = torch.bfloat16) -> str:
+    """The module that runs a backward of ``rows`` rows into a ``dw_dtype``
+    weight gradient on the current device (``module_for_rows``)."""
+    arch, sms = _device()
+    return loader.module_for_rows(arch, _backward_role(dw_dtype), rows, sms)
+
+
+def _dw_repeats(name: str) -> bool:
+    """Whether the backward module ``name`` repeats its weight gradient bit for
+    bit: every module but a row-claims backward, whose CTAs claim row blocks at
+    run time and add their sums with FP64 atomics."""
+    return loader.MODULES[name]["grid_rule"]["kind"] != "row_claims"
+
+
+def _check_outputs(
+    stage: str,
+    tokens: int,
+    alone,
+    busy,
+    dw_reference=None,
+    *,
+    module: str | None = None,
+) -> None:
+    """``y`` (forward) or ``dx`` and ``dz`` (backward) of every call of one
+    entry point and module bitwise those of its first call alone, and so its
+    ``dw`` where the backward ``module`` repeats it (``_dw_repeats``); every
+    backward ``dw`` within the backend suite's budget of ``dw_reference``."""
+    assert stage == "forward" or module is not None, "the backward's module"
     first = alone[0][1]
     for _t, out in alone + busy:
         if stage == "forward":
@@ -617,7 +688,8 @@ def _check_outputs(stage: str, tokens: int, alone, busy, dw_reference=None) -> N
             continue
         assert torch.equal(out[0], first[0]), f"dx tokens={tokens}"
         assert torch.equal(out[1], first[1]), f"dz tokens={tokens}"
-        assert torch.equal(out[2], first[2]), f"dw tokens={tokens} {out[2].dtype}"
+        if _dw_repeats(module):
+            assert torch.equal(out[2], first[2]), f"dw tokens={tokens} {out[2].dtype}"
         dw64, mag = dw_reference
         err = (out[2].double() - dw64).abs()
         bound = dw64.abs() * DW_REL_TOL + mag * DW_MAG_TOL
@@ -659,7 +731,14 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
         f"carveout=max_shared alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
         f"extra_ms={busy_ms - alone_ms:.4f}"
     )
-    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    _check_outputs(
+        "backward",
+        tokens,
+        alone,
+        busy,
+        _dw_reference(dy, x, z),
+        module=_backward_module(tokens * H, dw_dtype),
+    )
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
         f"tokens={tokens}: backward alone {alone_ms:.4f} ms, beside an all-SM kernel "
@@ -694,33 +773,142 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     )
 
 
-def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int, str]:
-    """``(T, block_share, blocks_per_chunk, chunks, module)``: the most tokens
-    ``T`` whose ``T * H`` rows give each CTA of the BF16 weight-gradient
-    backward's one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM,
-    all resident at once) at most ``blocks_per_cta`` row blocks, rows with
-    more chunks than that grid has CTAs; the share of one row block of each of
-    its CTAs in the call alone; the chunks of those rows
-    (``backward_chunks``); and the module that runs them (``module_for_rows``:
-    the claimed backward, or on SM100 and SM103 up to 245760 rows the second
-    static backward)."""
-    device_index = torch.cuda.current_device()
-    arch = loader.device_arch(device_index)
-    claimed = loader.route_module(arch, "bwd_bf16_mid")
-    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    wave = loader.backward_ctas(claimed, loader.INT32_MAX, sms)
-    rows_per_block = int(loader.MODULES[claimed]["grid_rule"]["rows_per_block"])
-    tokens = blocks_per_cta * wave * rows_per_block // H
+def _band_rows(arch: str, role: str, sms: int) -> list[tuple[int, int | None, str]]:
+    """``(first, last, module)`` of each ``BACKWARD_BANDS`` band of ``role`` on
+    ``arch`` with ``sms`` SMs, in order: its rows from one past the previous
+    band's last row (1 in the first band) to its last row (``(ROWS, n)``:
+    ``n``; ``r`` rows per SM: ``floor(r * sms)``; ``None``: no end).  A band
+    whose last row is below its first holds no rows."""
+    bands = []
+    first = 1
+    for last, band in loader.BACKWARD_BANDS[arch][role]:
+        if last is None:
+            end = None
+        elif isinstance(last, tuple):
+            assert last[0] == loader.ROWS, (arch, role, last)
+            end = int(last[1])
+        else:
+            end = math.floor(last * sms)
+        bands.append((first, end, loader.route_module(arch, band)))
+        if end is None:
+            break
+        first = max(first, end + 1)
+    return bands
+
+
+def _band_kind(name: str) -> str:
+    """The schedule of the backward module ``name``: ``"cluster"`` (a
+    small-row backward), ``"static"`` (a chunked backward of a call role: CTA
+    ``b`` runs the chunks ``b``, ``b + grid``, ...), ``"claimed"`` (another
+    chunked backward: its CTAs claim runs of chunks) or ``"row_claims"``."""
+    record = loader.MODULES[name]
+    kind = record["grid_rule"]["kind"]
+    if kind != "chunks":
+        return kind
+    return "static" if record["role"] in loader.ROLES else "claimed"
+
+
+def _rows_per_block(name: str) -> int:
+    """Rows of a row block of the chunked or row-claims backward module
+    ``name``: ``rows_per_block`` of a chunked one, ``rows_per_cta`` of a
+    row-claims one."""
+    rule = loader.MODULES[name]["grid_rule"]
+    return int(rule["rows_per_block" if rule["kind"] == "chunks" else "rows_per_cta"])
+
+
+def _work_units(name: str, rows: int) -> int:
+    """What the CTAs of the backward module ``name`` share out at ``rows``
+    rows: the chunks of a chunked backward (``backward_chunks``), the row
+    blocks of a row-claims backward."""
+    if loader.MODULES[name]["grid_rule"]["kind"] == "chunks":
+        return loader.backward_chunks(name, rows)[1]
+    return -(-rows // _rows_per_block(name))
+
+
+def _block_share(name: str, rows: int, sms: int) -> float:
+    """The share in a call alone of one row block of each CTA of the backward
+    module ``name`` at ``rows`` rows: its CTAs (``backward_ctas``) over its
+    row blocks."""
+    return loader.backward_ctas(name, rows, sms) / -(-rows // _rows_per_block(name))
+
+
+def _claim_tokens(blocks_per_cta: int) -> tuple[int, str, float]:
+    """``(T, module, block_share)``: the module of the first
+    ``BACKWARD_BANDS`` band of a BF16 weight gradient (past the small-row
+    bands) that runs the most tokens ``T`` whose ``T * H`` rows give each CTA
+    of its own one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM)
+    at most ``blocks_per_cta`` of its row blocks, rows with more chunks or
+    blocks than that grid has CTAs, and the share of one row block of each of
+    its CTAs in the call alone (``_block_share``); skips where no band's
+    module runs its own such rows."""
+    arch, sms = _device()
+    for _first, _last, name in _band_rows(arch, "bwd_bf16", sms):
+        if _band_kind(name) == "cluster":
+            continue
+        wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
+        tokens = blocks_per_cta * wave * _rows_per_block(name) // H
+        if loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms) == name:
+            break
+    else:
+        pytest.skip(
+            f"{arch} ({sms} SMs): no BF16 backward band's module runs "
+            f"{blocks_per_cta} row blocks a CTA of its own grid"
+        )
     rows = tokens * H
-    name = loader.module_for_rows(arch, "bwd_bf16", rows, sms)
-    role = loader.MODULES[name]["role"]
-    assert role in ("bwd_bf16_long", "bwd_bf16_mid"), (arch, rows, role)
     ctas = loader.backward_ctas(name, rows, sms)
-    assert ctas == wave
-    blocks_per_chunk, chunks = loader.backward_chunks(name, rows)
-    assert chunks > ctas, (rows, chunks, ctas)
-    blocks = -(-rows // rows_per_block)
-    return tokens, ctas / blocks, blocks_per_chunk, chunks, role
+    assert ctas == wave, (arch, rows, name, ctas, wave)
+    assert _work_units(name, rows) > ctas, (arch, rows, name, ctas)
+    return tokens, name, _block_share(name, rows, sms)
+
+
+def _backward_slows_in_proportion(
+    case: str,
+    tokens: int,
+    name: str,
+    block_share: float,
+    ctas: int,
+    threads: int,
+    dw_dtype: torch.dtype | None = None,
+) -> None:
+    """Busy / alone of the backward of ``tokens`` tokens (``dw_dtype`` weight
+    gradient; ``None``: the default BF16 one) beside ``ctas`` side CTAs of
+    ``threads`` threads, at most ``N / (N - ctas) + block_share +
+    PROPORTIONAL_SLACK``; the call runs the module ``name``."""
+    x, z, w, dy = _inputs(tokens)
+    rows = tokens * H
+    workspace = workspace_for(rows, x.device)
+    dw = None if dw_dtype is None else torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    def call():
+        return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
+
+    assert _launched(call) == [name], (case, tokens, name)
+    spin = _spin(None, ctas=ctas, threads=threads)
+    alone_ms, busy_ms, alone, busy = _paired_medians(call, spin, PROPORTIONAL_RUNS)
+    ideal = spin.sms / (spin.sms - ctas)
+    bound = ideal + block_share + PROPORTIONAL_SLACK
+    ratio = busy_ms / alone_ms
+    role = loader.MODULES[name]["role"]
+    grid = loader.backward_ctas(name, rows, spin.sms)
+    blocks = -(-rows // _rows_per_block(name))
+    print(
+        f"HELD stage=backward case={case} role={role} kind={_band_kind(name)} "
+        f"tokens={tokens} heads={H} rows={rows} dw={dw_dtype} ctas={grid} "
+        f"units={_work_units(name, rows)} blocks_per_cta={blocks / grid:.2f} "
+        f"side={ctas}x{threads} alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+        f"ratio={ratio:.3f} ideal={ideal:.3f} block_share={block_share:.4f} "
+        f"excess={ratio - ideal - block_share:.4f}"
+    )
+    _check_outputs(
+        "backward", tokens, alone, busy, _dw_reference(dy, x, z), module=name
+    )
+    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
+    assert ratio <= bound, (
+        f"tokens={tokens} ({case}): {role} alone {alone_ms:.4f} ms, beside "
+        f"{ctas} x {threads} side CTAs on {ctas} SMs {busy_ms:.4f} ms: ratio "
+        f"{ratio:.3f} > {bound:.3f} (proportional {ideal:.3f} + one row block "
+        f"{block_share:.4f} + {PROPORTIONAL_SLACK})"
+    )
 
 
 @pytest.mark.parametrize(
@@ -730,33 +918,149 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, float, int, int, str]:
 def test_backward_slows_in_proportion_to_the_sms_held(
     blocks_per_cta: int, ctas: int, threads: int
 ) -> None:
-    tokens, block_share, blocks_per_chunk, chunks, role = _claim_tokens(blocks_per_cta)
-    x, z, w, dy = _inputs(tokens)
-    workspace = workspace_for(tokens * H, x.device)
-
-    def call():
-        return backward(dy, x, z, w, EPS, workspace=workspace)
-
-    spin = _spin(None, ctas=ctas, threads=threads)
-    alone_ms, busy_ms, alone, busy = _paired_medians(call, spin, PROPORTIONAL_RUNS)
-    ideal = spin.sms / (spin.sms - ctas)
-    bound = ideal + block_share + PROPORTIONAL_SLACK
-    ratio = busy_ms / alone_ms
-    print(
-        f"HELD stage=backward role={role} tokens={tokens} heads={H} "
-        f"blocks_per_cta={blocks_per_cta} blocks_per_chunk={blocks_per_chunk} "
-        f"chunks={chunks} side={ctas}x{threads} "
-        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
-        f"ideal={ideal:.3f} block_share={block_share:.4f} "
-        f"excess={ratio - ideal - block_share:.4f}"
+    tokens, name, block_share = _claim_tokens(blocks_per_cta)
+    _backward_slows_in_proportion(
+        f"{blocks_per_cta}_blocks_per_cta", tokens, name, block_share, ctas, threads
     )
-    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
-    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
-    assert ratio <= bound, (
-        f"tokens={tokens} ({blocks_per_cta} row blocks per CTA): {role} alone "
-        f"{alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs on {ctas} SMs "
-        f"{busy_ms:.4f} ms: ratio {ratio:.3f} > {bound:.3f} (proportional "
-        f"{ideal:.3f} + one row block {block_share:.4f} + {PROPORTIONAL_SLACK})"
+
+
+# The band edges of the backward beside the item 1 side kernels, by the same
+# bound.  A static multi-chunk band: the band of a static backward
+# (``_band_kind``) that holds rows with more chunks than its one-wave grid has
+# CTAs (so a CTA runs more than one chunk); "first" is its first whole tokens
+# of H heads with more chunks than CTAs, "last" the most tokens whose rows
+# give each CTA of that grid the band end's whole row blocks a CTA
+# (``floor(band end / (wave * rows_per_block))``), or the band's last whole
+# tokens where those are not past "first" (a band that ends below 2 whole row
+# blocks a CTA).  A row-claims band: "first" and "last" are its first and its
+# last whole tokens.  Every size comes from BACKWARD_BANDS and the device's SM
+# count; the ``nth`` such band of the weight gradient's role, where the
+# architecture has one.
+BACKWARD_EDGES = ("first", "last")
+
+
+def _edge_band(arch: str, last, band: str, kind: str) -> bool:
+    """Whether the ``BACKWARD_BANDS`` band ``(last, band)`` of ``arch`` is a
+    band of ``kind`` (``_band_kind`` of its module) the edge tests probe: any
+    row-claims band; a static band without an end, of a count of rows, or
+    whose end in rows per SM passes one wave of one-block chunks
+    (``ctas_per_sm * rows_per_block``: only past it does a static backward
+    run more chunks than CTAs)."""
+    name = loader.route_module(arch, band)
+    if _band_kind(name) != kind:
+        return False
+    if kind != "static" or last is None or isinstance(last, tuple):
+        return True
+    rule = loader.MODULES[name]["grid_rule"]
+    return last > int(rule["ctas_per_sm"]) * int(rule["rows_per_block"])
+
+
+def _backward_band_probes(kind: str) -> list:
+    """``(dw_dtype, nth)`` parameters: for each weight-gradient dtype, ``1 ..
+    n`` for the most ``BACKWARD_BANDS`` bands of its role that any
+    architecture has of ``kind`` (``_edge_band``); for ``"static"`` at least
+    ``1``, so a dtype without a static multi-chunk band skips with the
+    reason."""
+    params = []
+    for dw_dtype, label in ((torch.bfloat16, "bf16"), (torch.float32, "f32")):
+        role = _backward_role(dw_dtype)
+        count = max(
+            sum(_edge_band(arch, last, band, kind) for last, band in bands[role])
+            for arch, bands in loader.BACKWARD_BANDS.items()
+        )
+        if kind == "static":
+            count = max(count, 1)
+        params += [
+            pytest.param(dw_dtype, nth, id=f"{label}-band{nth}")
+            for nth in range(1, count + 1)
+        ]
+    return params
+
+
+def _band_edge(
+    dw_dtype: torch.dtype, kind: str, nth: int, edge: str
+) -> tuple[int, str, float]:
+    """``(T, module, block_share)`` of ``edge`` of the ``nth`` static
+    multi-chunk band (``kind`` "static") or row-claims band (``kind``
+    "row_claims") of a ``dw_dtype`` weight gradient on the current device
+    (``BACKWARD_EDGES``), its module and the share of one row block of each
+    of its CTAs in the call alone (``_block_share``); skips where the
+    architecture has fewer such bands, or where "last" is not past "first"."""
+    arch, sms = _device()
+    role = _backward_role(dw_dtype)
+    bands = []
+    for first, last, name in _band_rows(arch, role, sms):
+        if _band_kind(name) != kind:
+            continue
+        if kind == "static":
+            # the first rows with more chunks than the one-wave grid has CTAs
+            wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
+            first = max(first, wave * _rows_per_block(name) + 1)
+        lowest = -(-first // H)
+        if last is None or lowest * H <= last:
+            bands.append((lowest, last, name))
+    if len(bands) < nth:
+        holds = " with more chunks than CTAs" if kind == "static" else ""
+        pytest.skip(
+            f"{arch} ({sms} SMs) has {len(bands)} {kind} backward band(s) of "
+            f"{role} holding whole tokens of {H} heads{holds}, not {nth}"
+        )
+    lowest, last, name = bands[nth - 1]
+    tokens = lowest
+    if edge == "last":
+        assert last is not None, f"{arch} {role}: the {kind} band of {name} has no end"
+        tokens = last // H
+        if kind == "static":
+            # the band end's whole row blocks a CTA, where past "first"
+            wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
+            per_block = wave * _rows_per_block(name)
+            whole = last // per_block * per_block // H
+            if whole > lowest:
+                tokens = whole
+        if tokens <= lowest:
+            pytest.skip(
+                f"{arch} {role} {kind} band {nth}: its last edge ({tokens} "
+                f"tokens) is not past its first ({lowest} tokens)"
+            )
+    rows = tokens * H
+    assert loader.module_for_rows(arch, role, rows, sms) == name, (arch, role, rows)
+    if kind == "static":
+        ctas = loader.backward_ctas(name, rows, sms)
+        assert _work_units(name, rows) > ctas, (arch, rows, name, ctas)
+    return tokens, name, _block_share(name, rows, sms)
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("edge", BACKWARD_EDGES)
+@pytest.mark.parametrize(("dw_dtype", "nth"), _backward_band_probes("static"))
+def test_static_backward_band_edges_slow_in_proportion_to_the_sms_held(
+    dw_dtype: torch.dtype, nth: int, edge: str, ctas: int, threads: int
+) -> None:
+    tokens, name, block_share = _band_edge(dw_dtype, "static", nth, edge)
+    _backward_slows_in_proportion(
+        f"static_band{nth}_{edge}", tokens, name, block_share, ctas, threads, dw_dtype
+    )
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("edge", BACKWARD_EDGES)
+@pytest.mark.parametrize(("dw_dtype", "nth"), _backward_band_probes("row_claims"))
+def test_row_claims_backward_band_edges_slow_in_proportion_to_the_sms_held(
+    dw_dtype: torch.dtype, nth: int, edge: str, ctas: int, threads: int
+) -> None:
+    tokens, name, block_share = _band_edge(dw_dtype, "row_claims", nth, edge)
+    _backward_slows_in_proportion(
+        f"row_claims_band{nth}_{edge}",
+        tokens,
+        name,
+        block_share,
+        ctas,
+        threads,
+        dw_dtype,
     )
 
 
@@ -1192,9 +1496,10 @@ def test_first_band_forward_ends_no_later_than_the_forward_beside_held_sms(
 # role on every architecture), beside the short forward's side kernels; their
 # held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD.
 # And "past": the first whole tokens of H heads past the role's last
-# small-row band (11 tokens, 528 rows), where the static backward takes over
-# from the small-row backward; it runs in the keeps-speed and the max-shared
-# start tests only.
+# small-row band (11 tokens, 528 rows), where the module of the role's next
+# band takes over from the small-row backward (on SM100 and SM103 for a BF16
+# weight gradient the row-claims backward, else the static backward); it runs
+# in the keeps-speed and the max-shared start tests only.
 SHORT_BACKWARD_PROBES = ("1x48", "5x48", "past")
 SHORT_BACKWARD_DW_DTYPES = pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
@@ -1205,25 +1510,38 @@ SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
 # shared memory with this or the default carveout (at most
 # MAX_ALL_SM_EXTRA_MS more than alone), or on the architectures of
 # SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT that it ends at most
-# MAX_ALL_SM_EXTRA_MS after the backward it replaces (the static backward,
-# 15616 bytes a CTA) beside that side kernel.
+# MAX_ALL_SM_EXTRA_MS after the backward it replaces (the module of the role's
+# first band past its small-row bands) beside that side kernel.
 CARVEOUT_MAX_L1 = 0
 
 
-# Why the small-carveout and held tests skip the "past" probe: the static
-# backward it runs is the backward a small-row backward replaces (a held test
-# would compare it with itself), and this file asserts no start of the static
-# backward beside a side kernel holding every SM with a small carveout ("a
-# side kernel holding every SM with a small carveout can delay its start until
-# the side kernel exits (no test here asserts that delay; documented in
-# flashinfer.cake_rmsnorm_silu_gate_nondet_train)").
+# Why the small-carveout and held tests skip the "past" probe: the backward it
+# runs is the backward a small-row backward replaces (a held test would
+# compare it with itself), and this file asserts no start of the chunked or
+# the row-claims backwards beside a side kernel holding every SM with a small
+# carveout ("a side kernel holding every SM with a small carveout can delay
+# its start until the side kernel exits (no test here asserts that delay;
+# documented in flashinfer.cake_rmsnorm_silu_gate_nondet_train)").
 PAST_PROBE_SKIP = (
-    "the static backward past the small-row band: it is the backward a "
-    "small-row backward replaces, and a side kernel holding every SM with a "
-    "small carveout can delay its start until the side kernel exits (no test "
-    "here asserts that delay; documented in "
+    "the backward past the small-row band: it is the backward a small-row "
+    "backward replaces, and a side kernel holding every SM with a small "
+    "carveout can delay its start until the side kernel exits (no test here "
+    "asserts that delay; documented in "
     "flashinfer.cake_rmsnorm_silu_gate_nondet_train)"
 )
+
+
+def _past_small_row_bands(arch: str, role: str, sms: int) -> tuple[int, str]:
+    """``(first row, module)`` of the first ``BACKWARD_BANDS`` band of
+    ``role`` on ``arch`` with ``sms`` SMs past its small-row bands
+    (``BAND_ROLES``) that holds rows: the backward a small-row backward
+    replaces."""
+    for first, last, name in _band_rows(arch, role, sms):
+        if loader.MODULES[name]["role"] in loader.BAND_ROLES:
+            continue
+        if last is None or first <= last:
+            return first, name
+    raise AssertionError(f"{arch} {role}: no band past the small-row bands")
 
 
 def _short_backward(
@@ -1232,29 +1550,26 @@ def _short_backward(
     """``(tokens, the probed backward, the backward it replaces)`` of the
     ``SHORT_BACKWARD_PROBES`` entry ``probe`` for a ``dw_dtype`` weight
     gradient: the tokens of H heads (for ``past`` the first whole tokens past
-    the role's last small-row ``BACKWARD_BANDS`` band), the module that runs
-    their rows and the role's module, the static backward.  ``past`` probes
-    run the static backward and skip unless ``past`` is set; the others skip
-    where no small-row band holds their rows."""
-    device_index = torch.cuda.current_device()
-    arch = loader.device_arch(device_index)
-    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
-    static = loader.route_module(arch, role)
+    the role's small-row ``BACKWARD_BANDS`` bands), the module that runs
+    their rows and the module of the role's first band past its small-row
+    bands (``_past_small_row_bands``).  ``past`` probes run that module and
+    skip unless ``past`` is set; the others skip where no small-row band holds
+    their rows."""
+    arch, sms = _device()
+    role = _backward_role(dw_dtype)
+    first, replaced = _past_small_row_bands(arch, role, sms)
     if probe == "past":
         if not past:
             pytest.skip(PAST_PROBE_SKIP)
-        bands = loader.BACKWARD_BANDS.get(arch, {}).get(role, ())
-        small = [last for last, band in bands if band in loader.BAND_ROLES]
-        tokens = (int(small[-1]) if small else 0) // H + 1
+        tokens = -(-first // H)
         name = loader.module_for_rows(arch, role, tokens * H, sms)
-        assert name == static, (arch, role, tokens, name)
-        return tokens, name, static
+        assert name == replaced, (arch, role, tokens, name)
+        return tokens, name, replaced
     tokens = int(probe.split("x")[0])
     name = loader.module_for_rows(arch, role, tokens * H, sms)
     if loader.MODULES[name]["role"] not in loader.BAND_ROLES:
         pytest.skip(f"{arch} runs no small-row backward for {tokens * H} rows")
-    return tokens, name, static
+    return tokens, name, replaced
 
 
 @pytest.mark.parametrize("probe", SHORT_BACKWARD_PROBES)
@@ -1262,7 +1577,7 @@ def _short_backward(
 def test_short_backward_keeps_its_speed_beside_a_resident_kernel(
     dw_dtype: torch.dtype, probe: str
 ) -> None:
-    tokens, _name, _replaced = _short_backward(probe, dw_dtype, past=True)
+    tokens, name, _replaced = _short_backward(probe, dw_dtype, past=True)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
@@ -1284,7 +1599,9 @@ def test_short_backward_keeps_its_speed_beside_a_resident_kernel(
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
         f"ratio={busy_ms / alone_ms:.3f} extra_ms={busy_ms - alone_ms:.4f}"
     )
-    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    _check_outputs(
+        "backward", tokens, alone, busy, _dw_reference(dy, x, z), module=name
+    )
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     assert _keeps_its_speed(alone_ms, busy_ms), (
         f"short backward tokens={tokens}: {busy_ms:.4f} ms beside a resident "
@@ -1297,7 +1614,7 @@ def test_short_backward_keeps_its_speed_beside_a_resident_kernel(
 def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     dw_dtype: torch.dtype, probe: str
 ) -> None:
-    tokens, _name, _replaced = _short_backward(probe, dw_dtype, past=True)
+    tokens, name, _replaced = _short_backward(probe, dw_dtype, past=True)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
@@ -1313,7 +1630,9 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
         f"carveout=max_shared alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
         f"extra_ms={busy_ms - alone_ms:.4f}"
     )
-    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    _check_outputs(
+        "backward", tokens, alone, busy, _dw_reference(dy, x, z), module=name
+    )
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
         f"tokens={tokens}: short backward alone {alone_ms:.4f} ms, beside an "
@@ -1327,6 +1646,7 @@ def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carve
 # every SM with a small carveout (the default or the maximum-L1 one) until that
 # kernel exits (observed on R200): there it
 # must end at most MAX_ALL_SM_EXTRA_MS after the backward it replaces (the
+# module of the role's first band past its small-row bands, on SM107 the
 # static backward, 15616 bytes a CTA) beside it.
 SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)
 
@@ -1337,7 +1657,7 @@ SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT = ("sm_107a",)
 def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
     carveout: int | None, dw_dtype: torch.dtype, probe: str
 ) -> None:
-    tokens, _name, replaced = _short_backward(probe, dw_dtype)
+    tokens, name, replaced = _short_backward(probe, dw_dtype)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
@@ -1352,7 +1672,9 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
         f"dw={dw_dtype} carveout={label} alone_ms={alone_ms:.4f} "
         f"busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
     )
-    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    _check_outputs(
+        "backward", tokens, alone, busy, _dw_reference(dy, x, z), module=name
+    )
     assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
     if loader.device_arch(x.device.index) in SHORT_BACKWARD_WAITS_FOR_SMALL_CARVEOUT:
 
@@ -1370,7 +1692,14 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
             f"dw={dw_dtype} carveout={label} alone_ms={rep_alone_ms:.4f} "
             f"busy_ms={rep_busy_ms:.4f} extra_ms={rep_busy_ms - rep_alone_ms:.4f}"
         )
-        _check_outputs("backward", tokens, rep_alone, rep_busy, _dw_reference(dy, x, z))
+        _check_outputs(
+            "backward",
+            tokens,
+            rep_alone,
+            rep_busy,
+            _dw_reference(dy, x, z),
+            module=replaced,
+        )
         _check_replaced_rows(tokens, alone, rep_alone)
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         assert busy_ms - rep_busy_ms <= MAX_ALL_SM_EXTRA_MS, (
@@ -1396,7 +1725,7 @@ def test_short_backward_beside_an_all_sm_kernel_with_a_small_carveout(
 def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
     dw_dtype: torch.dtype, probe: str, ctas: int, threads: int, carveout: int | None
 ) -> None:
-    tokens, _name, replaced = _short_backward(probe, dw_dtype)
+    tokens, name, replaced = _short_backward(probe, dw_dtype)
     x, z, w, dy = _inputs(tokens)
     workspace = workspace_for(tokens * H, x.device)
     dw = torch.empty(D, dtype=dw_dtype, device=x.device)
@@ -1435,8 +1764,10 @@ def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
             f"counts={int(counts)}"
         )
         # each module's outputs repeat their own bits; dx and dz match across them
-        _check_outputs("backward", tokens, alone, busy, dw_reference)
-        _check_outputs("backward", tokens, rep_alone, rep_busy, dw_reference)
+        _check_outputs("backward", tokens, alone, busy, dw_reference, module=name)
+        _check_outputs(
+            "backward", tokens, rep_alone, rep_busy, dw_reference, module=replaced
+        )
         _check_replaced_rows(tokens, alone, rep_alone)
         assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
         if counts:
