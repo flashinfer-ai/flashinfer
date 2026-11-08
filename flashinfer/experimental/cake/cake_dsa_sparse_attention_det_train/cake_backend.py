@@ -740,7 +740,9 @@ def redo_lists_fit(num_kv: int, num_dst: int, *, dkv_fp32: bool = False) -> bool
     return _align(int(num_dst) * 4) * 2 <= int(num_kv) * row_bytes
 
 
-def output_scratch_layout(num_queries: int, num_dst: int, *, delta: bool = True) -> dict:
+def output_scratch_layout(
+    num_queries: int, num_dst: int, *, delta: bool = True
+) -> dict:
     """Byte ``(offset, size)`` of the backward scratch at the front of a fresh RoPE dK/dV output (``dkv_latent`` or
     ``dkv_latent_fp32``), plus ``"total"``: the redo marks and the redo list (``[num_dst]`` int32 each) and, with
     ``delta``, ``delta`` (``[T, 64]`` FP32) and the global words.  ``bwd_delta`` writes ``delta`` and zeroes the
@@ -763,7 +765,9 @@ def delta_fits_output(
     fresh RoPE dK/dV output (``[num_kv, 512]``, BF16 or FP32): ``2 * align(R * 4) + align(T * 256) + 256 <=
     num_kv * 1024`` (BF16), so the workspace or the per-call allocation holds neither."""
     row_bytes = D_LATENT * (4 if dkv_fp32 else 2)
-    return output_scratch_layout(num_queries, num_dst)["total"] <= int(num_kv) * row_bytes
+    return (
+        output_scratch_layout(num_queries, num_dst)["total"] <= int(num_kv) * row_bytes
+    )
 
 
 def carve_fits(
@@ -1829,9 +1833,7 @@ def _carve_moved(plan: _Plan, t: dict[str, torch.Tensor]) -> None:
         flat = out.view(-1).view(torch.uint8)
         assert flat.data_ptr() % 16 == 0
         R = plan.num_dst
-        layout = output_scratch_layout(
-            plan.num_queries, R, delta=plan.delta_in_output
-        )
+        layout = output_scratch_layout(plan.num_queries, R, delta=plan.delta_in_output)
         t["redo_mark"] = _carve(flat, layout, "redo_mark", torch.int32, (R,))
         t["redo_rows"] = _carve(flat, layout, "redo_rows", torch.int32, (R,))
         if plan.delta_in_output:
