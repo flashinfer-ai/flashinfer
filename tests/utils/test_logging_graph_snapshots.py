@@ -58,7 +58,7 @@ def _graph_snapshot_alias_op(
 )
 def _graph_snapshot_readonly_op(x: torch.Tensor, w: torch.Tensor) -> None:
     """Declared mutation plus a read-only stride-0 argument."""
-    x.add_(1)
+    x.add_(w[:, 0])
 
 
 def _snapshot_review_identity(x, repeated, distinct):
@@ -76,6 +76,15 @@ def _snapshot_review_none(x):
     return None
 
 
+@register_custom_op(
+    "flashinfer::test_logging_mutate_none",
+    mutates_args=("x",),
+)
+def _snapshot_review_mutate_none(x: torch.Tensor) -> None:
+    """Exercise a completed None-return call with recorded post-call state."""
+    x.add_(1)
+
+
 @pytest.fixture
 def snapshot_logging(tmp_path, monkeypatch, request):
     """Reload only logging after its import-time snapshot opt-in is configured."""
@@ -89,7 +98,8 @@ def snapshot_logging(tmp_path, monkeypatch, request):
     monkeypatch.setenv("FLASHINFER_DUMP_MAX_SIZE_GB", "1")
     monkeypatch.setenv(
         "FLASHINFER_DUMP_INCLUDE",
-        "_graph_snapshot_alias_op,_snapshot_review_*,apply_rope_inplace,"
+        "_graph_snapshot_alias_op,_graph_snapshot_readonly_op,"
+        "_snapshot_review_*,apply_rope_inplace,"
         "fused_add_rmsnorm,BatchDecodeWithPagedKVCacheWrapper.run",
     )
     monkeypatch.delenv("FLASHINFER_DUMP_EXCLUDE", raising=False)
@@ -368,7 +378,7 @@ def test_readonly_alias_gaps_are_zero(
 @pytest.mark.parametrize("complete", [False, True])
 def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, complete):
     logging, _ = snapshot_logging
-    func = _snapshot_review_none if complete else _snapshot_review_result
+    func = _snapshot_review_mutate_none if complete else _snapshot_review_result
     x = torch.arange(8, dtype=torch.float32)
     with monkeypatch.context() as capture:
         capture.setattr(logging, "_is_current_stream_capturing", lambda: captured)
@@ -386,6 +396,8 @@ def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, com
     assert "execution_error" not in replay
     if complete:
         assert replay["execution_result"] is None
+        assert set(replay["expected_tensors"]) == {"mutated_input__arg_0"}
+        torch.testing.assert_close(replay["expected_tensors"]["mutated_input__arg_0"], x)
         assert replay["comparison_match"] is True
     else:
         assert replay["comparison_match"] is None
@@ -393,27 +405,35 @@ def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, com
 
 
 @pytest.mark.cpu_only
-def test_graph_snapshot_readonly_stride0_arg_cpu(snapshot_logging, monkeypatch):
+@pytest.mark.parametrize("captured", [False, True])
+def test_graph_snapshot_readonly_stride0_arg_cpu(snapshot_logging, monkeypatch, captured):
     """A read-only singleton must not veto the whole call's dump."""
     logging, root = snapshot_logging
     logged_op = logging.flashinfer_api(inspect.unwrap(_graph_snapshot_readonly_op))
     x = torch.arange(4, dtype=torch.float32)
-    w = torch.ones(4, 64, dtype=torch.float32).expand(4, 64)
+    w = torch.ones(1, 64, dtype=torch.float32).expand(4, 64)
+    assert w.stride() == (0, 1)
     with monkeypatch.context() as capture:
-        capture.setattr(logging, "_is_current_stream_capturing", lambda: True)
+        capture.setattr(logging, "_is_current_stream_capturing", lambda: captured)
         assert logged_op(x, w) is None
-    logging.flush_graph_dumps(synchronize=False)
+    if captured:
+        logging.flush_graph_dumps(synchronize=False)
     call = _calls(root, "_graph_snapshot_readonly_op")[0]
-    snapshot = call / "graph_flushes" / "flush_0001"
+    snapshot = call / "graph_flushes" / "flush_0001" if captured else call
     assert snapshot.exists()
     inputs = _load(snapshot, "inputs")
     assert "arg_1" in inputs
-    assert inputs["arg_1"].stride() == (0, 1)
+    # Read-only singletons follow the reference path. Materialization may
+    # normalize storage; this input must not need an alias reconstruction group.
+    assert "arg_1" not in _metadata(snapshot).get("input_tensor_aliases", {})
+    torch.testing.assert_close(inputs["arg_1"], w)
+    torch.testing.assert_close(inputs["arg_0"], torch.arange(4, dtype=torch.float32))
+    _assert_none_replay(logging, snapshot, "cpu")
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("snapshot_logging", [False], indirect=True)
-def test_none_return_without_snapshots_has_distinct_message(snapshot_logging):
+@pytest.mark.parametrize("snapshot_logging", [False, True], indirect=True)
+def test_none_return_without_recorded_state_has_distinct_message(snapshot_logging):
     """No post-call state is a distinct status, not an incomplete dump."""
     logging, _ = snapshot_logging
     func = _snapshot_review_none
@@ -425,6 +445,9 @@ def test_none_return_without_snapshots_has_distinct_message(snapshot_logging):
     )
     assert replay["comparison_match"] is None
     assert "No post-call state recorded" in replay["comparison_error"]
+    assert (
+        "enable FLASHINFER_DUMP_GRAPH_SNAPSHOTS" in replay["comparison_error"]
+    ) is not logging._DUMP_GRAPH_SNAPSHOTS
 
 
 @pytest.mark.cpu_only
