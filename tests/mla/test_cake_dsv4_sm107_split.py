@@ -1,9 +1,9 @@
 """GPU tests of the SM107 split-KV launch of the CAKE DSv4 FP8/H128 decode route.
 
 On SM107, FP8 launches of 128 heads over items 1025-1152 wide (nine sparse
-tiles) with at most 17 metadata rows and PDL run a split-KV producer and a
+tiles) with at most 20 metadata rows and PDL run a split-KV producer and a
 merge kernel (:func:`flashinfer.mla.cake_dsv4._k64_split`); launches of
-three pieces per row and 16 or 17 rows merge with the merge built for three
+three pieces per row and 16-20 rows merge with the merge built for three
 pieces (one warp per row and head, two heads per CTA, grid ``(rows, 64)``),
 those of nine and five pieces with the merge built for their count alone
 and those of three at 9-15 rows with the merge of any count (grid
@@ -19,9 +19,9 @@ CUDA graph replay, with the piece buffers poisoned before every call).
 Every launch that merges with the merge built for its count alone writes,
 bit for bit, what the merge of any count writes for it (its key removed from
 the registry, as on FlashInfer main before those merges).
-Launches outside the split rule (18 rows, PDL off, a workspace below the
-split carve at 8 rows and at 17, items 1024 wide, the K=64 launch gate
-false) must run the route's own launch bit for bit.
+Launches outside the split rule (21 rows, PDL off, a workspace below the
+split carve at 8 rows, at 17 and at 20, items 1024 wide, the K=64 launch
+gate false) must run the route's own launch bit for bit.
 FP8 launches of 64 heads over items of four to nine tiles with PDL split by
 the rows and pieces of ``_K64_SPLIT_RULES_H64``; the ``test_h64_*`` tests
 check the same contract at both ends of every pieces band of those rules
@@ -78,7 +78,7 @@ TILE = 128
 # Routed row counts and the pieces per row the SM107 rule plans for them.
 # 1 and 4, 5 and 8 rows bound the launches that merge with the merge for nine
 # and five pieces alone, 9 and 15 rows those that merge with the merge of any
-# count, 16 and 17 rows those that merge with the three-piece merge.
+# count, 16 and 20 rows those that merge with the three-piece merge.
 ROUTED = [
     (1, 9),
     (2, 9),
@@ -92,6 +92,9 @@ ROUTED = [
     (15, 3),
     (16, 3),
     (17, 3),
+    (18, 3),
+    (19, 3),
+    (20, 3),
 ]
 REPEATS = 20
 # The merge built for three pieces per row (one warp per row and head, two
@@ -332,7 +335,7 @@ def test_split_launch_matches_reference(monkeypatch, rows, splits, layout, lengt
 
 
 @pytest.mark.parametrize(
-    "rows,splits", [(1, 9), (4, 9), (8, 5), (15, 3), (16, 3), (17, 3)]
+    "rows,splits", [(1, 9), (4, 9), (8, 5), (15, 3), (16, 3), (17, 3), (20, 3)]
 )
 @pytest.mark.parametrize("sink", ["none", "large", "empty_piece_zero"])
 def test_split_launch_sinks(monkeypatch, rows, splits, sink):
@@ -356,7 +359,7 @@ def test_split_launch_sinks(monkeypatch, rows, splits, sink):
     hardening._assert_valid(out, case)
 
 
-@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (15, 3), (17, 3)])
+@pytest.mark.parametrize("rows,splits", [(2, 9), (8, 5), (15, 3), (17, 3), (20, 3)])
 def test_split_launch_zero_length_rows(monkeypatch, rows, splits):
     """Rows without an attendable column (zero active length, or every index
     ``-1``) write zeros; the other rows of the launch match the reference."""
@@ -424,7 +427,7 @@ def _run_metadata_form(
     return result.reshape(-1, case.num_heads, 512)
 
 
-@pytest.mark.parametrize("rows,splits", [(8, 5), (13, 3), (17, 3)])
+@pytest.mark.parametrize("rows,splits", [(8, 5), (13, 3), (17, 3), (20, 3)])
 @pytest.mark.parametrize("form", ["separate", "lens_offset"])
 def test_split_launch_metadata_forms(monkeypatch, rows, splits, form):
     """Separate SWA and compressed tables (compressed-only lengths, lens offset
@@ -448,7 +451,7 @@ def test_split_launch_metadata_forms(monkeypatch, rows, splits, form):
 
 @pytest.mark.parametrize(
     "rows,splits",
-    [(1, 9), (4, 9), (5, 5), (8, 5), (15, 3), (16, 3), (17, 3)],
+    [(1, 9), (4, 9), (5, 5), (8, 5), (15, 3), (16, 3), (17, 3), (18, 3), (20, 3)],
 )
 def test_split_launch_is_deterministic(monkeypatch, rows, splits):
     """Eager calls and CUDA graph replays of one split launch, with the piece
@@ -541,10 +544,11 @@ def test_per_count_merge_matches_the_merge_of_any_count(
 
 
 _UNSPLIT_FORMS = [
-    "rows18",
+    "rows21",
     "pdl_off",
     "small_workspace",
     "small_workspace_t17",
+    "small_workspace_t20",
     "width1024",
     "gate_false",
 ]
@@ -554,11 +558,15 @@ _UNSPLIT_FORMS = [
 def test_unsplit_launches_run_the_route_as_main(monkeypatch, form):
     """Launches outside the split rule run the route's own launch: no split,
     output bit-identical to the launch with the split decision forced off.
-    A 17-row launch with a workspace one byte below its three-piece carve
-    runs the route's own launch too (no fallback to fewer pieces)."""
+    A 17- or 20-row launch with a workspace one byte below its three-piece
+    carve runs the route's own launch too (no fallback to fewer pieces)."""
     _skip_unless_sm107()
-    rows = {"rows18": 18, "small_workspace_t17": 17}.get(form, 8)
-    splits = 3 if form == "small_workspace_t17" else 5
+    rows = {
+        "rows21": 21,
+        "small_workspace_t17": 17,
+        "small_workspace_t20": 20,
+    }.get(form, 8)
+    splits = 3 if form in ("small_workspace_t17", "small_workspace_t20") else 5
     case = _case(
         rows,
         splits,
