@@ -239,7 +239,7 @@ persistent finalization, and unfinalized output are rejected.
 Validation and timing
 ---------------------
 
-The checks used B300 at EP1/EP8 and GB300 at EP16 (four nodes with four
+The original checks used B300 at EP1/EP8 and GB300 at EP16 (four nodes with four
 GPUs each in one NVLink domain), with PyTorch
 ``2.14.0a0+b2c75dd062.nv26.09`` and CuTe DSL ``4.8.0``.
 All four quantization/combine pairs passed the sparse FP64 layout oracle,
@@ -249,10 +249,14 @@ tests compare exact quantizer bytes at zero, tiny values and midpoint ties,
 and check masked reducer slots filled with NaNs. The sparse oracle checks
 routing, gate/up order and scale layouts; it does not measure dense MMA
 accumulation error.
-All seven distributed tests passed on every EP8 and EP16 rank, including
+The original seven distributed tests passed on every EP8 and EP16 rank, including
 alternating eager calls and graph replays with the current standard provider
 and separate caller buffers. The EP16 preflight also verified 16 distinct
 GPU UUIDs, one fabric cluster/clique, and direct reads and writes to every peer.
+
+The expanded eight-case suite in ``test_sm100_kimi_k3.py`` passed on B300
+at EP1 and B200 at EP8. The added staged-output and flag-batch checks
+have not been rerun at EP16.
 
 Run the tests from the repository root:
 
