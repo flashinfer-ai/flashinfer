@@ -21,8 +21,11 @@ constants carries the mode token ``det`` (``Det`` in a class name), no public
 callable takes a ``deterministic`` keyword (the ``forward`` / ``backward`` of
 the autograd ``Function`` classes included), the former modules and names are
 gone (no module, no alias, no top-level name), the module imports its backend
-on first use only, and the package is wired at its path (test-helper key,
-package data, ignored ``aot/``, pre-commit exclude, manifest checker row).
+on first use only, the registry routes each architecture and hidden size to its
+own libraries (``ROUTES[arch][role][hidden]``, the small-problem backward of
+``SMALL_ROUTES``; ``build.json`` builds exactly the records' architectures),
+and the package is wired at its path (test-helper key, package data, ignored
+``aot/``, pre-commit exclude, manifest checker row).
 """
 
 import importlib
@@ -65,6 +68,35 @@ REMOVED_PREFIXES = (
     "is_cake_mhc_det_train_head",
 )
 REMOVED_NAMES = ("route_key", "route_modules")
+# The registry's records: library -> (role, architectures, CTA threads, BF16 values per vector, the hidden size the
+# build is for, 0 for any).  On sm_100a and sm_103a a 64-bit library per hidden size: the forward in 256-thread CTAs
+# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (256 on sm_100a at 5120 and 7168), the
+# accumulating backward in 1024-thread CTAs.  The unsuffixed libraries take any hidden size: 128-bit forward and
+# 256-bit backward vectors in 256-thread CTAs, on sm_107a (and the backward on sm_100a / sm_103a for a small problem).
+_LW64 = ("sm_100a", "sm_103a")
+RECORDS = {
+    "cake_mhc_det_train_head_fwd": ("head_fwd", ("sm_107a",), 256, 8, 0),
+    **{
+        f"cake_mhc_det_train_head_fwd__lw64_t128_h{h}": ("head_fwd", ("sm_103a",), 128, 4, h)
+        for h in (4096, 5120, 7168)
+    },
+    **{
+        f"cake_mhc_det_train_head_fwd__lw64_t256_h{h}": ("head_fwd", ("sm_100a",), 256, 4, h)
+        for h in (4096, 5120, 7168)
+    },
+    "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
+    "cake_mhc_det_train_head_bwd__lw64_t512_h4096": ("head_bwd", _LW64, 512, 4, 4096),
+    "cake_mhc_det_train_head_bwd__lw64_t512_h5120": ("head_bwd", ("sm_103a",), 512, 4, 5120),
+    "cake_mhc_det_train_head_bwd__lw64_t512_h7168": ("head_bwd", ("sm_103a",), 512, 4, 7168),
+    "cake_mhc_det_train_head_bwd__lw64_t256_h5120": ("head_bwd", ("sm_100a",), 256, 4, 5120),
+    "cake_mhc_det_train_head_bwd__lw64_t256_h7168": ("head_bwd", ("sm_100a",), 256, 4, 7168),
+    "cake_mhc_det_train_head_bwd__acc": ("head_bwd_acc", ("sm_107a",), 256, 16, 0),
+    **{
+        f"cake_mhc_det_train_head_bwd__acc_lw64_t1024_h{h}": ("head_bwd_acc", _LW64, 1024, 4, h)
+        for h in (4096, 5120, 7168)
+    },
+}
+ROLES = ("head_fwd", "head_bwd", "head_bwd_acc")
 
 _CHILD = r"""
 import importlib, json, sys
@@ -183,10 +215,96 @@ def test_the_backend_is_imported_on_first_use() -> None:
 
 
 @pytest.mark.cpu_only
+def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() -> None:
+    """The records are the libraries of :data:`RECORDS` (role, architectures, hidden size, a ``vectors`` grid rule
+    whose thread count is the CTA's, ``kernel`` / ``library`` the record name, ``kernel_symbol``
+    ``kernel_<library>``).  ``ROUTES[arch][role]`` maps every hidden size the architecture serves to the record of
+    the role delivered for the architecture and built for that hidden size, or built for any where none is;
+    ``SMALL_ROUTES`` sends the backward of at most ``SMALL_BWD_ELEMENTS`` values on sm_100a and sm_103a to the
+    unsuffixed backward; :func:`route_module` follows both and refuses any other call, and a record refuses a hidden
+    size it is not built for.  Every route stays inside the kernels' ``hv <= MAX_VECTORS`` and its largest grid
+    inside 31 bits."""
+    loader = importlib.import_module(f"{BACKEND}.cake_jit")
+    assert set(loader.MODULES) == set(RECORDS)
+    for name, (role, arches, threads, elems, hidden) in RECORDS.items():
+        record = loader.MODULES[name]
+        assert record["role"] == role and tuple(record["arches"]) == arches, name
+        assert record["hidden"] == hidden, name
+        assert record["grid_rule"] == {
+            "kind": "vectors",
+            "threads": threads,
+            "vector_elems": elems,
+        }, name
+        assert tuple(record["launch"]["block"]) == (threads, 1, 1), name
+        assert record["kernel"] == record["library"] == name
+        assert record["kernel_symbol"] == f"kernel_{name}"
+
+    def built(arch: str, role: str, hidden: int) -> str:
+        names = [
+            name
+            for name, (r, arches, _t, _e, h) in RECORDS.items()
+            if r == role and arch in arches and h == hidden
+        ]
+        assert len(names) <= 1, names
+        return names[0] if names else built(arch, role, 0)
+
+    assert loader.HIDDEN_SIZES == {
+        "sm_100a": (4096, 5120, 7168),
+        "sm_103a": (4096, 5120, 7168),
+        "sm_107a": (4096,),
+    }
+    assert loader.ROUTES == {
+        arch: {
+            role: {
+                hidden: built(arch, role, hidden)
+                for hidden in loader.supported_hidden_sizes(arch)
+            }
+            for role in ROLES
+        }
+        for arch in loader.ARCHES
+    }
+    small = "cake_mhc_det_train_head_bwd"
+    assert loader.SMALL_ROUTES == {
+        "sm_100a": {"head_bwd": small},
+        "sm_103a": {"head_bwd": small},
+    }
+    assert loader.SMALL_BWD_ELEMENTS == 2048 * 4096
+    for arch in loader.ARCHES:
+        for role in ROLES:
+            for hidden in loader.supported_hidden_sizes(arch):
+                largest = loader.SMALL_BWD_ELEMENTS // hidden
+                routed = loader.ROUTES[arch][role][hidden]
+                to_small = loader.SMALL_ROUTES.get(arch, {}).get(role, routed)
+                assert loader.route_module(arch, role, hidden, largest + 1) == routed
+                assert loader.route_module(arch, role, hidden, largest) == to_small
+                assert loader.route_module(arch, role, hidden, 1) == to_small
+                for name in {routed, to_small}:
+                    record = loader.MODULES[name]
+                    hv = loader.vectors_per_token(record, hidden)
+                    assert 1 <= hv <= loader.MAX_VECTORS, (arch, role, hidden, hv)
+                    (grid_x, _, _) = loader.launch_grid(
+                        record, loader.MAX_TOKENS, hidden
+                    )
+                    assert grid_x < 2**31, (arch, role, hidden, grid_x)
+    for arch, role, hidden in (
+        ("sm_90a", "head_fwd", 4096),
+        ("sm_100a", "head_mean", 4096),
+        ("sm_100a", "head_fwd", 8192),
+        ("sm_107a", "head_bwd", 5120),
+    ):
+        with pytest.raises(ValueError, match="no exported"):
+            loader.route_module(arch, role, hidden, 16384)
+    with pytest.raises(ValueError, match="is built for hidden 4096, got 5120"):
+        loader.vectors_per_token(
+            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t512_h4096"], 5120
+        )
+
+
+@pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package, the package data, the ignored ``aot/`` directory, the
-    pre-commit exclude of the generated sources and the manifest checker's row name the package at its path; no
-    key, package data, exclude, checker row or module file is left at the former path."""
+    """The test-helper key, the build manifest's package and libraries, the package data, the ignored ``aot/``
+    directory, the pre-commit exclude of the generated sources and the manifest checker's row name the package at
+    its path; no key, package data, exclude, checker row or module file is left at the former path."""
     from tests.test_helpers.cake_package import PACKAGES
 
     backend = importlib.import_module(BACKEND)
@@ -197,6 +315,12 @@ def test_package_wiring() -> None:
     assert PACKAGES[KEY] == BACKEND and former not in PACKAGES.values()
     manifest = json.loads((directory / "build.json").read_text())
     assert manifest["package"] == BACKEND
+    loader = importlib.import_module(f"{BACKEND}.cake_jit")
+    assert {entry["name"] for entry in manifest["libraries"]} == {
+        loader.library_name(name, arch)
+        for name, record in loader.MODULES.items()
+        for arch in record["arches"]
+    }
     try:
         import tomllib
     except ModuleNotFoundError:  # Python < 3.11
