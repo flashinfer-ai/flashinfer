@@ -31,10 +31,10 @@ The following parts are the deterministic KCP package's:
 - graph replay
 - the multi-tensor calls
 
-Only the backward after the head program differs: it overlaps the halo exchange, and its `dweight` sum is unordered.
-The forward's launch grid follows the architecture (`kcp.FWD_RESERVE_SMS`). On sm_107a it is the deterministic
-route's grid, one SM short of the co-resident CTA count. On sm_100a and sm_103a it is the full co-resident grid,
-which measured faster there. `y` does not depend on the grid.
+Of the programs, only the backward after the head program differs: it overlaps the halo exchange, and its `dweight`
+sum is unordered. The forward program is the same, but its launch grid follows the architecture
+(`kcp.FWD_RESERVE_SMS`). On sm_107a it is the deterministic route's grid, one SM short of the co-resident CTA count.
+On sm_100a and sm_103a it is the full co-resident grid, which measured faster there. `y` does not depend on the grid.
 
 - **Halo exchange:** one `all_to_all_single` per direction and call. The
   forward delivers the history rows into the history pool `hist`
@@ -115,10 +115,10 @@ deterministic route's head program. Then:
    no fragment had tail rows. Its CTAs take units of tokens from lanes. Through
    Cluster Launch Control, they also take the lanes of CTAs that have not
    started. A kernel resident on another stream therefore leaves no work waiting
-   for the SMs it holds. Its token loop computes two tokens per packed FP32
-   (`f32x2`) instruction, as the deterministic KCP backward does since
-   FlashInfer PR #9142; `dx` and each run's FP32 `dweight` sum are bitwise
-   those of a one-token loop. The FP32 `dweight` runs are added into four FP32
+   for the SMs it holds. Its token arithmetic computes two adjacent channels
+   per packed FP32 (`f32x2`) instruction, as the deterministic KCP backward does
+   since FlashInfer PR #9142; `dx` and each run's FP32 `dweight` sum are bitwise
+   those of the scalar (one channel per instruction) build. The FP32 `dweight` runs are added into four FP32
    accumulator copies in the order the runs end. The copies are summed once per
    channel tile.
 3. After the wait, on a rank that receives tail rows, the tail-row program
