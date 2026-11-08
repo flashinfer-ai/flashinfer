@@ -2744,6 +2744,44 @@ def test_kept_pool_knob_and_rule() -> None:
         assert seen == [(pool, None, None), (pool, None, None)], seen
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or cake_kcp._MEM_POOL is None,
+    reason="CUDA device and torch.cuda.MemPool required",
+)
+def test_default_workspace_cache_clear_drops_the_kept_pools() -> None:
+    """A package-private kept-set pool keeps a freed tensor's blocks reserved, and ``torch.cuda.empty_cache()`` does
+    not release them while the pool lives; :func:`cake_kcp.default_workspace_cache_clear` drops the pools (not
+    counted in its result), after which ``empty_cache`` releases them.  A tensor of a dropped pool stays valid and
+    its blocks go back once it is freed."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cake_kcp.default_workspace_cache_clear()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_reserved(device)
+    nbytes = 64 << 20
+    pool = cake_kcp._KEPT_POOLS.setdefault(device.index, cake_kcp._MEM_POOL())
+    with cake_kcp._USE_MEM_POOL(pool, device):
+        freed = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        alive = torch.full((nbytes,), 7, dtype=torch.uint8, device=device)
+    del freed
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    held = torch.cuda.memory_reserved(device)
+    # the live pool keeps the freed tensor's block
+    assert held >= base + 2 * nbytes, (base, held)
+    assert cake_kcp.default_workspace_cache_clear() == 0
+    assert not cake_kcp._KEPT_POOLS
+    del pool
+    torch.cuda.empty_cache()
+    dropped = torch.cuda.memory_reserved(device)
+    assert held - dropped >= nbytes, (held, dropped)
+    assert int(alive[0]) == 7 and int(alive[-1]) == 7
+    del alive
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    assert dropped - torch.cuda.memory_reserved(device) >= nbytes
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_handoff_is_blocked_inside_a_cuda_graph_capture() -> None:
     """A CUDA-graph capture blocks the request (a replay would hand a dropped set to a later backward)."""

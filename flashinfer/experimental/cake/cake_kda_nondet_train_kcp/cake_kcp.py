@@ -6402,7 +6402,8 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
 
 
 # The package-private pools of the checkpoint passes' kept sets (the knob kept_pool, shipped 1): one torch.cuda.MemPool
-# per device index, made at the first kept set of a checkpoint pass on that device and kept for the process.  A recompute
+# per device index, made at the first kept set of a checkpoint pass on that device and kept until
+# default_workspace_cache_clear() drops it.  A recompute
 # keeps its set from inside the call -- whose workspace=None arena is allocated at the call's start and freed at its end
 # (_default_acquire / _default_release) -- to the node's backward, which then allocates the larger backward arena.  In
 # the caching allocator's default pool the set lands in the remainder of the block the forward arena was cut from, so
@@ -6410,7 +6411,8 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
 # GB300, CP4, H = 64, 65536 tokens per pack: +5.0 GiB steady with the gate, +10.1 GiB with the raw gate, the allocated
 # peak +0.8 GiB).  In its own pool the set reuses its own blocks: the pool holds the largest set kept at a time (the wy
 # rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
-# other allocations cannot use.  The row count of a set changes from pack to pack (each document's rows are padded to
+# other allocations cannot use and torch.cuda.empty_cache() does not release while the pool lives (after
+# default_workspace_cache_clear() it does).  The row count of a set changes from pack to pack (each document's rows are padded to
 # whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor is
 # allocated with its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16
 # more) and the call binds the leading [:n] view, so packs of nearby sizes take the same blocks.  A caller-held
@@ -7761,10 +7763,14 @@ def _default_release(call: CakeKDANondetKcpCall) -> None:
 
 
 def default_workspace_cache_clear() -> int:
-    """Drop every workspace the package keeps for ``workspace=None`` calls and the kept checks of their in-kernel
-    Q / K L2 norm; returns the number of workspaces dropped.  They hold no device memory between calls but their
-    scratch table buffers (KiB, on the rows whose intra record writes the chunk tables), which go back to the
-    caching allocator; the next call of each key builds a new workspace.  ``DEFAULT_WS_STATS`` is left as it is.
+    """Drop every workspace the package keeps for ``workspace=None`` calls, the kept checks of their in-kernel
+    Q / K L2 norm and the package-private pools their checkpoint passes keep the kept set in (:data:`_KEPT_POOLS`);
+    returns the number of workspaces dropped.  The workspaces hold no device memory between calls but their scratch
+    table buffers (KiB, on the rows whose intra record writes the chunk tables), which go back to the caching
+    allocator; the next call of each key builds a new workspace.  A pool keeps its blocks (about one kept set per
+    device) reserved between calls and ``torch.cuda.empty_cache()`` does not release the blocks of a live pool:
+    after the pools are dropped it does (a kept set alive at that moment keeps its blocks until it is freed), and
+    the next checkpoint pass of a ``workspace=None`` call makes a new pool.  ``DEFAULT_WS_STATS`` is left as it is.
     :func:`set_backend` calls it.  One ``popitem`` per key, each atomic, so a release on another thread meanwhile
     never breaks the loop."""
     n = 0
@@ -7774,6 +7780,7 @@ def default_workspace_cache_clear() -> int:
         except KeyError:  # empty
             break
     _L2N_DEFAULT_OK.clear()
+    _KEPT_POOLS.clear()
     return n
 
 
