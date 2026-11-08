@@ -594,6 +594,13 @@ class TgvGemmCuteExtKernel:
                 d_layout,
             )
 
+        if cutlass.const_expr(self.use_2cta):
+            # Neither CTA may exit while its peer still has peer-redirected
+            # arrives, multicast commits or a TMEM dealloc targeting it;
+            # otherwise CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT under PDL.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
     # 1-CTA: SM90_TMA_LOAD into local sA, arrives on local bar_full.
