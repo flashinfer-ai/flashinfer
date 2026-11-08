@@ -1099,7 +1099,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
     # the output walk: a det-neutral module (the non-deterministic package ships the same program)
-    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v2_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
         if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
             # the deterministic family's stems
