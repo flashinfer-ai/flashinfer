@@ -34,8 +34,12 @@ def test_graph_knob_is_validated() -> None:
     # no environment gate: the backend reads no environment variable
     assert not hasattr(conv_kcp, "TEST_KNOBS_ENV")
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
-    assert conv_kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._set_test_knobs(None) == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+    }
+    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -46,10 +50,12 @@ def test_graph_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
         }
         assert conv_kcp._set_test_knobs({"graph": "off"}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_overlap": 1,
         }
     finally:
         conv_kcp._set_test_knobs(None)
@@ -66,17 +72,24 @@ def test_host_trim_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 1}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_overlap": 1,
         }
         assert conv_kcp._graph_mode(None) == "off"
         assert conv_kcp._set_test_knobs({"host_trim": 1, "graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
         }
-        assert conv_kcp._set_test_knobs({}) == {"graph": "off", "host_trim": 1}
+        assert conv_kcp._set_test_knobs({}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_overlap": 1,
+        }
         for bad in (
             {"host_trim": 2},
             {"host_trim": "1"},
@@ -88,10 +101,40 @@ def test_host_trim_knob_is_validated() -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 0}) == {
             "graph": "off",
             "host_trim": 0,
+            "bwd_overlap": 1,
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
+
+
+@pytest.mark.cpu_only
+def test_bwd_overlap_knob_is_validated() -> None:
+    """``bwd_overlap`` (the overlapped backward): a private setter validated against ``BWD_OVERLAPS`` (1 shipped = the
+    split program before the exchange's wait and the tail-row program after it, 0 = the wait before the main
+    program), independent of the other knobs; ``_overlapped`` holds only for the split form with an exchange in flight
+    under the shipped value, and a non-shipped value is part of the backward's graph-key variant."""
+    assert conv_kcp.BWD_OVERLAPS == (0, 1) and conv_kcp.BWD_OVERLAP_DEFAULT == 1
+    work = object()
+    try:
+        assert conv_kcp._overlapped(False, work) is True
+        assert conv_kcp._overlapped(True, work) is False
+        assert conv_kcp._overlapped(False, None) is False
+        assert conv_kcp._bwd_variant(False) is False
+        assert conv_kcp._bwd_variant(True) is True
+        assert conv_kcp._set_test_knobs({"bwd_overlap": 0}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_overlap": 0,
+        }
+        assert conv_kcp._overlapped(False, work) is False
+        assert conv_kcp._bwd_variant(False) == (False, ("bwd_overlap", 0))
+        for bad in ({"bwd_overlap": 2}, {"bwd_overlap": True}, {"bwd_overlap": "1"}):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+    finally:
+        conv_kcp._set_test_knobs(None)
+    assert conv_kcp._TEST_KNOBS["bwd_overlap"] == 1
 
 
 @pytest.mark.cpu_only

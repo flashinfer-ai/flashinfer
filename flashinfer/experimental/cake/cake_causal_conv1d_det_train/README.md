@@ -134,6 +134,20 @@ Every rank of a group passes the same `cooperative` value.  The form changes
 no collective, so a mismatch does not hang, but the ranks' `dweight` partials
 would then mix two reduction orders.
 
+With `cooperative=False` at more than one rank the backward overlaps its halo
+exchange: the `kcp_bwd_split` program and its reduce program run while the
+exchange is in flight, as if no tail row had arrived, and after the wait the
+`kcp_bwd_halo` program writes `dx` of the last `min(3, len)` rows of every
+fragment with a tail row again, recomputing their `dpre` with the main
+program's instructions and folding the received rows with its FMAs in its
+order.  `dx` and `dweight` keep the bits of the waiting launch; the exchange
+and its wait are unchanged, and one more program runs when the rank receives
+tail rows.  On sm_103a and sm_107a the multi entry overlaps only its first
+tensor this way and runs the other tensors' programs after the wait, so it
+also adds one program per call; on sm_100a, where this measured no gain, the
+multi entry waits first (`MULTI_BWD_OVERLAP_ARCHS`).  `cooperative=True` waits
+before its launch.
+
 ### Halo exchange
 
 One `all_to_all_single` per direction and call:
@@ -146,13 +160,16 @@ One `all_to_all_single` per direction and call:
   fragment's first tokens (the halo adjoints; a token feeds at most three
   predecessor fragments) into the send layout; the exchange delivers them to
   the predecessors as `dpre_tail` (`[n_tail_rows, C]` FP32), and the main
-  program adds them to the last rows' `dx` before the one BF16 rounding.
+  program (in the overlapped backward, the tail-row program after the wait)
+  adds them to the last rows' `dx` before the one BF16 rounding.
 
 The multi entry exchanges the rows of its `n` tensors side by side in one
 collective per direction and copies each tensor's rows into its own pool after
-the wait; each tensor then runs the single call's programs, so its outputs and
-gradients are bitwise those of one single call per tensor with the same
-`cooperative`.  With one rank no collective is issued.
+the wait; each tensor then runs the single call's programs (in the overlapped
+backward of sm_103a and sm_107a only the first tensor takes the overlapped
+form; the others run the waiting form, whose `dx` and `dweight` are bitwise the
+same), so its outputs and gradients are bitwise those of one single call per
+tensor with the same `cooperative`.  With one rank no collective is issued.
 
 ### Recompute handle
 
