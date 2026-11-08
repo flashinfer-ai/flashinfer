@@ -304,7 +304,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, float* __restrict__ initial_state, float* __restrict__ output_state, float* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
+kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ output_state, __nv_bfloat16* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1476,6 +1476,10 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             unsigned int v_cg1_phase = 0;
             unsigned int o_cg1_stage = 0;
             unsigned int o_cg1_phase = 1;
+            float seed_frag_0_cg1[32];
+            float seed_frag_1_cg1[32];
+            float seed_frag_2_cg1[32];
+            float seed_frag_3_cg1[32];
             unsigned int _phase_cg1_shared_acc_full_0 = 0;
             unsigned int _phase_q_state_acc_full_0 = 0;
             unsigned int _phase_kv_acc_full_0 = 0;
@@ -1496,61 +1500,95 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                 int num_pairs_b_1 = (seqlen_b_1 + 128 - 1) / 128;
                 int num_chunks_b_1 = num_pairs_b_1 * 2;
                 int value_split_idx_cg1 = 0;
+                int seed_tile_ord_cg1 = (int)tile_1 - bid;
+                int seed_next_tile_cg1 = (int)tile_1 + num_bids;
+                int seed_next_enabled_cg1 = 0;
+                long long seed_next_base_cg1 = 0;
+                if (seed_next_tile_cg1 < total_tiles) {
+                    int num_o_heads_0 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
+                    int batch_idx_1_1 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)seed_next_tile_cg1 >> (unsigned int)NUM_O_HEADS_LOG2 : (unsigned int)seed_next_tile_cg1 / (unsigned int)num_o_heads_0);
+                    int head_idx_2 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)seed_next_tile_cg1 & (unsigned int)(num_o_heads_0 - 1) : (unsigned int)seed_next_tile_cg1 % (unsigned int)num_o_heads_0);
+                    int qk_head_idx_3 = ((IS_GQA != 0) ? head_idx_2 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_v_heads / num_q_heads)));
+                    int v_head_idx_4 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_q_heads / num_v_heads)) : head_idx_2);
+                    int raw_batch_start_5 = cu_seqlens[batch_idx_1_1];
+                    int raw_batch_end_6 = cu_seqlens[batch_idx_1_1 + 1];
+                    int batch_start_floor_7 = ((raw_batch_start_5 > 0) ? raw_batch_start_5 : 0);
+                    int batch_start_8 = ((batch_start_floor_7 < total_tokens) ? batch_start_floor_7 : total_tokens);
+                    int batch_end_floor_9 = ((raw_batch_end_6 > batch_start_8) ? raw_batch_end_6 : batch_start_8);
+                    int batch_end_10 = ((batch_end_floor_9 < total_tokens) ? batch_end_floor_9 : total_tokens);
+                    int seqlen_b_11 = batch_end_10 - batch_start_8;
+                    int num_pairs_b_12 = (seqlen_b_11 + 128 - 1) / 128;
+                    int num_chunks_b_13 = num_pairs_b_12 * 2;
+                    int seed_next_slot_cg1 = batch_idx_1_1;
+                    long long seed_next_head_offset_cg1 = (long long)head_idx_2 * 16384;
+                    seed_next_base_cg1 = (long long)seed_next_slot_cg1 * initial_state_stride_slot + seed_next_head_offset_cg1;
+                    seed_next_enabled_cg1 = ((USE_INITIAL_STATE != 0 && num_chunks_b_13 > 0) ? 1 : 0);
+                }
                 int state_slot_cg1 = batch_idx_1;
                 long long state_head_offset_cg1 = (long long)head_idx_1 * 16384;
                 long long initial_state_head_base_cg1 = (long long)state_slot_cg1 * initial_state_stride_slot + state_head_offset_cg1;
                 long long output_state_head_base_cg1 = (long long)state_slot_cg1 * output_state_stride_slot + state_head_offset_cg1;
-                float seed_frag_0_cg1[32];
-                float seed_frag_1_cg1[32];
-                float seed_frag_2_cg1[32];
-                float seed_frag_3_cg1[32];
                 if (USE_INITIAL_STATE != 0 && num_chunks_b_1 > 0) {
                     int warp_id_in_role_1 = (warp - 4);
                     int state_warp_init = warp_id_in_role_1;
                     int state_row_init = state_warp_init * 32 + lane;
                     long long state_base_init = initial_state_head_base_cg1 + (long long)state_row_init * 128;
-                    #pragma unroll
-                    for (int state_vec_init = 0; state_vec_init < 8; state_vec_init++) {
-                        long long state_vec_index_init = state_base_init + (long long)(state_vec_init * 4);
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init);
-                            seed_frag_0_cg1[state_vec_init * 4 + 0] = _v4.x;
-                            seed_frag_0_cg1[state_vec_init * 4 + 1] = _v4.y;
-                            seed_frag_0_cg1[state_vec_init * 4 + 2] = _v4.z;
-                            seed_frag_0_cg1[state_vec_init * 4 + 3] = _v4.w;
+                    if (seed_tile_ord_cg1 == 0) {
+                        #pragma unroll
+                        for (int state_vec_init = 0; state_vec_init < 8; state_vec_init++) {
+                            long long state_vec_index_init = state_base_init + (long long)(state_vec_init * 4);
+                            {
+                                uint2 _vld_0;
+                                _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init);
+                                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&seed_frag_0_cg1[state_vec_init * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                    (&seed_frag_0_cg1[state_vec_init * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                                }
+                            }
                         }
-                    }
-                    #pragma unroll
-                    for (int state_vec_init_1 = 0; state_vec_init_1 < 8; state_vec_init_1++) {
-                        long long state_vec_index_init_1 = state_base_init + 32 + (long long)(state_vec_init_1 * 4);
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init_1);
-                            seed_frag_1_cg1[state_vec_init_1 * 4 + 0] = _v4.x;
-                            seed_frag_1_cg1[state_vec_init_1 * 4 + 1] = _v4.y;
-                            seed_frag_1_cg1[state_vec_init_1 * 4 + 2] = _v4.z;
-                            seed_frag_1_cg1[state_vec_init_1 * 4 + 3] = _v4.w;
+                        #pragma unroll
+                        for (int state_vec_init_1 = 0; state_vec_init_1 < 8; state_vec_init_1++) {
+                            long long state_vec_index_init_1 = state_base_init + 32 + (long long)(state_vec_init_1 * 4);
+                            {
+                                uint2 _vld_1;
+                                _vld_1 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_1);
+                                uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&seed_frag_1_cg1[state_vec_init_1 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                                    (&seed_frag_1_cg1[state_vec_init_1 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                                }
+                            }
                         }
-                    }
-                    #pragma unroll
-                    for (int state_vec_init_2 = 0; state_vec_init_2 < 8; state_vec_init_2++) {
-                        long long state_vec_index_init_2 = state_base_init + 64 + (long long)(state_vec_init_2 * 4);
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init_2);
-                            seed_frag_2_cg1[state_vec_init_2 * 4 + 0] = _v4.x;
-                            seed_frag_2_cg1[state_vec_init_2 * 4 + 1] = _v4.y;
-                            seed_frag_2_cg1[state_vec_init_2 * 4 + 2] = _v4.z;
-                            seed_frag_2_cg1[state_vec_init_2 * 4 + 3] = _v4.w;
+                        #pragma unroll
+                        for (int state_vec_init_2 = 0; state_vec_init_2 < 8; state_vec_init_2++) {
+                            long long state_vec_index_init_2 = state_base_init + 64 + (long long)(state_vec_init_2 * 4);
+                            {
+                                uint2 _vld_2;
+                                _vld_2 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_2);
+                                uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&seed_frag_2_cg1[state_vec_init_2 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                                    (&seed_frag_2_cg1[state_vec_init_2 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
+                                }
+                            }
                         }
-                    }
-                    #pragma unroll
-                    for (int state_vec_init_3 = 0; state_vec_init_3 < 8; state_vec_init_3++) {
-                        long long state_vec_index_init_3 = state_base_init + 96 + (long long)(state_vec_init_3 * 4);
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init_3);
-                            seed_frag_3_cg1[state_vec_init_3 * 4 + 0] = _v4.x;
-                            seed_frag_3_cg1[state_vec_init_3 * 4 + 1] = _v4.y;
-                            seed_frag_3_cg1[state_vec_init_3 * 4 + 2] = _v4.z;
-                            seed_frag_3_cg1[state_vec_init_3 * 4 + 3] = _v4.w;
+                        #pragma unroll
+                        for (int state_vec_init_3 = 0; state_vec_init_3 < 8; state_vec_init_3++) {
+                            long long state_vec_index_init_3 = state_base_init + 96 + (long long)(state_vec_init_3 * 4);
+                            {
+                                uint2 _vld_3;
+                                _vld_3 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_3);
+                                uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&seed_frag_3_cg1[state_vec_init_3 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                                    (&seed_frag_3_cg1[state_vec_init_3 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
+                                }
+                            }
                         }
                     }
                 }
@@ -2435,14 +2473,204 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                     o_cg1_stage += 1;
                     if (o_cg1_stage == 2) { o_cg1_stage = 0; o_cg1_phase ^= 1; }
                 }
+                if (seed_next_enabled_cg1 != 0) {
+                    int warp_id_in_role_6 = (warp - 4);
+                    int state_row_ahead = warp_id_in_role_6 * 32 + lane;
+                    long long state_base_ahead = seed_next_base_cg1 + (long long)state_row_ahead * 128;
+                    #pragma unroll
+                    for (int state_vec_ahead = 0; state_vec_ahead < 8; state_vec_ahead++) {
+                        long long state_vec_index_ahead = state_base_ahead + (long long)(state_vec_ahead * 4);
+                        {
+                            uint2 _vld_16;
+                            _vld_16 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead);
+                            uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&seed_frag_0_cg1[state_vec_ahead * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) << 16);
+                                (&seed_frag_0_cg1[state_vec_ahead * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int state_vec_ahead_1 = 0; state_vec_ahead_1 < 8; state_vec_ahead_1++) {
+                        long long state_vec_index_ahead_1 = state_base_ahead + 32 + (long long)(state_vec_ahead_1 * 4);
+                        {
+                            uint2 _vld_17;
+                            _vld_17 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_1);
+                            uint32_t* _vpairs_17 = reinterpret_cast<uint32_t*>(&_vld_17);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&seed_frag_1_cg1[state_vec_ahead_1 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_17[_pair]) << 16);
+                                (&seed_frag_1_cg1[state_vec_ahead_1 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_17[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int state_vec_ahead_2 = 0; state_vec_ahead_2 < 8; state_vec_ahead_2++) {
+                        long long state_vec_index_ahead_2 = state_base_ahead + 64 + (long long)(state_vec_ahead_2 * 4);
+                        {
+                            uint2 _vld_18;
+                            _vld_18 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_2);
+                            uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&seed_frag_2_cg1[state_vec_ahead_2 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_18[_pair]) << 16);
+                                (&seed_frag_2_cg1[state_vec_ahead_2 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_18[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int state_vec_ahead_3 = 0; state_vec_ahead_3 < 8; state_vec_ahead_3++) {
+                        long long state_vec_index_ahead_3 = state_base_ahead + 96 + (long long)(state_vec_ahead_3 * 4);
+                        {
+                            uint2 _vld_19;
+                            _vld_19 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_3);
+                            uint32_t* _vpairs_19 = reinterpret_cast<uint32_t*>(&_vld_19);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&seed_frag_3_cg1[state_vec_ahead_3 * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_19[_pair]) << 16);
+                                (&seed_frag_3_cg1[state_vec_ahead_3 * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_19[_pair]) & 0xffff0000u);
+                            }
+                        }
+                    }
+                } else {
+                    seed_frag_0_cg1[0] = 0.0f;
+                    seed_frag_0_cg1[1] = 0.0f;
+                    seed_frag_0_cg1[2] = 0.0f;
+                    seed_frag_0_cg1[3] = 0.0f;
+                    seed_frag_0_cg1[4] = 0.0f;
+                    seed_frag_0_cg1[5] = 0.0f;
+                    seed_frag_0_cg1[6] = 0.0f;
+                    seed_frag_0_cg1[7] = 0.0f;
+                    seed_frag_0_cg1[8] = 0.0f;
+                    seed_frag_0_cg1[9] = 0.0f;
+                    seed_frag_0_cg1[10] = 0.0f;
+                    seed_frag_0_cg1[11] = 0.0f;
+                    seed_frag_0_cg1[12] = 0.0f;
+                    seed_frag_0_cg1[13] = 0.0f;
+                    seed_frag_0_cg1[14] = 0.0f;
+                    seed_frag_0_cg1[15] = 0.0f;
+                    seed_frag_0_cg1[16] = 0.0f;
+                    seed_frag_0_cg1[17] = 0.0f;
+                    seed_frag_0_cg1[18] = 0.0f;
+                    seed_frag_0_cg1[19] = 0.0f;
+                    seed_frag_0_cg1[20] = 0.0f;
+                    seed_frag_0_cg1[21] = 0.0f;
+                    seed_frag_0_cg1[22] = 0.0f;
+                    seed_frag_0_cg1[23] = 0.0f;
+                    seed_frag_0_cg1[24] = 0.0f;
+                    seed_frag_0_cg1[25] = 0.0f;
+                    seed_frag_0_cg1[26] = 0.0f;
+                    seed_frag_0_cg1[27] = 0.0f;
+                    seed_frag_0_cg1[28] = 0.0f;
+                    seed_frag_0_cg1[29] = 0.0f;
+                    seed_frag_0_cg1[30] = 0.0f;
+                    seed_frag_0_cg1[31] = 0.0f;
+                    seed_frag_1_cg1[0] = 0.0f;
+                    seed_frag_1_cg1[1] = 0.0f;
+                    seed_frag_1_cg1[2] = 0.0f;
+                    seed_frag_1_cg1[3] = 0.0f;
+                    seed_frag_1_cg1[4] = 0.0f;
+                    seed_frag_1_cg1[5] = 0.0f;
+                    seed_frag_1_cg1[6] = 0.0f;
+                    seed_frag_1_cg1[7] = 0.0f;
+                    seed_frag_1_cg1[8] = 0.0f;
+                    seed_frag_1_cg1[9] = 0.0f;
+                    seed_frag_1_cg1[10] = 0.0f;
+                    seed_frag_1_cg1[11] = 0.0f;
+                    seed_frag_1_cg1[12] = 0.0f;
+                    seed_frag_1_cg1[13] = 0.0f;
+                    seed_frag_1_cg1[14] = 0.0f;
+                    seed_frag_1_cg1[15] = 0.0f;
+                    seed_frag_1_cg1[16] = 0.0f;
+                    seed_frag_1_cg1[17] = 0.0f;
+                    seed_frag_1_cg1[18] = 0.0f;
+                    seed_frag_1_cg1[19] = 0.0f;
+                    seed_frag_1_cg1[20] = 0.0f;
+                    seed_frag_1_cg1[21] = 0.0f;
+                    seed_frag_1_cg1[22] = 0.0f;
+                    seed_frag_1_cg1[23] = 0.0f;
+                    seed_frag_1_cg1[24] = 0.0f;
+                    seed_frag_1_cg1[25] = 0.0f;
+                    seed_frag_1_cg1[26] = 0.0f;
+                    seed_frag_1_cg1[27] = 0.0f;
+                    seed_frag_1_cg1[28] = 0.0f;
+                    seed_frag_1_cg1[29] = 0.0f;
+                    seed_frag_1_cg1[30] = 0.0f;
+                    seed_frag_1_cg1[31] = 0.0f;
+                    seed_frag_2_cg1[0] = 0.0f;
+                    seed_frag_2_cg1[1] = 0.0f;
+                    seed_frag_2_cg1[2] = 0.0f;
+                    seed_frag_2_cg1[3] = 0.0f;
+                    seed_frag_2_cg1[4] = 0.0f;
+                    seed_frag_2_cg1[5] = 0.0f;
+                    seed_frag_2_cg1[6] = 0.0f;
+                    seed_frag_2_cg1[7] = 0.0f;
+                    seed_frag_2_cg1[8] = 0.0f;
+                    seed_frag_2_cg1[9] = 0.0f;
+                    seed_frag_2_cg1[10] = 0.0f;
+                    seed_frag_2_cg1[11] = 0.0f;
+                    seed_frag_2_cg1[12] = 0.0f;
+                    seed_frag_2_cg1[13] = 0.0f;
+                    seed_frag_2_cg1[14] = 0.0f;
+                    seed_frag_2_cg1[15] = 0.0f;
+                    seed_frag_2_cg1[16] = 0.0f;
+                    seed_frag_2_cg1[17] = 0.0f;
+                    seed_frag_2_cg1[18] = 0.0f;
+                    seed_frag_2_cg1[19] = 0.0f;
+                    seed_frag_2_cg1[20] = 0.0f;
+                    seed_frag_2_cg1[21] = 0.0f;
+                    seed_frag_2_cg1[22] = 0.0f;
+                    seed_frag_2_cg1[23] = 0.0f;
+                    seed_frag_2_cg1[24] = 0.0f;
+                    seed_frag_2_cg1[25] = 0.0f;
+                    seed_frag_2_cg1[26] = 0.0f;
+                    seed_frag_2_cg1[27] = 0.0f;
+                    seed_frag_2_cg1[28] = 0.0f;
+                    seed_frag_2_cg1[29] = 0.0f;
+                    seed_frag_2_cg1[30] = 0.0f;
+                    seed_frag_2_cg1[31] = 0.0f;
+                    seed_frag_3_cg1[0] = 0.0f;
+                    seed_frag_3_cg1[1] = 0.0f;
+                    seed_frag_3_cg1[2] = 0.0f;
+                    seed_frag_3_cg1[3] = 0.0f;
+                    seed_frag_3_cg1[4] = 0.0f;
+                    seed_frag_3_cg1[5] = 0.0f;
+                    seed_frag_3_cg1[6] = 0.0f;
+                    seed_frag_3_cg1[7] = 0.0f;
+                    seed_frag_3_cg1[8] = 0.0f;
+                    seed_frag_3_cg1[9] = 0.0f;
+                    seed_frag_3_cg1[10] = 0.0f;
+                    seed_frag_3_cg1[11] = 0.0f;
+                    seed_frag_3_cg1[12] = 0.0f;
+                    seed_frag_3_cg1[13] = 0.0f;
+                    seed_frag_3_cg1[14] = 0.0f;
+                    seed_frag_3_cg1[15] = 0.0f;
+                    seed_frag_3_cg1[16] = 0.0f;
+                    seed_frag_3_cg1[17] = 0.0f;
+                    seed_frag_3_cg1[18] = 0.0f;
+                    seed_frag_3_cg1[19] = 0.0f;
+                    seed_frag_3_cg1[20] = 0.0f;
+                    seed_frag_3_cg1[21] = 0.0f;
+                    seed_frag_3_cg1[22] = 0.0f;
+                    seed_frag_3_cg1[23] = 0.0f;
+                    seed_frag_3_cg1[24] = 0.0f;
+                    seed_frag_3_cg1[25] = 0.0f;
+                    seed_frag_3_cg1[26] = 0.0f;
+                    seed_frag_3_cg1[27] = 0.0f;
+                    seed_frag_3_cg1[28] = 0.0f;
+                    seed_frag_3_cg1[29] = 0.0f;
+                    seed_frag_3_cg1[30] = 0.0f;
+                    seed_frag_3_cg1[31] = 0.0f;
+                }
                 if ((STORE_FINAL_STATE != 0 || ENABLE_CHECKPOINTS != 0) && num_chunks_b_1 > 0) {
                     mbarrier_wait(kv_acc_full_addr, _phase_kv_acc_full_0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     _phase_kv_acc_full_0 ^= 1;
                     int warp_in_wg_2 = warp % 4;
                     int state_tmem_row_base_cg1 = warp_in_wg_2 * 32 << 16;
-                    int warp_id_in_role_6 = (warp - 4);
-                    int state_row_cg1 = warp_id_in_role_6 * 32 + lane;
+                    int warp_id_in_role_7 = (warp - 4);
+                    int state_row_cg1 = warp_id_in_role_7 * 32 + lane;
                     long long state_base_idx_cg1 = output_state_head_base_cg1 + (long long)state_row_cg1 * 128;
                     #pragma unroll
                     for (int state_col_block_cg1 = 0; state_col_block_cg1 < 4; state_col_block_cg1++) {
@@ -2457,19 +2685,23 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                         for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
                             {
                                 long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
-                                asm volatile(
-                                    "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
-                                    :: "l"((output_state + final_state_vec_index_cg1) + 0), "f"(_tmem_load_19[state_vec_idx_cg1 * 4 + 0]), "f"(_tmem_load_19[state_vec_idx_cg1 * 4 + 1]), "f"(_tmem_load_19[state_vec_idx_cg1 * 4 + 2]), "f"(_tmem_load_19[state_vec_idx_cg1 * 4 + 3]) : "memory");
+                                {
+                                    uint2 _pk2;
+                                    __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                    _pk[0] = __floats2bfloat162_rn(_tmem_load_19[state_vec_idx_cg1 * 4 + 0], _tmem_load_19[state_vec_idx_cg1 * 4 + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(_tmem_load_19[state_vec_idx_cg1 * 4 + 2], _tmem_load_19[state_vec_idx_cg1 * 4 + 3]);
+                                    *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output_state + final_state_vec_index_cg1))[0]) = _pk2;
+                                }
                             }
                         }
                     }
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(kv_acc_empty_addr);
+                    if (USE_INITIAL_STATE == 0) { mbarrier_arrive(kv_acc_empty_addr); }
                 }
                 if (STORE_FINAL_STATE != 0 && USE_INITIAL_STATE != 0 && num_chunks_b_1 == 0) {
-                    int warp_id_in_role_7 = (warp - 4);
-                    int empty_state_row = warp_id_in_role_7 * 32 + lane;
+                    int warp_id_in_role_8 = (warp - 4);
+                    int empty_state_row = warp_id_in_role_8 * 32 + lane;
                     long long empty_initial_base = initial_state_head_base_cg1 + (long long)empty_state_row * 128;
                     long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128;
                     #pragma unroll
@@ -2477,15 +2709,21 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                         int empty_state_col = empty_state_vec * 4;
                         float _vec_load_0[4];
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + (long long)empty_state_col);
-                            _vec_load_0[0 + 0] = _v4.x;
-                            _vec_load_0[0 + 1] = _v4.y;
-                            _vec_load_0[0 + 2] = _v4.z;
-                            _vec_load_0[0 + 3] = _v4.w;
+                            uint2 _vld_20;
+                            _vld_20 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            uint32_t* _vpairs_20 = reinterpret_cast<uint32_t*>(&_vld_20);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&_vec_load_0[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_20[_pair]) << 16);
+                                (&_vec_load_0[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_20[_pair]) & 0xffff0000u);
+                            }
                         }
                         {
-                            float4 _v4 = make_float4(_vec_load_0[0 + 0], _vec_load_0[0 + 1], _vec_load_0[0 + 2], _vec_load_0[0 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + (long long)empty_state_col)) + 0) = _v4;
+                            uint2 _pk2;
+                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                            _pk[0] = __floats2bfloat162_rn(_vec_load_0[0 + 0], _vec_load_0[0 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_vec_load_0[0 + 2], _vec_load_0[0 + 3]);
+                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output_state + (empty_output_base + (long long)empty_state_col)))[0]) = _pk2;
                         }
                     }
                 }
@@ -2507,9 +2745,9 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             for (unsigned int tile_2 = bid; tile_2 < total_tiles; tile_2 += num_bids) {
                 int num_o_heads_2 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
                 int batch_idx_2 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_2 >> (unsigned int)NUM_O_HEADS_LOG2 : tile_2 / (unsigned int)num_o_heads_2);
-                int head_idx_2 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_2 & (unsigned int)(num_o_heads_2 - 1) : tile_2 % (unsigned int)num_o_heads_2);
-                int qk_head_idx_2 = ((IS_GQA != 0) ? head_idx_2 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_v_heads / num_q_heads)));
-                int v_head_idx_2 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_q_heads / num_v_heads)) : head_idx_2);
+                int head_idx_3 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_2 & (unsigned int)(num_o_heads_2 - 1) : tile_2 % (unsigned int)num_o_heads_2);
+                int qk_head_idx_2 = ((IS_GQA != 0) ? head_idx_3 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_v_heads / num_q_heads)));
+                int v_head_idx_2 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_q_heads / num_v_heads)) : head_idx_3);
                 int raw_batch_start_2 = cu_seqlens[batch_idx_2];
                 int raw_batch_end_2 = cu_seqlens[batch_idx_2 + 1];
                 int batch_start_floor_2 = ((raw_batch_start_2 > 0) ? raw_batch_start_2 : 0);
@@ -2775,9 +3013,9 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             for (unsigned int tile_3 = bid; tile_3 < total_tiles; tile_3 += num_bids) {
                 int num_o_heads_3 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
                 int batch_idx_3 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_3 >> (unsigned int)NUM_O_HEADS_LOG2 : tile_3 / (unsigned int)num_o_heads_3);
-                int head_idx_3 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_3 & (unsigned int)(num_o_heads_3 - 1) : tile_3 % (unsigned int)num_o_heads_3);
-                int qk_head_idx_3 = ((IS_GQA != 0) ? head_idx_3 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_v_heads / num_q_heads)));
-                int v_head_idx_3 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_q_heads / num_v_heads)) : head_idx_3);
+                int head_idx_4 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_3 & (unsigned int)(num_o_heads_3 - 1) : tile_3 % (unsigned int)num_o_heads_3);
+                int qk_head_idx_4 = ((IS_GQA != 0) ? head_idx_4 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_v_heads / num_q_heads)));
+                int v_head_idx_3 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_q_heads / num_v_heads)) : head_idx_4);
                 int raw_batch_start_3 = cu_seqlens[batch_idx_3];
                 int raw_batch_end_3 = cu_seqlens[batch_idx_3 + 1];
                 int batch_start_floor_3 = ((raw_batch_start_3 > 0) ? raw_batch_start_3 : 0);
@@ -2787,7 +3025,7 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                 int seqlen_b_3 = batch_end_3 - batch_start_3;
                 int num_pairs_b_3 = (seqlen_b_3 + 128 - 1) / 128;
                 int num_chunks_b_3 = num_pairs_b_3 * 2;
-                int k_head_idx = ((num_q_heads >= num_v_heads) ? v_head_idx_3 : qk_head_idx_3);
+                int k_head_idx = ((num_q_heads >= num_v_heads) ? v_head_idx_3 : qk_head_idx_4);
                 if (elect_sync()) {
                     asm volatile("tensormap.replace.tile.global_dim.global.b1024.b32 [%0], 1, %1;" :: "l"((uint64_t)(tensormap_workspace + cta_slot_base)), "r"((uint32_t)(batch_end_3)) : "memory");
                     asm volatile("tensormap.replace.tile.global_dim.global.b1024.b32 [%0], 1, %1;" :: "l"((uint64_t)(tensormap_workspace + (cta_slot_base + 128))), "r"((uint32_t)(batch_end_3)) : "memory");
@@ -2798,11 +3036,11 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"((uint64_t)(tensormap_workspace + (cta_slot_base + 256))) : "memory");
                 }
                 int state_slot_tma = batch_idx_3;
-                long long state_block_offset_tma = (long long)head_idx_3 * 16384;
+                long long state_block_offset_tma = (long long)head_idx_4 * 16384;
                 long long initial_state_block_base_tma = (long long)state_slot_tma * initial_state_stride_slot + state_block_offset_tma;
-                if (USE_INITIAL_STATE != 0 && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0) && initial_state_block_base_tma % 4 == 0) {
+                if (USE_INITIAL_STATE != 0 && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0) && initial_state_block_base_tma % 8 == 0) {
                     if (elect_sync()) {
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + initial_state_block_base_tma), "r"((uint32_t)(65536)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + initial_state_block_base_tma), "r"((uint32_t)(32768)) : "memory");
                     }
                 }
                 int num_pairs_tma = num_chunks_b_3 / 2;
@@ -2832,7 +3070,7 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                             mbarrier_arrive_expect_tx(load_q_full_addr + (q_stage) * 8, 16384);
                             #pragma unroll
                             for (int dim_half_1 = 0; dim_half_1 < 2; dim_half_1++) {
-                                tma_3d_gmem2smem(smem_q_addr + q_stage * 16384 + (unsigned int)(dim_half_1 * 8192), tensormap_workspace + cta_slot_base, dim_half_1 * 64, chunk_offset_4, qk_head_idx_3, load_q_full_addr + (q_stage) * 8);
+                                tma_3d_gmem2smem(smem_q_addr + q_stage * 16384 + (unsigned int)(dim_half_1 * 8192), tensormap_workspace + cta_slot_base, dim_half_1 * 64, chunk_offset_4, qk_head_idx_4, load_q_full_addr + (q_stage) * 8);
                             }
                         }
                         q_stage += 1;
@@ -2873,7 +3111,7 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             unsigned int q_state_acc_mma_stage = 0;
             unsigned int q_state_acc_mma_phase = 1;
             unsigned int kv_acc_mma_stage = 0;
-            unsigned int kv_acc_mma_phase = 1;
+            unsigned int kv_acc_mma_phase = ((USE_INITIAL_STATE == 0) ? 1 : 0);
             int kv_acc_release_pending = 1;
             unsigned int _phase_state_inp_ready_0 = 0;
             unsigned int _phase_cg1_shared_acc_empty_0 = 1;
@@ -2884,9 +3122,9 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             for (unsigned int tile_4 = bid; tile_4 < total_tiles; tile_4 += num_bids) {
                 int num_o_heads_4 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
                 int batch_idx_4 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_4 >> (unsigned int)NUM_O_HEADS_LOG2 : tile_4 / (unsigned int)num_o_heads_4);
-                int head_idx_4 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_4 & (unsigned int)(num_o_heads_4 - 1) : tile_4 % (unsigned int)num_o_heads_4);
-                int qk_head_idx_4 = ((IS_GQA != 0) ? head_idx_4 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_v_heads / num_q_heads)));
-                int v_head_idx_4 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_q_heads / num_v_heads)) : head_idx_4);
+                int head_idx_5 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_4 & (unsigned int)(num_o_heads_4 - 1) : tile_4 % (unsigned int)num_o_heads_4);
+                int qk_head_idx_5 = ((IS_GQA != 0) ? head_idx_5 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_v_heads / num_q_heads)));
+                int v_head_idx_5 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_q_heads / num_v_heads)) : head_idx_5);
                 int raw_batch_start_4 = cu_seqlens[batch_idx_4];
                 int raw_batch_end_4 = cu_seqlens[batch_idx_4 + 1];
                 int batch_start_floor_4 = ((raw_batch_start_4 > 0) ? raw_batch_start_4 : 0);
@@ -2898,13 +3136,13 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                 int num_chunks_b_4 = num_pairs_b_4 * 2;
                 int active_chunks_b_1 = (((SINGLE_CHUNK_NO_STATE & (int)(num_chunks_b_4 > 0)) != 0) ? 1 : num_chunks_b_4);
                 if (active_chunks_b_1 > 0) {
-                    if (kv_acc_release_pending == 1) {
+                    if (USE_INITIAL_STATE == 0 && kv_acc_release_pending == 1) {
                         mbarrier_wait(kv_acc_empty_addr + (kv_acc_mma_stage) * 8, kv_acc_mma_phase);
                         kv_acc_mma_phase ^= 1;
                     }
                     {
                         int chunk_offset_6 = batch_start_4;
-                        int _mma_marker = batch_idx_4 + head_idx_4 + chunk_offset_6 + batch_end_4 + 512;
+                        int _mma_marker = batch_idx_4 + head_idx_5 + chunk_offset_6 + batch_end_4 + 512;
                         {
                             mbarrier_wait(load_k_full_addr + (k_stage_1) * 8, k_phase_mma);
                         }
@@ -3144,7 +3382,7 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                 #pragma unroll 1
                 for (int chunk_idx_5 = 1; chunk_idx_5 < active_chunks_b_1; chunk_idx_5++) {
                     int chunk_offset_7 = batch_start_4 + chunk_idx_5 * 64;
-                    int _mma_marker_1 = batch_idx_4 + head_idx_4 + chunk_offset_7 + batch_end_4 + 512;
+                    int _mma_marker_1 = batch_idx_4 + head_idx_5 + chunk_offset_7 + batch_end_4 + 512;
                     {
                         mbarrier_wait(load_k_full_addr + (k_stage_1) * 8, k_phase_mma);
                     }
@@ -3411,12 +3649,12 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
             for (unsigned int tile_5 = bid; tile_5 < total_tiles; tile_5 += num_bids) {
                 int num_o_heads_5 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
                 int batch_idx_5 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_5 >> (unsigned int)NUM_O_HEADS_LOG2 : tile_5 / (unsigned int)num_o_heads_5);
-                int head_idx_5 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_5 & (unsigned int)(num_o_heads_5 - 1) : tile_5 % (unsigned int)num_o_heads_5);
-                int qk_head_idx_5 = ((IS_GQA != 0) ? head_idx_5 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_v_heads / num_q_heads)));
-                int v_head_idx_5 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_q_heads / num_v_heads)) : head_idx_5);
-                int raw_batch_start_5 = cu_seqlens[batch_idx_5];
+                int head_idx_6 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_5 & (unsigned int)(num_o_heads_5 - 1) : tile_5 % (unsigned int)num_o_heads_5);
+                int qk_head_idx_6 = ((IS_GQA != 0) ? head_idx_6 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_6 >> HEAD_GROUP_LOG2 : head_idx_6 / (num_v_heads / num_q_heads)));
+                int v_head_idx_6 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_6 >> HEAD_GROUP_LOG2 : head_idx_6 / (num_q_heads / num_v_heads)) : head_idx_6);
+                int raw_batch_start_6 = cu_seqlens[batch_idx_5];
                 int raw_batch_end_5 = cu_seqlens[batch_idx_5 + 1];
-                int batch_start_floor_5 = ((raw_batch_start_5 > 0) ? raw_batch_start_5 : 0);
+                int batch_start_floor_5 = ((raw_batch_start_6 > 0) ? raw_batch_start_6 : 0);
                 int batch_start_5 = ((batch_start_floor_5 < total_tokens) ? batch_start_floor_5 : total_tokens);
                 int batch_end_floor_5 = ((raw_batch_end_5 > batch_start_5) ? raw_batch_end_5 : batch_start_5);
                 int batch_end_5 = ((batch_end_floor_5 < total_tokens) ? batch_end_floor_5 : total_tokens);
@@ -3438,24 +3676,24 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                 int next_batch_end = 0;
                 int next_gate_budget = 0;
                 if (next_tile_i32 < total_tiles) {
-                    int num_o_heads_0 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
-                    int batch_idx_1_1 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 >> (unsigned int)NUM_O_HEADS_LOG2 : (unsigned int)next_tile_i32 / (unsigned int)num_o_heads_0);
-                    int head_idx_2_1 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 & (unsigned int)(num_o_heads_0 - 1) : (unsigned int)next_tile_i32 % (unsigned int)num_o_heads_0);
+                    int num_o_heads_0_1 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
+                    int batch_idx_1_2 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 >> (unsigned int)NUM_O_HEADS_LOG2 : (unsigned int)next_tile_i32 / (unsigned int)num_o_heads_0_1);
+                    int head_idx_2_1 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 & (unsigned int)(num_o_heads_0_1 - 1) : (unsigned int)next_tile_i32 % (unsigned int)num_o_heads_0_1);
                     int qk_head_idx_3_1 = ((IS_GQA != 0) ? head_idx_2_1 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2_1 >> HEAD_GROUP_LOG2 : head_idx_2_1 / (num_v_heads / num_q_heads)));
                     int v_head_idx_4_1 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2_1 >> HEAD_GROUP_LOG2 : head_idx_2_1 / (num_q_heads / num_v_heads)) : head_idx_2_1);
-                    int raw_batch_start_5_1 = cu_seqlens[batch_idx_1_1];
-                    int raw_batch_end_6 = cu_seqlens[batch_idx_1_1 + 1];
-                    int batch_start_floor_7 = ((raw_batch_start_5_1 > 0) ? raw_batch_start_5_1 : 0);
-                    int batch_start_8 = ((batch_start_floor_7 < total_tokens) ? batch_start_floor_7 : total_tokens);
-                    int batch_end_floor_9 = ((raw_batch_end_6 > batch_start_8) ? raw_batch_end_6 : batch_start_8);
-                    int batch_end_10 = ((batch_end_floor_9 < total_tokens) ? batch_end_floor_9 : total_tokens);
-                    int seqlen_b_11 = batch_end_10 - batch_start_8;
-                    int num_pairs_b_12 = (seqlen_b_11 + 128 - 1) / 128;
-                    int num_chunks_b_13 = num_pairs_b_12 * 2;
+                    int raw_batch_start_5_1 = cu_seqlens[batch_idx_1_2];
+                    int raw_batch_end_6_1 = cu_seqlens[batch_idx_1_2 + 1];
+                    int batch_start_floor_7_1 = ((raw_batch_start_5_1 > 0) ? raw_batch_start_5_1 : 0);
+                    int batch_start_8_1 = ((batch_start_floor_7_1 < total_tokens) ? batch_start_floor_7_1 : total_tokens);
+                    int batch_end_floor_9_1 = ((raw_batch_end_6_1 > batch_start_8_1) ? raw_batch_end_6_1 : batch_start_8_1);
+                    int batch_end_10_1 = ((batch_end_floor_9_1 < total_tokens) ? batch_end_floor_9_1 : total_tokens);
+                    int seqlen_b_11_1 = batch_end_10_1 - batch_start_8_1;
+                    int num_pairs_b_12_1 = (seqlen_b_11_1 + 128 - 1) / 128;
+                    int num_chunks_b_13_1 = num_pairs_b_12_1 * 2;
                     next_head_idx = head_idx_2_1;
-                    next_batch_start = batch_start_8;
-                    next_batch_end = batch_end_10;
-                    int la_gate_chunks = ((UNIT_GATES != 0) ? 0 : num_chunks_b_13);
+                    next_batch_start = batch_start_8_1;
+                    next_batch_end = batch_end_10_1;
+                    int la_gate_chunks = ((UNIT_GATES != 0) ? 0 : num_chunks_b_13_1);
                     next_gate_budget = ((la_gate_chunks < 4) ? la_gate_chunks : 4);
                 }
                 if (gate_prologue_chunks > 0) {
@@ -3471,8 +3709,8 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                         float gate_log_1 = 0.0f;
                         int token_0 = prefetch_offset + gb_lane;
                         int token_1 = token_0 + 32;
-                        int gate_idx_0 = token_0 * num_o_heads_5 + head_idx_5;
-                        int gate_idx_1 = token_1 * num_o_heads_5 + head_idx_5;
+                        int gate_idx_0 = token_0 * num_o_heads_5 + head_idx_6;
+                        int gate_idx_1 = token_1 * num_o_heads_5 + head_idx_6;
                         int beta_idx_0 = gate_idx_0;
                         int beta_idx_1 = gate_idx_1;
                         float gate_val_0 = 1.0f;
@@ -3580,8 +3818,8 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                             float gate_log_1_1 = 0.0f;
                             int token_0_1 = prefetch_offset_1 + gb_lane_1;
                             int token_1_1 = token_0_1 + 32;
-                            int gate_idx_0_1 = token_0_1 * num_o_heads_5 + head_idx_5;
-                            int gate_idx_1_1 = token_1_1 * num_o_heads_5 + head_idx_5;
+                            int gate_idx_0_1 = token_0_1 * num_o_heads_5 + head_idx_6;
+                            int gate_idx_1_1 = token_1_1 * num_o_heads_5 + head_idx_6;
                             int beta_idx_0_1 = gate_idx_0_1;
                             int beta_idx_1_1 = gate_idx_1_1;
                             float gate_val_0_1 = 1.0f;
@@ -3694,8 +3932,8 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                         float gate_log_1_2 = 0.0f;
                         int token_0_2 = prefetch_offset_2 + gb_lane_2;
                         int token_1_2 = token_0_2 + 32;
-                        int gate_idx_0_2 = token_0_2 * num_o_heads_5 + head_idx_5;
-                        int gate_idx_1_2 = token_1_2 * num_o_heads_5 + head_idx_5;
+                        int gate_idx_0_2 = token_0_2 * num_o_heads_5 + head_idx_6;
+                        int gate_idx_1_2 = token_1_2 * num_o_heads_5 + head_idx_6;
                         int beta_idx_0_2 = gate_idx_0_2;
                         int beta_idx_1_2 = gate_idx_1_2;
                         float gate_val_0_2 = 1.0f;
@@ -3908,7 +4146,7 @@ kernel_cake_gdn_e9d22a051244215e2ddd(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         #pragma unroll
                         for (int dim_half_3 = 0; dim_half_3 < 2; dim_half_3++) {
-                            tma_store_3d(tensormap_workspace + (cta_slot_base_epi + 384), dim_half_3 * 64, chunk_offset_8, head_idx_5, smem_o_addr + o_epi_stage * 16384 + (unsigned int)(dim_half_3 * 8192));
+                            tma_store_3d(tensormap_workspace + (cta_slot_base_epi + 384), dim_half_3 * 64, chunk_offset_8, head_idx_6, smem_o_addr + o_epi_stage * 16384 + (unsigned int)(dim_half_3 * 8192));
                         }
                     }
                     asm volatile("cp.async.bulk.commit_group;");
